@@ -58,6 +58,62 @@ pub const MIN_RECOVERY_WINDOW_DAYS: i64 = 7;
 /// The upper bound of the same documented range.
 pub const MAX_RECOVERY_WINDOW_DAYS: i64 = 30;
 
+/// How long a `ForceDeleteWithoutRecovery` deletion, which skips the recovery
+/// window, stays marked for deletion before the store owes its permanent
+/// removal.
+///
+/// "Secrets Manager performs the actual deletion with an asynchronous background
+/// process, so there might be a short delay before the secret is permanently
+/// deleted." (`DeleteSecretRequest$ForceDeleteWithoutRecovery`, this service's
+/// Smithy model.) AWS documents no duration for that delay, so this span is the
+/// emulator's OWN: long enough that a caller acting straight after the call
+/// still observes the secret marked for deletion — and is refused by its state
+/// rather than told it does not exist — short enough that a client retrying a
+/// create of the same name does not wait on a human timescale.
+pub const FORCE_DELETE_PURGE_DELAY: Duration = Duration::from_millis(500);
+
+/// The message `ResourceNotFoundException` carries when a `SecretId` names no
+/// secret this service holds.
+///
+/// `ResourceNotFoundException` is documented as "Secrets Manager can't find the
+/// resource that you asked for." (this service's Smithy model), and the wire
+/// message Secrets Manager answers with is this one constant sentence: it names
+/// no identifier, so the request's `SecretId` is never reflected back into the
+/// error body. Every operation that resolves a `SecretId` answers with THIS
+/// constant, so one secret-not-found error reads the same whichever operation
+/// raised it.
+pub const SECRET_NOT_FOUND_MESSAGE: &str = "Secrets Manager can't find the specified secret.";
+
+/// The message `InvalidNextTokenException` carries for a pagination token this
+/// service cannot resume from.
+///
+/// `InvalidNextTokenException` is documented as "The `NextToken` value is
+/// invalid." (this service's Smithy model); the wire message is this constant
+/// sentence, and it likewise carries no part of the request. Every paginated
+/// operation answers with THIS constant.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The pagination token is no longer valid.";
+
+/// The message `InvalidRequestException` carries for an operation a caller
+/// cannot perform on a secret that is inside its recovery window: the secret
+/// still exists ("The secret is scheduled for deletion.",
+/// `InvalidRequestException`, this service's Smithy model), so it is refused by
+/// state rather than reported as missing.
+pub const MARKED_FOR_DELETION_MESSAGE: &str =
+    "You can't perform this operation on the secret because it was marked for deletion.";
+
+/// The `InvalidParameterException` message for a `RecoveryWindowInDays` outside
+/// the documented range, stating that constraint: "The number of days from 7 to
+/// 30 that Secrets Manager waits before permanently deleting the secret."
+/// (`DeleteSecretRequest$RecoveryWindowInDays`, this service's Smithy model).
+/// The bounds come from the same constants the validation enforces, and the
+/// rejected value is not echoed back.
+pub fn recovery_window_out_of_range_message() -> String {
+    format!(
+        "The RecoveryWindowInDays value must be between {MIN_RECOVERY_WINDOW_DAYS} and \
+         {MAX_RECOVERY_WINDOW_DAYS} days (inclusive)."
+    )
+}
+
 /// Seconds in a day, for turning a recovery window into an instant.
 const SECONDS_PER_DAY: u64 = 86_400;
 
@@ -544,8 +600,22 @@ pub struct Secret {
     pub last_changed_date: SystemTime,
     pub last_accessed_date: Option<SystemTime>,
     /// The instant the secret is scheduled to be permanently deleted;
-    /// `Some(..)` means it is scheduled for deletion.
+    /// `Some(..)` means it is scheduled for deletion. This is the `DeletionDate`
+    /// the service reports, and for a `ForceDeleteWithoutRecovery` deletion —
+    /// which skips the recovery window — it is the instant of the delete call
+    /// itself.
     pub deleted_date: Option<SystemTime>,
+    /// The instant this store drops the secret for good, which [`expire_due`]
+    /// materialises. It is the end of the recovery window for a windowed
+    /// deletion, and a short span after the call for a
+    /// `ForceDeleteWithoutRecovery` one: "Secrets Manager performs the actual
+    /// deletion with an asynchronous background process, so there might be a
+    /// short delay before the secret is permanently deleted."
+    /// (`DeleteSecretRequest$ForceDeleteWithoutRecovery`, this service's Smithy
+    /// model.) Until it falls due the secret still exists, marked for deletion.
+    ///
+    /// [`expire_due`]: ComAmazonawsSecretsmanagerSecretsmanagerState::expire_due
+    pub purge_at: Option<SystemTime>,
     pub rotation_enabled: bool,
     /// The ARN of the Lambda rotation function `RotateSecret` configured for
     /// this secret; `None` for a secret no rotation has been configured for.
@@ -594,6 +664,7 @@ impl Secret {
             last_changed_date: at,
             last_accessed_date: None,
             deleted_date: None,
+            purge_at: None,
             rotation_enabled: false,
             rotation_lambda_arn: None,
             rotation_rules: None,
@@ -610,6 +681,13 @@ impl Secret {
     /// Whether a `DeleteSecret` call has scheduled this secret for deletion.
     pub fn scheduled_for_deletion(&self) -> bool {
         self.deleted_date.is_some()
+    }
+
+    /// Mark this secret for deletion: `at` is the `DeletionDate` the service
+    /// reports, and `purge_at` the instant the store owes its permanent removal.
+    pub fn schedule_deletion(&mut self, at: SystemTime, purge_at: SystemTime) {
+        self.deleted_date = Some(at);
+        self.purge_at = Some(purge_at);
     }
 
     /// The version with this id, deprecated ones included.
@@ -1098,16 +1176,18 @@ impl ComAmazonawsSecretsmanagerSecretsmanagerState {
         self.secrets.get_mut(&name)
     }
 
-    /// Permanently remove every secret whose recovery window has already
-    /// elapsed. This is the deletion the clock has already made due — it was
-    /// owed at this instant whether or not anybody called — so a reporting
-    /// operation materialises it before it answers, and never reports a secret
-    /// the service would already have deleted.
+    /// Permanently remove every secret whose deletion the clock has already made
+    /// due — the end of its recovery window, or the short asynchronous delay a
+    /// `ForceDeleteWithoutRecovery` deletion skips the window for. This is the
+    /// deletion the clock has already made due — it was owed at this instant
+    /// whether or not anybody called — so a reporting operation materialises it
+    /// before it answers, and never reports a secret the service would already
+    /// have deleted.
     pub fn expire_due(&mut self, now: SystemTime) {
         let due: Vec<String> = self
             .secrets
             .values()
-            .filter(|secret| secret.deleted_date.is_some_and(|at| at <= now))
+            .filter(|secret| secret.purge_at.is_some_and(|at| at <= now))
             .map(|secret| secret.name.clone())
             .collect();
         for name in due {

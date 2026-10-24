@@ -2,8 +2,9 @@
 
 //! @op TagResource
 //!
-//! Merges the request's tags, by key, onto the data store its `ResourceARN`
-//! names in [`crate::state`].
+//! Merges the request's tags, by key, onto the resource its `ResourceARN`
+//! names in [`crate::state`] — a FHIR data store or a data transformation
+//! profile, the two resource forms the modelled `AmazonResourceName` admits.
 //!
 //! ## Shape of an operation
 //!
@@ -143,61 +144,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The modelled `AmazonResourceName` pattern also admits a
-        // `dataTransformationProfile` ARN, which names a different resource;
-        // anything that is not a data store ARN resolves to no data store, and
-        // this service's not-found text names no identifier.
-        let Some(id) = crate::state::datastore_id_from_arn(&input.resource_arn) else {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        };
+        // The modelled `AmazonResourceName` pattern admits BOTH of this
+        // service's resource forms, and both carry tags, so the ARN is resolved
+        // to whichever resource it names; an ARN of neither form names nothing,
+        // and this service's not-found texts name no identifier.
+        let resolved = crate::state::tagged_resource_from_arn(&input.resource_arn);
 
         let mut store = state.lock();
         store.settle_lifecycle();
-        // The stored record's own ARN must equal the one the caller handed in,
-        // so an ARN naming another partition, region or account resolves to no
-        // data store even when its id segment happens to match a local one.
-        let Some(datastore) = store
-            .datastores
-            .get_mut(id)
-            .filter(|datastore| datastore.arn == input.resource_arn)
-        else {
+        // Whichever resource it is, the stored record's own ARN must equal the
+        // one the caller handed in, so an ARN naming another partition, region
+        // or account resolves to nothing even when its id segment happens to
+        // match a local one.
+        let (tags, max, noun, not_found) = match resolved {
+            Some(crate::state::TaggedResource::Datastore(id)) => {
+                let datastore = store
+                    .datastores
+                    .get_mut(id)
+                    .filter(|datastore| datastore.arn == input.resource_arn);
+                (
+                    datastore.map(|datastore| &mut datastore.tags),
+                    crate::state::MAX_TAGS_PER_DATASTORE,
+                    "data store",
+                    crate::state::DATASTORE_NOT_FOUND_MESSAGE,
+                )
+            }
+            Some(crate::state::TaggedResource::Profile(id)) => {
+                let profile = store
+                    .profiles
+                    .get_mut(id)
+                    .filter(|profile| profile.arn == input.resource_arn);
+                (
+                    profile.map(|profile| &mut profile.tags),
+                    crate::state::MAX_TAGS_PER_PROFILE,
+                    "data transformation profile",
+                    crate::state::PROFILE_NOT_FOUND_MESSAGE,
+                )
+            }
+            // Unreachable through the wire — the modelled pattern is enforced
+            // before this handler runs — but an ARN of neither form names no
+            // resource, so it is answered the same way a missing one is.
+            None => (
+                None,
+                crate::state::MAX_TAGS_PER_DATASTORE,
+                "data store",
+                crate::state::DATASTORE_NOT_FOUND_MESSAGE,
+            ),
+        };
+        let Some(tags) = tags else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(not_found.to_string()),
                 },
             )
             .into());
         };
 
-        // Merging is all-or-nothing: the resulting tag set is bounded, so a
-        // stream of calls with fresh keys cannot grow the record without limit.
-        // The modelled `TagList` bound caps one request; this caps the resource.
-        let merged: ::std::collections::BTreeSet<&str> = datastore
-            .tags
-            .keys()
-            .map(String::as_str)
-            .chain(input.tags.iter().map(|tag| tag.key.as_str()))
-            .collect();
-        if merged.len() > crate::state::MAX_TAGS_PER_DATASTORE {
-            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "A data store carries at most {} tags; this request would leave {}",
-                    crate::state::MAX_TAGS_PER_DATASTORE,
-                    merged.len()
-                )),
-            })
-            .into());
-        }
-        drop(merged);
-
-        for tag in input.tags {
-            datastore.tags.insert(tag.key, tag.value);
-        }
+        merge_tags(tags, input.tags, max, noun)?;
         Ok(TagResourceOutput {})
     }
+}
+
+/// Merge `requested`, by key, onto the `stored` tags of one resource, or refuse
+/// when the result would carry more than `max` tags.
+///
+/// Merging is all-or-nothing: the resulting tag set is bounded, so a stream of
+/// calls with fresh keys cannot grow a record without limit. The modelled
+/// `TagList` bound caps ONE request; `max` caps the resource, and `noun` names
+/// the kind of resource it caps in the refusal.
+fn merge_tags(
+    stored: &mut ::std::collections::BTreeMap<String, String>,
+    requested: Vec<Tag>,
+    max: usize,
+    noun: &str,
+) -> Result<(), TagResourceError> {
+    let merged = stored
+        .keys()
+        .map(String::as_str)
+        .chain(requested.iter().map(|tag| tag.key.as_str()))
+        .collect::<::std::collections::BTreeSet<&str>>()
+        .len();
+    if merged > max {
+        return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+            message: Some(format!(
+                "A {noun} carries at most {max} tags; this request would leave {merged}"
+            )),
+        })
+        .into());
+    }
+
+    for tag in requested {
+        stored.insert(tag.key, tag.value);
+    }
+    Ok(())
 }

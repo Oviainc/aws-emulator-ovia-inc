@@ -19,6 +19,8 @@ mod callback_signature;
 mod change_set_lifecycle;
 #[path = "all/change_set_preview.rs"]
 mod change_set_preview;
+#[path = "all/cognito_resource_types.rs"]
+mod cognito_resource_types;
 #[path = "all/drift_and_resource_reads.rs"]
 mod drift_and_resource_reads;
 #[path = "all/ecs_elbv2_stack_identifiers.rs"]

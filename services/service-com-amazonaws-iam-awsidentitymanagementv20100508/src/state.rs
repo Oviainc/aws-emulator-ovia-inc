@@ -927,6 +927,16 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     // service-linked role".
     ("batch.amazonaws.com", "AWSServiceRoleForBatch"),
     ("cloudtrail.amazonaws.com", "AWSServiceRoleForCloudTrail"),
+    // AWS CodeStar Notifications' own "Using service-linked roles for AWS CodeStar
+    // Notifications" page names the role it creates to publish notifications to a
+    // rule's targets: AWSServiceRoleForCodeStarNotifications, for the principal
+    // codestar-notifications.amazonaws.com. Without the row the derived fallback name
+    // is not the one AWS publishes, so a client that creates the role and then reads
+    // it back under the published name never converges.
+    (
+        "codestar-notifications.amazonaws.com",
+        "AWSServiceRoleForCodeStarNotifications",
+    ),
     // [model] service-com-amazonaws-configservice-starlingdoveservice
     // `src/ops/put_service_linked_configuration_recorder.rs`: "creates a
     // service-linked role AWSServiceRoleForConfig in your account".

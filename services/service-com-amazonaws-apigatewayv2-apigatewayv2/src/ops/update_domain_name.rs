@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDomainName
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDomainName`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDomainName::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -159,18 +149,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDomainName` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDomainNameErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDomainName"))
+        let _ = ctx;
+
+        // `None` here means the patch named no routing mode, so the stored one stands:
+        // the catalog check and its wording are shared with `create_domain_name`, but a
+        // create's default is NOT re-applied by an update.
+        let routing_mode = match crate::state::resolve_routing_mode(input.routing_mode.as_deref()) {
+            Ok(mode) => mode,
+            Err(message) => return Err(bad_request(&message)),
+        };
+
+        // A `DomainNameConfigurations` the request omits is not an empty list: it is a
+        // member the patch says nothing about. One it CARRIES is resolved through the
+        // same helper `CreateDomainName` uses, so an entry's defaults and enum catalogs
+        // cannot drift between the two operations.
+        let requested_configurations = match input.domain_name_configurations.as_ref() {
+            ::std::option::Option::None => ::std::option::Option::None,
+            Some(requested) => {
+                let mut resolved = ::std::vec::Vec::with_capacity(requested.len());
+                for (index, entry) in requested.iter().enumerate() {
+                    match crate::state::resolve_domain_name_endpoint(index, entry) {
+                        Ok(endpoint) => resolved.push(endpoint),
+                        Err(message) => return Err(bad_request(&message)),
+                    }
+                }
+                Some(resolved)
+            }
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateDomainName",
+            ));
+        };
+        let mut store = state.lock();
+
+        let Some(record) = store.domain_names.get_mut(&input.domain_name) else {
+            // The message AWS answers for a domain name the account does not hold; see
+            // the sibling refusal in `get_domain_name`. It names no value from the
+            // request.
+            return Err(UpdateDomainNameErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some("Invalid domain name identifier specified".to_string()),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // "If the status is UPDATING, the domain cannot be modified further until the
+        // existing operation is complete. If it is AVAILABLE, the domain can be updated"
+        // (`DomainNameConfiguration$DomainNameStatus`). A domain name mid-migration is
+        // therefore refused with the modelled `ConflictException` — "the requested
+        // operation would cause a conflict with the current state of a service resource"
+        // — and nothing is written. The status is read off the clock, so the refusal
+        // lifts of its own accord once the migration this service owes comes due.
+        let now = ::std::time::SystemTime::now();
+        if record.status(now) == crate::state::DOMAIN_NAME_STATUS_UPDATING {
+            return Err(UpdateDomainNameErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "The domain name {} is {} and cannot be modified until the existing \
+                         operation is complete.",
+                        input.domain_name,
+                        crate::state::DOMAIN_NAME_STATUS_UPDATING
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The update is a PATCH (`PATCH /v2/domainnames/{DomainName}`): a member the
+        // request carries replaces the stored one, and a member it omits leaves the
+        // stored value exactly as it was. `Tags` is not an input member of this
+        // operation, so an update never touches the domain name's tags; neither does it
+        // re-apply a create's defaults, which would silently undo a value a later
+        // `GetDomainName` can still report.
+        if let Some(routing_mode) = routing_mode {
+            record.routing_mode = routing_mode;
+        }
+        if let Some(mutual_tls) = input.mutual_tls_authentication {
+            record.mutual_tls_authentication = Some(mutual_tls);
+        }
+        if let Some(configurations) = requested_configurations {
+            // The endpoints a domain name is served on only migrate when they actually
+            // change: re-sending the stored configuration asks for no migration, so the
+            // domain name stays `AVAILABLE` and remains updatable.
+            if configurations != record.configurations {
+                record.configurations = configurations;
+                record.migration_due_at = Some(now + crate::state::DOMAIN_NAME_MIGRATION);
+            }
+        }
+
+        // Report the record as STORED, so what the caller gets is what a later
+        // GetDomainName will report. `DomainNameArn` and `ApiGatewayDomainName` are
+        // carried over untouched: they name the resource and the host a caller's DNS
+        // record points at, neither of which an update moves.
+        let stored = record.to_wire(now);
+        Ok(UpdateDomainNameOutput {
+            api_mapping_selection_expression: stored.api_mapping_selection_expression,
+            domain_name: Some(stored.domain_name),
+            domain_name_arn: stored.domain_name_arn,
+            domain_name_configurations: stored.domain_name_configurations,
+            mutual_tls_authentication: stored.mutual_tls_authentication,
+            routing_mode: stored.routing_mode,
+            tags: stored.tags,
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint. Takes
+/// the same `&str` the sibling helper in `create_domain_name` does.
+fn bad_request(message: &str) -> UpdateDomainNameError {
+    UpdateDomainNameErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

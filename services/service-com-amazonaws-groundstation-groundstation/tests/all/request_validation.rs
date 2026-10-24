@@ -17,14 +17,14 @@
 //! * a request the model's own rules refuse (a missing required member, a value outside
 //!   a declared bound) is answered with HTTP 400 `BadRequestException` and the service's
 //!   one fixed sentence, whatever operation it was addressed to;
-//! * an s3-recording `Config` is created only for a bucket whose location Ground
-//!   Station can read — a bucket it has no record of, or an ARN that names no bucket,
-//!   is refused.
+//! * a `bucketArn` that names no S3 bucket at all is refused without anything being
+//!   asked of S3 — what a bucket S3 itself reports on means is
+//!   `tests/all/s3_recording_buckets.rs`'s subject.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    parse_approved_uplink_bands, parse_recording_buckets, service_state, BAD_REQUEST_ERROR_CODE,
-    INVALID_REQUEST_BODY, UNAPPROVED_UPLINK_FREQUENCY, UNRESOLVABLE_RECORDING_BUCKET,
+    parse_approved_uplink_bands, service_state, BAD_REQUEST_ERROR_CODE, INVALID_REQUEST_BODY,
+    RECORDING_BUCKET_DOES_NOT_EXIST, UNAPPROVED_UPLINK_FREQUENCY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -949,115 +949,27 @@ fn the_uplink_approval_setting_parses_as_documented() {
     }
 }
 
-/// The recording buckets an operator names at start-up through
-/// `state::RECORDING_BUCKETS_ENV` read as documented: comma-separated names, surrounding
-/// space trimmed, empty entries dropped.
-#[test]
-fn the_recording_buckets_setting_parses_as_documented() {
-    let cases: Vec<(&str, Vec<&str>)> = vec![
-        ("", vec![]),
-        ("aws-groundstation-downlink", vec!["aws-groundstation-downlink"]),
-        (" gs , my.recording-bucket-01 ", vec!["gs", "my.recording-bucket-01"]),
-        (",,", vec![]),
-        ("gs,,other", vec!["gs", "other"]),
-    ];
-    for (setting, expected) in cases {
-        let parsed = parse_recording_buckets(setting);
-        assert_eq!(
-            parsed, expected,
-            "case {setting:?}: expected {expected:?}, got {parsed:?}"
-        );
-    }
-}
-
-/// Tell this account's Ground Station that it can read the location of `buckets`, the
-/// way [`state::RECORDING_BUCKETS_ENV`] does at start-up.
-fn make_buckets_readable(engine: &engine::InMemoryEngine, buckets: &[&str]) {
-    service_state(engine)
-        .expect("this service's state store")
-        .lock()
-        .readable_recording_buckets
-        .extend(buckets.iter().map(|bucket| (*bucket).to_string()));
-}
-
-fn s3_recording_config(bucket: &str) -> Value {
-    json!({"s3RecordingConfig": {
-        "bucketArn": format!("arn:aws:s3:::{bucket}"),
-        "roleArn": "arn:aws:iam::000000000000:role/GroundStationS3Role",
-        "prefix": "data/{satellite_id}/{year}/{month}/{day}",
-    }})
-}
-
-/// An `s3RecordingConfig` is created only for a bucket whose location Ground Station can
-/// read: one it can is created and reads back, and one it cannot — a bucket it has no
-/// record of, or an ARN that names no bucket at all — is refused with HTTP 431
-/// `InvalidParameterException` and the service's fixed sentence for the condition,
-/// whatever the bucket is named and however the ARN is written.
+/// A `bucketArn` that is not an S3 BUCKET ARN names no bucket, whatever its resource
+/// part spells, so an `s3RecordingConfig` carrying one is refused with HTTP 431
+/// `InvalidParameterException` and the service's fixed sentence for the condition —
+/// settled here without anything being asked of S3, because there is nothing to ask
+/// about. (A `bucketArn` that IS a bucket ARN is resolved against S3; that is
+/// `tests/all/s3_recording_buckets.rs`'s subject, and this router mounts no S3.)
 #[tokio::test]
-async fn an_s3_recording_config_needs_a_bucket_whose_location_can_be_read() {
+async fn an_arn_that_names_no_bucket_is_refused_without_resolving_anything() {
     let (router, engine) = harness_with_engine();
 
-    // Bucket names that differ along what the rule generalises over: length, the
-    // characters S3 allows in a name, and whether anything about the name looks like a
-    // Ground Station bucket. Each is one this service can locate, so each is accepted.
-    // "role" and "instance" are locatable too, which is what makes the ARN-shape rows
-    // below fail on the ARN rather than on the name being unknown.
-    let existing = ["gs", "aws-groundstation-downlink", "my.recording-bucket-01"];
-    make_buckets_readable(&engine, &existing);
-    make_buckets_readable(&engine, &["role", "instance"]);
-    for (index, bucket) in existing.iter().enumerate() {
-        let config_data = s3_recording_config(bucket);
-        let reply = create(&router, &format!("recording-{index}"), &config_data).await;
-        assert_eq!(
-            reply.status, 200,
-            "bucket {bucket}: expected CreateConfig 200, got {} {}",
-            reply.status, reply.body
-        );
-        let config_id = reply.string("configId");
-        let read_back = send(
-            &router,
-            "GET",
-            &format!("/config/s3-recording/{config_id}"),
-            None,
-        )
-        .await;
-        assert_eq!(
-            read_back.status, 200,
-            "bucket {bucket}: expected GetConfig 200, got {} {}",
-            read_back.status, read_back.body
-        );
-        assert_eq!(
-            read_back.field("configData"),
-            &config_data,
-            "bucket {bucket}: GetConfig must return the configData that was created, got {}",
-            read_back.field("configData")
-        );
-    }
-    assert_eq!(
-        config_count(&engine),
-        existing.len(),
-        "exactly the configs whose bucket can be located may be stored"
-    );
-
-    // A bucket this service cannot locate, ARNs of other services, and malformed ARNs:
-    // the location cannot be read in any of these, so none of them is created. The rows
-    // naming another service's resource matter because `BucketArn` carries no model
-    // pattern, so the boundary validator passes any string: a `role/<name>` or
-    // `instance/<id>` resource part must not be read as a bucket name, even when a bucket
-    // of that name IS locatable — "role" and "instance" are, above.
+    // Rows differ along the ways a string can fail to be an S3 bucket ARN: another
+    // service's ARN (whose resource part still LOOKS like a bucket name), an S3 resource
+    // that is not a bucket, an empty resource part, a non-ARN, and an ARN naming no
+    // service.
     for (label, bucket_arn) in [
-        ("a bucket this service cannot locate", "arn:aws:s3:::absent-bucket"),
         (
-            "a bucket name that differs from a locatable one",
-            "arn:aws:s3:::aws-groundstation-downlinks",
-        ),
-        ("an object ARN under a bucket it cannot locate", "arn:aws:s3:::absent-bucket/key"),
-        (
-            "an IAM role ARN whose resource part names a locatable bucket",
+            "an IAM role ARN whose resource part looks like a bucket name",
             "arn:aws:iam::000000000000:role/GroundStationS3Role",
         ),
         (
-            "an EC2 instance ARN whose resource part names a locatable bucket",
+            "an EC2 instance ARN whose resource part looks like a bucket name",
             "arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0",
         ),
         (
@@ -1086,14 +998,14 @@ async fn an_s3_recording_config_needs_a_bucket_whose_location_can_be_read() {
         );
         assert_eq!(
             reply.string("message"),
-            UNRESOLVABLE_RECORDING_BUCKET,
+            RECORDING_BUCKET_DOES_NOT_EXIST,
             "case {label}: wrong refusal text, got {}",
             reply.body
         );
     }
     assert_eq!(
         config_count(&engine),
-        existing.len(),
+        0,
         "a refused create must store nothing"
     );
 }

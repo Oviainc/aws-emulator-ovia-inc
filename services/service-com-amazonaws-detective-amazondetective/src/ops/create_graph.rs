@@ -6,6 +6,12 @@
 //! lives under in [`crate::state`], so `ListGraphs`, `CreateMembers`, `ListMembers`,
 //! `GetMembers` and `DeleteGraph` all resolve it.
 //!
+//! The account administers at most ONE graph per Region ("An account can only be the
+//! administrator account for one behavior graph within a Region … it always returns the
+//! same behavior graph ARN. It does not create a new behavior graph"), so a repeat call
+//! answers with the graph the account already has there instead of minting a second
+//! one.
+//!
 //! IMPLEMENTED: a graph minted here is stored under the ARN this returns.
 //!
 //! ## Shape of an operation
@@ -198,8 +204,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let created_time_millis = crate::state::now_epoch_millis();
+        let administrator_id = crate::state::administrator_account_id();
 
         let mut store = state.lock();
+
+        // "An account can only be the administrator account for one behavior graph
+        // within a Region. If the same account calls CreateGraph with the same
+        // administrator account, it always returns the same behavior graph ARN. It does
+        // not create a new behavior graph." So the account's graph in this Region is
+        // the whole answer when it already has one: nothing is minted, and the tags the
+        // repeat request carried are NOT applied — they are "the tags to assign to the
+        // NEW behavior graph", and there is no new graph. The lookup and the insert
+        // below both happen under this one lock, so concurrent callers converge on the
+        // one ARN instead of each minting its own.
+        if let Some(existing) = store.graph_of_administrator_in_region(&administrator_id, &region) {
+            return Ok(CreateGraphOutput {
+                graph_arn: Some(existing.arn.clone()),
+            });
+        }
 
         // The store is finite: a create that would take it past its cap is refused
         // rather than growing it, the way the service refuses one past its quota.
@@ -223,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "sets that account as the administrator account": the graph records who
             // administers it, which is what every `MemberDetail` of this graph later
             // reports as its `AdministratorId`.
-            administrator_id: crate::state::administrator_account_id(),
+            administrator_id,
             // Stored on the graph now: `TagResource` and `ListTagsForResource` key off
             // this same graph ARN.
             tags,

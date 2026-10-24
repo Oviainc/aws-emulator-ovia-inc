@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 use ::aws_smithy_types::base64;
 
 use crate::ops::types::{
-    AdditionalInfoRequest, AdditionalInfoResponse, Address, ConflictException,
+    AdditionalInfoRequest, AdditionalInfoResponse, Address, Authority, ConflictException,
     IndonesiaAdditionalInfo, InternalServerException, Jurisdiction, ResourceNotFoundException,
-    TaxDocumentMetadata, TaxRegistration, TaxRegistrationEntry, TaxRegistrationWithJurisdiction,
+    SupplementalTaxRegistration, SupplementalTaxRegistrationEntry, TaxDocumentMetadata,
+    TaxExemptionType, TaxRegistration, TaxRegistrationEntry, TaxRegistrationWithJurisdiction,
     ValidationException, ValidationExceptionField,
 };
 
@@ -147,6 +148,16 @@ pub const MAX_PAGE_SIZE: usize = 1_000;
 /// adds nothing.
 pub const MAX_STORED_REGISTRATIONS: usize = 1_000;
 
+/// The most supplemental tax registrations this emulator keeps resident.
+///
+/// `SupplementalTaxRegistrationEntry$registrationId` is caller-supplied, so
+/// without a bound a caller could grow the store by one record per request. A
+/// write that would ADD a record past this bound is refused with
+/// `PutSupplementalTaxRegistration`'s modelled `ConflictException`; rewriting a
+/// supplemental TRN the account already has is always allowed, because it adds
+/// nothing.
+pub const MAX_STORED_SUPPLEMENTAL_REGISTRATIONS: usize = 1_000;
+
 /// The page size a listing request selects: what it asked for, else
 /// [`DEFAULT_PAGE_SIZE`], never more than [`MAX_PAGE_SIZE`] and never zero.
 pub fn page_size(max_results: Option<i32>) -> usize {
@@ -175,6 +186,20 @@ pub struct ComAmazonawsTaxsettingsTaxsettingsState {
     /// be would write, and `GetTaxInheritance` reports
     /// [`DEFAULT_HERITAGE_STATUS`] until one does.
     pub tax_inheritance: Option<String>,
+    /// The account's supplemental tax registrations, keyed by the `authorityId`
+    /// this service minted for each when it was first stored.
+    ///
+    /// A `BTreeMap` so `ListSupplementalTaxRegistrations` enumerates in one
+    /// stable order and a page token can name the key the previous page stopped
+    /// after. One map for the whole store, because neither
+    /// `PutSupplementalTaxRegistration` nor `ListSupplementalTaxRegistrations`
+    /// takes an account: both address the caller's own, and this emulator
+    /// presents one account.
+    pub supplemental_registrations: BTreeMap<String, StoredSupplementalRegistration>,
+    /// How many `authorityId`s this service has minted. The next one is derived
+    /// from it, so every supplemental TRN gets its own and a deleted one's id is
+    /// never handed out again.
+    pub minted_authority_ids: u64,
 }
 
 impl ComAmazonawsTaxsettingsTaxsettingsState {
@@ -189,6 +214,115 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     pub fn settle_due(&mut self, now: Instant) {
         for stored in self.registrations.values_mut() {
             stored.settle(now);
+        }
+        for stored in self.supplemental_registrations.values_mut() {
+            stored.settle(now);
+        }
+    }
+
+    /// The `authorityId` of the stored supplemental TRN with this type and
+    /// registration id, if the account already has one.
+    ///
+    /// `SupplementalTaxRegistrationEntry` carries no `authorityId`, so the TRN
+    /// itself — its type and its registration id — is the identity a write
+    /// addresses: that is what makes `PutSupplementalTaxRegistration` "adding or
+    /// updating" one registration rather than appending a record per call.
+    pub fn find_supplemental_authority(
+        &self,
+        registration_type: &str,
+        registration_id: &str,
+    ) -> Option<String> {
+        self.supplemental_registrations
+            .iter()
+            .find(|(_, stored)| {
+                stored.registration_type == registration_type
+                    && stored.registration_id == registration_id
+            })
+            .map(|(authority_id, _)| authority_id.clone())
+    }
+
+    /// Mint the `authorityId` of a supplemental TRN this account did not have
+    /// yet.
+    ///
+    /// `authorityId` is SERVER-generated (no request member carries one) and the
+    /// model constrains it only as a `GenericString` of 1..=200 characters, so
+    /// AWS publishes no format for it: this mints a short opaque id from the
+    /// service's own counter, unique per record and stable for the life of that
+    /// record, which is every invariant the member has.
+    pub fn mint_supplemental_authority_id(&mut self) -> String {
+        self.minted_authority_ids = self.minted_authority_ids.saturating_add(1);
+        format!("supplemental-trn-{:08}", self.minted_authority_ids)
+    }
+}
+
+/// One supplemental tax registration (a supplemental TRN) of the account.
+///
+/// Every member of the `SupplementalTaxRegistration` shape the reads report is
+/// `@required`, and the write's entry carries all of them but `authorityId` and
+/// `status`, which the service owns: the id is minted when the record is first
+/// stored and the status is the outcome of validating the submitted TRN.
+#[derive(Debug, Clone, Default)]
+pub struct StoredSupplementalRegistration {
+    /// `SupplementalTaxRegistrationEntry$registrationId`, as submitted.
+    pub registration_id: String,
+    /// `SupplementalTaxRegistrationEntry$registrationType`, one of the model's
+    /// `SupplementalTaxRegistrationType` values (today only `VAT`).
+    pub registration_type: String,
+    /// `SupplementalTaxRegistrationEntry$legalName`, as submitted.
+    pub legal_name: String,
+    /// `SupplementalTaxRegistrationEntry$address`, as submitted.
+    pub address: Address,
+    /// The registration's `TaxRegistrationStatus`.
+    pub status: String,
+    /// When the validation of this TRN falls due, after which [`Self::settle`]
+    /// moves [`Self::status`] to [`SETTLED_REGISTRATION_STATUS`] — the same
+    /// clock-owed transition a main TRN has, for the same reason. `None` once it
+    /// has been settled.
+    pub validation_due_at: Option<Instant>,
+}
+
+impl StoredSupplementalRegistration {
+    /// The record `PutSupplementalTaxRegistration` stores for `entry`.
+    pub fn from_entry(entry: &SupplementalTaxRegistrationEntry, written_at: Instant) -> Self {
+        Self {
+            registration_id: entry.registration_id.clone(),
+            registration_type: entry.registration_type.clone(),
+            legal_name: entry.legal_name.clone(),
+            address: entry.address.clone(),
+            // The write starts the validation of the submitted TRN and reports
+            // the status the registration is stored with while that validation
+            // is outstanding.
+            status: STATUS_PENDING.to_string(),
+            validation_due_at: Some(written_at + TRN_VALIDATION_DELAY),
+        }
+    }
+
+    /// Move this registration to the status its validation reached, if that
+    /// validation was already due at `now`. Answers whether it moved.
+    pub fn settle(&mut self, now: Instant) -> bool {
+        match self.validation_due_at {
+            Some(due) if due <= now => {
+                self.status = SETTLED_REGISTRATION_STATUS.to_string();
+                self.validation_due_at = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The `SupplementalTaxRegistration` shape the reads report, under the
+    /// `authorityId` this record is stored by.
+    pub fn to_supplemental_tax_registration(
+        &self,
+        authority_id: &str,
+    ) -> SupplementalTaxRegistration {
+        SupplementalTaxRegistration {
+            registration_id: self.registration_id.clone(),
+            registration_type: self.registration_type.clone(),
+            legal_name: self.legal_name.clone(),
+            address: self.address.clone(),
+            authority_id: authority_id.to_string(),
+            status: self.status.clone(),
         }
     }
 }
@@ -1167,6 +1301,18 @@ pub fn registration_store_full() -> ConflictException {
     }
 }
 
+/// This service's modelled `ConflictException` (HTTP 409) for a write that would
+/// take the supplemental store past [`MAX_STORED_SUPPLEMENTAL_REGISTRATIONS`].
+/// It carries its `message` only, for the reason [`no_tax_registration`] gives.
+pub fn supplemental_store_full() -> ConflictException {
+    ConflictException {
+        message: format!(
+            "This emulator keeps at most {MAX_STORED_SUPPLEMENTAL_REGISTRATIONS} supplemental tax \
+             registrations resident. Delete one before adding another."
+        ),
+    }
+}
+
 /// This service's modelled `InternalServerException` (HTTP 500) for a handler
 /// mounted on an engine that holds no state for this service. A handler answers
 /// this rather than building an engine of its own, which would give that one
@@ -1178,38 +1324,29 @@ pub fn state_unavailable() -> InternalServerException {
     }
 }
 
-/// The opaque page cursor naming the last account id a page emitted.
+/// The opaque page cursor naming the last store key a page emitted — an account
+/// id for `ListTaxRegistrations`, an `authorityId` for
+/// `ListSupplementalTaxRegistrations`.
 ///
 /// Resuming from it means "the first key strictly greater than this one", which
-/// is well defined because [`ComAmazonawsTaxsettingsTaxsettingsState::registrations`]
-/// is ordered.
+/// is well defined because both
+/// [`ComAmazonawsTaxsettingsTaxsettingsState::registrations`] and
+/// [`ComAmazonawsTaxsettingsTaxsettingsState::supplemental_registrations`] are
+/// ordered.
 ///
 /// Encoded with `aws_smithy_types::base64`, the codec the wire protocols already
 /// use for this service's `blob` members. Its standard alphabet (`A-Za-z0-9+/`)
 /// and `=` padding both lie inside the model's `PaginationTokenString` pattern
 /// `^[-A-Za-z0-9_+\=\/]+$`, so every token issued here satisfies the constraint
 /// the next request's `nextToken` is validated against.
-pub fn encode_page_token(last_account_id: &str) -> String {
-    base64::encode(last_account_id)
+pub fn encode_page_token(last_key: &str) -> String {
+    base64::encode(last_key)
 }
 
 /// The account id a page cursor names, or a `ValidationException` when the token
 /// was not minted by [`encode_page_token`].
 pub fn decode_page_token(token: &str) -> Result<String, ValidationException> {
-    let decoded = base64::decode(token).map_err(|_| {
-        validation(
-            ERROR_CODE_MALFORMED_TOKEN,
-            "nextToken",
-            "nextToken is not a pagination token this service issued.",
-        )
-    })?;
-    let account_id = String::from_utf8(decoded).map_err(|_| {
-        validation(
-            ERROR_CODE_MALFORMED_TOKEN,
-            "nextToken",
-            "nextToken is not a pagination token this service issued.",
-        )
-    })?;
+    let account_id = decode_page_token_key(token)?;
     if account_id.len() != 12 || !account_id.bytes().all(|b| b.is_ascii_digit()) {
         return Err(validation(
             ERROR_CODE_INVALID_TOKEN,
@@ -1218,6 +1355,157 @@ pub fn decode_page_token(token: &str) -> Result<String, ValidationException> {
         ));
     }
     Ok(account_id)
+}
+
+// ---------------------------------------------------------------------------
+// The tax exemption type catalog
+//
+// `GetTaxExemptionTypes` answers "the supported types of tax exemptions": a
+// collection the SERVICE publishes, the same for every account, that no
+// operation of this service creates, updates or deletes. So the catalog below IS
+// that collection — the same way the API Gateway emulator's `SdkType` collection
+// is a published table rather than a stored record — and the handler projects it
+// into the modelled shapes instead of reading an account's records.
+// ---------------------------------------------------------------------------
+
+/// One jurisdiction an exemption type applies in, as the catalog spells it:
+/// `(country, state)` — the two members of the model's `Authority` shape
+/// (`smithy_query(query="shape", shape="Authority")`: `country` is a required
+/// two-letter code, `state` an optional name). `None` means the type applies
+/// across the whole country rather than in one state of it.
+pub type JurisdictionRow = (&'static str, Option<&'static str>);
+
+/// One entry of the published catalog:
+/// `(displayName, description, applicableJurisdictions)` — the three members of
+/// the model's `TaxExemptionType` shape.
+pub type TaxExemptionTypeRow = (&'static str, &'static str, &'static [JurisdictionRow]);
+
+/// The tax exemption types this service supports.
+///
+/// Hand-written because the model declares no shape enumerating them: `TaxExemptionType`
+/// is a free-form structure, and the only thing the model says about which values are
+/// legal is `PutTaxExemptionRequest$exemptionType`'s "Use the supported tax exemption type
+/// description" (`smithy_query(query="doc", shape="PutTaxExemptionRequest",
+/// member="exemptionType")`) — i.e. the `description` of an entry of THIS catalog is the
+/// token a caller names an exemption type by, so the descriptions below are the catalog's
+/// identifying values and are kept distinct from one another.
+///
+/// What is claimed to match AWS: the categories of US sales-and-use-tax exemption AWS
+/// accepts a certificate for (AWS Billing and Cost Management User Guide, "Tax exemption"
+/// / "Managing your tax exemptions": tax exemptions are offered for United States sales
+/// tax, under the certificate categories a reseller, a direct-pay permit holder, a
+/// federal, state, local or tribal government body, an educational institution or a
+/// section 501(c)(3) charitable organization holds), and the single country-level
+/// jurisdiction each of them carries — `US`, with no `state`, because the exemption
+/// category is published for the country and a certificate's state is a fact about the
+/// certificate rather than about the type.
+///
+/// What is NOT claimed: the `displayName` and `description` WORDING, and the order of the
+/// entries. The model states no sentence for either member, so each is this emulator's own
+/// phrasing of a documented category, sorted by `displayName` so the collection is
+/// enumerated one stable way; a client that keys off the prose rather than off a type it
+/// already read from this catalog is reading wording the real service words differently.
+pub const TAX_EXEMPTION_TYPE_CATALOG: &[TaxExemptionTypeRow] = &[
+    (
+        "501(c)(3)",
+        "Charitable organization exempt under section 501(c)(3) of the US Internal Revenue Code",
+        UNITED_STATES,
+    ),
+    (
+        "Direct Pay Permit",
+        "Holder of a direct pay permit that remits sales and use tax directly to the taxing \
+         authority",
+        UNITED_STATES,
+    ),
+    (
+        "Educational Institution",
+        "Accredited school, college or university exempt from sales and use tax",
+        UNITED_STATES,
+    ),
+    (
+        "Federal Government",
+        "US federal government body exempt from sales and use tax",
+        UNITED_STATES,
+    ),
+    (
+        "Reseller",
+        "Purchases for resale, held under a resale certificate",
+        UNITED_STATES,
+    ),
+    (
+        "State or Local Government",
+        "US state, county or municipal government body exempt from sales and use tax",
+        UNITED_STATES,
+    ),
+    (
+        "Tribal Government",
+        "Federally recognized tribal government body exempt from sales and use tax",
+        UNITED_STATES,
+    ),
+];
+
+/// The jurisdiction every entry of [`TAX_EXEMPTION_TYPE_CATALOG`] applies in: the
+/// United States as a whole. See that constant for why it carries no `state`.
+const UNITED_STATES: &[JurisdictionRow] = &[("US", None)];
+
+/// The catalog as the modelled `TaxExemptionType` list `GetTaxExemptionTypes`
+/// reports, in [`TAX_EXEMPTION_TYPE_CATALOG`]'s order.
+///
+/// Every member is reported: the collection exists to tell a caller which types
+/// it may name and where each one applies, and an omitted member would leave that
+/// unanswerable.
+pub fn tax_exemption_type_catalog() -> Vec<TaxExemptionType> {
+    TAX_EXEMPTION_TYPE_CATALOG
+        .iter()
+        .map(|(display_name, description, jurisdictions)| TaxExemptionType {
+            display_name: Some((*display_name).to_string()),
+            description: Some((*description).to_string()),
+            applicable_jurisdictions: Some(
+                jurisdictions
+                    .iter()
+                    .map(|(country, state)| Authority {
+                        country: (*country).to_string(),
+                        state: state.map(std::string::ToString::to_string),
+                    })
+                    .collect(),
+            ),
+        })
+        .collect()
+}
+
+/// The `authorityId` a supplemental-listing page cursor names, or a
+/// `ValidationException` when the token was not minted by
+/// [`encode_page_token`].
+///
+/// The key a supplemental page resumes from is an `authorityId`, which the model
+/// constrains as a `GenericString` of 1..=200 characters, so a token carrying
+/// anything outside that bound names nothing this listing could resume from.
+pub fn decode_supplemental_page_token(token: &str) -> Result<String, ValidationException> {
+    let authority_id = decode_page_token_key(token)?;
+    if authority_id.is_empty() || authority_id.chars().count() > 200 {
+        return Err(validation(
+            ERROR_CODE_INVALID_TOKEN,
+            "nextToken",
+            "nextToken does not name a supplemental tax registration this service can resume \
+             from.",
+        ));
+    }
+    Ok(authority_id)
+}
+
+/// The store key a page cursor carries, whatever kind of key that listing pages
+/// by: the text [`encode_page_token`] encoded, or a `ValidationException` when
+/// the token does not decode at all.
+fn decode_page_token_key(token: &str) -> Result<String, ValidationException> {
+    let malformed = || {
+        validation(
+            ERROR_CODE_MALFORMED_TOKEN,
+            "nextToken",
+            "nextToken is not a pagination token this service issued.",
+        )
+    };
+    let decoded = base64::decode(token).map_err(|_| malformed())?;
+    String::from_utf8(decoded).map_err(|_| malformed())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

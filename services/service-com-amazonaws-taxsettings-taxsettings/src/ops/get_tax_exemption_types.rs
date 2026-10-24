@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTaxExemptionTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTaxExemptionTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTaxExemptionTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tax exemption types this service supports: the catalog
+//! [`crate::state::tax_exemption_type_catalog`] publishes, which is the same
+//! collection for every account and which no operation of this service creates,
+//! updates or deletes. Purely reporting — it changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +133,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTaxExemptionTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTaxExemptionTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTaxExemptionTypes"))
+        // `GetTaxExemptionTypesRequest` has no members, so there is nothing of a
+        // caller's to read here.
+        let _ = (&input, ctx);
+        // The exemption types are the service's own published collection, not an
+        // account's records, so there is nothing for this read to look up and nothing
+        // for it to write. The store is still resolved, so a call served by an engine
+        // that cannot reach this service's state is refused exactly as it is on every
+        // sibling operation rather than answered.
+        let _store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTaxExemptionTypesErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+
+        Ok(GetTaxExemptionTypesOutput {
+            tax_exemption_types: Some(crate::state::tax_exemption_type_catalog()),
+        })
     }
 }

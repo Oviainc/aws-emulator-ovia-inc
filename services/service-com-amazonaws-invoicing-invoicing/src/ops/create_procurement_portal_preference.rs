@@ -260,6 +260,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                     resource_id: Some(existing.preference.procurement_portal_preference_arn.clone()),
                     resource_type: Some(RESOURCE_TYPE.to_string()),
+                    // The procurement-portal plane keys the text as `Message` (see
+                    // `crate::ops::types::MessageKey`).
+                    message_key: MessageKey::Capitalised,
                 },
             )
             .into());
@@ -276,6 +279,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                              preferences",
                             crate::state::MAX_PROCUREMENT_PORTAL_PREFERENCES
                         ),
+                        // The procurement-portal plane keys the text as `Message` (see
+                        // `crate::ops::types::MessageKey`).
+                        message_key: MessageKey::Capitalised,
                     },
                 )
                 .into(),

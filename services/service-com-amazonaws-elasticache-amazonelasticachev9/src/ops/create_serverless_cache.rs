@@ -460,15 +460,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            if group.status != crate::state::USER_STATUS_ACTIVE {
+            if let Some(message) = crate::state::user_group_state_refusal(group) {
                 return Err(
                     CreateServerlessCacheErrorModeled::InvalidUserGroupStateFault(
                         InvalidUserGroupStateFault {
-                            message: Some(format!(
-                                "User group {id} is in {} state, not {}.",
-                                group.status,
-                                crate::state::USER_STATUS_ACTIVE
-                            )),
+                            message: Some(message),
                         },
                     )
                     .into(),

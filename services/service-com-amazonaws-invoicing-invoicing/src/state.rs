@@ -64,7 +64,7 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     AccessDeniedException, InternalServerException, InvoiceProfile, InvoiceSummary, InvoiceUnit,
-    InvoiceUnitRule, ProcurementPortalPreference, ProcurementPortalPreferenceSummary,
+    InvoiceUnitRule, MessageKey, ProcurementPortalPreference, ProcurementPortalPreferenceSummary,
     ResourceNotFoundException, ResourceTag, ValidationException,
 };
 
@@ -561,7 +561,9 @@ pub const PORTAL_COUPA: &str = "COUPA";
 /// MarketplacePunchOutEnabled is true" — a combination of members the model cannot
 /// express, so the boundary validator passes it and it is refused here as the modelled
 /// `ValidationException`. The message names the portal the requirement is stated for, so
-/// it is built from what the write is acting on rather than from a constant.
+/// it is built from what the write is acting on rather than from a constant, and it is
+/// keyed the way this plane's recorded bodies key it ([`MessageKey::Capitalised`]) —
+/// every write that reaches this rule is a write of a procurement portal preference.
 pub fn marketplace_punch_out_preference_required(
     procurement_portal_name: &str,
 ) -> ValidationException {
@@ -573,6 +575,7 @@ pub fn marketplace_punch_out_preference_required(
         // `invalidInput` is one of the model's `ValidationExceptionReason` values
         // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]).
         reason: Some("invalidInput".to_string()),
+        message_key: MessageKey::Capitalised,
         ..Default::default()
     }
 }
@@ -781,22 +784,53 @@ pub fn invoice_profile(account_id: &str) -> InvoiceProfile {
     }
 }
 
-/// The message a `ResourceNotFoundException` of this service carries: a CONSTANT, the
-/// same sentence whatever was asked for.
+/// The message a `ResourceNotFoundException` of the INVOICE-UNIT and TAG planes carries:
+/// a CONSTANT, the same sentence whatever was asked for.
 ///
 /// The shape's own documentation gives it (`smithy_query(query="shape",
-/// shape="ResourceNotFoundException")` -> "The resource could not be found."), and the
-/// recorded 404s answer with exactly that sentence — the resource that was not found
-/// travels in its own member instead of being spliced into the prose, so a client can
-/// read it mechanically and a client matching the documented sentence still matches.
+/// shape="ResourceNotFoundException")` -> "The resource could not be found."), and those
+/// planes' recorded 404s answer with exactly that sentence — the resource that was not
+/// found travels in its own member instead of being spliced into the prose, so a client
+/// can read it mechanically and a client matching the documented sentence still matches.
+///
+/// The procurement-portal-preference plane words its own 404 from the REQUEST instead;
+/// see [`no_such_procurement_portal_preference`].
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The resource could not be found.";
 
-/// The 404 any operation of this service answers for an ARN that is not in state: the
-/// constant message, plus `arn` in the shape's own ARN member.
+/// The 404 an operation of the INVOICE-UNIT or TAG plane answers for an ARN that is not
+/// in state: the constant message, plus `arn` in the shape's own ARN member, keyed the
+/// way those planes' recorded bodies key it ([`MessageKey::ModelMemberName`]).
 pub fn no_such_resource(arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
         resource_id: Some(arn.to_string()),
+        message_key: MessageKey::ModelMemberName,
+    }
+}
+
+/// The kind of resource the procurement-portal plane's refusals name, as its recorded
+/// bodies spell it — the prose form of the `procurement-portal-preference` resource this
+/// plane's ARNs name (`smithy_query(query="shape",
+/// shape="ProcurementPortalPreferenceArnString")`: `@pattern
+/// ^arn:aws:invoicing::[0-9]{12}:procurement-portal-preference/[-a-zA-Z0-9]+$`).
+const PROCUREMENT_PORTAL_PREFERENCE_KIND: &str = "Procurement portal preference";
+
+/// The 404 an operation of the PROCUREMENT-PORTAL-PREFERENCE plane answers for an ARN
+/// that names no stored preference.
+///
+/// Recorded behaviour: this plane's message is BUILT FROM THE REQUEST — it names the kind
+/// of resource that was asked about and the exact ARN the request supplied — rather than
+/// the constant sentence the shape's documentation gives, and it travels under the
+/// capitalised key this plane's recorded bodies carry ([`MessageKey::Capitalised`]). The
+/// ARN is reported in the shape's own ARN member as well, so a client can still read it
+/// mechanically instead of parsing it out of the prose.
+pub fn no_such_procurement_portal_preference(arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "{PROCUREMENT_PORTAL_PREFERENCE_KIND} with arn {arn} does not exist"
+        )),
+        resource_id: Some(arn.to_string()),
+        message_key: MessageKey::Capitalised,
     }
 }
 
@@ -811,6 +845,7 @@ pub fn no_such_resource_unnamed() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
         resource_id: None,
+        message_key: MessageKey::ModelMemberName,
     }
 }
 
@@ -879,10 +914,15 @@ pub fn decode_page_token(
 /// mint: the model's own `invalidNextToken` reason
 /// ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]), so a client branches on
 /// the reason rather than on the prose.
-pub fn invalid_next_token() -> ValidationException {
+///
+/// `message_key` is the walking operation's own plane: a paginated walk of invoice units
+/// or invoice summaries keys the text as those planes do, a walk of procurement portal
+/// preferences as that plane does (see [`MessageKey`]).
+pub fn invalid_next_token(message_key: MessageKey) -> ValidationException {
     ValidationException {
         message: Some("The NextToken provided is not valid".to_string()),
         reason: Some("invalidNextToken".to_string()),
+        message_key,
         ..Default::default()
     }
 }

@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateServerConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateServerConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateServerConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the configuration of one server of this account's portfolio: the request's
+//! `strategyOption` becomes the strategy option the account PREFERS for the server
+//! ([`crate::state::ServerRecord::preferred_strategy`]), which `GetServerStrategies` then
+//! reports as that server's preferred strategy. The option is stored member for member,
+//! so the read reports what the update stored and the two cannot drift apart.
+//!
+//! It is an update of named members, not a replacement of the record: a request that
+//! names no `strategyOption` (or one whose every strategy member is absent, so it selects
+//! nothing) changes nothing and leaves the preference exactly as it was.
+//!
+//! A `serverId` that names no server of the portfolio is refused with the modelled 404
+//! `ResourceNotFoundException`, and a `strategyOption` whose `strategy`, `targetDestination`
+//! or `toolName` is not a value its enumeration declares — the boundary validator lets
+//! those through — with the service's 400 `ValidationException`, rather than stored and
+//! reported back as a preference the service cannot hold.
 //!
 //! ## Shape of an operation
 //!
@@ -67,6 +74,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{invalid_request_body, server_not_found};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -101,6 +109,46 @@ impl From<UpdateServerConfigErrorModeled> for UpdateServerConfigError {
     fn from(modeled: UpdateServerConfigErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// This operation's refusal of a request the model admits member by member but whose
+/// values this service does not accept, in the service's one wording for an invalid
+/// request body.
+fn refused() -> UpdateServerConfigError {
+    UpdateServerConfigErrorModeled::ValidationException(invalid_request_body()).into()
+}
+
+/// Refuse a value that is not one the named enumeration declares.
+///
+/// An absent member names no value, so it is accepted; enum membership is checked here
+/// because the boundary validator does not enforce it (the same reason `ListServers`
+/// checks its `serverCriteria` and `PutPortfolioPreferences` its `applicationMode`).
+fn check_enum(value: Option<&str>, declared: &[&str]) -> Result<(), UpdateServerConfigError> {
+    match value {
+        Some(value) if !declared.contains(&value) => Err(refused()),
+        _ => Ok(()),
+    }
+}
+
+/// The strategy option this request stores against the server, or `None` when it names
+/// none to store.
+///
+/// `isPreferred` alone selects no strategy, no destination and no tool, so an option
+/// carrying nothing else is nothing to store: this operation updates the members the
+/// request names, and that request names none.
+fn preference_of(
+    option: Option<StrategyOption>,
+) -> Result<Option<StrategyOption>, UpdateServerConfigError> {
+    let Some(option) = option else {
+        return Ok(None);
+    };
+    check_enum(option.strategy.as_deref(), STRATEGY_VALUES)?;
+    check_enum(option.target_destination.as_deref(), TARGET_DESTINATION_VALUES)?;
+    check_enum(option.tool_name.as_deref(), TRANSFORMATION_TOOL_NAME_VALUES)?;
+    let names_a_strategy = option.strategy.is_some()
+        || option.target_destination.is_some()
+        || option.tool_name.is_some();
+    Ok(names_a_strategy.then_some(option))
 }
 
 /// The `UpdateServerConfig` operation.
@@ -139,18 +187,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateServerConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServerConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateServerConfig"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateServerConfigErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the migrationhub-strategy server inventory is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Decided from the request alone, before the store is touched: a request this
+        // service cannot accept must leave the server's configuration exactly as it was.
+        let preference = preference_of(input.strategy_option)?;
+
+        let mut store = state.lock();
+        // The update applies to a server of THIS account's portfolio: an id naming none is
+        // reported as the missing resource it is, never silently created.
+        let Some(server) = store.servers.get_mut(&input.server_id) else {
+            return Err(
+                UpdateServerConfigErrorModeled::ResourceNotFoundException(server_not_found())
+                    .into(),
+            );
+        };
+        // The write: the option the request named becomes the server's preferred strategy
+        // option, member for member. A request naming none updates nothing, so a
+        // preference an earlier call stored survives it.
+        if let Some(option) = preference {
+            server.preferred_strategy = Some(option);
+        }
+
+        // `UpdateServerConfigResponse` models no members: the update is the whole of the
+        // answer.
+        Ok(UpdateServerConfigOutput {})
     }
 }

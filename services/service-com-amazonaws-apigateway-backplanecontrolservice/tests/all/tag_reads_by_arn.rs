@@ -374,7 +374,7 @@ async fn get_tags_answers_not_found_for_a_taggable_arn_no_record_answers_to() {
         ),
         ("an unknown api key", apigateway_arn("/apikeys/zzzzz99999")),
         (
-            "a usage plan, a kind with no records",
+            "an unknown usage plan",
             apigateway_arn("/usageplans/zzzzz99999"),
         ),
         (

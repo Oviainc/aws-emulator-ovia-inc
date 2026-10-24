@@ -202,7 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 DeleteProcurementPortalPreferenceErrorModeled::ResourceNotFoundException(
-                    crate::state::no_such_resource(&input.procurement_portal_preference_arn),
+                    crate::state::no_such_procurement_portal_preference(
+                        &input.procurement_portal_preference_arn,
+                    ),
                 )
                 .into(),
             );

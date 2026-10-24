@@ -121,6 +121,8 @@ mod presigned_notebook_instance_url;
 mod processing_job_lifecycle;
 #[path = "all/rejection_fidelity.rs"]
 mod rejection_fidelity;
+#[path = "all/search_suggestions.rs"]
+mod search_suggestions;
 #[path = "all/servicecatalog_portfolio_status.rs"]
 mod servicecatalog_portfolio_status;
 #[path = "all/state_roundtrip.rs"]

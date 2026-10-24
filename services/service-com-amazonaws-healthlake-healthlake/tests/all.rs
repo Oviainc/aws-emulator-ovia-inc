@@ -23,6 +23,8 @@ mod fhir_datastore_lifecycle;
 mod fhir_rest_and_validate_source;
 #[path = "all/fhir_update_interaction.rs"]
 mod fhir_update_interaction;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_fhir_datastore.rs"]

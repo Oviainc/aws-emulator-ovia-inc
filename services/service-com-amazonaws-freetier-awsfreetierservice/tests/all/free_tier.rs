@@ -1144,3 +1144,199 @@ async fn an_unissued_usage_token_is_refused() {
         .await;
     }
 }
+
+/// The `Expression` root operators, by the names the model gives the shape's
+/// members (`smithy_query shape=Expression`: `Or`, `And`, `Not`, `Dimensions` —
+/// "In the following Contents, you must specify exactly one of the following
+/// root operators").
+const ROOT_OPERATORS: [&str; 4] = ["Or", "And", "Not", "Dimensions"];
+
+/// A well-formed one-member expression that sets exactly `operator`, each with
+/// an operand the service can evaluate, so the only thing a combination of them
+/// gets wrong is how many root operators it sets.
+fn root_operator(operator: &str) -> Value {
+    let leaf =
+        json!({"Dimensions": {"Key": "REGION", "Values": ["us-east-1"], "MatchOptions": ["EQUALS"]}});
+    match operator {
+        "Dimensions" => leaf,
+        "Not" => json!({"Not": leaf}),
+        "And" => json!({"And": [leaf]}),
+        "Or" => json!({"Or": [leaf]}),
+        other => panic!("{other} is not an Expression root operator"),
+    }
+}
+
+/// One expression object that sets every operator in `operators` at once.
+fn expression_with(operators: &[&str]) -> Value {
+    let mut members = serde_json::Map::new();
+    for operator in operators {
+        let one = root_operator(operator);
+        let (name, value) = one
+            .as_object()
+            .and_then(|members| members.iter().next())
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .unwrap_or_else(|| panic!("case {operator}: a root operator is one JSON member"));
+        members.insert(name, value);
+    }
+    Value::Object(members)
+}
+
+/// Assert that `GetFreeTierUsage` refuses `filter` with the modelled
+/// `ValidationException` (HTTP 400).
+async fn refuse_filter(router: &MultiServiceRouter, case: &str, filter: &Value) {
+    let (status, payload) = call(
+        router,
+        "GetFreeTierUsage",
+        &json!({"maxResults": 1000, "filter": filter}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case} ({filter}): expected HTTP 400, got {status} with {payload}"
+    );
+    assert_eq!(
+        error_code(&payload),
+        "ValidationException",
+        "case {case} ({filter}): expected a ValidationException, got {payload}"
+    );
+}
+
+/// An `Expression` sets exactly one root operator: one is evaluated as the
+/// model documents that operator, and every other arity — none, any pair, any
+/// triple, all four — is refused rather than combined by a rule the model does
+/// not state. The rule holds at every level, so the same expression nested
+/// inside another is refused too.
+#[tokio::test]
+async fn an_expression_sets_exactly_one_root_operator() {
+    let router = router();
+    let records = usages(&router).await;
+    assert!(
+        records.len() > 1,
+        "case setup: the account must hold several usage records, got {}",
+        records.len()
+    );
+    let all: BTreeSet<String> = records.iter().map(usage_key).collect();
+    let leaf_rows = expected_for_dimension(&records, "REGION", "EQUALS", &["us-east-1"]);
+    assert!(
+        !leaf_rows.is_empty() && leaf_rows != all,
+        "case setup: the probe condition must select some records but not all, got {leaf_rows:?}"
+    );
+
+    // Exactly one root operator: accepted, and evaluated as that operator.
+    for operator in ROOT_OPERATORS {
+        let expected: BTreeSet<String> = if operator == "Not" {
+            all.difference(&leaf_rows).cloned().collect()
+        } else {
+            leaf_rows.clone()
+        };
+        let got = filtered(&router, &root_operator(operator)).await;
+        assert_eq!(
+            got, expected,
+            "case only {operator}: expected {expected:?}, got {got:?}"
+        );
+    }
+
+    // Every other arity: refused. The rows are each subset of the four root
+    // operators whose size is not one — the empty expression, the six pairs,
+    // the four triples and all four at once.
+    for mask in 0u8..(1 << ROOT_OPERATORS.len()) {
+        let operators: Vec<&str> = ROOT_OPERATORS
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(index, _)| mask & (1 << index) != 0)
+            .map(|(_, name)| name)
+            .collect();
+        if operators.len() == 1 {
+            continue;
+        }
+        let filter = expression_with(&operators);
+        let case = format!("{} root operators {operators:?}", operators.len());
+        refuse_filter(&router, &case, &filter).await;
+
+        // The same expression, one level down: nested in each operator that
+        // carries an expression.
+        for (place, nested) in [
+            (
+                "inside And",
+                json!({"And": [root_operator("Dimensions"), filter.clone()]}),
+            ),
+            ("inside Or", json!({"Or": [filter.clone()]})),
+            ("inside Not", json!({"Not": filter.clone()})),
+        ] {
+            refuse_filter(&router, &format!("{case} {place}"), &nested).await;
+        }
+    }
+}
+
+/// A logical operator that lists no expression states no condition, exactly as
+/// an expression that sets no root operator does, and is refused the same way.
+#[tokio::test]
+async fn a_logical_operator_listing_no_expression_is_refused() {
+    let router = router();
+    let leaf = root_operator("Dimensions");
+
+    // Rows differ in which operator is empty and how deeply it sits.
+    let cases: [(&str, Value); 5] = [
+        ("And of nothing", json!({"And": []})),
+        ("Or of nothing", json!({"Or": []})),
+        ("And of an Or of nothing", json!({"And": [{"Or": []}]})),
+        ("Not of an And of nothing", json!({"Not": {"And": []}})),
+        (
+            "And of a condition and an Or of nothing",
+            json!({"And": [leaf, {"Or": []}]}),
+        ),
+    ];
+
+    for (case, filter) in cases {
+        refuse_filter(&router, case, &filter).await;
+    }
+}
+
+/// Whether a filter is one the service can evaluate depends on the filter
+/// alone, so an account that holds no usage records refuses exactly the same
+/// expressions instead of answering an empty list — and still accepts a
+/// well-formed one.
+#[tokio::test]
+async fn a_filter_is_checked_before_any_record_is_read() {
+    let (router, engine) = harness();
+    {
+        let state = engine.state::<ComAmazonawsFreetierAwsfreetierserviceState>();
+        state.lock().usages.clear();
+    }
+    let records = usages(&router).await;
+    assert!(
+        records.is_empty(),
+        "case setup: the account must hold no usage records, got {records:?}"
+    );
+
+    // Rows span the ways an expression can be unevaluable: its arity, its
+    // dimension, its match options and its values.
+    let cases: [(&str, Value); 6] = [
+        ("no root operator", json!({})),
+        ("two root operators", expression_with(&["Not", "Dimensions"])),
+        ("four root operators", expression_with(&ROOT_OPERATORS)),
+        (
+            "a dimension outside the enum",
+            json!({"Dimensions": {"Key": "SERVICE_NAME", "Values": ["AWSLambda"], "MatchOptions": ["EQUALS"]}}),
+        ),
+        (
+            "two match options",
+            json!({"Dimensions": {"Key": "SERVICE", "Values": ["AWSLambda"], "MatchOptions": ["EQUALS", "CONTAINS"]}}),
+        ),
+        (
+            "a non-numeric value on a numeric dimension",
+            json!({"Dimensions": {"Key": "USAGE_PERCENTAGE", "Values": ["half"], "MatchOptions": ["EQUALS"]}}),
+        ),
+    ];
+
+    for (case, filter) in cases {
+        refuse_filter(&router, &format!("{case} with no records"), &filter).await;
+    }
+
+    let got = filtered(&router, &root_operator("Dimensions")).await;
+    assert!(
+        got.is_empty(),
+        "case a well-formed filter with no records: expected no records, got {got:?}"
+    );
+}

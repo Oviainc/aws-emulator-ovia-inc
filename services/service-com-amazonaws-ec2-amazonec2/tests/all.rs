@@ -155,6 +155,10 @@ mod volume_attributes;
 mod volume_lifecycle;
 #[path = "all/volume_modifications.rs"]
 mod volume_modifications;
+// The volume status check slice: what `DescribeVolumeStatus` reports for the stored
+// volumes, and how `VolumeIds`, the filters and the page size narrow it.
+#[path = "all/volume_status.rs"]
+mod volume_status;
 #[path = "all/vpc_attributes.rs"]
 mod vpc_attributes;
 #[path = "all/vpc_block_public_access_exclusions.rs"]

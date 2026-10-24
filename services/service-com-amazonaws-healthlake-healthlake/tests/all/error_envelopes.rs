@@ -29,7 +29,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_healthlake_healthlake::scaffolded::wire_http_status;
-use service_com_amazonaws_healthlake_healthlake::state::DATASTORE_NOT_FOUND_MESSAGE;
+use service_com_amazonaws_healthlake_healthlake::state::{
+    DATASTORE_NOT_FOUND_MESSAGE, PROFILE_NOT_FOUND_MESSAGE,
+};
 
 use crate::fhir_datastore_lifecycle::{error_code, HealthLake, PAST_TRANSITION};
 
@@ -444,44 +446,64 @@ async fn a_not_found_refusal_states_one_fixed_sentence_that_quotes_nothing_from_
             let (status, payload) = service
                 .call(operation, &json!({ "DatastoreId": id }))
                 .await;
-            assert_not_found(case, operation, status, &payload, id);
+            assert_not_found(
+                case,
+                operation,
+                status,
+                &payload,
+                id,
+                DATASTORE_NOT_FOUND_MESSAGE,
+            );
         }
     }
 
-    let arn_rows: Vec<(&str, String)> = vec![
+    // Each row carries the fixed sentence of the RESOURCE its ARN names: the
+    // modelled `AmazonResourceName` admits a data store ARN and a data
+    // transformation profile ARN, and this slice holds neither of the records
+    // these rows address.
+    let arn_rows: Vec<(&str, String, &str)> = vec![
         (
             "an ARN whose id nothing was minted under",
             format!(
                 "arn:aws:healthlake:us-east-1:000000000000:datastore/fhir/{unknown_id}"
             ),
+            DATASTORE_NOT_FOUND_MESSAGE,
         ),
-        ("an ARN of a live id with its last character changed", {
-            let mut arn = live_arn.clone();
-            let flipped = if arn.ends_with('0') { '1' } else { '0' };
-            arn.pop();
-            arn.push(flipped);
-            arn
-        }),
         (
-            "a dataTransformationProfile ARN",
+            "an ARN of a live id with its last character changed",
+            {
+                let mut arn = live_arn.clone();
+                let flipped = if arn.ends_with('0') { '1' } else { '0' };
+                arn.pop();
+                arn.push(flipped);
+                arn
+            },
+            DATASTORE_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "a dataTransformationProfile ARN no profile was minted under",
             "arn:aws:healthlake:us-east-1:000000000000:dataTransformationProfile/\
              0123456789abcdef0123456789abcdef"
                 .to_string(),
+            PROFILE_NOT_FOUND_MESSAGE,
         ),
         (
             "a live id in another region",
             format!("arn:aws:healthlake:eu-west-1:000000000000:datastore/fhir/{live}"),
+            DATASTORE_NOT_FOUND_MESSAGE,
         ),
         (
             "a live id in another account",
             format!("arn:aws:healthlake:us-east-1:210987654321:datastore/fhir/{live}"),
+            DATASTORE_NOT_FOUND_MESSAGE,
         ),
         (
             "a live id in another partition",
             format!("arn:aws-cn:healthlake:us-east-1:000000000000:datastore/fhir/{live}"),
+            DATASTORE_NOT_FOUND_MESSAGE,
         ),
     ];
-    for (case, arn) in &arn_rows {
+    for (case, arn, expected_message) in &arn_rows {
         for (operation, request) in [
             ("ListTagsForResource", json!({ "ResourceARN": arn })),
             (
@@ -490,7 +512,7 @@ async fn a_not_found_refusal_states_one_fixed_sentence_that_quotes_nothing_from_
             ),
         ] {
             let (status, payload) = service.call(operation, &request).await;
-            assert_not_found(case, operation, status, &payload, arn);
+            assert_not_found(case, operation, status, &payload, arn, expected_message);
         }
     }
 
@@ -529,12 +551,21 @@ async fn a_not_found_refusal_states_one_fixed_sentence_that_quotes_nothing_from_
         status,
         &payload,
         &gone,
+        DATASTORE_NOT_FOUND_MESSAGE,
     );
 }
 
-/// One not-found refusal: HTTP 400, `ResourceNotFoundException`, the fixed sentence in
-/// the modelled `Message`, and no trace of the identifier the caller sent.
-fn assert_not_found(case: &str, operation: &str, status: u16, payload: &Value, addressed: &str) {
+/// One not-found refusal: HTTP 400, `ResourceNotFoundException`, the addressed
+/// resource's fixed sentence in the modelled `Message`, and no trace of the identifier
+/// the caller sent.
+fn assert_not_found(
+    case: &str,
+    operation: &str,
+    status: u16,
+    payload: &Value,
+    addressed: &str,
+    expected_message: &str,
+) {
     assert_eq!(
         status, 400,
         "case {case:?} on {operation}: expected HTTP 400, got {status}: {payload}"
@@ -547,8 +578,8 @@ fn assert_not_found(case: &str, operation: &str, status: u16, payload: &Value, a
     let actual = modelled_message(payload);
     assert_eq!(
         actual,
-        Some(DATASTORE_NOT_FOUND_MESSAGE),
-        "case {case:?} on {operation}: expected Message {DATASTORE_NOT_FOUND_MESSAGE:?}, \
+        Some(expected_message),
+        "case {case:?} on {operation}: expected Message {expected_message:?}, \
          got {actual:?}"
     );
     // Nothing from the request may appear in the body. Checked for an identifier long

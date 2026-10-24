@@ -343,6 +343,49 @@ fn validate_config_data(
     }
 }
 
+/// The value the model gives `SpectrumConfig$polarization` when a request omits it.
+///
+/// Source: `smithy_query(query="shape", shape="SpectrumConfig")` — the member targets
+/// `Polarization` (values `RIGHT_HAND`, `LEFT_HAND`, `NONE`) and carries
+/// `default: "NONE"`, with `addedDefault` and `clientOptional`.
+pub const SPECTRUM_CONFIG_POLARIZATION_DEFAULT: &str = "NONE";
+
+/// Materialise the member defaults the model declares, on a `configData` about to be
+/// stored.
+///
+/// A member the model gives a `default` is one the SERVICE always has a value for: a
+/// request that leaves it out is stored carrying that default, so every later read
+/// answers the member populated and a client that round-trips a resource back through a
+/// create or an update loses nothing. An explicitly supplied value is never touched.
+///
+/// The one member with a modelled default anywhere in a `Config`'s shape closure is
+/// `SpectrumConfig$polarization` (`smithy_query(query="closure",
+/// operation="CreateConfig")` — no other member of the closure carries `default`), and
+/// it is applied wherever that shape is reached: `antennaDownlinkConfig.spectrumConfig`
+/// and `antennaDownlinkDemodDecodeConfig.spectrumConfig`. The spectrum shape reached
+/// through `antennaUplinkConfig` is `UplinkSpectrumConfig`, whose own `polarization`
+/// carries NO default, so an omitted uplink polarization stays absent — the default
+/// materialised here is the model's, not this service's guess.
+pub fn apply_modelled_defaults(config_data: &mut ConfigTypeData) {
+    let spectrum: Option<&mut SpectrumConfig> = match config_data {
+        ConfigTypeData::antennaDownlinkConfig(downlink) => Some(&mut downlink.spectrum_config),
+        ConfigTypeData::antennaDownlinkDemodDecodeConfig(downlink) => {
+            Some(&mut downlink.spectrum_config)
+        }
+        ConfigTypeData::antennaUplinkConfig(_)
+        | ConfigTypeData::trackingConfig(_)
+        | ConfigTypeData::dataflowEndpointConfig(_)
+        | ConfigTypeData::uplinkEchoConfig(_)
+        | ConfigTypeData::s3RecordingConfig(_)
+        | ConfigTypeData::telemetrySinkConfig(_) => None,
+    };
+    if let Some(spectrum) = spectrum {
+        if spectrum.polarization.is_none() {
+            spectrum.polarization = Some(SPECTRUM_CONFIG_POLARIZATION_DEFAULT.to_string());
+        }
+    }
+}
+
 /// The bucket name an S3 BUCKET ARN names, or `None` when the string is not one.
 ///
 /// An S3 bucket ARN is `arn:<partition>:s3:::<bucket>`: the service segment is `s3` and
@@ -371,49 +414,115 @@ pub fn bucket_name_of(bucket_arn: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// What `s3RecordingConfig`'s bucket resolution answers when it cannot read the
-/// bucket's location: the service's fixed refusal text for this condition, as recorded
-/// against AWS. As with every other refusal here the status (431) and the error code
+/// What `s3RecordingConfig`'s bucket resolution answers when the `bucketArn` names no
+/// bucket: the service's fixed refusal text for this condition, as recorded against AWS.
+/// As with every other refusal here the status (431) and the error code
 /// (`InvalidParameterException`) are the contract, and this is the wording that goes
 /// with them.
-pub const UNRESOLVABLE_RECORDING_BUCKET: &str =
-    "Unable to create new S3 endpoint config - unable to get location of bucket. Ensure \
-     that Ground Station has s3:GetBucketLocation permissions on the bucket.";
+pub const RECORDING_BUCKET_DOES_NOT_EXIST: &str =
+    "Unable to create new S3 endpoint config - bucket does not exist.";
 
-/// Whether Ground Station can read the location of the bucket `bucket_arn` names —
-/// `s3:GetBucketLocation` on an `s3RecordingConfig`'s bucket — given the buckets whose
-/// location it has read, `readable_buckets`.
+/// Refuse a `configData` whose recording bucket does not exist — and only then.
 ///
-/// The ARN has to name a bucket at all, and that bucket has to be one of those: the
-/// service refuses a config whose recording bucket it cannot locate, and an ARN of any
-/// other service names no bucket however its resource part is spelled.
-fn bucket_location_is_readable(bucket_arn: &str, readable_buckets: &[String]) -> bool {
-    bucket_name_of(bucket_arn)
-        .is_some_and(|name| readable_buckets.iter().any(|readable| readable == name))
+/// An `s3RecordingConfig` names the bucket to record to by ARN, and Ground Station
+/// resolves that bucket before it will store the config: a bucket S3 reports this account
+/// does not hold, and a `bucketArn` that names no bucket at all, are refused with the
+/// modelled `InvalidParameterException` (HTTP 431) instead of being stored, so a caller
+/// never holds a recording config that cannot record. A bucket that EXISTS is accepted.
+///
+/// S3 is reached the way the framework documents a handler reaching another emulated
+/// service ([`smithy_server_runtime::OperationContext::callback`]): an AWS SDK client
+/// over the in-process callback's HTTP client and credentials, so this crate names no
+/// other service crate and the bucket is resolved against the emulator's OWN S3 state.
+/// The question is put with `HeadBucket`, the operation S3 documents for it ("You can use
+/// this operation to determine if a bucket exists").
+///
+/// `None` means the create or update may proceed. That INCLUDES every answer that is not
+/// S3 reporting the bucket absent — a router with no S3 mounted, or any other failure to
+/// ask: nothing is then known about the bucket, and a refusal has to be grounded in what
+/// S3 answered rather than assumed (worth a warning, because that is a deployment where
+/// this gate does not run). Every other `ConfigTypeData` member names no bucket and is
+/// nothing for this to resolve.
+pub async fn unresolvable_recording_bucket(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    config_data: &ConfigTypeData,
+) -> Option<InvalidParameterException> {
+    let ConfigTypeData::s3RecordingConfig(recording) = config_data else {
+        return None;
+    };
+    let refusal = || {
+        invalid_parameter(
+            "configData.s3RecordingConfig.bucketArn",
+            RECORDING_BUCKET_DOES_NOT_EXIST.to_string(),
+        )
+    };
+    // A value that is not an S3 bucket ARN names no bucket, and that is settled without
+    // asking S3: there is nothing to ask about. An ARN of any other service names no
+    // bucket either, however its resource part is spelled (see [`bucket_name_of`]).
+    let Some(bucket) = bucket_name_of(&recording.bucket_arn) else {
+        return Some(refusal());
+    };
+    let answer = recording_bucket_client(ctx, region)
+        .head_bucket()
+        .bucket(bucket)
+        .send()
+        .await;
+    match answer {
+        // S3 holds the bucket, so the config can record to it.
+        Ok(_) => None,
+        // S3 says this account holds no such bucket: the refusal is grounded.
+        Err(error) if bucket_reported_absent(&error) => Some(refusal()),
+        Err(error) => {
+            ::tracing::warn!(
+                bucket_arn = %recording.bucket_arn,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the recording config's bucket could not be resolved against S3"
+            );
+            None
+        }
+    }
 }
 
-/// Refuse a `configData` whose recording bucket this service cannot locate.
-///
-/// An `s3RecordingConfig` names the bucket to record to by ARN, and Ground Station reads
-/// that bucket's location before it will store the config: a bucket it cannot read the
-/// location of — one it has no record of, or one the ARN does not even name — is refused
-/// with the modelled `InvalidParameterException` (HTTP 431) instead of being stored, so a
-/// caller never holds a recording config that cannot record. Every other
-/// `ConfigTypeData` member names no bucket and is nothing for this to check.
-fn check_recording_bucket(
-    config_data: &ConfigTypeData,
-    readable_buckets: &[String],
-) -> Result<(), InvalidParameterException> {
-    let ConfigTypeData::s3RecordingConfig(recording) = config_data else {
-        return Ok(());
-    };
-    if bucket_location_is_readable(&recording.bucket_arn, readable_buckets) {
-        return Ok(());
-    }
-    Err(invalid_parameter(
-        "configData.s3RecordingConfig.bucketArn",
-        UNRESOLVABLE_RECORDING_BUCKET.to_string(),
-    ))
+/// The S3 client this service resolves a recording bucket through: the AWS SDK driven
+/// over the emulator's own in-process transport.
+fn recording_bucket_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The emulator serves one endpoint for every service, so the bucket travels in
+        // the path rather than in a per-bucket host the router could not resolve.
+        .force_path_style(true)
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given. The same goes for caching the identity: the credentials are
+        // handed over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Whether an S3 `HeadBucket` failure is S3 reporting that the bucket does not exist
+/// (`NotFound`, the only error that operation models), as opposed to the call not
+/// reaching S3 at all.
+fn bucket_reported_absent(
+    error: &::aws_sdk_s3::error::SdkError<
+        ::aws_sdk_s3::operation::head_bucket::HeadBucketError,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    error
+        .as_service_error()
+        .is_some_and(::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found)
 }
 
 /// The capability's name as this service spells it in user-facing text: the
@@ -693,6 +802,26 @@ pub struct MissionProfile {
     pub streams_kms_role: Option<String>,
 }
 
+impl MissionProfile {
+    /// Whether this profile references the config `config_arn` names, through ANY member
+    /// that carries a `ConfigArn`: its tracking config, its telemetry sink config, or
+    /// either end of any of its dataflow edges.
+    ///
+    /// This is what makes the config "in use" for [`DeleteConfig`]'s referential
+    /// integrity check, so the question is asked of the whole profile rather than of one
+    /// member.
+    ///
+    /// [`DeleteConfig`]: crate::ops::delete_config
+    pub fn references_config(&self, config_arn: &str) -> bool {
+        self.tracking_config_arn == config_arn
+            || self.telemetry_sink_config_arn.as_deref() == Some(config_arn)
+            || self
+                .dataflow_edges
+                .iter()
+                .any(|edge| edge.iter().any(|arn| arn == config_arn))
+    }
+}
+
 /// A contact as `ReserveContact` stored it.
 #[derive(Debug, Clone)]
 pub struct Contact {
@@ -814,11 +943,83 @@ pub fn response_tags(tags: &HashMap<String, String>) -> Option<HashMap<String, S
 /// members of the request, id before type, which is the rule the recorded corpus shows
 /// for this service's config reads.
 ///
-/// It lives here rather than in one handler because every operation that addresses a
-/// config by that pair answers it — `GetConfig`, `DeleteConfig` and `UpdateConfig` —
-/// so it is one text of the service, not one text per operation.
+/// It lives here rather than in one handler because the two operations that LOOK UP a
+/// config by that pair answer it — `GetConfig` and `DeleteConfig`. The operation that
+/// WRITES one does not: see [`config_mutation_not_found_message`].
 pub fn config_not_found_message(config_type: &str, config_id: &str) -> String {
     format!("No config found with id {config_id} and type {config_type}")
+}
+
+/// The message `UpdateConfig` carries when the pair it addressed names no config.
+///
+/// The MUTATION path composes its own text, from the same two `@httpLabel` members plus
+/// the account the write was scoped to: `No config found with ID <configId> and type
+/// <configType> for customer <accountId>` — capital `ID` and an account-qualified tail,
+/// where the read path ([`config_not_found_message`]) names only the pair. The
+/// composition rule is the requirement; the two are separate functions because the read
+/// and the write genuinely answer different texts, so neither can be derived from the
+/// other.
+pub fn config_mutation_not_found_message(config_type: &str, config_id: &str) -> String {
+    format!(
+        "No config found with ID {config_id} and type {config_type} for customer {}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The message `UpdateMissionProfile` carries when `{missionProfileId}` names no
+/// profile: the id the request addressed plus the account the write was scoped to, where
+/// the read path answers this service's bare [`MISSION_PROFILE_NOT_FOUND`] literal.
+pub fn mission_profile_mutation_not_found_message(mission_profile_id: &str) -> String {
+    format!(
+        "No mission profile found with ID {mission_profile_id} for customer {}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// What `DeleteConfig` answers while a live mission profile still references the config:
+/// the refusal names the referencing mission-profile ARNs, which is what tells a caller
+/// what to delete first.
+///
+/// The status (431) and the error code (`InvalidParameterException`) are the contract;
+/// this is the wording that goes with them, and the ARNs in it are the ones the store
+/// holds rather than anything echoed from the request.
+pub fn config_in_use_message(mission_profile_arns: &[String]) -> String {
+    format!(
+        "Config cannot be deleted; it is currently being used by the following Mission \
+         Profiles: {}",
+        mission_profile_arns.join(", ")
+    )
+}
+
+/// Why an ARN-valued reference that admits exactly ONE config capability type cannot be
+/// used, when it cannot.
+///
+/// The two are distinct conditions and this service answers them differently: see
+/// [`ComAmazonawsGroundstationGroundstationState::typed_reference_fault`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedReferenceFault {
+    /// The ARN resolves to no config this account holds: there is nothing to reference.
+    Absent,
+    /// It resolves to a config that EXISTS, under another capability type.
+    WrongType,
+}
+
+/// What this service answers for such a reference that resolved to NO config: the
+/// capability the member required, spelled as the model spells that capability's shape
+/// ([`capability_display_name`]), and the ARN the request gave.
+pub fn typed_reference_absent_message(required_type: &str, arn: &str) -> String {
+    format!(
+        "Unable to find {} Config with ARN: {arn}",
+        capability_display_name(required_type)
+    )
+}
+
+/// What this service answers for such a reference that resolved to a config of ANOTHER
+/// capability type: the ARN named a config that exists, so nothing is missing — what is
+/// wrong is the type it points at, and the text states the type the member requires as
+/// the `ConfigCapabilityType` token a `ConfigArn`'s type segment carries.
+pub fn typed_reference_wrong_type_message(required_type: &str) -> String {
+    format!("Invalid ARN provided. Config Type must be of type \"{required_type}\".")
 }
 
 /// The message an operation that resolves a config BY ARN — a mission profile's
@@ -989,18 +1190,6 @@ pub struct ComAmazonawsGroundstationGroundstationState {
     /// the day the API models one. It is a field rather than a constant because the
     /// authorisation is per account.
     pub approved_uplink_bands_mhz: Vec<(f64, f64)>,
-    /// The S3 buckets whose location Ground Station has read — what `CreateConfig` and
-    /// `UpdateConfig` check an `s3RecordingConfig`'s `bucketArn` against.
-    ///
-    /// EMPTY unless [`RECORDING_BUCKETS_ENV`] names one. Ground Station reads the
-    /// recording bucket's location (`s3:GetBucketLocation`) before it will store the
-    /// config, and nothing in THIS API tells the service about a bucket: the bucket and
-    /// the permission on it are made in S3 and IAM, outside the operations this model
-    /// declares (`smithy_query(query="digest")` lists no bucket operation). So an
-    /// account starts with no bucket it can locate, and an `s3RecordingConfig` is
-    /// refused with [`UNRESOLVABLE_RECORDING_BUCKET`] — the sentence AWS answers when
-    /// the location cannot be read — until a bucket lands here.
-    pub readable_recording_buckets: Vec<String>,
     /// The reserved-minutes pricing plan this account holds — what `GetMinuteUsage`
     /// reports as `isReservedMinutesCustomer` and `totalReservedMinuteAllocation`, and
     /// what it measures `estimatedMinutesRemaining` against.
@@ -1118,25 +1307,6 @@ pub fn parse_approved_uplink_bands(setting: &str) -> Vec<(f64, f64)> {
         .collect()
 }
 
-/// The environment variable an operator uses to tell this emulated Ground Station which
-/// S3 buckets it can read the location of, since the API models no operation that says
-/// so: a comma-separated list of bucket NAMES, read once when this service's store is
-/// created (`GROUNDSTATION_RECORDING_BUCKETS="aws-groundstation-downlink"`). Unset means
-/// none, and an `s3RecordingConfig` is then refused exactly as AWS refuses one whose
-/// bucket location it cannot read.
-pub const RECORDING_BUCKETS_ENV: &str = "GROUNDSTATION_RECORDING_BUCKETS";
-
-/// The bucket names `setting` names: comma-separated, surrounding space trimmed, empty
-/// entries dropped.
-pub fn parse_recording_buckets(setting: &str) -> Vec<String> {
-    setting
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 /// The value `variable` holds, parsed by `parse`, or nothing when it is not set.
 fn from_env<T: Default>(variable: &str, parse: impl Fn(&str) -> T) -> T {
     ::std::env::var(variable)
@@ -1146,8 +1316,8 @@ fn from_env<T: Default>(variable: &str, parse: impl Fn(&str) -> T) -> T {
 
 impl Default for ComAmazonawsGroundstationGroundstationState {
     /// An account with no resources, the uplink approval [`APPROVED_UPLINK_BANDS_ENV`]
-    /// grants it, the recording buckets [`RECORDING_BUCKETS_ENV`] names and the reserved
-    /// minutes [`RESERVED_MINUTES_ENV`] commits (none of them, unless they are set).
+    /// grants it and the reserved minutes [`RESERVED_MINUTES_ENV`] commits (neither,
+    /// unless they are set).
     fn default() -> Self {
         Self {
             configs: HashMap::new(),
@@ -1159,23 +1329,25 @@ impl Default for ComAmazonawsGroundstationGroundstationState {
                 APPROVED_UPLINK_BANDS_ENV,
                 parse_approved_uplink_bands,
             ),
-            readable_recording_buckets: from_env(RECORDING_BUCKETS_ENV, parse_recording_buckets),
             reserved_minutes: from_env(RESERVED_MINUTES_ENV, parse_reserved_minutes),
         }
     }
 }
 
 impl ComAmazonawsGroundstationGroundstationState {
-    /// Refuse a `ConfigTypeData` this account's authorisation, the model's own documented
-    /// ranges or the buckets this service can locate do not allow, with the modelled
-    /// `InvalidParameterException` (HTTP 431). See [`validate_config_data`] for the
-    /// bounds and [`check_recording_bucket`] for the bucket.
+    /// Refuse a `ConfigTypeData` this account's authorisation or the model's own
+    /// documented ranges do not allow, with the modelled `InvalidParameterException`
+    /// (HTTP 431). See [`validate_config_data`] for the bounds.
+    ///
+    /// The one part of a `configData` this cannot judge from the store is an
+    /// `s3RecordingConfig`'s bucket, which lives in another service:
+    /// [`unresolvable_recording_bucket`] resolves it against S3 before the handler takes
+    /// this lock.
     pub fn validate_config_data(
         &self,
         config_data: &ConfigTypeData,
     ) -> Result<(), InvalidParameterException> {
-        validate_config_data(config_data, &self.approved_uplink_bands_mhz)?;
-        check_recording_bucket(config_data, &self.readable_recording_buckets)
+        validate_config_data(config_data, &self.approved_uplink_bands_mhz)
     }
 
     /// The config `arn` names, if it names one.
@@ -1198,6 +1370,61 @@ impl ComAmazonawsGroundstationGroundstationState {
     pub fn resolves_config(&self, arn: &str, required_type: Option<&str>) -> bool {
         self.config_by_arn(arn)
             .is_some_and(|config| required_type.is_none_or(|wanted| config.config_type == wanted))
+    }
+
+    /// Why `arn` cannot be used where only a config of `required_type` may be named, or
+    /// `None` when it names one.
+    ///
+    /// The two faults are different conditions and this service answers them
+    /// differently: an ARN resolving to no config of this account is a MISSING resource
+    /// (`ResourceNotFoundException`, HTTP 434), while one resolving to a config that
+    /// exists under another capability type is a BAD PARAMETER
+    /// (`InvalidParameterException`, HTTP 431) — the reference resolved, and what is
+    /// wrong with it is the type it points at, which no amount of waiting will change.
+    /// See [`typed_reference_absent_message`] and
+    /// [`typed_reference_wrong_type_message`] for the two texts.
+    ///
+    /// Used by every reference member whose resolution is type-checked against the ARN it
+    /// was given — `uplinkEchoConfig$antennaUplinkConfigArn`, whose refusal quotes that
+    /// ARN. A mission profile's config references are resolved differently: their
+    /// recorded text names the id from the ARN under the type the MEMBER requires ("No
+    /// config found with ID … and config type: … for customer …"), i.e. the lookup is by
+    /// that pair, so a config of another type is genuinely nothing found there — see
+    /// [`config_reference_not_found_message`] and [`resolves_config`].
+    ///
+    /// [`resolves_config`]: Self::resolves_config
+    pub fn typed_reference_fault(
+        &self,
+        arn: &str,
+        required_type: &str,
+    ) -> Option<TypedReferenceFault> {
+        match self.config_by_arn(arn) {
+            None => Some(TypedReferenceFault::Absent),
+            Some(config) if config.config_type != required_type => {
+                Some(TypedReferenceFault::WrongType)
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// The ARNs of the mission profiles that reference the config `config_arn` names, in
+    /// a stable order; empty when nothing references it.
+    ///
+    /// Every member of a mission profile that carries a `ConfigArn` is an inbound
+    /// reference — `trackingConfigArn`, `telemetrySinkConfigArn` and both ends of every
+    /// entry of `dataflowEdges` (`smithy_query(query="shape",
+    /// shape="CreateMissionProfileRequest")`) — so a config is in use when ANY of them
+    /// names it, not only the tracking one. Sorted, so a refusal listing them reads the
+    /// same on every call whatever order the map iterates in.
+    pub fn mission_profiles_referencing(&self, config_arn: &str) -> Vec<String> {
+        let mut referencing: Vec<String> = self
+            .mission_profiles
+            .values()
+            .filter(|profile| profile.references_config(config_arn))
+            .map(|profile| profile.mission_profile_arn.clone())
+            .collect();
+        referencing.sort();
+        referencing
     }
 
     /// Remove the config the `(configType, configId)` pair addresses, along with the ARN

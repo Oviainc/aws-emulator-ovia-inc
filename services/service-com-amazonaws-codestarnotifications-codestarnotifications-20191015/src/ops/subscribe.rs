@@ -136,7 +136,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
-        let now = ::std::time::Instant::now();
         let region = st::request_region(ctx.parts());
 
         let target = st::rule_targets_from(std::slice::from_ref(&input.target))
@@ -159,7 +158,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let mut store = state.lock();
-        store.apply_due_target_activations(now);
 
         if let Some(token) = input.client_request_token.as_deref() {
             if let Some(previous) = store.idempotent_request(Self::NAME, token) {
@@ -218,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             rule.last_modified_timestamp = st::now_timestamp();
         }
-        store.register_target(&arn, &target, now);
+        store.register_target(&arn, &target);
         if let Some(token) = input.client_request_token.as_deref() {
             store.remember_idempotent_request(
                 Self::NAME,

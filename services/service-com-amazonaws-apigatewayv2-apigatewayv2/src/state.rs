@@ -12,7 +12,7 @@
 //! field, and `to_wire` projects it onto the modelled shape the handlers serialize.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types as wire;
 
@@ -103,6 +103,88 @@ pub const MAX_ROUTE_RESPONSES_PER_ROUTE: usize = 300;
 /// store without end. Cite the routes/integrations quotas for those; do not cite this
 /// as a published models quota.
 pub const MAX_MODELS_PER_API: usize = 300;
+
+/// The most custom domain names one account may hold in one Region, after which
+/// CreateDomainName is refused.
+///
+/// API Gateway publishes a quota of 120 custom domain names per account per Region, so
+/// this is the faithful bound AND what stops a loop of CreateDomainName calls growing
+/// this store without end. `TooManyRequestsException` ("A limit has been exceeded") is
+/// the modelled error the operation refuses with.
+pub const MAX_DOMAIN_NAMES: usize = 120;
+
+/// The longest custom domain name this service accepts.
+///
+/// `DomainName$DomainName` targets `StringWithLengthBetween1And512`, whose own
+/// documentation is "A string with a length between [1-512]"
+/// (`smithy_query(query="shape", shape="StringWithLengthBetween1And512")`). The shape
+/// carries no `@length` trait, so the bound is a handler's to enforce rather than the
+/// boundary validator's.
+pub const DOMAIN_NAME_MAX_LENGTH: usize = 512;
+
+/// The service signing name this emulator's ARNs are built under — the `apigateway`
+/// signing name and ARN namespace this model shares with the API Gateway control plane
+/// (`smithy_query(query="service_info")`).
+pub const ARN_SERVICE: &str = "apigateway";
+
+/// The `RoutingMode` a domain name gets when the request names none, out of
+/// `ROUTING_MODE_VALUES` (`API_MAPPING_ONLY | ROUTING_RULE_ONLY |
+/// ROUTING_RULE_THEN_API_MAPPING`).
+///
+/// A CHOSEN default, not a figure AWS publishes: the model documents the member only as
+/// "The routing mode", so this takes the one value that needs no routing rule to resolve
+/// a request — a domain name reached through its `ApiMapping`s alone, which is what a
+/// domain name created without any routing rule can actually serve.
+pub const DEFAULT_ROUTING_MODE: &str = "API_MAPPING_ONLY";
+
+/// The `EndpointType` a domain name configuration gets when the request names none, out
+/// of `ENDPOINT_TYPE_VALUES` (`EDGE | REGIONAL`).
+///
+/// Every operation of this model is bound under `/v2/…` and every api it creates is
+/// reported on a REGIONAL `{api-id}.execute-api.{region}.amazonaws.com` host
+/// (`CreateApiResponse$ApiEndpoint`, see [`execute_api_endpoint`]), so `REGIONAL` is the
+/// endpoint type a domain name fronting one of them carries; `EDGE` is the
+/// edge-optimized form the member's certificate wording belongs to.
+pub const DEFAULT_ENDPOINT_TYPE: &str = "REGIONAL";
+
+/// The `SecurityPolicy` a domain name configuration gets when the request names none,
+/// out of `SECURITY_POLICY_VALUES` (`TLS_1_0 | TLS_1_2`).
+///
+/// A CHOSEN default, not a figure AWS publishes: `DomainNameConfiguration$SecurityPolicy`
+/// documents only that "The valid values are TLS_1_0 and TLS_1_2", so this takes the
+/// later TLS version of the two, which is the one a domain name minted today can
+/// actually be reached over.
+pub const DEFAULT_SECURITY_POLICY: &str = "TLS_1_2";
+
+/// The `ApiMappingSelectionExpression` every domain name reports.
+///
+/// An `ApiMapping` selects an api by the base path of the incoming request
+/// (`CreateApiMapping$ApiMappingKey`), so the expression that extracts the value the
+/// mapping is matched on is the request's base path. It is service-computed: no member
+/// of any request sets it.
+pub const API_MAPPING_SELECTION_EXPRESSION: &str = "$request.basepath";
+
+/// The `DomainNameStatus` of a domain name whose endpoint migration has finished, out of
+/// `DOMAIN_NAME_STATUS_VALUES`. From `DomainNameConfiguration$DomainNameStatus`: "If it
+/// is AVAILABLE, the domain can be updated."
+pub const DOMAIN_NAME_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The `DomainNameStatus` of a domain name whose endpoint migration is still in flight,
+/// out of `DOMAIN_NAME_STATUS_VALUES`. From
+/// `DomainNameConfiguration$DomainNameStatus`: "If the status is UPDATING, the domain
+/// cannot be modified further until the existing operation is complete."
+pub const DOMAIN_NAME_STATUS_UPDATING: &str = "UPDATING";
+
+/// How long a domain name's endpoint migration takes before the clock owes it
+/// `AVAILABLE` again.
+///
+/// A CHOSEN span, not one AWS documents: AWS takes as long as propagating a certificate
+/// to its endpoints takes. What matters is that it is never zero — a caller that updates
+/// a domain name's `DomainNameConfigurations` and immediately reads it back still sees
+/// the `UPDATING` the model documents, and the refusal that status carries — and that
+/// nothing sleeps for it: the due instant is stored and the status is derived from the
+/// clock on every read.
+pub const DOMAIN_NAME_MIGRATION: Duration = Duration::from_millis(500);
 
 /// The most authorizers one api may hold, after which CreateAuthorizer is refused.
 ///
@@ -209,6 +291,14 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_api_id`]; see
     /// [`ID_MULTIPLIER`] for how an id is derived from it.
     pub api_id_seed: u64,
+    /// Every persisted custom domain name, keyed by its `DomainName` — the name IS the
+    /// resource's identifier on the wire (`GET|PATCH|DELETE /v2/domainnames/{DomainName}`),
+    /// so there is no second id to key on. `BTreeMap` for the same stable key order the
+    /// api store relies on.
+    pub domain_names: BTreeMap<String, DomainName>,
+    /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_domain_name_id`]; see
+    /// [`ID_MULTIPLIER`] for how an id is derived from it.
+    pub domain_name_id_seed: u64,
 }
 
 impl ComAmazonawsApigatewayv2Apigatewayv2State {
@@ -216,6 +306,14 @@ impl ComAmazonawsApigatewayv2Apigatewayv2State {
     pub fn mint_api_id(&mut self) -> String {
         self.api_id_seed = self.api_id_seed.wrapping_add(1);
         mint_id(self.api_id_seed)
+    }
+
+    /// Mint the id of the regional host a custom domain name is served on: ten
+    /// lowercase alphanumerics, never one already minted. Drawn from a seed of its own,
+    /// so minting a domain name never shifts the ids apis get.
+    pub fn mint_domain_name_id(&mut self) -> String {
+        self.domain_name_id_seed = self.domain_name_id_seed.wrapping_add(1);
+        mint_id(self.domain_name_id_seed)
     }
 }
 
@@ -1104,6 +1202,255 @@ impl Deployment {
             deployment_status_message: self.deployment_status_message.clone(),
             description: self.description.clone(),
         }
+    }
+}
+
+/// A persisted custom `DomainName` resource.
+///
+/// Keyed in the store by [`DomainName::domain_name`], which is the identifier every
+/// operation on the resource addresses it by. `DomainNameStatus` is deliberately NOT a
+/// field: it is derived from the clock on every read (see [`DomainName::status`]), so no
+/// stored copy of it can go stale.
+#[derive(Debug, Clone)]
+pub struct DomainName {
+    pub domain_name: String,
+    /// The resource's ARN, built once at create time from the request's region so it
+    /// stays stable for the life of the resource.
+    pub domain_name_arn: String,
+    /// The regional host API Gateway serves this domain name on, minted with the
+    /// resource and stable across every update: it names the endpoint a caller points
+    /// their own DNS record at, so changing a certificate or a routing mode cannot move
+    /// it. See [`api_gateway_domain_host`].
+    pub api_gateway_domain_name: String,
+    /// This domain name's endpoint configurations, in the order the request gave them —
+    /// `DomainNameConfigurations` is a modelled list, not a map, so order is the
+    /// caller's and is preserved.
+    pub configurations: Vec<DomainNameEndpoint>,
+    /// The mutual-TLS truststore, held as the modelled INPUT shape: `TruststoreUri` and
+    /// `TruststoreVersion` are the caller's, while `TruststoreWarnings` is the service's
+    /// report on the truststore and is projected in [`DomainName::to_wire`].
+    pub mutual_tls_authentication: Option<wire::MutualTlsAuthenticationInput>,
+    /// One of `ROUTING_MODE_VALUES`.
+    pub routing_mode: String,
+    pub tags: BTreeMap<String, String>,
+    /// The instant the endpoint migration started by the last change to
+    /// [`DomainName::configurations`] is due to finish, or `None` for a domain name
+    /// whose endpoints have never been migrated. Until it passes the domain name reports
+    /// `UPDATING` and refuses a further update; after it, `AVAILABLE`.
+    pub migration_due_at: Option<SystemTime>,
+}
+
+impl DomainName {
+    /// This domain name's `DomainNameStatus` as of `now`.
+    ///
+    /// `UPDATING` while the migration the last endpoint-configuration change started is
+    /// still due, `AVAILABLE` otherwise — "If the status is UPDATING, the domain cannot
+    /// be modified further until the existing operation is complete. If it is AVAILABLE,
+    /// the domain can be updated" (`DomainNameConfiguration$DomainNameStatus`). Derived,
+    /// not stored, so reading a domain name never has to write one.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        match self.migration_due_at {
+            Some(due) if now < due => DOMAIN_NAME_STATUS_UPDATING,
+            _ => DOMAIN_NAME_STATUS_AVAILABLE,
+        }
+    }
+
+    /// Project the record onto the modelled `DomainName` shape, as of `now`.
+    pub fn to_wire(&self, now: SystemTime) -> wire::DomainName {
+        let status = self.status(now);
+        wire::DomainName {
+            api_mapping_selection_expression: Some(
+                API_MAPPING_SELECTION_EXPRESSION.to_string(),
+            ),
+            domain_name: self.domain_name.clone(),
+            domain_name_arn: Some(self.domain_name_arn.clone()),
+            domain_name_configurations: Some(
+                self.configurations
+                    .iter()
+                    .map(|endpoint| endpoint.to_wire(&self.api_gateway_domain_name, status))
+                    .collect(),
+            ),
+            mutual_tls_authentication: self.mutual_tls_authentication.as_ref().map(|input| {
+                wire::MutualTlsAuthentication {
+                    truststore_uri: input.truststore_uri.clone(),
+                    truststore_version: input.truststore_version.clone(),
+                    // "A list of warnings that API Gateway returns while processing your
+                    // truststore. Invalid certificates produce warnings"
+                    // (`MutualTlsAuthentication$TruststoreWarnings`). Nothing was
+                    // fetched or parsed — the truststore is an S3 URL this emulator does
+                    // not read — so there is no warning to report and the list is empty
+                    // rather than invented.
+                    truststore_warnings: Some(Vec::new()),
+                }
+            }),
+            routing_mode: Some(self.routing_mode.clone()),
+            tags: Some(self.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        }
+    }
+}
+
+/// One entry of a domain name's `DomainNameConfigurations`.
+///
+/// Holds only what a request sets plus the members the service resolves ONCE at write
+/// time (the three defaulted enums). `DomainNameStatus` and `ApiGatewayDomainName` are
+/// not here: the first is derived from the clock and the second belongs to the domain
+/// name as a whole, so both are supplied by [`DomainNameEndpoint::to_wire`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainNameEndpoint {
+    pub certificate_arn: Option<String>,
+    pub certificate_name: Option<String>,
+    pub ownership_verification_certificate_arn: Option<String>,
+    /// One of `ENDPOINT_TYPE_VALUES`.
+    pub endpoint_type: String,
+    /// One of `SECURITY_POLICY_VALUES`.
+    pub security_policy: String,
+    /// One of `IP_ADDRESS_TYPE_VALUES`.
+    pub ip_address_type: String,
+}
+
+impl DomainNameEndpoint {
+    /// Project the entry onto the modelled `DomainNameConfiguration` shape, carrying the
+    /// owning domain name's host and its current status.
+    pub fn to_wire(
+        &self,
+        api_gateway_domain_name: &str,
+        domain_name_status: &str,
+    ) -> wire::DomainNameConfiguration {
+        wire::DomainNameConfiguration {
+            api_gateway_domain_name: Some(api_gateway_domain_name.to_string()),
+            certificate_arn: self.certificate_arn.clone(),
+            certificate_name: self.certificate_name.clone(),
+            // "The timestamp when the certificate … was uploaded"
+            // (`DomainNameConfiguration$CertificateUploadDate`) is a fact about the
+            // certificate in ACM, not about this resource: nothing was uploaded here and
+            // no rule derives the instant from the request, so it is left unset rather
+            // than filled with an instant that would claim an upload that never happened.
+            certificate_upload_date: None,
+            domain_name_status: Some(domain_name_status.to_string()),
+            // Reported only alongside a status that needs explaining; `AVAILABLE` and
+            // the migration this service runs carry no detail beyond the status itself.
+            domain_name_status_message: None,
+            endpoint_type: Some(self.endpoint_type.clone()),
+            // "The Amazon Route 53 Hosted Zone ID of the endpoint"
+            // (`DomainNameConfiguration$HostedZoneId`) names a zone in Route 53 that
+            // this emulator neither owns nor can look up, and no rule derives it from the
+            // request. Left unset: a made-up zone id is one a caller could put in a real
+            // DNS alias record.
+            hosted_zone_id: None,
+            ip_address_type: Some(self.ip_address_type.clone()),
+            security_policy: Some(self.security_policy.clone()),
+            ownership_verification_certificate_arn: self
+                .ownership_verification_certificate_arn
+                .clone(),
+        }
+    }
+}
+
+/// The ARN of a `DomainName` resource in `region`.
+///
+/// API Gateway's resource portion for a custom domain name is `/domainnames/{name}`, and
+/// the account segment is the emulator's canonical one (see `engine::emulator_arn`).
+pub fn domain_name_arn(domain_name: &str, region: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("/domainnames/{domain_name}"))
+}
+
+/// The regional host API Gateway serves a custom domain name on: the
+/// `d-{id}.execute-api.{region}.amazonaws.com` form a caller aliases their own DNS
+/// record to, built from an id this store minted (see
+/// [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_domain_name_id`]) and the api
+/// endpoint host `CreateApiResponse$ApiEndpoint` documents.
+pub fn api_gateway_domain_host(domain_id: &str, region: &str) -> String {
+    format!("d-{domain_id}.execute-api.{region}.amazonaws.com")
+}
+
+/// Resolve one `DomainNameConfigurations` entry of a request into the record to store.
+///
+/// The three enum members are defaulted here and nowhere else, so a create and an update
+/// resolve them identically. `Err` carries the message for the operation's
+/// `BadRequestException`: `DomainNameStatus` is service-computed, so a request that sets
+/// it is naming a value it does not own, and each enum is checked against its modelled
+/// catalog so an unexpected value is named in the refusal rather than stored.
+pub fn resolve_domain_name_endpoint(
+    index: usize,
+    requested: &wire::DomainNameConfiguration,
+) -> Result<DomainNameEndpoint, String> {
+    if let Some(status) = requested.domain_name_status.as_deref() {
+        return Err(format!(
+            "DomainNameConfigurations[{index}].DomainNameStatus is set by the service and \
+             cannot be specified in a request; got '{status}'."
+        ));
+    }
+    let endpoint_type = checked_enum(
+        index,
+        "EndpointType",
+        requested.endpoint_type.as_deref(),
+        DEFAULT_ENDPOINT_TYPE,
+        wire::ENDPOINT_TYPE_VALUES,
+    )?;
+    let security_policy = checked_enum(
+        index,
+        "SecurityPolicy",
+        requested.security_policy.as_deref(),
+        DEFAULT_SECURITY_POLICY,
+        wire::SECURITY_POLICY_VALUES,
+    )?;
+    let ip_address_type = checked_enum(
+        index,
+        "IpAddressType",
+        requested.ip_address_type.as_deref(),
+        DEFAULT_IP_ADDRESS_TYPE,
+        wire::IP_ADDRESS_TYPE_VALUES,
+    )?;
+    Ok(DomainNameEndpoint {
+        certificate_arn: requested.certificate_arn.clone(),
+        certificate_name: requested.certificate_name.clone(),
+        ownership_verification_certificate_arn: requested
+            .ownership_verification_certificate_arn
+            .clone(),
+        endpoint_type,
+        security_policy,
+        ip_address_type,
+    })
+}
+
+/// Resolve a request's `RoutingMode` against the modelled catalog.
+///
+/// `Ok(None)` means the request named none, leaving the defaulting decision with the
+/// caller — a create applies [`DEFAULT_ROUTING_MODE`], an update leaves the stored value
+/// alone — while the catalog check and its wording live here, so the two handlers cannot
+/// drift. `Err` carries the message for the operation's `BadRequestException`.
+///
+/// `RoutingMode` is a modelled enum, so the boundary validator already refuses a value
+/// outside the catalog; checking it here too means an unexpected value is named in the
+/// refusal rather than stored and reported back.
+pub fn resolve_routing_mode(requested: Option<&str>) -> Result<Option<String>, String> {
+    match requested {
+        None => Ok(None),
+        Some(mode) if wire::ROUTING_MODE_VALUES.contains(&mode) => Ok(Some(mode.to_string())),
+        Some(mode) => Err(format!(
+            "Invalid value for RoutingMode: '{mode}'. Valid values are: {}.",
+            wire::ROUTING_MODE_VALUES.join(", ")
+        )),
+    }
+}
+
+/// One enum member of a `DomainNameConfigurations` entry: the requested value when it is
+/// in `catalog`, `default` when the request names none.
+fn checked_enum(
+    index: usize,
+    member: &str,
+    requested: Option<&str>,
+    default: &str,
+    catalog: &[&str],
+) -> Result<String, String> {
+    match requested {
+        None => Ok(default.to_string()),
+        Some(value) if catalog.contains(&value) => Ok(value.to_string()),
+        Some(value) => Err(format!(
+            "Invalid value for DomainNameConfigurations[{index}].{member}: '{value}'. \
+             Valid values are: {}.",
+            catalog.join(", ")
+        )),
     }
 }
 

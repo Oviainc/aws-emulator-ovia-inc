@@ -186,6 +186,9 @@ fn test_einvoice_delivery_not_confirmed(endpoint: Option<&str>) -> ValidationExc
         // the input, which satisfies every modelled constraint, but about the delivery
         // this call could not confirm.
         reason: Some("other".to_string()),
+        // The procurement-portal plane keys the text as `Message` (see
+        // [`MessageKey`]).
+        message_key: MessageKey::Capitalised,
         ..Default::default()
     }
 }
@@ -243,7 +246,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.procurement_portal_preference_arn)
             .ok_or_else(|| {
                 SendProcurementPortalValidationErrorModeled::ResourceNotFoundException(
-                    crate::state::no_such_resource(&input.procurement_portal_preference_arn),
+                    crate::state::no_such_procurement_portal_preference(
+                        &input.procurement_portal_preference_arn,
+                    ),
                 )
             })?;
 

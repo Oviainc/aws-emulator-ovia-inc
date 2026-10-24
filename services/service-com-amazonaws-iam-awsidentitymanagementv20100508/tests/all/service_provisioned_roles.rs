@@ -48,6 +48,13 @@ const PUBLISHED_ROWS: &[(&str, &str)] = &[
         "ecs.application-autoscaling.amazonaws.com",
         "AWSServiceRoleForApplicationAutoScaling_ECSService",
     ),
+    // A name whose capitalisation the principal does not carry: the principal is
+    // `codestar-notifications`, the published role is AWSServiceRoleForCodeStarNotifications
+    // ("Using service-linked roles for AWS CodeStar Notifications").
+    (
+        "codestar-notifications.amazonaws.com",
+        "AWSServiceRoleForCodeStarNotifications",
+    ),
 ];
 
 /// The `Role` members a read reports, pulled off one response body.

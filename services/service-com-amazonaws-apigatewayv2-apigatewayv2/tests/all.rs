@@ -23,6 +23,8 @@ mod cors_configuration;
 mod deployment_lifecycle;
 #[path = "all/deployment_stage_release.rs"]
 mod deployment_stage_release;
+#[path = "all/domain_name_lifecycle.rs"]
+mod domain_name_lifecycle;
 #[path = "all/integration_lifecycle.rs"]
 mod integration_lifecycle;
 #[path = "all/integration_pagination.rs"]

@@ -29,9 +29,19 @@ use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 /// `SendProcurementPortalValidation` / `VerifyProcurementPortalValidation`.
 const PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
 
-/// The message of this service's `ResourceNotFoundException`, from the shape's own
-/// documentation (`smithy_query(query="shape", shape="ResourceNotFoundException")`).
-const RESOURCE_NOT_FOUND_MESSAGE: &str = "The resource could not be found.";
+/// The message a 404 of the PROCUREMENT-PORTAL-PREFERENCE plane carries is built from the
+/// request (see `procurement_portal_error_message_key.rs`, which pins that rule over a
+/// table), so this suite asserts only that it names the ARN asked about.
+///
+/// The key it travels under is this plane's `Message`; a reader that accepts either case
+/// keeps this suite about the READ rather than about the key.
+fn error_message(body: &Value) -> String {
+    body.get("Message")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
 
 /// An instant every `CreateDate` this suite observes must be at or after: 2025-01-01T00:00Z
 /// in epoch seconds, so a date read back is the clock's rather than a zero or a default.
@@ -466,10 +476,9 @@ async fn a_read_of_a_preference_the_service_does_not_hold_is_the_modelled_404() 
             code.ends_with("ResourceNotFoundException"),
             "case {case:?}: expected a ResourceNotFoundException, got {code:?} {parsed}"
         );
-        assert_eq!(
-            parsed.get("message").and_then(Value::as_str),
-            Some(RESOURCE_NOT_FOUND_MESSAGE),
-            "case {case:?}: expected the documented message, got {parsed}"
+        assert!(
+            error_message(&parsed).contains(case),
+            "case {case:?}: expected a message naming the ARN asked about, got {parsed}"
         );
     }
 }

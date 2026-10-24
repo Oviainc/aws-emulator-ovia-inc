@@ -50,14 +50,14 @@ pub const ACCOUNT_ID_LEN: usize = 12;
 
 /// The most graphs this emulator will hold.
 ///
-/// Emulator resource guard, NOT an AWS quota. `ListGraphs` documents a far tighter
-/// account-level rule ("Because an account can currently only be the administrator
-/// of one behavior graph within a Region, the results always contain a single
-/// behavior graph"), which this slice deliberately does not enforce: every request
-/// this emulator serves is signed for the one canonical emulator account, so a
-/// single-graph rule would leave `ListGraphs`' modelled pagination unreachable.
-/// This cap is what keeps the store finite in its place, and a create that would
-/// exceed it is refused with the modelled `ServiceQuotaExceededException`.
+/// Emulator resource guard, NOT an AWS quota. The account-level rule `CreateGraph`
+/// documents ("An account can only be the administrator account for one behavior graph
+/// within a Region. If the same account calls CreateGraph with the same administrator
+/// account, it always returns the same behavior graph ARN") is enforced per
+/// account+Region by [`ComAmazonawsDetectiveAmazondetectiveState::graph_of_administrator_in_region`],
+/// so the store grows by at most one graph per Region; this cap is what keeps it finite
+/// across Regions, and a create that would exceed it is refused with the modelled
+/// `ServiceQuotaExceededException`.
 pub const MAX_GRAPHS: usize = 500;
 
 /// The most member accounts one behavior graph may hold.
@@ -84,6 +84,13 @@ pub const MEMBER_STATUS_VERIFICATION_IN_PROGRESS: &str = "VERIFICATION_IN_PROGRE
 /// but the member has not responded yet. One of `MEMBER_STATUS_VALUES`.
 pub const MEMBER_STATUS_INVITED: &str = "INVITED";
 
+/// `MemberStatus$VERIFICATION_FAILED`: "For invited accounts only. Indicates that the
+/// account and email address provided for the member account do not match, and
+/// Detective did not send an invitation to the account." The other outcome of the
+/// verification `CreateMembers` starts, and a terminal one. One of
+/// `MEMBER_STATUS_VALUES`.
+pub const MEMBER_STATUS_VERIFICATION_FAILED: &str = "VERIFICATION_FAILED";
+
 /// `InvitationType$INVITATION`: the membership came from `CreateMembers` inviting
 /// the account, not from an organization. One of `INVITATION_TYPE_VALUES`.
 pub const INVITATION_TYPE_INVITATION: &str = "INVITATION";
@@ -93,10 +100,11 @@ pub const INVITATION_TYPE_INVITATION: &str = "INVITATION";
 /// `MemberStatus$VERIFICATION_IN_PROGRESS` is a transient status Detective moves
 /// out of by itself — "Detective is verifying that the account identifier and email
 /// address provided for the member account match. If they do match, then Detective
-/// sends the invitation" — so the move to `INVITED` is owed by the clock, not by any
-/// later call. AWS publishes no duration for it; this is the span this emulator
-/// chooses, short enough not to slow a caller down and long enough that a caller
-/// reading straight back still observes the transient status.
+/// sends the invitation" — so the move to its terminal status ([`MEMBER_STATUS_INVITED`]
+/// when the pair matches, [`MEMBER_STATUS_VERIFICATION_FAILED`] when it does not) is
+/// owed by the clock, not by any later call. AWS publishes no duration for it; this is
+/// the span this emulator chooses, short enough not to slow a caller down and long
+/// enough that a caller reading straight back still observes the transient status.
 pub const MEMBER_VERIFICATION_MILLIS: i64 = 500;
 
 /// `MemberStatus$ACCEPTED_BUT_DISABLED`: the member accepted the invitation but data
@@ -222,8 +230,9 @@ pub struct Member {
     /// One of `MEMBER_DISABLED_REASON_VALUES`, only while the membership is
     /// `ACCEPTED_BUT_DISABLED`.
     pub disabled_reason: Option<String>,
-    /// The instant the `VERIFICATION_IN_PROGRESS` -> `INVITED` move is due, while
-    /// that move is still outstanding.
+    /// The instant the move out of `VERIFICATION_IN_PROGRESS` — to `INVITED` or to
+    /// `VERIFICATION_FAILED`, whichever [`member_pair_verifies`] decides — is due,
+    /// while that move is still outstanding.
     pub verification_due_millis: Option<i64>,
 }
 
@@ -234,10 +243,21 @@ impl Member {
     /// `verification_due_millis` whether or not anybody called, so `UpdatedTime`
     /// carries that due instant rather than the time of the read, and the record a
     /// later caller sees is identical.
+    ///
+    /// The status it moves to is the OUTCOME of the verification, decided by
+    /// [`member_pair_verifies`]: `INVITED` when the account identifier and the email
+    /// address match, `VERIFICATION_FAILED` when they do not. Both are terminal, so a
+    /// membership never sits in `VERIFICATION_IN_PROGRESS` once its due instant has
+    /// passed. Each membership is settled on its own record, so a batch of accounts
+    /// resolves independently.
     pub fn settle(&mut self, now_millis: i64) {
         if let Some(due) = self.verification_due_millis {
             if due <= now_millis {
-                self.status = MEMBER_STATUS_INVITED.to_string();
+                self.status = if member_pair_verifies(&self.account_id, &self.email_address) {
+                    MEMBER_STATUS_INVITED.to_string()
+                } else {
+                    MEMBER_STATUS_VERIFICATION_FAILED.to_string()
+                };
                 self.updated_time_millis = due;
                 self.verification_due_millis = None;
             }
@@ -390,6 +410,29 @@ impl ComAmazonawsDetectiveAmazondetectiveState {
     /// Store a newly created graph.
     pub fn insert_graph(&mut self, graph: Graph) {
         self.graphs.insert(graph.arn.clone(), graph);
+    }
+
+    /// The one behavior graph `administrator_id` administers in `region`, if it has
+    /// one.
+    ///
+    /// `CreateGraph` documents the rule this answers: "An account can only be the
+    /// administrator account for one behavior graph within a Region. If the same
+    /// account calls CreateGraph with the same administrator account, it always returns
+    /// the same behavior graph ARN. It does not create a new behavior graph." So this is
+    /// the identity of "this account's graph here", and `CreateGraph` answers with it
+    /// rather than minting a second one.
+    ///
+    /// The lookup walks the stored graphs rather than a second index, so a graph
+    /// `DeleteGraph` removed stops being the account's graph with no further
+    /// bookkeeping, and the next `CreateGraph` in that Region mints a fresh one.
+    pub fn graph_of_administrator_in_region(
+        &self,
+        administrator_id: &str,
+        region: &str,
+    ) -> Option<&Graph> {
+        self.graphs.values().find(|graph| {
+            graph.administrator_id == administrator_id && arn_region(&graph.arn) == Some(region)
+        })
     }
 
     /// Remove the graph `arn` names, with its members and its tags. `None` when
@@ -549,6 +592,50 @@ pub fn administrator_account_id() -> String {
 /// operation such as `RejectInvitation` resolves its own membership by.
 pub fn caller_account_id() -> String {
     administrator_account_id()
+}
+
+/// The root-user email address registered for the account `account_id`, or `None` when
+/// this emulator holds no registration for it.
+///
+/// An account's root-user email address lives in the account directory, not in
+/// Detective: `MemberDetail$EmailAddress` is "The Amazon Web Services account root user
+/// email address for the member account", and the only place to check a given one
+/// against is that directory. This emulator serves exactly ONE account
+/// ([`caller_account_id`]) and registers no email address for it or for any other, so
+/// the answer here is `None` for every account \u2014 returning an address for one would be
+/// inventing a registration that does not exist.
+pub fn registered_root_email(account_id: &str) -> Option<String> {
+    let _ = account_id;
+    None
+}
+
+/// Whether the account identifier and email address one `CreateMembers` entry carried
+/// match, which is the question `MemberStatus$VERIFICATION_IN_PROGRESS` describes
+/// Detective answering: "Detective is verifying that the account identifier and email
+/// address provided for the member account match. If they do match, then Detective
+/// sends the invitation. If the email address and account identifier don't match, then
+/// the member cannot be added to the behavior graph."
+///
+/// The pair matches when the account named by `account_id` has a registered root-user
+/// email address equal to `email_address` \u2014 compared case-insensitively, as email
+/// domains and the addresses AWS reports are. [`registered_root_email`] is the one
+/// source of that address, so an account this emulator holds no registration for can
+/// never match, and its membership settles at [`MEMBER_STATUS_VERIFICATION_FAILED`]:
+/// "the account and email address provided for the member account do not match, and
+/// Detective did not send an invitation to the account."
+pub fn member_pair_verifies(account_id: &str, email_address: &str) -> bool {
+    registered_root_email(account_id)
+        .is_some_and(|registered| registered.eq_ignore_ascii_case(email_address))
+}
+
+/// The Region field of the ARN `arn`, or `None` when it carries no such field.
+///
+/// Every behavior-graph ARN this service mints names the Region it was created in
+/// (`arn:aws:detective:<region>:<account>:graph:<id>`), which is what makes the stored
+/// graphs themselves the index of "this account's graph in this Region" \u2014 see
+/// [`ComAmazonawsDetectiveAmazondetectiveState::graph_of_administrator_in_region`].
+pub fn arn_region(arn: &str) -> Option<&str> {
+    arn.split(':').nth(3)
 }
 
 /// The region this request was signed for, from its SigV4 credential scope; the

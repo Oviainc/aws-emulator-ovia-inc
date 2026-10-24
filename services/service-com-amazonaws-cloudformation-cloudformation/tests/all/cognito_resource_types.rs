@@ -1,0 +1,485 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The Amazon Cognito resource types a template may declare, end to end over the awsQuery
+//! wire.
+//!
+//! RULE under test: **an operation that submits a template accepts every resource type the
+//! "AWS resource and property types reference" publishes** — the emulator's catalogue in
+//! `state::resource_types` is a transcription of that published set, so a type the
+//! reference publishes is recognised, the stack reaches `CREATE_COMPLETE` and the resource
+//! is recorded under the type the template declared — **while a name the reference does
+//! not publish is still refused** with HTTP 400, `ValidationError` and `Template format
+//! error: Unrecognized resource types: [<types>]`.
+//!
+//! `unrecognized_resource_types.rs` is the suite of the REFUSING half of that rule, over
+//! namespaces and spellings. This suite is the ADMITTING half over one whole published
+//! namespace: Amazon Cognito, the namespace of the reported case
+//! (`AWS::Cognito::IdentityPoolPrincipalTag`, which the catalogue did not carry and which
+//! was therefore refused before any principal-tag scenario could deploy).
+//!
+//! The rows differ along what the rule generalises over — the resource NAME inside one
+//! published namespace. Every type the reference publishes under `AWS::Cognito::` is a row,
+//! which is what makes the reported type one row among its fourteen siblings rather than a
+//! special case, and each row is crossed with the two things a published type owes a
+//! caller: the submission is accepted, and the declared resource is readable back through
+//! `DescribeStackResources` under its declared type. The refusing rows are the near misses
+//! of the same namespace — a plural, a wrong case, an invented resource and the service
+//! model's own namespace spelling — so admitting the published set is not admitting
+//! `AWS::Cognito::<anything>`.
+//!
+//! None of these types has a provisioner, so each is declared-only
+//! (`unprovisioned_resources.rs` pins that: nothing is called in the owning service and the
+//! stack completes). What this suite asserts is only what the rule is about — that a
+//! template may DECLARE the type at all.
+
+use serde_json::{json, Value};
+use service_com_amazonaws_cloudformation_cloudformation::state::resource_types::{
+    is_recognized, AWS_RESOURCE_TYPES,
+};
+use service_com_amazonaws_cloudformation_cloudformation::state::status;
+use smithy_server_runtime::MultiServiceRouter;
+
+use crate::stack_lifecycle::{
+    call, create_stack, describe_stack, member, router, wait_for_the_transition, xml_text,
+    xml_texts,
+};
+use crate::stack_resources::{resources_of, wire_resources};
+
+/// The namespace Amazon Cognito's resource types are published under. The service's own
+/// models are named `cognito-identity` and `cognito-idp`, but a template spells the
+/// published namespace, which is this one.
+const COGNITO_NAMESPACE: &str = "AWS::Cognito::";
+
+/// Every resource type the "AWS resource and property types reference" publishes under
+/// `AWS::Cognito::`, with the operation of the owning service — present in this checkout's
+/// `cognito-identity` and `cognito-idp` models — that deploying one calls.
+///
+/// Source: that reference's Amazon Cognito section. This is the expectation side of the
+/// catalogue: the test below holds `AWS_RESOURCE_TYPES`' own `AWS::Cognito::` group to
+/// exactly this set, so a missing entry (the reported defect) and a stray one both fail.
+const PUBLISHED: &[&str] = &[
+    // CreateIdentityPool (cognito-identity)
+    "AWS::Cognito::IdentityPool",
+    // SetPrincipalTagAttributeMap (cognito-identity) — the reported type.
+    "AWS::Cognito::IdentityPoolPrincipalTag",
+    // SetIdentityPoolRoles (cognito-identity)
+    "AWS::Cognito::IdentityPoolRoleAttachment",
+    // SetLogDeliveryConfiguration (cognito-idp)
+    "AWS::Cognito::LogDeliveryConfiguration",
+    // CreateManagedLoginBranding (cognito-idp)
+    "AWS::Cognito::ManagedLoginBranding",
+    // CreateUserPool (cognito-idp)
+    "AWS::Cognito::UserPool",
+    // CreateUserPoolClient (cognito-idp)
+    "AWS::Cognito::UserPoolClient",
+    // CreateUserPoolDomain (cognito-idp)
+    "AWS::Cognito::UserPoolDomain",
+    // CreateGroup (cognito-idp)
+    "AWS::Cognito::UserPoolGroup",
+    // CreateIdentityProvider (cognito-idp)
+    "AWS::Cognito::UserPoolIdentityProvider",
+    // CreateResourceServer (cognito-idp)
+    "AWS::Cognito::UserPoolResourceServer",
+    // SetRiskConfiguration (cognito-idp)
+    "AWS::Cognito::UserPoolRiskConfigurationAttachment",
+    // SetUICustomization (cognito-idp)
+    "AWS::Cognito::UserPoolUICustomizationAttachment",
+    // AdminCreateUser (cognito-idp)
+    "AWS::Cognito::UserPoolUser",
+    // AdminAddUserToGroup (cognito-idp)
+    "AWS::Cognito::UserPoolUserToGroupAttachment",
+];
+
+/// The stack name a one-resource stack for `resource_type` is created under: the type's
+/// last segment, lower-cased, which is inside a stack name's own alphabet.
+fn stack_name_for(resource_type: &str) -> String {
+    let resource = resource_type
+        .rsplit("::")
+        .next()
+        .unwrap_or(resource_type)
+        .to_ascii_lowercase();
+    format!("cognito-{resource}")
+}
+
+/// A one-resource template declaring `resource_type` under the logical id `Subject`.
+///
+/// No properties: a published type may be declared with whatever properties its own
+/// reference gives it, and what this suite is about is the TYPE. The reported template's
+/// own properties are the separate case below.
+fn one_resource_template(resource_type: &str) -> String {
+    json!({ "Resources": { "Subject": { "Type": resource_type } } }).to_string()
+}
+
+/// The catalogue's own `AWS::Cognito::` group, in catalogue order.
+fn catalogued_cognito_types() -> Vec<&'static str> {
+    AWS_RESOURCE_TYPES
+        .iter()
+        .copied()
+        .filter(|entry| entry.starts_with(COGNITO_NAMESPACE))
+        .collect()
+}
+
+/// The catalogue carries exactly the published Amazon Cognito namespace — every type the
+/// reference publishes, and nothing else under it.
+#[test]
+fn the_catalogue_carries_the_published_cognito_namespace() {
+    let catalogued = catalogued_cognito_types();
+    let mut expected: Vec<&str> = PUBLISHED.to_vec();
+    expected.sort_unstable();
+    let mut actual = catalogued.clone();
+    actual.sort_unstable();
+    assert_eq!(
+        actual, expected,
+        "case {COGNITO_NAMESPACE:?}: expected the catalogue to carry exactly the published \
+         Amazon Cognito types {expected:?}, got {actual:?}"
+    );
+    for resource_type in PUBLISHED {
+        assert!(
+            is_recognized(resource_type),
+            "case {resource_type:?}: expected a published type to be recognized, it is not"
+        );
+    }
+}
+
+/// `CreateStack` accepts a template declaring any published Amazon Cognito type, the stack
+/// completes, and the resource is readable back under the type that was declared.
+#[tokio::test]
+async fn every_published_cognito_type_may_be_declared_and_is_recorded() {
+    let router = router();
+    // Submit every row first, then wait once for the transition they all owe: the delay is
+    // per stack and runs from its own create.
+    for resource_type in PUBLISHED {
+        let stack_name = stack_name_for(resource_type);
+        let template = one_resource_template(resource_type);
+        let (status_code, body) = create_stack(&router, &stack_name, &template, &[]).await;
+        assert_eq!(
+            status_code, 200,
+            "case {resource_type:?}: expected HTTP 200 from CreateStack for a published \
+             resource type, got {status_code} with body {body}"
+        );
+    }
+    wait_for_the_transition().await;
+
+    for resource_type in PUBLISHED {
+        let stack_name = stack_name_for(resource_type);
+        let (status_code, body) = describe_stack(&router, &stack_name).await;
+        assert_eq!(
+            status_code, 200,
+            "case {resource_type:?}: expected DescribeStacks to report the created stack, \
+             got {status_code} with body {body}"
+        );
+        assert_eq!(
+            xml_text(&body, "StackStatus").as_deref(),
+            Some(status::CREATE_COMPLETE),
+            "case {resource_type:?}: expected the stack to reach {:?}, got body {body}",
+            status::CREATE_COMPLETE
+        );
+
+        let (status_code, body) = resources_of(&router, &stack_name).await;
+        assert_eq!(
+            status_code, 200,
+            "case {resource_type:?}: expected DescribeStackResources to answer, got \
+             {status_code} with body {body}"
+        );
+        let reported = wire_resources(&body);
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {resource_type:?}: expected the one declared resource, got {reported:?}"
+        );
+        assert_eq!(
+            reported[0].resource_type.as_deref(),
+            Some(*resource_type),
+            "case {resource_type:?}: expected the declared type to be reported, got {:?}",
+            reported[0].resource_type
+        );
+        assert_eq!(
+            reported[0].logical_id.as_deref(),
+            Some("Subject"),
+            "case {resource_type:?}: expected the declared logical id, got {:?}",
+            reported[0].logical_id
+        );
+        let physical_id = reported[0].physical_id.clone().unwrap_or_default();
+        assert!(
+            physical_id.contains(&stack_name) && physical_id.contains("Subject"),
+            "case {resource_type:?}: expected a generated physical id built from the stack \
+             name and the logical id, got {physical_id:?}"
+        );
+    }
+}
+
+/// One refusing row: a name of the same namespace the reference does not publish.
+struct NearMiss {
+    case: &'static str,
+    stack_name: &'static str,
+    declared: &'static [&'static str],
+}
+
+/// The near misses of the admitted namespace. Admitting the published set must not admit
+/// `AWS::Cognito::<anything>`.
+const NEAR_MISSES: &[NearMiss] = &[
+    NearMiss {
+        case: "the reported type, pluralised",
+        stack_name: "cognito-plural",
+        declared: &["AWS::Cognito::IdentityPoolPrincipalTags"],
+    },
+    NearMiss {
+        case: "the reported type in the wrong case",
+        stack_name: "cognito-wrong-case",
+        declared: &["AWS::Cognito::identitypoolprincipaltag"],
+    },
+    NearMiss {
+        case: "a resource the Amazon Cognito namespace does not publish",
+        stack_name: "cognito-invented",
+        declared: &["AWS::Cognito::UserPoolPrincipalTag"],
+    },
+    NearMiss {
+        case: "the service model's own name as the namespace",
+        stack_name: "cognito-model-namespace",
+        declared: &["AWS::CognitoIdentity::IdentityPoolPrincipalTag"],
+    },
+    NearMiss {
+        case: "two unpublished names beside a published one, each named once",
+        stack_name: "cognito-mixed",
+        declared: &[
+            "AWS::Cognito::PrincipalTag",
+            "AWS::Cognito::IdentityPoolPrincipalTagMap",
+        ],
+    },
+];
+
+/// A name the reference does not publish is refused, whatever namespace it wears, and
+/// nothing is created for it.
+#[tokio::test]
+async fn an_unpublished_cognito_name_is_still_refused() {
+    let router = router();
+    for near_miss in NEAR_MISSES {
+        let NearMiss {
+            case,
+            stack_name,
+            declared,
+        } = near_miss;
+        // The published type beside the unpublished ones: the refusal names only what it
+        // did not recognise.
+        let mut resources = serde_json::Map::new();
+        resources.insert(
+            "Pool".to_string(),
+            json!({ "Type": "AWS::Cognito::IdentityPool" }),
+        );
+        for (index, resource_type) in declared.iter().enumerate() {
+            resources.insert(format!("Unknown{index}"), json!({ "Type": resource_type }));
+        }
+        let template = Value::Object(
+            [("Resources".to_string(), Value::Object(resources))]
+                .into_iter()
+                .collect(),
+        )
+        .to_string();
+
+        let (status_code, body) = create_stack(&router, stack_name, &template, &[]).await;
+        assert_eq!(
+            status_code, 400,
+            "case {case:?}: expected HTTP 400 for an unpublished resource type, got \
+             {status_code} with body {body}"
+        );
+        assert_eq!(
+            xml_text(&body, "Code").as_deref(),
+            Some("ValidationError"),
+            "case {case:?}: expected the wire code ValidationError, got body {body}"
+        );
+        let message = xml_text(&body, "Message").unwrap_or_default();
+        for resource_type in *declared {
+            assert!(
+                message.contains(resource_type),
+                "case {case:?}: expected the refusal to name {resource_type:?}, got \
+                 {message:?}"
+            );
+        }
+        assert!(
+            !message.contains("AWS::Cognito::IdentityPool,")
+                && !message.contains("[AWS::Cognito::IdentityPool]"),
+            "case {case:?}: expected the refusal not to name the published type beside \
+             them, got {message:?}"
+        );
+        let (status_code, body) = describe_stack(&router, stack_name).await;
+        assert_eq!(
+            status_code, 400,
+            "case {case:?}: expected the refused stack not to exist, DescribeStacks \
+             answered {status_code} with body {body}"
+        );
+    }
+}
+
+/// The reported template itself: an identity pool and the principal-tag mapping of one of
+/// its providers, declared together as a production template does, with the mapping's
+/// identifiers resolved through the pool it references.
+#[tokio::test]
+async fn the_reported_principal_tag_template_deploys() {
+    let router: MultiServiceRouter = router();
+    let case = "an identity pool and its provider's principal-tag mapping";
+    let stack_name = "cognito-principal-tags";
+    let template = json!({
+        "Resources": {
+            "Pool": {
+                "Type": "AWS::Cognito::IdentityPool",
+                "Properties": {
+                    "IdentityPoolName": "principal-tag-pool",
+                    "AllowUnauthenticatedIdentities": false
+                }
+            },
+            "PrincipalTags": {
+                "Type": "AWS::Cognito::IdentityPoolPrincipalTag",
+                "Properties": {
+                    "IdentityPoolId": { "Ref": "Pool" },
+                    "IdentityProviderName": "cognito-idp.us-east-1.amazonaws.com/us-east-1_example",
+                    "UseDefaults": false,
+                    "PrincipalTags": { "department": "custom:department" }
+                }
+            }
+        },
+        "Outputs": {
+            "PoolId": { "Value": { "Ref": "Pool" } },
+            "Mapping": { "Value": { "Ref": "PrincipalTags" } }
+        }
+    })
+    .to_string();
+
+    let (status_code, body) = create_stack(&router, stack_name, &template, &[]).await;
+    assert_eq!(
+        status_code, 200,
+        "case {case:?}: expected HTTP 200 from CreateStack, got {status_code} with body \
+         {body}"
+    );
+    wait_for_the_transition().await;
+
+    let (status_code, body) = describe_stack(&router, stack_name).await;
+    assert_eq!(
+        status_code, 200,
+        "case {case:?}: expected DescribeStacks to answer, got {status_code} with body {body}"
+    );
+    assert_eq!(
+        xml_text(&body, "StackStatus").as_deref(),
+        Some(status::CREATE_COMPLETE),
+        "case {case:?}: expected the stack to reach {:?}, got body {body}",
+        status::CREATE_COMPLETE
+    );
+    let keys = xml_texts(&body, "OutputKey");
+    let values = xml_texts(&body, "OutputValue");
+    assert_eq!(
+        keys.len(),
+        2,
+        "case {case:?}: expected both declared outputs, got {keys:?} in {body}"
+    );
+    // Every reported output carries a VALUE: an `OutputKey` with no `OutputValue` beside it
+    // is an output that resolved to nothing, which the counts are what catch — pairing by
+    // position would silently skip it.
+    assert_eq!(
+        values.len(),
+        keys.len(),
+        "case {case:?}: expected one OutputValue per OutputKey {keys:?}, got {values:?} in \
+         {body}"
+    );
+    // Each one resolves to the referenced resource's physical id: the pool's is the name
+    // its `IdentityPoolName` property declares, and the mapping, which the template leaves
+    // unnamed, carries the generated `<stack name>-<logical id>-<unique id>`.
+    let resolved: Vec<(String, String)> = keys.iter().cloned().zip(values.iter().cloned()).collect();
+    for (key, value) in &resolved {
+        match key.as_str() {
+            "PoolId" => assert_eq!(
+                value, "principal-tag-pool",
+                "case {case:?}: expected output {key:?} to resolve to the declared identity \
+                 pool name, got {value:?}"
+            ),
+            "Mapping" => assert!(
+                value.starts_with(&format!("{stack_name}-PrincipalTags-")),
+                "case {case:?}: expected output {key:?} to resolve to the generated physical \
+                 id of the mapping, got {value:?}"
+            ),
+            other => panic!("case {case:?}: unexpected output {other:?} in {resolved:?}"),
+        }
+    }
+
+    let (status_code, body) = resources_of(&router, stack_name).await;
+    assert_eq!(
+        status_code, 200,
+        "case {case:?}: expected DescribeStackResources to answer, got {status_code} with \
+         body {body}"
+    );
+    let mut reported: Vec<String> = wire_resources(&body)
+        .into_iter()
+        .map(|resource| resource.resource_type.unwrap_or_default())
+        .collect();
+    reported.sort();
+    assert_eq!(
+        reported,
+        vec![
+            "AWS::Cognito::IdentityPool".to_string(),
+            "AWS::Cognito::IdentityPoolPrincipalTag".to_string(),
+        ],
+        "case {case:?}: expected both declared resources to be recorded, got {reported:?}"
+    );
+
+    // The same template is accepted by the other operations that submit one for
+    // deployment, which are held to the same catalogue.
+    let (status_code, body) = call(
+        &router,
+        "CreateChangeSet",
+        &[
+            member("StackName", "cognito-principal-tags-change-set"),
+            member("ChangeSetName", "a-change-set"),
+            member("ChangeSetType", "CREATE"),
+            member("TemplateBody", &template),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status_code, 200,
+        "case {case:?}: expected CreateChangeSet to accept the same template, got \
+         {status_code} with body {body}"
+    );
+    // UpdateStack refuses a template identical to the stack's own ("No updates are to be
+    // performed."), so the submitted body declares one more mapping — of the same published
+    // type, which is what this asserts the operation admits.
+    let updated = json!({
+        "Resources": {
+            "Pool": {
+                "Type": "AWS::Cognito::IdentityPool",
+                "Properties": {
+                    "IdentityPoolName": "principal-tag-pool",
+                    "AllowUnauthenticatedIdentities": false
+                }
+            },
+            "PrincipalTags": {
+                "Type": "AWS::Cognito::IdentityPoolPrincipalTag",
+                "Properties": {
+                    "IdentityPoolId": { "Ref": "Pool" },
+                    "IdentityProviderName": "cognito-idp.us-east-1.amazonaws.com/us-east-1_example",
+                    "UseDefaults": true
+                }
+            },
+            "GooglePrincipalTags": {
+                "Type": "AWS::Cognito::IdentityPoolPrincipalTag",
+                "Properties": {
+                    "IdentityPoolId": { "Ref": "Pool" },
+                    "IdentityProviderName": "accounts.google.com",
+                    "PrincipalTags": { "team": "custom:team" }
+                }
+            }
+        }
+    })
+    .to_string();
+    let (status_code, body) = call(
+        &router,
+        "UpdateStack",
+        &[
+            member("StackName", stack_name),
+            member("TemplateBody", &updated),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status_code, 200,
+        "case {case:?}: expected UpdateStack to accept a template declaring the same \
+         published types, got {status_code} with body {body}"
+    );
+}
