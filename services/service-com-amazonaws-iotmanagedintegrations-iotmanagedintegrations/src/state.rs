@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    CapabilityReport, CapabilitySchemaItem, ConfigurationStatus, EndpointConfig, PushConfig,
-    ResourceNotFoundException, WiFiSimpleSetupConfiguration,
+    CapabilityReport, CapabilitySchemaItem, ConfigurationStatus, EndpointConfig,
+    GeneralAuthorizationName, PushConfig, ResourceNotFoundException,
+    WiFiSimpleSetupConfiguration,
 };
 
 /// The region an ARN carries when the request names none (the emulator's default
@@ -19,13 +20,13 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 pub const SERVICE_ARN_NAMESPACE: &str = "iotmanagedintegrations";
 
 /// The `Role`, `AuthMaterialType`, `HubNetworkMode`, `EncryptionType`, `EndpointType`,
-/// `LogLevel` and
-/// `ConfigurationState` value lists the handlers validate against and report, re-exported
-/// from the MODEL-GENERATED constants in `crate::ops::types` so there is no second copy
-/// to drift from the model.
+/// `LogLevel`, `ConfigurationState` and `AssociationState` value lists the handlers
+/// validate against and report, re-exported from the MODEL-GENERATED constants in
+/// `crate::ops::types` so there is no second copy to drift from the model.
 pub use crate::ops::types::{
-    AUTH_MATERIAL_TYPE_VALUES, CONFIGURATION_STATE_VALUES, ENCRYPTION_TYPE_VALUES,
-    ENDPOINT_TYPE_VALUES, HUB_NETWORK_MODE_VALUES, LOG_LEVEL_VALUES, ROLE_VALUES,
+    ASSOCIATION_STATE_VALUES, AUTH_MATERIAL_TYPE_VALUES, CONFIGURATION_STATE_VALUES,
+    ENCRYPTION_TYPE_VALUES, ENDPOINT_TYPE_VALUES, HUB_NETWORK_MODE_VALUES, LOG_LEVEL_VALUES,
+    ROLE_VALUES,
 };
 
 /// The `ProvisioningStatus` a freshly created managed thing carries: it is not yet
@@ -328,6 +329,89 @@ pub const EVENT_LOG_CONFIGURATION_RESOURCE_NAME: &str = "Event Log Configuration
 /// bound CHOSEN for the emulator, like [`MAX_MANAGED_THINGS`], not a published AWS quota.
 pub const MAX_EVENT_LOG_CONFIGURATIONS: usize = 1_000;
 
+/// One stored account association: the authoritative record every account-association
+/// operation reads and writes. `CreateAccountAssociation` inserts it, and
+/// `GetAccountAssociation` / `ListAccountAssociations` project it onto their output
+/// shapes.
+#[derive(Debug, Clone)]
+pub struct AccountAssociation {
+    /// The generated `AccountAssociationId` this record is keyed by.
+    pub id: String,
+    /// `AccountAssociationArn`, as [`account_association_arn`] builds it.
+    pub arn: String,
+    /// The region the creating request was signed for. An account association is a
+    /// regional resource, like every other resource of this service: only that region's
+    /// endpoint resolves or lists it.
+    pub region: String,
+    /// The `ConnectorDestinationId` the create named — required there, so every record
+    /// carries one. `ListAccountAssociations` filters on it.
+    pub connector_destination_id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// `AssociationState` enum value, one of [`ASSOCIATION_STATE_VALUES`]. A fresh record
+    /// carries [`INITIAL_ASSOCIATION_STATE`].
+    pub association_state: String,
+    /// `AccountAssociationErrorMessage` — why the association failed. `None` until an
+    /// association enters `ASSOCIATION_FAILED`, which no operation in this slice does.
+    pub error_message: Option<String>,
+    /// `OAuthAuthorizationUrlOutput` — the third-party OAuth authorization URL the end
+    /// user authenticates at. Always [`NO_OAUTH_AUTHORIZATION_URL`] here; see that
+    /// constant for why.
+    pub o_auth_authorization_url: String,
+    /// `GeneralAuthorizationName` exactly as the create supplied it, so a read reports
+    /// the authorization material the caller named.
+    pub general_authorization: Option<GeneralAuthorizationName>,
+    /// `TagsMap` — `@sensitive`, stored as the create supplied it and reported by
+    /// `GetAccountAssociation`.
+    pub tags: HashMap<String, String>,
+    /// Monotonic insertion sequence. `ListAccountAssociations` pages by it, so a page
+    /// token keeps resuming at the right place even when records are deleted in between.
+    pub sequence: u64,
+}
+
+/// The `AssociationState` a freshly created account association carries.
+///
+/// `CreateAccountAssociation` answers with an `OAuthAuthorizationUrl` that is
+/// "backed with all the required parameters to perform end-user authentication", so the
+/// association is complete only once the END USER has authenticated at the third-party
+/// platform — an external event, not the passage of time, so no transition out of this
+/// state is owed by the clock (the same reason [`INITIAL_PROVISIONING_STATUS`] is where a
+/// managed thing stays until a device is onboarded). A member of
+/// [`ASSOCIATION_STATE_VALUES`].
+pub const INITIAL_ASSOCIATION_STATE: &str = "ASSOCIATION_IN_PROGRESS";
+
+/// The `OAuthAuthorizationUrl` this emulator reports for an account association: none.
+///
+/// The URL AWS answers with points at the third-party platform's OAuth authorization
+/// server, whose address is part of the `ConnectorDestination`'s `AuthConfig` — and
+/// `CreateConnectorDestination` is still a scaffold stub here, so this emulator holds no
+/// such configuration and has no authorization server to name. The modelled member has
+/// `@default ""` and AWS itself reports it empty "when using General Authorization flows
+/// that do not require OAuth", so the empty string is a modelled value rather than an
+/// invented one; synthesising an `https://…` URL for a server that does not exist would
+/// be fabrication.
+pub const NO_OAUTH_AUTHORIZATION_URL: &str = "";
+
+/// The `ResourceType` this service reports an account association under — the Smithy
+/// resource name, as [`MANAGED_THING_RESOURCE_TYPE`] is for a managed thing. It is also
+/// the resource kind an [`IdempotencyKey`] of a `CreateAccountAssociation` carries.
+pub const ACCOUNT_ASSOCIATION_RESOURCE_TYPE: &str = "AccountAssociation";
+
+/// The account-association resource as a READ's reason names it: the resource's name in
+/// words, the way [`MANAGED_THING_RESOURCE_NAME`] is for a managed thing.
+pub const ACCOUNT_ASSOCIATION_RESOURCE_NAME: &str = "Account Association";
+
+/// The most `AccountAssociationItem`s one `ListAccountAssociations` page carries, and the
+/// page size an absent `MaxResults` gets, for the same reason and on the same terms as
+/// [`MANAGED_THING_PAGE_LIMIT`]: a caller reaches the rest of the store through the
+/// `NextToken`, so one response stays bounded however many records are stored.
+pub const ACCOUNT_ASSOCIATION_PAGE_LIMIT: usize = 100;
+
+/// The most account associations one store holds, for the same reason and on the same
+/// terms as [`MAX_MANAGED_THINGS`]: a bound CHOSEN for the emulator, not a published AWS
+/// quota.
+pub const MAX_ACCOUNT_ASSOCIATIONS: usize = 10_000;
+
 /// Per-service state for com-amazonaws-iotmanagedintegrations-iotmanagedintegrations. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
@@ -372,6 +456,12 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// `LogConfigurationId`. At most one record per log target per region — see
     /// [`Self::event_log_configuration_for_target`].
     pub event_log_configurations: HashMap<String, EventLogConfiguration>,
+    /// The authoritative account-association store, keyed by the generated
+    /// `AccountAssociationId`.
+    pub account_associations: HashMap<String, AccountAssociation>,
+    /// Insertion order of account-association ids, so `ListAccountAssociations` pages
+    /// deterministically. An id is appended on create and removed on delete.
+    pub account_association_order: Vec<String>,
 }
 
 /// One region's hub configuration: the hub token timer expiry an account set there, and
@@ -604,6 +694,14 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
             configuration.region == region
                 && configuration.target() == (resource_type, resource_id)
         })
+    }
+
+    /// The account association `region`'s endpoint holds under `id`, if any. A record
+    /// created in another region is not visible here, as for every regional resource.
+    pub fn account_association_in(&self, region: &str, id: &str) -> Option<&AccountAssociation> {
+        self.account_associations
+            .get(id)
+            .filter(|association| association.region == region)
     }
 
     /// Take the next insertion sequence number.
@@ -1157,6 +1255,30 @@ pub fn ota_task_configuration_not_found_on_read(identifier: &str) -> ResourceNot
 /// The ARN of a managed thing in `region`, as the `ManagedThingArn` pattern requires.
 pub fn managed_thing_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(SERVICE_ARN_NAMESPACE, region, &format!("managed-thing/{id}"))
+}
+
+/// The ARN of an account association in `region`, as the `AccountAssociationArn` pattern
+/// (`^arn:aws:iotmanagedintegrations:[0-9a-zA-Z-]+:[0-9]+:account-association/[0-9a-zA-Z]+$`)
+/// requires.
+pub fn account_association_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        SERVICE_ARN_NAMESPACE,
+        region,
+        &format!("account-association/{id}"),
+    )
+}
+
+/// The modelled `ResourceNotFoundException` a READ answers for an account association the
+/// store does not hold under the identifier a request named: the read path's reason
+/// ([`resource_not_found_message`]) plus the `ResourceId` and `ResourceType` members,
+/// worded through the same two helpers every other resource of this service uses.
+pub fn account_association_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(
+            ACCOUNT_ASSOCIATION_RESOURCE_NAME,
+        )),
+        ..resource_not_found(ACCOUNT_ASSOCIATION_RESOURCE_TYPE, identifier)
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

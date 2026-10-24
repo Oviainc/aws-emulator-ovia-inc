@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccountAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccountAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccountAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an account association against the `ConnectorDestinationId` the request names
+//! and stores it in `crate::state`'s `account_associations`, so `GetAccountAssociation`
+//! and `ListAccountAssociations` report what this call was given. The record starts in
+//! `crate::state::INITIAL_ASSOCIATION_STATE` — leaving it needs the end user to
+//! authenticate at the third-party platform, which no clock in this emulator performs —
+//! and its `OAuthAuthorizationUrl` is `crate::state::NO_OAUTH_AUTHORIZATION_URL`. A
+//! retry carrying the same `ClientToken` replays the first call's answer.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +174,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccountAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccountAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccountAssociation"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAccountAssociationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the account-association store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // Every modelled constraint on this request (`@required`, the `@length` and
+        // `@pattern` of each member, the `TagsMap` size) is refused at the boundary, so
+        // reaching here means there is nothing left to check. The
+        // `ConnectorDestinationId` is NOT resolved against a stored connector
+        // destination: `CreateConnectorDestination` is still a scaffold stub, so this
+        // emulator holds no destination registry to resolve it against and cannot tell a
+        // destination that exists from one that does not.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let created_at = ::std::time::SystemTime::now();
+
+        // Retire the idempotency records the clock already made due, before anything
+        // reads them: a token past its TTL neither replays nor occupies the map.
+        store.retire_expired_idempotency_tokens(created_at);
+
+        // A retry with the same `ClientToken` answers with what the first call created,
+        // performing no further action. The token is scoped to the region that minted the
+        // record, as the record itself is.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store.replayed_resource_id(crate::state::ACCOUNT_ASSOCIATION_RESOURCE_TYPE, token)
+        });
+        if let Some(created) = replayed.and_then(|id| store.account_association_in(&region, &id)) {
+            return Ok(CreateAccountAssociationOutput {
+                account_association_id: created.id.clone(),
+                arn: Some(created.arn.clone()),
+                association_state: created.association_state.clone(),
+                o_auth_authorization_url: created.o_auth_authorization_url.clone(),
+            });
+        }
+
+        // The store is bounded: past its maximum a create is refused rather than grown
+        // into. The operation models no quota error, so the refusal is the modelled error
+        // closest to "this service will not take another one now".
+        if store.account_associations.len() >= crate::state::MAX_ACCOUNT_ASSOCIATIONS {
+            return Err(CreateAccountAssociationErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "this service holds the maximum of {} account associations; delete \
+                         one before creating another",
+                        crate::state::MAX_ACCOUNT_ASSOCIATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.take_sequence();
+        // `AccountAssociationId` is `^[0-9a-zA-Z]+$`, len 1..64, which the lowercase-hex
+        // opaque id satisfies.
+        let id = crate::state::opaque_id(sequence);
+        let arn = crate::state::account_association_arn(&region, &id);
+        let association = crate::state::AccountAssociation {
+            id: id.clone(),
+            arn: arn.clone(),
+            region: region.clone(),
+            connector_destination_id: input.connector_destination_id,
+            name: input.name,
+            description: input.description,
+            association_state: crate::state::INITIAL_ASSOCIATION_STATE.to_string(),
+            // An association that has not failed carries no error message.
+            error_message: None,
+            o_auth_authorization_url: crate::state::NO_OAUTH_AUTHORIZATION_URL.to_string(),
+            general_authorization: input.general_authorization,
+            tags: input.tags.unwrap_or_default(),
+            sequence,
+        };
+
+        if let Some(token) = input.client_token {
+            store.record_idempotency_token(
+                crate::state::ACCOUNT_ASSOCIATION_RESOURCE_TYPE,
+                &token,
+                &id,
+                created_at,
+            );
+        }
+        store.account_association_order.push(id.clone());
+        store
+            .account_associations
+            .insert(id.clone(), association.clone());
+
+        Ok(CreateAccountAssociationOutput {
+            account_association_id: id,
+            arn: Some(arn),
+            association_state: association.association_state,
+            o_auth_authorization_url: association.o_auth_authorization_url,
+        })
     }
 }
