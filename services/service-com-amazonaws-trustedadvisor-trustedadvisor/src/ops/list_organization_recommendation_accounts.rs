@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOrganizationRecommendationAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOrganizationRecommendationAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Resolves the `organizationRecommendationIdentifier` ARN in [`crate::state`]
+//! and reports ONE `AccountRecommendationLifecycleSummary` per member account
+//! recommendation that organization recommendation aggregates
+//! ([`crate::state::OrganizationRecommendationEntry`]'s
+//! `member_recommendation_arns`): the account that owns it (its ARN's account
+//! segment), that recommendation's ARN, and its OWN lifecycle members — never
+//! the organization recommendation's, which is a separate resource.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOrganizationRecommendationAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `affectedAccountId` keeps only the member recommendations owned by that
+//! account, and the page is in member-recommendation-ARN order, the same stable
+//! order every other list of this service pages in.
+//!
+//! A well-formed ARN that names nothing in the store is a
+//! `ResourceNotFoundException` (404); an identifier outside the modelled
+//! `length`/`pattern` never reaches this handler — the framework refuses it as
+//! a `ValidationException` (400) before `handle` runs — and a `nextToken` this
+//! read did not issue is refused with that same error.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +95,38 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// One member account's lifecycle of an organization recommendation, as the
+/// modelled `AccountRecommendationLifecycleSummary`.
+///
+/// Every member is read off the member account's own recommendation: the
+/// account id is that recommendation's ARN account segment (so the two can
+/// never disagree), and `lifecycleStage`, `updateReason`, `updateReasonCode`
+/// and `lastUpdatedAt` are the ones a caller last wrote through
+/// `UpdateRecommendationLifecycle` on it.
+///
+/// `updatedOnBehalfOf`/`updatedOnBehalfOfJobTitle` are documented as "only
+/// available when a Technical Account Manager takes an action on a
+/// recommendation" managed for the account
+/// (`smithy_query(query="doc",shape="AccountRecommendationLifecycleSummary",member="updatedOnBehalfOf")`):
+/// this API models no TAM action, so nothing in the store attributes an update
+/// to a TAM and there is no such attribution to report.
+fn account_lifecycle_summary(
+    entry: &crate::state::RecommendationEntry,
+) -> AccountRecommendationLifecycleSummary {
+    AccountRecommendationLifecycleSummary {
+        account_id: crate::state::arn_account(&entry.arn)
+            .filter(|account| !account.is_empty())
+            .map(str::to_string),
+        account_recommendation_arn: Some(entry.arn.clone()),
+        lifecycle_stage: entry.lifecycle_stage.clone(),
+        updated_on_behalf_of: None,
+        updated_on_behalf_of_job_title: None,
+        update_reason: entry.update_reason.clone(),
+        update_reason_code: entry.update_reason_code.clone(),
+        last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,30 +199,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // The support-level gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account's support plan does not include
-        // the Trusted Advisor API is refused with the modelled `AccessDeniedException`,
-        // which is the WHOLE answer the service gives such a request — no unimplemented
-        // behaviour is involved. An entitled caller still gets the 501 below. See
-        // [`crate::state::support_level_refusal`].
+        // `ctx` carries only request metadata; this operation reads nothing from it.
+        let _ = ctx;
+        // The support-level gate, ahead of everything else this handler does —
+        // ahead of resolving the identifier in particular, so an unentitled
+        // caller is never told whether an organization recommendation exists.
+        // See [`crate::state::support_level_refusal`].
         if let Some(denied) = crate::state::support_level_refusal(&*self.engine) {
             return Err(
                 ListOrganizationRecommendationAccountsErrorModeled::AccessDeniedException(denied)
                     .into(),
             );
         }
-        // Implement `ListOrganizationRecommendationAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOrganizationRecommendationAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListOrganizationRecommendationAccountsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the Trusted Advisor store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        let identifier = &input.organization_recommendation_identifier;
+        let Some(entry) = state.organization_recommendations.get(identifier) else {
+            return Err(
+                ListOrganizationRecommendationAccountsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "no organization recommendation with the identifier {identifier}"
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The accounts that own the resources of this aggregate recommendation
+        // are the accounts of the member recommendations it aggregates: each is
+        // reported from its own stored recommendation, so the lifecycle a member
+        // account wrote is what this list reports for it. A member ARN the store
+        // does not hold names no recommendation, and so no account.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOrganizationRecommendationAccounts"))
+        // The stored member list is an unordered set, so the page order is
+        // member-recommendation-ARN order — a stable sequence a cursor can point
+        // into, as in every other list of this service.
+        let mut matching: Vec<(String, AccountRecommendationLifecycleSummary)> = entry
+            .member_recommendation_arns
+            .iter()
+            .filter(|member_arn| {
+                input
+                    .affected_account_id
+                    .as_deref()
+                    .is_none_or(|account| crate::state::arn_account(member_arn) == Some(account))
+            })
+            .filter_map(|member_arn| {
+                let member = state.recommendations.get(member_arn)?;
+                Some((member_arn.clone(), account_lifecycle_summary(member)))
+            })
+            .collect();
+        matching.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        // The cursor's scope names this organization recommendation AND this
+        // read's filter, so a token issued for one organization
+        // recommendation's accounts (or under another `affectedAccountId`)
+        // cannot resume another sequence.
+        let page = crate::state::paginate(
+            &crate::state::list_scope(
+                &format!("organizationRecommendationAccounts/{identifier}"),
+                &[("affectedAccountId", input.affected_account_id.as_deref())],
+            ),
+            matching,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            ListOrganizationRecommendationAccountsErrorModeled::ValidationException(
+                ValidationException {
+                    message: "nextToken is not a pagination token this service issued for this \
+                              list"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        Ok(ListOrganizationRecommendationAccountsOutput {
+            next_token: page.next_token,
+            account_recommendation_lifecycle_summaries: page.items,
+        })
     }
 }
