@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayPeering
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayPeering`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a transit gateway peering on an edge location of a core network: the peering is
+//! MINTED here, its id, ARN, edge location (the Region the peered transit gateway is in),
+//! the id of the peering attachment it leaves on that gateway and its timestamps computed
+//! and stored, and every later read of the peering answers from that record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayPeering::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This file is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +150,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayPeering` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayPeeringErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayPeering"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTransitGatewayPeeringErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The same tag rules `TagResource` applies hold for the tags a create carries.
+        // This operation models no `ServiceQuotaExceededException`, so the per-resource tag
+        // quota is refused through the `ValidationException` it does model.
+        if let Err(problem) = crate::state::check_requested_tags(input.tags.as_ref()) {
+            return Err(CreateTransitGatewayPeeringErrorModeled::ValidationException(
+                crate::state::tag_problem_rejection(problem),
+            )
+            .into());
+        }
+
+        // A peering is a connection OF a core network ("The ID of a core network",
+        // `smithy_query query="doc" shape="CreateTransitGatewayPeeringRequest"
+        // member="CoreNetworkId"`), so one naming nothing would leave the record with a
+        // dangling back-reference. Like every create of this service, an unresolvable
+        // reference is a FIELD failure on the member that carried it.
+        let core_network = store
+            .core_networks
+            .get(&input.core_network_id)
+            .ok_or_else(|| {
+                CreateTransitGatewayPeeringErrorModeled::ValidationException(
+                    crate::state::unknown_reference(
+                        crate::state::FIELD_CORE_NETWORK_ID,
+                        crate::state::CORE_NETWORK_KIND,
+                    ),
+                )
+            })?;
+
+        // The peering's edge location is the Region the peered transit gateway is in — no
+        // request member carries it — and it has to be one the core network's policy
+        // configures an edge for, since a peering peers an EDGE of the core network with
+        // that gateway. `TransitGatewayArn` carries only a length and a permissive pattern,
+        // so establishing that the string names a transit gateway at all is the handler's.
+        let edge_location = crate::state::ec2_resource_region(
+            &input.transit_gateway_arn,
+            crate::state::TRANSIT_GATEWAY_TYPE,
+        )
+        .ok_or_else(|| {
+            CreateTransitGatewayPeeringErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_TRANSIT_GATEWAY_ARN,
+                    crate::state::REASON_FIELD_VALIDATION_FAILED,
+                    "must name a transit gateway and the Region it is in".to_string(),
+                ),
+            )
+        })?
+        .to_string();
+        if !core_network.topology.has_edge_location(&edge_location) {
+            return Err(CreateTransitGatewayPeeringErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_TRANSIT_GATEWAY_ARN,
+                    crate::state::VALIDATION_REASON_OTHER,
+                    format!(
+                        "core network {} configures no edge location in {edge_location}",
+                        input.core_network_id
+                    ),
+                ),
+            )
+            .into());
+        }
+        let core_network_arn = core_network.arn.clone();
+
+        // `ClientToken` is the operation's modelled `@idempotencyToken`, so a retry of the
+        // same request answers the record the first call minted instead of minting a second
+        // peering; the same token asking for something else is a conflict. This is resolved
+        // BEFORE the one-peering-per-gateway rule below, so a retry answers the peering it
+        // created rather than colliding with it.
+        if let Some(token) = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+        {
+            if let Some(existing) = store
+                .peerings
+                .values()
+                .find(|record| record.client_token.as_deref() == Some(token))
+            {
+                let same_request = existing.core_network_id == input.core_network_id
+                    && existing.resource_arn == input.transit_gateway_arn
+                    && crate::state::same_tags(
+                        &existing.tags,
+                        input.tags.as_deref().unwrap_or_default(),
+                    );
+                if same_request {
+                    return Ok(CreateTransitGatewayPeeringOutput {
+                        transit_gateway_peering: Some(existing.to_transit_gateway_peering(now)),
+                    });
+                }
+                return Err(CreateTransitGatewayPeeringErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "client token {token:?} already created peering {}, with a different request",
+                            existing.id
+                        ),
+                        resource_id: existing.id.clone(),
+                        resource_type: crate::state::PEERING_KIND.to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A transit gateway is peered with one core network at a time, so a second peering
+        // of the same gateway is the service's concurrent-state conflict and stores nothing.
+        if let Some(existing) = store
+            .peerings
+            .values()
+            .find(|record| record.resource_arn == input.transit_gateway_arn)
+        {
+            return Err(CreateTransitGatewayPeeringErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "transit gateway {} is already peered by peering {}",
+                        input.transit_gateway_arn, existing.id
+                    ),
+                    resource_id: existing.id.clone(),
+                    resource_type: crate::state::PEERING_KIND.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // A quota bounds how many peerings one core network can be made to hold: at the cap
+        // the create is refused and nothing is stored, so a repeated call cannot grow the
+        // store without end.
+        let held = store.peering_count_of_core_network(&input.core_network_id);
+        if held >= crate::state::MAX_PEERINGS_PER_CORE_NETWORK {
+            return Err(CreateTransitGatewayPeeringErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_CORE_NETWORK_ID,
+                    crate::state::VALIDATION_REASON_OTHER,
+                    format!(
+                        "core network {} already holds the maximum of {} peerings",
+                        input.core_network_id,
+                        crate::state::MAX_PEERINGS_PER_CORE_NETWORK
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let id = store.next_id(crate::state::PEERING_KIND);
+        // The peering attachment the peered transit gateway holds is a resource of that
+        // gateway rather than a request member, so its id is minted here under the prefix
+        // the model's own pattern fixes.
+        let transit_gateway_peering_attachment_id =
+            store.next_id(crate::state::TRANSIT_GATEWAY_PEERING_ATTACHMENT_KIND);
+        let record = crate::state::PeeringRecord {
+            arn: crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn(
+                crate::state::PEERING_KIND,
+                &id,
+            ),
+            id: id.clone(),
+            core_network_id: input.core_network_id,
+            core_network_arn,
+            peering_type: crate::state::PEERING_TYPE_TRANSIT_GATEWAY,
+            edge_location,
+            // The resource this peering peers with is the transit gateway itself, which is
+            // also the `TransitGatewayArn` the shape reports.
+            resource_arn: input.transit_gateway_arn,
+            transit_gateway_peering_attachment_id,
+            created_at: now,
+            available_at: now + crate::state::SETTLE_DELAY,
+            client_token: input.client_token.filter(|token| !token.is_empty()),
+            tags: input.tags.unwrap_or_default(),
+        };
+        // The peering is `CREATING` until the settle span the clock owes elapses, so the
+        // response reports the state the stored record is in now.
+        let transit_gateway_peering = record.to_transit_gateway_peering(now);
+        store.peerings.insert(id, record);
+
+        Ok(CreateTransitGatewayPeeringOutput {
+            transit_gateway_peering: Some(transit_gateway_peering),
+        })
     }
 }
+
