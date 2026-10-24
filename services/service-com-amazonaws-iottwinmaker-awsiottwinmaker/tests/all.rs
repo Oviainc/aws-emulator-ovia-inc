@@ -68,6 +68,9 @@ mod scene_delete;
 #[path = "all/scene_lifecycle.rs"]
 mod scene_lifecycle;
 
+#[path = "all/scene_listing.rs"]
+mod scene_listing;
+
 #[path = "all/scene_read.rs"]
 mod scene_read;
 

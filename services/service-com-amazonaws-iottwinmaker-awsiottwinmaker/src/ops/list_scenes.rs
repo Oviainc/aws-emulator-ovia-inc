@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListScenes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListScenes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the scenes of ONE workspace — "Lists all scenes in a workspace" — in
+//! `sceneId` order, a page at a time, each row built from the STORED scene
+//! record the create persisted, so a summary says about a scene exactly what
+//! `GetScene` says about it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListScenes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The workspace is the listing's scope: a request naming a workspace this
+//! service does not hold is refused with the `ValidationException` (HTTP 400)
+//! this operation models — it declares no `ResourceNotFoundException`, so a
+//! missing scope is reported through the only client error it has, the same
+//! choice `ListComponentTypes` and `ListSyncJobs` make.
+//!
+//! `maxResults` caps the page. This member's documentation publishes neither a
+//! default nor a minimum ("Specifies the maximum number of results to display"),
+//! so the only bounds that are AWS's here are its modelled `range` (0..200): a
+//! zero is a page of no rows — the maximum number of results to display,
+//! literally — and not a refusal this handler invents, and a request naming none
+//! is served this service's own [`crate::state::DEFAULT_PAGE_SIZE`] rather than
+//! every scene. The service never serves more than
+//! [`crate::state::MAX_PAGE_SIZE`] rows whatever is asked for. The opaque
+//! `nextToken` resumes at the next `sceneId` rather than at an offset, so a page
+//! boundary survives a scene being created or deleted between two pages; it is
+//! bound to the workspace it was minted for, and a token this listing did not
+//! mint is refused with the same `ValidationException`.
+//!
+//! This is a REPORTING operation: it writes nothing — not even a lifecycle
+//! transition, because a scene carries no `state` member anywhere in its API and
+//! is ready as soon as it is created, so the clock owes it none (see
+//! [`crate::state::Scene`]).
+//!
+//! The modelled `AccessDeniedException` and `ThrottlingException` are
+//! deliberately unreachable here: this emulator models no caller principal and
+//! no rate state, so nothing this handler can read would decide either, and a
+//! served page is never evidence that a real authorization or quota check
+//! passed.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +173,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListScenes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListScenesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListScenes"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and a page served is a read of tenant state.
+        ::tracing::info!(
+            operation = "ListScenes",
+            workspace_id = %input.workspace_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListScenesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        // A read, so the store is borrowed immutably: a scene is stored in no
+        // non-terminal state, so this call has no transition to materialise and
+        // nothing a later caller sees changes because a page was served.
+        let state = state.lock();
+
+        let invalid = |message: String| {
+            ListScenesErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        };
+
+        // A scene lives INSIDE a workspace, so a workspace this service does not
+        // hold holds no scene to list. This operation models no
+        // `ResourceNotFoundException`, so the refusal is the `ValidationException`
+        // it does model — the same choice `ListComponentTypes` makes for the same
+        // missing parent.
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+            return Err(invalid(crate::state::workspace_not_found_message(
+                &input.workspace_id,
+            ))
+            .into());
+        };
+
+        // A `nextToken` carries the `sceneId` the page resumes AT (inclusive),
+        // not an offset, so a page boundary survives a scene being created or
+        // deleted between two pages. It is bound to the workspace it was minted
+        // for, so a token from another listing — or from this listing taken over
+        // another workspace — is refused rather than silently resumed.
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                decode_next_token(token, &input.workspace_id).ok_or_else(|| {
+                    // The token itself is NOT echoed back: it is opaque to the
+                    // caller and modelled up to 17880 characters, so the refusal
+                    // names the member and what is wrong with it rather than
+                    // copying an arbitrary request string into the response.
+                    invalid("nextToken is not a token this listing minted".to_string())
+                })?,
+            ),
+        };
+
+        // The page size served. THIS member's documentation publishes no default
+        // and no minimum, so a zero is served as what it says — a page of no rows
+        // — rather than refused, and a request naming no `maxResults` is served
+        // this service's own default instead of the whole workspace. Whatever is
+        // asked for, the service serves at most `crate::state::MAX_PAGE_SIZE`, so
+        // the page this call BUILDS is bounded by this code and not only by the
+        // boundary validator. The token a zero-row page answers names the
+        // position the call STARTED from — a page of no rows consumed none — so a
+        // generated paginator must not be driven at zero: it would ask again from
+        // the same place forever.
+        let page_size = match input.max_results {
+            None => crate::state::DEFAULT_PAGE_SIZE,
+            // The conversion can only fail on a NEGATIVE value, which the
+            // modelled range refuses before this handler runs — so this arm is
+            // belt-and-braces. It fails CLOSED (the modelled refusal, naming the
+            // member and the published range) rather than falling back to the
+            // largest page, so a page size nothing could have asked for can never
+            // resolve to the most permissive answer.
+            Some(requested) => usize::try_from(requested)
+                .map_err(|_| {
+                    invalid(format!(
+                        "maxResults must be between 0 and {MODELLED_MAX_RESULTS}, got {requested}"
+                    ))
+                })?
+                .min(crate::state::MAX_PAGE_SIZE),
+        };
+
+        // `scenes` is keyed by `sceneId`, so iterating the map IS id order and
+        // resuming is a `range` from the token's key: the page starts at the
+        // first id at or past it without walking what came before.
+        let mut remaining = match &resume_at {
+            Some(from) => workspace.scenes.range(from.clone()..),
+            None => workspace.scenes.range::<String, _>(..),
+        }
+        .map(|(_, scene)| scene);
+
+        let mut scene_summaries = Vec::new();
+        for scene in remaining.by_ref().take(page_size) {
+            scene_summaries.push(SceneSummary {
+                scene_id: scene.scene_id.clone(),
+                arn: scene.arn.clone(),
+                content_location: scene.content_location.clone(),
+                // Reported exactly as stored, which is how `GetScene` reports
+                // it: a scene created without a description carries none, and
+                // the member is omitted rather than served as an empty string.
+                description: scene.description.clone(),
+                creation_date_time: crate::state::timestamp(scene.creation_date_time),
+                update_date_time: crate::state::timestamp(scene.update_date_time),
+            });
+        }
+        // The token the next call resumes at: the first scene this page left
+        // over. Absent on the last page, which is how a caller knows to stop.
+        let next_token = remaining
+            .next()
+            .map(|scene| encode_next_token(&input.workspace_id, &scene.scene_id));
+
+        Ok(ListScenesOutput {
+            // Present, not omitted, for a workspace holding no scene: the member
+            // is how a caller reads the set, and an empty list says there is
+            // none where an absent member cannot be told from an unanswered
+            // read.
+            scene_summaries: Some(scene_summaries),
+            next_token,
+        })
     }
+}
+
+/// The top of the `maxResults` member's modelled `range` (0..200), which is the
+/// only maximum published for it — its documentation names none.
+///
+/// This listing never serves a page larger than [`crate::state::MAX_PAGE_SIZE`],
+/// so that ceiling must be EXACTLY what this operation's member admits — no
+/// larger, or a page could leave the range the model allows; no smaller, or a
+/// `maxResults` this member admits would be silently narrowed — and the default
+/// may never exceed it. Checked at COMPILE time, so moving either past what the
+/// model allows fails the build instead of serving a page the member could not
+/// have asked for or quietly shortening one it did.
+const MODELLED_MAX_RESULTS: usize = 200;
+const _: () = assert!(crate::state::MAX_PAGE_SIZE == MODELLED_MAX_RESULTS);
+const _: () = assert!(crate::state::DEFAULT_PAGE_SIZE <= MODELLED_MAX_RESULTS);
+
+/// The envelope a `nextToken` of this listing carries, so a token minted
+/// elsewhere — by another listing of this service, for another workspace, or by
+/// hand — is recognisably not one of ours. The token itself is the shape every
+/// paginated operation of this service mints
+/// ([`crate::state::encode_page_token`]), scoped to the workspace whose page it
+/// is.
+const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:scenes:1:";
+
+/// The opaque `nextToken` for a page of `workspace_id` starting at `scene_id`.
+fn encode_next_token(workspace_id: &str, scene_id: &str) -> String {
+    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id], scene_id)
+}
+
+/// The scene id inside a `nextToken` minted for `workspace_id`, or `None` when
+/// the token is not one this listing minted for that workspace.
+fn decode_next_token(token: &str, workspace_id: &str) -> Option<String> {
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id], token)
 }

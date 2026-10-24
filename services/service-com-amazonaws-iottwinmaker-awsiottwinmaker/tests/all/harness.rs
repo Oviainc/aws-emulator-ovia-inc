@@ -281,6 +281,18 @@ impl Emulator {
         .await
     }
 
+    /// `ListScenes`: POST /workspaces/{workspaceId}/scenes-list, with the
+    /// workspace as the only `@httpLabel` and the page members (`maxResults`,
+    /// `nextToken`) carried in the body.
+    pub(crate) async fn list_scenes(&self, workspace_id: &str, body: Value) -> Resp {
+        self.call(
+            "POST",
+            &format!("/workspaces/{workspace_id}/scenes-list"),
+            Some(body),
+        )
+        .await
+    }
+
     /// `DeleteScene`: DELETE on the scene's own path, with both ids as
     /// `@httpLabel`s and no body.
     pub(crate) async fn delete_scene(&self, workspace_id: &str, scene_id: &str) -> Resp {
