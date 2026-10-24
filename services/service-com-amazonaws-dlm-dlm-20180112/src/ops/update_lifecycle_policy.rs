@@ -224,16 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exist before its kind can be read) and before the first write, so a
         // refused update leaves the stored policy exactly as it was.
         if !policy.default_policy {
-            let mut refused = crate::state::DefaultPolicyOnlyParameters {
-                resource_type: false,
-                create_interval: input.create_interval.is_some(),
-                retain_interval: input.retain_interval.is_some(),
-                copy_tags: input.copy_tags.is_some(),
-                cross_region_copy_targets: input.cross_region_copy_targets.is_some(),
-                extend_deletion: input.extend_deletion.is_some(),
-                exclusions: input.exclusions.is_some(),
-            }
-            .stated_names("");
+            let mut refused = default_policy_only_body_parameters(&input).stated_names("");
             refused.extend(
                 crate::state::DefaultPolicyOnlyParameters::in_policy_details(
                     input.policy_details.as_ref(),
@@ -268,30 +259,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The one cross-member rule a default policy's configuration follows
+        // wherever it is stated, which `CreateLifecyclePolicy` documents for the
+        // parameters this operation declares too: "you can specify the request
+        // parameters either in the request body, or in the PolicyDetails request
+        // structure, but not both". Refused before the first write, so a request
+        // stating the configuration twice leaves no record holding two copies of
+        // it.
+        if policy.default_policy && input.policy_details.is_some() {
+            let duplicated = default_policy_only_body_parameters(&input).stated_names("");
+            if !duplicated.is_empty() {
+                return Err(
+                    UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
+                        crate::state::configuration_stated_twice(&duplicated),
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // The documented numeric domain of a default policy's cadence, as at
         // create: the creation frequency's 1-to-7 days, the retention period's
         // 2-to-14 days, and a retention period greater than the creation
         // frequency. An update may state only one of the two, so the ordering is
-        // judged against what the policy already holds for the other: the body
-        // value a create or an earlier update stored, or — unless THIS request
-        // replaces the configuration structure — the one inside it. Refused
-        // before the first write, so the stored policy is left exactly as it was.
+        // judged against what the policy already holds for the other — unless
+        // THIS request states the configuration structure, which replaces that
+        // configuration wholesale and so leaves nothing of it to compare
+        // against. Refused before the first write, so the stored policy is left
+        // exactly as it was.
         let replaced_details = input.policy_details.as_ref();
-        let kept_details = replaced_details
-            .is_none()
-            .then_some(policy.policy_details.as_ref())
-            .flatten();
+        let keeps_stored_configuration = replaced_details.is_none();
         if let Some(refusal) = (crate::state::Cadence {
             body_create_interval: input.create_interval,
             body_retain_interval: input.retain_interval,
             details_create_interval: replaced_details.and_then(|details| details.create_interval),
             details_retain_interval: replaced_details.and_then(|details| details.retain_interval),
-            stored_create_interval: policy
-                .create_interval
-                .or_else(|| kept_details.and_then(|details| details.create_interval)),
-            stored_retain_interval: policy
-                .retain_interval
-                .or_else(|| kept_details.and_then(|details| details.retain_interval)),
+            stored_create_interval: keeps_stored_configuration
+                .then_some(policy.create_interval)
+                .flatten(),
+            stored_retain_interval: keeps_stored_configuration
+                .then_some(policy.retain_interval)
+                .flatten(),
         })
         .violation()
         {
@@ -314,8 +322,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(policy_details) = input.policy_details {
             // As at create: the replacement configuration is stored with the
-            // service-materialized members stamped onto it.
-            policy.policy_details = Some(crate::state::materialized_policy_details(policy_details));
+            // service-materialized members stamped onto it, and a default
+            // policy's `[Default policies only]` members are MOVED out of it
+            // onto the record, the one place this service keeps them. The
+            // structure is "the configuration of the lifecycle policy", so it
+            // replaces that configuration WHOLESALE: the members it states take
+            // effect and the ones it omits go back to their documented defaults.
+            // A policy that is not a default policy holds none of those members
+            // and may state none (refused above), so for one of those this moves
+            // nothing and replaces nothing.
+            let mut details = crate::state::materialized_policy_details(policy_details);
+            let configuration =
+                crate::state::DefaultPolicyConfiguration::taken_from_policy_details(&mut details);
+            policy.replace_default_policy_configuration(configuration);
+            policy.policy_details = Some(details);
         }
         if let Some(create_interval) = input.create_interval {
             policy.create_interval = Some(create_interval);
@@ -339,5 +359,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         policy.date_modified = now;
 
         Ok(UpdateLifecyclePolicyOutput {})
+    }
+}
+
+/// The `[Default policies only]` parameters this request states in the request
+/// BODY, as against inside its `PolicyDetails` structure.
+///
+/// The ONE place this operation maps its request-body members onto that set, so
+/// the refusal of a default-only parameter and the "either in the request body,
+/// or in the PolicyDetails request structure, but not both" rule read the same
+/// list — as `create_lifecycle_policy.rs` does for the create's own input.
+///
+/// `PolicyDetails$ResourceType` has no request-body counterpart to read: the
+/// resource type is not something an update may change.
+fn default_policy_only_body_parameters(
+    input: &UpdateLifecyclePolicyInput,
+) -> crate::state::DefaultPolicyOnlyParameters {
+    crate::state::DefaultPolicyOnlyParameters {
+        resource_type: false,
+        create_interval: input.create_interval.is_some(),
+        retain_interval: input.retain_interval.is_some(),
+        copy_tags: input.copy_tags.is_some(),
+        cross_region_copy_targets: input.cross_region_copy_targets.is_some(),
+        extend_deletion: input.extend_deletion.is_some(),
+        exclusions: input.exclusions.is_some(),
     }
 }

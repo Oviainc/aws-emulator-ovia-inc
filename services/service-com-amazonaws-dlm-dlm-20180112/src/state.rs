@@ -350,6 +350,63 @@ pub fn materialized_policy_details(mut details: PolicyDetails) -> PolicyDetails 
     details
 }
 
+/// A DEFAULT policy's `[Default policies only]` configuration, in the ONE form
+/// [`LifecyclePolicyRecord`] keeps it in.
+///
+/// Every one of these members is declared twice over — by
+/// `CreateLifecyclePolicyRequest` / `UpdateLifecyclePolicyRequest` at the request
+/// body level and by `PolicyDetails` inside the configuration structure — and a
+/// request states the configuration in one place or the other. Two stored copies
+/// of one member would need a precedence between them, and any fixed precedence
+/// makes a write to the losing place unobservable, so the write paths resolve the
+/// two into this ONE value and the read reports it.
+#[derive(Debug, Clone, Default)]
+pub struct DefaultPolicyConfiguration {
+    pub create_interval: Option<i32>,
+    pub retain_interval: Option<i32>,
+    pub copy_tags: Option<bool>,
+    pub extend_deletion: Option<bool>,
+    pub cross_region_copy_targets: Option<Vec<CrossRegionCopyTarget>>,
+    pub exclusions: Option<Exclusions>,
+}
+
+impl DefaultPolicyConfiguration {
+    /// The configuration `details` states, MOVED OUT of it.
+    ///
+    /// Taking rather than copying is what leaves one stored copy per member: the
+    /// structure the record goes on to hold carries the configuration members
+    /// that are not `[Default policies only]`, and this carries the ones that
+    /// are.
+    pub fn taken_from_policy_details(details: &mut PolicyDetails) -> Self {
+        Self {
+            create_interval: details.create_interval.take(),
+            retain_interval: details.retain_interval.take(),
+            copy_tags: details.copy_tags.take(),
+            extend_deletion: details.extend_deletion.take(),
+            cross_region_copy_targets: details.cross_region_copy_targets.take(),
+            exclusions: details.exclusions.take(),
+        }
+    }
+
+    /// This configuration where it states a member, `fallback` elsewhere.
+    ///
+    /// A request that states the same member in both places is refused
+    /// ([`configuration_stated_twice`]), so at most one side states each member
+    /// and the precedence never decides anything a caller can observe.
+    pub fn or(self, fallback: Self) -> Self {
+        Self {
+            create_interval: self.create_interval.or(fallback.create_interval),
+            retain_interval: self.retain_interval.or(fallback.retain_interval),
+            copy_tags: self.copy_tags.or(fallback.copy_tags),
+            extend_deletion: self.extend_deletion.or(fallback.extend_deletion),
+            cross_region_copy_targets: self
+                .cross_region_copy_targets
+                .or(fallback.cross_region_copy_targets),
+            exclusions: self.exclusions.or(fallback.exclusions),
+        }
+    }
+}
+
 /// One Amazon Data Lifecycle Manager lifecycle policy, as this emulator persists
 /// it. Every member a read operation reports comes from here, never from the
 /// request being served.
@@ -376,6 +433,8 @@ pub struct LifecyclePolicyRecord {
     pub default_policy: bool,
     /// `DefaultPolicyTypeValues` (`INSTANCE` | `VOLUME`) for a default policy.
     pub default_policy_type: Option<String>,
+    /// The `[Default policies only]` configuration, in the ONE place this record
+    /// keeps it — see [`DefaultPolicyConfiguration`].
     pub create_interval: Option<i32>,
     pub retain_interval: Option<i32>,
     pub copy_tags: Option<bool>,
@@ -390,12 +449,15 @@ impl LifecyclePolicyRecord {
     /// lifecycle policy".
     ///
     /// A CUSTOM policy's configuration is exactly the structure the request
-    /// carried. A DEFAULT policy's may instead have been stated in the request
-    /// body — `CreateLifecyclePolicy` documents the two as alternatives ("either
-    /// in the request body, or in the PolicyDetails request structure, but not
-    /// both") — so for one of those the stored body parameters are reported
-    /// here, each with the default its member documents when the request named
-    /// no value.
+    /// carried. A DEFAULT policy's may have been stated in the request body
+    /// instead — `CreateLifecyclePolicy` documents the two as alternatives
+    /// ("either in the request body, or in the PolicyDetails request structure,
+    /// but not both") — so whichever place a request stated it in, the write
+    /// path moved it onto the record's own fields
+    /// ([`DefaultPolicyConfiguration`]). This reports THOSE, each with the
+    /// default its member documents when nothing stated a value, so there is one
+    /// stored value per configuration member and the last write of it is what
+    /// every later read reports.
     ///
     /// A CUSTOM policy therefore reports its stored structure and nothing else,
     /// and that loses nothing: every one of the `[Default policies only]` fields
@@ -414,31 +476,37 @@ impl LifecyclePolicyRecord {
             .default_policy_type
             .clone()
             .or(details.resource_type.clone());
-        details.create_interval = Some(
-            self.create_interval
-                .or(details.create_interval)
-                .unwrap_or(DEFAULT_CREATE_INTERVAL),
-        );
-        details.retain_interval = Some(
-            self.retain_interval
-                .or(details.retain_interval)
-                .unwrap_or(DEFAULT_RETAIN_INTERVAL),
-        );
-        details.copy_tags = Some(
-            self.copy_tags
-                .or(details.copy_tags)
-                .unwrap_or(DEFAULT_COPY_TAGS),
-        );
-        details.extend_deletion = Some(
-            self.extend_deletion
-                .or(details.extend_deletion)
-                .unwrap_or(DEFAULT_EXTEND_DELETION),
-        );
-        if !self.cross_region_copy_targets.is_empty() {
-            details.cross_region_copy_targets = Some(self.cross_region_copy_targets.clone());
-        }
-        details.exclusions = self.exclusions.clone().or(details.exclusions.clone());
+        details.create_interval = Some(self.create_interval.unwrap_or(DEFAULT_CREATE_INTERVAL));
+        details.retain_interval = Some(self.retain_interval.unwrap_or(DEFAULT_RETAIN_INTERVAL));
+        details.copy_tags = Some(self.copy_tags.unwrap_or(DEFAULT_COPY_TAGS));
+        details.extend_deletion = Some(self.extend_deletion.unwrap_or(DEFAULT_EXTEND_DELETION));
+        // A destination list is reported only when the policy copies somewhere:
+        // `CrossRegionCopyTargetList` is `@length(min: 0)`, so a policy that
+        // states the empty list states "no cross-Region copies", which the member
+        // documents as the state of omitting it.
+        details.cross_region_copy_targets = (!self.cross_region_copy_targets.is_empty())
+            .then(|| self.cross_region_copy_targets.clone());
+        details.exclusions = self.exclusions.clone();
         Some(details)
+    }
+
+    /// Replace this policy's `[Default policies only]` configuration with
+    /// `configuration`.
+    ///
+    /// WHOLESALE: every member `configuration` states takes effect and every
+    /// member it omits goes back to the default its own documentation publishes,
+    /// because the `PolicyDetails` structure a request states IS "the
+    /// configuration of the lifecycle policy" rather than a patch of it.
+    pub fn replace_default_policy_configuration(
+        &mut self,
+        configuration: DefaultPolicyConfiguration,
+    ) {
+        self.create_interval = configuration.create_interval;
+        self.retain_interval = configuration.retain_interval;
+        self.copy_tags = configuration.copy_tags;
+        self.extend_deletion = configuration.extend_deletion;
+        self.cross_region_copy_targets = configuration.cross_region_copy_targets.unwrap_or_default();
+        self.exclusions = configuration.exclusions;
     }
 
     /// This policy's `PolicyTypeValues`.
@@ -716,7 +784,8 @@ pub fn required_parameters_omitted(
 
 /// The prefix [`DefaultPolicyOnlyParameters::stated_names`] qualifies a member
 /// stated inside the `PolicyDetails` configuration structure with, so a refusal
-/// tells a caller WHERE it stated the parameter.
+/// tells a caller WHERE it stated the parameter. The unqualified name of the
+/// structure itself is [`POLICY_DETAILS_MEMBER`].
 pub const POLICY_DETAILS_PREFIX: &str = "PolicyDetails.";
 
 /// Which `[Default policies only]` configuration members a request states,
@@ -779,6 +848,33 @@ impl DefaultPolicyOnlyParameters {
         .collect()
     }
 }
+
+/// The `InvalidRequestException` for a DEFAULT policy request that states its
+/// configuration in the request body AND as a `PolicyDetails` structure.
+///
+/// `CreateLifecyclePolicy` documents the two as alternatives: "If you create a
+/// default policy, you can specify the request parameters either in the request
+/// body, or in the PolicyDetails request structure, but not both." The rule is
+/// about one request's parameters, so it holds for every request that carries
+/// them — the message is built from the request, naming the body parameters it
+/// duplicated, and `MutuallyExclusiveParameters` lists them beside the structure
+/// they cannot be combined with.
+pub fn configuration_stated_twice(body_parameters: &[String]) -> InvalidRequestException {
+    let mut parameters = vec![POLICY_DETAILS_MEMBER.to_string()];
+    parameters.extend(body_parameters.iter().cloned());
+    parameters_cannot_be_combined(
+        format!(
+            "a default policy specifies {} either in the request body or in \
+             {POLICY_DETAILS_MEMBER}, but not both",
+            body_parameters.join(", ")
+        ),
+        parameters,
+    )
+}
+
+/// The wire name of the configuration structure the body parameters are an
+/// alternative to.
+pub const POLICY_DETAILS_MEMBER: &str = "PolicyDetails";
 
 /// The `InvalidRequestException` for `[Default policies only]` parameters stated
 /// by a request that is not creating or updating a DEFAULT policy.

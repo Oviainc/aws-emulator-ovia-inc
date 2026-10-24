@@ -211,17 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if is_default && input.policy_details.is_some() {
             let duplicated = stated_in_body.stated_names("");
             if !duplicated.is_empty() {
-                let mut parameters = vec!["PolicyDetails".to_string()];
-                parameters.extend(duplicated.iter().cloned());
                 return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
-                    crate::state::parameters_cannot_be_combined(
-                        format!(
-                            "a default policy specifies {} either in the request body or in \
-                             PolicyDetails, but not both",
-                            duplicated.join(", ")
-                        ),
-                        parameters,
-                    ),
+                    crate::state::configuration_stated_twice(&duplicated),
                 )
                 .into());
             }
@@ -361,6 +352,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The configuration is stored with every member the service
+        // materializes already stamped onto it, so a read reports the stored
+        // record rather than synthesizing a default per call.
+        let mut policy_details = input
+            .policy_details
+            .map(crate::state::materialized_policy_details);
+        // A default policy's `[Default policies only]` configuration is stored in
+        // ONE place — the record's own fields — whichever of the two alternative
+        // places this request stated it in: the members stated inside the
+        // structure are MOVED out of it onto the record, so no stored value can
+        // shadow another and a later update of either form is what a read
+        // reports. A request that is not creating a default policy may state none
+        // of them anywhere (refused above), so this moves nothing for one.
+        let configuration = crate::state::DefaultPolicyConfiguration {
+            create_interval: input.create_interval,
+            retain_interval: input.retain_interval,
+            copy_tags: input.copy_tags,
+            extend_deletion: input.extend_deletion,
+            cross_region_copy_targets: input.cross_region_copy_targets,
+            exclusions: input.exclusions,
+        }
+        .or(policy_details
+            .as_mut()
+            .map(crate::state::DefaultPolicyConfiguration::taken_from_policy_details)
+            .unwrap_or_default());
+
         let policy_id = store.mint_policy_id();
         let record = crate::state::LifecyclePolicyRecord {
             policy_arn: crate::state::policy_arn(&policy_id, &region),
@@ -376,20 +393,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             execution_role_arn: input.execution_role_arn,
             date_created: now,
             date_modified: now,
-            // The configuration is stored with every member the service
-            // materializes already stamped onto it, so a read reports the
-            // stored record rather than synthesizing a default per call.
-            policy_details: input
-                .policy_details
-                .map(crate::state::materialized_policy_details),
+            policy_details,
             default_policy: is_default,
             default_policy_type,
-            create_interval: input.create_interval,
-            retain_interval: input.retain_interval,
-            copy_tags: input.copy_tags,
-            extend_deletion: input.extend_deletion,
-            cross_region_copy_targets: input.cross_region_copy_targets.unwrap_or_default(),
-            exclusions: input.exclusions,
+            create_interval: configuration.create_interval,
+            retain_interval: configuration.retain_interval,
+            copy_tags: configuration.copy_tags,
+            extend_deletion: configuration.extend_deletion,
+            cross_region_copy_targets: configuration.cross_region_copy_targets.unwrap_or_default(),
+            exclusions: configuration.exclusions,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
         };
         store.policies.insert(policy_id.clone(), record);
