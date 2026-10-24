@@ -89,6 +89,8 @@ mod gateway_lifecycle;
 mod hierarchies_etags_and_refusals;
 #[path = "all/logging_options.rs"]
 mod logging_options;
+#[path = "all/portal_lifecycle.rs"]
+mod portal_lifecycle;
 #[path = "all/property_value_history.rs"]
 mod property_value_history;
 #[path = "all/resource_tags.rs"]

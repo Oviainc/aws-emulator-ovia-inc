@@ -196,12 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::constraint_report`), which echoes no request value.
         //
         // `recommendedActionTypes` is required and names the action types to
-        // include, so an empty list selects nothing at all.
-        if input.recommended_action_types.is_empty() {
-            return Err(invalid_parameter(crate::state::constraint_report(
-                "recommendedActionTypes",
-                "Member must have length greater than or equal to 1",
-            )));
+        // include, so an empty list selects nothing at all — judged by the one
+        // check every operation taking the member shares.
+        if let Some(report) =
+            crate::state::recommended_action_types_violation(&input.recommended_action_types)
+        {
+            return Err(invalid_parameter(report));
         }
         // `organizationScope` names the accounts of an ORGANIZATION preview; an
         // account-scoped rule previews only the account it lives in, so a scope

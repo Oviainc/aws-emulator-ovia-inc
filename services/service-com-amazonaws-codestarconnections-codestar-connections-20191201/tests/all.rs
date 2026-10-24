@@ -23,6 +23,8 @@ mod host_lifecycle;
 mod host_listing;
 #[path = "all/repository_link_lifecycle.rs"]
 mod repository_link_lifecycle;
+#[path = "all/repository_link_reads.rs"]
+mod repository_link_reads;
 #[path = "all/sdk_target_dispatch.rs"]
 mod sdk_target_dispatch;
 #[path = "all/state_roundtrip.rs"]

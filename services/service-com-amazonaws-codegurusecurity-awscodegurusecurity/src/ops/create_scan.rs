@@ -349,6 +349,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at_millis: now,
             updated_at_millis: None,
             error_message: None,
+            // What this run has to analyse: the resource uploaded to the artifact's
+            // minted target, if the caller performed that upload before starting the
+            // run. Read once, here, so the run reports the resource it was started on
+            // however the target is written to afterwards.
+            resource_uploaded: artifact.upload.is_some(),
             settle_due_millis: now.saturating_add(crate::state::settle_span_millis(&scan_type)),
         };
         let settle_due_millis = run.settle_due_millis;

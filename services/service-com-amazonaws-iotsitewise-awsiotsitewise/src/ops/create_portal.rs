@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePortal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePortal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePortal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates an IoT SiteWise Monitor portal from the request and persists it
+//! in this service's state; `DescribePortal` reads it back.
 //!
 //! ## Shape of an operation
 //!
@@ -212,18 +205,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePortal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePortalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePortal"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePortalError::Modeled(CreatePortalErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `TagMap`'s KEYS target `TagKey` (@length 1..128), which the framework's
+        // constraint walk does not reach — it validates a map's values only — so the
+        // bound is enforced here, in the same wording `TagResource` uses.
+        if let Some(tags) = input.tags.as_ref() {
+            for key in tags.keys() {
+                if let Err(message) = crate::state::check_tag_key(key) {
+                    return Err(crate::scaffolded::Scaffolded::validation(message));
+                }
+            }
+        }
+
+        // "Default: SSO" — `portalAuthMode`'s own documentation. The value set
+        // itself (`IAM` | `SSO`) is a modelled enum, so a value outside it is
+        // already refused before this handler runs.
+        let auth_mode = input
+            .portal_auth_mode
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_PORTAL_AUTH_MODE.to_string());
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> created-id mapping, so a retry with the same token mints a second
+        // portal rather than replaying the first answer. Deliberately left to the
+        // idempotency issue rather than half-done here, exactly as `CreateAssetModel`
+        // leaves it; nothing is fabricated for it.
+        let mut store = state.lock();
+
+        // The store is bounded: a create is the only thing that adds a portal and
+        // nothing evicts one, so past the cap this is a quota refusal.
+        if store.portals.len() >= crate::state::MAX_PORTALS {
+            return Err(CreatePortalError::Modeled(
+                CreatePortalErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} portals.",
+                        crate::state::MAX_PORTALS
+                    ),
+                }),
+            ));
+        }
+
+        let portal_id = loop {
+            let candidate = crate::state::new_id();
+            if !store.portals.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
+        // The IAM Identity Center identifiers exist only for a portal that
+        // authenticates through IAM Identity Center: both members are documented as
+        // the application / client id "if the portal uses IAM Identity Center", so a
+        // portal in `IAM` mode names neither. Minted once, here, and read back from
+        // the record, so every later read reports the same pair.
+        let uses_identity_center = auth_mode == crate::state::PORTAL_AUTH_MODE_SSO;
+        let sso_application_id = if uses_identity_center {
+            crate::state::new_id()
+        } else {
+            String::new()
+        };
+        let client_id = if uses_identity_center {
+            crate::state::new_id()
+        } else {
+            String::new()
+        };
+
+        let record = crate::state::PortalRecord {
+            id: portal_id.clone(),
+            arn: crate::state::portal_arn(&region, &portal_id),
+            name: input.portal_name.clone(),
+            description: input.portal_description.clone(),
+            contact_email: input.portal_contact_email.clone(),
+            auth_mode,
+            notification_sender_email: input.notification_sender_email.clone(),
+            alarms: input.alarms.clone(),
+            portal_type: input.portal_type.clone(),
+            portal_type_configuration: input.portal_type_configuration.clone(),
+            role_arn: Some(input.role_arn.clone()),
+            start_url: crate::state::portal_start_url(&portal_id),
+            sso_application_id,
+            client_id,
+            // An id for the logo image the request uploaded, and none at all when it
+            // uploaded none: the reported location is derived from this id, so a
+            // portal without a logo reports no location rather than an empty one.
+            logo_image_id: input
+                .portal_logo_image_file
+                .as_ref()
+                .map(|_| crate::state::new_id()),
+            creation_date: now,
+            last_update_date: now,
+            // The transition the clock owes this portal: `CREATING` now, `ACTIVE`
+            // once the span falls due. The instant is STORED, never slept on, so a
+            // caller reading the portal straight after this call still sees
+            // `CREATING`.
+            active_at: now + crate::state::ACTIVATION_DELAY,
+            settling_state: crate::state::STATE_CREATING.to_string(),
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output = CreatePortalOutput {
+            portal_id: record.id.clone(),
+            portal_arn: record.arn.clone(),
+            portal_start_url: record.start_url.clone(),
+            portal_status: record.status(now),
+            sso_application_id: record.sso_application_id.clone(),
+        };
+
+        store.portals.insert(record.id.clone(), record);
+
+        Ok(output)
     }
 }

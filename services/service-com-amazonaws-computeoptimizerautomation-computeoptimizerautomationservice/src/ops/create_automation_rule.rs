@@ -399,9 +399,16 @@ fn output_for(rule: &crate::state::StoredRule) -> CreateAutomationRuleOutput {
 /// * `schedule` — "The expression that defines when the schedule runs", with
 ///   specific (non-wildcard) minutes and hours
 ///   ([`crate::state::schedule_violation`]).
-/// * `criteria` — a condition the service could not evaluate
+/// * `criteria` — a condition the service could not evaluate, or one past the
+///   published 20-conditions/20-values size
 ///   ([`crate::state::criteria_violation`]), which is what the preview
-///   operations refuse the same value set with.
+///   operations refuse the same value set with: a rule whose criteria can never
+///   be previewed or evaluated is not a rule this service could run.
+/// * `tags` — one request may not name the same tag key twice
+///   ([`crate::state::duplicate_tag_key_violation`]).
+///
+/// Every clause runs BEFORE the store is touched, so a refused create leaves
+/// the store exactly as it was.
 fn invalid_parameter(input: &CreateAutomationRuleInput) -> Option<String> {
     if input.name.is_empty() {
         return Some(crate::state::constraint_report(
@@ -432,8 +439,15 @@ fn invalid_parameter(input: &CreateAutomationRuleInput) -> Option<String> {
     if let Some(report) = crate::state::schedule_violation(&input.schedule) {
         return Some(report);
     }
-    input
+    if let Some(report) = input
         .criteria
         .as_ref()
         .and_then(crate::state::criteria_violation)
+    {
+        return Some(report);
+    }
+    input
+        .tags
+        .as_deref()
+        .and_then(crate::state::duplicate_tag_key_violation)
 }

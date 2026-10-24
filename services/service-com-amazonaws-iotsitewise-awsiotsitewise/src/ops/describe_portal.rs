@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePortal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePortal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePortal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the portal `CreatePortal` persisted, exactly as it was stored,
+//! with the status the clock owes it as of this call. A read, so it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -192,20 +185,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePortal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePortalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePortal"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribePortalError::Modeled(DescribePortalErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let store = state.lock();
+        let record = store
+            .portals
+            .get(&input.portal_id)
+            .ok_or_else(|| not_found(&input.portal_id))?;
+
+        Ok(DescribePortalOutput {
+            portal_id: record.id.clone(),
+            portal_arn: record.arn.clone(),
+            portal_name: record.name.clone(),
+            portal_description: record.description.clone(),
+            portal_client_id: record.client_id.clone(),
+            portal_start_url: record.start_url.clone(),
+            portal_contact_email: record.contact_email.clone(),
+            // Derived from the stored due instant, so this read reports the state the
+            // clock owes the portal without writing anything.
+            portal_status: record.status(now),
+            portal_creation_date: crate::state::to_date_time(record.creation_date),
+            portal_last_update_date: crate::state::to_date_time(record.last_update_date),
+            portal_logo_image_location: record.logo_image_location(),
+            role_arn: record.role_arn.clone(),
+            portal_auth_mode: Some(record.auth_mode.clone()),
+            notification_sender_email: record.notification_sender_email.clone(),
+            alarms: record.alarms.clone(),
+            portal_type: record.portal_type.clone(),
+            portal_type_configuration: record.portal_type_configuration.clone(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing, in
+/// the one wording every not-found refusal in this service carries.
+fn not_found(portal_id: &str) -> DescribePortalError {
+    DescribePortalError::Modeled(DescribePortalErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_PORTAL, portal_id),
+        },
+    ))
 }

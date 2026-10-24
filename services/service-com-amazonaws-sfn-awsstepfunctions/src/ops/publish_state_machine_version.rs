@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PublishStateMachineVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PublishStateMachineVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: snapshots the CURRENT configuration of the persisted state machine
+//! in [`crate::state`] as its next numbered version, under that version's own
+//! qualified ARN, so a later `DescribeStateMachine` on the version ARN and a later
+//! `ListStateMachineVersions` answer from the record this call wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PublishStateMachineVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Publishing is idempotent per REVISION: the revision a version snapshots is stored
+//! on it, so a repeat for a revision that already has a version reports that version
+//! instead of minting a second one, and a caller that pins `revisionId` to anything
+//! other than the state machine's current revision is refused with
+//! `ConflictException`.
+//!
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +177,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PublishStateMachineVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PublishStateMachineVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PublishStateMachineVersion"))
+        // `stateMachineArn` (len 1..256) and `description` (len 0..256) are modelled
+        // constraints, so the centralized walk has already refused anything outside
+        // them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is judged BEFORE anything is resolved from it: text that is not a
+        // well-formed state machine ARN of this service, in the region this endpoint
+        // serves, is a defect in the REQUEST, which `InvalidArn` reports.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let parsed =
+            match crate::state::read_state_machine_arn(&input.state_machine_arn, &endpoint_region) {
+                Ok(parsed) => parsed,
+                Err(message) => {
+                    return Err(PublishStateMachineVersionErrorModeled::InvalidArn(
+                        InvalidArn {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            };
+
+        // "A qualified state machine ARN can either refer to a Distributed Map state
+        // defined within a state machine, a version ARN, or an alias ARN." This call
+        // "creates a version from the current revision of a state machine", and none
+        // of the three is a state machine with a current revision of its own: a
+        // Distributed Map state is refused through the modelled
+        // `API_DOES_NOT_SUPPORT_LABELED_ARNS` reason, and a version — an immutable
+        // snapshot — and an alias — which only routes to versions — have no version
+        // of their own to publish.
+        if parsed.label().is_some() {
+            return Err(PublishStateMachineVersionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::LABELED_ARN_MESSAGE.to_string()),
+                    reason: Some(crate::state::VALIDATION_REASON_LABELED_ARN.to_string()),
+                },
+            )
+            .into());
+        }
+        if parsed.qualifier.is_some() {
+            return Err(PublishStateMachineVersionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "'{}' is a qualified ARN, naming a version or an alias, which has no \
+                         version of its own to publish",
+                        input.state_machine_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        // The one write this call makes before it looks anything up: a state machine
+        // whose removal the clock already owed is gone, so no version is published
+        // from a record that no longer exists.
+        store.settle(now);
+
+        let Some(machine) = store.state_machines.get(&input.state_machine_arn) else {
+            return Err(
+                PublishStateMachineVersionErrorModeled::StateMachineDoesNotExist(
+                    StateMachineDoesNotExist {
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                            &input.state_machine_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        if machine.is_deleting() {
+            return Err(
+                PublishStateMachineVersionErrorModeled::StateMachineDeleting(
+                    StateMachineDeleting {
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::STATE_MACHINE_DELETING,
+                            &input.state_machine_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let revision_id = machine.revision_id.clone();
+
+        // `revisionId`'s own documentation: "Only publish the state machine version if
+        // the current state machine's revision ID matches the specified ID [...] If
+        // the specified revision ID doesn't match the state machine's current revision
+        // ID, the API returns ConflictException." A state machine that has never been
+        // updated carries no revision ID, which a caller pins with `INITIAL`.
+        if let Some(requested) = input.revision_id.as_deref() {
+            if !crate::state::revision_matches(revision_id.as_deref(), requested) {
+                let current = revision_id.as_deref().map_or_else(
+                    || crate::state::INITIAL_REVISION_ID.to_string(),
+                    |current| format!("'{current}'"),
+                );
+                return Err(PublishStateMachineVersionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "the revision ID of '{}' is {current}, not the specified \
+                             '{requested}'",
+                            input.state_machine_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "PublishStateMachineVersion is an idempotent API. It doesn't create a
+        // duplicate state machine version if it already exists for the current
+        // revision [...] Requests with the same parameters return a successful
+        // idempotent response. If you don't specify a revisionId, Step Functions
+        // checks for a previously published version of the state machine's current
+        // revision." The revision each version snapshots is stored ON it, so the check
+        // reads the store rather than a side table of past requests — and the repeat
+        // answers the FIRST response, creation date included.
+        if let Some(published) =
+            store.version_of_revision(&input.state_machine_arn, revision_id.as_deref())
+        {
+            return Ok(PublishStateMachineVersionOutput {
+                state_machine_version_arn: published.arn.clone(),
+                creation_date: crate::state::to_date_time(published.creation_date),
+            });
+        }
+
+        // "You can publish up to 1000 versions for each state machine. You must
+        // manually delete unused versions using the DeleteStateMachineVersion API
+        // action" — so the cap is on what the state machine HOLDS, not on how many
+        // versions were ever published, and a publish that would exceed it is the
+        // modelled `ServiceQuotaExceededException`.
+        if store.version_count(&input.state_machine_arn)
+            >= crate::state::MAX_VERSIONS_PER_STATE_MACHINE
+        {
+            return Err(
+                PublishStateMachineVersionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "'{}' already holds the {} versions a state machine may publish",
+                            input.state_machine_arn,
+                            crate::state::MAX_VERSIONS_PER_STATE_MACHINE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A version retains a second snapshot of the state machine's caller-sized
+        // text, so its bytes are admitted against the store's bound BEFORE it is
+        // stored, the way every other growth site does it.
+        if !store.has_room_for(store.version_reserve(&input.state_machine_arn)) {
+            return Err(
+                PublishStateMachineVersionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "publishing a version would take the store past the {} bytes this \
+                             emulator retains",
+                            crate::state::MAX_STORE_BYTES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Creates a version from the current revision of a state machine": the
+        // version snapshots what the state machine holds NOW, takes the next number
+        // from the state machine's own counter, and carries the description this
+        // request gave it.
+        let Some(published) =
+            store.publish_state_machine_version(&input.state_machine_arn, input.description, now)
+        else {
+            return Err(
+                PublishStateMachineVersionErrorModeled::StateMachineDoesNotExist(
+                    StateMachineDoesNotExist {
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                            &input.state_machine_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(PublishStateMachineVersionOutput {
+            state_machine_version_arn: published.arn,
+            creation_date: crate::state::to_date_time(published.creation_date),
+        })
     }
 }

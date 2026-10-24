@@ -2,9 +2,9 @@
 
 //! Engine state for the com-amazonaws-iotsitewise-awsiotsitewise service.
 //!
-//! The asset-model / asset / property-value, gateway and dataset slices of IoT
-//! SiteWise live here: one map per resource plus the indexes the modelled lookup
-//! forms need
+//! The asset-model / asset / property-value, gateway, dataset and Monitor-portal
+//! slices of IoT SiteWise live here: one map per resource plus the indexes the
+//! modelled lookup forms need
 //! (`externalId:<id>` labels, property aliases, a gateway's platform device). A
 //! resource's tags live on that resource's own record, reached by ARN through
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::tags_for_resource`], so the
@@ -26,12 +26,13 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AggregatedValue, Aggregates, AssetHierarchy, AssetModelCompositeModel,
+    AggregatedValue, Aggregates, Alarms, AssetHierarchy, AssetModelCompositeModel,
     AssetModelCompositeModelPathSegment, AssetModelCompositeModelSummary, AssetModelHierarchy,
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
     AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, DatasetConfig, DatasetSource,
-    DatasetStatus, ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, LoggingOptions,
-    PropertyType, ResourceStatus, TimeInNanos, Variant,
+    DatasetStatus, ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, ImageLocation,
+    LoggingOptions, PortalStatus, PortalTypeEntry, PropertyType, ResourceStatus, TimeInNanos,
+    Variant,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -193,6 +194,8 @@ pub const ASSET_RESOURCE_TYPE: &str = "asset";
 pub const ASSET_MODEL_RESOURCE_TYPE: &str = "asset-model";
 /// The ARN resource-type segment of a gateway ARN, as [`gateway_arn`] builds it.
 pub const GATEWAY_RESOURCE_TYPE: &str = "gateway";
+/// The ARN resource-type segment of a portal ARN, as [`portal_arn`] builds it.
+pub const PORTAL_RESOURCE_TYPE: &str = "portal";
 /// The ARN resource-type segment of a pipeline ARN, as [`pipeline_arn`] builds it.
 pub const PIPELINE_RESOURCE_TYPE: &str = "pipeline";
 
@@ -235,6 +238,26 @@ pub const FIRST_PIPELINE_VERSION: u64 = 1;
 
 /// The ARN resource-type segment of a dataset ARN, as [`dataset_arn`] builds it.
 pub const DATASET_RESOURCE_TYPE: &str = "dataset";
+
+/// See [`MAX_ASSET_MODELS`]: the same bound, for the portal map. `CreatePortal`
+/// is the only thing that adds a portal and it declares the modelled
+/// `LimitExceededException` (HTTP 410), so that is how this store refuses past the
+/// cap. The emulator's own bound, not a published AWS default.
+pub const MAX_PORTALS: usize = 1_000;
+
+/// The `AuthMode` value of a portal that authenticates its users through IAM
+/// Identity Center, as `AuthMode` spells it (smithy_query query="shape"
+/// shape="AuthMode": `IAM` | `SSO`).
+///
+/// The IAM Identity Center identifiers a portal reports — `ssoApplicationId` and
+/// `portalClientId` — exist only for a portal in this mode: both members are
+/// documented as present only "if the portal uses IAM Identity Center".
+pub const PORTAL_AUTH_MODE_SSO: &str = "SSO";
+
+/// The `portalAuthMode` a `CreatePortal` call that named none gets, as the
+/// member's own documentation states: "Default: SSO" — so the default and the
+/// identity-center test are one value and cannot drift apart.
+pub const DEFAULT_PORTAL_AUTH_MODE: &str = PORTAL_AUTH_MODE_SSO;
 
 /// See [`MAX_ASSET_MODELS`]: the same bound, for the dataset map. `CreateDataset`
 /// is the only thing that adds a dataset and it declares the modelled
@@ -899,6 +922,87 @@ pub fn gateway_platform_count(platform: &GatewayPlatform) -> usize {
     .count()
 }
 
+/// A stored IoT SiteWise Monitor portal: everything `DescribePortal` reports,
+/// plus the `tags` the tagging operations read.
+///
+/// The identity-center identifiers (`sso_application_id`, `client_id`) and the
+/// logo image are minted ONCE, by the call that created or last replaced them,
+/// and read back from here: nothing a reader reports about a portal is rebuilt
+/// per request, so two reads of one portal answer the same.
+#[derive(Debug, Clone)]
+pub struct PortalRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub contact_email: String,
+    /// An `AuthMode` value: `IAM` or `SSO`.
+    pub auth_mode: String,
+    pub notification_sender_email: Option<String>,
+    pub alarms: Option<Alarms>,
+    /// A `PortalType` value, when the create named one. AWS documents no default
+    /// for it, so a portal created without one reports none.
+    pub portal_type: Option<String>,
+    pub portal_type_configuration: Option<HashMap<String, PortalTypeEntry>>,
+    pub role_arn: Option<String>,
+    /// The portal's own URL, as [`portal_start_url`] builds it.
+    pub start_url: String,
+    /// The IAM Identity Center application id, or EMPTY for a portal that
+    /// authenticates through IAM: the member is documented as the application id
+    /// "if the portal uses IAM Identity Center", and such a portal has no
+    /// application to name.
+    ///
+    /// The empty value is a deliberate DEVIATION from the modelled
+    /// `SSOApplicationId` length (1..64): the member is modelled required, so
+    /// there is no "absent" to report, and naming an application that does not
+    /// exist would be worse than reporting none.
+    pub sso_application_id: String,
+    /// The IAM Identity Center generated client id, empty for the same reason as
+    /// [`Self::sso_application_id`] — including the same deviation from the
+    /// modelled `PortalClientId` length (1..256).
+    pub client_id: String,
+    /// The id of the logo image the portal was given, if any. The reported
+    /// location is derived from it by [`portal_logo_image_url`].
+    pub logo_image_id: Option<String>,
+    pub creation_date: SystemTime,
+    pub last_update_date: SystemTime,
+    /// The instant the transition the clock owes — from [`Self::settling_state`]
+    /// to `ACTIVE` — falls due.
+    pub active_at: SystemTime,
+    /// The `PortalState` this portal reports until [`Self::active_at`] falls due.
+    pub settling_state: String,
+    pub tags: HashMap<String, String>,
+}
+
+impl PortalRecord {
+    /// The portal's status as of `now`: its [`Self::settling_state`] until the
+    /// owed transition falls due, `ACTIVE` from then on. Derived, so a read never
+    /// has to write.
+    pub fn status(&self, now: SystemTime) -> PortalStatus {
+        PortalStatus {
+            state: self.state(now).to_string(),
+            error: None,
+        }
+    }
+
+    /// The portal's `PortalState` as of `now`.
+    ///
+    /// Through the same [`state_at`] rule every record in this store derives its
+    /// state from: `PortalState`'s `CREATING` and `ACTIVE` are spelled exactly as
+    /// [`STATE_CREATING`] and [`STATE_ACTIVE`].
+    pub fn state(&self, now: SystemTime) -> &str {
+        state_at(&self.settling_state, self.active_at, now)
+    }
+
+    /// Where the portal's logo image is reported to live, when it has one.
+    pub fn logo_image_location(&self) -> Option<ImageLocation> {
+        self.logo_image_id.as_ref().map(|image_id| ImageLocation {
+            id: image_id.clone(),
+            url: portal_logo_image_url(&self.id, image_id),
+        })
+    }
+}
+
 /// One version of a pipeline: the caller-owned configuration as of the call that
 /// wrote it.
 ///
@@ -1184,6 +1288,7 @@ macro_rules! tagged_record {
 tagged_record!(AssetRecord);
 tagged_record!(AssetModelRecord);
 tagged_record!(GatewayRecord);
+tagged_record!(PortalRecord);
 tagged_record!(PipelineRecord);
 tagged_record!(DatasetRecord);
 
@@ -1253,6 +1358,8 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// on a given platform device. One device hosts at most one gateway, so this
     /// is what makes a second create naming the same device a conflict.
     pub gateway_devices: HashMap<String, String>,
+    /// IoT SiteWise Monitor portals by `portalId`.
+    pub portals: HashMap<String, PortalRecord>,
     /// Pipelines by [`pipeline_key`] — the workspace they live in and their own
     /// name — because a pipeline name is unique only within its workspace.
     pub pipelines: HashMap<(String, String), PipelineRecord>,
@@ -1728,6 +1835,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             ASSET_RESOURCE_TYPE => tags_of(self.assets.get(id), arn),
             ASSET_MODEL_RESOURCE_TYPE => tags_of(self.asset_models.get(id), arn),
             GATEWAY_RESOURCE_TYPE => tags_of(self.gateways.get(id), arn),
+            PORTAL_RESOURCE_TYPE => tags_of(self.portals.get(id), arn),
             PIPELINE_RESOURCE_TYPE => {
                 let (workspace, name) = id.split_once('/')?;
                 tags_of(self.pipelines.get(&pipeline_key(workspace, name)), arn)
@@ -1744,6 +1852,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             ASSET_RESOURCE_TYPE => tags_of_mut(self.assets.get_mut(id), arn),
             ASSET_MODEL_RESOURCE_TYPE => tags_of_mut(self.asset_models.get_mut(id), arn),
             GATEWAY_RESOURCE_TYPE => tags_of_mut(self.gateways.get_mut(id), arn),
+            PORTAL_RESOURCE_TYPE => tags_of_mut(self.portals.get_mut(id), arn),
             PIPELINE_RESOURCE_TYPE => {
                 let (workspace, name) = id.split_once('/')?;
                 tags_of_mut(self.pipelines.get_mut(&pipeline_key(workspace, name)), arn)
@@ -2113,6 +2222,9 @@ pub const RESOURCE_DATASET: &str = "Dataset";
 /// rather than as an "Asset Model"; it lives here beside its siblings so the
 /// operations that address one cannot each invent a kind of their own.
 pub const RESOURCE_ASSET_MODEL_COMPOSITE_MODEL: &str = "Asset Model Composite Model";
+
+/// The resource kind those errors name for an IoT SiteWise Monitor portal.
+pub const RESOURCE_PORTAL: &str = "Portal";
 
 /// The message a not-found refusal carries: the resource kind, then the
 /// identifier the REQUEST supplied (a raw id or an `externalId:` label, exactly
@@ -2484,6 +2596,43 @@ pub fn check_tag_key(key: &str) -> Result<(), String> {
 /// documents: `arn:${Partition}:iotsitewise:${Region}:${Account}:gateway/${GatewayId}`.
 pub fn gateway_arn(region: &str, gateway_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("gateway/{gateway_id}"))
+}
+
+/// The canonical ARN of a portal in `region`, in the form `CreatePortal`
+/// documents: `arn:${Partition}:iotsitewise:${Region}:${Account}:portal/${PortalId}`.
+pub fn portal_arn(region: &str, portal_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{PORTAL_RESOURCE_TYPE}/{portal_id}"),
+    )
+}
+
+/// The host every IoT SiteWise Monitor portal is served under, as the one
+/// `portalStartUrl` is built from.
+///
+/// A portal's URL is per-portal — `CreatePortal` documents `portalStartUrl` as
+/// "The URL for the IoT SiteWise Monitor portal" — so the portal's own id is the
+/// subdomain and this is the suffix it sits under.
+const PORTAL_HOST_SUFFIX: &str = "app.iotsitewise.aws";
+
+/// The `portalStartUrl` of the portal `portal_id` names.
+///
+/// DERIVED from the portal id rather than minted, so it is stable across reads
+/// and unique per portal without anything being written on a read. Within the
+/// modelled `Url` bounds (1..256, `^(http|https)://\S+$`) for every `ID`, which
+/// is 36 characters.
+pub fn portal_start_url(portal_id: &str) -> String {
+    format!("https://{portal_id}.{PORTAL_HOST_SUFFIX}")
+}
+
+/// Where a portal's logo image is reported to live: a path under that portal's
+/// own URL, keyed by the image id the create minted.
+///
+/// Derived for the same reason as [`portal_start_url`], and from the portal that
+/// owns the image rather than from any store this emulator does not run.
+pub fn portal_logo_image_url(portal_id: &str, image_id: &str) -> String {
+    format!("{}/logo/{image_id}", portal_start_url(portal_id))
 }
 
 /// The canonical ARN of a dataset in `region`, in the form `CreateDataset`
