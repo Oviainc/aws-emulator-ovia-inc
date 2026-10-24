@@ -908,6 +908,37 @@ fn index_covers(key_schema: &[KeySchemaElement], item: &Item) -> bool {
         .all(|element| item.contains_key(&element.attribute_name))
 }
 
+/// Whether an index with this key schema and projection STORES the attribute `name` of
+/// an item it covers: "KEYS_ONLY - Only the index and primary key attributes are
+/// projected ... INCLUDE - ... the attributes that are projected are those in
+/// NonKeyAttributes ... ALL - All of the table attributes are projected into the index"
+/// (`Projection$ProjectionType`).
+///
+/// One predicate for every question about an index's stored entry — its size and whether
+/// a write changed it — so both answers are decided by the same projection rule.
+fn index_projects(
+    key_schema: &[KeySchemaElement],
+    projection: &Projection,
+    table_key_schema: &[KeySchemaElement],
+    name: &str,
+) -> bool {
+    let projection_type = projection.projection_type.as_deref().unwrap_or("ALL");
+    if projection_type == "ALL" {
+        return true;
+    }
+    let is_key = key_schema
+        .iter()
+        .chain(table_key_schema)
+        .any(|element| element.attribute_name == name);
+    is_key
+        || (projection_type == "INCLUDE"
+            && projection
+                .non_key_attributes
+                .iter()
+                .flatten()
+                .any(|kept| kept == name))
+}
+
 /// The bytes an index stores for one covered item: the attributes the index projects,
 /// which are the index and table key attributes plus whatever `Projection` adds.
 fn index_projected_size(
@@ -916,23 +947,43 @@ fn index_projected_size(
     item: &Item,
     table_key_schema: &[KeySchemaElement],
 ) -> i64 {
-    let projection_type = projection.projection_type.as_deref().unwrap_or("ALL");
-    if projection_type == "ALL" {
+    if projection.projection_type.as_deref().unwrap_or("ALL") == "ALL" {
         return item_size(item);
     }
-    let non_key = projection.non_key_attributes.as_deref().unwrap_or_default();
     let projected: Item = item
         .iter()
-        .filter(|(name, _)| {
-            key_schema
-                .iter()
-                .chain(table_key_schema)
-                .any(|element| &element.attribute_name == *name)
-                || (projection_type == "INCLUDE" && non_key.iter().any(|kept| kept == *name))
-        })
+        .filter(|(name, _)| index_projects(key_schema, projection, table_key_schema, name))
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
     item_size(&projected)
+}
+
+/// Whether a write CHANGES what an index stores for an item it covers both before and
+/// after: the index keeps only the attributes it projects, so a write that leaves every
+/// one of them as it was leaves the index entry as it was.
+///
+/// An attribute is compared as the VALUE it is, by the same rule a condition compares
+/// values with ([`attribute_values_equal`]) — a number respelt is the same number — and
+/// an attribute one version carries and the other does not is a change, whichever side
+/// carries it.
+fn index_entry_changed(
+    key_schema: &[KeySchemaElement],
+    projection: &Projection,
+    table_key_schema: &[KeySchemaElement],
+    before: &Item,
+    after: &Item,
+) -> bool {
+    let differs = |source: &Item, other: &Item| {
+        source
+            .iter()
+            .filter(|(name, _)| index_projects(key_schema, projection, table_key_schema, name))
+            .any(|(name, value)| {
+                other
+                    .get(name)
+                    .is_none_or(|stored| !attribute_values_equal(value, stored))
+            })
+    };
+    differs(before, after) || differs(after, before)
 }
 
 /// What a write costs ONE index, or `None` when that index is not affected at all.
@@ -955,6 +1006,12 @@ fn index_projected_size(
 ///   does not change the value of any indexed key attribute, then one write is required
 ///   to update the values of the projected attributes into the index" — charged, like the
 ///   table itself, on the larger of the two projections.
+///
+/// Every case the Guide charges for is a CHANGE to what the index stores, so a write that
+/// leaves this index's entry exactly as it stood costs nothing on it: the attributes it
+/// does not project cannot change it, which is why projecting fewer attributes is what
+/// keeps an index's write cost down. The table itself is charged either way — it stores
+/// the item the write carried whether or not the item differs.
 fn index_write_units<'a>(
     key_schema: &[KeySchemaElement],
     projection: &Projection,
@@ -971,8 +1028,10 @@ fn index_write_units<'a>(
         (Some(old), Some(new)) => {
             if index_key_changed(key_schema, old, new) {
                 Some(write_capacity_units(size(old)) + write_capacity_units(size(new)))
-            } else {
+            } else if index_entry_changed(key_schema, projection, table_key_schema, old, new) {
                 Some(write_capacity_units(size(old).max(size(new))))
+            } else {
+                None
             }
         }
     }
@@ -1962,7 +2021,8 @@ impl Table {
     /// costs the table the one-unit minimum and touches no index.
     ///
     /// Each index is charged by [`index_write_units`], so an index the write leaves
-    /// untouched gets no entry at all.
+    /// untouched gets no entry at all — neither one the item does not reach, nor one
+    /// whose stored entry this write does not change.
     pub fn write_capacity(&self, before: Option<&Item>, after: Option<&Item>) -> WriteCapacity {
         let mut capacity = WriteCapacity {
             table: write_capacity_units(before.map_or(0, item_size).max(after.map_or(0, item_size))),
