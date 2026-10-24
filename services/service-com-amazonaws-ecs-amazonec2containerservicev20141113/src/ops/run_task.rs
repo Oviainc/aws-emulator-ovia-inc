@@ -490,6 +490,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Scaling group", so the request is one Amazon ECS can satisfy by adding capacity
         // and is accepted; with managed scaling off ("the user must manage the scaling of
         // the Auto Scaling group") there is no capacity coming and the task is refused.
+        // The refusal names THAT provider, because the placement named it and a cluster
+        // can carry several: the caller's own Auto Scaling group is what has to grow.
         // A name no stored provider carries, and the predefined Fargate providers, name no
         // Auto Scaling group of this account, so this decides nothing about them.
         if guard.registered_container_instances(&cluster_name) == 0 {
@@ -498,11 +500,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|name| guard.capacity_providers.get(name))
             {
                 if crate::state::needs_registered_capacity_now(provider) {
+                    let message = crate::state::empty_capacity_provider_message(&provider.name);
                     return Err(RunTaskErrorModeled::InvalidParameterException(
                         InvalidParameterException {
-                            message: Some(
-                                crate::state::NO_CONTAINER_INSTANCES_MESSAGE.to_string(),
-                            ),
+                            message: Some(message),
                         },
                     )
                     .into());

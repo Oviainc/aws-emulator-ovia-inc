@@ -572,6 +572,14 @@ pub const REGISTERED_CAPACITY_LAUNCH_TYPES: [&str; 2] = ["EC2", "EXTERNAL"];
 pub const NO_CONTAINER_INSTANCES_MESSAGE: &str =
     "No Container Instances were found in your cluster.";
 
+/// The message the `InvalidParameterException` carries when the placement runs through a
+/// CAPACITY PROVIDER whose capacity is not there: the provider the placement named is
+/// what the caller has to scale, and a cluster can carry several of them, so the sentence
+/// is built from the request and names that one provider.
+pub fn empty_capacity_provider_message(provider_name: &str) -> String {
+    format!("The specified capacity provider '{provider_name}' contains no container instances.")
+}
+
 /// The container-instance attribute an `awsvpc` task needs: its own elastic network
 /// interface. One of the Amazon ECS container-agent capabilities (the ECS developer
 /// guide's "awsvpc network mode" requirements), reported through
@@ -932,7 +940,63 @@ impl CapacityProviderRecord {
             .as_ref()
             .map(|provider| provider.auto_scaling_group_arn.as_str())
     }
+
+    /// This provider's binding, as [`capacity_provider_binding_fingerprint`] renders it,
+    /// so a repeated create can be compared against what is already stored.
+    pub fn binding_fingerprint(&self) -> String {
+        capacity_provider_binding_fingerprint(
+            self.cluster.as_deref(),
+            self.auto_scaling_group_provider.as_ref(),
+            self.managed_instances_provider.as_ref(),
+        )
+    }
 }
+
+/// A capacity provider's BINDING, rendered as the string two creates of one name are
+/// compared on.
+///
+/// The binding is what the provider IS: the cluster it is scoped to, plus either the Auto
+/// Scaling group it scales (with that group's managed-scaling, termination-protection and
+/// draining configuration) or the managed-instances configuration Amazon ECS runs for it.
+/// That configuration is a deep tree — a launch template, its network, storage and
+/// instance requirements — and these shapes carry a derived `Debug` rather than an
+/// equality, so rendering it is what stands in for comparing it member by member: the two
+/// sides are the same shape in the same member order, so equal renderings are equal
+/// bindings. The Auto Scaling group is rendered through [`auto_scaling_group_key`],
+/// because naming one group by ARN and by its bare name names the same group.
+///
+/// Tags are deliberately NOT part of it: they are metadata a create applies and
+/// `TagResource`/`UntagResource` change afterwards, not part of the capacity the provider
+/// binds onto.
+pub fn capacity_provider_binding_fingerprint(
+    cluster: Option<&str>,
+    auto_scaling_group_provider: Option<&AutoScalingGroupProvider>,
+    managed_instances_provider: Option<&ManagedInstancesProvider>,
+) -> String {
+    let group = auto_scaling_group_provider.map(|provider| {
+        let mut normalised = provider.clone();
+        normalised.auto_scaling_group_arn =
+            auto_scaling_group_key(&provider.auto_scaling_group_arn).to_string();
+        normalised
+    });
+    format!("cluster={cluster:?} group={group:?} managed={managed_instances_provider:?}")
+}
+
+/// The `ClientException` message a create earns when the name it asks for is held by a
+/// provider bound onto DIFFERENT capacity. A fixed sentence naming nothing from the
+/// request, as the recorded refusal carries it: it tells the caller to change the
+/// provider that is there rather than to create it again.
+pub const CAPACITY_PROVIDER_EXISTS_MESSAGE: &str =
+    "The specified capacity provider already exists. To change the configuration of an \
+     existing capacity provider, update the capacity provider.";
+
+/// The `ClientException` message a create earns when the Auto Scaling group it asks for
+/// is already backing another capacity provider. A fixed sentence naming nothing from the
+/// request, as the recorded refusal carries it: it names the MEMBER at fault and what a
+/// retry has to carry, not which provider holds the group.
+pub const AUTO_SCALING_GROUP_IN_USE_MESSAGE: &str =
+    "The specified Auto Scaling group ARN is already being used by another capacity \
+     provider. Specify a unique Auto Scaling group ARN and try again.";
 
 /// A cluster, as `CreateCluster` created it and every cluster-mutating operation
 /// (`UpdateCluster`, `UpdateClusterSettings`, `PutClusterCapacityProviders`) has left it.
@@ -3628,29 +3692,35 @@ pub fn capacity_provider_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("capacity-provider/{name}"))
 }
 
-/// The refusal a capacity-provider `name` earns, or `Ok(())` when it is one AWS accepts.
+/// The message the refusal of a capacity-provider `name` carries. A fixed sentence, as
+/// the recorded refusal carries it, restating the whole of the name rule
+/// `CreateCapacityProvider$name` documents — the length, the character set and the
+/// prefixes Amazon ECS keeps for its own providers — whichever half of it the value broke.
+pub const CAPACITY_PROVIDER_NAME_INVALID_MESSAGE: &str =
+    "The specified capacity provider name is invalid. Up to 255 characters are allowed, \
+     including letters (upper and lowercase), numbers, underscores, and hyphens. The name \
+     cannot be prefixed with \"aws\", \"ecs\", or \"fargate\". Specify a valid name and \
+     try again.";
+
+/// Whether a capacity-provider `name` is one the caller may take, or the refusal it earns.
 ///
 /// The `CreateCapacityProvider$name` doc: "Up to 255 characters are allowed. They include
 /// letters (both upper and lowercase letters), numbers, underscores (_), and hyphens (-).
 /// The name can't be prefixed with \"aws\", \"ecs\", or \"fargate\"." The character rule is
 /// [`is_valid_name`]'s, shared with every other ECS name; the reserved prefixes are this
 /// member's own, and are what keeps a caller from shadowing `FARGATE`/`FARGATE_SPOT`.
-pub fn validate_capacity_provider_name(name: &str) -> Result<(), String> {
-    if !is_valid_name(name) {
-        return Err(format!(
-            "name must be 1 to {MAX_NAME_LENGTH} letters, numbers, underscores or hyphens; \
-             got {name:?}"
-        ));
-    }
+///
+/// The name is the provider's resource IDENTIFIER (the model's `resourceIdentifier` on
+/// this member), so a value outside that one rule is refused as the `ClientException`
+/// modelled for "specifying an identifier that isn't valid", carrying the one sentence
+/// that states the rule.
+pub fn validate_capacity_provider_name(name: &str) -> Result<(), &'static str> {
     let lowered = name.to_ascii_lowercase();
-    if let Some(prefix) = CAPACITY_PROVIDER_RESERVED_PREFIXES
+    let reserved = CAPACITY_PROVIDER_RESERVED_PREFIXES
         .iter()
-        .find(|prefix| lowered.starts_with(**prefix))
-    {
-        return Err(format!(
-            "name must not be prefixed with {prefix:?}, which Amazon ECS reserves; got \
-             {name:?}"
-        ));
+        .any(|prefix| lowered.starts_with(prefix));
+    if !is_valid_name(name) || reserved {
+        return Err(CAPACITY_PROVIDER_NAME_INVALID_MESSAGE);
     }
     Ok(())
 }
@@ -3830,7 +3900,9 @@ pub fn network_configuration_violation(
 /// with the task's own IAM role — so a launch that turns `enableExecuteCommand` on
 /// requires the revision to carry a task role. `subject` names what the refusal is about
 /// ("The service couldn't be created", "The task couldn't be launched"), since the
-/// sentence AWS words is the one the calling operation's own answer carries.
+/// sentence AWS words is the one the calling operation's own answer carries. Its
+/// remediation clause names WHERE the role belongs — in the task definition, which is the
+/// resource the caller has to change, rather than on this request.
 pub fn execute_command_violation(
     enabled: bool,
     definition: Option<&TaskDefinitionRecord>,
@@ -3848,7 +3920,7 @@ pub fn execute_command_violation(
     (!has_role).then(|| {
         format!(
             "{subject} because a valid taskRoleArn is not being used. Specify a valid \
-             task IAM role and try again."
+             task role in your task definition and try again."
         )
     })
 }
