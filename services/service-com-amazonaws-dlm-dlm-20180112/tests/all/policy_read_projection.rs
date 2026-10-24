@@ -740,6 +740,7 @@ async fn every_summary_reports_its_policys_tags() {
             "ExecutionRoleArn": ROLE_ARN,
             "Description": format!("policy with {case}"),
             "State": "ENABLED",
+            "PolicyDetails": snapshot_details_with_defaults_omitted(),
         });
         if !members(&tags).is_empty() {
             request["Tags"] = tags.clone();
