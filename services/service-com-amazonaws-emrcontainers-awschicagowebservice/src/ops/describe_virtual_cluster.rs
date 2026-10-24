@@ -4,6 +4,10 @@
 //! Reports the stored virtual cluster, including a cluster that has been deleted: EMR on
 //! EKS keeps a TERMINATED cluster describable rather than answering not-found for it.
 //!
+//! Its `schedulerStatus` is COUNTED out of the job runs this service holds for the
+//! cluster ([`crate::state::ComAmazonawsEmrcontainersAwschicagowebserviceState::cluster_scheduler_status`]),
+//! so a caller reading the cluster sees how much of its scheduler capacity is in use.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
