@@ -17,6 +17,8 @@ mod discovered_metric_references;
 mod entity_identity;
 #[path = "all/error_identity.rs"]
 mod error_identity;
+#[path = "all/exclusion_windows.rs"]
+mod exclusion_windows;
 #[path = "all/get_instrumentation_configuration.rs"]
 mod get_instrumentation_configuration;
 #[path = "all/get_service.rs"]

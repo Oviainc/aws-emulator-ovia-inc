@@ -35,7 +35,13 @@ pub const STATUS_UNSUBSCRIBED: &str = "UNSUBSCRIBED";
 pub const STATUS_ASSOCIATING: &str = "ASSOCIATING";
 /// The status a user association carries once configuration completed.
 pub const STATUS_ASSOCIATED: &str = "ASSOCIATED";
-/// The status returned by `DisassociateUser` for the association it ended.
+/// The status a user association carries from the moment `DisassociateUser` accepted its
+/// disassociation until the teardown that status announces has completed.
+///
+/// Non-terminal: an association is REPORTED in it (that is what the status is for) while
+/// the instance is being reconfigured, and stops being reported when the teardown falls
+/// due — see [`DISASSOCIATION_SPAN`] and
+/// [`begin_instance_user_disassociation`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::begin_instance_user_disassociation).
 pub const STATUS_DISASSOCIATING: &str = "DISASSOCIATING";
 /// The status an instance carries in this service's view while at least one user is
 /// associated with it.
@@ -57,6 +63,18 @@ pub const PROVISIONING_STATUS_DELETING: &str = "DELETING";
 /// The terminal `LicenseServerEndpointProvisioningStatus` an endpoint reaches once the
 /// deletion that put it in [`PROVISIONING_STATUS_DELETING`] has completed.
 pub const PROVISIONING_STATUS_DELETED: &str = "DELETED";
+
+/// Whether `status` is a status a user association carries because its disassociation was
+/// accepted.
+///
+/// An association in it is still REPORTED — its instance goes on providing user-based
+/// subscriptions in `ListInstances` while the teardown runs — but it is no longer a live
+/// resource: it is not taggable ([`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::holds_resource`]),
+/// and the `(IdentityProvider, InstanceId, Username)` triple it occupies cannot be
+/// associated again until the teardown has completed.
+pub fn disassociation_started(status: &str) -> bool {
+    status == STATUS_DISASSOCIATING
+}
 
 /// Whether `status` is a registration status a record carries because its deregistration
 /// was accepted.
@@ -98,6 +116,16 @@ const REGISTRATION_SPAN: Duration = Duration::from_millis(500);
 /// status, and the span is inside the emulator's 250-750 ms window so a caller that
 /// reads straight back still observes the transient status.
 const ASSOCIATION_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after `DisassociateUser` the teardown the `DISASSOCIATING` status announces
+/// completes — the instant the association stops being reported.
+///
+/// A chosen span, on the same footing as [`ASSOCIATION_SPAN`]: AWS documents no duration
+/// for it, the association is returned in the non-terminal `DISASSOCIATING` status, and
+/// the span is inside the emulator's 250-750 ms window so a caller that reads straight
+/// back still observes that transient status — and the instance still in the service's
+/// view — instead of the association vanishing between two reads.
+const DISASSOCIATION_SPAN: Duration = Duration::from_millis(500);
 
 /// How long after `CreateLicenseServerEndpoint` the endpoint becomes `PROVISIONED`.
 ///
@@ -469,6 +497,9 @@ pub struct InstanceUserRecord {
     pub disassociation_date: Option<String>,
     /// When the `ASSOCIATING` -> `ASSOCIATED` transition falls due.
     pub associated_due_at: SystemTime,
+    /// When the teardown the `DISASSOCIATING` status announces falls due — the instant the
+    /// association stops being reported — or `None` while the association is still live.
+    pub disassociated_due_at: Option<SystemTime>,
 }
 
 /// A license server endpoint, as `CreateLicenseServerEndpoint` stored it.
@@ -546,6 +577,17 @@ pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscrip
     /// addresses an association by its identifier triple resolves the same record its
     /// ARN does.
     pub instance_user_index: HashMap<(String, String, String), String>,
+    /// `InstanceId -> the ARNs of the associations naming it, in association order`.
+    ///
+    /// The reverse of [`InstanceUserRecord::instance_id`], maintained by the one writer
+    /// ([`insert_instance_user`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::insert_instance_user))
+    /// and the one remover
+    /// ([`remove_instance_user`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::remove_instance_user)).
+    /// An instance's view is recomputed from exactly the associations that name it, so
+    /// without this index every refresh would scan every association the account holds —
+    /// and a request that refreshes every instance would pay instances x associations with
+    /// the service-state lock held.
+    pub instance_users_by_instance: HashMap<String, Vec<String>>,
     /// The EC2 instances this account has, keyed by instance id.
     ///
     /// Whether the caller may associate a user with an instance is a fact about the
@@ -635,6 +677,7 @@ impl Default for ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersu
             instance_users: HashMap::new(),
             instance_user_order: Vec::new(),
             instance_user_index: HashMap::new(),
+            instance_users_by_instance: HashMap::new(),
             license_server_endpoints: HashMap::new(),
             license_server_endpoint_order: Vec::new(),
             license_server_endpoint_index: HashMap::new(),
@@ -658,8 +701,11 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// Materialise every transition the clock already made due at `now`.
     ///
     /// Only transitions that were owed at `now` whether or not anybody called: a
-    /// registration whose [`REGISTRATION_SPAN`] has elapsed becomes `REGISTERED`, a user
-    /// association whose [`ASSOCIATION_SPAN`] has elapsed becomes `ASSOCIATED`, and a
+    /// registration whose [`REGISTRATION_SPAN`] has elapsed becomes `REGISTERED`, one whose
+    /// deregistration was accepted has finished tearing down and stops being reported, a
+    /// user association whose [`ASSOCIATION_SPAN`] has elapsed becomes `ASSOCIATED`, one
+    /// whose disassociation was accepted [`DISASSOCIATION_SPAN`] ago has finished tearing
+    /// down and stops being reported, and a
     /// license server endpoint whose [`ENDPOINT_PROVISIONING_SPAN`] has elapsed becomes
     /// `PROVISIONED`, and one whose deletion was accepted [`ENDPOINT_DELETION_SPAN`] ago
     /// reaches the terminal `DELETED`. Reporting operations call this so a read reflects
@@ -705,14 +751,27 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
                 }
             }
         }
+        // The associations whose teardown the clock has made due, collected while the
+        // records are borrowed and dropped once the sweep is over.
+        let mut torn_down: Vec<String> = Vec::new();
         for record in self.instance_users.values_mut() {
-            if record.status != STATUS_ASSOCIATING {
-                continue;
-            }
-            if now >= record.associated_due_at {
-                record.status = STATUS_ASSOCIATED.to_string();
-            } else {
-                still_pending(record.associated_due_at, &mut next);
+            if record.status == STATUS_ASSOCIATING {
+                if now >= record.associated_due_at {
+                    record.status = STATUS_ASSOCIATED.to_string();
+                } else {
+                    still_pending(record.associated_due_at, &mut next);
+                }
+            } else if disassociation_started(&record.status) {
+                // The teardown the clock owes: a `DISASSOCIATING` association has
+                // finished being torn down once its span has elapsed, whether or not
+                // anybody called.
+                if let Some(due_at) = record.disassociated_due_at {
+                    if now >= due_at {
+                        torn_down.push(record.arn.clone());
+                    } else {
+                        still_pending(due_at, &mut next);
+                    }
+                }
             }
         }
         for record in self.license_server_endpoints.values_mut() {
@@ -744,6 +803,13 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             self.refresh_every_instance_view();
         }
         self.pending_transition_due_at = next;
+
+        // A teardown that has completed is what finally removes the association, and the
+        // instance it named is recomputed from the associations that are left: the last
+        // one to finish takes its instance out of this service's view. Dropped in ONE
+        // batch, so however many fell due together the work stays linear in what the
+        // store holds.
+        self.drop_instance_users(&torn_down);
     }
 
     /// Record that a stored resource owes the clock a status transition at `due_at`.
@@ -874,13 +940,128 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         }
     }
 
-    /// Remove one user association from the store and from every index that reaches it.
+    /// Store one user association and index it everywhere it is reached from: by ARN, in
+    /// association order, by its `(provider key, InstanceId, Username)` triple and under
+    /// the instance it names.
+    ///
+    /// The ONE writer, so no two of those views of the same association can disagree.
+    pub fn insert_instance_user(&mut self, record: InstanceUserRecord) {
+        let arn = record.arn.clone();
+        let index_key = (
+            record.provider_key.clone(),
+            record.instance_id.clone(),
+            record.username.clone(),
+        );
+        self.instance_users_by_instance
+            .entry(record.instance_id.clone())
+            .or_default()
+            .push(arn.clone());
+        self.instance_users.insert(arn.clone(), record);
+        self.instance_user_order.push(arn.clone());
+        self.instance_user_index.insert(index_key, arn);
+    }
+
+    /// Remove one user association from the store and from every index that reaches it,
+    /// and recompute the view of the instance it named.
+    ///
+    /// This is the FINAL drop, which stops reporting the association altogether; a
+    /// disassociation the caller asked for goes through
+    /// [`begin_instance_user_disassociation`](Self::begin_instance_user_disassociation)
+    /// instead, so the non-terminal status it answers with stays observable until the
+    /// teardown the clock owes completes.
     pub fn remove_instance_user(&mut self, arn: &str) -> Option<InstanceUserRecord> {
-        let record = self.instance_users.remove(arn)?;
-        self.instance_user_order.retain(|a| a != arn);
-        self.instance_user_index.retain(|_, indexed| indexed != arn);
-        self.tags.remove(arn);
+        let record = self.instance_users.get(arn)?.clone();
+        self.drop_instance_users(std::slice::from_ref(&record.arn));
         Some(record)
+    }
+
+    /// Drop the user associations `arns` names, and recompute the view of every instance
+    /// they named.
+    ///
+    /// Batched on purpose: each association is unindexed in O(1) by the triple its record
+    /// carries, the association ORDER is rebuilt in ONE pass however many associations are
+    /// dropped together, and each instance's view is recomputed once against one
+    /// precomputed registration map. So a request that finds several teardowns due pays
+    /// the associations and the registrations once each rather than a product of the two
+    /// with the service-state lock held.
+    fn drop_instance_users(&mut self, arns: &[String]) {
+        let mut dropped: HashSet<String> = HashSet::new();
+        let mut affected: Vec<String> = Vec::new();
+        for arn in arns {
+            let Some(record) = self.instance_users.remove(arn) else {
+                continue;
+            };
+            dropped.insert(arn.clone());
+            self.instance_user_index.remove(&(
+                record.provider_key.clone(),
+                record.instance_id.clone(),
+                record.username.clone(),
+            ));
+            self.tags.remove(arn);
+            let emptied = match self.instance_users_by_instance.get_mut(&record.instance_id) {
+                Some(naming) => {
+                    naming.retain(|held| held != arn);
+                    naming.is_empty()
+                }
+                None => false,
+            };
+            if emptied {
+                self.instance_users_by_instance.remove(&record.instance_id);
+            }
+            if !affected.contains(&record.instance_id) {
+                affected.push(record.instance_id);
+            }
+        }
+        if dropped.is_empty() {
+            return;
+        }
+        self.instance_user_order.retain(|arn| !dropped.contains(arn));
+        let products_by_key = self.products_by_provider_key();
+        for instance_id in affected {
+            let naming = self.associations_naming(&instance_id);
+            self.apply_instance_view(&instance_id, &naming, &products_by_key);
+        }
+    }
+
+    /// Accept the disassociation of one user association: it enters `DISASSOCIATING` now
+    /// and owes the clock the completion of its teardown at [`DISASSOCIATION_SPAN`], which
+    /// is what finally stops reporting it.
+    ///
+    /// Disassociation is ASYNCHRONOUS — the instance has to be reconfigured, which is why
+    /// the call answers the non-terminal `DISASSOCIATING` rather than a terminal status —
+    /// so the record is NOT dropped here: a caller polling for the teardown to finish keeps
+    /// seeing the association in `DISASSOCIATING`, and keeps seeing the instance it names
+    /// in this service's view, instead of the state vanishing between two reads. What the
+    /// disassociation does take away immediately is what made the association a LIVE
+    /// resource: its tags, so the tagging surface no longer resolves it (see
+    /// [`holds_resource`](Self::holds_resource)). The
+    /// `(provider key, InstanceId, Username)` index entry is KEPT, because that triple is
+    /// still occupied: the user is still being torn down from that instance, so it cannot
+    /// be associated with it again until the teardown has completed.
+    ///
+    /// Returns the record as the disassociation left it (`DISASSOCIATING`), or `None` when
+    /// the ARN names no stored association. An association whose disassociation was ALREADY
+    /// accepted is returned unchanged, which is what this operation's `@idempotent` trait
+    /// asks for: a repeat call neither restarts the teardown nor re-stamps the instant it
+    /// ended.
+    pub fn begin_instance_user_disassociation(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<InstanceUserRecord> {
+        let record = self.instance_users.get_mut(arn)?;
+        if disassociation_started(&record.status) {
+            return Some(record.clone());
+        }
+        record.status = STATUS_DISASSOCIATING.to_string();
+        record.disassociation_date = Some(iso8601(now));
+        let due_at = now + DISASSOCIATION_SPAN;
+        record.disassociated_due_at = Some(due_at);
+        let disassociating = record.clone();
+        self.tags.remove(arn);
+        // The teardown the clock now owes, which is what stops reporting the association.
+        self.schedule_transition(due_at);
+        Some(disassociating)
     }
 
     /// The license server endpoints in creation order.
@@ -990,12 +1171,16 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// A license server endpoint whose deletion was accepted is NOT one: it is still
     /// reported in its `DELETING`/`DELETED` status, but it is on its way out and carries
     /// no tags any more, so the tagging surface resolves it exactly as it resolves an
-    /// endpoint that is gone. A registration whose deregistration was accepted is on its
-    /// way out in exactly the same sense, so it is not one either.
+    /// endpoint that is gone. A user association whose disassociation was accepted
+    /// ([`disassociation_started`]), and a registration whose deregistration was accepted,
+    /// are on their way out in exactly the same sense, so neither is one either.
     pub fn holds_resource(&self, arn: &str) -> bool {
         self.live_identity_provider(arn).is_some()
             || self.product_users.contains_key(arn)
-            || self.instance_users.contains_key(arn)
+            || self
+                .instance_users
+                .get(arn)
+                .is_some_and(|record| !disassociation_started(&record.status))
             || self
                 .license_server_endpoints
                 .get(arn)
@@ -1084,44 +1269,51 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// being reported as soon as the last association or registration behind it is gone.
     /// Nothing else is recorded: no status check has been performed, so none is reported.
     ///
-    /// ONE pass over the associations and ONE over the registrations: this runs with the
-    /// service-state lock held, so the work it costs must not multiply with how much the
-    /// store holds beyond the lists it has to read.
+    /// An association whose teardown is still running still NAMES the instance, so the
+    /// instance stays in view while that association is `DISASSOCIATING` and leaves it
+    /// only when the last teardown has completed ([`materialise_due`](Self::materialise_due))
+    /// — an instance a user is still being disassociated from is still configured for
+    /// user-based subscriptions.
+    ///
+    /// ONE pass over the associations that name the instance and ONE over the
+    /// registrations: this runs with the service-state lock held, so the work it costs must
+    /// not multiply with how much the store holds beyond the lists it has to read.
     pub fn refresh_instance_view(&mut self, instance_id: &str) {
         let products_by_key = self.products_by_provider_key();
-        let naming: Vec<InstanceUserRecord> = self
-            .instance_user_order
-            .iter()
-            .filter_map(|arn| self.instance_users.get(arn))
-            .filter(|association| association.instance_id == instance_id)
-            .cloned()
-            .collect();
+        let naming = self.associations_naming(instance_id);
         self.apply_instance_view(instance_id, &naming, &products_by_key);
+    }
+
+    /// The associations naming `instance_id`, in association order.
+    ///
+    /// Read from [`instance_users_by_instance`](Self::instance_users_by_instance), the
+    /// reverse index the one association writer maintains, so recomputing one instance's
+    /// view visits that instance's associations instead of scanning every association the
+    /// account holds.
+    fn associations_naming(&self, instance_id: &str) -> Vec<InstanceUserRecord> {
+        self.instance_users_by_instance
+            .get(instance_id)
+            .map(|arns| {
+                arns.iter()
+                    .filter_map(|arn| self.instance_users.get(arn))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Recompute the view of every instance an association names: what a registration's
     /// removal changes is which PRODUCTS those instances provide.
     ///
-    /// ONE pass over each of the three lists involved — the registrations, the
-    /// associations (grouped by the instance each names) and the instances — rather than
+    /// ONE pass over each of the three lists involved — the registrations, the associations
+    /// of each instance (through the reverse index) and the instances — rather than
     /// re-reading two of them per instance: this runs with the service-state lock held, so
     /// one request must not be able to buy work that multiplies with the whole store.
     pub fn refresh_every_instance_view(&mut self) {
         let products_by_key = self.products_by_provider_key();
-        let mut naming: HashMap<String, Vec<InstanceUserRecord>> = HashMap::new();
-        for association in self
-            .instance_user_order
-            .iter()
-            .filter_map(|arn| self.instance_users.get(arn))
-        {
-            naming
-                .entry(association.instance_id.clone())
-                .or_default()
-                .push(association.clone());
-        }
         for instance_id in self.instance_order.clone() {
-            let associations = naming.remove(&instance_id).unwrap_or_default();
-            self.apply_instance_view(&instance_id, &associations, &products_by_key);
+            let naming = self.associations_naming(&instance_id);
+            self.apply_instance_view(&instance_id, &naming, &products_by_key);
         }
     }
 
@@ -1179,13 +1371,14 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .instances
             .get(instance_id)
             .and_then(|record| record.last_status_check_at);
+        let identity_provider = Some(first.identity_provider.clone());
         self.upsert_instance(InstanceRecord {
             instance_id: instance_id.to_string(),
             status: STATUS_ACTIVE.to_string(),
             products,
             status_message: None,
             owner_account_id: ::engine::emulator_account_id().to_string(),
-            identity_provider: Some(first.identity_provider.clone()),
+            identity_provider,
             last_status_check_at,
         });
     }

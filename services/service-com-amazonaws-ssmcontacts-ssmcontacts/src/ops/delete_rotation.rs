@@ -198,6 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ledger entries that named it rather than leaving them resident.
         state.forget_idempotency_tokens_for(&input.rotation_id);
 
+        // Its overrides go with it: an override is an override OF this rotation and is
+        // stored under its ARN, so with the rotation gone no operation can read or delete
+        // one again, and keeping them would leave one resident record per override.
+        state.remove_rotation_overrides_of(&input.rotation_id);
+
         Ok(DeleteRotationOutput {})
     }
 }

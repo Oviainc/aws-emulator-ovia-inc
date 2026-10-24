@@ -29,3 +29,5 @@ mod resource_resolution_refusals;
 mod state_roundtrip;
 #[path = "all/tag_validation.rs"]
 mod tag_validation;
+#[path = "all/user_disassociation.rs"]
+mod user_disassociation;
