@@ -15,6 +15,8 @@
 mod inference;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/score_denominator.rs"]
+mod score_denominator;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support.rs"]
