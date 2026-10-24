@@ -107,11 +107,13 @@ impl From<GetAccountLinkErrorModeled> for GetAccountLinkError {
 /// The `ResourceNotFoundException` for an identifier that names no stored link.
 ///
 /// The shape carries a `ResourceId` ("The ID of the resource that could not be
-/// found"), so the identifier the caller sent is reported there as well as in the
-/// message.
+/// found"), which is where this API reports the identifier the caller sent; the
+/// message is the error class's fixed
+/// [`crate::state::ACCOUNT_LINK_NOT_FOUND_MESSAGE`], identical for every
+/// identifier, so no request value reaches the prose.
 fn not_found(resource_id: &str) -> GetAccountLinkError {
     GetAccountLinkErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("The account link {resource_id} could not be found.")),
+        message: Some(crate::state::ACCOUNT_LINK_NOT_FOUND_MESSAGE.to_string()),
         resource_id: Some(resource_id.to_string()),
     })
     .into()
@@ -174,8 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (None, None) => {
                 return Err(GetAccountLinkErrorModeled::ValidationException(
                     ValidationException {
+                        // The class's one sentence
+                        // ([`crate::state::ACCOUNT_LINK_INVALID_REQUEST_MESSAGE`]):
+                        // an account-link refusal states its class, not the
+                        // request that provoked it.
                         message: Some(
-                            "Either LinkId or LinkedAccountId must be provided.".to_string(),
+                            crate::state::ACCOUNT_LINK_INVALID_REQUEST_MESSAGE.to_string(),
                         ),
                     },
                 )

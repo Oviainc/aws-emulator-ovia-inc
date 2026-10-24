@@ -109,9 +109,14 @@ impl From<ListAccountLinksErrorModeled> for ListAccountLinksError {
 
 /// Refuse the request as invalid, with this operation's own modelled
 /// `ValidationException`.
-fn invalid(message: String) -> ListAccountLinksError {
+///
+/// The message is the account-link error class's fixed
+/// [`crate::state::ACCOUNT_LINK_INVALID_REQUEST_MESSAGE`] rather than text built
+/// from the request: this API states the class of refusal, and never the member,
+/// the value or the constraint that failed.
+fn invalid() -> ListAccountLinksError {
     ListAccountLinksErrorModeled::ValidationException(ValidationException {
-        message: Some(message),
+        message: Some(crate::state::ACCOUNT_LINK_INVALID_REQUEST_MESSAGE.to_string()),
     })
     .into()
 }
@@ -164,11 +169,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let mut wanted = Vec::with_capacity(values.len());
                     for value in values {
                         wanted.push(
-                            crate::state::AccountLinkStatus::from_wire(value).ok_or_else(|| {
-                                invalid(format!(
-                                    "The LinkStatusFilter value {value} is not a valid account link status."
-                                ))
-                            })?,
+                            crate::state::AccountLinkStatus::from_wire(value)
+                                .ok_or_else(invalid)?,
                         );
                     }
                     Some(wanted)
@@ -179,19 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token names the last link the previous page reported, by its
         // creation sequence; this page resumes strictly after it.
         let after_seq = match input.next_token.as_deref() {
-            Some(token) => crate::state::decode_page_token(token)
-                .ok_or_else(|| invalid("The NextToken value is not valid.".to_string()))?,
+            Some(token) => crate::state::decode_page_token(token).ok_or_else(invalid)?,
             None => 0,
         };
         // `MaxResults` is `range 1..25`, so request validation refuses anything
         // outside that; a value that still does not convert is refused here
         // rather than silently answered with a default-sized page.
         let max_results = match input.max_results {
-            Some(max_results) => usize::try_from(max_results).map_err(|_| {
-                invalid(format!(
-                    "The MaxResults value {max_results} is not valid; MaxResults must be between 1 and 25."
-                ))
-            })?,
+            Some(max_results) => usize::try_from(max_results).map_err(|_| invalid())?,
             None => crate::state::DEFAULT_ACCOUNT_LINK_PAGE_SIZE,
         };
 
