@@ -97,6 +97,24 @@ pub fn job_state_is_in_queue(state: &str) -> bool {
     JOB_IN_QUEUE_STATES.contains(&state)
 }
 
+/// The scheduler limits a submitted `SchedulerConfiguration` actually configures.
+///
+/// `None` when it configures none — both an absent structure and one whose every member
+/// is omitted, which are the same statement: `SchedulerConfiguration` is documented as
+/// "when not set, no concurrency or queue limits are applied", each member as "if you
+/// omit this field, the service applies no … limit", and `VirtualCluster$schedulerConfiguration`
+/// as "the service does not return this field when no scheduler limits are configured".
+/// Normalising on the way IN is what lets every read answer that, whether the cluster was
+/// created with an empty configuration or had its last limit removed by an update.
+pub fn configured_scheduler_limits(
+    configuration: Option<SchedulerConfiguration>,
+) -> Option<SchedulerConfiguration> {
+    configuration.filter(|configuration| {
+        configuration.max_in_queue_job_runs.is_some()
+            || configuration.max_concurrent_job_runs.is_some()
+    })
+}
+
 /// The alphabet a minted id is drawn from: `ResourceIdString` is
 /// `^[0-9a-z]+$` (len 1..64), so base-36 over `0-9a-z` is exactly its character set.
 const ID_ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -141,6 +159,17 @@ pub const MAX_SECURITY_CONFIGURATIONS: usize = 200;
 /// A token is scoped to the operation that minted the resource, so the same token on
 /// another operation is a different request.
 pub const CREATE_VIRTUAL_CLUSTER_SCOPE: &str = "CreateVirtualCluster";
+
+/// How many `UpdateVirtualCluster` `clientToken`s one virtual cluster remembers.
+///
+/// `UpdateVirtualCluster`'s token is remembered ON the cluster it updated rather than in
+/// [`ComAmazonawsEmrcontainersAwschicagowebserviceState::idempotency`], because an update
+/// mints no resource for a token to name and a cluster may be updated any number of
+/// times: a per-record, bounded window keeps the store from growing with the number of
+/// updates served (and the window is reclaimed with the cluster). Within it, a retried
+/// update is ignored, which is the whole window the `@idempotencyToken` contract is
+/// about; a token replayed after this many LATER updates applies again.
+pub const MAX_RETAINED_UPDATE_TOKENS: usize = 32;
 
 /// The idempotency scope `CreateSecurityConfiguration` remembers a `clientToken` under,
 /// on the same terms as [`CREATE_VIRTUAL_CLUSTER_SCOPE`]: the same token replayed names
@@ -312,10 +341,32 @@ pub struct VirtualClusterRecord {
     pub session_enabled: Option<bool>,
     pub scheduler_configuration: Option<SchedulerConfiguration>,
     pub client_token: String,
+    /// The `UpdateVirtualCluster` `clientToken`s this cluster has already applied, most
+    /// recent last, at most [`MAX_RETAINED_UPDATE_TOKENS`] of them.
+    pub update_client_tokens: Vec<String>,
     pub pending: Option<PendingTransition>,
 }
 
 impl VirtualClusterRecord {
+    /// Whether an `UpdateVirtualCluster` carrying `client_token` has already been applied
+    /// to this cluster, inside the window [`MAX_RETAINED_UPDATE_TOKENS`] keeps.
+    pub fn has_applied_update_token(&self, client_token: &str) -> bool {
+        self.update_client_tokens
+            .iter()
+            .any(|applied| applied == client_token)
+    }
+
+    /// Remember that an update carrying `client_token` has been applied, dropping the
+    /// oldest remembered token once the window is full.
+    fn remember_update_token(&mut self, client_token: &str) {
+        if self.has_applied_update_token(client_token) {
+            return;
+        }
+        self.update_client_tokens.push(client_token.to_string());
+        if self.update_client_tokens.len() > MAX_RETAINED_UPDATE_TOKENS {
+            self.update_client_tokens.remove(0);
+        }
+    }
     /// Materialise this cluster's transition if the clock has made it due.
     fn settle(&mut self, now: Instant) {
         let Some(pending) = self.pending.take() else {
@@ -1054,6 +1105,27 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     /// The modelled `JobTemplate` for this id.
     pub fn job_template_view(&self, id: &str) -> Option<JobTemplate> {
         Some(self.job_templates.get(id)?.to_job_template())
+    }
+
+    /// Replace a stored virtual cluster's `schedulerConfiguration` with the one submitted,
+    /// remembering `client_token` so a retry of the same update is ignored rather than
+    /// applied twice.
+    ///
+    /// A REPLACEMENT, not a merge: `UpdateVirtualCluster$schedulerConfiguration` is "the
+    /// scheduler configuration to apply to the virtual cluster. The new configuration
+    /// fully replaces the existing one. If you omit a field, the corresponding limit is
+    /// removed." A request that carries no configuration at all therefore leaves the
+    /// cluster with no scheduler limits (see [`configured_scheduler_limits`]).
+    pub fn apply_scheduler_configuration(
+        &mut self,
+        id: &str,
+        configuration: Option<SchedulerConfiguration>,
+        client_token: &str,
+    ) {
+        if let Some(record) = self.virtual_clusters.get_mut(id) {
+            record.scheduler_configuration = configured_scheduler_limits(configuration);
+            record.remember_update_token(client_token);
+        }
     }
 
     /// Move a stored virtual cluster into `now_state` with `next_state` owed to the

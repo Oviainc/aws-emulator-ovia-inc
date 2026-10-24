@@ -31,3 +31,5 @@ mod virtual_cluster_job_run_loop;
 mod virtual_cluster_scheduler;
 #[path = "all/virtual_cluster_scheduler_status.rs"]
 mod virtual_cluster_scheduler_status;
+#[path = "all/virtual_cluster_update.rs"]
+mod virtual_cluster_update;
