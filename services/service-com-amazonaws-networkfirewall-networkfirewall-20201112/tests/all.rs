@@ -21,6 +21,8 @@ mod firewall_policy_associations;
 mod flow_operations;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/refusal_message_shapes.rs"]
+mod refusal_message_shapes;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_policy_action_subsets.rs"]

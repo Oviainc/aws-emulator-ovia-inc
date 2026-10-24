@@ -264,11 +264,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let consumed = crate::state::required_capacity(&input.r#type, &rule_group);
         if consumed > input.capacity {
-            return Err(invalid_request(&format!(
-                "The rules in RulesSource.{} require {consumed} capacity units, which exceeds \
-                 the rule group's capacity of {}.",
-                crate::state::rules_source_member(&rule_group),
-                input.capacity
+            // Built from the request, so it takes the service's built shape: the
+            // stem and context name the `RulesSource` member the rules arrived
+            // in, and the brackets carry the capacity they REQUIRE — what a
+            // client retries with.
+            return Err(invalid_request(&crate::state::capacity_exceeded_message(
+                &rule_group,
+                consumed,
             )));
         }
 

@@ -178,10 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if associations > 0 {
             return Err(DeleteFirewallPolicyErrorModeled::InvalidOperationException(
                 InvalidOperationException {
-                    message: Some(format!(
-                        "Firewall policy {key} is in use by {associations} firewall(s) and cannot \
-                         be deleted."
-                    )),
+                    // The same resource-agnostic constant every in-use refusal
+                    // carries: neither the policy's name nor how many firewalls
+                    // still use it reaches the message.
+                    message: Some(crate::state::DELETE_IN_USE_MESSAGE.to_string()),
                 },
             )
             .into());
