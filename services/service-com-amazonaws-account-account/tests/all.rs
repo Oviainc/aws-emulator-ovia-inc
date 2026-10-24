@@ -21,6 +21,8 @@ mod alternate_contact_delete_precedence;
 mod contact_information;
 #[path = "all/enum_input_validation.rs"]
 mod enum_input_validation;
+#[path = "all/gov_cloud_account_information.rs"]
+mod gov_cloud_account_information;
 #[path = "all/pattern_validation_messages.rs"]
 mod pattern_validation_messages;
 #[path = "all/phone_number_verification.rs"]
