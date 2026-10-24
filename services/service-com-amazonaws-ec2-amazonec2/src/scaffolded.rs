@@ -333,6 +333,26 @@ impl<E> Scaffolded<E> {
         )
     }
 
+    /// `InvalidInstanceID.Malformed` (HTTP 400) for an operation whose OWN validator
+    /// refuses every instance id it cannot resolve as malformed, rather than telling a
+    /// value outside the id form from a well-formed id that names nothing.
+    ///
+    /// The same code as [`Self::invalid_instance_id_malformed`] in a different wording, and
+    /// a second named constructor rather than a literal at a call site so both wordings are
+    /// visible here: EC2's per-operation validators do not agree about an unresolvable
+    /// instance id, and the operations that answer this one say "The instance ID '<id>' is
+    /// malformed" where the syntax check above says "Invalid id: '<id>'". The caller is
+    /// `crate::ops::create_replace_root_volume_task`, which records the evidence for its
+    /// operation; an operation that DOES draw the distinction keeps using
+    /// [`crate::state::require_known_instance`] and the constructor above.
+    pub fn instance_id_is_malformed(instance_id: &str) -> Self {
+        Self::service_error(
+            "InvalidInstanceID.Malformed",
+            400,
+            format!("The instance ID '{instance_id}' is malformed"),
+        )
+    }
+
     /// `InvalidID` (HTTP 400): the request named a resource id of a kind this
     /// operation cannot resolve at all.
     pub fn invalid_id(resource_id: &str) -> Self {

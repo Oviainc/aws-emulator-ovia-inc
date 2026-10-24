@@ -58,7 +58,8 @@ fn budget(name: &str) -> Value {
 
 /// Create `name` under `account_id` and fail the test if the setup call did not take.
 ///
-/// `pub(crate)` so the sibling deletion suite seeds its budgets the same way.
+/// `pub(crate)` so the sibling suites in this test target seed their budgets the same
+/// way rather than copying the setup.
 pub(crate) async fn seed_budget(router: &MultiServiceRouter, account_id: &str, name: &str) {
     let (status, body) = call(
         router,
@@ -242,7 +243,7 @@ pub(crate) async fn describe_action(
 }
 
 /// The `Action$Status` a read reports for `action_id`.
-async fn read_status(
+pub(crate) async fn read_status(
     router: &MultiServiceRouter,
     account_id: &str,
     budget_name: &str,
@@ -328,10 +329,11 @@ fn settles_at(
         .map(|pending| pending.settles_at)
 }
 
-/// Bring the owed settle forward to the past, so a test asserts the settled status
-/// without waiting out the span (the span itself is asserted in
-/// [`the_clock_settles_an_execution_with_no_further_call`]).
-fn make_settle_due(
+/// Bring the owed settle forward to NOW, so a test asserts the settled status without
+/// waiting out the span (the span itself is asserted in
+/// [`the_clock_settles_an_execution_with_no_further_call`]). The instant stays AFTER the
+/// execution that owed it, which is what the clock would have done.
+pub(crate) fn make_settle_due(
     engine: &Arc<engine::InMemoryEngine>,
     account_id: &str,
     budget_name: &str,
@@ -352,7 +354,7 @@ fn make_settle_due(
         .pending
         .as_mut()
         .expect("an execution that is still in flight");
-    pending.settles_at = SystemTime::now() - Duration::from_secs(1);
+    pending.settles_at = SystemTime::now();
 }
 
 /// How many actions the budget holds.

@@ -258,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entries describing the same component are one component.
         let mut components: Vec<String> = Vec::new();
         for component in input.components_info.into_iter().flatten() {
-            let id = format!("{}-{}", component.sid, component.component_type);
+            let id = crate::state::component_id(&component.sid, &component.component_type);
             if !components.contains(&id) {
                 components.push(id);
             }

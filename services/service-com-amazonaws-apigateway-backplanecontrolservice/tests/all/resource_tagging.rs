@@ -13,10 +13,11 @@
 //! The tests assert RULES over sets of inputs, not one recorded call:
 //!
 //! * the tag round trip over EVERY taggable resource kind this suite's harness builds a
-//!   record for (a REST API, a stage, an API key) crossed with a table of tag shapes —
-//!   ASCII, non-ASCII, an empty value, the documented character set, and a key and a
-//!   value at their published length bounds (a custom domain name's tags are read by its
-//!   ARN in the `domain_name_collection` suite, which is where that record is created);
+//!   record for (a REST API, a stage, an API key, a VPC link) crossed with a table of
+//!   tag shapes — ASCII, non-ASCII, an empty value, the documented character set, and a
+//!   key and a value at their published length bounds (a custom domain name's tags are
+//!   read by its ARN in the `domain_name_collection` suite, which is where that record
+//!   is created);
 //! * the merge rule (`TagResource` "adds or updates") over a table of before/after
 //!   collections;
 //! * the `resourceArn` reading over a table spanning every way a value fails to name a
@@ -38,6 +39,7 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
 use crate::api_key_lifecycle::create_key;
 use crate::rest_api_lifecycle::{assert_failure, create_api, string_member, Answer, Gateway};
 use crate::stage_lifecycle::create_deployed_stage;
+use crate::vpc_links::created_vpc_link;
 // The ARN builder, the `@httpLabel` percent-encoding and the `GetTags` call are the
 // sibling `tag_reads_by_arn` suite's: one spelling of each for the whole tagging
 // surface, so a write suite and a read suite cannot address a resource differently.
@@ -49,12 +51,13 @@ const STAGE: &str = "prod";
 /// The taggable resource kinds this emulator keeps no records of — the first path
 /// segment of each one's read URI. Source: `UNSTORED_TAGGABLE_KINDS` in
 /// `src/state.rs`, which lists them because the operations that would create a client
-/// certificate, a VPC link or a domain name access association are still scaffolds. An
-/// ARN of one of these is well formed, so it resolves to a missing resource rather than
-/// to a bad request.
+/// certificate or a domain name access association are still scaffolds. An ARN of one of
+/// these is well formed, so it resolves to a missing resource rather than to a bad
+/// request. (A VPC link is NOT among them: `CreateVpcLink` stores one, so a `vpclinks`
+/// ARN resolves to a record when the link exists — the round trip below tags one — and to
+/// a missing resource when it does not, which the `/vpclinks/…` row below pins.)
 const UNSTORED_KINDS: &[&str] = &[
     "clientcertificates",
-    "vpclinks",
     "domainnameaccessassociations",
 ];
 
@@ -140,6 +143,7 @@ async fn taggables(gateway: &Gateway, label: &str) -> Vec<(&'static str, String,
     create_deployed_stage(gateway, &api, STAGE).await;
     let key = create_key(gateway, label, json!({ "name": format!("{label}-key") })).await;
     let key_id = string_member(&key, "id", label);
+    let vpc_link = created_vpc_link(gateway, &format!("{label}-link")).await;
     vec![
         (
             "a REST API",
@@ -155,6 +159,11 @@ async fn taggables(gateway: &Gateway, label: &str) -> Vec<(&'static str, String,
             "an API key",
             apigateway_arn(&format!("/apikeys/{key_id}")),
             format!("/apikeys/{key_id}"),
+        ),
+        (
+            "a VPC link",
+            apigateway_arn(&format!("/vpclinks/{vpc_link}")),
+            format!("/vpclinks/{vpc_link}"),
         ),
     ]
 }
@@ -395,6 +404,14 @@ async fn a_resource_arn_is_read_as_the_arn_form_a_taggable_resource_takes() {
         (
             "an unknown API key".to_string(),
             apigateway_arn(&format!("/apikeys/{missing}")),
+            404,
+            "NotFoundException",
+        ),
+        (
+            // A VPC link IS a kind this emulator stores (`CreateVpcLink`), so an id no
+            // link has is a missing resource rather than an unstored kind.
+            "an unknown VPC link".to_string(),
+            apigateway_arn(&format!("/vpclinks/{missing}")),
             404,
             "NotFoundException",
         ),

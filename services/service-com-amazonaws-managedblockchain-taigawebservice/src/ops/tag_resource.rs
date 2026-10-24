@@ -3,7 +3,9 @@
 //! @op TagResource
 //! Implemented: adds or overwrites tags on the resource named by `ResourceArn` in
 //! [`crate::state`] — the one tag set `ListTagsForResource` and that resource's own
-//! Get/Describe report.
+//! Get/Describe report. A key in the reserved namespace
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased) is not a key a
+//! caller may write, so such a request is refused whole and stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -171,6 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The reserved key namespace is Amazon Web Services' own: a caller may not create
+        // or overwrite a key in it. The request is judged WHOLE and before the store is
+        // touched, so one reserved key refuses the whole request and the resource's tag set
+        // is left exactly as it was.
+        if let Some(why) =
+            crate::state::reserved_tag_keys_refusal(input.tags.keys().map(String::as_str))
+        {
+            return Err(TagResourceErrorModeled::InvalidRequestException(
+                InvalidRequestException { message: Some(why) },
+            )
+            .into());
+        }
 
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());

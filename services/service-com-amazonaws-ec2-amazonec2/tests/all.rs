@@ -22,6 +22,11 @@ mod prefix_lists;
 // every new ec2 suite inserts its lines.
 #[path = "all/instance_attribute_reset.rs"]
 mod instance_attribute_reset;
+// The root volume replacement slice: create a task, then read it back. Declared beside the
+// two above for the same reason — the sorted region is where every new ec2 suite inserts
+// its lines, and this fix lost three serialized squash merges to exactly that.
+#[path = "all/replace_root_volume_tasks.rs"]
+mod replace_root_volume_tasks;
 // Declared here rather than in sorted position, for the reason above: the sorted
 // neighbourhood of this suite is the contended region of this file.
 #[path = "all/local_gateway_routes.rs"]

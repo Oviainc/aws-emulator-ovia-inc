@@ -734,6 +734,23 @@
 //! of progress an active task reports is derived per read, being a fact of elapsed time
 //! that no store could hold.
 //!
+//! ## Root volume replacement tasks
+//!
+//! [`ComAmazonawsEc2Amazonec2State::replace_root_volume_tasks`] holds the root volume
+//! replacement tasks `CreateReplaceRootVolumeTask` starts as
+//! [`ReplaceRootVolumeTaskRecord`]s: the modelled [`ReplaceRootVolumeTask`]
+//! `DescribeReplaceRootVolumeTasks` reports, plus the two moves the clock owes it. A task
+//! AWS hands back is `pending` — "the replacement volume is being created" — and walks
+//! `pending` -> `in-progress` -> `succeeded` on its own
+//! (`smithy_query(query="shape",shape="ReplaceRootVolumeTaskState")`), so each move falls
+//! due one [`TRANSITION_DELAY`] after the one before it on the same monotonic clock as an
+//! instance's [`PendingTransition`], and [`ReplaceRootVolumeTaskRecord::view_at`] derives
+//! the state a reader sees from it rather than writing on a read. `CompleteTime` is "the
+//! time the task completed", so it is reported only once the task has reached a terminal
+//! state. Keyed by `ReplaceRootVolumeTaskId` in a [`BTreeMap`], the same stable order the
+//! other stores are kept in, so a pagination token can name the id the next page starts
+//! at.
+//!
 //! ## Spot Instance requests
 //!
 //! [`ComAmazonawsEc2Amazonec2State::spot_instance_requests`] holds the Spot Instance
@@ -807,7 +824,7 @@ use crate::ops::types::{
     PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry, ProductCode,
-    Region, RequestLaunchTemplateData, RouteServer, RouteServerBfdStatus,
+    Region, ReplaceRootVolumeTask, RequestLaunchTemplateData, RouteServer, RouteServerBfdStatus,
     RouteServerBgpOptions, RouteServerBgpStatus, RouteServerEndpoint, RouteServerPeer,
     RunInstancesOutput, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
@@ -2182,6 +2199,17 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// "the number of partitions", "the spread level", "the ARN", "any tags applied to the
     /// placement group" — [`PlacementGroup`]) is a member of it.
     pub placement_groups: BTreeMap<String, PlacementGroup>,
+    /// Every root volume replacement task the account has started, by
+    /// `ReplaceRootVolumeTaskId` — see [`ReplaceRootVolumeTaskRecord`] and the module docs.
+    /// `CreateReplaceRootVolumeTask` is the operation that starts one and
+    /// `DescribeReplaceRootVolumeTasks` the one that reports it. Ordered by id, which is the
+    /// order that describe reports and pages over.
+    pub replace_root_volume_tasks: BTreeMap<String, ReplaceRootVolumeTaskRecord>,
+    /// A `CreateReplaceRootVolumeTask` `ClientToken` and the task id it minted, so a repeat
+    /// of the same request answers with that task instead of starting a second replacement:
+    /// "Unique, case-sensitive identifier you provide to ensure the idempotency of the
+    /// request" (`CreateReplaceRootVolumeTaskRequest$ClientToken`).
+    pub replace_root_volume_task_client_tokens: HashMap<String, String>,
     /// Every Infrastructure Performance metric subscription the account has enabled, as the
     /// modelled [`Subscription`] shape itself, keyed by [`subscription_key`] — the four
     /// members that are a subscription's identity.
@@ -2356,6 +2384,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             spot_instance_requests: BTreeMap::new(),
             spot_instance_request_client_tokens: HashMap::new(),
             placement_groups: BTreeMap::new(),
+            replace_root_volume_tasks: BTreeMap::new(),
+            replace_root_volume_task_client_tokens: HashMap::new(),
             // A fresh account has enabled no Infrastructure Performance metric
             // subscription.
             network_performance_subscriptions: BTreeMap::new(),
@@ -10575,6 +10605,38 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(payload_bytes);
         self.images.insert(image_id.clone(), image);
         image_id
+    }
+
+    /// The snapshot id of `image_id`'s ROOT block device mapping, or `None` when this
+    /// account holds no such image or that image's root device carries no snapshot.
+    ///
+    /// A fact OF the image, read back off the stored [`Image`] rather than recomputed:
+    /// [`Self::insert_image`] mints the root device's snapshot id and writes it into the
+    /// mapping, so this is the snapshot an EBS-backed AMI restores its root volume from —
+    /// which is what a root volume replacement restored from an AMI, or to the original
+    /// root volume's launch state, creates the replacement volume from
+    /// (`ReplaceRootVolumeTask$SnapshotId`, "the ID of the snapshot used to create the
+    /// replacement root volume").
+    ///
+    /// The ROOT mapping is the one whose `DeviceName` is the image's own
+    /// `RootDeviceName`; an image that declares none falls back to the first mapping that
+    /// carries a snapshot, so a single-mapping AMI is read the same either way.
+    pub fn image_root_snapshot_id(&self, image_id: &str) -> Option<String> {
+        let image = self.images.get(image_id)?;
+        let root_device = image.root_device_name.as_deref();
+        let mappings = image.block_device_mappings.as_deref().unwrap_or_default();
+        mappings
+            .iter()
+            .find(|mapping| {
+                root_device.is_some() && mapping.device_name.as_deref() == root_device
+            })
+            .or_else(|| {
+                mappings
+                    .iter()
+                    .find(|mapping| mapping.ebs.as_ref().is_some_and(|ebs| ebs.snapshot_id.is_some()))
+            })
+            .and_then(|mapping| mapping.ebs.as_ref())
+            .and_then(|ebs| ebs.snapshot_id.clone())
     }
 
     /// Give the store the public images Amazon publishes ([`published_image_specs`]), and
@@ -22284,6 +22346,219 @@ pub fn allowed_images_settings_full<E>(region: &str, full: AllowedImagesSettings
             "The image criteria carry {requested} bytes, which this emulator has no room for: \
              it stores at most {MAX_STORED_BYTES} bytes of caller-supplied data"
         )),
+    }
+}
+
+// =============================================================================
+// Root volume replacement tasks
+// =============================================================================
+//
+// See the module docs for why a task is stored as the modelled shape plus the two moves
+// the clock owes it. The words below are members of the model's own enums and the id form
+// EC2 issues, named here so `CreateReplaceRootVolumeTask` and
+// `DescribeReplaceRootVolumeTasks` cannot spell one value two ways.
+
+/// The id prefix EC2 gives a root volume replacement task: `replacevol-<hex>`, the same
+/// `<prefix>-<hex>` form every other EC2 resource id takes, so
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints them and
+/// [`prefixed_id_is_well_formed`] reads them.
+pub const REPLACE_ROOT_VOLUME_TASK_ID_PREFIX: &str = "replacevol";
+
+/// The one `ResourceType` a `CreateReplaceRootVolumeTask` tag specification may name: "The
+/// tags to apply to the root volume replacement task"
+/// (`CreateReplaceRootVolumeTaskRequest$TagSpecifications`), spelled as the modelled
+/// `ResourceType` enum spells it (`smithy_query(query="shape",shape="ResourceType")`).
+pub const REPLACE_ROOT_VOLUME_TASK_TAGGABLE_RESOURCE: &str = "replace-root-volume-task";
+
+/// `ReplaceRootVolumeTaskState`'s `pending` member — "the replacement volume is being
+/// created" (`ReplaceRootVolumeTask$TaskState`), which is the state a task is created in.
+/// The generated catalog is
+/// `crate::ops::types::REPLACE_ROOT_VOLUME_TASK_STATE_VALUES`.
+pub const REPLACE_ROOT_VOLUME_TASK_STATE_PENDING: &str = "pending";
+
+/// `ReplaceRootVolumeTaskState`'s `in-progress` member — "the original volume is being
+/// detached and the replacement volume is being attached".
+pub const REPLACE_ROOT_VOLUME_TASK_STATE_IN_PROGRESS: &str = "in-progress";
+
+/// `ReplaceRootVolumeTaskState`'s `succeeded` member — "the replacement volume has been
+/// successfully attached to the instance and the instance is available": the terminal state
+/// a replacement that runs to completion reaches.
+pub const REPLACE_ROOT_VOLUME_TASK_STATE_SUCCEEDED: &str = "succeeded";
+
+/// The slowest volume initialization rate a request may ask for: "Valid range: 100 - 300
+/// MiB/s" (`CreateReplaceRootVolumeTaskRequest$VolumeInitializationRate`). The model
+/// declares no `@range` for the member, so a handler is the only place the published bound
+/// can be enforced.
+pub const MIN_VOLUME_INITIALIZATION_RATE: i64 = 100;
+
+/// The fastest volume initialization rate a request may ask for — the ceiling of that same
+/// documented "Valid range: 100 - 300 MiB/s".
+pub const MAX_VOLUME_INITIALIZATION_RATE: i64 = 300;
+
+/// The largest page `DescribeReplaceRootVolumeTasks` serves, and the page it serves when
+/// the request names no size.
+///
+/// The top of the modelled `MaxResults` range, `range 1..50`
+/// (`smithy_query(query="operation",operation="DescribeReplaceRootVolumeTasks")`), so a
+/// request that names no page size is answered with the largest page the operation can be
+/// ASKED for and the `NextToken` path behaves the same either way.
+pub const MAX_REPLACE_ROOT_VOLUME_TASKS_PAGE_SIZE: usize = 50;
+
+/// EC2's code for something that is not a root volume replacement task id at all.
+///
+/// EC2's model declares no error shape (see [`crate::scaffolded::ServiceError`]), and the
+/// service answers `Invalid<Resource>Id.Malformed` BEFORE it looks an id up —
+/// [`INVALID_LAUNCH_TEMPLATE_ID_MALFORMED`] is the same code for a launch template — so
+/// that is the code this resource's id gets.
+pub const INVALID_REPLACE_ROOT_VOLUME_TASK_ID_MALFORMED: &str =
+    "InvalidReplaceRootVolumeTaskId.Malformed";
+
+/// EC2's code for a root volume replacement task id that names no task of the account,
+/// named the way [`INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND`] is.
+pub const INVALID_REPLACE_ROOT_VOLUME_TASK_ID_NOT_FOUND: &str =
+    "InvalidReplaceRootVolumeTaskId.NotFound";
+
+/// One stored root volume replacement task: the modelled [`ReplaceRootVolumeTask`] every
+/// operation that reports one answers with, plus the two moves the clock owes it.
+///
+/// `CreateReplaceRootVolumeTask` answers a task in the non-terminal `pending` state, and
+/// the task walks `pending` -> `in-progress` -> `succeeded` on its own whether or not
+/// anybody calls again, so each move's due instant is recorded here on the monotonic clock
+/// and [`Self::view_at`] derives the state from it. `TaskState` is therefore NOT stored on
+/// the view: a reader that observed one state could otherwise disagree with the clock.
+#[derive(Debug, Clone)]
+pub struct ReplaceRootVolumeTaskRecord {
+    /// The task as the model shapes it, with `TaskState` and `CompleteTime` left for
+    /// [`Self::view_at`] to fill.
+    pub view: ReplaceRootVolumeTask,
+    /// The instant from which this task's `pending` -> `in-progress` move is due.
+    /// Monotonic ([`Instant`]), because it is only ever compared against the clock and
+    /// never reported, so a wall-clock adjustment cannot move a task backwards.
+    pub in_progress_at: Instant,
+    /// The instant from which this task's `in-progress` -> `succeeded` move is due.
+    pub succeeded_at: Instant,
+    /// "The time the task completed" (`ReplaceRootVolumeTask$CompleteTime`), rendered from
+    /// the wall clock at the instant [`Self::succeeded_at`] falls due — reported only once
+    /// the task has reached that state, because until then there is no instant at which it
+    /// completed.
+    pub complete_time: String,
+}
+
+impl ReplaceRootVolumeTaskRecord {
+    /// A task starting now: `pending`, with its `in-progress` move due one
+    /// [`TRANSITION_DELAY`] from now and its `succeeded` move one delay after that.
+    ///
+    /// `started_at` is the wall-clock instant the task was created, which is what
+    /// `StartTime` reports and what `CompleteTime` is derived from, so the two timestamps
+    /// come from one reading of the clock.
+    pub fn starting_now(view: ReplaceRootVolumeTask, started_at: SystemTime) -> Self {
+        let now = Instant::now();
+        Self {
+            view,
+            in_progress_at: now + TRANSITION_DELAY,
+            succeeded_at: now + TRANSITION_DELAY * 2,
+            complete_time: iso8601_utc(started_at + TRANSITION_DELAY * 2),
+        }
+    }
+
+    /// The task's `ReplaceRootVolumeTaskState` at `now`.
+    pub fn state_at(&self, now: Instant) -> &'static str {
+        if now < self.in_progress_at {
+            REPLACE_ROOT_VOLUME_TASK_STATE_PENDING
+        } else if now < self.succeeded_at {
+            REPLACE_ROOT_VOLUME_TASK_STATE_IN_PROGRESS
+        } else {
+            REPLACE_ROOT_VOLUME_TASK_STATE_SUCCEEDED
+        }
+    }
+
+    /// This task as of `now`: the stored view with the state the clock has reached, and
+    /// the completion time only once it has completed. A read observes the moves the clock
+    /// already owed without writing anything.
+    pub fn view_at(&self, now: Instant) -> ReplaceRootVolumeTask {
+        let task_state = self.state_at(now);
+        ReplaceRootVolumeTask {
+            task_state: Some(task_state.to_string()),
+            complete_time: (task_state == REPLACE_ROOT_VOLUME_TASK_STATE_SUCCEEDED)
+                .then(|| self.complete_time.clone()),
+            ..self.view.clone()
+        }
+    }
+}
+
+/// The bytes one stored root volume replacement task holds for the process's lifetime: the
+/// tags the request chose, the `ClientToken` the token map keeps for it, and the fixed
+/// overhead of the record itself ([`STORED_RECORD_OVERHEAD_BYTES`]).
+///
+/// Everything else on the record — the task's own id, the instance, image, snapshot and
+/// volume ids it names, the timestamps and the state — is this module's own or bounded by
+/// the id forms the model publishes, so it is fixed-size. The ONE definition of that
+/// charge, so a writer cannot store bytes the store's budget never saw.
+pub fn replace_root_volume_task_payload_bytes(
+    view: &ReplaceRootVolumeTask,
+    client_token: Option<&str>,
+) -> usize {
+    tag_list_bytes(view.tags.as_deref().unwrap_or_default())
+        .saturating_add(client_token.map_or(0, str::len))
+        .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
+}
+
+/// Refuse a request that named a root volume replacement task id this service cannot
+/// resolve: a malformed one before an unknown one, the order EC2 asks the two questions in
+/// — the contract [`require_known_volume`] keeps for volumes.
+pub fn require_known_replace_root_volume_task<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    task_id: &str,
+) -> Result<(), Scaffolded<E>> {
+    require_well_formed_id(
+        REPLACE_ROOT_VOLUME_TASK_ID_PREFIX,
+        task_id,
+        INVALID_REPLACE_ROOT_VOLUME_TASK_ID_MALFORMED,
+    )?;
+    if !store.replace_root_volume_tasks.contains_key(task_id) {
+        return Err(id_not_found(
+            INVALID_REPLACE_ROOT_VOLUME_TASK_ID_NOT_FOUND,
+            "replace root volume task id",
+            task_id,
+        ));
+    }
+    Ok(())
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another root volume replacement task fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`]: a writer asks this BEFORE storing
+    /// anything and refuses the request when it answers `false`.
+    pub fn has_replace_root_volume_task_capacity(&self) -> bool {
+        self.replace_root_volume_tasks.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store `record` under a freshly minted `ReplaceRootVolumeTaskId`, charge the bytes it
+    /// and `client_token` retain against the store's byte budget, and answer that id.
+    ///
+    /// The id is minted HERE rather than by the writer, so a task never shares an id with
+    /// another resource of this store, and the record is written with that id on it so no
+    /// reader has to learn the key twice. A create still asks
+    /// [`Self::has_replace_root_volume_task_capacity`] and
+    /// [`Self::would_exceed_stored_bytes`] first so it can refuse instead of overshooting.
+    pub fn insert_replace_root_volume_task(
+        &mut self,
+        mut record: ReplaceRootVolumeTaskRecord,
+        client_token: Option<&str>,
+    ) -> String {
+        let task_id = self.next_id(REPLACE_ROOT_VOLUME_TASK_ID_PREFIX);
+        record.view.replace_root_volume_task_id = Some(task_id.clone());
+        self.add_stored_bytes(replace_root_volume_task_payload_bytes(
+            &record.view,
+            client_token,
+        ));
+        if let Some(token) = client_token {
+            self.replace_root_volume_task_client_tokens
+                .insert(token.to_string(), task_id.clone());
+        }
+        self.replace_root_volume_tasks.insert(task_id.clone(), record);
+        task_id
     }
 }
 

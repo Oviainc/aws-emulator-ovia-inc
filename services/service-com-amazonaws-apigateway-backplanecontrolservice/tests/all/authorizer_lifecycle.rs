@@ -461,8 +461,8 @@ async fn the_members_a_type_requires_are_the_ones_each_member_documents() {
     }
 
     // A `type` outside the modelled enum is refused by the boundary validator, which
-    // answers the framework's 400 `ValidationException` rather than this operation's
-    // `BadRequestException`.
+    // names the same `BadRequestException` this operation's own refusals do: API Gateway
+    // classifies an unknown authorizer type as a bad request.
     let off_model = create_authorizer(
         &gateway,
         &api,
@@ -477,7 +477,7 @@ async fn the_members_a_type_requires_are_the_ones_each_member_documents() {
     assert_failure(
         &off_model,
         400,
-        "ValidationException",
+        "BadRequestException",
         "a type outside AuthorizerType",
     );
 }

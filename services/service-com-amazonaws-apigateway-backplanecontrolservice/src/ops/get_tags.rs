@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before the store is reached: there is nothing to look up by it.
         let resource = crate::state::parse_tagged_resource(&input.resource_arn).ok_or_else(|| {
             GetTagsErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::invalid_tagged_resource_arn(&input.resource_arn)),
+                message: Some(crate::state::invalid_arn(&input.resource_arn)),
             })
         })?;
         let state = crate::state::service_state(&*self.engine)
