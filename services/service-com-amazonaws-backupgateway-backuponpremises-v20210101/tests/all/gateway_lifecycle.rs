@@ -1043,14 +1043,7 @@ async fn operations_outside_this_slice_still_answer_501() {
     let router = build_router(&engine);
     let arn = create(&router, "gw-untouched").await;
 
-    let rows: [(&str, Value); 2] = [
-        (
-            "GetVirtualMachine",
-            json!({ "ResourceArn": format!(
-                "arn:aws:backup-gateway:{REGION}:{}:vm/vm-0000000000000000",
-                engine::EMULATOR_ACCOUNT_ID
-            ) }),
-        ),
+    let rows: [(&str, Value); 1] = [
         (
             "UpdateGatewaySoftwareNow",
             json!({ "GatewayArn": arn }),

@@ -230,6 +230,12 @@ fn record_inventory(
                         host_name: row.host_name.clone(),
                         path: row.path.clone(),
                         last_backup_date: row.last_backup_date,
+                        // The `VirtualMachine` summary a listing carries declares no
+                        // `VmwareTags` member (`smithy_query(query="shape",
+                        // shape="VirtualMachine")`) — only the `VirtualMachineDetails`
+                        // a read of one machine returns does, which
+                        // `virtual_machine_reads` covers — so the rows here report none.
+                        vmware_tags: Vec::new(),
                     },
                     SystemTime::now(),
                 )
