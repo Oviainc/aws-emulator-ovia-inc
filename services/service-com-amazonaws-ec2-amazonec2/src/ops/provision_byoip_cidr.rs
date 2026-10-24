@@ -238,13 +238,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // action tags is the pool it creates, whose `ResourceType` is the one of the
         // range's own family. The tag payload's own bounds are the ones every create holds
         // its tags to, applied by the one shared reader — so a specification naming
-        // another resource type, or a tag outside those bounds, is refused HERE. The tags
-        // themselves are not stored: the address pool is not a resource this store holds
-        // (every public-pool operation is a scaffold answering 501), so there would be
-        // nothing to hang them on and nothing that could report them back. The operation
-        // that lands a public-pool read has to store them WITH the pool rather than let
-        // this drop them.
-        let _pool_tags: Vec<Tag> = state::tags_from_specifications(
+        // another resource type, or a tag outside those bounds, is refused HERE. For an
+        // IPv4 range the tags are stored WITH the pool the store creates for it
+        // (`state::PublicIpv4PoolRecord::tags`), which is what `DescribePublicIpv4Pools`
+        // reports them back from; an IPv6 range's `ipv6pool-ec2` is not a resource this
+        // store holds yet, so its tags have nothing to hang on until that pool does.
+        let pool_tags: Vec<Tag> = state::tags_from_specifications(
             input.pool_tag_specifications.as_deref(),
             block.family.pool_resource_type(),
             Self::NAME,
@@ -257,6 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description.clone(),
             network_border_group,
             publicly_advertisable,
+            pool_tags,
         };
 
         let service_state = state::require_service_state(&*self.engine)?;

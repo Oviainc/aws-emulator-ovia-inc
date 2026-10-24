@@ -296,11 +296,16 @@ fn dispatch_table() -> Vec<(&'static str, &'static str, String, &'static str, Re
             },
         ),
         (
+            // Implemented: it answers the modelled `NotFoundException` (404) for a bridge
+            // ARN this store does not hold.
             "UpdateBridgeSource",
             "PUT",
             format!("/v1/bridges/{BRIDGE_ARN}/sources/source-1"),
             "{}",
-            Reached::ScaffoldedStub,
+            Reached::ModelledError {
+                status: 404,
+                code: "NotFoundException",
+            },
         ),
         (
             // Implemented: it answers the modelled `NotFoundException` (404) for a flow

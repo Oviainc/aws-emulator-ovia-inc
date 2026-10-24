@@ -3,8 +3,9 @@
 //! Engine state for the com-amazonaws-networkmanager-networkmanager service.
 //!
 //! The global-network / site / link lifecycle is the core resource tree of Network
-//! Manager: a global network owns sites, a site owns links (and, in a later slice,
-//! devices). A global network also owns its CORE network — the Cloud WAN managed network
+//! Manager: a global network owns sites, a site owns links, and a global network owns
+//! devices (each optionally assigned to one of its sites). A global network also owns its
+//! CORE network — the Cloud WAN managed network
 //! whose segments and edges are a function of the core network policy document it holds.
 //! Everything
 //! the implemented operations answer is computed from the records below — no handler
@@ -14,9 +15,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Bandwidth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
-    CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment, GlobalNetwork, Link,
-    Location, ResourceNotFoundException, Site, Tag, ValidationException, ValidationExceptionField,
+    AWSLocation, Bandwidth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
+    CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment, Device, GlobalNetwork,
+    Link, Location, ResourceNotFoundException, Site, Tag, ValidationException,
+    ValidationExceptionField,
 };
 
 /// Members of `GlobalNetworkState` / `SiteState` / `LinkState` this slice uses. All three
@@ -47,6 +49,8 @@ pub const GLOBAL_NETWORK_KIND: &str = "global-network";
 pub const SITE_KIND: &str = "site";
 /// See [`GLOBAL_NETWORK_KIND`].
 pub const LINK_KIND: &str = "link";
+/// See [`GLOBAL_NETWORK_KIND`].
+pub const DEVICE_KIND: &str = "device";
 /// See [`GLOBAL_NETWORK_KIND`]. The model constrains this one's id itself:
 /// `CoreNetworkId` carries `pattern ^core-network-([0-9a-f]{8,17})$`
 /// (`smithy_query shape=CoreNetworkId`), which the 17 hex digits of
@@ -69,6 +73,9 @@ pub const LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT: &str = "global-networks-per-account
 pub const LIMIT_SITES_PER_GLOBAL_NETWORK: &str = "sites-per-global-network";
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`].
 pub const LIMIT_LINKS_PER_SITE: &str = "links-per-site";
+/// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota
+/// [`MAX_DEVICES_PER_GLOBAL_NETWORK`] bounds.
+pub const LIMIT_DEVICES_PER_GLOBAL_NETWORK: &str = "devices-per-global-network";
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota
 /// [`MAX_CORE_NETWORKS_PER_GLOBAL_NETWORK`] bounds.
 pub const LIMIT_CORE_NETWORKS_PER_GLOBAL_NETWORK: &str = "core-networks-per-global-network";
@@ -226,6 +233,17 @@ pub const MAX_SITES_PER_GLOBAL_NETWORK: usize = 100;
 /// [`MAX_SITES_PER_GLOBAL_NETWORK`]: the model carries no number and the published quota
 /// is per-account adjustable, so this one only bounds the store.
 pub const MAX_LINKS_PER_SITE: usize = 100;
+/// How many devices one global network may hold. CHOSEN for the same reason as
+/// [`MAX_SITES_PER_GLOBAL_NETWORK`]: the model carries no number and the published quota
+/// is per-account adjustable, so this one only bounds the store.
+pub const MAX_DEVICES_PER_GLOBAL_NETWORK: usize = 100;
+
+/// The documented maximum length, in characters, of a device's `Vendor`, `Model` and
+/// `SerialNumber`: "Constraints: Maximum length of 128 characters" on each of the three
+/// (`smithy_query query="doc" shape="CreateDeviceRequest" member="Vendor"`, the same
+/// sentence for `Model` and `SerialNumber`) — a bound the modelled `ConstrainedString`
+/// (len 0..256) does not express, so it is checked by the handler instead.
+pub const MAX_DEVICE_DESCRIPTOR_CHARS: usize = 128;
 
 /// How many core networks one global network may hold.
 ///
@@ -384,6 +402,76 @@ impl LinkRecord {
     }
 }
 
+/// A stored device, back-referencing the global network that owns it and, when the
+/// create named one, the site it sits at.
+///
+/// A device hangs off the GLOBAL NETWORK, not off a site: "Creates a new device in a
+/// global network" (`smithy_query query="doc" shape="CreateDevice"`) and `SiteId` is
+/// optional, so `site_id` is an `Option` where [`LinkRecord::site_id`] is required.
+/// Like the records above, `state` is a function of the clock rather than a field.
+#[derive(Debug, Clone)]
+pub struct DeviceRecord {
+    pub id: String,
+    pub arn: String,
+    pub global_network_id: String,
+    /// The site this device sits at, when the create named one.
+    pub site_id: Option<String>,
+    /// The Amazon Web Services location (zone / subnet ARN) of the device, if any: "For
+    /// an on-premises device, you can omit this parameter"
+    /// (`smithy_query query="doc" shape="CreateDeviceRequest" member="AWSLocation"`).
+    pub aws_location: Option<AWSLocation>,
+    pub description: Option<String>,
+    /// The device's `Type`, a free-form string the model does not enumerate.
+    pub device_type: Option<String>,
+    pub vendor: Option<String>,
+    pub model: Option<String>,
+    pub serial_number: Option<String>,
+    pub location: Option<Location>,
+    pub created_at: SystemTime,
+    /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
+    pub available_at: SystemTime,
+    pub tags: Vec<Tag>,
+}
+
+impl DeviceRecord {
+    /// This device's lifecycle state as of `now`. `DeviceState` carries the same four
+    /// values as the three enums above (`smithy_query shape=DeviceState`: PENDING,
+    /// AVAILABLE, DELETING, UPDATING), so a device waits in [`STATE_PENDING`] too.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.available_at {
+            STATE_AVAILABLE
+        } else {
+            STATE_PENDING
+        }
+    }
+
+    /// The modelled `Device` for this record, as of `now`.
+    pub fn to_shape(&self, now: SystemTime) -> Device {
+        self.to_shape_with_state(self.state_at(now))
+    }
+
+    /// The modelled `Device` for this record, forcing `state` — for an operation that
+    /// reports the record it just removed as `DELETING`.
+    pub fn to_shape_with_state(&self, state: &str) -> Device {
+        Device {
+            device_id: Some(self.id.clone()),
+            device_arn: Some(self.arn.clone()),
+            global_network_id: Some(self.global_network_id.clone()),
+            aws_location: self.aws_location.clone(),
+            description: self.description.clone(),
+            r#type: self.device_type.clone(),
+            vendor: self.vendor.clone(),
+            model: self.model.clone(),
+            serial_number: self.serial_number.clone(),
+            location: self.location.clone(),
+            site_id: self.site_id.clone(),
+            created_at: Some(epoch_seconds(self.created_at)),
+            state: Some(state.to_string()),
+            tags: Some(self.tags.clone()),
+        }
+    }
+}
+
 /// A stored core network: the Cloud WAN managed network a global network owns.
 ///
 /// Its `state` is a function of the clock, like the records above, and its topology
@@ -464,6 +552,9 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     pub sites: BTreeMap<String, SiteRecord>,
     /// Links by `LinkId`, each carrying the `SiteId` and `GlobalNetworkId` it belongs to.
     pub links: BTreeMap<String, LinkRecord>,
+    /// Devices by `DeviceId`, each carrying its owning `GlobalNetworkId` and, when the
+    /// create named one, the `SiteId` it sits at.
+    pub devices: BTreeMap<String, DeviceRecord>,
     /// Core networks by `CoreNetworkId`, each carrying its owning `GlobalNetworkId`.
     pub core_networks: BTreeMap<String, CoreNetworkRecord>,
     /// Resource policies by the ARN of the resource they are attached to — the one store
@@ -525,6 +616,24 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .count()
     }
 
+    /// How many devices the global network `global_network_id` holds, for the
+    /// per-global-network quota and the network-resource inventory.
+    pub fn device_count_of(&self, global_network_id: &str) -> usize {
+        self.devices
+            .values()
+            .filter(|device| device.global_network_id == global_network_id)
+            .count()
+    }
+
+    /// The ids of the devices assigned to `site_id`, in `DeviceId` order.
+    pub fn device_ids_of_site(&self, site_id: &str) -> Vec<String> {
+        self.devices
+            .values()
+            .filter(|device| device.site_id.as_deref() == Some(site_id))
+            .map(|device| device.id.clone())
+            .collect()
+    }
+
     /// How many core networks `global_network_id` owns, for the per-global-network quota.
     pub fn core_network_count_of(&self, global_network_id: &str) -> usize {
         self.core_networks
@@ -553,6 +662,7 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         let held = match resource_type {
             SITE_KIND => self.site_count_of(global_network_id),
             LINK_KIND => self.link_count_of_network(global_network_id),
+            DEVICE_KIND => self.device_count_of(global_network_id),
             CORE_NETWORK_KIND => self.core_network_count_of(global_network_id),
             _ => 0,
         };
@@ -580,8 +690,8 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// no resource under that ARN.
     ///
     /// Tags live on the resource record itself, so every reader of a resource
-    /// (`DescribeGlobalNetworks`, `GetSites`, `GetLinks`, `ListTagsForResource`) answers
-    /// from the one stored list.
+    /// (`DescribeGlobalNetworks`, `GetSites`, `GetLinks`, `GetDevices`,
+    /// `ListTagsForResource`) answers from the one stored list.
     pub fn tags_of(&self, arn: &str) -> Option<&Vec<Tag>> {
         let parts = parse_resource_arn(arn)?;
         match parts.kind {
@@ -597,6 +707,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 .map(|record| &record.tags),
             LINK_KIND => self
                 .links
+                .get(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &record.tags),
+            DEVICE_KIND => self
+                .devices
                 .get(parts.id)
                 .filter(|record| record.arn == arn)
                 .map(|record| &record.tags),
@@ -625,6 +740,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 .map(|record| &mut record.tags),
             LINK_KIND => self
                 .links
+                .get_mut(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &mut record.tags),
+            DEVICE_KIND => self
+                .devices
                 .get_mut(parts.id)
                 .filter(|record| record.arn == arn)
                 .map(|record| &mut record.tags),

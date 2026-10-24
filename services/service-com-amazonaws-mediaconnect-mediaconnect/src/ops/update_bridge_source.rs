@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBridgeSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBridgeSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBridgeSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the settings the request carries to ONE source of the STORED bridge — the
+//! source that bridge addresses by the requested name — and answers with the stored
+//! source read back, so DescribeBridge afterwards reports exactly what this operation
+//! wrote.
+//!
+//! The operation is a PARTIAL update (`@idempotent`, every input member but the two
+//! `@httpLabel`s optional), exactly like UpdateBridge: a member the request carries
+//! replaces that setting on the stored source and a member it omits leaves the stored
+//! setting untouched. The request-only wrapper shapes are merged member by member into the
+//! shape the bridge holds: `UpdateBridgeFlowSourceRequest` into the `BridgeFlowSource` and
+//! `UpdateBridgeNetworkSourceRequest` into the `BridgeNetworkSource`. A member of the
+//! stored shape the request shape has no counterpart for is the service's own and is
+//! carried over untouched — `BridgeFlowSource$Name` / `BridgeNetworkSource$Name` (the name
+//! the bridge addresses the source by, which is the `@httpLabel` this request resolves it
+//! with) and `BridgeFlowSource$OutputArn` ("the Amazon Resource Number (ARN) of the
+//! output", which the service, not the client, assigns).
+//!
+//! A `BridgeSource` is EITHER a flow source ("the source of the associated flow") or a
+//! network source ("the network source for the bridge"), so a request that names both
+//! wrappers is refused as self-contradictory, and one that names the wrapper for the kind
+//! the addressed source is NOT is refused because that source has no such settings to
+//! update. Both are `BadRequestException` (HTTP 400), the error the model describes as the
+//! one for "a semantic error" in the request. A request that names NEITHER wrapper is a
+//! partial update of nothing: it is accepted and the stored source is answered unchanged,
+//! the same way UpdateBridge answers a request that carries no setting.
+//!
+//! The model gives this operation no state member and documents no state change for it, so
+//! it leaves the bridge's state alone: it only settles a transition the clock had already
+//! made due, exactly as DescribeBridge, AddBridgeSources and UpdateBridge do.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +107,41 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable about the REQUEST's content; the message carries it inside this service's
+/// refusal envelope ([`crate::state::validation_failed_message`]), the one every refusal
+/// about a request's content carries.
+fn bad_request(detail: impl Into<String>) -> UpdateBridgeSourceError {
+    UpdateBridgeSourceErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse a WELL-FORMED request the addressed SOURCE itself does not admit, with the same
+/// `BadRequestException` (HTTP 400) under the other envelope
+/// ([`crate::state::bad_request_message`]): the request is not malformed, the source just
+/// has no such settings to update. The same split UpdateBridge makes for a wrapper the
+/// addressed bridge has no counterpart for.
+fn refused_by_source(detail: impl Into<String>) -> UpdateBridgeSourceError {
+    UpdateBridgeSourceErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::bad_request_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources in
+/// the request does not exist in the system" — the bridge or the source `identifier`
+/// addressed, in this service's not-found envelope
+/// ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> UpdateBridgeSourceError {
+    UpdateBridgeSourceErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +216,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBridgeSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBridgeSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBridgeSource"))
+        // Nothing in this operation's answer depends on request metadata: both the bridge
+        // ARN and the source name are `@httpLabel`s the deserializer already put on
+        // `input`, and the response is read back out of the stored bridge.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateBridgeSourceErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect bridge store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A bridge source is one kind or the other, so a request naming both wrappers
+        // describes no single source. This is about the REQUEST's content, so it is checked
+        // before the bridge and the source it addresses are resolved.
+        if input.flow_source.is_some() && input.network_source.is_some() {
+            return Err(bad_request(
+                "An update bridge source request may name at most one of FlowSource (the \
+                 source of an associated cloud flow) and NetworkSource (a source that \
+                 originates at your premises): a bridge source is one kind or the other.",
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write this operation owes beyond the request: a bridge state change the
+        // clock already made due is materialised before the bridge is read or written.
+        store.settle_due_transitions(now);
+
+        // This operation updates a source of "an existing bridge", addressed by the
+        // bridge's own ARN.
+        let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
+            return Err(not_found(&input.bridge_arn));
+        };
+        // The source updated is the one of THIS bridge's sources the bridge addresses by
+        // the requested name ("this name is used to reference the source and must be unique
+        // among sources in this bridge"), so at most one position matches; a name of some
+        // other bridge's source, or of a source already removed, resolves nothing here.
+        let Some(position) = bridge.source_position(&input.source_name) else {
+            return Err(not_found(&input.source_name));
+        };
+
+        // What the source becomes once this request is applied: the request's value for
+        // every member it carries, the stored value for every member it does not. The
+        // merged source is computed in full before anything is written, and a wrapper the
+        // addressed source has no counterpart for is refused rather than silently ignored,
+        // so a refused update leaves the bridge exactly as it was.
+        let stored = &bridge.sources[position];
+        let updated = if let Some(update) = input.flow_source.as_ref() {
+            let Some(stored_flow) = stored.flow_source.as_ref() else {
+                return Err(refused_by_source(
+                    "FlowSource cannot be updated on a network source of a bridge.",
+                ));
+            };
+            BridgeSource {
+                flow_source: Some(BridgeFlowSource {
+                    flow_arn: update
+                        .flow_arn
+                        .clone()
+                        .unwrap_or_else(|| stored_flow.flow_arn.clone()),
+                    flow_vpc_interface_attachment: update
+                        .flow_vpc_interface_attachment
+                        .clone()
+                        .or_else(|| stored_flow.flow_vpc_interface_attachment.clone()),
+                    // `BridgeFlowSource$Name` is the name the bridge addresses this source
+                    // by — the `@httpLabel` that resolved it — and `OutputArn` is "the
+                    // Amazon Resource Number (ARN) of the output" the service assigns.
+                    // Neither has a counterpart in the request shape, so both are carried
+                    // over untouched.
+                    name: stored_flow.name.clone(),
+                    output_arn: stored_flow.output_arn.clone(),
+                }),
+                network_source: None,
+            }
+        } else if let Some(update) = input.network_source.as_ref() {
+            let Some(stored_network) = stored.network_source.as_ref() else {
+                return Err(refused_by_source(
+                    "NetworkSource cannot be updated on a flow source of a bridge.",
+                ));
+            };
+            BridgeSource {
+                flow_source: None,
+                network_source: Some(BridgeNetworkSource {
+                    multicast_ip: update
+                        .multicast_ip
+                        .clone()
+                        .unwrap_or_else(|| stored_network.multicast_ip.clone()),
+                    multicast_source_settings: update
+                        .multicast_source_settings
+                        .clone()
+                        .or_else(|| stored_network.multicast_source_settings.clone()),
+                    // As for a flow source, the source's `Name` is the one the bridge
+                    // addresses it by and the request shape has no member for it.
+                    name: stored_network.name.clone(),
+                    network_name: update
+                        .network_name
+                        .clone()
+                        .unwrap_or_else(|| stored_network.network_name.clone()),
+                    port: update.port.unwrap_or(stored_network.port),
+                    protocol: update
+                        .protocol
+                        .clone()
+                        .unwrap_or_else(|| stored_network.protocol.clone()),
+                }),
+            }
+        } else {
+            // A request that carries neither wrapper updates no setting, so the stored
+            // source stays as it is and is answered unchanged.
+            stored.clone()
+        };
+        bridge.sources[position] = updated;
+
+        // "The ARN of the updated bridge source" and "the updated bridge source" — both read
+        // back out of the STORED bridge rather than echoed from the request, so the answer
+        // can only report what this call actually wrote. Updating a source moves nothing
+        // else about the bridge: its state is left as it was, because no clock owes a change
+        // for an updated source.
+        Ok(UpdateBridgeSourceOutput {
+            bridge_arn: Some(bridge.bridge_arn.clone()),
+            source: Some(bridge.sources[position].clone()),
+        })
     }
 }
