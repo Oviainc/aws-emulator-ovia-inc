@@ -66,3 +66,5 @@ mod reserved_tag_keys;
 mod attached_multiview_channels;
 #[path = "all/delete_channel_multiview_source.rs"]
 mod delete_channel_multiview_source;
+#[path = "all/multiview_configuration_validation.rs"]
+mod multiview_configuration_validation;

@@ -510,11 +510,9 @@ async fn a_multiview_channels_sources_and_layouts_are_editable() {
 
     // A multiview channel's sources and layouts are editable. The layout values come
     // from the model's MultiviewLayoutType enum (LAYOUT_2EH | LAYOUT_2PL | LAYOUT_3EL |
-    // LAYOUT_3PL | LAYOUT_4E | LAYOUT_4PL). (The source rules themselves —
-    // MULTIVIEW_SOURCE_NOT_FOUND / MULTIVIEW_SOURCE_INVALID_INPUT_TYPE — are enforced by
-    // neither create nor update yet; they belong with the other cross-member validation
-    // gaps, so these rows use sources that satisfy them rather than asserting anything
-    // about ones that do not.)
+    // LAYOUT_3PL | LAYOUT_4E | LAYOUT_4PL). Every row names CMAF channels of this group,
+    // which is what a tile source must be; the refusals for the ones that are not are
+    // asserted in the multiview-configuration suite.
     let (status, multiview) = emulator
         .create_channel(
             group,
