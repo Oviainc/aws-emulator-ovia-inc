@@ -6,6 +6,10 @@
 //! malformed ARN is `BadRequestException` (400) before any lookup, an absent resource is
 //! `NotFoundException` (404).
 //!
+//! A key in the reserved [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace is refused
+//! `ValidationException` (400): that namespace belongs to AWS, and a caller can no more
+//! delete a tag in it than create one.
+//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken".
 //!
@@ -175,6 +179,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let at = crate::state::now();
+        // AWS owns the `aws:` tag-key namespace: a caller can neither edit nor DELETE a
+        // tag in it, so naming one here is refused rather than silently ignored. `tagKeys`
+        // is the wire name of the member (`@httpQuery("tagKeys")` on
+        // `UntagResourceRequest$TagKeys`).
+        if let Some(rejection) = crate::state::reserved_tag_key_rejection(
+            "tagKeys",
+            input.tag_keys.iter().map(String::as_str),
+        ) {
+            return Err(UntagResourceErrorModeled::ValidationException(rejection).into());
+        }
         let untagged = store.with_tags_mut(&target, at, |tags| {
             // A key the resource does not carry is not an error: the state this call
             // promises is "these keys are absent".

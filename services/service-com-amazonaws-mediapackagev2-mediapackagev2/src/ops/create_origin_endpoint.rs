@@ -350,6 +350,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(rejection) = crate::state::tag_bounds_rejection(&tags) {
             return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
         }
+        // Tag-on-create writes into the same tag map `TagResource` does, so it is held to
+        // the same reserved-namespace rule: AWS owns the `aws:` tag-key namespace, and a
+        // request naming a key in it is refused before anything is stored. `Tags` is the
+        // wire name of the member (no `@jsonName` on `CreateOriginEndpointRequest$Tags`).
+        if let Some(rejection) =
+            crate::state::reserved_tag_key_rejection("Tags", tags.keys().map(String::as_str))
+        {
+            return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
         let fingerprint = crate::state::request_fingerprint(&[
             input.channel_group_name.clone(),
             input.channel_name.clone(),
