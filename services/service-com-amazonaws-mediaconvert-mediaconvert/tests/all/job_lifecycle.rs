@@ -214,13 +214,18 @@ impl Emulator {
     }
 }
 
-/// A minimal but structurally real `JobSettings`: one input file and one output group.
+/// A minimal but structurally real `JobSettings`: one input file and one output group
+/// holding one output that states the container it is written in (`Output$Preset`: "You can
+/// specify either Preset or Container settings, but not both").
 pub(crate) fn settings(input_uri: &str, name_modifier: &str) -> Value {
     json!({
         "inputs": [{ "fileInput": input_uri }],
         "outputGroups": [{
             "name": "File Group",
-            "outputs": [{ "nameModifier": name_modifier }],
+            "outputs": [{
+                "nameModifier": name_modifier,
+                "containerSettings": { "container": "MP4" }
+            }],
             "outputGroupSettings": {
                 "type": "FILE_GROUP_SETTINGS",
                 "fileGroupSettings": { "destination": "s3://example-bucket/out/" }
@@ -759,17 +764,12 @@ async fn create_job_persists_its_input_and_get_job_reads_it_back() {
         .create_job_template(json!({
             "name": "my-template",
             // A graph a job can be built from: `JobTemplateSettings` needs an output
-            // group, so the fixture states one rather than inputs alone.
+            // group, and each of its outputs needs the container it is written in, so the
+            // fixture states the output groups this suite's own job fixture builds.
             "settings": {
                 "inputs": [{ "timecodeSource": "ZEROBASED" }],
-                "outputGroups": [{
-                    "name": "File Group",
-                    "outputs": [{ "nameModifier": "_tpl" }],
-                    "outputGroupSettings": {
-                        "type": "FILE_GROUP_SETTINGS",
-                        "fileGroupSettings": { "destination": "s3://example-bucket/out/" }
-                    }
-                }]
+                "outputGroups": settings("s3://example-bucket/in/ignored.mp4", "_t")["outputGroups"]
+                    .clone()
             }
         }))
         .await;

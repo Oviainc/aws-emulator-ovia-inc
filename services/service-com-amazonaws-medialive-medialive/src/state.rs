@@ -4230,6 +4230,56 @@ pub fn new_input(id: String, arn: String) -> InputRecord {
     }
 }
 
+/// Build the record of the input `CreatePartnerInput` creates as a partner of
+/// `primary`: a second input, under its own minted `id` and `arn`, that ingests
+/// the configuration the input it partners was created with, carrying the tags
+/// the partner request supplied and naming the input it partners — which is
+/// what makes the pair report each other in `InputPartnerIds`
+/// ([`ComAmazonawsMedialiveMedialiveState::input_partner_ids`]).
+///
+/// EVERY configuration member of the partnered input is inherited, since
+/// `CreatePartnerInput` carries no member to configure the partner with: its
+/// `name`, `input_type`, `input_network_location`, `role_arn`,
+/// `security_groups`, the per-pipeline `sources`, `destinations`,
+/// `media_connect_flows`, `input_devices`, `sdi_sources`, `srt_settings`,
+/// `multicast_settings`, `smpte2110_receiver_group_settings`,
+/// `router_settings`, and the `vpc` and `special_router_settings` a request
+/// supplied but the `Input` shape reports no member for.
+///
+/// What it does NOT inherit is the rest — a per-input value rather than part of
+/// that configuration:
+///
+/// * `ingest_ips` starts empty, so
+///   [`ComAmazonawsMedialiveMedialiveState::allocate_input_ingest_addresses`]
+///   gives the partner an ingest endpoint of its OWN for each destination slot
+///   instead of sharing the primary's allocated one — a partner exists so a
+///   second source can be pushed somewhere else. A destination slot whose
+///   request named its own ON-PREM `StaticIpAddress` keeps reporting that
+///   address on both inputs, because that address is the CALLER's value for the
+///   slot rather than one this service allocates;
+/// * `tags` are the partner request's own, never a copy of the primary's;
+/// * the deletion lifecycle starts fresh: the partner is a newly created input,
+///   not a copy of the primary's state. Like `CreateInput`, there is no
+///   transient state to owe — the input is usable from the instant it is
+///   stored.
+pub fn new_partner_input(
+    primary: &InputRecord,
+    id: String,
+    arn: String,
+    tags: HashMap<String, String>,
+) -> InputRecord {
+    InputRecord {
+        id,
+        arn,
+        ingest_ips: Vec::new(),
+        tags,
+        partner_of: Some(primary.id.clone()),
+        deletion_due: None,
+        deleted: false,
+        ..primary.clone()
+    }
+}
+
 /// Delete an input: it moves into `DELETING` and owes the terminal `DELETED`
 /// once [`TRANSIENT_STATE_SPAN`] has passed, which is the lifecycle the real
 /// service runs (a caller waits on `State`, which is what the `input_deleted`

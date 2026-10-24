@@ -24,6 +24,7 @@
 use serde_json::{json, Value};
 
 use super::job_lifecycle::{settings as job_settings, Emulator, Reply, ROLE};
+use super::job_template_crud::settings as template_settings;
 
 /// The queue the fixture creates and deletes, so a read of it is a read of a queue that
 /// is gone.
@@ -77,19 +78,10 @@ async fn seeded() -> (Emulator, Vec<Case>) {
     let template = emulator
         .create_job_template(json!({
             "name": DELETED_TEMPLATE,
-            // A graph a job can be built from: `JobTemplateSettings` needs an output
-            // group, so the fixture states one rather than inputs alone.
-            "settings": {
-                "inputs": [{ "timecodeSource": "ZEROBASED" }],
-                "outputGroups": [{
-                    "name": "File Group",
-                    "outputs": [{ "nameModifier": "_0" }],
-                    "outputGroupSettings": {
-                        "type": "FILE_GROUP_SETTINGS",
-                        "fileGroupSettings": { "destination": "s3://example-bucket/out/" }
-                    }
-                }]
-            }
+            // A graph a job can be built from: `JobTemplateSettings` needs an output group,
+            // and each of its outputs needs the container it is written in, which is what
+            // the job-template suites' one settings fixture builds.
+            "settings": template_settings(1, 1)
         }))
         .await;
     assert_eq!(

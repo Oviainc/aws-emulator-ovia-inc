@@ -1654,6 +1654,13 @@ pub fn resource_not_found() -> ResourceNotFoundException {
 /// refusal: an authorization decision that leaked whether the resource exists would
 /// tell an unauthorized caller what the organization holds. A refused call therefore
 /// also writes nothing.
+///
+/// Which operations take this gate is decided PER OPERATION, by what each one
+/// answers, never by the resource it names: an operation whose recorded answer to
+/// a caller with no administrator association is the outcome of its own lookup is
+/// not gated here, and reaches the store directly (`GetPolicy` and `DeletePolicy`
+/// are that case — `AccessDeniedException` is in neither one's modeled error set,
+/// nor in this service's common errors).
 /// The refusal [`require_administrator`] states when the organization has no
 /// Firewall Manager administrator: HTTP 400 `AccessDeniedException`, naming the
 /// calling account and the Region the request was signed for.

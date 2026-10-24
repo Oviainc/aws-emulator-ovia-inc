@@ -479,26 +479,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The settings graph is validated at SUBMIT time, against what the job will
-        // actually be run from: the request's own `Settings` merged with whatever the
-        // referenced template supplies. A job that describes no source, or no outputs and
-        // has no template to supply them, describes no transcode at all, which is the
+        // actually be run from: `settings` above is the request's own `Settings` with the
+        // referenced template's laid under it, member by member. A job that describes no
+        // source, or no complete output, describes no transcode at all, which is the
         // modelled 400 — and nothing is stored, because this returns before `accept_job`.
-        let settings_problem = {
-            let template = match job_template.as_deref() {
-                Some(reference) => match state.job_template_settings(reference) {
-                    Some(settings) => Some(settings),
-                    None => {
-                        return Err(CreateJobErrorModeled::NotFoundException(NotFoundException {
-                            message: Some(crate::state::not_found_message("jobTemplate")),
-                        })
-                        .into())
-                    }
-                },
-                None => None,
-            };
-            crate::state::job_settings_problem(&settings, template)
-        };
-        if let Some(problem) = settings_problem {
+        // The template reference itself was resolved against this same guarded store above,
+        // so a template that vanished is already the 404 naming the member it came from.
+        if let Some(problem) = crate::state::job_settings_problem(&settings) {
             return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
                 message: Some(problem.message()),
             })

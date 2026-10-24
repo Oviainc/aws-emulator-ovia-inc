@@ -89,9 +89,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AacSettings, AccelerationSettings, AudioCodecSettings, AudioDescription, ContainerSettings,
     H264Settings, H265Settings, HopDestination, Input, InputTemplate, Job, JobEngineVersion,
-    JobMessages, JobSettings, JobTemplate, JobTemplateSettings, Output, Policy, Preset,
-    PresetSettings, Queue, QueueTransition, ReservationPlan, ReservationPlanSettings, Timing,
-    VideoCodecSettings, VideoDescription,
+    JobMessages, JobSettings, JobTemplate, JobTemplateSettings, Output, OutputGroup, Policy,
+    Preset, PresetSettings, Queue, QueueTransition, ReservationPlan, ReservationPlanSettings,
+    Timing, VideoCodecSettings, VideoDescription,
 };
 
 /// The built-in queue a job with no `Queue` member is sent to.
@@ -851,69 +851,132 @@ pub fn invalid_job_engine_version_message() -> String {
     )
 }
 
-/// What a submitted job's settings graph is missing for the job to describe a transcode at
-/// all.
+/// What a settings graph is missing for it to describe a transcode at all.
 ///
-/// `JobSettings$Inputs` is "Use Inputs to define source file used in the transcode job" and
-/// `JobSettings$OutputGroups` is "Contains one group of settings for each set of outputs":
-/// a job with no input names nothing to read and a job with no output group names nothing
-/// to write, so in either case there is no transcode for the service to run. MediaConvert
-/// validates the settings graph when the job is SUBMITTED — the error envelope's
-/// `settingsValidationErrorsJsonBlob` member exists to report exactly that — and refuses
-/// such a request with `BadRequestException` (400) rather than storing a job.
+/// `JobSettings$Inputs` is "Use Inputs to define source file used in the transcode job",
+/// `JobSettings$OutputGroups` is "Contains one group of settings for each set of outputs",
+/// `OutputGroup$Outputs` "holds groups of encoding settings, one group of settings per
+/// output" and `Output$Preset` is "Use Preset to specify a preset for your transcoding
+/// settings. … You can specify either Preset or Container settings, but not both": a graph
+/// with no input names nothing to read, and one with no output group, a group with no
+/// output, or an output that states neither the container to write nor the preset that
+/// states it, names nothing to write. In each case there is no transcode for the service to
+/// run. MediaConvert validates the settings graph when it is handed one — the error
+/// envelope's `settingsValidationErrorsJsonBlob` member exists to report exactly that — and
+/// refuses such a request with `BadRequestException` (400) rather than storing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobSettingsProblem {
-    /// Nothing supplies an input, so the job names no source.
+pub enum SettingsProblem {
+    /// Nothing supplies an input, so the graph names no source.
     NoInputs,
-    /// Nothing supplies an output group, so the job names no outputs.
+    /// Nothing supplies an output group, so the graph names no outputs.
     NoOutputGroups,
+    /// The output group at this index holds no `Outputs` entry, so it produces nothing.
+    NoOutputs {
+        /// The group's index in `OutputGroups`, as the request stated it.
+        group: usize,
+    },
+    /// The output at this position states neither a container of its own nor a preset, so
+    /// nothing says what it is written as.
+    NoContainer {
+        /// The group's index in `OutputGroups`, as the request stated it.
+        group: usize,
+        /// The output's index in that group's `Outputs`.
+        output: usize,
+    },
 }
 
-impl JobSettingsProblem {
-    /// The refusal's wording: the settings member that must carry an entry and what it
+impl SettingsProblem {
+    /// The refusal's wording: the settings member that must carry a value and what it
     /// describes. Built from the request's own members, as every member-naming refusal in
     /// this crate is (see [`not_found_message`]), never from a recorded sentence.
     pub fn message(self) -> String {
         match self {
             Self::NoInputs => {
-                "Your job settings must specify at least one entry in Inputs: use Inputs to \
+                "Your settings must specify at least one entry in Inputs: use Inputs to \
                  define the source file used in the transcode job."
+                    .to_string()
             }
             Self::NoOutputGroups => {
-                "Your job settings must specify at least one entry in OutputGroups: use \
-                 OutputGroups to define each set of outputs the transcode produces, or \
-                 create the job from a job template that supplies them."
+                "Your settings must specify at least one entry in OutputGroups: use \
+                 OutputGroups to define each set of outputs the transcode produces."
+                    .to_string()
             }
+            Self::NoOutputs { group } => format!(
+                "Your settings must specify at least one entry in \
+                 OutputGroups[{group}].Outputs: an output group holds one group of encoding \
+                 settings per output it produces."
+            ),
+            Self::NoContainer { group, output } => format!(
+                "Your settings must specify either Preset or ContainerSettings.Container \
+                 for OutputGroups[{group}].Outputs[{output}]: an output states the container \
+                 it is written in, either in its own container settings or through the preset \
+                 it names."
+            ),
         }
-        .to_string()
     }
 }
 
-/// What is missing from the settings a `CreateJob` request submits, or `None` when they
-/// describe a transcode.
+/// What is missing from a list of output groups for it to describe at least one output, or
+/// `None` when it does.
 ///
-/// `template` is the stored settings of the job template the request referenced, when it
-/// referenced one: a job template is "a pre-made set of encoding instructions that you can
-/// use to quickly create a job", so a job that carries only its inputs and takes its
-/// outputs from its template describes a transcode just as fully as one that spells both
-/// out. The EFFECTIVE graph — what the request carries plus what the template supplies — is
-/// therefore what is tested here. An absent list and an empty list are the same thing: a
-/// list with no entries supplies nothing.
-pub fn job_settings_problem(
-    settings: &JobSettings,
-    template: Option<&JobTemplateSettings>,
-) -> Option<JobSettingsProblem> {
-    let inputs = settings.inputs.iter().flatten().count()
-        + template.map_or(0, |template| template.inputs.iter().flatten().count());
-    if inputs == 0 {
-        return Some(JobSettingsProblem::NoInputs);
+/// The ONE walk over `OutputGroups[].Outputs[]` in this module, so every operation handed a
+/// settings graph — a job at submit, a job template at create and at update — takes the
+/// same test and no two of them can disagree about what describes an output. An absent list
+/// and an empty list are the same thing: a list with no entries supplies nothing.
+pub fn output_groups_problem(groups: &[OutputGroup]) -> Option<SettingsProblem> {
+    if groups.is_empty() {
+        return Some(SettingsProblem::NoOutputGroups);
     }
-    let output_groups = settings.output_groups.iter().flatten().count()
-        + template.map_or(0, |template| template.output_groups.iter().flatten().count());
-    if output_groups == 0 {
-        return Some(JobSettingsProblem::NoOutputGroups);
+    for (group, output_group) in groups.iter().enumerate() {
+        let outputs = output_group.outputs.as_deref().unwrap_or_default();
+        if outputs.is_empty() {
+            return Some(SettingsProblem::NoOutputs { group });
+        }
+        if let Some(output) = outputs
+            .iter()
+            .position(|output| !output_states_a_container(output))
+        {
+            return Some(SettingsProblem::NoContainer { group, output });
+        }
     }
     None
+}
+
+/// Whether an output says what it is written as.
+///
+/// `Output$Preset`: "Provide the system or custom preset name. You can specify either
+/// Preset or Container settings, but not both" — so the container comes either from the
+/// preset the output names or from its own `ContainerSettings`, whose `Container` is the
+/// member that states it. A blank preset name names no preset, and container settings that
+/// state no container state no container.
+fn output_states_a_container(output: &Output) -> bool {
+    let preset = output
+        .preset
+        .as_deref()
+        .is_some_and(|preset| !preset.trim().is_empty());
+    let container = output.container_settings.as_ref().is_some_and(|settings| {
+        settings
+            .container
+            .as_deref()
+            .is_some_and(|container| !container.trim().is_empty())
+    });
+    preset || container
+}
+
+/// What is missing from the settings a submitted job will be run from, or `None` when they
+/// describe a transcode.
+///
+/// `settings` is the EFFECTIVE graph: a job created from a job template states only what it
+/// wants to differ and inherits every member it leaves out, so the caller validates what
+/// [`merge_template_settings`] produced — the graph the job is stored with. That is why a
+/// job which carries only its inputs and takes its outputs from its template passes here
+/// just as one that spells both ends out does, and why the graph that is validated cannot
+/// differ from the graph that is stored.
+pub fn job_settings_problem(settings: &JobSettings) -> Option<SettingsProblem> {
+    if settings.inputs.as_deref().unwrap_or_default().is_empty() {
+        return Some(SettingsProblem::NoInputs);
+    }
+    output_groups_problem(settings.output_groups.as_deref().unwrap_or_default())
 }
 
 /// How many entries `JobTemplateSettings$Inputs` can carry.
@@ -931,19 +994,24 @@ pub const MAX_JOB_TEMPLATE_INPUTS: usize = 1;
 /// applied to jobs created from it", so the graph a template stores has to be one jobs can
 /// be created from. Two members of it decide that:
 ///
-/// * `OutputGroups` "contains one group of settings for each set of outputs" — a template
-///   with none describes nothing to write, and neither does any job that takes its outputs
-///   from it (see [`job_settings_problem`], which refuses exactly that job);
+/// * `OutputGroups` is what the template supplies to every job created from it, so it takes
+///   the same test the submitted job's own graph takes ([`output_groups_problem`]): a group
+///   list with no entry, a group with no output, or an output that states no container
+///   describes nothing to write, and neither does any job that takes its outputs from it;
 /// * `Inputs` states the cardinality: "There can only be one input in a job template."
+///
+/// `Inputs` is otherwise the job's to state: `JobTemplateSettings$Inputs` is an
+/// `InputTemplate` list that carries no file input at all, so a template with no input
+/// still describes a transcode.
 ///
 /// Either way the request states a graph the service cannot save, which is the modelled
 /// `BadRequestException` (400) rather than a stored template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobTemplateSettingsProblem {
-    /// Nothing supplies an output group, so the template names no outputs.
-    NoOutputGroups,
     /// More inputs than a job template can hold, with the count the request carried.
     TooManyInputs(usize),
+    /// The graph describes no complete output, as [`output_groups_problem`] reports it.
+    Outputs(SettingsProblem),
 }
 
 impl JobTemplateSettingsProblem {
@@ -952,18 +1020,15 @@ impl JobTemplateSettingsProblem {
     /// (see [`not_found_message`]).
     pub fn message(self) -> String {
         match self {
-            Self::NoOutputGroups => format!(
-                "{} Your job template settings must specify at least one entry in \
-                 OutputGroups: use OutputGroups to define each set of outputs that jobs \
-                 created from this template produce.",
-                invalid_value_sentence("settings")
-            ),
             Self::TooManyInputs(count) => format!(
                 "{} There can only be {MAX_JOB_TEMPLATE_INPUTS} input in a job template, \
                  and Inputs carries {count}; include the additional inputs on each job \
                  that references the template.",
                 invalid_value_sentence("settings")
             ),
+            Self::Outputs(problem) => {
+                format!("{} {}", invalid_value_sentence("settings"), problem.message())
+            }
         }
     }
 }
@@ -982,10 +1047,8 @@ pub fn job_template_settings_problem(
     if inputs > MAX_JOB_TEMPLATE_INPUTS {
         return Some(JobTemplateSettingsProblem::TooManyInputs(inputs));
     }
-    if settings.output_groups.iter().flatten().count() == 0 {
-        return Some(JobTemplateSettingsProblem::NoOutputGroups);
-    }
-    None
+    output_groups_problem(settings.output_groups.as_deref().unwrap_or_default())
+        .map(JobTemplateSettingsProblem::Outputs)
 }
 
 /// The resource-type prefixes a MediaConvert resource ARN can carry.

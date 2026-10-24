@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPageReceipts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPageReceipts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPageReceipts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the acknowledgements recorded against ONE page — the engagement to a single
+//! contact channel the request's `PageId` names — oldest first, in `MaxResults`-sized pages
+//! with an opaque `NextToken` that resumes after the last receipt emitted.
+//!
+//! A page's receipts are its acknowledgement log ([`crate::state::PageRecord::receipts`]):
+//! every acknowledgement `AcceptPage` has recorded against the page, in the order they
+//! arrived, which is why a page nobody has acknowledged reports an EMPTY list. This operation
+//! only READS them — it never records one, so polling a page cannot move the engagement cycle
+//! on.
+//!
+//! Two refusals come before the listing, in this order:
+//!
+//! 1. the account-level Incident Manager precondition, reported as the `PageId` being
+//!    unresolvable
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`])
+//!    — the modelled `ValidationException` (HTTP 400), BEFORE the page is looked up;
+//! 2. a `PageId` the store does not hold — the modelled `ResourceNotFoundException` (HTTP
+//!    404), never an empty list, exactly as `ListRotationOverrides` refuses a rotation it
+//!    cannot resolve.
+//!
+//! Only then is the `NextToken` read, so a request carrying an unreadable token for a page
+//! that does not exist is answered 404 rather than 400; an unreadable token for a page that
+//! does is the modelled `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +170,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPageReceipts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPageReceiptsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPageReceipts"))
+        use crate::state::{
+            decode_next_token, invalid_next_token_message, page_size, receipt_summary, take_page,
+            TOKEN_SCOPE_PAGE_RECEIPTS,
+        };
+
+        // The listing is addressed entirely by `PageId` and the pagination members, so
+        // nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal());
+        };
+
+        let state = state.lock();
+
+        // The account gate comes FIRST: before the pagination token is read and before the
+        // page is, so a non-onboarded account is refused identically whether or not the page
+        // it named exists. The refusal is the ARN-shaped one, since this listing's whole
+        // subject is the acknowledgements under one page ARN.
+        state
+            .require_active_replication_set_for(&input.page_id)
+            .map_err(account_precondition_failed)?;
+
+        // A receipt is a receipt OF a page, so a page the store does not hold has nothing to
+        // report — and no empty list either. It is resolved BEFORE the pagination token is
+        // read, so an unknown page is reported as a missing page whatever else the request
+        // carries.
+        let Some(page) = state.pages.get(&input.page_id) else {
+            return Err(ListPageReceiptsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Page {} not found", input.page_id),
+                    resource_id: input.page_id.clone(),
+                    resource_type: PAGE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The resume point: the position in the page's receipt log the previous response
+        // ended on. A receipt has no id of its own — the modelled `Receipt` carries none — and
+        // the log only ever grows at the end, so its position is a stable key.
+        let after: Option<usize> = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => Some(
+                decode_next_token(TOKEN_SCOPE_PAGE_RECEIPTS, token)
+                    .and_then(|decoded| decoded.parse::<usize>().ok())
+                    .ok_or_else(|| validation(invalid_next_token_message(token)))?,
+            ),
+            None => None,
+        };
+
+        let remaining: Vec<(usize, Receipt)> = page
+            .receipts
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| after.is_none_or(|last| *position > last))
+            .map(|(position, record)| (position, receipt_summary(record)))
+            .collect();
+
+        let (receipts, next_token) = take_page(
+            remaining,
+            page_size(input.max_results),
+            TOKEN_SCOPE_PAGE_RECEIPTS,
+            |(position, _)| position.to_string(),
+        );
+
+        Ok(ListPageReceiptsOutput {
+            next_token,
+            receipts: Some(receipts.into_iter().map(|(_, receipt)| receipt).collect()),
+        })
     }
+}
+
+/// The `resourceType` this operation's not-found error names for the page whose receipts
+/// were asked for.
+const PAGE_RESOURCE_TYPE: &str = "page";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` and `fields` is present but EMPTY, exactly as every gated
+/// operation in this service answers: the failure is account level, so no member of the
+/// request is at fault.
+fn account_precondition_failed(message: String) -> ListPageReceiptsError {
+    ListPageReceiptsErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: the same modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> ListPageReceiptsError {
+    ListPageReceiptsErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
+}
+
+/// The modelled server fault for an engine that holds no state at all: without a store there
+/// is nothing to list a page's receipts from, and that is this emulator's own failure rather
+/// than anything about the request.
+fn internal() -> ListPageReceiptsError {
+    ListPageReceiptsErrorModeled::InternalServerException(InternalServerException {
+        message: "this service is mounted on an engine that holds no state".to_string(),
+        retry_after_seconds: 0,
+    })
+    .into()
 }
