@@ -23,7 +23,8 @@ use ::aws_smithy_schema_server::constraints::{
 
 use crate::ops::types::{
     IPSet, LabelSummary, OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleGroup, Statement,
-    Tag, WAFAssociatedItemException, WAFDuplicateItemException, WAFInvalidParameterException,
+    Tag, WAFAssociatedItemException, WAFDuplicateItemException,
+    WAFFeatureNotIncludedInPricingPlanException, WAFInvalidParameterException,
     WAFLimitsExceededException, WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
 };
 
@@ -139,6 +140,30 @@ pub fn limits_exceeded_exception() -> WAFLimitsExceededException {
     }
 }
 
+/// The sentence `WAFFeatureNotIncludedInPricingPlanException` carries: the shape's
+/// own documented sentence
+/// (`smithy_query(query="shape",shape="WAFFeatureNotIncludedInPricingPlanException")`).
+/// See [`DUPLICATE_ITEM_MESSAGE`] for why the wording is a property of the
+/// exception type rather than of the call.
+pub const FEATURE_NOT_INCLUDED_IN_PRICING_PLAN_MESSAGE: &str = "The operation failed \
+     because the specified WAF feature isn’t supported by the CloudFront pricing \
+     plan associated with the web ACL.";
+
+/// `WAFFeatureNotIncludedInPricingPlanException` as WAF returns it:
+/// [`FEATURE_NOT_INCLUDED_IN_PRICING_PLAN_MESSAGE`] and no `DisallowedFeatures`.
+///
+/// The model leaves `DisallowedFeatures` optional and gives no vocabulary for
+/// either of its members (`PricingPlanFeatureName` and `RequiredPricingPlanName`
+/// are free strings, with no enum and no documented value list), so this emulator
+/// reports no feature/plan names rather than inventing two.
+pub fn feature_not_included_in_pricing_plan_exception()
+-> WAFFeatureNotIncludedInPricingPlanException {
+    WAFFeatureNotIncludedInPricingPlanException {
+        message: Some(FEATURE_NOT_INCLUDED_IN_PRICING_PLAN_MESSAGE.to_string()),
+        disallowed_features: None,
+    }
+}
+
 /// A WebACL as stored: the modelled shape plus the bookkeeping WAFv2 keeps beside
 /// it.
 #[derive(Debug, Clone)]
@@ -191,6 +216,34 @@ pub struct RuleGroupEntry {
     pub lock_token: String,
     /// Tags given at create time (`ListTagsForResource` is a separate gap issue).
     pub tags: Vec<Tag>,
+}
+
+/// One request a web ACL evaluated, as WAF's bot visibility recorded it: the URI
+/// path the request asked for and the bot that sent it.
+///
+/// WAF reports `GetTopPathStatisticsByTraffic` by aggregating the requests a web
+/// ACL actually evaluated over the window the caller names. This emulator serves
+/// the WAFv2 control plane only — no HTTP request is ever evaluated against a
+/// stored web ACL here — so nothing appends to
+/// [`ComAmazonawsWafv2Awswaf20190729State::bot_requests`] and a web ACL that has
+/// evaluated nothing reports zero requests over every window. The aggregation is
+/// still the whole answer: a web ACL whose log holds requests reports exactly
+/// those, grouped by path and ordered by volume.
+#[derive(Debug, Clone)]
+pub struct BotRequestRecord {
+    /// When WAF evaluated the request, in milliseconds since the Unix epoch: a
+    /// `TimeWindow` selects the records that fall inside it.
+    pub observed_at_millis: i64,
+    /// The URI path the request asked for, which `PathStatistics$Path` groups by.
+    pub uri_path: String,
+    /// The bot that sent the request, as `BotStatistics$BotName` names it and the
+    /// `BotName` filter selects it.
+    pub bot_name: String,
+    /// The category the bot belongs to, as the `BotCategory` filter selects it.
+    pub bot_category: String,
+    /// The organization operating the bot, as the `BotOrganization` filter selects
+    /// it.
+    pub bot_organization: String,
 }
 
 /// What an ARN in [`ComAmazonawsWafv2Awswaf20190729State::arn_index`] resolves to.
@@ -260,6 +313,9 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
     /// Every resource ARN this service minted, so a by-ARN lookup resolves from
     /// state instead of parsing the ARN back apart.
     pub arn_index: HashMap<String, ResourceRef>,
+    /// The requests each web ACL has evaluated, by `(Scope, Id)`: the log
+    /// `GetTopPathStatisticsByTraffic` aggregates. See [`BotRequestRecord`].
+    pub bot_requests: HashMap<(String, String), Vec<BotRequestRecord>>,
 }
 
 impl ComAmazonawsWafv2Awswaf20190729State {
@@ -270,6 +326,16 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     pub fn web_acl(&self, scope: &str, name: &str, id: &str) -> Option<&WebAclEntry> {
         let entry = self.web_acls.get(&(scope.to_string(), id.to_string()))?;
         (entry.web_acl.name == name).then_some(entry)
+    }
+
+    /// The requests recorded for the web ACL `(scope, id)`, in whatever order they
+    /// were appended — the aggregation over them is order-independent. Empty for a
+    /// web ACL that has evaluated none, which is every web ACL this emulator holds
+    /// (see [`BotRequestRecord`]).
+    pub fn bot_requests(&self, scope: &str, id: &str) -> &[BotRequestRecord] {
+        self.bot_requests
+            .get(&(scope.to_string(), id.to_string()))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// [`Self::web_acl`], mutably.
@@ -881,6 +947,17 @@ fn statement_references_ip_set(statement: &Statement, arn: &str, depth_budget: u
     nested_statements(statement)
         .into_iter()
         .any(|nested| statement_references_ip_set(nested, arn, depth_budget - 1))
+}
+
+/// A modelled timestamp as milliseconds since the Unix epoch, so a `TimeWindow`
+/// endpoint and a stored observation ([`BotRequestRecord::observed_at_millis`])
+/// compare as plain numbers. Sub-millisecond precision is truncated, which is the
+/// resolution a traffic window is reported at.
+pub fn date_time_millis(value: &::aws_smithy_types::DateTime) -> i64 {
+    value
+        .secs()
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(value.subsec_nanos() / 1_000_000))
 }
 
 /// A fresh lowercase, hyphenated UUIDv4 — the form every `EntityId` and

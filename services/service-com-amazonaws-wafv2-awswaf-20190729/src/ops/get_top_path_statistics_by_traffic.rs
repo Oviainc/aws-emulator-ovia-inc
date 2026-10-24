@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTopPathStatisticsByTraffic
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTopPathStatisticsByTraffic`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The top URI paths the bot traffic of ONE stored web ACL asked for over ONE time
+//! window. The answer is an aggregation of the requests recorded for that web ACL
+//! ([`crate::state::BotRequestRecord`]): the requests that fall inside the window
+//! and match the request's filters, grouped by path, ordered by request count, each
+//! entry carrying its share of the matching total and the busiest bots that asked
+//! for it, cut into pages of at most `Limit` entries.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTopPathStatisticsByTraffic::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This emulator serves the WAFv2 control plane only — no HTTP request is ever
+//! evaluated against a stored web ACL here — so that log holds nothing and a window
+//! reports zero requests and no paths, which is the answer AWS gives for a web ACL
+//! whose window saw no bot traffic.
+//!
+//! For a CLOUDFRONT-scoped web ACL the bot-level view — the one a `BotCategory`,
+//! `BotOrganization` or `BotName` filter asks for, whose entries carry `Source` — is
+//! a pricing-plan feature: `WAFFeatureNotIncludedInPricingPlanException` reports
+//! that a feature "isn't supported by the CloudFront pricing plan associated with
+//! the web ACL", and no WAFv2 operation provisions such a plan. A bot-filtered
+//! CLOUDFRONT request is therefore refused with that exception, while the
+//! unfiltered view is served. A REGIONAL web ACL is not served through CloudFront,
+//! so no CloudFront pricing plan gates it and every view of it is served.
+//!
+//! The call REPORTS: it reads the stored web ACL and its request log and changes
+//! nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -204,18 +218,353 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTopPathStatisticsByTraffic` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTopPathStatisticsByTrafficErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTopPathStatisticsByTraffic"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need, and nothing here writes to the store.
+        let _ = ctx;
+
+        // The request's own members first, so a bad one is refused whether or not
+        // the ARN it carries names a stored web ACL.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(
+                GetTopPathStatisticsByTrafficErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_SCOPE_VALUE,
+                        &input.scope,
+                        "the scope names the namespace the web ACL lives in, and is one of \
+                         CLOUDFRONT or REGIONAL",
+                    ),
+                )
+                .into(),
+            );
+        }
+        // `WebAclArn` names a web ACL, so an ARN of another shape — malformed, or
+        // well formed but naming a resource of another kind — is the parameter
+        // failure the model names, not a missing resource.
+        if crate::state::arn_resource_kind(&input.web_acl_arn)
+            != Some(crate::state::WEB_ACL_ARN_KIND)
+        {
+            return Err(
+                GetTopPathStatisticsByTrafficErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_arn_exception(&input.web_acl_arn),
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetTopPathStatisticsByTrafficErrorModeled::WAFInternalErrorException(
+                    WAFInternalErrorException {
+                        message: Some("the wafv2 store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // The statistics belong to ONE web ACL, and WAFv2 namespaces every resource
+        // by scope: an ARN that resolves in the other scope names nothing here.
+        let web_acl_id = match state.arn_index.get(&input.web_acl_arn) {
+            Some(crate::state::ResourceRef::WebAcl { scope, id }) if *scope == input.scope => {
+                id.clone()
+            }
+            _ => {
+                return Err(
+                    GetTopPathStatisticsByTrafficErrorModeled::WAFNonexistentItemException(
+                        crate::state::nonexistent_item_exception(),
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The query criteria beside the window: which bots to count, and which part
+        // of the URI space to report on.
+        let filters = BotFilters {
+            category: input.bot_category.as_deref(),
+            organization: input.bot_organization.as_deref(),
+            name: input.bot_name.as_deref(),
+        };
+        let prefix = input.uri_path_prefix.as_deref();
+
+        // A bot-identity filter asks for the bot-level view of the traffic — the one
+        // whose entries carry `Source` ("when you apply this filter, the Source
+        // field is populated in the response"). For a CLOUDFRONT-scoped web ACL that
+        // view is a pricing-plan feature: the modelled refusal reports that a
+        // feature "isn't supported by the CloudFront pricing plan associated with
+        // the web ACL", no WAFv2 operation provisions such a plan, and the recorded
+        // WAF responses refuse the bot-filtered form for a CLOUDFRONT web ACL while
+        // serving the unfiltered one. A REGIONAL web ACL is not served through
+        // CloudFront, so no CloudFront pricing plan gates it and its filtered view
+        // is computed like any other.
+        if input.scope == crate::state::SCOPE_CLOUDFRONT && filters.any() {
+            return Err(
+                GetTopPathStatisticsByTrafficErrorModeled::WAFFeatureNotIncludedInPricingPlanException(
+                    crate::state::feature_not_included_in_pricing_plan_exception(),
+                )
+                .into(),
+            );
+        }
+
+        // A window whose end precedes its start holds no instant, so it selects no
+        // request — the model names no error for one, and the window is a filter.
+        let window = crate::state::date_time_millis(&input.time_window.start_time)
+            ..=crate::state::date_time_millis(&input.time_window.end_time);
+
+        // Every recorded request that matches, paired with the path it is reported
+        // under: the requested URI itself when the caller drilled into a prefix, and
+        // the top-level path otherwise.
+        let matched: Vec<(String, &crate::state::BotRequestRecord)> = state
+            .bot_requests(&input.scope, &web_acl_id)
+            .iter()
+            .filter(|record| {
+                window.contains(&record.observed_at_millis)
+                    && filters.matches(record)
+                    && within_prefix(&record.uri_path, prefix)
+            })
+            .map(|record| (reported_path(&record.uri_path, prefix), record))
+            .collect();
+
+        // `TotalRequestCount` is "the total number of requests that match the query
+        // criteria within the specified time window" — every matching request, not
+        // only the ones on this page.
+        let total_request_count = i64::try_from(matched.len()).unwrap_or(i64::MAX);
+        let bots_per_path = usize::try_from(input.number_of_top_traffic_bots_per_path).unwrap_or(0);
+        let page_size = usize::try_from(input.limit).unwrap_or(0);
+
+        // Each filter the request applied is echoed on every entry: "when you apply
+        // this filter, the Source field is populated in the response".
+        let source = filters.any().then(|| FilterSource {
+            bot_category: input.bot_category.clone(),
+            bot_organization: input.bot_organization.clone(),
+            bot_name: input.bot_name.clone(),
+        });
+
+        let mut by_path: ::std::collections::BTreeMap<String, TrafficAggregate> =
+            ::std::collections::BTreeMap::new();
+        for (path, record) in &matched {
+            by_path.entry(path.clone()).or_default().add(record);
+        }
+        let mut statistics: Vec<PathStatistics> = by_path
+            .iter()
+            .map(|(path, aggregate)| PathStatistics {
+                source: source.clone(),
+                path: path.clone(),
+                request_count: aggregate.request_count,
+                percentage: share(aggregate.request_count, total_request_count),
+                top_bots: Some(aggregate.top_bots(bots_per_path)),
+            })
+            .collect();
+        // "ordered by request count", the busiest path first; the path breaks a tie,
+        // so one window always reports one order and a marker names one position.
+        statistics.sort_by(|left, right| {
+            right
+                .request_count
+                .cmp(&left.request_count)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+
+        // A `NextMarker` is "the marker from the prior call": the last path of the
+        // page before this one, so this page resumes at the entry after it. A marker
+        // naming no path in this window names no position to resume from.
+        if let Some(marker) = input.next_marker.as_deref() {
+            match statistics.iter().position(|entry| entry.path == marker) {
+                Some(index) => {
+                    statistics.drain(..=index);
+                }
+                None => statistics.clear(),
+            }
+        }
+        // "If the number of objects that are still available for retrieval exceeds
+        // the limit, WAF returns a NextMarker value in the response": a page that
+        // ends the window carries none, which is what ends a paginator's loop.
+        let truncated = statistics.len() > page_size;
+        statistics.truncate(page_size);
+        let next_marker = truncated
+            .then(|| statistics.last().map(|entry| entry.path.clone()))
+            .flatten();
+
+        // `TopCategories` "is only populated when no bot filters are applied to the
+        // request", and each of its entries carries a bot category and the paths
+        // accessed by bots in that category: one entry per category seen in the
+        // window, reporting that category's busiest path.
+        let top_categories = (!filters.any())
+            .then(|| category_statistics(&matched, total_request_count, bots_per_path, page_size));
+
+        Ok(GetTopPathStatisticsByTrafficOutput {
+            path_statistics: statistics,
+            total_request_count,
+            next_marker,
+            top_categories,
+        })
     }
+}
+
+/// The bot filters one request applied, each selecting the recorded requests whose
+/// own value equals it (`BotCategory`, `BotOrganization` and `BotName` are free
+/// strings in the model, with no documented matching beyond the value itself).
+struct BotFilters<'a> {
+    /// `BotCategory`, matched against [`crate::state::BotRequestRecord::bot_category`].
+    category: Option<&'a str>,
+    /// `BotOrganization`, matched against
+    /// [`crate::state::BotRequestRecord::bot_organization`].
+    organization: Option<&'a str>,
+    /// `BotName`, matched against [`crate::state::BotRequestRecord::bot_name`].
+    name: Option<&'a str>,
+}
+
+impl BotFilters<'_> {
+    /// Whether the request applied any bot filter at all — what decides both the
+    /// `Source` member and whether `TopCategories` is populated.
+    fn any(&self) -> bool {
+        self.category.is_some() || self.organization.is_some() || self.name.is_some()
+    }
+
+    /// Whether `record` satisfies every filter the request applied.
+    fn matches(&self, record: &crate::state::BotRequestRecord) -> bool {
+        self.category
+            .is_none_or(|category| category == record.bot_category)
+            && self
+                .organization
+                .is_none_or(|organization| organization == record.bot_organization)
+            && self.name.is_none_or(|name| name == record.bot_name)
+    }
+}
+
+/// Whether a recorded URI path is inside the `UriPathPrefix` the request drilled
+/// into. Without a prefix every path is in scope.
+fn within_prefix(uri_path: &str, prefix: Option<&str>) -> bool {
+    prefix.is_none_or(|prefix| uri_path.starts_with(prefix))
+}
+
+/// The path a recorded request is reported under.
+///
+/// `UriPathPrefix` decides the granularity: with it, "the operation returns
+/// statistics for individual URIs within the specified path prefix" — so the URI
+/// itself; without it, "the operation returns top-level path statistics" — so the
+/// first segment of the URI (`/api` for `/api/v1/users`).
+fn reported_path(uri_path: &str, prefix: Option<&str>) -> String {
+    if prefix.is_some() {
+        return uri_path.to_string();
+    }
+    match uri_path
+        .split('/')
+        .find(|segment| !segment.is_empty())
+    {
+        Some(first) => format!("/{first}"),
+        None => "/".to_string(),
+    }
+}
+
+/// `part` as a percentage of `whole`, the `PercentageValue` both `PathStatistics`
+/// and `BotStatistics` report (`range 0..100`). A whole of zero has no shares.
+fn share(part: i64, whole: i64) -> f64 {
+    if whole <= 0 {
+        return 0.0;
+    }
+    (part as f64) * 100.0 / (whole as f64)
+}
+
+/// The requests counted for one group — one path, or one bot category — and how
+/// they split across the bots that sent them.
+#[derive(Debug, Default)]
+struct TrafficAggregate {
+    /// How many recorded requests fall in this group.
+    request_count: i64,
+    /// Requests per bot name, ordered by name so a tie between two equally busy
+    /// bots resolves the same way on every call.
+    bots: ::std::collections::BTreeMap<String, i64>,
+}
+
+impl TrafficAggregate {
+    /// Count one more recorded request into this group.
+    fn add(&mut self, record: &crate::state::BotRequestRecord) {
+        self.request_count = self.request_count.saturating_add(1);
+        *self.bots.entry(record.bot_name.clone()).or_default() += 1;
+    }
+
+    /// "The maximum number of top bots to include in the statistics for each path":
+    /// the busiest bots of this group, at most `limit` of them, each with its share
+    /// of the group's requests.
+    fn top_bots(&self, limit: usize) -> Vec<BotStatistics> {
+        let mut bots: Vec<BotStatistics> = self
+            .bots
+            .iter()
+            .map(|(bot_name, count)| BotStatistics {
+                bot_name: bot_name.clone(),
+                request_count: *count,
+                percentage: share(*count, self.request_count),
+            })
+            .collect();
+        bots.sort_by(|left, right| {
+            right
+                .request_count
+                .cmp(&left.request_count)
+                .then_with(|| left.bot_name.cmp(&right.bot_name))
+        });
+        bots.truncate(limit);
+        bots
+    }
+}
+
+/// The category-level aggregation `TopCategories` reports: one entry per bot
+/// category seen among `matched`, carrying that category in `Source`, the
+/// category's busiest path, its request count and share of `total_request_count`,
+/// and its busiest bots. Ordered by request count like `PathStatistics`, and
+/// bounded by the same page size, so the response stays within what the caller
+/// asked for.
+fn category_statistics(
+    matched: &[(String, &crate::state::BotRequestRecord)],
+    total_request_count: i64,
+    bots_per_path: usize,
+    page_size: usize,
+) -> Vec<PathStatistics> {
+    let mut by_category: ::std::collections::BTreeMap<
+        String,
+        (TrafficAggregate, ::std::collections::BTreeMap<String, i64>),
+    > = ::std::collections::BTreeMap::new();
+    for (path, record) in matched {
+        let entry = by_category
+            .entry(record.bot_category.clone())
+            .or_default();
+        entry.0.add(record);
+        *entry.1.entry(path.clone()).or_default() += 1;
+    }
+
+    let mut categories: Vec<PathStatistics> = by_category
+        .iter()
+        .map(|(category, (aggregate, paths))| {
+            // The busiest path this category's bots asked for, the path breaking a
+            // tie as it does between two equally busy paths above.
+            let path = paths
+                .iter()
+                .max_by(|left, right| {
+                    left.1
+                        .cmp(right.1)
+                        .then_with(|| right.0.cmp(left.0))
+                })
+                .map(|(path, _)| path.clone())
+                .unwrap_or_default();
+            PathStatistics {
+                source: Some(FilterSource {
+                    bot_category: Some(category.clone()),
+                    bot_organization: None,
+                    bot_name: None,
+                }),
+                path,
+                request_count: aggregate.request_count,
+                percentage: share(aggregate.request_count, total_request_count),
+                top_bots: Some(aggregate.top_bots(bots_per_path)),
+            }
+        })
+        .collect();
+    categories.sort_by(|left, right| {
+        right
+            .request_count
+            .cmp(&left.request_count)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    categories.truncate(page_size);
+    categories
 }

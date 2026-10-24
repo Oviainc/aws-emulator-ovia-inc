@@ -31,6 +31,15 @@ pub(crate) struct Waf {
 
 impl Waf {
     pub(crate) fn new() -> Self {
+        Self::sharing_engine().0
+    }
+
+    /// [`Self::new`], handing the shared engine back as well.
+    ///
+    /// For a suite that must seed state NO operation writes — the per-web-ACL
+    /// request log `GetTopPathStatisticsByTraffic` aggregates, which only WAF's data
+    /// plane appends to (see `crate::top_path_statistics`).
+    pub(crate) fn sharing_engine() -> (Self, Arc<engine::InMemoryEngine>) {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests exercise the service, not SigV4: the `Authorization` header
@@ -38,9 +47,9 @@ impl Waf {
         // verified.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_wafv2_awswaf_20190729::EmulatedService::new(engine),
+            service_com_amazonaws_wafv2_awswaf_20190729::EmulatedService::new(engine.clone()),
         );
-        Self { router }
+        (Self { router }, engine)
     }
 
     /// POST one awsJson1_1 call, credential-scoped for `region`, and answer its
