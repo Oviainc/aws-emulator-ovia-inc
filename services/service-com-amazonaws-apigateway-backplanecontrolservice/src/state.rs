@@ -2297,6 +2297,14 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
         Some((entry, api_key))
     }
 
+    /// The ids of every stored usage plan in creation order, the stable sequence
+    /// [`page_of`] cuts a `GetUsagePlans` page out of.
+    pub fn usage_plan_ids_in_creation_order(&self) -> Vec<String> {
+        let mut ordered: Vec<&UsagePlanEntry> = self.usage_plans.values().collect();
+        ordered.sort_by_key(|plan| (plan.sequence, plan.id.clone()));
+        ordered.into_iter().map(|plan| plan.id.clone()).collect()
+    }
+
     /// The ids of every stored API in creation order, the stable sequence [`page_of`]
     /// cuts a `GetRestApis` page out of.
     pub fn rest_api_ids_in_creation_order(&self) -> Vec<String> {
