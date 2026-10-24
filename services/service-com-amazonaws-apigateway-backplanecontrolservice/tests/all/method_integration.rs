@@ -64,6 +64,27 @@ pub(crate) async fn resource_with_a_method(
     resource_id
 }
 
+/// `PutMethod` for `verb` on `resource` of `api`, with nothing but the authorization
+/// type the method needs, asserting the modelled 201.
+///
+/// This crate's one copy of that call, shared with the sibling `delete_lifecycle` and
+/// `delete_integration_response` suites, which stand several verbs up on ONE resource —
+/// which is what [`resource_with_a_method`], one method per fresh resource, does not do.
+pub(crate) async fn put_method(gateway: &Gateway, api: &str, resource: &str, verb: &str) {
+    let answer = gateway
+        .call(
+            "PUT",
+            &format!("/restapis/{api}/resources/{resource}/methods/{verb}"),
+            Some(json!({ "authorizationType": "NONE" })),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 201,
+        "case PutMethod({verb}): expected 201, got {} with {:?}",
+        answer.status, answer.body
+    );
+}
+
 /// `PutIntegration` for `verb` on `resource` of `api`.
 ///
 /// The integration's own method is the input's `integrationHttpMethod`, whose `jsonName`
