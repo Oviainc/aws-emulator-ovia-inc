@@ -177,7 +177,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeregisterNotificationHubErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("no NotificationHub is registered in region {region}"),
+                        message: crate::state::not_found_message(
+                            crate::state::HUB_RESOURCE_LABEL,
+                            crate::state::HUB_IDENTIFIER_LABEL,
+                            &region,
+                        ),
                         resource_id: region,
                     },
                 )

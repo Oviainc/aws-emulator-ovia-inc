@@ -190,8 +190,8 @@ async fn create_persists_the_record_a_get_reports() {
         );
         assert_eq!(
             created["status"].as_str(),
-            Some("ACTIVE"),
-            "case {:?}: a created configuration is ACTIVE, got {created:?}",
+            Some("INACTIVE"),
+            "case {:?}: a created configuration owns no EventRule, so it is INACTIVE, got {created:?}",
             case.case
         );
         assert!(
@@ -227,8 +227,8 @@ async fn create_persists_the_record_a_get_reports() {
         );
         assert_eq!(
             got["status"].as_str(),
-            Some("ACTIVE"),
-            "case {:?}: get reports the persisted status, got {got:?}",
+            Some("INACTIVE"),
+            "case {:?}: get reports the same derived status, got {got:?}",
             case.case
         );
         assert_eq!(
@@ -618,8 +618,8 @@ async fn list_pages_newest_first_and_resumes_from_its_token() {
                 );
                 assert_eq!(
                     item["status"].as_str(),
-                    Some("ACTIVE"),
-                    "case maxResults={page_size}: a listed entry reports its persisted status, got {item:?}"
+                    Some("INACTIVE"),
+                    "case maxResults={page_size}: a listed entry reports its derived status, got {item:?}"
                 );
                 assert_eq!(
                     item["subtype"].as_str(),
@@ -678,10 +678,12 @@ async fn list_filters_select_by_the_persisted_value() {
 
 
     // Catalog source: `NotificationConfigurationStatus`, re-exported as
-    // `NOTIFICATION_CONFIGURATION_STATUS_VALUES`. Everything created here is
-    // ACTIVE, so that value selects all and every other value selects none.
+    // `NOTIFICATION_CONFIGURATION_STATUS_VALUES`. Nothing created here owns an
+    // EventRule, so every one of them is INACTIVE: that value selects all and
+    // every other value selects none. (The derivation itself is table-tested in
+    // `tests/all/configuration_status.rs`.)
     for status_value in NOTIFICATION_CONFIGURATION_STATUS_VALUES {
-        let expected = if *status_value == "ACTIVE" { total } else { 0 };
+        let expected = if *status_value == "INACTIVE" { total } else { 0 };
         let (code, response) = emulator.list(&format!("status={status_value}")).await;
         assert_eq!(
             code, 200,
@@ -719,13 +721,12 @@ async fn list_filters_select_by_the_persisted_value() {
     // Two filters that agree select the same set as each alone; two that
     // disagree select nothing.
     for (case, query, expected) in [
-        ("both filters match", "status=ACTIVE&subtype=ACCOUNT", total),
-        ("status disagrees", "status=INACTIVE&subtype=ACCOUNT", 0),
-        ("subtype disagrees", "status=ACTIVE&subtype=ADMIN_MANAGED", 0),
+        ("both filters match", "status=INACTIVE&subtype=ACCOUNT", total),
+        ("status disagrees", "status=ACTIVE&subtype=ACCOUNT", 0),
+        ("subtype disagrees", "status=INACTIVE&subtype=ADMIN_MANAGED", 0),
         // An EventRule source or a channel arn is matched against the
-        // record's own associations, and a created configuration has none
-        // (CreateEventRule / AssociateChannel are still 501), so these
-        // filters select nothing.
+        // record's own associations, and a configuration created with
+        // neither has none, so these filters select nothing.
         ("event rule source filter", "eventRuleSource=aws.ec2", 0),
         (
             "channel arn filter",

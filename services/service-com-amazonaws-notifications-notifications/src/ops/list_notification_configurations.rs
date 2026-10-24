@@ -183,7 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // Apply what the clock already owed first: an EventRule whose activation
+        // has fallen due is ACTIVE, and a configuration's status — which this
+        // listing both filters on and reports — is derived from exactly that. The
+        // step was owed at this instant whether or not anybody called.
+        store.settle_due_event_rules(::std::time::SystemTime::now());
 
         let resume_after = match input.next_token.as_deref() {
             Some(token) => Some(decode_page_token(token).ok_or_else(|| {
@@ -206,18 +212,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "in reverse chronological order (newest first)", so the most recently
         // created configuration leads the listing and a page token walks
-        // backwards through creation order.
-        let mut ordered = store.configurations_in_creation_order();
+        // backwards through creation order. Each record comes with the status
+        // derived from the EventRules it owns, which is what the `status` filter
+        // below matches and what each entry reports.
+        let mut ordered = store.configurations_with_status();
         ordered.reverse();
 
-        let matching: Vec<&crate::state::NotificationConfigurationRecord> = ordered
+        let matching: Vec<(&crate::state::NotificationConfigurationRecord, String)> = ordered
             .into_iter()
-            .filter(|record| {
-                // Each filter the request carries must hold. `status` and
-                // `subtype` are matched against the record's own persisted
-                // values.
+            .filter(|(record, derived_status)| {
+                // Each filter the request carries must hold. `status` is matched
+                // against the value derived from the record's own EventRules and
+                // `subtype` against its persisted value.
                 if let Some(status) = input.status.as_deref() {
-                    if record.status != status {
+                    if derived_status != status {
                         return false;
                     }
                 }
@@ -247,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let start = match resume_after {
             Some(cursor) => matching
                 .iter()
-                .position(|record| record.sequence < cursor)
+                .position(|(record, _)| record.sequence < cursor)
                 .unwrap_or(matching.len()),
             None => 0,
         };
@@ -270,13 +278,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => DEFAULT_MAX_RESULTS,
         };
 
-        let page: Vec<&crate::state::NotificationConfigurationRecord> =
-            matching.iter().skip(start).take(page_size).copied().collect();
+        let page: Vec<&(&crate::state::NotificationConfigurationRecord, String)> =
+            matching.iter().skip(start).take(page_size).collect();
 
         // A token is emitted only while configurations remain behind this page;
         // the final page carries none.
         let next_token = match page.last() {
-            Some(last) if start + page.len() < matching.len() => {
+            Some((last, _)) if start + page.len() < matching.len() => {
                 Some(encode_page_token(last.sequence))
             }
             _ => None,
@@ -286,11 +294,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
             notification_configurations: page
                 .into_iter()
-                .map(|record| NotificationConfigurationStructure {
+                .map(|(record, derived_status)| NotificationConfigurationStructure {
                     arn: record.arn.clone(),
                     name: record.name.clone(),
                     description: record.description.clone(),
-                    status: record.status.clone(),
+                    status: derived_status.clone(),
                     creation_time: record.creation_time,
                     aggregation_duration: record.aggregation_duration.clone(),
                     subtype: record.subtype.clone(),
