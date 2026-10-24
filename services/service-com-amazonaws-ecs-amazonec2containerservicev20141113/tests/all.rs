@@ -23,6 +23,8 @@ mod cluster_mutations;
 mod cluster_projection;
 #[path = "all/cluster_tombstone.rs"]
 mod cluster_tombstone;
+#[path = "all/container_instance_not_found.rs"]
+mod container_instance_not_found;
 #[path = "all/container_instances.rs"]
 mod container_instances;
 #[path = "all/ecs_wire.rs"]

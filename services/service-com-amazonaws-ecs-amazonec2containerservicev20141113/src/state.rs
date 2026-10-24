@@ -731,12 +731,14 @@ pub const MAX_CLIENT_TOKEN_LENGTH: usize = 36;
 pub const MAX_DESCRIBE_SERVICES: usize = 10;
 
 // The message of a refusal whose condition is that a NAMED resource does not exist.
-// Amazon ECS answers each of these with ONE fixed sentence that names no resource: the
+// Amazon ECS answers most of these with ONE fixed sentence that names no resource: the
 // same text for every request that meets the condition, whatever cluster, service, task
 // or task definition the request named. Every such refusal in this crate therefore
-// carries the constant below rather than a sentence built from the request — only a
-// refusal ECS derives from the request (a member that is blank, or outside its
-// documented constraint) names a member.
+// carries the constant below rather than a sentence built from the request — a refusal
+// ECS DERIVES from the request (a member that is blank or outside its documented
+// constraint, or a container-instance reference that resolves to nothing — see
+// [`container_instance_not_found_message`]) names the member or the value instead, and
+// is built by a function rather than being a constant.
 
 /// `ClusterNotFoundException$message` for a `cluster` that names no stored cluster.
 pub const CLUSTER_NOT_FOUND_MESSAGE: &str = "Cluster not found.";
@@ -751,12 +753,38 @@ pub const TASK_NOT_FOUND_MESSAGE: &str = "The referenced task was not found";
 /// refusal every operation that resolves a task-definition reference answers with.
 pub const TASK_DEFINITION_NOT_FOUND_MESSAGE: &str = "Unable to describe task definition.";
 
+/// The container instance ID a `containerInstance`/`containerInstances` entry names: the
+/// last segment of the value when it is an ARN
+/// (`arn:aws:ecs:<region>:<account>:container-instance/<cluster>/<id>`), and the value
+/// itself when the member carries the id — "The container instance ID or full ARN of the
+/// container instance" are the two forms the member documents, and both name the same
+/// instance.
+pub fn container_instance_id_from_reference(reference: &str) -> &str {
+    if reference.starts_with("arn:") {
+        reference.rsplit('/').next().unwrap_or(reference)
+    } else {
+        reference
+    }
+}
+
 /// `InvalidParameterException$message` for a `containerInstance` reference that names no
-/// instance registered in the cluster. No recording in the corpus fixes this sentence,
-/// so the wording follows [`TASK_NOT_FOUND_MESSAGE`]; what the rule fixes is that the
-/// sentence is the SAME for every request that meets the condition.
-pub const CONTAINER_INSTANCE_NOT_FOUND_MESSAGE: &str =
-    "The referenced container instance was not found";
+/// instance registered in the cluster, BUILT FROM THE REQUEST: Amazon ECS names the
+/// container instance the request referred to — "Referenced container instance <id> not
+/// found." — so a caller deregistering a batch can tell which entry was rejected. The
+/// corpus records this refusal for `DeregisterContainerInstance` with a reference given
+/// as a full ARN, and the recorded sentence carries the instance ID alone, which is why
+/// the reference is reduced to its id by [`container_instance_id_from_reference`] rather
+/// than echoed whole.
+///
+/// Every refusal in this crate whose condition is "this container-instance reference
+/// resolves to no registered instance" goes through this one function, so the sentence
+/// and the value it names are the same wherever the condition is met.
+pub fn container_instance_not_found_message(reference: &str) -> String {
+    format!(
+        "Referenced container instance {} not found.",
+        container_instance_id_from_reference(reference)
+    )
+}
 
 /// `ClusterContainsServicesException$message`: the sentence the wire corpus records for
 /// this refusal, which names no cluster. It is the RECORDED text rather than the shape's

@@ -273,8 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         RegisterContainerInstanceErrorModeled::InvalidParameterException(
                             InvalidParameterException {
                                 message: Some(
-                                    crate::state::CONTAINER_INSTANCE_NOT_FOUND_MESSAGE
-                                        .to_string(),
+                                    crate::state::container_instance_not_found_message(reference),
                                 ),
                             },
                         )
