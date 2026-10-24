@@ -32,10 +32,9 @@
 //! `ListPricingRulesAssociatedToPricingPlan`, its tags through the read-only
 //! `ListTagsForResource`, its name through the uniqueness index `CreatePricingPlan`
 //! consults, and its `Name` / `Description` / `Size` through a further `Arn`-only
-//! `UpdatePricingPlan` (which names no member, so it reports stored state).
-//! `ListPricingPlans` — the one reader that would report all of it at once — is still a
-//! scaffold (`src/ops/list_pricing_plans.rs` carries the `SCAFFOLDED, NOT IMPLEMENTED`
-//! marker), so it is not used here.
+//! `UpdatePricingPlan` (which names no member, so it reports stored state). The reader
+//! that reports all of it at once, `ListPricingPlans`, is the subject of
+//! `tests/all/pricing_plan_list.rs`.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
