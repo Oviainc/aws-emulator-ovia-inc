@@ -4,7 +4,9 @@
 //!
 //! The global-network / site / link lifecycle is the core resource tree of Network
 //! Manager: a global network owns sites, a site owns links, and a global network owns
-//! devices (each optionally assigned to one of its sites). A global network also owns its
+//! devices (each optionally assigned to one of its sites). A device and a link that sit at
+//! the same site can be tied together by a LINK ASSOCIATION, which has no id of its own
+//! and is therefore keyed by that pair. A global network also owns its
 //! CORE network — the Cloud WAN managed network
 //! whose segments and edges are a function of the core network policy document it holds.
 //! Everything
@@ -17,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AWSLocation, Bandwidth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
     CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment, Device, GlobalNetwork,
-    Link, Location, ResourceNotFoundException, Site, Tag, ValidationException,
+    Link, LinkAssociation, Location, ResourceNotFoundException, Site, Tag, ValidationException,
     ValidationExceptionField,
 };
 
@@ -51,6 +53,15 @@ pub const SITE_KIND: &str = "site";
 pub const LINK_KIND: &str = "link";
 /// See [`GLOBAL_NETWORK_KIND`].
 pub const DEVICE_KIND: &str = "device";
+/// The resource kind a link ASSOCIATION reports in a refusal that names it.
+///
+/// Unlike the kinds above this one is not an ARN resource type and no id is minted for
+/// it: a link association has no ARN and no id of its own — "Describes the association
+/// between a device and a link" (`smithy_query shape=LinkAssociation`) is the
+/// device/link pair plus its state — so the pair is its identity
+/// ([`link_association_key`]) and this name is only how a not-found refusal spells the
+/// resource type.
+pub const LINK_ASSOCIATION_KIND: &str = "link-association";
 /// See [`GLOBAL_NETWORK_KIND`]. The model constrains this one's id itself:
 /// `CoreNetworkId` carries `pattern ^core-network-([0-9a-f]{8,17})$`
 /// (`smithy_query shape=CoreNetworkId`), which the 17 hex digits of
@@ -544,6 +555,68 @@ impl DeviceRecord {
     }
 }
 
+/// A stored link association: the tie between one device and one link of the same global
+/// network and the same site.
+///
+/// The association has no id and no ARN of its own — the modelled `LinkAssociation` is
+/// the device/link pair plus its state (`smithy_query shape=LinkAssociation`) — so the
+/// pair is its identity and the store keys it by [`link_association_key`]. Like the
+/// records above, its state is a function of the clock rather than a field, so reading
+/// one never writes.
+#[derive(Debug, Clone)]
+pub struct LinkAssociationRecord {
+    pub global_network_id: String,
+    pub device_id: String,
+    pub link_id: String,
+    /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
+    pub available_at: SystemTime,
+}
+
+impl LinkAssociationRecord {
+    /// This association's state as of `now`.
+    ///
+    /// `LinkAssociationState` carries PENDING, AVAILABLE, DELETING and DELETED
+    /// (`smithy_query shape=LinkAssociationState`, mirrored in
+    /// `ops::types::LINK_ASSOCIATION_STATE_VALUES`); the first three are spelled exactly
+    /// as [`STATE_PENDING`], [`STATE_AVAILABLE`] and [`STATE_DELETING`], so this slice
+    /// reuses those constants.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.available_at {
+            STATE_AVAILABLE
+        } else {
+            STATE_PENDING
+        }
+    }
+
+    /// The modelled `LinkAssociation` for this record, as of `now`.
+    pub fn to_shape(&self, now: SystemTime) -> LinkAssociation {
+        self.to_shape_with_state(self.state_at(now))
+    }
+
+    /// The modelled `LinkAssociation` for this record, forcing `state` — used by
+    /// `DisassociateLink`, which reports the association it just removed as `DELETING`.
+    pub fn to_shape_with_state(&self, state: &str) -> LinkAssociation {
+        LinkAssociation {
+            global_network_id: Some(self.global_network_id.clone()),
+            device_id: Some(self.device_id.clone()),
+            link_id: Some(self.link_id.clone()),
+            link_association_state: Some(state.to_string()),
+        }
+    }
+}
+
+/// The key the association store holds a device/link pair under: the device id, then the
+/// link id, so the map orders associations by device and then by link and a pagination
+/// token can name an offset into it.
+///
+/// An association is only ever stored for a device and a link this service minted ids for
+/// ([`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`]), each `<kind>-<17 hex>`,
+/// so no two pairs can produce the same key. The same string identifies the association
+/// in a not-found refusal, where no single resource id would.
+pub fn link_association_key(device_id: &str, link_id: &str) -> String {
+    format!("{device_id}/{link_id}")
+}
+
 /// A stored core network: the Cloud WAN managed network a global network owns.
 ///
 /// Its `state` is a function of the clock, like the records above, and its topology
@@ -627,6 +700,13 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// Devices by `DeviceId`, each carrying its owning `GlobalNetworkId` and, when the
     /// create named one, the `SiteId` it sits at.
     pub devices: BTreeMap<String, DeviceRecord>,
+    /// Link associations by [`link_association_key`], each tying one stored device to one
+    /// stored link of the same site.
+    ///
+    /// No quota of its own bounds this map: an association exists only for a device and a
+    /// link that are both stored and sit at the same site, so the per-global-network
+    /// device quota and the per-site link quota already bound how many pairs can exist.
+    pub link_associations: BTreeMap<String, LinkAssociationRecord>,
     /// Core networks by `CoreNetworkId`, each carrying its owning `GlobalNetworkId`.
     pub core_networks: BTreeMap<String, CoreNetworkRecord>,
     /// Resource policies by the ARN of the resource they are attached to — the one store
