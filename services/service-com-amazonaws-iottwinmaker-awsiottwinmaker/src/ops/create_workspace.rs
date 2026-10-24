@@ -205,13 +205,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 description: input.description.unwrap_or_default(),
                 s3_location: input.s3_location,
                 role: input.role,
-                linked_services: Vec::new(),
                 tags: input.tags.unwrap_or_default().into_iter().collect(),
                 creation_date_time: now,
                 update_date_time: now,
                 entities: ::std::collections::BTreeMap::new(),
                 component_types: ::std::collections::BTreeMap::new(),
                 scenes: ::std::collections::BTreeMap::new(),
+                // A new workspace is linked to no other service: the sync jobs
+                // that link one in are created afterwards, and
+                // `Workspace::linked_services` reads them.
+                sync_jobs: ::std::collections::BTreeMap::new(),
             },
         );
         // Indexed after the record is stored, so the index can never name a

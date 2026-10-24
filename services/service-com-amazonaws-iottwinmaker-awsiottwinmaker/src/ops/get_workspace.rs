@@ -188,10 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // empty string when its create named none), as an entity's does.
             description: Some(workspace.description.clone()),
             // Omitted rather than reported as an empty list while nothing has
-            // linked a service into the workspace: the member is optional and
-            // the sync-job slice is what populates it.
-            linked_services: (!workspace.linked_services.is_empty())
-                .then(|| workspace.linked_services.clone()),
+            // linked a service into the workspace: the member is optional, and
+            // what links a service in is a sync job against it, so the list is
+            // derived from the workspace's sync jobs.
+            linked_services: Some(workspace.linked_services())
+                .filter(|services| !services.is_empty()),
             s3_location: workspace.s3_location.clone(),
             role: workspace.role.clone(),
             creation_date_time: crate::state::timestamp(workspace.creation_date_time),

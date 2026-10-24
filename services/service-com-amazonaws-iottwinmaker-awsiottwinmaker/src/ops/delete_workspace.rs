@@ -212,6 +212,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A sync job is contained the same way, so it blocks the delete the
+        // same way. NOTE: `DeleteSyncJob` is still a scaffold stub (its own
+        // issue), so until it is implemented a workspace that has ever created
+        // a sync job cannot be deleted through the API — the guard is still
+        // right, because dropping the workspace would leave the job's indexed
+        // ARN naming a resource nothing holds.
+        if !workspace.sync_jobs.is_empty() {
+            return Err(DeleteWorkspaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "workspace {} still contains {} sync jobs; delete them first",
+                        input.workspace_id,
+                        workspace.sync_jobs.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
         let Some(workspace) = state.workspaces.remove(&input.workspace_id) else {
             return Err(DeleteWorkspaceErrorModeled::InternalServerException(
                 InternalServerException {

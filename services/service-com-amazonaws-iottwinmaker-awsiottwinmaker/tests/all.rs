@@ -53,6 +53,9 @@ mod scene_read;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/sync_job.rs"]
+mod sync_job;
+
 #[path = "all/workspace_entity_lifecycle.rs"]
 mod workspace_entity_lifecycle;
 

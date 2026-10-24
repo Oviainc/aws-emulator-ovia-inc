@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSyncJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSyncJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a sync job in a workspace and persists it in [`crate::state`] under
+//! that workspace, so `GetSyncJob` reads back what was created.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSyncJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A sync job has no id of its own: it is addressed as
+//! `/workspaces/{workspaceId}/sync-jobs/{syncSource}`, so the sync SOURCE is
+//! its identity inside the workspace and a workspace holds at most one job per
+//! source. This create therefore mints nothing but the job's ARN and its
+//! creation instant, and answers the non-terminal `CREATING` state the service
+//! accepts a job in — the clock owes the outcome, which
+//! [`crate::state::SyncJob::settle`] materialises and
+//! [`crate::state::SYNC_JOB_ERROR_CODE`] explains.
+//!
+//! The refusals this handler owns:
+//!
+//! * `syncSource` is not [`crate::state::SYNC_SOURCE_SITEWISE`] — a
+//!   `ValidationException`, because the member's own documentation says that is
+//!   the only source the service supports and the modelled pattern cannot;
+//! * the workspace does not exist — a `ValidationException`, because the model
+//!   declares no `ResourceNotFoundException` for this operation (the same
+//!   choice `CreateScene` makes);
+//! * the workspace already has a sync job for that source — a
+//!   `ConflictException`.
+//!
+//! Two deliberate gaps. `syncRole` is stored once it satisfies the modelled
+//! `RoleArn`, WITHOUT resolving the role or reading its trust policy: the role
+//! lives in IAM, which this handler does not reach, and inventing a verdict for
+//! a policy it never read would refuse legitimate roles. Authorization is not
+//! emulated, so the modelled `AccessDeniedException` is never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +177,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSyncJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSyncJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSyncJob"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one mutates tenant state.
+        ::tracing::info!(
+            operation = "CreateSyncJob",
+            workspace_id = %input.workspace_id,
+            sync_source = %input.sync_source,
+            "serving a request"
+        );
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSyncJobErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The `syncSource` label is a plain `^[a-zA-Z_0-9]+$` string, so the
+        // model cannot refuse a source the service does not support; its own
+        // documentation can and does ("Currently the only supported syncSource
+        // is SITEWISE"), so a create naming any other source is refused with
+        // the `ValidationException` this operation models, naming the member
+        // and the value the service accepts.
+        if input.sync_source != crate::state::SYNC_SOURCE_SITEWISE {
+            return Err(CreateSyncJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "syncSource {} is not supported; the only supported syncSource is {}",
+                        input.sync_source,
+                        crate::state::SYNC_SOURCE_SITEWISE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A sync job lives INSIDE a workspace
+        // (`/workspaces/{workspaceId}/sync-jobs/{syncSource}`), so a create
+        // naming a workspace this service does not hold is refused rather than
+        // allowed to orphan a record. This operation models no
+        // `ResourceNotFoundException`, so the refusal is the
+        // `ValidationException` it does model — the same choice `CreateScene`
+        // makes for the same missing parent.
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+            return Err(CreateSyncJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The sync SOURCE is the job's identity inside its workspace — the
+        // create, the read and the delete address a job by it and nothing else —
+        // so a workspace that already syncs from it holds the job this call
+        // would create, and that is a conflict rather than a second job.
+        if workspace.sync_jobs.contains_key(&input.sync_source) {
+            return Err(CreateSyncJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "workspace {} already has a sync job for sync source {}",
+                        input.workspace_id, input.sync_source
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::sync_job_arn(&region, &input.workspace_id, &input.sync_source);
+        let now = ::std::time::SystemTime::now();
+        let job = crate::state::SyncJob::accepted(
+            input.sync_source.clone(),
+            arn.clone(),
+            input.workspace_id.clone(),
+            input.sync_role,
+            input.tags.unwrap_or_default().into_iter().collect(),
+            now,
+        );
+        // Reported from the record that is about to be stored, so this answer
+        // and the read that follows it report one job's state from one place.
+        let reported_state = job.state.clone();
+
+        // Store the record BEFORE indexing its ARN, so the index can never name
+        // a sync job that was not stored: the workspace is re-borrowed mutably
+        // here (the lookup that validated the request held it immutably) and
+        // that re-borrow is the last fallible step.
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(CreateSyncJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("workspace {} vanished", input.workspace_id)),
+                },
+            )
+            .into());
+        };
+        workspace.sync_jobs.insert(input.sync_source.clone(), job);
+        state.arn_index.insert(
+            arn.clone(),
+            crate::state::ResourceRef::SyncJob {
+                workspace_id: input.workspace_id.clone(),
+                sync_source: input.sync_source.clone(),
+            },
+        );
+
+        Ok(CreateSyncJobOutput {
+            arn,
+            creation_date_time: crate::state::timestamp(now),
+            // The non-terminal state the service accepts a sync job in: nothing
+            // has been synchronised yet, and the clock owes the outcome (see
+            // `crate::state::SyncJob::settle`).
+            state: reported_state,
+        })
     }
 }

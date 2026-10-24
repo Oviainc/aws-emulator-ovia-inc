@@ -3,14 +3,16 @@
 //! Engine state for the com-amazonaws-iottwinmaker-awsiottwinmaker service.
 //!
 //! IoT TwinMaker's control plane is a two-level tree: a *workspace* owns the
-//! *entities*, *component types* and *scenes* created inside it. That
-//! containment is modelled literally here — `Workspace::entities`,
-//! `Workspace::component_types` and `Workspace::scenes` — so none of them can
-//! outlive its workspace and two operations cannot read two copies of one
-//! resource.
+//! *entities*, *component types*, *scenes* and *sync jobs* created inside it.
+//! That containment is modelled literally here — `Workspace::entities`,
+//! `Workspace::component_types`, `Workspace::scenes` and
+//! `Workspace::sync_jobs` — so none of them can outlive its workspace and two
+//! operations cannot read two copies of one resource.
 //!
 //! Nothing derivable is stored: `hasChildEntities` is computed by scanning the
-//! workspace's entities for the id as a parent. A resource's `state`, by
+//! workspace's entities for the id as a parent, and a workspace's
+//! `linkedServices` by reading the sources of the sync jobs it holds
+//! (`Workspace::linked_services`). A resource's `state`, by
 //! contrast, IS stored. An entity's create settles it in `ACTIVE` within the
 //! call that asked for it, so there is no provisioning instant for a read to
 //! compute a transient state from; a component type's create answers the
@@ -24,7 +26,8 @@
 //! (`metadata_transfer_jobs`). A job is accepted in the non-terminal
 //! `VALIDATING` state and carries the instant its outcome falls due
 //! (`MetadataTransferJob::settles_at`), the same way a component type carries
-//! its own.
+//! its own — and so does a *sync job* (`SyncJob::settles_at`), which
+//! `CreateSyncJob` accepts in the non-terminal `CREATING` state.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -205,6 +208,64 @@ pub const METADATA_TRANSFER_JOB_ERROR_MESSAGE: &str =
 pub const METADATA_TRANSFER_JOB_ROLE_PATH: &str =
     "role/aws-service-role/iottwinmaker.amazonaws.com/AWSServiceRoleForIoTTwinMaker";
 
+/// The one `SyncSource` this service supports.
+///
+/// Taken from the model, not chosen here: the `syncSource` member of every sync
+/// operation documents "Currently the only supported syncSource is SITEWISE"
+/// (`smithy_query(query="operation",operation="CreateSyncJob")`), and the
+/// `SyncSource` shape itself is a plain `^[a-zA-Z_0-9]+$` string that cannot say
+/// so — so a create naming any other source is refused with the
+/// `ValidationException` the operation models rather than stored as a job
+/// against a source nothing can sync from.
+pub const SYNC_SOURCE_SITEWISE: &str = "SITEWISE";
+
+/// The `SyncJobState` a sync job the service has just accepted is in, and the
+/// terminal state it reaches.
+///
+/// `CREATING` is the state `CreateSyncJob` answers with: the job has been
+/// accepted and nothing has been synchronised yet, so it is non-terminal and the
+/// clock owes its outcome ([`SYNC_JOB_SETTLE_SPAN`]). `ERROR` is the modelled
+/// failure state that outcome is in this emulator — see [`SyncJob::settle`] —
+/// while `INITIALIZING` and `ACTIVE` belong to a synchronisation that really
+/// ran and `DELETING` to `DeleteSyncJob`, which owns it. The full value list is
+/// `SYNC_JOB_STATE_VALUES` in `ops::types`.
+pub const SYNC_JOB_STATE_CREATING: &str = "CREATING";
+/// See [`SYNC_JOB_STATE_CREATING`].
+pub const SYNC_JOB_STATE_ERROR: &str = "ERROR";
+
+/// How long a sync job stays in [`SYNC_JOB_STATE_CREATING`] before the clock
+/// makes its outcome due.
+///
+/// AWS documents no duration for bringing a sync job up, so this span is CHOSEN
+/// by this emulator, the same way (and for the same reasons) as
+/// [`METADATA_TRANSFER_JOB_SETTLE_SPAN`]: deliberately non-zero, so a caller
+/// that reads the job back in the same breath as the create still observes the
+/// non-terminal state the create answered with, and deliberately short, so a
+/// client that polls reaches the terminal state without a long wait. Nothing
+/// sleeps for it: the instant it is due is stored on the record
+/// ([`SyncJob::settles_at`]) and a reader materialises the transition the clock
+/// already owed.
+pub const SYNC_JOB_SETTLE_SPAN: Duration = Duration::from_millis(500);
+
+/// The `ErrorCode` a sync job that never synchronised anything carries
+/// (`ops::types::ERROR_CODE_VALUES`), and the message that says why.
+///
+/// Synchronising means reading the sync source — an IoT SiteWise asset model
+/// hierarchy — and creating, updating or deleting the corresponding entities
+/// and component types in the workspace, which is work this emulator does not
+/// perform: it holds no link to the source service. Nothing therefore runs for
+/// an accepted job, and a job nothing ran ends in the service's own modelled
+/// failure state with the reason that says so, rather than being reported
+/// `ACTIVE` for a synchronisation that is not happening. `SYNC_INITIALIZING_ERROR`
+/// is the code for a job that failed bringing the sync up, which is where this
+/// one stops. The message is this emulator's, not AWS's: it states the
+/// emulator's limitation, which no AWS rule produces.
+pub const SYNC_JOB_ERROR_CODE: &str = "SYNC_INITIALIZING_ERROR";
+/// See [`SYNC_JOB_ERROR_CODE`].
+pub const SYNC_JOB_ERROR_MESSAGE: &str =
+    "this emulator synchronises nothing: no resource was read from the sync source and none was \
+     created, updated or deleted in the workspace";
+
 /// The `PricingMode` an account that has never changed its pricing plan is on,
 /// and the `UpdateReason` such a plan carries.
 ///
@@ -363,6 +424,12 @@ pub enum ResourceRef {
         workspace_id: String,
         scene_id: String,
     },
+    /// A sync job, by the workspace that owns it and the sync source that
+    /// identifies it inside that workspace.
+    SyncJob {
+        workspace_id: String,
+        sync_source: String,
+    },
 }
 
 /// One stored workspace.
@@ -377,9 +444,6 @@ pub struct Workspace {
     pub description: String,
     pub s3_location: Option<String>,
     pub role: Option<String>,
-    /// Other AWS services linked into this workspace. Populated by the sync-job
-    /// slice; empty until then.
-    pub linked_services: Vec<String>,
     pub tags: BTreeMap<String, String>,
     pub creation_date_time: SystemTime,
     pub update_date_time: SystemTime,
@@ -398,9 +462,37 @@ pub struct Workspace {
     /// cannot outlive the workspace that contains it, and two operations must
     /// not read two copies of one scene.
     pub scenes: BTreeMap<String, Scene>,
+    /// The sync jobs created in this workspace, keyed by `syncSource`.
+    ///
+    /// Owned by the workspace for the same reason its scenes are: a sync job is
+    /// addressed as `/workspaces/{workspaceId}/sync-jobs/{syncSource}`, so it
+    /// cannot outlive the workspace that contains it. The KEY is the sync
+    /// source, because that label is the job's whole identity inside its
+    /// workspace — the create, the read and the delete all address a job by it
+    /// and nothing else — so one workspace holds at most one job per source.
+    pub sync_jobs: BTreeMap<String, SyncJob>,
 }
 
 impl Workspace {
+    /// The services linked into this workspace — what `GetWorkspace` and
+    /// `ListWorkspaces` report as `linkedServices`, documented as "a list of
+    /// services that are linked to the workspace".
+    ///
+    /// DERIVED from the workspace's sync jobs rather than stored beside them:
+    /// what links another service into a workspace is a sync job against that
+    /// service as its source (the sync role "is used by the SyncJob to read from
+    /// the syncSource, and create, update, or delete the corresponding
+    /// resources"), so the linked services ARE the sources of the jobs the
+    /// workspace holds — and deriving them means a job created or deleted after
+    /// a read cannot leave a stored list stale, the same choice
+    /// [`has_child_entities`](Self::has_child_entities) makes.
+    ///
+    /// In sync-source order, because the map is keyed by source: two reads of an
+    /// unchanged workspace report the same list.
+    pub fn linked_services(&self) -> Vec<String> {
+        self.sync_jobs.keys().cloned().collect()
+    }
+
     /// Whether any stored entity names `entity_id` as its parent.
     ///
     /// Derived on every read rather than kept as a flag beside the entity, so a
@@ -559,6 +651,121 @@ pub struct Scene {
     pub tags: BTreeMap<String, String>,
     pub creation_date_time: SystemTime,
     pub update_date_time: SystemTime,
+}
+
+/// One stored sync job.
+///
+/// A sync job is a workspace's standing link to another service: its
+/// `syncSource` says which service's resources are synchronised into the
+/// workspace, and its `syncRole` is the role the synchronisation would run
+/// under. The source is the job's identity inside the workspace, so it is the
+/// key of [`Workspace::sync_jobs`] and is not repeated here.
+///
+/// Like a [`MetadataTransferJob`], the job is accepted in a non-terminal state
+/// and carries the instant its outcome falls due ([`settles_at`](Self::settles_at)),
+/// which a reader materialises rather than sleeps for.
+#[derive(Debug, Clone)]
+pub struct SyncJob {
+    pub sync_source: String,
+    pub arn: String,
+    pub workspace_id: String,
+    /// The ARN of the IAM role the create supplied: "this IAM role is used by
+    /// the SyncJob to read from the syncSource, and create, update, or delete
+    /// the corresponding resources". Required on both the create and the read,
+    /// so it is stored, never derived.
+    pub sync_role: String,
+    /// The tags the create supplied. `CreateSyncJob` accepts a `tags` map, so a
+    /// sync job is a taggable resource of this service: its ARN is indexed in
+    /// [`ComAmazonawsIottwinmakerAwsiottwinmakerState::arn_index`] and the
+    /// tagging operations reach this map through it, exactly as they reach a
+    /// scene's.
+    pub tags: BTreeMap<String, String>,
+    pub creation_date_time: SystemTime,
+    /// When the job last changed — the create, until the clock settles its
+    /// outcome, which moves it to the instant that outcome fell due.
+    pub update_date_time: SystemTime,
+    /// The job's `SyncJobState`, as STORED: [`SYNC_JOB_STATE_CREATING`] from the
+    /// create until [`settles_at`](Self::settles_at) passes, then the terminal
+    /// state [`settle`](Self::settle) writes.
+    pub state: String,
+    /// Why the job is in a failed state, and `None` while nothing has failed.
+    pub error: Option<crate::ops::types::ErrorDetails>,
+    /// The instant the transition out of [`SYNC_JOB_STATE_CREATING`] falls due
+    /// — the instant of the create plus [`SYNC_JOB_SETTLE_SPAN`]. Stored, never
+    /// slept for, so a reader can materialise a transition the clock already
+    /// owed without any caller having had to poll.
+    pub settles_at: SystemTime,
+}
+
+impl SyncJob {
+    /// The job a `CreateSyncJob` call accepted at `now`: accepted, nothing
+    /// synchronised yet, and its outcome due [`SYNC_JOB_SETTLE_SPAN`] later.
+    pub fn accepted(
+        sync_source: String,
+        arn: String,
+        workspace_id: String,
+        sync_role: String,
+        tags: BTreeMap<String, String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            sync_source,
+            arn,
+            workspace_id,
+            sync_role,
+            tags,
+            creation_date_time: now,
+            // Nothing has changed the job yet, so it was last updated when it
+            // was created.
+            update_date_time: now,
+            state: SYNC_JOB_STATE_CREATING.to_string(),
+            error: None,
+            settles_at: now + SYNC_JOB_SETTLE_SPAN,
+        }
+    }
+
+    /// Materialise the lifecycle transition the CLOCK has already made due.
+    ///
+    /// Called by a reader before it reports this job, exactly as
+    /// [`MetadataTransferJob::settle`] is: the outcome was owed at
+    /// [`settles_at`](Self::settles_at) whether or not anybody called, so
+    /// writing it here makes the record say what was already true rather than
+    /// changing anything a read caused.
+    ///
+    /// The outcome is the modelled failure state: nothing was synchronised,
+    /// because this emulator synchronises nothing (see [`SYNC_JOB_ERROR_CODE`]),
+    /// so the job carries the error that says so instead of an `ACTIVE` nothing
+    /// earned. Idempotent, a no-op before the instant falls due, and a no-op on
+    /// a job some other operation has already moved out of the non-terminal
+    /// state.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.state != SYNC_JOB_STATE_CREATING || now < self.settles_at {
+            return;
+        }
+        self.state = SYNC_JOB_STATE_ERROR.to_string();
+        self.error = Some(crate::ops::types::ErrorDetails {
+            code: Some(SYNC_JOB_ERROR_CODE.to_string()),
+            message: Some(SYNC_JOB_ERROR_MESSAGE.to_string()),
+        });
+        // The change fell due at `settles_at`, not at the instant a caller
+        // happened to ask, so that is when the job was last updated: two reads
+        // of a settled job report the same instant.
+        self.update_date_time = self.settles_at;
+    }
+
+    /// The job's modelled `SyncJobStatus`: its stored state and, when it has
+    /// failed, why.
+    ///
+    /// The `error` structure is reported WHOLE, the way every other status of
+    /// this service is (see [`status`]): a job that has not failed carries an
+    /// `ErrorDetails` with neither a code nor a message, so a client that reads
+    /// `status.error` needs no null guard.
+    pub fn status(&self) -> crate::ops::types::SyncJobStatus {
+        crate::ops::types::SyncJobStatus {
+            state: Some(self.state.clone()),
+            error: Some(self.error.clone().unwrap_or_default()),
+        }
+    }
 }
 
 /// One stored metadata transfer job.
@@ -1066,6 +1273,17 @@ impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
                 workspace_id,
                 scene_id,
             } => Some(&self.workspaces.get(workspace_id)?.scenes.get(scene_id)?.tags),
+            ResourceRef::SyncJob {
+                workspace_id,
+                sync_source,
+            } => Some(
+                &self
+                    .workspaces
+                    .get(workspace_id)?
+                    .sync_jobs
+                    .get(sync_source)?
+                    .tags,
+            ),
         }
     }
 
@@ -1115,6 +1333,17 @@ impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
                     .get_mut(&scene_id)?
                     .tags,
             ),
+            ResourceRef::SyncJob {
+                workspace_id,
+                sync_source,
+            } => Some(
+                &mut self
+                    .workspaces
+                    .get_mut(&workspace_id)?
+                    .sync_jobs
+                    .get_mut(&sync_source)?
+                    .tags,
+            ),
         }
     }
 }
@@ -1149,6 +1378,15 @@ pub fn component_type_not_found_message(workspace_id: &str, component_type_id: &
 /// construction as [`entity_not_found_message`] one resource across.
 pub fn scene_not_found_message(workspace_id: &str, scene_id: &str) -> String {
     format!("Scene {scene_id} in workspace {workspace_id} not found.")
+}
+
+/// The message for a sync job the workspace the request named does not hold.
+/// Built from the request, naming the SOURCE that was looked for and the
+/// workspace it was looked for in — a sync job has no id of its own, the source
+/// being its identity inside the workspace. Same construction as
+/// [`scene_not_found_message`] one resource across.
+pub fn sync_job_not_found_message(workspace_id: &str, sync_source: &str) -> String {
+    format!("SyncJob for sync source {sync_source} in workspace {workspace_id} not found.")
 }
 
 /// The message for a workspace this service does not hold: built from the
@@ -1207,6 +1445,17 @@ pub fn scene_arn(region: &str, workspace_id: &str, scene_id: &str) -> String {
         "iottwinmaker",
         region,
         &format!("workspace/{workspace_id}/scene/{scene_id}"),
+    )
+}
+
+/// The ARN of a sync job, nested under its workspace's resource path the way
+/// [`scene_arn`] nests a scene's. The sync SOURCE takes the place of the id,
+/// being the job's identity inside its workspace.
+pub fn sync_job_arn(region: &str, workspace_id: &str, sync_source: &str) -> String {
+    ::engine::emulator_arn(
+        "iottwinmaker",
+        region,
+        &format!("workspace/{workspace_id}/sync-job/{sync_source}"),
     )
 }
 

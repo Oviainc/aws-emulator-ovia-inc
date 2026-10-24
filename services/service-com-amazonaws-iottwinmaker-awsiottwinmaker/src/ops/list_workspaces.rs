@@ -224,11 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 description: Some(workspace.description.clone()),
                 // Omitted rather than reported as an empty list while nothing
                 // has linked a service into the workspace: the member is
-                // optional and the sync-job slice is what populates it. Again
-                // the choice `GetWorkspace` makes, so one workspace reads the
-                // same whichever operation reports it.
-                linked_services: (!workspace.linked_services.is_empty())
-                    .then(|| workspace.linked_services.clone()),
+                // optional, and what links a service in is a sync job against
+                // it, so the list is derived from the workspace's sync jobs.
+                // Again the choice `GetWorkspace` makes, so one workspace reads
+                // the same whichever operation reports it.
+                linked_services: Some(workspace.linked_services())
+                    .filter(|services| !services.is_empty()),
                 creation_date_time: crate::state::timestamp(workspace.creation_date_time),
                 update_date_time: crate::state::timestamp(workspace.update_date_time),
             });

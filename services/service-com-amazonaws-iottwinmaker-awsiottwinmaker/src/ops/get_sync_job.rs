@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSyncJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSyncJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the sync job a workspace holds for the named sync source, read from
+//! [`crate::state`] — the very record `CreateSyncJob` wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSyncJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A sync job is addressed by its workspace AND its source, but the workspace
+//! is carried in the `workspace` query parameter rather than in the path, so it
+//! is optional in the model: a request that omits it names no job, and is
+//! refused with the `ValidationException` this operation models naming the
+//! missing member. A workspace this service does not hold, and a workspace that
+//! holds no job for the source, are both the `ResourceNotFoundException` this
+//! operation models (which the create does not).
+//!
+//! This read WRITES one thing: the lifecycle transition the CLOCK had already
+//! made due ([`crate::state::SyncJob::settle`]). The outcome was owed at the
+//! stored instant whether or not anybody called, so materialising it here makes
+//! the record say what was already true rather than moving the job because it
+//! was read. Authorization is not emulated, so the modelled
+//! `AccessDeniedException` is never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +167,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSyncJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSyncJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSyncJob"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one reads tenant state.
+        ::tracing::info!(
+            operation = "GetSyncJob",
+            workspace_id = ?input.workspace_id,
+            sync_source = %input.sync_source,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSyncJobErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // A sync job is addressed by its workspace AND its sync source, and
+        // `workspaceId` is carried in the `workspace` query parameter rather
+        // than in the path — so a request that omits it names no job to report,
+        // and is refused with the `ValidationException` this operation models,
+        // naming the member it is missing.
+        let Some(workspace_id) = input.workspace_id.clone() else {
+            return Err(GetSyncJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "workspaceId is required: a sync job is addressed by the workspace that \
+                         contains it and its sync source"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A workspace this service does not hold holds no sync job either, and
+        // this operation — unlike the create — models the
+        // `ResourceNotFoundException` that says so.
+        let Some(workspace) = state.workspaces.get_mut(&workspace_id) else {
+            return Err(GetSyncJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::workspace_not_found_message(&workspace_id)),
+                },
+            )
+            .into());
+        };
+        let Some(job) = workspace.sync_jobs.get_mut(&input.sync_source) else {
+            return Err(GetSyncJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::sync_job_not_found_message(
+                        &workspace_id,
+                        &input.sync_source,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The clock, not this call, is what moves the job on: its outcome was
+        // due at `settles_at`, so reporting the state without materialising it
+        // would report a state that stopped being true before the request
+        // arrived.
+        job.settle(::std::time::SystemTime::now());
+
+        Ok(GetSyncJobOutput {
+            arn: job.arn.clone(),
+            workspace_id: job.workspace_id.clone(),
+            sync_source: job.sync_source.clone(),
+            // Reported as STORED: the role the create supplied, never a role
+            // this service invents.
+            sync_role: job.sync_role.clone(),
+            // Carries the stored state (settled above) and, once the job has
+            // failed, why.
+            status: job.status(),
+            creation_date_time: crate::state::timestamp(job.creation_date_time),
+            update_date_time: crate::state::timestamp(job.update_date_time),
+        })
     }
 }
