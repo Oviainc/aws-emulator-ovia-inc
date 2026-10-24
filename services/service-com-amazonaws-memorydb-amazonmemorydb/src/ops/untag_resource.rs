@@ -152,6 +152,13 @@ fn reject(rejection: crate::state::TagTargetRejection) -> UntagResourceError {
                 message: Some(message),
             })
         }
+        TagTargetRejection::ForeignScope(message) => {
+            UntagResourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+        }
         TagTargetRejection::NotFound(kind, text) => {
             let message = Some(text);
             match kind {
@@ -289,7 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(std::time::Instant::now());
         state.ensure_builtins(&region);
 
-        let resource_arn = state.tag_target(&input.resource_arn).map_err(reject)?;
+        let resource_arn = state
+            .tag_target(&input.resource_arn, &region)
+            .map_err(reject)?;
         let mut remaining = state.tags.get(&resource_arn).cloned().unwrap_or_default();
         // EVERY key is resolved against the resource's tags BEFORE any is removed, so a
         // request naming one tag the resource does not carry removes none of the others:

@@ -152,6 +152,13 @@ fn reject(rejection: crate::state::TagTargetRejection) -> TagResourceError {
                 message: Some(message),
             })
         }
+        TagTargetRejection::ForeignScope(message) => {
+            TagResourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+        }
         TagTargetRejection::NotFound(kind, text) => {
             let message = Some(text);
             match kind {
@@ -266,7 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(std::time::Instant::now());
         state.ensure_builtins(&region);
 
-        let resource_arn = state.tag_target(&input.resource_arn).map_err(reject)?;
+        let resource_arn = state
+            .tag_target(&input.resource_arn, &region)
+            .map_err(reject)?;
         // MERGE, not replace: the resource keeps every key this request does not name,
         // and a key it does name takes the new value.
         let mut merged = state.tags.get(&resource_arn).cloned().unwrap_or_default();

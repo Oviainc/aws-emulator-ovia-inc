@@ -33,6 +33,8 @@ mod parameter_catalog;
 mod parameter_groups;
 #[path = "all/parameters.rs"]
 mod parameters;
+#[path = "all/refusal_fault_codes.rs"]
+mod refusal_fault_codes;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 #[path = "all/resource_tags.rs"]

@@ -67,6 +67,9 @@
 //! * `InvalidARNFault` (HTTP 400) — The specified Amazon Resource Name (ARN) is not valid.
 //! * `InvalidClusterStateFault` (HTTP 400) — The cluster is not in a valid state for the
 //!   requested operation.
+//! * `InvalidParameterValueException` (HTTP 400) — The specified parameter value is not
+//!   valid. Widened in through `extra_errors` (see below): the answer to a `ResourceArn`
+//!   whose region or account this endpoint does not serve.
 //! * `MultiRegionClusterNotFoundFault` (HTTP 404) — The specified multi-Region cluster does
 //!   not exist.
 //! * `MultiRegionParameterGroupNotFoundFault` (HTTP 404) — The specified multi-Region
@@ -92,13 +95,25 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-memorydb-amazonmemorydb
 // here — hence the `ListTagsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.memorydb#ListTags")]
+//
+// `InvalidParameterValueException` is widened in through `extra_errors`: the SERVICE
+// models that shape as its answer for a `ResourceArn` naming a region or an account
+// this endpoint does not serve (the two tag MUTATIONS, which take the same ARN, list
+// it), and none of the errors this operation does list says anything about the ARN's
+// scope — `InvalidARNFault` is about the ARN's FORM, and a not-found fault would claim
+// this endpoint looked for the resource. Widening keeps the refusal on a shape real
+// clients already know instead of answering one of those two.
+#[smithy_macros::operation_error(
+    "com.amazonaws.memorydb#ListTags",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsErrorModeled {
     ACLNotFoundFault(ACLNotFoundFault),
     ClusterNotFoundFault(ClusterNotFoundFault),
     InvalidARNFault(InvalidARNFault),
     InvalidClusterStateFault(InvalidClusterStateFault),
+    InvalidParameterValueException(InvalidParameterValueException),
     MultiRegionClusterNotFoundFault(MultiRegionClusterNotFoundFault),
     MultiRegionParameterGroupNotFoundFault(MultiRegionParameterGroupNotFoundFault),
     ParameterGroupNotFoundFault(ParameterGroupNotFoundFault),
@@ -133,6 +148,11 @@ fn reject(rejection: crate::state::TagTargetRejection) -> ListTagsError {
     match rejection {
         TagTargetRejection::InvalidArn(message) => {
             ListTagsErrorModeled::InvalidARNFault(InvalidARNFault {
+                message: Some(message),
+            })
+        }
+        TagTargetRejection::ForeignScope(message) => {
+            ListTagsErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
                 message: Some(message),
             })
         }
@@ -232,7 +252,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Tags belong to a resource: an ARN that resolves to nothing is the modelled
         // refusal, never an empty tag list.
-        let resource_arn = state.tag_target(&input.resource_arn).map_err(reject)?;
+        let resource_arn = state
+            .tag_target(&input.resource_arn, &region)
+            .map_err(reject)?;
         Ok(ListTagsOutput {
             tag_list: Some(state.tag_list(&resource_arn)),
         })
