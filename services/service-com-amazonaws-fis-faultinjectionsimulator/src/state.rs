@@ -100,8 +100,12 @@ use crate::ops::types::{
     ExperimentTemplateTargetInputFilter, ReportConfigurationCloudWatchDashboardInput,
     ReportConfigurationS3Output, ReportConfigurationS3OutputInput, ResolvedTarget,
     ResourceNotFoundException, ServiceQuotaExceededException, StartExperimentInput,
-    TargetAccountConfiguration, TargetAccountConfigurationSummary, ValidationException,
-    ACCOUNT_TARGETING_VALUES, ACTIONS_MODE_VALUES, EMPTY_TARGET_RESOLUTION_MODE_VALUES,
+    TargetAccountConfiguration, TargetAccountConfigurationSummary,
+    UpdateExperimentTemplateActionInputItem, UpdateExperimentTemplateInput,
+    UpdateExperimentTemplateLogConfigurationInput, UpdateExperimentTemplateReportConfigurationInput,
+    UpdateExperimentTemplateStopConditionInput, UpdateExperimentTemplateTargetInput,
+    ValidationException, ACCOUNT_TARGETING_VALUES, ACTIONS_MODE_VALUES,
+    EMPTY_TARGET_RESOLUTION_MODE_VALUES,
 };
 
 pub mod action_permissions;
@@ -878,6 +882,140 @@ impl ExperimentTemplateRecord {
         }
     }
 
+    /// Apply an `UpdateExperimentTemplate` request to this record.
+    ///
+    /// `id` is the only member that request requires, while the create requires
+    /// `description`, `actions`, `roleArn` and `stopConditions`, so the update is a
+    /// MEMBER-WISE PARTIAL one: a member the request carries REPLACES the stored value,
+    /// and a member it omits leaves the stored value exactly as it is. A member the
+    /// request's shape cannot carry at all keeps its stored value for the same reason —
+    /// `experimentOptions.accountTargeting` is settled when the template is created and
+    /// `UpdateExperimentTemplateExperimentOptionsInput` declares no member for it.
+    ///
+    /// A member the request carries replaces the stored value WHOLE: the `actions`,
+    /// `targets` and `stopConditions` collections are each replaced by the collection the
+    /// request names (so a name the request leaves out is no longer declared), and a
+    /// nested structure is replaced by the structure the request names. The ONE exception
+    /// is a nested member the create declares REQUIRED where the update's looser shape
+    /// makes it optional (`actions.*.actionId`, `logConfiguration.logSchemaVersion`): the
+    /// stored value is kept, so the template an update leaves behind is one a create could
+    /// have produced. Where there is no stored value to keep — an action name the template
+    /// does not already declare, a template that held no log configuration — the request
+    /// is refused with the `ValidationException` returned here, before anything is
+    /// written; the caller judges the rest of the resulting record ([`actions_refusal`]
+    /// and the other refusals the create applies) and discards this record if any of them
+    /// refuses it.
+    ///
+    /// `id`, `arn`, `creationTime`, the template's `tags` (which `TagResource` owns) and
+    /// its target account configurations (which their own operations own) are never
+    /// touched by an update. `lastUpdateTime` moves to `now`: this call is the update FIS
+    /// records for the template.
+    pub fn apply_update(
+        &mut self,
+        input: &UpdateExperimentTemplateInput,
+        now: SystemTime,
+    ) -> Result<(), ValidationException> {
+        if let Some(description) = input.description.as_deref() {
+            self.description = description.to_string();
+        }
+        if let Some(role_arn) = input.role_arn.as_deref() {
+            self.role_arn = role_arn.to_string();
+        }
+        if let Some(stop_conditions) = input.stop_conditions.as_ref() {
+            self.stop_conditions = stop_conditions.iter().map(update_stop_condition).collect();
+        }
+        if let Some(targets) = input.targets.as_ref() {
+            self.targets = targets
+                .iter()
+                .map(|(name, target)| (name.clone(), update_target(target)))
+                .collect();
+        }
+        if let Some(actions) = input.actions.as_ref() {
+            self.actions = self.updated_actions(actions)?;
+        }
+        if let Some(configuration) = input.log_configuration.as_ref() {
+            self.log_configuration = Some(self.updated_log_configuration(configuration)?);
+        }
+        if let Some(options) = input.experiment_options.as_ref() {
+            if let Some(mode) = options.empty_target_resolution_mode.clone() {
+                self.experiment_options.empty_target_resolution_mode = Some(mode);
+            }
+        }
+        if let Some(report) = input.experiment_report_configuration.as_ref() {
+            self.experiment_report_configuration = Some(update_report_configuration(report));
+        }
+        self.last_update_time = now;
+        Ok(())
+    }
+
+    /// The actions an update's `actions` map leaves the template declaring: exactly the
+    /// names that map carries, each as the request names it, with the stored `actionId`
+    /// kept for an entry that omits one (see [`ExperimentTemplateRecord::apply_update`]).
+    fn updated_actions(
+        &self,
+        actions: &HashMap<String, UpdateExperimentTemplateActionInputItem>,
+    ) -> Result<HashMap<String, ExperimentTemplateAction>, ValidationException> {
+        // The map's iteration order is not stable, so the refusal is taken over the action
+        // names in order: one request always earns the same message, exactly as
+        // [`actions_refusal`] does.
+        let mut entries: Vec<(&String, &UpdateExperimentTemplateActionInputItem)> =
+            actions.iter().collect();
+        entries.sort_by_key(|(name, _)| *name);
+        let mut updated = HashMap::with_capacity(actions.len());
+        for (name, action) in entries {
+            let action_id = action.action_id.clone().or_else(|| {
+                self.actions
+                    .get(name)
+                    .and_then(|stored| stored.action_id.clone())
+            });
+            if action_id.is_none() {
+                return Err(invalid_input(format!(
+                    "actions.{name}.actionId is required: the template declares no action \
+                     {name} to take it from."
+                )));
+            }
+            updated.insert(
+                name.clone(),
+                ExperimentTemplateAction {
+                    action_id,
+                    description: action.description.clone(),
+                    parameters: action.parameters.clone(),
+                    targets: action.targets.clone(),
+                    start_after: action.start_after.clone(),
+                },
+            );
+        }
+        Ok(updated)
+    }
+
+    /// The log configuration an update's `logConfiguration` leaves the template carrying:
+    /// the one the request names, with the stored `logSchemaVersion` kept when the request
+    /// omits it (see [`ExperimentTemplateRecord::apply_update`]).
+    fn updated_log_configuration(
+        &self,
+        input: &UpdateExperimentTemplateLogConfigurationInput,
+    ) -> Result<ExperimentTemplateLogConfiguration, ValidationException> {
+        let log_schema_version = input.log_schema_version.or_else(|| {
+            self.log_configuration
+                .as_ref()
+                .and_then(|stored| stored.log_schema_version)
+        });
+        if log_schema_version.is_none() {
+            return Err(invalid_input(
+                "logConfiguration.logSchemaVersion is required: the template carries no log \
+                 configuration to take it from.",
+            ));
+        }
+        Ok(ExperimentTemplateLogConfiguration {
+            cloud_watch_logs_configuration: input
+                .cloud_watch_logs_configuration
+                .as_ref()
+                .map(template_cloud_watch_logs_configuration),
+            s3_configuration: input.s3_configuration.as_ref().map(template_s3_configuration),
+            log_schema_version,
+        })
+    }
+
     /// `targetAccountConfigurationsCount` — how many target account configurations this
     /// template holds, derived from the stored configurations rather than counted
     /// separately.
@@ -1598,18 +1736,26 @@ pub fn page_size(max_results: Option<i32>) -> usize {
     usize::try_from(requested.clamp(1, PAGE_LIMIT)).unwrap_or(1)
 }
 
-/// `None` when every stop condition in `conditions` satisfies what FIS documents for
-/// `StopCondition`; otherwise the `ValidationException` that refuses the request.
+/// `None` when every stop condition of the template a request builds satisfies what FIS
+/// documents for `StopCondition`; otherwise the `ValidationException` that refuses the
+/// request.
+///
+/// Taken over the STORED stop conditions rather than over one request's input shape, so
+/// the rule is judged the same whether the template is being created or updated: FIS
+/// states it about a template, not about a request.
 ///
 /// Two rules the model cannot express: `source` is one of
 /// [`STOP_CONDITION_SOURCE_NONE`] / [`STOP_CONDITION_SOURCE_ALARM`], and a stop condition
 /// naming the alarm source carries the alarm's ARN in `value` ("This is required if the
 /// source is a CloudWatch alarm").
 pub fn stop_conditions_refusal(
-    conditions: &[CreateExperimentTemplateStopConditionInput],
+    conditions: &[ExperimentTemplateStopCondition],
 ) -> Option<ValidationException> {
     for (index, condition) in conditions.iter().enumerate() {
-        let source = condition.source.as_str();
+        // `source` is required on both the create's and the update's stop-condition
+        // input, so a stored condition always carries one; an absent one is refused by
+        // the admitted-source rule below rather than silently accepted.
+        let source = condition.source.as_deref().unwrap_or_default();
         if source != STOP_CONDITION_SOURCE_NONE && source != STOP_CONDITION_SOURCE_ALARM {
             return Some(invalid_input(format!(
                 "stopConditions[{index}].source must be \
@@ -1652,12 +1798,14 @@ pub fn enum_refusal(
     )))
 }
 
-/// The `ValidationException` refusals of the experiment options a
-/// `CreateExperimentTemplate` request carries.
+/// The `ValidationException` refusals of the experiment options a template carries.
+///
+/// Taken over the STORED options — the ones the create filled its documented defaults
+/// into and the ones an update replaced — so a value outside either enum is refused
+/// whichever call put it there.
 pub fn template_experiment_options_refusal(
-    options: Option<&CreateExperimentTemplateExperimentOptionsInput>,
+    options: &ExperimentTemplateExperimentOptions,
 ) -> Option<ValidationException> {
-    let options = options?;
     enum_refusal(
         "experimentOptions.accountTargeting",
         options.account_targeting.as_deref(),
@@ -1955,8 +2103,11 @@ pub fn wait_duration(value: &str) -> Result<Duration, WaitDurationProblem> {
     Ok(span)
 }
 
-/// `None` when every action a `CreateExperimentTemplate` request carries satisfies what
-/// FIS documents for it; otherwise the `ValidationException` that refuses the request.
+/// `None` when every action of the template a request builds satisfies what FIS documents
+/// for it; otherwise the `ValidationException` that refuses the request.
+///
+/// Taken over the STORED actions rather than over one request's input shape, so a created
+/// and an updated template are judged by the same rule.
 ///
 /// The rule this enforces is the built-in `aws:fis:wait` action's: it takes a required
 /// `duration` parameter, an ISO 8601 duration within the documented 1 to 720 minutes. An
@@ -1965,14 +2116,13 @@ pub fn wait_duration(value: &str) -> Result<Duration, WaitDurationProblem> {
 /// graph: `startAfter` is "the name of the action that must be completed before the
 /// current action starts", so it names an action the same template declares.
 pub fn actions_refusal(
-    actions: &HashMap<String, CreateExperimentTemplateActionInput>,
+    actions: &HashMap<String, ExperimentTemplateAction>,
 ) -> Option<ValidationException> {
     // The map's iteration order is not stable, so the refusal is taken over the action
     // names in order: one request always earns the same message. The entries are sorted
     // as PAIRS, so no path through this function can turn a lookup miss into an
     // acceptance.
-    let mut entries: Vec<(&String, &CreateExperimentTemplateActionInput)> =
-        actions.iter().collect();
+    let mut entries: Vec<(&String, &ExperimentTemplateAction)> = actions.iter().collect();
     entries.sort_by_key(|(name, _)| *name);
     for (name, action) in entries {
         if action
@@ -1985,7 +2135,7 @@ pub fn actions_refusal(
                 "actions.{name}.startAfter must name actions the template declares."
             )));
         }
-        if action.action_id != WAIT_ACTION_ID {
+        if action.action_id.as_deref() != Some(WAIT_ACTION_ID) {
             continue;
         }
         let duration = action
@@ -2024,7 +2174,7 @@ pub fn actions_refusal(
 /// keeps the per-request cost of [`run_plan`] proportional to the request rather than to
 /// its square.
 pub fn actions_quota_refusal(
-    actions: &HashMap<String, CreateExperimentTemplateActionInput>,
+    actions: &HashMap<String, ExperimentTemplateAction>,
 ) -> Option<ServiceQuotaExceededException> {
     if actions.len() <= MAX_ACTIONS_PER_TEMPLATE {
         return None;
@@ -2557,6 +2707,52 @@ fn template_stop_condition(
     ExperimentTemplateStopCondition {
         source: Some(input.source.clone()),
         value: input.value.clone(),
+    }
+}
+
+/// One target of an `UpdateExperimentTemplate` request, as the template stores it.
+///
+/// `UpdateExperimentTemplateTargetInput` declares the same members as the create's target
+/// input, with the same two required (`resourceType`, `selectionMode`), so a stored target
+/// is built from it exactly as [`template_target`] builds one — down to the filters, which
+/// are the SAME input shape on both requests.
+fn update_target(input: &UpdateExperimentTemplateTargetInput) -> ExperimentTemplateTarget {
+    ExperimentTemplateTarget {
+        resource_type: Some(input.resource_type.clone()),
+        resource_arns: input.resource_arns.clone(),
+        resource_tags: input.resource_tags.clone(),
+        filters: input
+            .filters
+            .as_ref()
+            .map(|filters| filters.iter().map(template_target_filter).collect()),
+        selection_mode: Some(input.selection_mode.clone()),
+        parameters: input.parameters.clone(),
+    }
+}
+
+/// One stop condition of an `UpdateExperimentTemplate` request, as the template stores it.
+/// `source` is required on both requests, so this is [`template_stop_condition`] over the
+/// update's shape.
+fn update_stop_condition(
+    input: &UpdateExperimentTemplateStopConditionInput,
+) -> ExperimentTemplateStopCondition {
+    ExperimentTemplateStopCondition {
+        source: Some(input.source.clone()),
+        value: input.value.clone(),
+    }
+}
+
+/// The report configuration an `UpdateExperimentTemplate` request names, as the template
+/// stores it. Every member is optional on both requests and the nested shapes are the
+/// SAME ones, so this is [`template_report_configuration`] over the update's shape.
+fn update_report_configuration(
+    input: &UpdateExperimentTemplateReportConfigurationInput,
+) -> ExperimentTemplateReportConfiguration {
+    ExperimentTemplateReportConfiguration {
+        outputs: input.outputs.as_ref().map(template_report_outputs),
+        data_sources: input.data_sources.as_ref().map(template_report_data_sources),
+        pre_experiment_duration: input.pre_experiment_duration.clone(),
+        post_experiment_duration: input.post_experiment_duration.clone(),
     }
 }
 

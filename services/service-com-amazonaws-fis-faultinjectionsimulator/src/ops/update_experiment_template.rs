@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateExperimentTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateExperimentTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates the experiment template `id` names, IN PLACE in
+//! [`crate::state::ComAmazonawsFisFaultinjectionsimulatorState::experiment_templates`],
+//! and reports the record as it now stands.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateExperimentTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The update is MEMBER-WISE PARTIAL ([`crate::state::ExperimentTemplateRecord::apply_update`]
+//! applies it): a member the request carries replaces the stored value, a member it omits
+//! leaves the stored value alone, and the template that results is judged by the very
+//! rules `CreateExperimentTemplate` judges the template it builds by — so an update can
+//! only leave behind a template a create could have produced. `id`, `arn`, `creationTime`,
+//! the `tags` (`TagResource`'s business) and the target account configurations are not
+//! members of this request and are not touched; `lastUpdateTime` moves to the instant of
+//! this call.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +158,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateExperimentTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateExperimentTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateExperimentTemplate"))
+        // An update changes a template that already carries its `id` and `arn`, and this
+        // request mints neither, so nothing here reads the credential scope's region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Every modelled constraint on this input — the required `id`, the lengths and
+        // patterns on `id`, `description` and `roleArn`, the bounds on the collections —
+        // was refused at the boundary. What the model cannot express is that a `roleArn`
+        // the request carries names an IAM ROLE; refused BEFORE the lookup and before any
+        // write, so the template keeps the role it already held.
+        if let Some(refusal) = crate::state::role_arn_refusal("roleArn", input.role_arn.as_deref())
+        {
+            return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // No upsert semantics: this operation changes a template that EXISTS and reports
+        // the miss exactly as a read of the same id does.
+        let Some(stored) = store.experiment_templates.get(&input.id) else {
+            return Err(UpdateExperimentTemplateErrorModeled::ResourceNotFoundException(
+                crate::state::template_not_found(),
+            )
+            .into());
+        };
+
+        // The change is applied to a CANDIDATE copy and judged before it is committed, so
+        // a refused update leaves the stored template exactly as it was — by the same
+        // rules, in the same order, as `CreateExperimentTemplate` applies to the template
+        // it builds.
+        let mut candidate = stored.clone();
+        if let Err(refusal) = candidate.apply_update(&input, now) {
+            return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
+        }
+        if let Some(refusal) = crate::state::stop_conditions_refusal(&candidate.stop_conditions) {
+            return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
+        }
+        if let Some(refusal) =
+            crate::state::template_experiment_options_refusal(&candidate.experiment_options)
+        {
+            return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
+        }
+        if let Some(refusal) = crate::state::actions_quota_refusal(&candidate.actions) {
+            return Err(
+                UpdateExperimentTemplateErrorModeled::ServiceQuotaExceededException(refusal).into(),
+            );
+        }
+        if let Some(refusal) = crate::state::actions_refusal(&candidate.actions) {
+            return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
+        }
+
+        // Built from the record now in the store, so this answer and every later read of
+        // this template agree. Experiments already started from it are untouched: each
+        // one snapshotted the template it was started from.
+        let experiment_template = candidate.to_experiment_template();
+        store.experiment_templates.insert(input.id.clone(), candidate);
+
+        Ok(UpdateExperimentTemplateOutput {
+            experiment_template: Some(experiment_template),
+        })
     }
 }

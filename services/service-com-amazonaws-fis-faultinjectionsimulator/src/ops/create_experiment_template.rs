@@ -171,6 +171,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The RECORD this request builds, which is what every server-side rule below is
+        // judged over — the same record `UpdateExperimentTemplate` judges once it has
+        // applied its changes, so the two operations cannot disagree about which
+        // templates are admissible. The id and the ARN are minted only once the request
+        // has been judged and its token resolved, so a refused or replayed request
+        // consumes neither; until then this record carries neither.
+        let mut record = crate::state::ExperimentTemplateRecord::from_create_input(
+            String::new(),
+            String::new(),
+            &input,
+            now,
+        );
+
         // Every modelled constraint on this input — the required members, the lengths
         // and patterns on `clientToken`, `description` and `roleArn`, the 50-entry tag
         // map — was already refused at the boundary. What the model cannot express is
@@ -178,15 +194,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `source`/`value` pair, which values the two `experimentOptions` enums admit,
         // and the parameters FIS's built-in actions take.
         if let Some(refusal) =
-            crate::state::role_arn_refusal("roleArn", Some(input.role_arn.as_str()))
+            crate::state::role_arn_refusal("roleArn", Some(record.role_arn.as_str()))
         {
             return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
         }
-        if let Some(refusal) = crate::state::stop_conditions_refusal(&input.stop_conditions) {
+        if let Some(refusal) = crate::state::stop_conditions_refusal(&record.stop_conditions) {
             return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
         }
         if let Some(refusal) =
-            crate::state::template_experiment_options_refusal(input.experiment_options.as_ref())
+            crate::state::template_experiment_options_refusal(&record.experiment_options)
         {
             return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
         }
@@ -194,34 +210,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // template this call accepts is one the service would run. The action count is
         // capped for the same reason, and because it is what bounds the work the action
         // graph of this template costs every later `StartExperiment`.
-        if let Some(refusal) = crate::state::actions_quota_refusal(&input.actions) {
+        if let Some(refusal) = crate::state::actions_quota_refusal(&record.actions) {
             return Err(
                 CreateExperimentTemplateErrorModeled::ServiceQuotaExceededException(refusal).into(),
             );
         }
-        if let Some(refusal) = crate::state::actions_refusal(&input.actions) {
+        if let Some(refusal) = crate::state::actions_refusal(&record.actions) {
             return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
         }
 
-        let region = crate::state::request_region(ctx.parts());
-        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // The token is `@idempotencyToken`: a replay of the SAME request reports the
         // template the first call created, so a retried request never leaves two
         // templates behind, while reusing the token for a different request is the
         // parameter mismatch FIS answers with `ConflictException`.
-        //
-        // The id and ARN are minted only once the token has been judged, so a refused or
-        // replayed request consumes neither.
-        let fingerprint = crate::state::template_fingerprint(
-            &crate::state::ExperimentTemplateRecord::from_create_input(
-                String::new(),
-                String::new(),
-                &input,
-                now,
-            ),
-        );
+        let fingerprint = crate::state::template_fingerprint(&record);
         match store.replayed(
             crate::state::IdempotentResource::ExperimentTemplate,
             &input.client_token,
@@ -256,9 +260,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_template_id();
-        let arn = crate::state::template_arn(&region, &id);
-        let record =
-            crate::state::ExperimentTemplateRecord::from_create_input(id.clone(), arn, &input, now);
+        record.id = id.clone();
+        record.arn = crate::state::template_arn(&region, &id);
         // Built from the record that is about to be stored, so what the caller sees is
         // what a later `GetExperimentTemplate` reads back.
         let experiment_template = record.to_experiment_template();
