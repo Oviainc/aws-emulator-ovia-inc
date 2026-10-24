@@ -40,7 +40,12 @@ pub(crate) fn settings(inputs: usize, groups: usize) -> Value {
         .map(|index| {
             json!({
                 "name": format!("File Group {index}"),
-                "outputs": [{ "nameModifier": format!("_{index}") }],
+                // Each output states the container it is written in: `Output$Preset` is
+                // "either Preset or Container settings", so one of the two must be there.
+                "outputs": [{
+                    "nameModifier": format!("_{index}"),
+                    "containerSettings": { "container": "MP4" }
+                }],
                 "outputGroupSettings": {
                     "type": "FILE_GROUP_SETTINGS",
                     "fileGroupSettings": { "destination": format!("s3://example-bucket/out{index}/") }
