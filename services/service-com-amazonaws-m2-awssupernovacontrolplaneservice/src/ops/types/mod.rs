@@ -31,6 +31,7 @@ pub mod get_data_set_export_task_types;
 pub mod get_data_set_import_task_types;
 pub mod get_deployment_types;
 pub mod get_environment_types;
+pub mod get_signed_bluinsights_url_types;
 pub mod list_application_versions_types;
 pub mod list_applications_types;
 pub mod list_batch_job_definitions_types;
@@ -86,6 +87,8 @@ pub use get_data_set_import_task_types::*;
 pub use get_deployment_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_environment_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_signed_bluinsights_url_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_application_versions_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

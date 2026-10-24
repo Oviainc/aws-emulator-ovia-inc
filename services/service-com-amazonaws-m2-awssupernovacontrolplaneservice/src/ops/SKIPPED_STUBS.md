@@ -18,4 +18,12 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 `@required`-member reference cycle are NOT decline reasons — a scaffolded
 handler returns an error, so it never has to construct a value.
 
-// SKIPPED: GetSignedBluinsightsUrl — unsupported shape construct: operation 'GetSignedBluinsightsUrl' has a Unit/absent input, which the generator does not emit yet
+Nothing is currently declined for this service. `GetSignedBluinsightsUrl` was declined
+when this service was scaffolded ("unsupported shape construct: operation
+'GetSignedBluinsightsUrl' has a Unit/absent input, which the generator does not emit
+yet") and has since been hand-authored in `src/ops/get_signed_bluinsights_url.rs` (with
+its types in `src/ops/types/get_signed_bluinsights_url_types.rs`), which puts it in the
+service's `operations(...)` allow-list (`build.rs` derives that list from each ops
+file's `//! @op <Name>` header). Its `// SKIPPED:` line is deleted rather than kept as
+history: those lines are the machine-readable census of unwired operations, and a stale
+one would report an implemented operation as unwired.

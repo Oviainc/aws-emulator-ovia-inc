@@ -13,5 +13,9 @@
 // points it into `tests/all/`.
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
+#[path = "all/pre_handler_refusals.rs"]
+mod pre_handler_refusals;
+#[path = "all/signed_bluinsights_url.rs"]
+mod signed_bluinsights_url;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

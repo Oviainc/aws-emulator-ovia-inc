@@ -70,3 +70,36 @@ Model evidence (services/service-com-amazonaws-m2-awssupernovacontrolplaneservic
 2. Cause 1: replay fixture m2-create-resource-access-denied step task#2 — POST /applications with the fixture's recorded (unauthorizable) request. Expect 403 + x-amzn-errortype: AccessDeniedException + a `message` member; observe 200 and a created application.
 3. Cause 2: GET /signed-bi-url (fixture m2-engine-discovery-and-blu-insights step task#4). Expect 200 with a `signedBiUrl` member; observe 501.
 4. Cause 3: GET /tags/not-a-valid-arn (fixture m2-environment-not-found-errors step task#4). Expect 400 with x-amzn-errortype: BadRequestException; observe 400 with x-amzn-errortype: ValidationException.
+
+## Resolution
+
+Cause 2 and cause 3 are FIXED, and so is the general rule cause 1 names; two parts of
+cause 1's recorded instance are DECLINED and are recorded here so a later sweep does
+not have to re-derive them.
+
+- Cause 2 — `GetSignedBluinsightsUrl` is served: `src/ops/get_signed_bluinsights_url.rs`
+  (hand-authored, the generator declines a `smithy.api#Unit` input) answers 200 with
+  `signedBiUrl` built on the endpoint the request arrived on, naming the account and
+  the signed region. Covered by `tests/all/signed_bluinsights_url.rs`.
+- Cause 3 — a `resourceArn` that `service_common::arn::parse` does not read as an ARN
+  is refused 400 `BadRequestException` "Invalid input resource arn: bad syntax"
+  (`src/service.rs`'s `override_refusal`); an ARN-shaped value outside the modelled
+  `Arn` pattern, and every other `Arn`-typed member, keep the modelled
+  `ValidationException`. Covered by `tests/all/pre_handler_refusals.rs`.
+- Cause 1, the RULE — a caller the pre-handler authorization stage refuses is now
+  answered with the modelled `AccessDeniedException` (403, `x-amzn-errortype:
+  AccessDeniedException`, a `message` member) instead of the framework's `AccessDenied`,
+  before any state mutation. Covered by `tests/all/pre_handler_refusals.rs`.
+- DECLINED, `m2|CreateApplication|4xx->2xx|{status,$.message,$headers.x-amzn-errortype}`:
+  the recorded request was read off the wire and is an ordinary, fully conforming
+  `POST /applications` (name/engineType/definition/clientToken, `application/json`,
+  botocore headers) on exactly the URI the model binds CreateApplication to, re-signed
+  by the replay harness with the emulator's own credentials. Nothing in it distinguishes
+  it from an authorized create, and the recorded message ("Unable to determine
+  service/operation name to be authorized") is AWS's authorization layer failing to name
+  a service/operation pair — a property of the recording principal/endpoint, not of the
+  request. No AWS rule produces that answer for that request, so the emulator still
+  answers 200 here and will keep doing so.
+- DECLINED, `m2|GetSignedBluinsightsUrl|…|$.signedBiUrl` (the VALUE, once the status is
+  right): a single-sign-on URL AWS generates per call, recorded as environment-specific
+  and not asserted; the model constrains it only as a `String`.

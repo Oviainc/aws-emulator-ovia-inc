@@ -118,55 +118,6 @@ impl From<CreateApplicationErrorModeled> for CreateApplicationError {
     }
 }
 
-/// The region an ARN this operation mints carries: the one the caller signed for, when
-/// it is shaped like the region segment of the modelled `Arn` pattern, else the
-/// emulator's default region.
-///
-/// The ARN is minted ONCE, here, and persisted; every later read returns the stored
-/// string rather than rebuilding it, so an application's ARN never changes.
-fn arn_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    const DEFAULT_REGION: &str = "us-east-1";
-    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
-        .map(|scope| scope.region)
-        .filter(|region| is_arn_region(region))
-        .unwrap_or_else(|| DEFAULT_REGION.to_string())
-}
-
-/// Whether `region` matches the region segment of the m2 `Arn` pattern,
-/// `[a-z]{2}-((iso[a-z]{0,1}-)|(gov-)){0,1}[a-z]+-[0-9]` (from `smithy_query`'s
-/// `Arn` pattern), so a minted ARN satisfies the shape the model declares.
-fn is_arn_region(region: &str) -> bool {
-    let Some((prefix, mut rest)) = region.split_once('-') else {
-        return false;
-    };
-    if prefix.len() != 2 || !prefix.bytes().all(|b| b.is_ascii_lowercase()) {
-        return false;
-    }
-    // The optional partition segment: `gov-`, `iso-`, or `iso<letter>-`.
-    if let Some(stripped) = rest.strip_prefix("gov-") {
-        rest = stripped;
-    } else if let Some(after_iso) = rest.strip_prefix("iso") {
-        if let Some(stripped) = after_iso.strip_prefix('-') {
-            rest = stripped;
-        } else if after_iso
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_lowercase)
-        {
-            if let Some(stripped) = after_iso[1..].strip_prefix('-') {
-                rest = stripped;
-            }
-        }
-    }
-    let Some((name, number)) = rest.rsplit_once('-') else {
-        return false;
-    };
-    !name.is_empty()
-        && name.bytes().all(|b| b.is_ascii_lowercase())
-        && number.len() == 1
-        && number.bytes().all(|b| b.is_ascii_digit())
-}
-
 /// Whether a retried `CreateApplication` carries the same application as the one the
 /// client token already created — the test an `@idempotencyToken` replay turns on.
 fn same_application(
@@ -322,8 +273,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let application_id = store.mint_identifier(&input.name);
         let application_arn = ::engine::emulator_arn(
-            "m2",
-            &arn_region(ctx),
+            crate::state::ARN_SERVICE,
+            &crate::state::request_region(ctx.parts()),
             &format!("app/{application_id}"),
         );
 
