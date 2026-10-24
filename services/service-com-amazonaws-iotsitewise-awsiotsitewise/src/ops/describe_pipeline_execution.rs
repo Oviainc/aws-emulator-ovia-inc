@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePipelineExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePipelineExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePipelineExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below reports the stored pipeline execution the
+//! request's `workspaceName`, `pipelineName` and `pipelineExecutionId` together
+//! name — its status, the pipeline version it ran against, the priority and the
+//! override maps the start request carried, and the per-compute-node execution
+//! details `StartPipelineExecution` resolved — paginating the compute nodes with
+//! `maxResults` / `nextToken`, as the operation's `@paginated` trait declares.
+//! Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +183,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePipelineExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePipelineExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePipelineExecution"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribePipelineExecutionError::Modeled(
+                DescribePipelineExecutionErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        let store = state.lock();
+
+        // An execution is identified by its id, and the record names the pipeline it
+        // belongs to: an id scoped to another workspace or pipeline names an
+        // execution this request does not address, which is an absence rather than
+        // another execution's answer.
+        let execution = store
+            .pipeline_executions
+            .get(&input.pipeline_execution_id)
+            .filter(|execution| {
+                execution.workspace_name == input.workspace_name
+                    && execution.pipeline_name == input.pipeline_name
+            })
+            .ok_or_else(|| {
+                DescribePipelineExecutionError::Modeled(
+                    DescribePipelineExecutionErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::not_found_message(
+                                crate::state::RESOURCE_PIPELINE_EXECUTION,
+                                &input.pipeline_execution_id,
+                            ),
+                        },
+                    ),
+                )
+            })?;
+
+        // `nextToken` resumes this execution's compute-node enumeration at the node
+        // it names, hex-encoded as the sibling paginated operations encode theirs. A
+        // token naming a node this execution does not hold is refused rather than
+        // answered with an empty page, which would report absence as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = ::hex::decode(token)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .ok_or_else(invalid_token)?;
+                execution
+                    .compute_nodes
+                    .iter()
+                    .position(|node| node.compute_node_name == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250 and the default of 50 the
+        // model itself states, both applied BEFORE this handler runs, so the value
+        // here is already in range; `max(1)` only keeps the slice arithmetic total.
+        let max_results = input.max_results.max(1) as usize;
+        let end = start.saturating_add(max_results).min(execution.compute_nodes.len());
+
+        let next_token = execution
+            .compute_nodes
+            .get(end)
+            .map(|node| ::hex::encode(node.compute_node_name.as_bytes()));
+        let compute_node_execution_details = execution.compute_nodes[start..end]
+            .iter()
+            .map(crate::state::ComputeNodeExecutionRecord::details)
+            .collect();
+
+        Ok(DescribePipelineExecutionOutput {
+            pipeline_execution_id: execution.id.clone(),
+            pipeline_name: execution.pipeline_name.clone(),
+            workspace_name: execution.workspace_name.clone(),
+            pipeline_version: execution.pipeline_version.clone(),
+            status: execution.status(),
+            start_time: execution.start_time.map(crate::state::to_date_time),
+            end_time: execution.end_time.map(crate::state::to_date_time),
+            request_environment_variables: execution.request_environment_variables.clone(),
+            request_mount_overrides: execution.request_mount_overrides.clone(),
+            execution_priority: Some(execution.execution_priority),
+            compute_node_execution_details,
+            next_token,
+        })
     }
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued for this execution.
+fn invalid_token() -> DescribePipelineExecutionError {
+    DescribePipelineExecutionError::Modeled(
+        DescribePipelineExecutionErrorModeled::InvalidRequestException(InvalidRequestException {
+            message: "The nextToken is not a token this operation issued.".to_string(),
+        }),
+    )
 }

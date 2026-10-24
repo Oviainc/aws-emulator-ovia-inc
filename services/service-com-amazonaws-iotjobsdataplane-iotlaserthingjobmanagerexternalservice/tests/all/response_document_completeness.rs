@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::command_registry;
+use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::{
+    command_registry, iot_commands::CommandFacts,
+};
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -57,7 +59,7 @@ impl Emulator {
         command_registry(&*engine)
             .expect("the shared IoT command index")
             .lock()
-            .register(COMMAND_ARN)
+            .register(COMMAND_ARN, CommandFacts::default())
             .expect("register the command these tests start");
         let mut router = MultiServiceRouter::new();
         // These tests exercise handler behaviour, not request signing.
