@@ -41,16 +41,16 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The endpoint host a `geo-maps` client addresses; its first label is the
 /// signing name the router routes on.
-const HOST: &str = "geo-maps.us-east-1.amazonaws.com";
+pub(crate) const HOST: &str = "geo-maps.us-east-1.amazonaws.com";
 
 /// One emulator: the single shared engine plus the router that serves it.
-struct Emulator {
+pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
-    router: MultiServiceRouter,
+    pub(crate) router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests exercise the maps routes, not SigV4; the signature path
@@ -61,12 +61,12 @@ impl Emulator {
     }
 
     /// The service's asset catalog, as a handler sees it.
-    fn catalog(&self) -> engine::ServiceState<ComAmazonawsGeomapsMapsserviceState> {
+    pub(crate) fn catalog(&self) -> engine::ServiceState<ComAmazonawsGeomapsMapsserviceState> {
         self.engine
             .state::<ComAmazonawsGeomapsMapsserviceState>()
     }
 
-    async fn get(&self, path_and_query: &str) -> http::Response<Bytes> {
+    pub(crate) async fn get(&self, path_and_query: &str) -> http::Response<Bytes> {
         let request = http::Request::builder()
             .method(http::Method::GET)
             .uri(format!("https://{HOST}{path_and_query}"))
@@ -77,7 +77,7 @@ impl Emulator {
     }
 }
 
-fn header(response: &http::Response<Bytes>, name: &str) -> String {
+pub(crate) fn header(response: &http::Response<Bytes>, name: &str) -> String {
     response
         .headers()
         .get(name)
@@ -114,11 +114,11 @@ fn error_code(response: &http::Response<Bytes>) -> String {
 }
 
 /// The body as the UTF-8 text an error message is reported in.
-fn body_text(response: &http::Response<Bytes>) -> String {
+pub(crate) fn body_text(response: &http::Response<Bytes>) -> String {
     String::from_utf8_lossy(response.body()).to_string()
 }
 
-fn assert_ok(case: &str, response: &http::Response<Bytes>) {
+pub(crate) fn assert_ok(case: &str, response: &http::Response<Bytes>) {
     assert_eq!(
         response.status(),
         200,
@@ -131,13 +131,13 @@ fn assert_ok(case: &str, response: &http::Response<Bytes>) {
 /// `ETag` as this service computes it: a quoted 128-bit prefix of the body's
 /// SHA-256. Recomputed here from the bytes on the wire, so the test checks the
 /// header against the body it was served with.
-fn expected_etag(body: &[u8]) -> String {
+pub(crate) fn expected_etag(body: &[u8]) -> String {
     let digest = sha2::Sha256::digest(body);
     format!("\"{}\"", hex::encode(&digest[..16]))
 }
 
 /// The path and query of an absolute URL, which is what the router dispatches.
-fn path_of(url: &str) -> String {
+pub(crate) fn path_of(url: &str) -> String {
     let uri: http::Uri = url.parse().unwrap_or_else(|error| {
         panic!("case {url:?}: a style template must be a URL, got {error}");
     });
@@ -146,7 +146,7 @@ fn path_of(url: &str) -> String {
         .unwrap_or_else(|| uri.path().to_string())
 }
 
-fn expand_tile_template(template: &str, z: u32, x: u32, y: u32) -> String {
+pub(crate) fn expand_tile_template(template: &str, z: u32, x: u32, y: u32) -> String {
     template
         .replace("{z}", &z.to_string())
         .replace("{x}", &x.to_string())
@@ -236,7 +236,12 @@ async fn a_style_descriptor_bootstraps_tiles_sprites_and_glyphs() {
                 document["version"], 8,
                 "case {case:?}: the style specification version"
             );
-            let expected_name = format!("{} {}", style.as_wire(), scheme.as_wire());
+            let expected_name = format!(
+                "AmazonLocation-{}-Global-{}-{}",
+                style.as_wire(),
+                scheme.as_wire(),
+                VariantKind::Default.as_wire()
+            );
             assert_eq!(
                 document["name"].as_str(),
                 Some(expected_name.as_str()),
@@ -306,12 +311,14 @@ async fn a_style_descriptor_bootstraps_tiles_sprites_and_glyphs() {
     }
 }
 
-/// The templates a style document hands back carry only a scheme the REQUEST
-/// itself stated — on the URI, or in `x-forwarded-proto`. With no scheme to go
-/// on they stay root-relative, because a guessed scheme is a URL the client
-/// cannot fetch.
+/// Every template a style document hands back is ABSOLUTE, rooted at the
+/// endpoint the request addressed: a client that does not resolve a relative
+/// URL against the endpoint it called must still be able to follow them. The
+/// scheme is the one the request stated — on the URI or in
+/// `x-forwarded-proto` — and `https` when it stated neither, which is how this
+/// emulator's own listener is reached.
 #[tokio::test]
-async fn style_templates_carry_only_a_scheme_the_request_stated() {
+async fn style_templates_are_absolute_urls_rooted_at_the_request_endpoint() {
     let emulator = Emulator::new();
     // Row = (how the request addressed the emulator, x-forwarded-proto), and
     // the prefix every template in the answer must start with.
@@ -328,9 +335,13 @@ async fn style_templates_carry_only_a_scheme_the_request_stated() {
             format!("http://{HOST}/v2/"),
         ),
         // Origin-form, the shape a server really receives: no scheme on the
-        // URI, so the templates stay relative...
-        ("/v2/styles/Standard/descriptor", None, "/v2/".to_string()),
-        // ...unless a proxy states one.
+        // URI, so the templates carry the one this emulator is served over...
+        (
+            "/v2/styles/Standard/descriptor",
+            None,
+            format!("https://{HOST}/v2/"),
+        ),
+        // ...unless a proxy states another.
         (
             "/v2/styles/Standard/descriptor",
             Some("http"),
@@ -345,7 +356,7 @@ async fn style_templates_carry_only_a_scheme_the_request_stated() {
         (
             "/v2/styles/Standard/descriptor",
             Some("javascript"),
-            "/v2/".to_string(),
+            format!("https://{HOST}/v2/"),
         ),
     ];
 
@@ -409,18 +420,26 @@ fn font_stacks(document: &serde_json::Value) -> BTreeSet<String> {
 #[tokio::test]
 async fn style_knobs_add_layers_whose_tiles_carry_them() {
     let emulator = Emulator::new();
-    // Row = one query string, and what it must put in the document.
+    // Row = one query string, and what it must put in the document. A layer is
+    // drawn because the tiles behind it carry it, so the ids are the tile layer
+    // names of the families each knob switches on.
     let cases: [(&str, &[&str]); 7] = [
         ("color-scheme=Dark", &[]),
         ("terrain=Hillshade", &["hillshade"]),
         ("terrain=Terrain3D", &[]),
-        ("contour-density=High", &["contours"]),
-        ("traffic=All", &["traffic-flow", "traffic-incidents"]),
+        ("contour-density=High", &["contour_lines", "contour_lines-line"]),
+        (
+            "traffic=All",
+            &["traffic_flow-line", "traffic_incidents-line"],
+        ),
         (
             "travel-modes=Transit&travel-modes=Truck",
-            &["travel-mode-transit", "travel-mode-truck"],
+            &["transit-line", "logistics-line"],
         ),
-        ("political-view=IND&buildings=Buildings3D", &["borders"]),
+        (
+            "political-view=IND&buildings=Buildings3D",
+            &["borders", "borders-line"],
+        ),
     ];
 
     for (query, expected_layers) in cases {
@@ -836,7 +855,7 @@ async fn tile_addresses_outside_the_catalog_are_refused() {
     let cases: [(&str, u16, &str); 9] = [
         ("/v2/tiles/no-such-tileset/3/4/5", 404, "ResourceNotFoundException"),
         ("/v2/tiles/vector.basemap/999/0/0", 400, "ValidationException"),
-        ("/v2/tiles/vector.basemap/17/0/0", 400, "ValidationException"),
+        ("/v2/tiles/vector.basemap/18/0/0", 400, "ValidationException"),
         ("/v2/tiles/raster.dem/15/0/0", 400, "ValidationException"),
         ("/v2/tiles/vector.basemap/abc/0/0", 400, "ValidationException"),
         ("/v2/tiles/vector.basemap/3/-1/0", 400, "ValidationException"),
@@ -868,7 +887,7 @@ async fn tile_addresses_outside_the_catalog_are_refused() {
     // The zoom just inside each tileset's range is served, which is what makes
     // the refusals above about the range and not about the route.
     for (path, _, _) in [
-        ("/v2/tiles/vector.basemap/16/0/0", 0, ""),
+        ("/v2/tiles/vector.basemap/17/0/0", 0, ""),
         ("/v2/tiles/raster.dem/14/0/0", 0, ""),
         ("/v2/tiles/raster.satellite/19/0/0", 0, ""),
     ] {

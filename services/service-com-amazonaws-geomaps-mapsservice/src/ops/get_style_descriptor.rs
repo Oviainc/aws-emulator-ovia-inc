@@ -299,23 +299,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The endpoint prefix to put in front of the document's templates, so a client
-/// can follow them without knowing where the emulator is listening.
+/// that does not resolve a relative URL against the endpoint it called can
+/// still follow them.
 ///
-/// Taken from the request's own `Host`, which is how the caller addressed this
-/// emulator. The SCHEME is only ever one the request itself states — on the URI
-/// or in `x-forwarded-proto` — because guessing it is worse than omitting it: a
-/// client reached over plain http would be handed `https://` templates it
-/// cannot fetch. With no scheme to go on, the templates stay root-relative
-/// paths, which a client resolves against the endpoint it already called; the
-/// same happens when there is no usable host.
+/// The HOST is the one the caller addressed this emulator with, taken from the
+/// request's URI or its `Host` header. The SCHEME is the one the request itself
+/// states — on the URI or in `x-forwarded-proto` — and `https` when it states
+/// neither, because this emulator's API listener terminates TLS, so a request
+/// that reached a handler without saying how it arrived arrived over TLS. With
+/// no usable host there is nothing to root a URL at, so the templates stay
+/// root-relative paths, which a client resolves against the endpoint it called.
 ///
 /// Both values are client-controlled, so each is accepted only in the shape it
 /// must have: the characters a host and port are written with, no longer than
-/// the DNS limit plus a port, and a scheme of `http` or `https`. Anything else
-/// falls back to the relative form rather than being pasted into the document.
+/// the DNS limit plus a port, and a scheme of `http` or `https`. A scheme in
+/// any other shape is not pasted into the document; the default stands in.
 fn request_endpoint(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option<String> {
     /// The longest a fully qualified domain name can be, plus room for `:port`.
     const MAX_HOST_LEN: usize = 253 + 6;
+    /// The scheme a request that states none arrived over.
+    const DEFAULT_SCHEME: &str = "https";
 
     let parts = ctx.parts();
     let host = parts
@@ -347,6 +350,7 @@ fn request_endpoint(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_ascii_lowercase)
         })
-        .filter(|scheme| matches!(scheme.as_str(), "http" | "https"))?;
+        .filter(|scheme| matches!(scheme.as_str(), "http" | "https"))
+        .unwrap_or_else(|| DEFAULT_SCHEME.to_string());
     Some(format!("{scheme}://{host}"))
 }

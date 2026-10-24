@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::administrator_gated_operations::associate_admin;
-use crate::policy_lifecycle::{call, emulator, error_code};
+use crate::policy_lifecycle::{call, emulator, emulator_with_administrator, error_code};
 
 /// The `ResourceType` value that says "the scope is the resource types in
 /// `ResourceTypeList`", per `Policy$ResourceType`: "To apply this policy to
@@ -258,7 +258,7 @@ async fn every_resource_type_the_model_lists_for_a_policy_type_is_accepted() {
         }
     }
 
-    let router = emulator();
+    let router = emulator_with_administrator().await;
     for row in TYPE_CASES {
         for resource_type in row.valid {
             let case = format!("{}/{resource_type}", row.security_service_type);
@@ -336,7 +336,7 @@ async fn every_resource_type_the_model_lists_for_a_policy_type_is_accepted() {
 /// `ResourceType` or one entry of a `ResourceTypeList` — and nothing is stored.
 #[tokio::test]
 async fn a_resource_type_the_policy_type_does_not_allow_is_refused_and_stores_nothing() {
-    let router = emulator();
+    let router = emulator_with_administrator().await;
     for row in TYPE_CASES {
         for resource_type in row.invalid {
             let case = format!("{}/{resource_type}", row.security_service_type);
@@ -404,7 +404,7 @@ async fn a_resource_type_the_policy_type_does_not_allow_is_refused_and_stores_no
 /// type, constrained or not.
 #[tokio::test]
 async fn the_resource_type_list_sentinel_needs_a_resource_type_list_behind_it() {
-    let router = emulator();
+    let router = emulator_with_administrator().await;
     let policy_types = TYPE_CASES
         .iter()
         .map(|row| row.security_service_type)
@@ -658,7 +658,7 @@ async fn include_map_and_exclude_map_cannot_both_scope_one_policy() {
         ),
     ];
 
-    let router = emulator();
+    let router = emulator_with_administrator().await;
     for (case, include, exclude) in &accepted {
         let mut document = policy_document(
             "one-scope-map",
@@ -723,7 +723,7 @@ async fn include_map_and_exclude_map_cannot_both_scope_one_policy() {
 /// the refusal still works afterwards.
 #[tokio::test]
 async fn a_refused_update_leaves_the_stored_policy_exactly_as_it_was() {
-    let router = emulator();
+    let router = emulator_with_administrator().await;
     let (status, created) = call(
         &router,
         "PutPolicy",

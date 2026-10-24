@@ -49,6 +49,13 @@ const OTHER_UNKNOWN_LIST_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 /// matching `^[a-z0-9A-Z]{22}$`) that names no resource set.
 const UNKNOWN_RESOURCE_SET_ID: &str = "0123456789AbCdEfGhIjKl";
 
+/// A `PolicyId` (the model's `com.amazonaws.fms#PolicyId`: 36 characters
+/// matching `^[a-z0-9A-Z-]{36}$`) that names no policy.
+const UNKNOWN_POLICY_ID: &str = "109c24c6-0d5e-407e-98b5-8619b6cf4907";
+
+/// A second well-formed `PolicyId` that names no policy.
+const OTHER_UNKNOWN_POLICY_ID: &str = "7b1f0e52-3c44-4a90-8d61-0ac5e9f2b8d3";
+
 /// The `message` member of an awsJson1_1 error envelope, under either casing: the
 /// modelled error shapes of this service spell it `Message`, the synthetic
 /// authorization refusal `message`.
@@ -276,6 +283,47 @@ fn gated_calls() -> Vec<Gated> {
             operation: "ListResourceSets",
             body: json!({ "MaxResults": 5 }),
         },
+        // The policy operations: a create (no `PolicyId`), an update of an id
+        // that names nothing, the two id-keyed ones, and the unbounded list.
+        Gated {
+            operation: "PutPolicy",
+            body: json!({
+                "Policy": {
+                    "PolicyName": "gated",
+                    "SecurityServicePolicyData": { "Type": "WAFV2" },
+                    "ResourceType": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+                    "ExcludeResourceTags": false,
+                    "RemediationEnabled": false,
+                },
+                "TagList": [{ "Key": "gated", "Value": "yes" }],
+            }),
+        },
+        Gated {
+            operation: "PutPolicy",
+            body: json!({
+                "Policy": {
+                    "PolicyId": UNKNOWN_POLICY_ID,
+                    "PolicyUpdateToken": "not-a-token-this-service-minted",
+                    "PolicyName": "gated-update",
+                    "SecurityServicePolicyData": { "Type": "WAFV2" },
+                    "ResourceType": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+                    "ExcludeResourceTags": false,
+                    "RemediationEnabled": false,
+                },
+            }),
+        },
+        Gated {
+            operation: "GetPolicy",
+            body: json!({ "PolicyId": UNKNOWN_POLICY_ID }),
+        },
+        Gated {
+            operation: "DeletePolicy",
+            body: json!({ "PolicyId": OTHER_UNKNOWN_POLICY_ID, "DeleteAllPolicyResources": true }),
+        },
+        Gated {
+            operation: "ListPolicies",
+            body: json!({}),
+        },
     ]
 }
 
@@ -366,6 +414,7 @@ async fn a_refused_gated_call_leaves_no_state_behind() {
             store.resource_sets.is_empty()
                 && store.apps_lists.is_empty()
                 && store.protocols_lists.is_empty()
+                && store.policies.is_empty()
                 && store.notification_channel.is_none()
                 && store.third_party_firewalls.is_empty(),
             "a refused gated call must write nothing, store holds {store:?}"

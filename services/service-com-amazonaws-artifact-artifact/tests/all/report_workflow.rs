@@ -13,9 +13,9 @@
 //! * a paginated report operation cuts a page at `maxResults`, hands back a `nextToken`
 //!   exactly when items remain, and resumes where the previous page ended — so walking
 //!   the pages at ANY admissible page size enumerates the whole collection once;
-//! * a report document is served only under a term grant this service issued for that
-//!   same report version, so a token nobody was given, or one accepted for another
-//!   version, yields a modelled failure rather than a URL.
+//! * a report document is served only under a term grant this service issued for the
+//!   TERM governing that report, so a token nobody was given, or one accepted under
+//!   another term, yields a modelled failure rather than a URL.
 
 use std::collections::BTreeSet;
 
@@ -638,36 +638,54 @@ async fn a_report_downloads_only_under_a_term_grant_issued_for_it() {
         );
     }
 
-    // A token issued for a DIFFERENT report version does not authorise this one.
+    // A grant covers the TERM it was accepted under, and one term document governs
+    // every version of its report: so a token minted through ANY version of a report
+    // downloads ALL of them, and downloads no other report in the catalog — each of
+    // which is governed by its own term document.
     for (report_id, version, token) in &issued {
-        let Some((other_id, other_version, _)) = issued
+        let expected = CATALOG
             .iter()
-            .find(|(id, other, _)| id != report_id || other != version)
-        else {
-            continue;
-        };
-        let case = format!("{token} accepted for {report_id} v{version}");
-        let refused = get_report(
-            &router,
-            &format!("?reportId={other_id}&reportVersion={other_version}&termToken={token}"),
-        )
-        .await;
-        assert_eq!(
-            refused.status, 409,
-            "case {case:?}: must not authorise {other_id} v{other_version}, got {} with {:?}",
-            refused.status, refused.body
-        );
-        assert_eq!(
-            refused.error_code(),
-            "ConflictException",
-            "case {case:?}: expected ConflictException, got {:?}",
-            refused.body
-        );
-        assert!(
-            refused.body["documentPresignedUrl"].is_null(),
-            "case {case:?}: a refused request must carry no document URL, got {:?}",
-            refused.body
-        );
+            .find(|row| row.id == report_id)
+            .expect("every issued grant names a catalog report");
+        for other_version in expected.versions {
+            let case = format!("{report_id} v{other_version} under the grant for v{version}");
+            let served = get_report(
+                &router,
+                &format!("?reportId={report_id}&reportVersion={other_version}&termToken={token}"),
+            )
+            .await;
+            assert_eq!(
+                served.status, 200,
+                "case {case:?}: one term document governs every version of a report, got {} \
+                 with {:?}",
+                served.status, served.body
+            );
+        }
+        for other in CATALOG.iter().filter(|row| row.id != report_id) {
+            let case = format!("{} under the grant for {report_id} v{version}", other.id);
+            let refused = get_report(
+                &router,
+                &format!("?reportId={}&termToken={token}", other.id),
+            )
+            .await;
+            assert_eq!(
+                refused.status, 400,
+                "case {case:?}: a grant under another term must not authorise it, got {} \
+                 with {:?}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error_code(),
+                "ValidationException",
+                "case {case:?}: expected ValidationException, got {:?}",
+                refused.body
+            );
+            assert!(
+                refused.body["documentPresignedUrl"].is_null(),
+                "case {case:?}: a refused request must carry no document URL, got {:?}",
+                refused.body
+            );
+        }
     }
 
     // Reading a report does not consume its grant: the first token still downloads.
@@ -741,7 +759,7 @@ async fn a_report_id_naming_nothing_is_unauthorized_on_every_report_operation() 
 }
 
 #[tokio::test]
-async fn a_malformed_report_id_or_version_is_refused_before_the_catalog_is_consulted() {
+async fn a_report_id_or_version_outside_its_constraint_is_refused_before_the_catalog() {
     let router = emulator();
     // Each row breaks ONE modelled constraint: the id pattern (prefix, length, alphabet)
     // or `reportVersion`'s `@range(min: 1)`. The two are refused by different layers,
@@ -790,7 +808,10 @@ async fn a_malformed_report_id_or_version_is_refused_before_the_catalog_is_consu
     ];
     for (case, query, status, code) in cases {
         for (operation, answer) in [
-            ("GetReportMetadata", get_report_metadata(&router, &query).await),
+            (
+                "GetReportMetadata",
+                get_report_metadata(&router, &query).await,
+            ),
             ("GetTermForReport", get_term_for_report(&router, &query).await),
         ] {
             assert_eq!(

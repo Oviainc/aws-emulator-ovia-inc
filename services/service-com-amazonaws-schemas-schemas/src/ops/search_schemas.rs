@@ -7,15 +7,22 @@
 //!
 //! ## What a keyword matches
 //!
-//! A keyword search is a search of the schema REGISTRY's index, not a grep of the
-//! stored documents: what a schema is indexed under is the event it describes — the
-//! event `source` and `detail-type` the schema document declares, which an EventBridge
-//! schema records in the `x-amazon-events-source` / `x-amazon-events-detail-type`
-//! extensions of its root component (every schema AWS publishes in `aws.events`
-//! carries both; see [`crate::state::aws_managed_schemas`]). A schema that declares
-//! neither — a document a caller wrote by hand and created in a registry of their own —
-//! is indexed under nothing, so no keyword selects it, and neither the schema's name
-//! nor the rest of its document text is searched.
+//! `Keywords` LIMITS the registry's schemas — "specifying this limits the results to
+//! only schemas that include the provided keywords" — so the base set a search reports
+//! is every schema of the named registry, and each keyword only narrows it. What a
+//! schema is indexed under is its own identity plus the event it describes: its NAME
+//! (the identifier every other operation of this service takes, and what a caller
+//! searches by) together with the event `source` and `detail-type` its document
+//! declares, which an EventBridge schema records in the `x-amazon-events-source` /
+//! `x-amazon-events-detail-type` extensions of its event component (every schema AWS
+//! publishes in `aws.events` carries both; see [`crate::state::aws_managed_schemas`]).
+//! A schema that declares no event — a document a caller wrote by hand and created in a
+//! registry of their own — is still indexed under its name, so a keyword of that name
+//! selects it. The rest of the document text is NOT searched: a search is a search of
+//! the registry's index, not a grep of the stored documents.
+//!
+//! A `Keywords` value that carries no keyword at all limits nothing, so the search
+//! reports the whole registry.
 //!
 //! ## Shape of an operation
 //!
@@ -282,20 +289,35 @@ fn keywords_of(raw: &str) -> Vec<String> {
 
 /// Whether `keywords` match a schema.
 ///
-/// A schema is selected when EVERY requested keyword occurs in one of the event
-/// keywords the schema declares ([`declared_event_keywords`]), matched
-/// case-insensitively as a substring — a search is not a lookup by exact value, and
-/// adding a keyword only ever narrows the result. A schema that declares no event
-/// keyword at all is indexed under nothing, so a search never selects it, whatever (or
-/// nothing) the request asks for.
+/// A schema is selected when EVERY requested keyword occurs in one of the values the
+/// schema is indexed under ([`indexed_values`]), matched case-insensitively as a
+/// substring — a search is not a lookup by exact value, and adding a keyword only ever
+/// narrows the result. A request that names NO keyword limits nothing, so it selects
+/// every schema, which is also what folding over an empty keyword list says.
 fn matches_every_keyword(schema: &crate::state::Schema, keywords: &[String]) -> bool {
-    let declared = declared_event_keywords(schema);
-    if declared.is_empty() {
-        return false;
+    // Answering "no keyword narrows nothing" before the index is built keeps an
+    // unlimited search from parsing any stored document.
+    if keywords.is_empty() {
+        return true;
     }
+    let indexed = indexed_values(schema);
     keywords
         .iter()
-        .all(|keyword| declared.iter().any(|value| value.contains(keyword.as_str())))
+        .all(|keyword| indexed.iter().any(|value| value.contains(keyword.as_str())))
+}
+
+/// The values a schema is indexed under, folded to lower case: its NAME, and the event
+/// keywords its document declares ([`declared_event_keywords`]).
+///
+/// The name comes first because it is the only value EVERY schema has — a document a
+/// caller wrote by hand declares no event, and a search by the name the schema was
+/// created under must still find it. Built ONCE per schema per search rather than once
+/// per keyword at the match.
+fn indexed_values(schema: &crate::state::Schema) -> Vec<String> {
+    let mut indexed = Vec::with_capacity(1 + 2 * schema.versions.len());
+    indexed.push(schema.name.to_lowercase());
+    indexed.extend(declared_event_keywords(schema));
+    indexed
 }
 
 /// The event keywords a schema declares, folded to lower case: the event `source` and
@@ -381,8 +403,8 @@ mod tests {
     }
 
     /// Every schema AWS publishes declares the event it describes, so a search of the
-    /// published registry has something to select on — and what it declares is the
-    /// event's source and detail type, not the schema's own name.
+    /// published registry selects on more than the names: what a document DECLARES is
+    /// the event's source and detail type, and the name is indexed beside them.
     #[test]
     fn a_published_schema_declares_the_event_it_describes() {
         let state = crate::state::ComAmazonawsSchemasSchemasState::default();
@@ -407,8 +429,15 @@ mod tests {
             );
             assert!(
                 declared.iter().all(|value| value != schema_name),
-                "case {schema_name:?}: the schema's name is not what it is indexed \
-                 under, got {declared:?}"
+                "case {schema_name:?}: a declared event keyword is the event's, not the \
+                 schema's name, got {declared:?}"
+            );
+            // The name is indexed too, as a value of its own beside the declared ones.
+            assert_eq!(
+                indexed_values(schema).first().map(String::as_str),
+                Some(schema_name.to_lowercase().as_str()),
+                "case {schema_name:?}: a schema is indexed under its name, got {:?}",
+                indexed_values(schema)
             );
             // Every published source is under the `aws.` prefix, so this one keyword
             // selects each of them.
@@ -417,9 +446,21 @@ mod tests {
                 "case {schema_name:?}: a keyword of its source must select it, \
                  declared {declared:?}"
             );
+            // And so does the name it is published under: the identifier a caller
+            // holding it searches by.
+            assert!(
+                matches_every_keyword(schema, &keywords_of(schema_name)),
+                "case {schema_name:?}: its own name must select it, indexed under {:?}",
+                indexed_values(schema)
+            );
             assert!(
                 !matches_every_keyword(schema, &keywords_of("no-event-says-this")),
                 "case {schema_name:?}: a keyword nothing declares must not select it"
+            );
+            // A value carrying no keyword limits nothing, so it selects every schema.
+            assert!(
+                matches_every_keyword(schema, &keywords_of(" , ")),
+                "case {schema_name:?}: a value carrying no keyword must limit nothing"
             );
         }
     }
