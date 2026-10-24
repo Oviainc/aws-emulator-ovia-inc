@@ -1303,6 +1303,7 @@ async fn the_request_store_is_bounded_and_refuses_past_its_ceiling() {
                 100.0 + index as f64,
                 state::SUPPORT_CASE_ALLOWED_BY_DEFAULT,
                 requester.clone(),
+                None,
                 std::time::SystemTime::now(),
             );
             assert!(
@@ -1319,6 +1320,7 @@ async fn the_request_store_is_bounded_and_refuses_past_its_ceiling() {
                     99_999.0,
                     state::SUPPORT_CASE_ALLOWED_BY_DEFAULT,
                     requester.clone(),
+                    None,
                     std::time::SystemTime::now(),
                 )
                 .is_none(),
