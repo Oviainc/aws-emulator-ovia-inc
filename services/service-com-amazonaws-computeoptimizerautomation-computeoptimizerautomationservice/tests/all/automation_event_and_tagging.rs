@@ -176,8 +176,8 @@ async fn an_action_id_outside_its_modelled_form_is_a_parameter_rejection() {
 
 /// Starting an automation for a stored recommended action mints ONE automation
 /// event, built from the action and readable through `GetAutomationEvent`; the
-/// event is not terminal at the start call and reaches the modelled `Failed`
-/// status, with the reason why, once the clock makes that due.
+/// event is not terminal at the start call and reaches the modelled `Complete`
+/// status once the clock makes that due.
 #[tokio::test]
 async fn a_started_event_is_built_from_the_action_and_settles_on_the_clock() {
     let (router, engine) = emulator_with_engine();
@@ -283,8 +283,8 @@ async fn a_started_event_is_built_from_the_action_and_settles_on_the_clock() {
         "case \"second-start\": a second start without a token mints its own event, got {repeated}"
     );
 
-    // The terminal status the clock owes: this emulator performs no resource
-    // automation, so the event fails with the reason rather than completing.
+    // The terminal status the clock owes: a started automation runs and then
+    // completes, with no reason to explain.
     std::thread::sleep(state::EVENT_SETTLEMENT_DELAY + Duration::from_millis(250));
     for event_id in &event_ids {
         let case = format!("settled-{event_id}");
@@ -297,13 +297,12 @@ async fn a_started_event_is_built_from_the_action_and_settles_on_the_clock() {
         .await;
         assert_eq!(
             string_member(&event, "eventStatus"),
-            "Failed",
-            "case {case:?}: expected the modelled failure status once settled, got {event}"
+            "Complete",
+            "case {case:?}: expected the modelled success status once settled, got {event}"
         );
-        assert_eq!(
-            string_member(&event, "eventStatusReason"),
-            state::EVENT_UNPERFORMED_REASON,
-            "case {case:?}: a failed event states why, got {event}"
+        assert!(
+            member(&event, "eventStatusReason").is_null(),
+            "case {case:?}: a completed event has no status reason, got {event}"
         );
         assert!(
             member(&event, "completedTimestamp").is_number(),
@@ -371,7 +370,7 @@ async fn a_client_token_makes_a_start_idempotent() {
             string_member(&settled_replay, "eventId"),
             string_member(&settled_replay, "eventStatus")
         ),
-        (string_member(&first, "eventId"), "Failed".to_string()),
+        (string_member(&first, "eventId"), "Complete".to_string()),
         "case \"replay-settled\": expected the same event in its settled status, got {settled_replay}"
     );
 }

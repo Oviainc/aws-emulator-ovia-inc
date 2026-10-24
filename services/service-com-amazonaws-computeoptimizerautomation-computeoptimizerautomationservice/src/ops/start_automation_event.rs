@@ -5,9 +5,9 @@
 //! IMPLEMENTED. Resolves `recommendedActionId` against the recommended actions
 //! this service holds: an id no action has is `ResourceNotFoundException` (404),
 //! and an action that is there mints one automation event, stored and reported
-//! from the store. The automation itself is not performed by this emulator, so
-//! the event the clock settles reaches the modelled `Failed` status carrying the
-//! reason why — see `crate::state::EVENT_UNPERFORMED_REASON`.
+//! from the store. The event the start call answers with is not terminal, and
+//! the clock settles it to the modelled `Complete` status once its run window
+//! has passed — see `crate::state::StoredEvent::settle`.
 //!
 //! ## Shape of an operation
 //!

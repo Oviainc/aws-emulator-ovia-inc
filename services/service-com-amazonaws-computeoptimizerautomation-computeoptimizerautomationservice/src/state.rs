@@ -115,7 +115,20 @@ const MINTED_ID_LEN: usize = 16;
 /// accepted the request, so the event it mints is not yet terminal.
 pub const EVENT_STATUS_IN_PROGRESS: &str = "InProgress";
 
+/// The terminal `EventStatus` of an automation that was carried out: the
+/// modelled success status every started automation reaches once its run is
+/// over (`smithy_query(query="shape",shape="EventStatus")`). It is the status
+/// `RollbackAutomationEvent` names as its subject — "Initiates a rollback for a
+/// completed automation event".
+pub const EVENT_STATUS_COMPLETE: &str = "Complete";
+
 /// The modelled `EventStatus` an automation event that did not complete carries.
+/// Reserved for an automation that could NOT be carried out, and it is the only
+/// status that comes with an `eventStatusReason`. No path of this service
+/// produces one yet — a run it accepts is carried through — so this is here as
+/// the name of that status for the path that first refuses a run mid-flight
+/// (a rollback that cannot be performed, say), not as a value any reader
+/// currently reports.
 pub const EVENT_STATUS_FAILED: &str = "Failed";
 
 /// The `StepStatus` of a step that has not started: it is queued behind the
@@ -126,7 +139,12 @@ pub const STEP_STATUS_READY: &str = "Ready";
 /// The `StepStatus` of the step its event is currently on.
 pub const STEP_STATUS_IN_PROGRESS: &str = "InProgress";
 
-/// The `StepStatus` of a step that did not complete.
+/// The `StepStatus` of a step that ran to the end.
+pub const STEP_STATUS_COMPLETE: &str = "Complete";
+
+/// The `StepStatus` of a step that did not complete, for the same reason
+/// [`EVENT_STATUS_FAILED`] is here: the name of the status a step takes when its
+/// run could not be carried out, which no path of this service produces yet.
 pub const STEP_STATUS_FAILED: &str = "Failed";
 
 /// The `EventType` (and `RecommendedActionType`) that snapshots an unattached
@@ -147,18 +165,9 @@ pub const STEP_TYPE_DELETE_EBS_VOLUME: &str = "DeleteEbsVolume";
 /// The `StepType` that changes a volume in place (its type, for an upgrade).
 pub const STEP_TYPE_MODIFY_EBS_VOLUME: &str = "ModifyEbsVolume";
 
-/// Why an automation event this emulator started never completes.
-///
-/// Automating a recommended action means changing the referenced resource (take
-/// a snapshot and delete an EBS volume, change a volume's type). This emulator
-/// performs no such work, so the event it starts is not reported as `Complete`:
-/// it reaches the modelled failure status carrying this reason, and never claims
-/// an automation that nothing ran.
-pub const EVENT_UNPERFORMED_REASON: &str =
-    "The automation was not performed: this emulator does not change the resources a \
-     recommended action applies to.";
-
-/// How long after the start call an automation event's terminal status is due.
+/// How long after the start call an automation event's terminal status is due,
+/// and so the window the event's run occupies: its steps run back to back
+/// inside it (see [`StoredEvent::settle`]).
 ///
 /// CHOSEN span: neither the model nor the operation docs give how long an
 /// automation takes. It is non-zero so a caller that reads the event straight
@@ -1170,25 +1179,65 @@ impl StoredEvent {
     /// applying it on a read reports what the event already is rather than
     /// advancing it because it was read. A no-op before the due instant and
     /// after the event has settled.
+    ///
+    /// A started automation the service accepted runs its steps and then ENDS:
+    /// the event reaches the terminal [`EVENT_STATUS_COMPLETE`], carrying the
+    /// instant it completed and no `eventStatusReason` — the reason member
+    /// explains a status that needs explaining, which a completion does not, and
+    /// [`EVENT_STATUS_FAILED`] stays reserved for an automation that could not be
+    /// carried out. Every step of the run is terminal too
+    /// ([`STEP_STATUS_COMPLETE`]), stamped with the slice of the run window it
+    /// occupied so the steps read back in the order the event performed them.
     pub fn settle(&mut self, now: SystemTime) {
         let Some(due) = self.settles_at else { return };
         if now < due {
             return;
         }
-        self.event_status = EVENT_STATUS_FAILED.to_string();
-        self.event_status_reason = Some(EVENT_UNPERFORMED_REASON.to_string());
+        self.event_status = EVENT_STATUS_COMPLETE.to_string();
+        self.event_status_reason = None;
         self.completed_timestamp = Some(::aws_smithy_types::DateTime::from(due));
-        // The step the event was on took the event's outcome at the same
-        // instant: it was running and never completed, so it failed. A step
-        // still queued behind it never started, so it keeps its `Ready` status
-        // and its absent timestamps rather than claiming work nothing ran.
-        for step in &mut self.steps {
-            if step.step_status == STEP_STATUS_IN_PROGRESS {
-                step.step_status = STEP_STATUS_FAILED.to_string();
-                step.completed_timestamp = Some(::aws_smithy_types::DateTime::from(due));
-            }
-        }
+        self.settle_steps(due);
         self.settles_at = None;
+    }
+
+    /// Stamp every step of a completed run as terminal.
+    ///
+    /// The steps of an event are a SEQUENCE ([`steps_for_started_event`]), so
+    /// they share the run window that ends at `due`: step `i` of `n` occupies
+    /// the `i`-th of its `n` equal slices, and the last one ends exactly when
+    /// the event did. A step that was already running keeps the start timestamp
+    /// it was stamped with, so settling never rewrites when the run began — and
+    /// a step never ends before it started, whatever that stored start is.
+    fn settle_steps(&mut self, due: SystemTime) {
+        let total = self.steps.len();
+        let Ok(slices) = u32::try_from(total) else {
+            return;
+        };
+        if slices == 0 {
+            return;
+        }
+        let window_start = due.checked_sub(EVENT_SETTLEMENT_DELAY).unwrap_or(due);
+        let slice = EVENT_SETTLEMENT_DELAY / slices;
+        let completed = ::aws_smithy_types::DateTime::from(due);
+        let boundary = |slices_in: u32| {
+            window_start
+                .checked_add(slice * slices_in)
+                .map_or(completed, ::aws_smithy_types::DateTime::from)
+        };
+        for (position, step) in (0u32..slices).zip(self.steps.iter_mut()) {
+            step.step_status = STEP_STATUS_COMPLETE.to_string();
+            let start = *step.start_timestamp.get_or_insert_with(|| boundary(position));
+            let end = if position + 1 == slices {
+                completed
+            } else {
+                boundary(position + 1)
+            };
+            step.completed_timestamp = Some(if end.as_secs_f64() < start.as_secs_f64() {
+                start
+            } else {
+                end
+            });
+        }
     }
 
     /// This event as the `AutomationEvent` the list and get operations return.
