@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateFirewallPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateFirewallPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateFirewallPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: re-points the stored `FirewallRecord` at the firewall policy the
+//! request names, re-minting the firewall's `UpdateToken` and moving the
+//! `NumberOfAssociations` count from the policy it used onto the new one when the
+//! association changed — so a following `DescribeFirewall` reports the new
+//! `FirewallPolicyArn`. A stale `UpdateToken` is refused with
+//! `InvalidTokenException`, a firewall carrying `FirewallPolicyChangeProtection`
+//! with `InvalidOperationException`, and an ARN no stored policy carries with
+//! `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -186,20 +185,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateFirewallPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateFirewallPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateFirewallPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AssociateFirewallPolicyErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the firewall store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // "You must specify the ARN or the name, and you can specify both"
+        // (`FirewallArn` / `FirewallName`), so the firewall this call changes is
+        // identified exactly the way every other firewall operation identifies
+        // one.
+        let key = state
+            .resolve_firewall(input.firewall_name.as_deref(), input.firewall_arn.as_deref())
+            .map_err(associate_lookup_error)?;
+
+        let now = ::std::time::SystemTime::now();
+        let previous_policy_arn = {
+            let Some(record) = state.firewalls.get_mut(&key) else {
+                return Err(AssociateFirewallPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            };
+            // The `PROVISIONING` -> `READY` move the clock owed at `ready_at()`
+            // is materialised here too, so this call leaves no status a reader
+            // would already have seen moved on.
+            record.settle(now);
+
+            // `UpdateToken` is the resource's optimistic lock: when the caller
+            // sends one it must be the token the firewall currently carries, so a
+            // caller that read the firewall before someone else changed it is
+            // refused rather than overwriting that change.
+            if input
+                .update_token
+                .as_ref()
+                .is_some_and(|token| token != &record.update_token)
+            {
+                return Err(AssociateFirewallPolicyErrorModeled::InvalidTokenException(
+                    InvalidTokenException {
+                        message: Some(crate::state::INVALID_TOKEN_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            if record.firewall_policy_change_protection {
+                return Err(
+                    AssociateFirewallPolicyErrorModeled::InvalidOperationException(
+                        InvalidOperationException {
+                            message: Some(
+                                crate::state::FIREWALL_POLICY_CHANGE_PROTECTED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            record.firewall_policy_arn.clone()
+        };
+
+        // The policy must already exist: `FirewallPolicyArn` is a reference to
+        // another resource, and the model classes "references an ARN that ...
+        // corresponds to a resource that isn't valid in the context of the
+        // request" as `InvalidRequestException` — the same refusal
+        // `CreateFirewall` answers an unknown policy reference with. It is
+        // resolved in the critical section the association is written in, so the
+        // reference cannot go stale between the two.
+        let Some(policy_name) = state
+            .firewall_policy_arn_index
+            .get(&input.firewall_policy_arn)
+            .cloned()
+        else {
+            return Err(AssociateFirewallPolicyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::missing_arn_message(
+                        crate::state::KIND_FIREWALL_POLICY,
+                        &input.firewall_policy_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let changed = previous_policy_arn != input.firewall_policy_arn;
+        let output = {
+            let record = state
+                .firewalls
+                .get_mut(&key)
+                .expect("the firewall resolved above is still stored under its key");
+            if changed {
+                record.firewall_policy_arn = input.firewall_policy_arn.clone();
+                // The token "marks the state of the firewall resource at the time
+                // of the request", so it is re-minted exactly when this call moved
+                // that state: a request naming the policy the firewall already
+                // uses associates nothing new and leaves the resource — its token
+                // included — as it was.
+                record.update_token = crate::state::new_uuid();
+            }
+            AssociateFirewallPolicyOutput {
+                firewall_arn: Some(record.firewall_arn.clone()),
+                firewall_name: Some(record.firewall_name.clone()),
+                firewall_policy_arn: Some(record.firewall_policy_arn.clone()),
+                update_token: Some(record.update_token.clone()),
+            }
+        };
+
+        // "Each firewall requires one firewall policy association", so a firewall
+        // that moves to another policy stops using the one it had, and
+        // `NumberOfAssociations` — how many firewalls use a policy — moves with
+        // the association.
+        if changed {
+            if let Some(policy) = state.firewall_policies.get_mut(&policy_name) {
+                policy.number_of_associations += 1;
+            }
+            if let Some(previous_name) = state
+                .firewall_policy_arn_index
+                .get(&previous_policy_arn)
+                .cloned()
+            {
+                if let Some(previous) = state.firewall_policies.get_mut(&previous_name) {
+                    previous.number_of_associations =
+                        previous.number_of_associations.saturating_sub(1);
+                }
+            }
+        }
+
+        Ok(output)
     }
 }
+
+crate::state::impl_resolve_error!(
+    associate_lookup_error -> AssociateFirewallPolicyError, AssociateFirewallPolicyErrorModeled,
+    plural = "firewalls",
+    name_member = "FirewallName", arn_member = "FirewallArn"
+);
