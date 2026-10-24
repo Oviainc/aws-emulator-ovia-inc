@@ -21,6 +21,8 @@ mod domain_subscription_lifecycle;
 mod error_detail_member;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/patient_insights_job_lifecycle.rs"]
+mod patient_insights_job_lifecycle;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

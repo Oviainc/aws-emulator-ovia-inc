@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartPatientInsightsJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartPatientInsightsJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartPatientInsightsJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +80,33 @@
 //!   allowed request rate.
 //! * `ValidationException` (HTTP 400) — This error is thrown when the client supplies invalid
 //!   input to the API.
+//!
+//! ---
+//!
+//! # How this operation behaves
+//!
+//! "Starts a new patient insights job": a MUTATION. It mints the job's id and ARN,
+//! persists every parameter the request carried on a [`crate::state::PatientInsightsJob`]
+//! under the domain it names, and reports the identifiers and creation instant back out
+//! of the stored record. `GetPatientInsightsJob` reads the same record.
+//!
+//! The job is born in the non-terminal `SUBMITTED` status and the clock owes it the
+//! transitions from there (`crate::state::PATIENT_INSIGHTS_JOB_STEP_SPAN`), so a caller
+//! reading straight after this call still sees `SUBMITTED`.
+//!
+//! The RUN itself does not happen: generating clinical insights from patient data is an
+//! inference workload this emulator has no engine for, so the job ends in the service's
+//! own modelled failure status with a `statusDetails` that says exactly that
+//! (`crate::state::PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE`) and never carries an
+//! `insightsOutput` — nothing is synthesised to look computed. Everything around it
+//! stays real: the record, the identifiers, the timestamps, the status transitions and
+//! the idempotency of `clientToken`.
+//!
+//! `clientToken` is an `@idempotencyToken`: a retry carrying a token this domain has
+//! already bound to a job answers with THAT job rather than starting a second one, and
+//! the same token presented with different job parameters is the modelled
+//! `ConflictException`. A `domainId` that names no live domain is the modelled
+//! `ResourceNotFoundException`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -166,18 +184,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartPatientInsightsJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartPatientInsightsJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartPatientInsightsJob"))
+        // The store is unreachable only when this service was mounted on a foreign
+        // engine. This operation models `InternalServerException`, so that is the
+        // channel for a server-side failure.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StartPatientInsightsJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "StartPatientInsightsJob could not reach this service's store"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // What the CLOCK already made due, before anything is resolved or written: a
+        // domain whose DELETING span has elapsed is purged, and every job whose next
+        // status transition has fallen due is moved on.
+        store.purge_due_deletions(now);
+        store.advance_due_patient_insights_jobs(now);
+
+        // A job can only be started in a domain that is live: one already being deleted
+        // is on its way out, so it is reported as not found.
+        let Some(domain) = store.live_domain(&input.domain_id) else {
+            return Err(
+                StartPatientInsightsJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::service::error_detail::domain_not_found_message(
+                            &input.domain_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The parameters this request asks a job to run with, and their digest: what a
+        // repeated `clientToken` is compared against.
+        let spec = crate::state::PatientInsightsJobSpec {
+            patient_context: input.patient_context,
+            insights_context: input.insights_context,
+            encounter_context: input.encounter_context,
+            user_context: input.user_context,
+            input_data_config: input.input_data_config,
+            output_data_config: input.output_data_config,
+        };
+        let fingerprint = spec.fingerprint();
+
+        // `clientToken` is an `@idempotencyToken`: the token identifies the REQUEST, so
+        // a retry of the same request must not start a second job. A token this domain
+        // already bound to a job answers with that job; the same token presented with
+        // different parameters is a conflict, since the assumption the first call was
+        // made under no longer holds.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = domain
+                .patient_insights_job_ids_by_client_token
+                .get(token)
+                .and_then(|job_id| domain.patient_insights_jobs.get(job_id))
+            {
+                if existing.spec.fingerprint() != fingerprint {
+                    return Err(StartPatientInsightsJobErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(format!(
+                                "Idempotent parameter mismatch: clientToken {token} was already \
+                                 used to start job {} with different parameters",
+                                existing.job_id
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                // The idempotent replay: the job the first call created, read back out
+                // of the store.
+                return Ok(StartPatientInsightsJobOutput {
+                    job_arn: existing.arn.clone(),
+                    job_id: existing.job_id.clone(),
+                    creation_time: Some(crate::state::to_timestamp(existing.created_at)),
+                });
+            }
+        }
+
+        // Bound the store BEFORE minting, so a refused request advances nothing. This
+        // operation models no `ServiceQuotaExceededException`
+        // (`smithy_query(query="operation",operation="StartPatientInsightsJob")` lists
+        // AccessDenied / Conflict / InternalServer / ResourceNotFound / Throttling /
+        // Validation), so the refusal goes out as the modelled client-input error, with
+        // the count it names.
+        if domain.patient_insights_jobs.len() >= crate::state::MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN
+        {
+            return Err(StartPatientInsightsJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "domain {} already holds the maximum of {} patient insights jobs",
+                        input.domain_id,
+                        crate::state::MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let job_id = store.mint_patient_insights_job_id(&input.domain_id);
+        let Some(domain) = store.live_domain_mut(&input.domain_id) else {
+            return Err(
+                StartPatientInsightsJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::service::error_detail::domain_not_found_message(
+                            &input.domain_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let job = crate::state::PatientInsightsJob {
+            job_id: job_id.clone(),
+            domain_id: domain.domain_id.clone(),
+            arn: crate::state::patient_insights_job_arn(&domain.arn, &job_id),
+            // A started job has been accepted, not yet picked up: the clock owes it the
+            // move out of this status (see the module docs).
+            status: crate::state::JobStatus::Submitted,
+            // Nothing to report about a job that has only just been accepted.
+            status_details: None,
+            // No run has produced insights, so there is no output to point at.
+            insights_output: None,
+            created_at: now,
+            updated_at: now,
+            next_transition_at: Some(now + crate::state::PATIENT_INSIGHTS_JOB_STEP_SPAN),
+            spec,
+        };
+        if let Some(token) = input.client_token {
+            domain
+                .patient_insights_job_ids_by_client_token
+                .insert(token, job_id.clone());
+        }
+        // `or_insert` hands back the record it STORED, so every field rendered below is
+        // read out of the store rather than echoed from the request.
+        let stored = domain.patient_insights_jobs.entry(job_id).or_insert(job);
+        Ok(StartPatientInsightsJobOutput {
+            job_arn: stored.arn.clone(),
+            job_id: stored.job_id.clone(),
+            creation_time: Some(crate::state::to_timestamp(stored.created_at)),
+        })
     }
 }
