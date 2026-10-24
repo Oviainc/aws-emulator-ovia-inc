@@ -218,6 +218,28 @@ const AWS_MANAGED_POLICY_CREATE_DATE_SECS: i64 = 1_423_247_986;
 /// role's attachment set growing without end.
 pub const MAX_MANAGED_POLICIES_PER_ROLE: usize = 10;
 
+/// The scheme an OIDC provider's URL must carry.
+/// `CreateOpenIDConnectProvider$Url`'s documentation: "The URL must begin with
+/// https://".
+pub const OPEN_ID_CONNECT_URL_SCHEME: &str = "https://";
+
+/// How many client IDs one IAM OIDC provider may carry.
+/// `CreateOpenIDConnectProvider$ClientIDList`'s documentation: "You cannot register
+/// more than 100 client IDs with a single IAM OIDC provider."
+pub const MAX_CLIENT_IDS_PER_OPEN_ID_CONNECT_PROVIDER: usize = 100;
+
+/// How many certificate thumbprints one IAM OIDC provider may carry.
+/// `CreateOpenIDConnectProvider$ThumbprintList`'s documentation: "IAM lets you have
+/// up to five thumbprints for an OIDC provider."
+pub const MAX_THUMBPRINTS_PER_OPEN_ID_CONNECT_PROVIDER: usize = 5;
+
+/// How many OIDC providers one account may hold. AWS's "IAM and STS quotas" page
+/// gives the quota "OIDC identity providers in an account: 100", and a create past
+/// it is refused with `LimitExceededException`, whose documentation says "the error
+/// message describes the limit exceeded". It is also what stops the provider map
+/// growing without end.
+pub const MAX_OPEN_ID_CONNECT_PROVIDERS_PER_ACCOUNT: usize = 100;
+
 /// The tag-key prefix AWS reserves. "Tagging IAM resources" (IAM User Guide):
 /// "You cannot create tag keys that begin with `aws:` because this prefix is
 /// reserved for Amazon Web Services use."
@@ -492,6 +514,50 @@ pub struct AccessKeyRecord {
     pub create_date: ::aws_smithy_types::DateTime,
 }
 
+/// One IAM OpenID Connect (OIDC) identity provider the account holds, keyed in
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::open_id_connect_providers`]
+/// by its ARN — the handle every other operation on one takes
+/// (`GetOpenIDConnectProvider`, `DeleteOpenIDConnectProvider` and
+/// `AddClientIDToOpenIDConnectProvider` all name the provider by ARN, and
+/// `ListOpenIDConnectProviders` reports nothing else about it).
+///
+/// The ARN is DERIVED from the URL ([`open_id_connect_provider_arn`]), so keying by
+/// it is also what makes a provider's URL its identity: "you cannot register the same
+/// provider multiple times in a single Amazon Web Services account"
+/// (`CreateOpenIDConnectProvider$Url`).
+///
+/// No modelled shape carries a whole provider — `OpenIDConnectProviderListEntry`
+/// holds only the ARN (`smithy_query(query="shape",
+/// shape="OpenIDConnectProviderListEntry")`) — so the record holds the members
+/// `GetOpenIDConnectProvider` reports, and that read is what defines them.
+#[derive(Debug, Clone)]
+pub struct OpenIdConnectProviderRecord {
+    /// "The URL that the IAM OIDC provider resource object is associated with"
+    /// (`GetOpenIDConnectProvider$Url`), WITHOUT its scheme: the host-and-path form
+    /// the provider's ARN is built from, which is also the issuer form a client
+    /// compares an OIDC token's `iss` claim against.
+    pub url: String,
+    /// "A list of client IDs (also known as audiences) that are associated with the
+    /// specified IAM OIDC provider resource object"
+    /// (`GetOpenIDConnectProvider$ClientIDList`), in the order they were registered.
+    /// At most [`MAX_CLIENT_IDS_PER_OPEN_ID_CONNECT_PROVIDER`] of them.
+    pub client_id_list: Vec<String>,
+    /// "A list of certificate thumbprints that are associated with the specified IAM
+    /// OIDC provider resource object" (`GetOpenIDConnectProvider$ThumbprintList`), in
+    /// the order they were supplied. At most
+    /// [`MAX_THUMBPRINTS_PER_OPEN_ID_CONNECT_PROVIDER`] of them, and empty when the
+    /// create named none.
+    pub thumbprint_list: Vec<String>,
+    /// "The date and time when the IAM OIDC provider resource object was created in
+    /// the Amazon Web Services account" (`GetOpenIDConnectProvider$CreateDate`):
+    /// minted once and reported unchanged by every later read.
+    pub create_date: ::aws_smithy_types::DateTime,
+    /// The provider's tags, sorted by tag key, because "the returned list of tags is
+    /// sorted by tag key" (`GetOpenIDConnectProvider$Tags`). `None` when the provider
+    /// carries none, so the member is reported only when there is a tag to report.
+    pub tags: Option<Vec<Tag>>,
+}
+
 /// One IAM user's login profile: the console password `CreateLoginProfile`
 /// created, as the account holds it.
 ///
@@ -600,6 +666,13 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// because the total ARN order is what lets
     /// `ListAttachedRolePolicies` hand out a resumable marker.
     pub role_attached_policies: BTreeMap<String, BTreeSet<String>>,
+    /// The persisted IAM OpenID Connect (OIDC) identity providers, keyed by their
+    /// ARN — the handle every operation on one takes, and the value
+    /// [`open_id_connect_provider_arn`] derives from the provider's URL. Keying by
+    /// the ARN keeps enumeration order total and stable, and makes the URL the
+    /// provider's identity, which is what refuses a second create for one the
+    /// account already holds.
+    pub open_id_connect_providers: BTreeMap<String, OpenIdConnectProviderRecord>,
     /// The account's alias, when one has been created. An `Option` rather than a
     /// collection because an account holds AT MOST ONE: "Lists the account alias
     /// associated with the Amazon Web Services account (Note: you can have only
@@ -945,6 +1018,18 @@ pub fn policy_arn(path: &str, policy_name: &str) -> String {
 /// segment is empty.
 pub fn role_arn(path: &str, role_name: &str) -> String {
     ::engine::emulator_arn("iam", "", &format!("role{path}{role_name}"))
+}
+
+/// The ARN of an IAM OIDC identity provider:
+/// `arn:aws:iam::<account>:oidc-provider/<url without its scheme>`.
+///
+/// The provider is named by its URL, so its ARN is derived from that URL with the
+/// `https://` scheme ([`OPEN_ID_CONNECT_URL_SCHEME`]) removed — which is what makes
+/// two creates for one URL two creates for one provider. IAM is a global service, so
+/// the region segment is empty, exactly as it is for [`user_arn`].
+pub fn open_id_connect_provider_arn(url: &str) -> String {
+    let host_and_path = url.strip_prefix(OPEN_ID_CONNECT_URL_SCHEME).unwrap_or(url);
+    ::engine::emulator_arn("iam", "", &format!("oidc-provider/{host_and_path}"))
 }
 
 /// The ARN of an IAM instance profile:

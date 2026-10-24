@@ -33,6 +33,8 @@ mod instance_profiles;
 mod login_profiles;
 #[path = "all/managed_policies.rs"]
 mod managed_policies;
+#[path = "all/open_id_connect_providers.rs"]
+mod open_id_connect_providers;
 #[path = "all/role_attached_policies.rs"]
 mod role_attached_policies;
 #[path = "all/role_deletion.rs"]
