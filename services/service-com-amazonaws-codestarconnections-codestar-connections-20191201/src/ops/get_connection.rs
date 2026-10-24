@@ -155,15 +155,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read: the connection is reported exactly as it is stored.
         let store = state.lock();
         let Some(connection) = store.connections.get(&input.connection_arn) else {
-            return Err(GetConnectionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Could not find connection {}",
-                        input.connection_arn
-                    )),
-                },
-            )
-            .into());
+            // An ARN that resolves to no connection is the modeled absence. The SHAPE,
+            // its wire code and its wording are the model's and the service's own; only
+            // the STATUS is overridden, to the one the live service answers an absent
+            // resource with — see `state::RESOURCE_NOT_FOUND_STATUS`, which the host and
+            // repository-link readers of this crate answer at too.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                GetConnectionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::NO_SUCH_CONNECTION_MESSAGE.to_string()),
+                }),
+                crate::state::RESOURCE_NOT_FOUND_STATUS,
+            ));
         };
 
         Ok(GetConnectionOutput {

@@ -37,6 +37,8 @@ mod rule_groups_namespace_listing;
 mod rule_groups_namespace_listing_scope;
 #[path = "all/rule_groups_namespace_update.rs"]
 mod rule_groups_namespace_update;
+#[path = "all/scraper_deletion.rs"]
+mod scraper_deletion;
 #[path = "all/scraper_listing.rs"]
 mod scraper_listing;
 #[path = "all/state_roundtrip.rs"]

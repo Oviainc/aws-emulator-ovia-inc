@@ -27,7 +27,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// The same three literals are entries of `com.amazonaws.amp#AnomalyDetectorStatusCode`
 /// too (`crate::ops::types::ANOMALY_DETECTOR_STATUS_CODE_VALUES`), so an anomaly
 /// detector's lifecycle reports them from these same constants rather than from a
-/// second copy of the strings.
+/// second copy of the strings. `com.amazonaws.amp#ScraperStatusCode`
+/// (`crate::ops::types::SCRAPER_STATUS_CODE_VALUES`) spells them the same way and
+/// states the same rules for a scraper: `ACTIVE` — "Scraper has been created and is
+/// usable."; `CREATING` and `UPDATING` — "Deletion is disallowed until status is
+/// ACTIVE."; `DELETING` — "Scraper is being deleted. Deletions are allowed only when
+/// status is ACTIVE." — so a scraper's lifecycle reads them from here too.
 pub const STATUS_CREATING: &str = "CREATING";
 /// See [`STATUS_CREATING`].
 pub const STATUS_ACTIVE: &str = "ACTIVE";
@@ -155,7 +160,7 @@ pub const POLICY_RESOURCE_TYPE: &str = "AWS::APS::ResourcePolicy";
 /// How long a workspace stays in a transient status before the clock owes the next
 /// transition (`CREATING` -> `ACTIVE`, `DELETING` -> removed, a workspace
 /// configuration's `UPDATING` -> `ACTIVE`), and the same for a resource-based policy
-/// (`CREATING`/`UPDATING` -> `ACTIVE`, `DELETING` -> removed).
+/// and for a scraper (`CREATING`/`UPDATING` -> `ACTIVE`, `DELETING` -> removed).
 ///
 /// CHOSEN, not documented: Amazon Managed Service for Prometheus publishes no
 /// duration for any of these transitions, so this is the emulator's own span — long
@@ -348,6 +353,17 @@ pub const SCRAPER_FILTER_SOURCE_ARN: &str = "sourceArn";
 pub const SCRAPER_FILTER_DESTINATION_ARN: &str = "destinationArn";
 /// See [`SCRAPER_FILTER_STATUS`].
 pub const SCRAPER_FILTER_ALIAS: &str = "alias";
+
+/// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException`
+/// report for a scraper. The name is the one the model itself gives the resource:
+/// `ScraperArn` carries `@arnReference(type: "AWS::APS::Scraper")`.
+pub const SCRAPER_RESOURCE_TYPE: &str = "AWS::APS::Scraper";
+
+/// The `message` the modelled `ResourceNotFoundException` carries for a scraper this
+/// account does not hold. Constant and id-free for the same reason
+/// [`WORKSPACE_NOT_FOUND_MESSAGE`] is: `ResourceNotFoundException` models `resourceId`
+/// beside `message`, so the id of the missing scraper has its own home there.
+pub const SCRAPER_NOT_FOUND_MESSAGE: &str = "Scraper not found.";
 
 /// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException` /
 /// `ServiceQuotaExceededException` report for an anomaly detector — the resource's AWS
@@ -667,10 +683,11 @@ pub struct QueryLoggingConfiguration {
 /// One stored scraper: every member `ScraperSummary` reports.
 ///
 /// `ListScrapers` reports the scrapers this store HOLDS, so the listing is computed from
-/// state rather than announced. Nothing writes this map yet — `CreateScraper` is still
-/// scaffolded and answers 501, which is its own stub issue — so an account that has never
-/// created one lists the empty page AWS lists for it; when `CreateScraper` lands it
-/// inserts here and the listing needs no change.
+/// state rather than announced. `CreateScraper` is still scaffolded and answers 501,
+/// which is its own stub issue — so an account that has never created one lists the empty
+/// page AWS lists for it; when `CreateScraper` lands it inserts here and the listing needs
+/// no change. `DeleteScraper` moves the record it names to `DELETING` and lets the clock
+/// drop it ([`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`]).
 #[derive(Debug, Clone)]
 pub struct Scraper {
     pub scraper_id: String,
@@ -694,6 +711,13 @@ pub struct Scraper {
     pub role_configuration: Option<crate::ops::types::RoleConfiguration>,
     /// `ScraperSummary$exporters` is modelled `len ..1`; empty when none is configured.
     pub exporters: Vec<crate::ops::types::ExporterConfiguration>,
+    /// When the clock owes this scraper's next lifecycle transition, if one is pending:
+    /// `CREATING`/`UPDATING` become `ACTIVE`, `DELETING` is removed.
+    pub transition_due: Option<SystemTime>,
+    /// The `clientToken` of the `DeleteScraper` call that started a pending deletion, so
+    /// replaying that exact call stays idempotent rather than conflicting with the
+    /// deletion it already started.
+    pub delete_token: Option<String>,
 }
 
 /// One stored anomaly detector: every member `AnomalyDetectorDescription` /
@@ -864,6 +888,22 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
         for workspace_id in dropped {
             self.query_logging.remove(&workspace_id);
         }
+
+        // A scraper is an account-level resource, so its pending transition is owed on
+        // its own clock: one being deleted is GONE once its due instant has passed, and
+        // one in any other transient status settles to `ACTIVE`.
+        self.scrapers.retain(|_, scraper| match scraper.transition_due {
+            Some(due) if now >= due => {
+                scraper.transition_due = None;
+                if scraper.status_code == STATUS_DELETING {
+                    false
+                } else {
+                    scraper.status_code = STATUS_ACTIVE.to_string();
+                    true
+                }
+            }
+            _ => true,
+        });
     }
 
     /// The `workspaceId` the stored ARN `resource_arn` belongs to, if any.
