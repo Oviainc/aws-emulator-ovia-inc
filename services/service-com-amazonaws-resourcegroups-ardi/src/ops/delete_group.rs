@@ -188,7 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
         let mut store = state.lock();
-        let name = store.lookup(identifier).ok_or_else(not_found)?;
+        // A group lives in the region whose endpoint created it, so the request's
+        // own region is where the identifier is resolved: a group of another region
+        // is not deletable from here.
+        let region = crate::state::request_region(ctx.parts());
+        let key = store.lookup(&region, identifier).ok_or_else(not_found)?;
         // A group's own stored service configuration can forbid deleting it: the
         // `deletion-protection` parameter set to `UNLESS_EMPTY` protects a group
         // that still contains resources. The record is read before anything is
@@ -196,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store holds NOW, and a refusal leaves the group exactly as it was.
         // `lookup` already resolved the name to a stored record, so the 404 arm
         // here is defensive only.
-        let record = store.groups.get(&name).ok_or_else(not_found)?;
+        let record = store.groups.get(&key).ok_or_else(not_found)?;
         if record.deletion_is_protected() {
             let resources = record.members.len();
             drop(store);
@@ -206,8 +210,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 target: crate::state::AUDIT_TARGET,
                 operation = Self::NAME,
                 caller = ?crate::state::request_caller(ctx.parts()),
-                region = ?crate::state::request_region(ctx.parts()),
-                group = ?name,
+                region = ?region,
+                group = ?key.name,
                 resources,
                 outcome = "refused",
                 "resource group deletion refused",
@@ -223,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Removing the record removes the group's memberships and tags with it:
         // both are held on the record itself.
-        let removed = store.groups.remove(&name).ok_or_else(not_found)?;
+        let removed = store.groups.remove(&key).ok_or_else(not_found)?;
         // Everything below is owned, so the store lock is released before the record
         // is formatted: the critical section covers the state change only.
         drop(store);
@@ -235,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target: crate::state::AUDIT_TARGET,
             operation = Self::NAME,
             caller = ?crate::state::request_caller(ctx.parts()),
-            region = ?crate::state::request_region(ctx.parts()),
+            region = ?region,
             group = ?removed.name,
             resources = removed.members.len(),
             tags = removed.tags.len(),

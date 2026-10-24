@@ -24,7 +24,7 @@ use crate::ops::types::{
     GatewayInstance,
     GatewayNetwork,
     GatewayBridgeSource, GrantEntitlementRequest, IngressGatewayBridge, InputConfiguration,
-    Interface, ListedBridge, ListedFlow,
+    Interface, ListedBridge, ListedEntitlement, ListedFlow,
     ListedGateway,
     Maintenance, MaintenanceConfiguration, MaintenanceSchedule,
     MediaConnectFlowRouterInputStreamDetails,
@@ -1588,6 +1588,38 @@ impl StoredEntitlement {
     /// operation's `ResourceArn`, addresses it by.
     pub fn arn(&self) -> &str {
         &self.entitlement.entitlement_arn
+    }
+
+    /// The `ListedEntitlement` summary a listing reports for this record.
+    ///
+    /// Every member the summary shape carries
+    /// (`smithy_query(query="shape",shape="ListedEntitlement")`: `EntitlementArn`,
+    /// `EntitlementName`, `DataTransferSubscriberFeePercent`), each projected from the
+    /// stored entitlement — the summary holds no value of its own.
+    pub fn to_listed_entitlement(&self) -> ListedEntitlement {
+        ListedEntitlement {
+            entitlement_arn: self.entitlement.entitlement_arn.clone(),
+            entitlement_name: self.entitlement.name.clone(),
+            data_transfer_subscriber_fee_percent: self
+                .entitlement
+                .data_transfer_subscriber_fee_percent,
+        }
+    }
+
+    /// Whether this entitlement is granted TO the account `account_id`: whether that
+    /// account is one of its subscribers.
+    ///
+    /// `Entitlement$Subscribers` is "the Amazon Web Services account IDs that you want to
+    /// share your content with. The receiving accounts (subscribers) will be allowed to
+    /// create their own flow using your content as the source"
+    /// (`smithy_query(query="shape",shape="Entitlement",member="Subscribers")`), so a
+    /// grant's subscriber list is exactly the set of accounts the entitlement is granted
+    /// to.
+    pub fn is_granted_to(&self, account_id: &str) -> bool {
+        self.entitlement
+            .subscribers
+            .iter()
+            .any(|subscriber| subscriber == account_id)
     }
 }
 
@@ -4028,6 +4060,31 @@ impl ComAmazonawsMediaconnectMediaconnectState {
             .find_map(|flow| flow.sub_resource_tags_mut(resource_arn))
     }
 
+    /// Every entitlement the store holds that is granted TO the account `account_id`,
+    /// keyed by the entitlement's own ARN.
+    ///
+    /// An entitlement is a sub-resource of the flow that GRANTS it, and the accounts it is
+    /// granted to are its subscribers ([`StoredEntitlement::is_granted_to`]) — so the
+    /// entitlements one account holds are gathered from every stored flow rather than read
+    /// off one list. The keys are ARNs, so the answer is ordered and a listing can page
+    /// from one stably, exactly as the ARN-keyed resource maps above let one page.
+    pub fn entitlements_granted_to(
+        &self,
+        account_id: &str,
+    ) -> BTreeMap<String, ListedEntitlement> {
+        self.flows
+            .values()
+            .flat_map(|flow| flow.entitlements.iter())
+            .filter(|entitlement| entitlement.is_granted_to(account_id))
+            .map(|entitlement| {
+                (
+                    entitlement.arn().to_string(),
+                    entitlement.to_listed_entitlement(),
+                )
+            })
+            .collect()
+    }
+
     /// Settle every flow, gateway, bridge, router input and router output whose status
     /// change the clock already made due, and materialise the removal of every router input
     /// and router output whose deletion has come due.
@@ -4834,6 +4891,34 @@ pub fn is_mintable_reservation_arn(arn: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && is_valid_reservation_name(reservation_name)
+}
+
+/// Whether `arn` is an entitlement ARN this service could have minted: the prefix
+/// [`has_mintable_arn_prefix`] describes for the `entitlement` resource type, then the
+/// entitlement id [`entitlement_resource_fragment`] mints and a non-empty name.
+///
+/// The model puts no pattern on `Entitlement$EntitlementArn`
+/// (`smithy_query(query="shape",shape="Entitlement",member="EntitlementArn")`: it targets
+/// `String`), and no operation constrains an entitlement's name either, so the name is
+/// only required to carry something: a name that itself holds the ARN segment separator
+/// still yields an ARN this function accepts, which is why the trailing segments are
+/// walked rather than counted.
+///
+/// ListEntitlements' `NextToken` is the entitlement ARN its next page resumes at, so a
+/// token the service never minted is a semantic error in the request rather than a key to
+/// page from. The entitlement it names need NOT still exist: paging must survive a revoke
+/// between pages.
+pub fn is_mintable_entitlement_arn(arn: &str) -> bool {
+    let segments: Vec<&str> = arn.split(':').collect();
+    if segments.len() < 8 || !has_mintable_arn_prefix(&segments, "entitlement") {
+        return false;
+    }
+    let entitlement_id = segments[6];
+    !entitlement_id.is_empty()
+        && entitlement_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && segments[7..].iter().any(|segment| !segment.is_empty())
 }
 
 /// Whether `arn` is a flow ARN this service could have minted.

@@ -9,7 +9,9 @@
 //! A configuration name identifies a configuration within an account and region,
 //! so a name already in use in the signing region is refused with the modelled
 //! `ConflictException`, and a create past the region's quota with
-//! `TooManyRequestsException`.
+//! `TooManyRequestsException`. A `KafkaVersions` entry that names no Apache Kafka
+//! version this service publishes is refused with the modelled
+//! `BadRequestException`, before anything is stored.
 //!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
@@ -185,6 +187,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateConfigurationErrorModeled::BadRequestException(BadRequestException {
                     invalid_parameter: Some("name".to_string()),
                     message: Some("name must not be blank.".to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // `KafkaVersions` enumerates the Apache Kafka versions this configuration
+        // may be applied to, so every entry has to BE one of the versions this
+        // service publishes — the one catalogue `ListKafkaVersions` reports and
+        // every other version-aware operation answers from. Checked before the
+        // lock, and so before anything is stored: a list carrying an unknown entry
+        // registers no configuration at all, whichever position it is in. EVERY
+        // offending entry is named, so a caller with several of them needs one
+        // round trip rather than one per entry.
+        let unknown: Vec<String> = input
+            .kafka_versions
+            .iter()
+            .flatten()
+            .filter(|version| crate::state::kafka_version_index(version).is_none())
+            .map(|version| format!("'{version}'"))
+            .collect();
+        if !unknown.is_empty() {
+            let listed = unknown.join(", ");
+            return Err(
+                CreateConfigurationErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("kafkaVersions".to_string()),
+                    message: Some(format!(
+                        "Amazon MSK supports none of these Apache Kafka versions: {listed}."
+                    )),
                 })
                 .into(),
             );

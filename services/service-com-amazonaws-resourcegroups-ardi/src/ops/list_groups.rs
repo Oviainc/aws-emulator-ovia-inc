@@ -175,8 +175,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Authorization is not emulated: the emulator verifies request signatures
         // centrally but holds no principals or policies, so the modelled
         // `ForbiddenException` is deliberately unreachable here and a success says
-        // nothing about the caller's permissions.
-        let _ = ctx;
+        // nothing about the caller's permissions. `ctx` is read below for the region
+        // the request addressed.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListGroupsErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -224,15 +224,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
+        // A group lives in the region whose endpoint created it, and only that
+        // region's callers see it, so this listing enumerates the groups of the
+        // region the request addressed and no other.
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         let mut remaining: Vec<&crate::state::GroupRecord> = store
-            .groups
-            .values()
+            .groups_in(&region)
             .filter(|group| filters.iter().all(|filter| matches_filter(group, filter)))
             .collect();
         // The listing order is group-name order, which is what the resume key below
-        // is compared against. The store is keyed in that order, and sorting here as
-        // well keeps this page correct whatever order it is handed.
+        // is compared against. One region's groups are stored in that order, and
+        // sorting here as well keeps this page correct whatever order it is handed.
         remaining.sort_by(|left, right| left.name.cmp(&right.name));
         if let Some(resume) = resume_after.as_deref() {
             remaining.retain(|group| group.name.as_str() > resume);

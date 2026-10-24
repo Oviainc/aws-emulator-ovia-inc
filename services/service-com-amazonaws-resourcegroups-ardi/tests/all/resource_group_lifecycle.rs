@@ -11,9 +11,10 @@
 //! * a created group is persisted, and a read returns what was created;
 //! * a group's ARN is `arn:aws:resource-groups:<region>:<account>:group/<name>`,
 //!   with the region taken from the caller's SigV4 credential scope;
-//! * a group name identifies at most one group, and an identifier that names no
-//!   stored group is `NotFoundException` (404) on every operation that addresses
-//!   one;
+//! * a group name identifies at most one group IN ONE REGION, and an identifier
+//!   that names no group of the region the request addressed is `NotFoundException`
+//!   (404) on every operation that addresses one (the per-region isolation rule
+//!   itself is the sibling `region_isolation` suite);
 //! * a request that violates a modelled rule is `BadRequestException` (400);
 //! * a listing is computed from the store, ordered, and pages through every item
 //!   exactly once whatever the page size;
@@ -106,11 +107,20 @@ impl Emulator {
         self.call_in("us-east-1", path, body).await
     }
 
+    /// Call `path` signed (in scope only) for `region`, requiring a 200, and return
+    /// the body.
+    pub(crate) async fn ok_in(&self, region: &str, path: &str, body: &Value) -> Value {
+        let (status, parsed) = self.call_in(region, path, body).await;
+        assert_eq!(
+            status, 200,
+            "POST {path} {body} in {region}: expected 200, got {status} {parsed}",
+        );
+        parsed
+    }
+
     /// Call `path`, requiring a 200, and return the body.
     pub(crate) async fn ok(&self, path: &str, body: &Value) -> Value {
-        let (status, parsed) = self.call(path, body).await;
-        assert_eq!(status, 200, "POST {path} {body}: expected 200, got {status} {parsed}");
-        parsed
+        self.ok_in("us-east-1", path, body).await
     }
 }
 
@@ -358,10 +368,10 @@ async fn a_group_arn_carries_the_scope_region_and_the_emulator_account() {
             "case {scope_region:?}: expected {expected}, got {:?}",
             created["Group"]["GroupArn"],
         );
-        // The ARN is stored, not recomputed: a read in another region returns it
-        // unchanged.
+        // The ARN is stored, not recomputed: a read in the region the group lives
+        // in returns it unchanged.
         let (status, read) = emulator
-            .call_in("eu-central-1", "/get-group", &json!({ "Group": "arn-group" }))
+            .call_in(scope_region, "/get-group", &json!({ "Group": "arn-group" }))
             .await;
         assert_eq!(
             (status, read["Group"]["GroupArn"].as_str()),
@@ -371,8 +381,10 @@ async fn a_group_arn_carries_the_scope_region_and_the_emulator_account() {
     }
 }
 
-/// A group name is unique within the account, and a name starting with any
-/// capitalization of the reserved `aws` prefix is refused.
+/// A group name is unique within one region of the account, and a name starting
+/// with any capitalization of the reserved `aws` prefix is refused. (That the same
+/// name in ANOTHER region is a different group is the sibling `region_isolation`
+/// suite's rule.)
 #[tokio::test]
 async fn names_are_unique_and_the_reserved_prefix_is_refused() {
     let emulator = Emulator::new();

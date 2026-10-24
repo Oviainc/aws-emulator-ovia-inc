@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAvailableManagedRuleGroupVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAvailableManagedRuleGroupVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the versions the VENDOR of a managed rule group offers of it, one page
+//! at a time, beside the name of the version that is currently the default.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAvailableManagedRuleGroupVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A managed rule group is published by its vendor and identified by its
+//! `(VendorName, Name)` pair; it is not a resource of this account, so the versions
+//! on offer come from the service's own managed-rule-group catalogue
+//! ([`crate::state::MANAGED_RULE_GROUP_CATALOGUE`]) — the same catalogue that
+//! decides whether a `ManagedRuleGroupStatement` names a group that exists and what
+//! running it costs. A pair the catalogue does not list names nothing that exists.
+//!
+//! Nothing here writes: the response is a reading of published data, so two
+//! identical calls answer identically and a call changes nothing a later caller
+//! sees.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +180,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAvailableManagedRuleGroupVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAvailableManagedRuleGroupVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAvailableManagedRuleGroupVersions"))
+        // A read of PUBLISHED data: `ctx` carries only request metadata, which this
+        // operation does not need, and the versions a vendor offers are not state
+        // this account owns — nothing creates, updates or deletes one — so the
+        // engine's store holds none of them and nothing here writes.
+        let _ = (ctx, &self.engine);
+
+        // `Scope` names the namespace the request is made in, and WAF recognises
+        // only the two values the enum declares. It narrows nothing below: a
+        // managed rule group is identified by its `(VendorName, Name)` pair alone
+        // ("you use this, along with the vendor name, to identify the rule group",
+        // `Name`'s own doc, which names no scope), so a vendor offers the same
+        // group, and the same versions of it, in either namespace — unlike every
+        // resource this ACCOUNT owns, which a scope does namespace.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(
+                ListAvailableManagedRuleGroupVersionsErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_SCOPE_VALUE,
+                        &input.scope,
+                        "the scope names the namespace the request is made in, and is one of \
+                         CLOUDFRONT or REGIONAL",
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // "You use this, along with the vendor name, to identify the rule group"
+        // (`Name`'s own doc): the pair identifies a group the service publishes, and
+        // a pair the catalogue does not list names nothing that exists — the
+        // modelled `WAFNonexistentItemException`, exactly as a
+        // `ManagedRuleGroupStatement` naming an uncatalogued pair is refused.
+        let Some(group) = crate::state::managed_rule_group(&input.vendor_name, &input.name) else {
+            return Err(
+                ListAvailableManagedRuleGroupVersionsErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
+        };
+
+        // Absent `Limit`, a page holds as many as the model's `PaginationLimit`
+        // range allows; a `Limit` outside that range is refused rather than
+        // clamped, so no caller gets a silently empty terminal page. That reading
+        // of the range is `crate::state::page_size`, shared with every other
+        // paginated operation of this service.
+        let page_size = crate::state::page_size(input.limit, "versions").map_err(
+            ListAvailableManagedRuleGroupVersionsErrorModeled::WAFInvalidParameterException,
+        )?;
+
+        // `NextMarker` is "the marker from the prior call", which is the name of the
+        // last version of the previous page, so this page starts at the version
+        // after it IN THE PUBLISHED ORDER. The position is found by name rather than
+        // by comparing names, because a version name orders by release and not
+        // lexically (`Version_10.0` follows `Version_9.0`). A marker naming no
+        // published version names a position the catalogue does not hold, so nothing
+        // follows it.
+        let remaining: &[crate::state::ManagedRuleGroupRelease] =
+            match input.next_marker.as_deref() {
+                None => group.versions,
+                Some(marker) => group
+                    .versions
+                    .iter()
+                    .position(|release| release.name == marker)
+                    .map_or(&[], |at| &group.versions[at + 1..]),
+            };
+        let page = &remaining[..remaining.len().min(page_size)];
+
+        // Every non-empty page answers a `NextMarker` — the name of its LAST version,
+        // whether or not the page is full — and only the empty page that follows the
+        // last one carries none (`NextMarker` is `length 1..256`, and a page with no
+        // last name has no marker), which is what ends a paginator's loop.
+        let next_marker = page.last().map(|release| release.name.to_string());
+        let versions = page
+            .iter()
+            .map(|release| ManagedRuleGroupVersion {
+                name: Some(release.name.to_string()),
+                last_update_timestamp: release.last_update_timestamp(),
+            })
+            .collect();
+
+        Ok(ListAvailableManagedRuleGroupVersionsOutput {
+            next_marker,
+            versions: Some(versions),
+            // The default version is the group's, not the page's: it is reported
+            // whichever page the request asked for, and a group whose vendor offers
+            // no versions has none.
+            current_default_version: group
+                .current_default_version()
+                .map(|version| version.to_string()),
+        })
     }
 }

@@ -197,8 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
         let mut store = state.lock();
-        let name = store.lookup(identifier).ok_or_else(not_found)?;
-        let record = store.groups.get_mut(&name).ok_or_else(not_found)?;
+        // A group lives in the region whose endpoint created it, so the request's
+        // own region is where the identifier is resolved: a group of another region
+        // is not updatable from here.
+        let region = crate::state::request_region(ctx.parts());
+        let key = store.lookup(&region, identifier).ok_or_else(not_found)?;
+        let record = store.groups.get_mut(&key).ok_or_else(not_found)?;
         // Each attribute is optional and independent: a member the request carries
         // replaces the stored value (an empty `Description` clears it, which the
         // modelled 0..1024 length allows), and a member it omits leaves the stored
@@ -229,8 +233,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target: crate::state::AUDIT_TARGET,
             operation = Self::NAME,
             caller = ?crate::state::request_caller(ctx.parts()),
-            region = ?crate::state::request_region(ctx.parts()),
-            group = ?name,
+            region = ?region,
+            group = ?key.name,
             outcome = "updated",
             "resource group updated",
         );

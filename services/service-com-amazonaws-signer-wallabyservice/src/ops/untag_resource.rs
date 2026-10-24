@@ -168,10 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing here reads the request's metadata: the ARN the caller supplies
-        // carries the region and account the profile lives in, and it is matched
-        // against the ARN this service stored for that profile.
-        let _ = ctx;
+        // The ARN the caller supplies carries the region and account the profile
+        // lives in, and it is matched against the ARN this service stored for
+        // that profile; the request's own region is what says which region's
+        // endpoint is answering, and only that region's resources are there to
+        // untag.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
@@ -184,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let profile = store
-            .profile_for_tagging_mut(&input.resource_arn)
+            .profile_for_tagging_mut(&region, &input.resource_arn)
             .map_err(|problem| refused(problem, &input.resource_arn))?;
 
         // A canceled profile is the one status the modelled bad request names, and

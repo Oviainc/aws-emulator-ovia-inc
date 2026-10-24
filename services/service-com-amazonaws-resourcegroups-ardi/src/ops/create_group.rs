@@ -280,12 +280,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+        // The group this create would store: the name, qualified by the region the
+        // request addressed. Modelled on `CreateGroupInput$Name`: "A resource group
+        // name must be unique within each Amazon Web Services Region in your Amazon
+        // Web Services account" — so the SAME name in another region is another
+        // group, not a conflict.
+        let key = crate::state::GroupKey::new(&region, &input.name);
         let mut store = state.lock();
         // A group name is unique within an account and region, so a second create
-        // for a stored name is refused rather than overwriting it. The refusal is
-        // the service's own fixed sentence and names nothing the caller sent: the
-        // name is already in the request.
-        if store.groups.contains_key(&input.name) {
+        // for a name stored IN THIS REGION is refused rather than overwriting it.
+        // The refusal is the service's own fixed sentence and names nothing the
+        // caller sent: the name is already in the request.
+        if store.groups.contains_key(&key) {
             return Err(bad_request("Cannot create group: group already exists"));
         }
         // The emulator's own ceiling on stored state (see `MAX_GROUPS`), so a client
@@ -329,7 +335,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: Some(record.tags_map()),
             group_configuration: record.to_group_configuration(),
         };
-        store.groups.insert(record.name.clone(), record);
+        store.groups.insert(key, record);
         // Everything below is owned, so the store lock is released before the record
         // is formatted: the critical section covers the state change only.
         drop(store);

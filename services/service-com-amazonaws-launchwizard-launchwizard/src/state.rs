@@ -142,6 +142,18 @@ pub const CATALOGUE_PATTERN_VERSIONS: &[&str] = &["1.0.0", "1.1.0", "2.0.0"];
 pub const DEPLOYMENT_NOT_UPDATABLE_MESSAGE: &str =
     "The specified deployment is being deleted and cannot be updated.";
 
+/// The message an update of a deployment whose lifecycle is still in flight is refused
+/// with.
+///
+/// A deployment that is still being created, or that is still applying an earlier
+/// update, owes status steps nobody has observed yet; a second configuration change
+/// would take those steps over, so it is refused instead. Fixed and identifier-free
+/// like the message above, and CHOSEN for the same reason: AWS documents no wording,
+/// so only the status (HTTP 400) and the modelled `ValidationException` code are the
+/// contract.
+pub const DEPLOYMENT_UPDATE_IN_FLIGHT_MESSAGE: &str =
+    "The specified deployment has an operation in progress and cannot be updated.";
+
 /// The message a deployment lookup that finds nothing carries.
 ///
 /// Launch Wizard's `ResourceNotFoundException` message is FIXED per kind of resource
@@ -680,6 +692,26 @@ impl Deployment {
         matches!(
             self.status.as_str(),
             STATUS_DELETE_INITIATING | STATUS_DELETE_IN_PROGRESS | STATUS_DELETED
+        )
+    }
+
+    /// True while a lifecycle this deployment started has not finished: the
+    /// NON-TERMINAL `DeploymentStatus` members, each of which still owes the clock a
+    /// step ([`Deployment::pending`]).
+    ///
+    /// Every other member of the enum is a resting state — a status the deployment
+    /// stays in until a caller asks for something else (`COMPLETED`, `DELETED`, and the
+    /// failure/rollback outcomes), which is why a status not listed here is one from
+    /// which a new lifecycle may start.
+    pub fn is_lifecycle_in_flight(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            STATUS_CREATING
+                | STATUS_VALIDATING
+                | STATUS_IN_PROGRESS
+                | STATUS_UPDATE_IN_PROGRESS
+                | STATUS_DELETE_INITIATING
+                | STATUS_DELETE_IN_PROGRESS
         )
     }
 
@@ -2005,6 +2037,25 @@ pub fn specification_warning_refusal(warnings: &[String]) -> String {
         "{}; resubmit with force set to true to update the deployment anyway.",
         counted_clauses("warning", warnings)
     )
+}
+
+/// Why `deployment` cannot take a configuration update right now, or `None` when it
+/// can.
+///
+/// A deployment accepts new settings only while its lifecycle is AT REST: a delete
+/// that has started leaves no settings to apply, and a create or an update that is
+/// still in flight still owes the clock the steps it scheduled, so taking new settings
+/// would discard a lifecycle nobody has seen finish. Both answers are the operation's
+/// modelled `ValidationException`; the two messages differ only so a caller can tell
+/// which state it hit.
+pub fn deployment_update_refusal(deployment: &Deployment) -> Option<&'static str> {
+    if deployment.is_deleting_or_deleted() {
+        Some(DEPLOYMENT_NOT_UPDATABLE_MESSAGE)
+    } else if deployment.is_lifecycle_in_flight() {
+        Some(DEPLOYMENT_UPDATE_IN_FLIGHT_MESSAGE)
+    } else {
+        None
+    }
 }
 
 /// The `ValidationException` message a CREATE refused for its specification warnings

@@ -463,6 +463,15 @@ pub(crate) async fn drain(
     items
 }
 
+/// Every item of a listing, walked to its end with no `maxResults`, as a JSON array.
+///
+/// An assertion about a WHOLE listing has to follow the tokens: a request that names no
+/// `maxResults` is served one documented-default page at a time, so a single call is a
+/// page and not the listing.
+async fn drained(emulator: &Emulator, path: &str, items_key: &str, body: &Value) -> Value {
+    Value::Array(drain(emulator, path, items_key, body, None).await)
+}
+
 // ---------------------------------------------------------------------------
 // ListTransactions
 // ---------------------------------------------------------------------------
@@ -480,13 +489,14 @@ async fn list_transactions_returns_exactly_the_stored_transactions_of_each_addre
         for address in network.addresses() {
             let case = format!("{}/{address}", network.network);
             let expected = network.hashes_for(&address);
-            let reply = emulator
-                .ok(
-                    "/list-transactions",
-                    &json!({"network": network.network, "address": address}),
-                )
-                .await;
-            let got = hashes(&reply["transactions"]);
+            let items = drained(
+                &emulator,
+                "/list-transactions",
+                "transactions",
+                &json!({"network": network.network, "address": address}),
+            )
+            .await;
+            let got = hashes(&items);
             assert_eq!(
                 got, expected,
                 "case {case}: expected the stored transactions {expected:?}, got {got:?}"
@@ -495,7 +505,7 @@ async fn list_transactions_returns_exactly_the_stored_transactions_of_each_addre
             // Each item is the stored record's summary, not a re-statement of the
             // request: `TransactionOutputItem` requires transactionHash, network and
             // transactionTimestamp.
-            for item in reply["transactions"].as_array().unwrap_or(&Vec::new()) {
+            for item in items.as_array().unwrap_or(&Vec::new()) {
                 let hash = item["transactionHash"].as_str().unwrap_or_default();
                 let stored = network
                     .transactions
@@ -579,7 +589,7 @@ async fn list_transactions_honours_sort_order_the_confirmation_filter_and_the_wi
         for order in ["ASCENDING", "DESCENDING"] {
             let mut body = base.clone();
             body["sort"] = json!({"sortBy": "TRANSACTION_TIMESTAMP", "sortOrder": order});
-            let got = hashes(&emulator.ok("/list-transactions", &body).await["transactions"]);
+            let got = hashes(&drained(&emulator, "/list-transactions", "transactions", &body).await);
             let mut expected = ascending.clone();
             if order == "DESCENDING" {
                 expected.reverse();
@@ -607,7 +617,7 @@ async fn list_transactions_honours_sort_order_the_confirmation_filter_and_the_wi
                 })
                 .map(|transaction| transaction.transaction_hash.clone())
                 .collect();
-            let got = hashes(&emulator.ok("/list-transactions", &body).await["transactions"]);
+            let got = hashes(&drained(&emulator, "/list-transactions", "transactions", &body).await);
             assert_eq!(
                 got, expected,
                 "case {case} include={include:?}: expected {expected:?}, got {got:?}"
@@ -648,7 +658,8 @@ async fn list_transactions_honours_sort_order_the_confirmation_filter_and_the_wi
                     })
                     .map(|transaction| transaction.transaction_hash.clone())
                     .collect();
-                let got = hashes(&emulator.ok("/list-transactions", &body).await["transactions"]);
+                let got =
+                    hashes(&drained(&emulator, "/list-transactions", "transactions", &body).await);
                 assert_eq!(
                     got, expected,
                     "case {case} window={from:?}..{to:?}: expected {expected:?}, got {got:?}"

@@ -663,6 +663,67 @@ pub struct ManagedRuleGroupDescriptor {
     /// The WCUs a web ACL spends on one rule that runs this group; see
     /// [`web_acl_capacity`].
     pub capacity: i64,
+    /// The versions of this group its vendor offers, OLDEST first.
+    ///
+    /// "Customers can retrieve the available versions for a managed rule group by
+    /// calling `ListAvailableManagedRuleGroupVersions`"
+    /// (`smithy_query(query="doc",shape="PutManagedRuleSetVersions")`), and the
+    /// versions on offer are the VENDOR's, not anything this account holds — so
+    /// they sit here, beside the capacity, rather than in the state struct. Every
+    /// catalogued group offers at least its initial version (see
+    /// [`MANAGED_RULE_GROUP_CATALOGUE`]).
+    pub versions: &'static [ManagedRuleGroupRelease],
+}
+
+impl ManagedRuleGroupDescriptor {
+    /// The version of this group that is currently the default: the NEWEST version
+    /// its vendor offers.
+    ///
+    /// `ListAvailableManagedRuleGroupVersionsResponse$CurrentDefaultVersion` is
+    /// "the name of the version that's currently set as the default", and
+    /// `DescribeManagedRuleGroup$VersionName` says WAF "uses the vendor's default
+    /// version" when a request names none. The catalogue keeps each group's
+    /// versions in release order, so its default is the last of them: a group gains
+    /// a default by being versioned, and gains a new one when a newer version is
+    /// published, with no second field to fall out of step with the list.
+    pub fn current_default_version(&self) -> Option<&'static str> {
+        self.versions.last().map(|release| release.name)
+    }
+}
+
+/// One version of a managed rule group as its vendor offers it.
+///
+/// Flat and `Copy`, like [`ManagedRuleGroupDescriptor`], because it is published
+/// data rather than stored state: a caller cannot add, change or remove one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedRuleGroupRelease {
+    /// The version name, which is what a `ManagedRuleGroupStatement$Version` pins
+    /// (`ManagedRuleGroupVersion$Name`, a `VersionKeyString`: `length 1..64`,
+    /// pattern `^[\w#:\.\-/]+$`).
+    pub name: &'static str,
+    /// When the vendor last updated this version's information
+    /// (`ManagedRuleGroupVersion$LastUpdateTimestamp`), as an RFC 3339 instant in
+    /// UTC — the form [`::aws_smithy_types::DateTime::from_str`] reads with
+    /// `Format::DateTime`, so the calendar arithmetic stays in that library.
+    ///
+    /// A PROPERTY of the published version and not a clock reading: the same
+    /// version answers the same instant on every call, and only publishing a new
+    /// version changes what this catalogue reports.
+    pub last_update: &'static str,
+}
+
+impl ManagedRuleGroupRelease {
+    /// [`Self::last_update`] as the modelled `Timestamp`, or `None` when the text
+    /// is not an instant that library can read — which leaves the optional
+    /// `ManagedRuleGroupVersion$LastUpdateTimestamp` member off the response
+    /// rather than reporting an instant nobody published.
+    pub fn last_update_timestamp(&self) -> Option<::aws_smithy_types::DateTime> {
+        ::aws_smithy_types::DateTime::from_str(
+            self.last_update,
+            ::aws_smithy_types::date_time::Format::DateTime,
+        )
+        .ok()
+    }
 }
 
 /// The managed rule groups this emulator publishes, with the capacity of each.
@@ -684,6 +745,12 @@ pub struct ManagedRuleGroupDescriptor {
 /// CONFIGURATION (Bot Control, whose targeted inspection level costs more than its
 /// common one), the entry carries the group's base figure, because nothing here
 /// prices a `ManagedRuleGroupConfigs` setting.
+///
+/// Each entry also carries the VERSIONS its vendor offers of that group (see
+/// [`ManagedRuleGroupDescriptor::versions`]), oldest first: every published group
+/// offers at least its initial version, which is what
+/// `ListAvailableManagedRuleGroupVersions` lists and what
+/// [`ManagedRuleGroupDescriptor::current_default_version`] answers the newest of.
 pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
     descriptor("AWSManagedRulesCommonRuleSet", 700),
     descriptor("AWSManagedRulesAdminProtectionRuleSet", 100),
@@ -696,19 +763,90 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
     descriptor("AWSManagedRulesWordPressRuleSet", 100),
     descriptor("AWSManagedRulesAmazonIpReputationList", 25),
     descriptor("AWSManagedRulesAnonymousIpList", 50),
-    descriptor("AWSManagedRulesBotControlRuleSet", 50),
-    descriptor("AWSManagedRulesATPRuleSet", 50),
-    descriptor("AWSManagedRulesACFPRuleSet", 50),
-    descriptor("AWSManagedRulesAntiDDoSRuleSet", 50),
+    versioned("AWSManagedRulesBotControlRuleSet", 50, BOT_CONTROL_VERSIONS),
+    versioned("AWSManagedRulesATPRuleSet", 50, ATP_VERSIONS),
+    versioned("AWSManagedRulesACFPRuleSet", 50, ACFP_VERSIONS),
+    versioned("AWSManagedRulesAntiDDoSRuleSet", 50, ANTI_DDOS_VERSIONS),
 ];
 
-/// One [`MANAGED_RULE_GROUP_CATALOGUE`] entry, of the AWS vendor.
+/// The versions offered of a group the WAF Developer Guide publishes no version
+/// HISTORY for: its initial version alone.
+///
+/// A managed rule group is offered WITH versions — a recorded
+/// `ListAvailableManagedRuleGroupVersions` response for the core rule set carries
+/// at least one, and `ManagedRuleGroupStatement$Version` lets a web ACL pin one of
+/// any group — so every catalogue entry offers at least this, and a group the guide
+/// lists further versions for carries them instead (see [`BOT_CONTROL_VERSIONS`]).
+/// The guide publishes no version NAMES or dates for the groups that carry this
+/// one, so both are what THIS catalogue publishes for them rather than anything
+/// observed from the real service: one initial version, stable per group and per
+/// call, which is what keeps every published group pinnable and listable.
+const INITIAL_VERSION_ONLY: &[ManagedRuleGroupRelease] =
+    &[release("Version_1.0", "2019-11-25T00:00:00Z")];
+
+/// The versions offered of `AWSManagedRulesBotControlRuleSet`, oldest first.
+///
+/// The intelligent-threat-mitigation groups below are the ones the WAF Developer
+/// Guide publishes a version history for, and the names are the guide's
+/// (`Version_<major>.<minor>`). The instant on each release is the one THIS
+/// catalogue publishes as that version's last update — stable per version, and
+/// ordered with the list — because a vendor's own update instants are not
+/// something this emulator can know.
+const BOT_CONTROL_VERSIONS: &[ManagedRuleGroupRelease] = &[
+    release("Version_1.0", "2021-02-09T00:00:00Z"),
+    release("Version_2.0", "2022-09-21T00:00:00Z"),
+    release("Version_3.0", "2023-10-24T00:00:00Z"),
+];
+
+/// The versions offered of `AWSManagedRulesATPRuleSet`. See
+/// [`BOT_CONTROL_VERSIONS`].
+const ATP_VERSIONS: &[ManagedRuleGroupRelease] = &[
+    release("Version_1.0", "2022-06-14T00:00:00Z"),
+    release("Version_2.0", "2023-05-03T00:00:00Z"),
+    release("Version_3.0", "2023-11-14T00:00:00Z"),
+];
+
+/// The versions offered of `AWSManagedRulesACFPRuleSet`. See
+/// [`BOT_CONTROL_VERSIONS`].
+const ACFP_VERSIONS: &[ManagedRuleGroupRelease] = &[
+    release("Version_1.0", "2023-09-26T00:00:00Z"),
+    release("Version_2.0", "2024-04-09T00:00:00Z"),
+];
+
+/// The versions offered of `AWSManagedRulesAntiDDoSRuleSet`. See
+/// [`BOT_CONTROL_VERSIONS`].
+const ANTI_DDOS_VERSIONS: &[ManagedRuleGroupRelease] =
+    &[release("Version_1.0", "2025-05-14T00:00:00Z")];
+
+/// One [`MANAGED_RULE_GROUP_CATALOGUE`] entry, of the AWS vendor, offered with
+/// [`INITIAL_VERSION_ONLY`].
 const fn descriptor(name: &'static str, capacity: i64) -> ManagedRuleGroupDescriptor {
     ManagedRuleGroupDescriptor {
         vendor_name: AWS_MANAGED_RULE_GROUP_VENDOR,
         name,
         capacity,
+        versions: INITIAL_VERSION_ONLY,
     }
+}
+
+/// [`descriptor`] for a group whose vendor offers `versions` of it, oldest first.
+const fn versioned(
+    name: &'static str,
+    capacity: i64,
+    versions: &'static [ManagedRuleGroupRelease],
+) -> ManagedRuleGroupDescriptor {
+    ManagedRuleGroupDescriptor {
+        vendor_name: AWS_MANAGED_RULE_GROUP_VENDOR,
+        name,
+        capacity,
+        versions,
+    }
+}
+
+/// One version of a group, named `name` and last updated at `last_update` (see
+/// [`ManagedRuleGroupRelease::last_update`]).
+const fn release(name: &'static str, last_update: &'static str) -> ManagedRuleGroupRelease {
+    ManagedRuleGroupRelease { name, last_update }
 }
 
 /// The published managed rule group a `(VendorName, Name)` pair names, if the
@@ -1642,6 +1780,39 @@ pub fn invalid_parameter_exception(
 /// [`ARN_NOT_VALID_REASON`].
 pub fn invalid_arn_exception(arn: &str) -> WAFInvalidParameterException {
     invalid_parameter_exception(FIELD_RESOURCE_ARN, arn, ARN_NOT_VALID_REASON)
+}
+
+/// The largest page a paginated WAFv2 list answers with when the request names no
+/// `Limit`: the upper bound of the model's `PaginationLimit`
+/// (`smithy_query(query="shape",shape="PaginationLimit")` → `range 1..100`), which
+/// every paginated operation of this service shares.
+pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// How many entries one page holds, for a request whose `Limit` is `limit`.
+///
+/// Absent `Limit`, a page holds as many as [`MAX_PAGE_SIZE`] allows; a `Limit`
+/// outside the model's `PaginationLimit` range is REFUSED rather than clamped, so
+/// no caller gets a silently empty terminal page. One reading of that range for
+/// every paginated operation, so a third one cannot grow a third copy of it.
+///
+/// `noun` is what the page holds (`"summaries"`, `"versions"`), for the refusal's
+/// `Reason`; the refusal itself is the modelled `WAFInvalidParameterException`
+/// carrying `Field` [`FIELD_ENTITY_LIMIT`] and the rejected value.
+pub fn page_size(limit: Option<i32>, noun: &str) -> Result<usize, WAFInvalidParameterException> {
+    let requested = match limit {
+        None => MAX_PAGE_SIZE,
+        Some(limit) if (1..=MAX_PAGE_SIZE).contains(&limit) => limit,
+        Some(limit) => {
+            return Err(invalid_parameter_exception(
+                FIELD_ENTITY_LIMIT,
+                &limit.to_string(),
+                &format!("a page holds between 1 and {MAX_PAGE_SIZE} {noun}"),
+            ));
+        }
+    };
+    // The match above leaves `requested` in `1..=MAX_PAGE_SIZE`, so this cannot
+    // fail: the conversion is here to state that invariant, not to hide a case.
+    Ok(usize::try_from(requested).expect("a page size in 1..=MAX_PAGE_SIZE fits a usize"))
 }
 
 /// The resource-kind segment of a wafv2 resource ARN (`webacl`, `ipset`,

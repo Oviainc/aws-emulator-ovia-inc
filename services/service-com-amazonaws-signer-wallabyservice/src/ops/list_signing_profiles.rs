@@ -2,8 +2,8 @@
 
 //! @op ListSigningProfiles
 //!
-//! Implemented: pages over the stored signing profiles. Reporting only — it
-//! writes nothing.
+//! Implemented: pages over the signing profiles stored for the region this
+//! request was signed for. Reporting only — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -163,7 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Signer is regional: a list reports the profiles of the region whose
+        // endpoint was addressed, and none of any other region's.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListSigningProfilesErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
@@ -221,14 +223,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let mut profiles = Vec::with_capacity(page_size);
         let mut next_token = None;
-        for (profile_name, profile) in &store.profiles {
+        for (profile_name, profile) in store.profiles_in(&region) {
             // Resume at the first name at or after the token, so a page is still
             // served when the profile the token named no longer passes the
             // filters this call carries.
             if input
                 .next_token
                 .as_deref()
-                .is_some_and(|token| profile_name.as_str() < token)
+                .is_some_and(|token| profile_name < token)
             {
                 continue;
             }
@@ -243,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             if profiles.len() == page_size {
-                next_token = Some(profile_name.clone());
+                next_token = Some(profile_name.to_string());
                 break;
             }
             profiles.push(profile.to_summary());

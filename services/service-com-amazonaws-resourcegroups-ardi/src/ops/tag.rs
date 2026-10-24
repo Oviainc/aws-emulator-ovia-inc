@@ -195,10 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
         // `Arn` is a group ARN (the modelled `GroupArnV2`), so it resolves only
-        // against a group's own STORED ARN: an ARN for another region or account
-        // addresses no group here.
-        let name = store.lookup(&input.arn).ok_or_else(not_found)?;
-        let record = store.groups.get_mut(&name).ok_or_else(not_found)?;
+        // against a group's own STORED ARN, and only within the region the request
+        // addressed: an ARN for another region or account addresses no group here.
+        let region = crate::state::request_region(ctx.parts());
+        let key = store.lookup(&region, &input.arn).ok_or_else(not_found)?;
+        let record = store.groups.get_mut(&key).ok_or_else(not_found)?;
         // The merge, and the store's own ceiling on how many tags one group holds,
         // live on the record: an empty batch is a no-op success, and the pairs that
         // come back are the ones now STORED for the keys the request named.
@@ -222,8 +223,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target: crate::state::AUDIT_TARGET,
             operation = Self::NAME,
             caller = ?crate::state::request_caller(ctx.parts()),
-            region = ?crate::state::request_region(ctx.parts()),
-            group = ?name,
+            region = ?region,
+            group = ?key.name,
             tags = added.len(),
             outcome = "tagged",
             "resource group tagged",

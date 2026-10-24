@@ -14,9 +14,10 @@
 //!   the value it had — and reports the group's stored ARN beside the pairs now
 //!   stored for the keys it named;
 //! * `GetTags` reports that same stored map and changes nothing a later caller
-//!   sees, whatever region the reader's credential scope names;
+//!   sees, for a caller signing for the region the group lives in;
 //! * a group is addressed by its own stored ARN, so an ARN for another region or
-//!   another account addresses no group and is `NotFoundException` (404);
+//!   another account — and an ARN read from another region — addresses no group
+//!   and is `NotFoundException` (404);
 //! * a pair this service will not store — outside the modelled key/value lengths
 //!   or character set, or in the reserved key namespace — is
 //!   `BadRequestException` (400) and stores NONE of its batch, on `Tag` and on the
@@ -117,13 +118,15 @@ pub(crate) async fn get_tags(emulator: &Emulator, region: &str, arn: &str) -> (u
         .await
 }
 
-/// The map `GetTags` reports for `arn`, which must be a 200 reporting that same ARN.
+/// The map `GetTags` reports for `arn` to a caller signing for `region`, which
+/// must be a 200 reporting that same ARN.
 pub(crate) async fn stored_tags(
     emulator: &Emulator,
+    region: &str,
     case: &str,
     arn: &str,
 ) -> BTreeMap<String, String> {
-    let (status, body) = get_tags(emulator, "us-east-1", arn).await;
+    let (status, body) = get_tags(emulator, region, arn).await;
     assert_eq!(
         status, 200,
         "case {case:?}: GetTags expected 200, got {status} {body}",
@@ -246,7 +249,7 @@ async fn tagging_merges_pairs_into_the_stored_map_and_reads_back() {
             );
 
             expected.extend(batch.iter().cloned());
-            let stored = stored_tags(&emulator, case, &arn).await;
+            let stored = stored_tags(&emulator, region, case, &arn).await;
             assert_eq!(
                 stored, expected,
                 "case {case:?}: expected the stored map {expected:?}, got {stored:?}",
@@ -259,7 +262,7 @@ async fn tagging_merges_pairs_into_the_stored_map_and_reads_back() {
                 repeat_status, 200,
                 "case {case:?}: repeating the batch expected 200, got {repeat_status} {repeated}",
             );
-            let after = stored_tags(&emulator, case, &arn).await;
+            let after = stored_tags(&emulator, region, case, &arn).await;
             assert_eq!(
                 after, expected,
                 "case {case:?}: repeating the batch must leave the map at {expected:?}, \
@@ -325,10 +328,19 @@ async fn get_tags_reports_the_stored_map_and_changes_nothing() {
         );
         let expected: BTreeMap<String, String> = pairs.into_iter().collect();
 
-        // The map is computed from the store, so every reader sees it — including
-        // one whose credential scope names another region.
+        // The map is computed from the store, and the group lives in the region
+        // that created it: a caller signing for another region addresses no group.
         for region in ["us-east-1", "eu-central-1", "ap-southeast-2"] {
             let (status, body) = get_tags(&emulator, region, &arn).await;
+            if region != "us-east-1" {
+                assert_eq!(
+                    (status, error_code(&body)),
+                    (404, "NotFoundException"),
+                    "case {case:?} (read from {region}): expected 404 NotFoundException, \
+                     got {status} {body}",
+                );
+                continue;
+            }
             assert_eq!(
                 status, 200,
                 "case {case:?} (read from {region}): expected 200, got {status} {body}",
@@ -429,7 +441,7 @@ async fn an_arn_that_addresses_no_stored_group_is_refused() {
             "case {case:?}: expected GetTags to answer {status} {code}, \
              got {read_status} {read_body}",
         );
-        let stored = stored_tags(&emulator, case, &present).await;
+        let stored = stored_tags(&emulator, "us-east-1", case, &present).await;
         assert_eq!(
             stored, expected,
             "case {case:?}: the refusal must leave the stored group's tags at {expected:?}, \
@@ -524,7 +536,7 @@ async fn a_pair_this_service_refuses_stores_nothing() {
             (400, "BadRequestException"),
             "case {case:?}: expected Tag to answer 400 BadRequestException, got {status} {body}",
         );
-        let stored = stored_tags(&emulator, &case, &arn).await;
+        let stored = stored_tags(&emulator, "us-east-1", &case, &arn).await;
         assert_eq!(
             stored, expected,
             "case {case:?}: a refused batch must store nothing, expected {expected:?}, \
@@ -597,7 +609,7 @@ async fn the_tags_per_group_ceiling_is_enforced_atomically() {
         status, 200,
         "case {case:?}: expected 200, got {status} {body}",
     );
-    let at_the_bound = stored_tags(&emulator, case, &arn).await;
+    let at_the_bound = stored_tags(&emulator, "us-east-1", case, &arn).await;
     assert_eq!(
         at_the_bound.len(),
         MAX_TAGS_PER_GROUP,
@@ -616,7 +628,7 @@ async fn the_tags_per_group_ceiling_is_enforced_atomically() {
         status, 200,
         "case {case:?}: expected 200, got {status} {body}",
     );
-    let overwritten = stored_tags(&emulator, case, &arn).await;
+    let overwritten = stored_tags(&emulator, "us-east-1", case, &arn).await;
     assert_eq!(
         overwritten.get("key-0").map(String::as_str),
         Some("changed"),
@@ -641,7 +653,7 @@ async fn the_tags_per_group_ceiling_is_enforced_atomically() {
         (400, "BadRequestException"),
         "case {case:?}: expected 400 BadRequestException, got {status} {body}",
     );
-    let after = stored_tags(&emulator, case, &arn).await;
+    let after = stored_tags(&emulator, "us-east-1", case, &arn).await;
     assert_eq!(
         after, overwritten,
         "case {case:?}: the refusal must store nothing, expected {overwritten:?}, got {after:?}",

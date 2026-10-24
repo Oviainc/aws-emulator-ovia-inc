@@ -153,10 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(rule) = store.rule(&bus_name, &input.name) else {
             return Err(DescribeRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Rule {} does not exist on event bus {bus_name}.",
-                        input.name
-                    )),
+                    message: Some(crate::state::no_such_rule(&bus_name, &input.name)),
                 },
             )
             .into());

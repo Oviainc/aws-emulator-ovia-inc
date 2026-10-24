@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // centrally but holds no principals or policies, so the modelled
         // `ForbiddenException` and `UnauthorizedException` are deliberately
         // unreachable here and a success says nothing about the caller's permissions.
-        let _ = ctx;
+        // `ctx` is read below for the region the request addressed.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListGroupResourcesErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -232,13 +232,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         };
-        let name = store.lookup(identifier).ok_or_else(not_found)?;
-        let group = store.groups.get(&name).ok_or_else(not_found)?;
+        // A group lives in the region whose endpoint created it, so the request's
+        // own region is where the identifier is resolved: a group of another region
+        // answers no listing here.
+        let region = crate::state::request_region(ctx.parts());
+        let key = store.lookup(&region, identifier).ok_or_else(not_found)?;
+        let group = store.groups.get(&key).ok_or_else(not_found)?;
 
         // The token is this service's own opaque encoding of the ARN the previous
         // page stopped at, scoped to THIS listing of THIS group; anything else
         // cannot name a resume point in it.
-        let listing = listing_of(&name);
+        let listing = listing_of(&key.name);
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => match crate::state::decode_page_token(&listing, token) {
