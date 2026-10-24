@@ -61,7 +61,7 @@ use std::time::SystemTime;
 use crate::ops::types::{
     Multiplex, MultiplexAlert, MultiplexProgram, MultiplexProgramPacketIdentifiersMap,
     MultiplexProgramSettings,
-    MultiplexProgramSummary, MultiplexSettings,
+    MultiplexProgramSummary, MultiplexSettings, MultiplexSettingsSummary, MultiplexSummary,
 };
 
 use super::{ChannelRecord, ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
@@ -1174,6 +1174,37 @@ impl ComAmazonawsMedialiveMedialiveState {
         })
     }
 
+    /// One page of the multiplexes this store holds, as the `MultiplexSummary`
+    /// list `ListMultiplexes` reports: the multiplexes whose id is at or after
+    /// `first`, in id order, at most `page_size` of them, together with the id
+    /// the next page starts at when a multiplex is left over after this one.
+    ///
+    /// A deleted multiplex keeps its record in its terminal state, so it goes on
+    /// being listed there exactly as `DescribeMultiplex` goes on reporting it —
+    /// which is what makes a listing a read of the same stored multiplex rather
+    /// than a second account of it.
+    ///
+    /// Every member of a summary comes from the same place the full
+    /// [`ComAmazonawsMedialiveMedialiveState::multiplex_description`] takes it
+    /// from ([`multiplex_summary`]), so a listed multiplex cannot disagree with
+    /// the same multiplex's describe.
+    pub fn multiplex_summaries(
+        &self,
+        first: Bound<&str>,
+        page_size: usize,
+    ) -> (Vec<MultiplexSummary>, Option<String>) {
+        let mut remaining = self.multiplexes.range::<str, _>((first, Bound::Unbounded));
+        let summaries: Vec<MultiplexSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, multiplex)| multiplex_summary(multiplex))
+            .collect();
+        // Absent on the last page: a token is handed out only when a multiplex
+        // is left over after the ones this page carries.
+        let next_token = remaining.next().map(|(id, _)| id.clone());
+        (summaries, next_token)
+    }
+
     /// Change the multiplex `multiplex_id` as `UpdateMultiplex` asks, or refuse.
     ///
     /// Each member the request carries REPLACES the stored one, and a member it
@@ -1675,6 +1706,34 @@ fn multiplex_program_destinations(
             settings.program_name.as_deref()?,
         ))
     })
+}
+
+/// One stored multiplex as the model's `MultiplexSummary` shape, so the listing
+/// reports a multiplex exactly as its own describe does.
+///
+/// Every member comes from the same place
+/// [`ComAmazonawsMedialiveMedialiveState::multiplex_description`] takes it from:
+/// the stored `Arn`, `AvailabilityZones`, `Id`, `Name`, `Tags` and lifecycle
+/// `State`, the derived `ProgramCount` and `PipelinesRunningCount`, and the
+/// `MultiplexSettingsSummary` projection of the stored `MultiplexSettings` —
+/// which carries `TransportStreamBitrate` alone
+/// (`smithy_query(query="shape", shape="MultiplexSettingsSummary")`), so the
+/// other three settings members are the summary's own omission rather than
+/// anything unstored.
+fn multiplex_summary(multiplex: &MultiplexRecord) -> MultiplexSummary {
+    MultiplexSummary {
+        arn: Some(multiplex.arn.clone()),
+        availability_zones: Some(multiplex.availability_zones.clone()),
+        id: Some(multiplex.id.clone()),
+        multiplex_settings: Some(MultiplexSettingsSummary {
+            transport_stream_bitrate: Some(multiplex.multiplex_settings.transport_stream_bitrate),
+        }),
+        name: Some(multiplex.name.clone()),
+        pipelines_running_count: Some(multiplex.pipelines_running_count()),
+        program_count: Some(multiplex.program_count()),
+        state: Some(multiplex.state.clone()),
+        tags: Some(multiplex.tags.clone()),
+    }
 }
 
 /// One stored alert as the model's `MultiplexAlert` shape, so every reader of an
