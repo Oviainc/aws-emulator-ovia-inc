@@ -78,6 +78,14 @@
 //! whose start time is over an hour past whenever [`ComAmazonawsMedialiveMedialiveState::settle`]
 //! runs.
 //!
+//! A channel's ALERTS live on its own [`ChannelRecord`] too, as the
+//! [`ChannelAlerts`] log of the [`channel_alerts`] slice: the alerts the service
+//! has observed on that channel, which `ListAlerts` reports. Nothing in this
+//! emulator ingests media, so no operation observes an alert condition and the
+//! log stays empty unless [`ChannelRecord::raise_alert`] is called — a read
+//! reports what the log holds and never invents an alert for a channel that is
+//! merely running.
+//!
 //! The monitor side of the service lives here as well: one
 //! [`CloudWatchAlarmTemplateGroupRecord`] per created cloudwatch alarm template
 //! group and one [`EventBridgeRuleTemplateGroupRecord`] per created eventbridge
@@ -175,6 +183,17 @@ pub mod alarm_template_groups;
 /// Its store is the `schedule` member of [`ChannelRecord`] below, so a schedule
 /// goes away with the channel that owns it.
 pub mod schedules;
+
+/// The channel ALERT slice: one channel's alert log, the state an alert is in,
+/// the `StateFilter` a read narrows it with and the set-time order a read
+/// reports it in. Its store is the `alerts` member of [`ChannelRecord`] below,
+/// for the same reason as the schedule: an alert belongs to exactly one channel.
+pub mod channel_alerts;
+
+pub use channel_alerts::{
+    channel_alert_output, channel_alert_state, ChannelAlertRecord, ChannelAlerts,
+    CHANNEL_ALERT_FILTERS, CHANNEL_ALERT_FILTER_ALL, MAX_CHANNEL_ALERTS,
+};
 
 pub use alarm_template_groups::{
     AlarmTemplateGroupRefusal, CloudWatchAlarmTemplateGroupRecord,
@@ -893,6 +912,12 @@ pub struct ChannelRecord {
     /// it — `DeleteChannel` takes the schedule with it, and no operation reaches
     /// a schedule without naming its channel.
     pub schedule: ChannelSchedule,
+    /// This channel's alert log, which `ListAlerts` reports: it lives on the
+    /// channel for the same reason the schedule does. Empty until something
+    /// raises an alert on this channel ([`Self::raise_alert`]); see the
+    /// [`channel_alerts`] module for why nothing in this emulator does so on its
+    /// own.
+    pub alerts: ChannelAlerts,
     /// The thumbnail frames this channel's pipelines have captured, oldest
     /// first — the [`thumbnails`] slice's store. Nothing in this emulator
     /// captures one, so this is empty unless
@@ -952,6 +977,32 @@ impl ChannelRecord {
         (0..self.pipeline_count())
             .filter(|pipeline| !self.restarting_pipelines.contains(pipeline))
             .collect()
+    }
+
+    /// Record an alert the service has observed on this channel, and answer the
+    /// `Id` it was given — or `None` when the observation names a pipeline this
+    /// channel has not got.
+    ///
+    /// The one way an alert enters a channel's log, so the `PipelineId` rule
+    /// holds for every alert in it: `ChannelAlert$PipelineId` is "The ID of the
+    /// pipeline this alert is associated with", and a pipeline this channel's
+    /// class does not give it ([`Self::has_pipeline`]) is not one an alert can be
+    /// associated with — so there is no such alert to record, and the `None` says
+    /// so rather than quietly recording one with the pipeline dropped.
+    pub fn raise_alert(
+        &mut self,
+        alert_type: &str,
+        message: Option<&str>,
+        pipeline: Option<i32>,
+        now: SystemTime,
+    ) -> Option<String> {
+        if pipeline.is_some_and(|pipeline| !self.has_pipeline(pipeline)) {
+            return None;
+        }
+        Some(
+            self.alerts
+                .raise(&self.id, alert_type, message, pipeline, now),
+        )
     }
 
     /// Whether `pipeline` is one of the pipelines this channel's class gives it
@@ -4537,6 +4588,7 @@ pub fn new_channel(
         channel_engine_version: None,
         restarting_pipelines: Vec::new(),
         schedule: ChannelSchedule::default(),
+        alerts: ChannelAlerts::default(),
         thumbnails: Vec::new(),
         transition: None,
     };
