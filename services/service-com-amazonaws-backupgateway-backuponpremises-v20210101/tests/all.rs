@@ -15,6 +15,8 @@
 mod bandwidth_rate_limit_schedule;
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
+#[path = "all/gateway_server_association.rs"]
+mod gateway_server_association;
 #[path = "all/hypervisor_import_concurrency.rs"]
 mod hypervisor_import_concurrency;
 #[path = "all/hypervisor_listing.rs"]

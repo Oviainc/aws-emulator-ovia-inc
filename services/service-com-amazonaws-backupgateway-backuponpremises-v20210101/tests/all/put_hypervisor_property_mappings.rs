@@ -47,13 +47,14 @@ use crate::hypervisor_property_mappings::{
     persisted_mappings,
 };
 
-/// Associate `gateway_arn` with the hypervisor `hypervisor_arn` names.
+/// Associate `gateway_arn` with the hypervisor `hypervisor_arn` names, straight on the
+/// stored record.
 ///
-/// This is what `AssociateGatewayToServer` will persist once it is implemented (it is a
-/// scaffold answering 501 under its own stub issue): the gateway record's
-/// `hypervisor_arn` — the field `PutHypervisorPropertyMappings` resolves the association
-/// through — and the bare `HypervisorId` read off that ARN, so the two cannot name
-/// different hypervisors.
+/// This is what `AssociateGatewayToServer` persists over the wire (that operation has its
+/// own suite, `gateway_server_association`): the gateway record's `hypervisor_arn` — the
+/// field `PutHypervisorPropertyMappings` resolves the association through — and the bare
+/// `HypervisorId` read off that ARN, so the two cannot name different hypervisors.
+/// Seeding it here keeps this suite's scene independent of that operation.
 fn associate(engine: &Arc<engine::InMemoryEngine>, gateway_arn: &str, hypervisor_arn: &str) {
     let hypervisor_id = arn_resource_id(hypervisor_arn).map(str::to_string);
     let state = service_state(&**engine).expect("the in-memory engine must expose this state");
