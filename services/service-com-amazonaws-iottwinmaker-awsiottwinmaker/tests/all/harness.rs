@@ -367,6 +367,17 @@ impl Emulator {
         }
         self.call("DELETE", &format!("/tags{query}"), None).await
     }
+
+    /// `CancelMetadataTransferJob`: PUT on the job's own `cancel` path, with the
+    /// job id as the only `@httpLabel` and no body.
+    pub(crate) async fn cancel_metadata_transfer_job(&self, metadata_transfer_job_id: &str) -> Resp {
+        self.call(
+            "PUT",
+            &format!("/metadata-transfer-jobs/{metadata_transfer_job_id}/cancel"),
+            None,
+        )
+        .await
+    }
 }
 
 pub(crate) fn workspace_arn(workspace_id: &str) -> String {

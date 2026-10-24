@@ -44,6 +44,8 @@ mod hcx_eip_associations;
 mod host_ec2_instances;
 #[path = "all/hosts.rs"]
 mod hosts;
+#[path = "all/list_while_initializing.rs"]
+mod list_while_initializing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging_not_found.rs"]

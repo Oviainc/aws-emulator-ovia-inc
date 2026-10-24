@@ -22,6 +22,10 @@ mod prefix_lists;
 // every new ec2 suite inserts its lines.
 #[path = "all/instance_attribute_reset.rs"]
 mod instance_attribute_reset;
+// Declared here rather than in sorted position, for the reason above: the sorted
+// neighbourhood of this suite is the contended region of this file.
+#[path = "all/local_gateway_routes.rs"]
+mod local_gateway_routes;
 #[path = "all/address_transfers.rs"]
 mod address_transfers;
 #[path = "all/allowed_images_settings.rs"]

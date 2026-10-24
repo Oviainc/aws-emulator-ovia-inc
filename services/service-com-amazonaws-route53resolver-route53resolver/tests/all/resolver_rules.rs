@@ -6,8 +6,8 @@
 //! Every case goes over the wire the service actually speaks (awsJson1_1,
 //! `POST /` with `X-Amz-Target: Route53Resolver.<OperationName>`), through the
 //! same router the emulator mounts, so what is asserted is the HTTP behaviour
-//! and not a handler called directly. The transport helpers are the ones the
-//! endpoint suite already owns.
+//! and not a handler called directly. The transport helpers are the shared
+//! ones in [`super::harness`].
 
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::resolver_endpoints::{
+use super::harness::{
     call, emulator, error_type, expect_error, ok, parse_time, string_member, without_status,
     ACCOUNT, REGION,
 };

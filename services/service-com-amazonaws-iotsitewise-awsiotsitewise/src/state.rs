@@ -2,7 +2,8 @@
 
 //! Engine state for the com-amazonaws-iotsitewise-awsiotsitewise service.
 //!
-//! The asset-model / asset / property-value and gateway slices of IoT SiteWise
+//! The asset-model / asset / property-value, gateway and dataset slices of IoT
+//! SiteWise
 //! live here: one map per resource plus the indexes the modelled lookup forms need
 //! (`externalId:<id>` labels, property aliases, a gateway's platform device). A
 //! resource's tags live on that resource's own record, reached by ARN through
@@ -22,8 +23,9 @@ use crate::ops::types::{
     AggregatedValue, Aggregates, AssetHierarchy, AssetModelCompositeModel,
     AssetModelCompositeModelPathSegment, AssetModelCompositeModelSummary, AssetModelHierarchy,
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
-    AssetPropertyValue, AssetStatus, AssetSummary, ExpressionVariable, GatewayCapabilitySummary,
-    GatewayPlatform, PropertyType, TimeInNanos, Variant,
+    AssetPropertyValue, AssetStatus, AssetSummary, DatasetConfig, DatasetSource, DatasetStatus,
+    ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, PropertyType, TimeInNanos,
+    Variant,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -169,6 +171,23 @@ pub const ASSET_RESOURCE_TYPE: &str = "asset";
 pub const ASSET_MODEL_RESOURCE_TYPE: &str = "asset-model";
 /// The ARN resource-type segment of a gateway ARN, as [`gateway_arn`] builds it.
 pub const GATEWAY_RESOURCE_TYPE: &str = "gateway";
+/// The ARN resource-type segment of a dataset ARN, as [`dataset_arn`] builds it.
+pub const DATASET_RESOURCE_TYPE: &str = "dataset";
+
+/// See [`MAX_ASSET_MODELS`]: the same bound, for the dataset map. `CreateDataset`
+/// is the only thing that adds a dataset and it declares the modelled
+/// `LimitExceededException` (HTTP 410), so that is how this store refuses past the
+/// cap. The emulator's own bound, not a published AWS default.
+pub const MAX_DATASETS: usize = 1_000;
+
+/// The `datasetVersion` a freshly created dataset reports.
+///
+/// A dataset's version counts the writes it has accepted — the create is the
+/// first — so it is derived from the stored record rather than minted, and a
+/// read never has to write for it to stay the same. The modelled `Version` type
+/// is a decimal string (`^(0|([1-9]{1}\d*))$`), which is how the counter reaches
+/// the wire.
+pub const DATASET_INITIAL_VERSION: u32 = 1;
 
 /// See [`MAX_ASSET_MODELS`]: the same bound, for the gateway map. `CreateGateway`
 /// is the only thing that adds a gateway and it declares the modelled
@@ -664,6 +683,81 @@ pub struct GatewayRecord {
     pub tags: HashMap<String, String>,
 }
 
+/// A stored dataset: everything `DescribeDataset` reports, plus the `tags` the
+/// tagging operations read.
+///
+/// `settling_state` holds a `DatasetState` value, which spells its states exactly
+/// as `AssetState` does — `CREATING`, `ACTIVE`, `UPDATING`, `DELETING` (plus
+/// `FAILED`, which nothing here produces) — so this record reuses
+/// [`STATE_CREATING`] / [`STATE_UPDATING`] / [`STATE_ACTIVE`] and the one
+/// [`state_at`] rule rather than a second spelling of the same values.
+#[derive(Debug, Clone)]
+pub struct DatasetRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// A `DatasetTypeEnum` value — `SESSION`, `CURATED` or `EXTERNAL` — when the
+    /// create named one. The member is optional on every shape that carries it,
+    /// so a dataset created without one has none rather than a guessed type.
+    pub dataset_type: Option<String>,
+    pub config: Option<DatasetConfig>,
+    pub metadata: HashMap<String, String>,
+    pub source: DatasetSource,
+    /// The workspace that contains the dataset, for a dataset created in one.
+    pub workspace_name: Option<String>,
+    pub creation_date: SystemTime,
+    pub last_update_date: SystemTime,
+    /// The instant the transition the clock owes — from [`Self::settling_state`]
+    /// to `ACTIVE` — falls due.
+    pub active_at: SystemTime,
+    /// The `DatasetState` this dataset reports until [`Self::active_at`] falls
+    /// due: [`STATE_CREATING`] for a freshly created dataset, [`STATE_UPDATING`]
+    /// while a mutating call it already accepted settles.
+    pub settling_state: String,
+    /// How many writes this dataset has accepted, which is the `datasetVersion`
+    /// it reports; see [`DATASET_INITIAL_VERSION`].
+    pub version: u32,
+    pub tags: HashMap<String, String>,
+}
+
+impl DatasetRecord {
+    /// The dataset's status as of `now`; see [`AssetModelRecord::status`].
+    pub fn status(&self, now: SystemTime) -> DatasetStatus {
+        DatasetStatus {
+            state: self.state(now).to_string(),
+            error: None,
+        }
+    }
+
+    /// The dataset's `DatasetState` as of `now`: its [`Self::settling_state`]
+    /// until the owed transition falls due, `ACTIVE` from then on. Derived, so a
+    /// read never has to write.
+    pub fn state(&self, now: SystemTime) -> &str {
+        state_at(&self.settling_state, self.active_at, now)
+    }
+
+    /// The `datasetVersion` this dataset reports: its accepted-write count as the
+    /// decimal string the modelled `Version` type is.
+    pub fn version_label(&self) -> String {
+        self.version.to_string()
+    }
+
+    /// Record that a mutating call landed at `now`: the dataset reports
+    /// `UPDATING` until the transition that call owes falls due and `ACTIVE`
+    /// after it, and the write it accepted takes the dataset to its next version.
+    ///
+    /// The due instant is STORED, never slept on, so the caller's own call
+    /// returns immediately and the transient state is still what a read taken
+    /// straight afterwards observes.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.last_update_date = now;
+        self.settling_state = STATE_UPDATING.to_string();
+        self.active_at = now + ACTIVATION_DELAY;
+        self.version = self.version.saturating_add(1);
+    }
+}
+
 /// The platform device a gateway runs on, as a single comparable key: the
 /// Greengrass V1 group ARN, the Greengrass V2 core device thing name or the Siemens
 /// Industrial Edge IoT Core thing name, whichever the platform names.
@@ -761,6 +855,7 @@ macro_rules! tagged_record {
 tagged_record!(AssetRecord);
 tagged_record!(AssetModelRecord);
 tagged_record!(GatewayRecord);
+tagged_record!(DatasetRecord);
 
 /// `record`'s tag set, but only when `record` is the one `arn` names exactly —
 /// same partition, account and region, not merely the same id.
@@ -828,6 +923,8 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// on a given platform device. One device hosts at most one gateway, so this
     /// is what makes a second create naming the same device a conflict.
     pub gateway_devices: HashMap<String, String>,
+    /// Datasets by `datasetId`.
+    pub datasets: HashMap<String, DatasetRecord>,
 }
 
 impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
@@ -1238,6 +1335,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             ASSET_RESOURCE_TYPE => tags_of(self.assets.get(id), arn),
             ASSET_MODEL_RESOURCE_TYPE => tags_of(self.asset_models.get(id), arn),
             GATEWAY_RESOURCE_TYPE => tags_of(self.gateways.get(id), arn),
+            DATASET_RESOURCE_TYPE => tags_of(self.datasets.get(id), arn),
             _ => None,
         }
     }
@@ -1249,6 +1347,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             ASSET_RESOURCE_TYPE => tags_of_mut(self.assets.get_mut(id), arn),
             ASSET_MODEL_RESOURCE_TYPE => tags_of_mut(self.asset_models.get_mut(id), arn),
             GATEWAY_RESOURCE_TYPE => tags_of_mut(self.gateways.get_mut(id), arn),
+            DATASET_RESOURCE_TYPE => tags_of_mut(self.datasets.get_mut(id), arn),
             _ => None,
         }
     }
@@ -1600,6 +1699,9 @@ pub const RESOURCE_ASSET: &str = "Asset";
 
 /// The resource kind those errors name for an asset model.
 pub const RESOURCE_ASSET_MODEL: &str = "Asset Model";
+
+/// The resource kind those errors name for a dataset.
+pub const RESOURCE_DATASET: &str = "Dataset";
 
 /// The resource kind those errors name for a composite model of an asset model.
 ///
@@ -1978,6 +2080,16 @@ pub fn check_tag_key(key: &str) -> Result<(), String> {
 /// documents: `arn:${Partition}:iotsitewise:${Region}:${Account}:gateway/${GatewayId}`.
 pub fn gateway_arn(region: &str, gateway_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("gateway/{gateway_id}"))
+}
+
+/// The canonical ARN of a dataset in `region`, in the form `CreateDataset`
+/// documents: `arn:${Partition}:iotsitewise:${Region}:${Account}:dataset/${DatasetId}`.
+pub fn dataset_arn(region: &str, dataset_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{DATASET_RESOURCE_TYPE}/{dataset_id}"),
+    )
 }
 
 /// The character joining the two ids a `TimeSeriesId` is built from; see

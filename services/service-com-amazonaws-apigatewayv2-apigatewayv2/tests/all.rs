@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/api_endpoint_scheme.rs"]
 mod api_endpoint_scheme;
+#[path = "all/api_import.rs"]
+mod api_import;
 #[path = "all/api_lifecycle.rs"]
 mod api_lifecycle;
 #[path = "all/authorizer_lifecycle.rs"]

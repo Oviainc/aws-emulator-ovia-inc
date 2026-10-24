@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataSources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataSources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataSources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every direct-query data source of one domain, from the records
+//! `AddDataSource` persisted on it (`crate::state::Domain::data_sources`).
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +73,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::DataSource;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +149,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataSources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataSourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataSources"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // A pure read: a domain's data sources are reported exactly as they are
+        // stored, so this call writes nothing at all — the next caller sees what this
+        // one saw.
+        let store = state.lock();
+        let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
+            ListDataSourcesErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        // `DataSources` is the whole listing: the model gives this operation no page
+        // size and no token, so there is nothing to paginate by. What bounds the answer
+        // instead is the store itself — a domain holds at most
+        // [`crate::state::DATA_SOURCE_QUOTA`] data sources, which `AddDataSource`
+        // enforces, so this clone is bounded by that quota rather than unbounded.
+        // A domain with no data source reports an EMPTY list rather than no member —
+        // the member is "a list of data sources associated with specified domain", and
+        // for such a domain that list is empty.
+        let data_sources: Vec<DataSourceDetails> = domain
+            .data_sources
+            .values()
+            .map(DataSource::to_details)
+            .collect();
+
+        Ok(ListDataSourcesOutput {
+            data_sources: Some(data_sources),
+        })
     }
 }

@@ -152,6 +152,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        use crate::state::TokenOutcome;
+
         let _ = ctx;
         // A key in the reserved `aws:` namespace names a tag AWS generates, not one a
         // caller may set. The request is refused before the store is reached, so it
@@ -182,14 +184,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // hand back an id this service has stopped knowing.
         state.settle_all(std::time::Instant::now());
 
-        // `@idempotent` + `@idempotencyToken`: a repeat call carrying a token this
-        // service has already created for replays the SAME id and creates nothing.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(existing) = state.client_tokens.get(token) {
+        // `@idempotent` + `@idempotencyToken`: a token identifies ONE request, so a
+        // repeat call carrying a token this service has already created an instance for
+        // replays the SAME id and creates nothing ONLY where the parameters are the ones
+        // that token was spent on. A call that reuses a spent token with different
+        // parameters is a different request under a spent token, and is refused with the
+        // modelled `ConflictException` rather than handed an instance it did not ask
+        // for; nothing is written on that refusal.
+        //
+        // The fingerprint is taken over the request with its token cleared, so every
+        // member except the token itself is compared.
+        let mut parameters = input.clone();
+        parameters.client_token = None;
+        let fingerprint = crate::state::request_fingerprint(&parameters);
+        match crate::state::resolve_client_token(
+            &state.client_tokens,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            TokenOutcome::Replay(instance_id) => {
                 return Ok(CreateWorkspaceInstanceOutput {
-                    workspace_instance_id: Some(existing.clone()),
-                });
+                    workspace_instance_id: Some(instance_id),
+                })
             }
+            TokenOutcome::Mismatch(instance_id) => {
+                return Err(CreateWorkspaceInstanceErrorModeled::ConflictException(
+                    crate::state::idempotent_parameter_mismatch(
+                        &instance_id,
+                        crate::state::WORKSPACE_INSTANCE_RESOURCE_TYPE,
+                    ),
+                )
+                .into())
+            }
+            TokenOutcome::Unclaimed => {}
         }
 
         // A real account has a Service Quotas limit on RUNNING WorkSpace Instances,
@@ -246,7 +273,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         if let Some(token) = input.client_token {
-            state.client_tokens.insert(token, instance_id.clone());
+            state.client_tokens.insert(
+                token,
+                crate::state::IdempotencyClaim {
+                    resource_id: instance_id.clone(),
+                    fingerprint,
+                },
+            );
         }
         state.instances.insert(instance_id.clone(), record);
 

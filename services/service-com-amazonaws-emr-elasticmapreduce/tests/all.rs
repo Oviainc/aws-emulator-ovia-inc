@@ -15,6 +15,8 @@
 mod block_public_access;
 #[path = "all/emr_control_plane.rs"]
 mod emr_control_plane;
+#[path = "all/instance_groups.rs"]
+mod instance_groups;
 #[path = "all/job_flow_lifecycle.rs"]
 mod job_flow_lifecycle;
 #[path = "all/managed_scaling_policy.rs"]
