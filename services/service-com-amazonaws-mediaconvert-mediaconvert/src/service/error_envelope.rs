@@ -90,9 +90,11 @@ const MODELLED_EXCEPTIONS: [&str; 7] = [
 /// failure.
 ///
 /// AWS carries the validation report in this member when it rejects a job's `Settings`,
-/// and an empty string otherwise. This emulator runs no settings validation — nothing in
-/// `src/ops/` rejects a request for the content of `Settings` — so every error it answers
-/// is the "otherwise" case.
+/// and an empty string otherwise. The report's own JSON format is not published, so this
+/// emulator does not invent one: `CreateJob`'s settings refusal states the problem in the
+/// `message` of the `BadRequestException` it answers with — naming the settings member
+/// that must carry an entry (see `crate::state::JobSettingsProblem`) — and this member
+/// stays empty, as it is for every other failure.
 const NO_SETTINGS_VALIDATION_ERRORS: &str = "";
 
 /// The response header restJson1 resolves an error shape from, and the fallback source of

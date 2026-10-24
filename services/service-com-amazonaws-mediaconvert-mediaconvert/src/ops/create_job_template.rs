@@ -234,6 +234,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A hop destination names the queue a job created from this template may move to,
+        // which is a reference to a queue resource exactly as the member above is: one
+        // that resolves to nothing is the same modelled 404, naming the member it came
+        // from.
+        let hop_destinations = input.hop_destinations.unwrap_or_default();
+        if crate::state::hop_destination_queues(&hop_destinations)
+            .any(|reference| !state.holds_queue(reference))
+        {
+            return Err(CreateJobTemplateErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::not_found_message("hopDestinations")),
+                },
+            )
+            .into());
+        }
+
         // "A name you create for each job template. Each name must be unique within your
         // account." A create under a name that is already in use does NOT conflict: see
         // the match below.
@@ -253,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             acceleration_settings: input
                 .acceleration_settings
                 .unwrap_or_else(crate::state::default_acceleration_settings),
-            hop_destinations: input.hop_destinations.unwrap_or_default(),
+            hop_destinations,
             // A template a caller creates is custom; only built-in templates are SYSTEM.
             template_type: crate::state::TYPE_CUSTOM.to_string(),
             created_at: now,

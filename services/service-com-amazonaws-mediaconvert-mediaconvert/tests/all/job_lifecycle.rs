@@ -753,6 +753,19 @@ async fn create_job_persists_its_input_and_get_job_reads_it_back() {
         "the fixture queue must be created: got {} with body {}",
         created_queue.status, created_queue.body
     );
+    // The `jobTemplate` row below references this template: a `CreateJob` reference must
+    // resolve to a stored resource, so the template the job names is created first.
+    let created_template = emulator
+        .create_job_template(json!({
+            "name": "my-template",
+            "settings": { "inputs": [{ "timecodeSource": "ZEROBASED" }] }
+        }))
+        .await;
+    assert_eq!(
+        created_template.status, 201,
+        "the fixture job template must be created: got {} with body {}",
+        created_template.status, created_template.body
+    );
 
     let cases = vec![
         Case {

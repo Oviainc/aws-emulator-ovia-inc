@@ -221,6 +221,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "Optional. When you create a job, you can either specify a job template or
+        // specify the transcoding settings individually." A template the caller DID name
+        // is a reference to a job template resource — by name or by ARN, as every resource
+        // reference in this service is — so what is stored is the NAME it resolves to,
+        // which is this store's key for the template, exactly as the job's queue is stored
+        // as the queue's name. A member the caller SENT is a value they meant, so an empty
+        // one is refused rather than quietly dropped, as `CreateJobTemplate` refuses an
+        // empty `Queue`.
+        let job_template = match input.job_template.as_deref().map(str::trim) {
+            Some("") => {
+                return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
+                    message: Some("JobTemplate must not be empty.".to_string()),
+                })
+                .into())
+            }
+            Some(reference) => {
+                Some(crate::state::job_template_name_from_reference(reference).to_string())
+            }
+            None => None,
+        };
+        // Every hop destination that names a queue references one, so the list is resolved
+        // against the store below with the job's own `Queue`.
+        let hop_destinations = input.hop_destinations.unwrap_or_default();
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
@@ -258,6 +282,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Every other reference this request makes to a stored resource is resolved the
+        // same way, against the same guarded store: a reference that resolves to nothing
+        // is the modelled 404 naming the member it came from, never a job pointing at a
+        // resource no reader can see.
+        if crate::state::hop_destination_queues(&hop_destinations)
+            .any(|reference| !state.holds_queue(reference))
+        {
+            return Err(CreateJobErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("hopDestinations")),
+            })
+            .into());
+        }
+
+        // The settings graph is validated at SUBMIT time, against what the job will
+        // actually be run from: the request's own `Settings` plus whatever the referenced
+        // template supplies. A job that describes no source, or no outputs and has no
+        // template to supply them, describes no transcode at all, which is the modelled
+        // 400 — and nothing is stored, because this returns before `accept_job`.
+        let settings_problem = {
+            let template = match job_template.as_deref() {
+                Some(reference) => match state.job_template_settings(reference) {
+                    Some(settings) => Some(settings),
+                    None => {
+                        return Err(CreateJobErrorModeled::NotFoundException(NotFoundException {
+                            message: Some(crate::state::not_found_message("jobTemplate")),
+                        })
+                        .into())
+                    }
+                },
+                None => None,
+            };
+            crate::state::job_settings_problem(&input.settings, template)
+        };
+        if let Some(problem) = settings_problem {
+            return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some(problem.message()),
+            })
+            .into());
+        }
+
         // The id, the clock-owed exit from SUBMITTED and the idempotency entry are all
         // owned by `accept_job`, which also enforces the store's `MAX_JOBS` ceiling, so
         // caller-driven growth is bounded.
@@ -267,7 +331,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             role: input.role,
             settings: input.settings,
             queue,
-            job_template: input.job_template,
+            // The resolved template name, so a later reader sees the template this job
+            // was created from under the name the store holds it by.
+            job_template,
             // Every member below is one the service fills in when the request omits it:
             // "If you don't specify a priority, the service uses the default value 0",
             // "Leave blank to use the default value, Job" for the billing tags source,
@@ -287,7 +353,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_else(crate::state::default_acceleration_settings),
             // Nothing has shared this job: a resource share is what moves the status.
             share_status: crate::state::SHARE_STATUS_NOT_SHARED.to_string(),
-            hop_destinations: input.hop_destinations.unwrap_or_default(),
+            hop_destinations,
             job_engine_version_requested: input.job_engine_version,
             simulate_reserved_queue: input.simulate_reserved_queue,
             user_metadata: input.user_metadata.unwrap_or_default().into_iter().collect(),

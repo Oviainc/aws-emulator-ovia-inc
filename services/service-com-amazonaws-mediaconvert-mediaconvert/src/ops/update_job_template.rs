@@ -206,6 +206,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let queue_missing = queue
             .as_deref()
             .is_some_and(|queue| !state.queues.contains_key(queue));
+        // A hop destination's `Queue` is a reference to a queue resource exactly as the
+        // member above is, so a new hop list is resolved the same way, under the same
+        // guard, before anything is applied.
+        let hop_queue_missing = input.hop_destinations.as_deref().is_some_and(|hops| {
+            crate::state::hop_destination_queues(hops)
+                .any(|reference| !state.holds_queue(reference))
+        });
 
         // The ADDRESSED resource is checked first: the template must exist, and a
         // built-in one cannot be changed at all — "System or built-in job templates can't
@@ -226,6 +233,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if queue_missing {
             return Err(UpdateJobTemplateErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::not_found_message("queue")),
+            })
+            .into());
+        }
+        if hop_queue_missing {
+            return Err(UpdateJobTemplateErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("hopDestinations")),
             })
             .into());
         }

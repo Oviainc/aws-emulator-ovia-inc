@@ -546,10 +546,107 @@ pub fn account_endpoint_url(region: &str) -> String {
 /// `CreateJob`'s `Queue` and `ListJobs`' `queue` both accept either form; the resource
 /// id in a MediaConvert queue ARN is `queues/<name>`.
 pub fn queue_name_from_reference(reference: &str) -> &str {
-    match reference.rsplit_once(":queues/") {
+    resource_name_from_reference(RESOURCE_TYPE_QUEUES, reference)
+}
+
+/// The job template name a caller named, whether they gave the name or the template's
+/// ARN.
+///
+/// `CreateJob$JobTemplate` ("when you create a job, you can either specify a job template
+/// or specify the transcoding settings individually") is a reference to a job template
+/// resource, so it accepts the same two forms every resource reference in this service
+/// does; the resource id in a MediaConvert job template ARN is `jobTemplates/<name>`.
+pub fn job_template_name_from_reference(reference: &str) -> &str {
+    resource_name_from_reference(RESOURCE_TYPE_JOB_TEMPLATES, reference)
+}
+
+/// The resource name inside a reference that is either a bare name or the ARN of a
+/// MediaConvert resource of `resource_type`.
+///
+/// One function for every kind of reference this service resolves, because the resource id
+/// of a MediaConvert ARN is `<plural type>/<name>` for all of them (see
+/// [`TaggedResource::resource_id`]); a value that is not an ARN is the name itself.
+fn resource_name_from_reference<'a>(resource_type: &str, reference: &'a str) -> &'a str {
+    let separator = format!(":{resource_type}/");
+    match reference.rsplit_once(separator.as_str()) {
         Some((prefix, name)) if prefix.starts_with("arn:") => name,
         _ => reference,
     }
+}
+
+/// The queue reference of every hop destination that names one, in request order.
+///
+/// `HopDestination$Queue` is "Optional unless the job is submitted on the default queue.
+/// When you set up a job to use queue hopping, you can specify a destination queue" — so a
+/// hop destination that names no queue references nothing, and one that DOES name a queue
+/// references a queue resource exactly as `CreateJob$Queue` does.
+pub fn hop_destination_queues(hops: &[HopDestination]) -> impl Iterator<Item = &str> + '_ {
+    hops.iter().filter_map(|hop| hop.queue.as_deref())
+}
+
+/// What a submitted job's settings graph is missing for the job to describe a transcode at
+/// all.
+///
+/// `JobSettings$Inputs` is "Use Inputs to define source file used in the transcode job" and
+/// `JobSettings$OutputGroups` is "Contains one group of settings for each set of outputs":
+/// a job with no input names nothing to read and a job with no output group names nothing
+/// to write, so in either case there is no transcode for the service to run. MediaConvert
+/// validates the settings graph when the job is SUBMITTED — the error envelope's
+/// `settingsValidationErrorsJsonBlob` member exists to report exactly that — and refuses
+/// such a request with `BadRequestException` (400) rather than storing a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobSettingsProblem {
+    /// Nothing supplies an input, so the job names no source.
+    NoInputs,
+    /// Nothing supplies an output group, so the job names no outputs.
+    NoOutputGroups,
+}
+
+impl JobSettingsProblem {
+    /// The refusal's wording: the settings member that must carry an entry and what it
+    /// describes. Built from the request's own members, as every member-naming refusal in
+    /// this crate is (see [`not_found_message`]), never from a recorded sentence.
+    pub fn message(self) -> String {
+        match self {
+            Self::NoInputs => {
+                "Your job settings must specify at least one entry in Inputs: use Inputs to \
+                 define the source file used in the transcode job."
+            }
+            Self::NoOutputGroups => {
+                "Your job settings must specify at least one entry in OutputGroups: use \
+                 OutputGroups to define each set of outputs the transcode produces, or \
+                 create the job from a job template that supplies them."
+            }
+        }
+        .to_string()
+    }
+}
+
+/// What is missing from the settings a `CreateJob` request submits, or `None` when they
+/// describe a transcode.
+///
+/// `template` is the stored settings of the job template the request referenced, when it
+/// referenced one: a job template is "a pre-made set of encoding instructions that you can
+/// use to quickly create a job", so a job that carries only its inputs and takes its
+/// outputs from its template describes a transcode just as fully as one that spells both
+/// out. The EFFECTIVE graph — what the request carries plus what the template supplies — is
+/// therefore what is tested here. An absent list and an empty list are the same thing: a
+/// list with no entries supplies nothing.
+pub fn job_settings_problem(
+    settings: &JobSettings,
+    template: Option<&JobTemplateSettings>,
+) -> Option<JobSettingsProblem> {
+    let inputs = settings.inputs.iter().flatten().count()
+        + template.map_or(0, |template| template.inputs.iter().flatten().count());
+    if inputs == 0 {
+        return Some(JobSettingsProblem::NoInputs);
+    }
+    let output_groups = settings.output_groups.iter().flatten().count()
+        + template.map_or(0, |template| template.output_groups.iter().flatten().count());
+    if output_groups == 0 {
+        return Some(JobSettingsProblem::NoOutputGroups);
+    }
+    None
 }
 
 /// The resource-type prefixes a MediaConvert resource ARN can carry.
@@ -2007,6 +2104,29 @@ impl ComAmazonawsMediaconvertMediaconvertState {
             return None;
         }
         self.jobs.get(&entry.job_id)
+    }
+
+    /// Whether this store holds the queue a reference names, in either form a queue
+    /// reference comes in ([`queue_name_from_reference`]).
+    ///
+    /// For a reference the caller has NOT already reduced to a name: the hop destinations
+    /// of a job or of a job template, each of which may name its queue either way. A
+    /// handler that resolved the name itself — because it STORES it, as `CreateJob` stores
+    /// the name of the queue the job was submitted to — probes `queues` with that name.
+    pub fn holds_queue(&self, reference: &str) -> bool {
+        self.queues
+            .contains_key(queue_name_from_reference(reference))
+    }
+
+    /// The stored settings of the job template a reference names, or `None` when this
+    /// store holds no template under that name.
+    ///
+    /// The template is resolved from the reference exactly as a queue is
+    /// ([`job_template_name_from_reference`]), so a caller may name it by name or by ARN.
+    pub fn job_template_settings(&self, reference: &str) -> Option<&JobTemplateSettings> {
+        self.job_templates
+            .get(job_template_name_from_reference(reference))
+            .map(|template| &template.settings)
     }
 
     /// Cancel a stored job: "Permanently cancel a job. Once you have canceled a job, you
