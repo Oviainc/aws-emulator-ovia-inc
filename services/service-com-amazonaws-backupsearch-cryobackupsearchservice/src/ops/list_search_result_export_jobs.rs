@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSearchResultExportJobs
-//! Pages over the export jobs held in [`crate::state`], newest-last in creation order.
+//! Pages over the export jobs held in [`crate::state`], NEWEST-CREATED FIRST — the same
+//! order `ListSearchJobs` reports a search-job listing in, so a single-page read is "the
+//! latest export job".
+//!
 //! `Status` and `SearchJobIdentifier` are both FILTERS: a `SearchJobIdentifier` that
 //! names no search job narrows the listing to nothing and answers 200 with an empty
 //! `ExportJobs`, exactly as filtering by a real search job with no exports does — a
@@ -177,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // filter the request carried. Neither one is looked up as a resource, so
         // neither can turn a listing into a not-found.
         let summaries: Vec<ExportJobSummary> = state
-            .export_jobs_in_order()
+            .export_jobs_newest_first()
             .filter(|export| {
                 input
                     .status

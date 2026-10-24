@@ -45,7 +45,7 @@ const REGION: &str = "us-west-2";
 /// A `RoleArn` the pass-role check accepts: a role in the account this emulator
 /// attributes every caller to. The `@pattern` on the model's `IamRoleArn` member is
 /// `^arn:(?:aws|aws-cn|aws-us-gov):iam::[a-z0-9-]+:role/(.+)$`, which this satisfies.
-fn passable_role(name: &str) -> String {
+pub(crate) fn passable_role(name: &str) -> String {
     format!(
         "arn:aws:iam::{}:role/{name}",
         engine::emulator_account_id()
@@ -87,7 +87,7 @@ async fn started_job(emulator: &MultiServiceRouter) -> String {
 /// Seed one search job in `status`, with `backups` recovery points covered, straight
 /// into the store: `FAILED` is a status no sequence of calls reaches in this emulator,
 /// and seeding keeps every row of a status table deterministic and sleep-free.
-fn seed_job(
+pub(crate) fn seed_job(
     engine: &engine::InMemoryEngine,
     identifier: &str,
     status: &str,
@@ -134,7 +134,7 @@ fn backup(index: usize, status: &str, resource_type: &str) -> types::SearchJobBa
 }
 
 /// Every export job currently listed, with the filters `query` carries.
-async fn listed_exports(emulator: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn listed_exports(emulator: &MultiServiceRouter, query: &str) -> Answer {
     call(
         emulator,
         REGION,
