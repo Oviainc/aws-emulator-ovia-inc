@@ -1161,6 +1161,63 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
             .filter(|association| association.region == region)
     }
 
+    /// [`Self::account_association_in`], mutably.
+    pub fn account_association_in_mut(
+        &mut self,
+        region: &str,
+        id: &str,
+    ) -> Option<&mut AccountAssociation> {
+        self.account_associations
+            .get_mut(id)
+            .filter(|association| association.region == region)
+    }
+
+    /// The tags of the resource the `IoTManagedIntegrationsResourceARN` `arn` names, as
+    /// `region`'s endpoint resolves it: the ONE tag map the ARN-addressed tagging surface
+    /// reads and writes, which is the same map the resource's own read reports.
+    ///
+    /// The ARN has to be one this region really minted — it carries the region and the
+    /// account it belongs to — so an ARN of another region or account resolves to nothing
+    /// here, exactly as an identifier of another region does ([`Self::managed_thing_in`]).
+    /// The pattern admits five resource types; the two this service STORES resolve, and an
+    /// ARN naming a kind whose create is not implemented holds no record under any id, so
+    /// it resolves to nothing.
+    pub fn tags_of(&self, region: &str, arn: &str) -> Option<&HashMap<String, String>> {
+        let parts = parse_resource_arn(arn).filter(|parts| parts.region == region)?;
+        match parts.resource_type_segment {
+            MANAGED_THING_ARN_SEGMENT => self
+                .managed_thing_in(region, parts.id)
+                .filter(|thing| thing.arn == arn)
+                .map(|thing| &thing.tags),
+            ACCOUNT_ASSOCIATION_ARN_SEGMENT => self
+                .account_association_in(region, parts.id)
+                .filter(|association| association.arn == arn)
+                .map(|association| &association.tags),
+            _ => None,
+        }
+    }
+
+    /// [`Self::tags_of`], mutably: what a tagging call adds to or removes from, so the
+    /// write side resolves an ARN by exactly the rule the read side resolves it by.
+    pub fn tags_of_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut HashMap<String, String>> {
+        let parts = parse_resource_arn(arn).filter(|parts| parts.region == region)?;
+        match parts.resource_type_segment {
+            MANAGED_THING_ARN_SEGMENT => self
+                .managed_thing_in_mut(region, parts.id)
+                .filter(|thing| thing.arn == arn)
+                .map(|thing| &mut thing.tags),
+            ACCOUNT_ASSOCIATION_ARN_SEGMENT => self
+                .account_association_in_mut(region, parts.id)
+                .filter(|association| association.arn == arn)
+                .map(|association| &mut association.tags),
+            _ => None,
+        }
+    }
+
     /// The destination `region`'s endpoint holds under `name`, if any. A destination
     /// created in another region is not visible here, as for every regional resource.
     pub fn destination_in(&self, region: &str, name: &str) -> Option<&Destination> {
@@ -1934,9 +1991,20 @@ pub fn ota_task_configuration_not_found_on_read(identifier: &str) -> ResourceNot
     }
 }
 
+/// The resource-type segment a managed thing's ARN carries, which is also how the
+/// `IoTManagedIntegrationsResourceARN` pattern names that kind of resource.
+pub const MANAGED_THING_ARN_SEGMENT: &str = "managed-thing";
+
+/// The resource-type segment an account association's ARN carries, named the same way.
+pub const ACCOUNT_ASSOCIATION_ARN_SEGMENT: &str = "account-association";
+
 /// The ARN of a managed thing in `region`, as the `ManagedThingArn` pattern requires.
 pub fn managed_thing_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn(SERVICE_ARN_NAMESPACE, region, &format!("managed-thing/{id}"))
+    ::engine::emulator_arn(
+        SERVICE_ARN_NAMESPACE,
+        region,
+        &format!("{MANAGED_THING_ARN_SEGMENT}/{id}"),
+    )
 }
 
 /// The ARN of an account association in `region`, as the `AccountAssociationArn` pattern
@@ -1946,8 +2014,117 @@ pub fn account_association_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(
         SERVICE_ARN_NAMESPACE,
         region,
-        &format!("account-association/{id}"),
+        &format!("{ACCOUNT_ASSOCIATION_ARN_SEGMENT}/{id}"),
     )
+}
+
+/// What an ARN of this service names: the region the resource belongs to, the
+/// resource-type segment, and the resource's own id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceArnParts<'a> {
+    pub region: &'a str,
+    /// The resource-type segment — `managed-thing`, `account-association`, … — which is
+    /// what the ARN states the KIND of resource through.
+    pub resource_type_segment: &'a str,
+    /// The resource's own identifier, the segment after the `/`.
+    pub id: &'a str,
+}
+
+/// The parts of `arn` when it is an ARN of THIS service naming one resource, else `None`.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<type>/<id>`, so the service
+/// segment has to be this service's ([`SERVICE_ARN_NAMESPACE`]) and the resource segment
+/// has to carry both a type and an id — which is what every ARN this service mints looks
+/// like ([`managed_thing_arn`], [`account_association_arn`]).
+pub fn parse_resource_arn(arn: &str) -> Option<ResourceArnParts<'_>> {
+    // The resource segment may itself carry `:`, so only the first five fields are split.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let _partition = fields.next()?;
+    if fields.next()? != SERVICE_ARN_NAMESPACE {
+        return None;
+    }
+    let region = fields.next()?;
+    let _account = fields.next()?;
+    let (resource_type_segment, id) = fields.next()?.split_once('/')?;
+    (!region.is_empty() && !resource_type_segment.is_empty() && !id.is_empty()).then_some(
+        ResourceArnParts {
+            region,
+            resource_type_segment,
+            id,
+        },
+    )
+}
+
+/// The most tags one resource of this service carries: the `@length` maximum of `TagsMap`
+/// (`smithy_query(query="shape",shape="TagsMap")` -> length 1..50), the shape both the
+/// `Tags` a tagging call sends and the `tags` a tag read reports target. A resource whose
+/// tag map grew past it could not be REPORTED on the member the model declares for it, so
+/// the bound is enforced on the map a tagging call would leave the resource carrying.
+pub const MAX_RESOURCE_TAGS: usize = 50;
+
+/// How this service states that a tagging call would leave a resource carrying more tags
+/// than one resource may have: the bound, and the number the merged map would come to.
+///
+/// Built FROM THE REQUEST — the count is the stored map plus the keys the request adds —
+/// and it names no tag key or value, because `TagsMap` is `@sensitive` and an error body
+/// must not publish a value the model marks so.
+pub fn too_many_tags_message(merged: usize) -> String {
+    format!(
+        "A resource carries at most {MAX_RESOURCE_TAGS} tags; this request would leave it \
+         carrying {merged}."
+    )
+}
+
+/// The resource as the 404 of an ARN-addressed call names it when the ARN states no kind
+/// this service knows — the subject of [`resource_name_not_found_message`] in that one
+/// case, where there is no resource kind to word the sentence with.
+pub const TAGGED_RESOURCE_SUBJECT: &str = "Resource";
+
+/// The modelled `ResourceNotFoundException` an ARN-addressed tagging call answers for an
+/// `IoTManagedIntegrationsResourceARN` the caller's region holds no resource under.
+///
+/// The ARN states the KIND it addresses in its resource-type segment, so the sentence is
+/// worded from the ARN itself: the segment's words give both the `ResourceType` this
+/// service reports (`managed-thing` -> `ManagedThing`, which is
+/// [`MANAGED_THING_RESOURCE_TYPE`]) and the resource's name in words that the read path's
+/// reason states (`Managed Thing`, which is [`MANAGED_THING_RESOURCE_NAME`]) — so one
+/// sentence serves every kind the tagging surface addresses, worded through the same
+/// helper every other read of this service uses. `ResourceId` carries the ARN the request
+/// named, as every 404 of this service reports the identifier it was given.
+pub fn tagged_resource_not_found(arn: &str) -> ResourceNotFoundException {
+    let Some(parts) = parse_resource_arn(arn) else {
+        // Not reachable through the wire — the member's modelled pattern refuses a string
+        // this cannot parse, so such a request is refused before any handler runs — but it
+        // is still an ARN naming no resource, so it answers the same 404 with no kind.
+        return ResourceNotFoundException {
+            message: Some(resource_name_not_found_message(TAGGED_RESOURCE_SUBJECT)),
+            resource_id: Some(arn.to_string()),
+            resource_type: None,
+        };
+    };
+    let words: Vec<String> = parts
+        .resource_type_segment
+        .split('-')
+        .filter(|word| !word.is_empty())
+        .map(capitalized)
+        .collect();
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(&words.join(" "))),
+        ..resource_not_found(&words.concat(), arn)
+    }
+}
+
+/// `word` with its first character upper-cased, which is how the words of a resource-type
+/// segment are rendered into the resource's type and name ([`tagged_resource_not_found`]).
+fn capitalized(word: &str) -> String {
+    let mut characters = word.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
 }
 
 /// The modelled `ResourceNotFoundException` a READ answers for an account association the

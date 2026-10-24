@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let user = pool
             .user_mut(&input.username)
-            .ok_or_else(|| user_not_found(&input.username))?;
+            .ok_or_else(user_not_found)?;
 
         user.password = Some(input.password);
         user.password_permanent = input.permanent;
@@ -229,10 +229,12 @@ fn user_pool_not_found(user_pool_id: &str) -> AdminSetUserPasswordError {
     .into()
 }
 
-/// This operation's `UserNotFoundException` for an absent user.
-fn user_not_found(username: &str) -> AdminSetUserPasswordError {
+/// This operation's `UserNotFoundException` for an absent user. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> AdminSetUserPasswordError {
     AdminSetUserPasswordErrorModeled::UserNotFoundException(UserNotFoundException {
-        message: Some(format!("User {username} does not exist.")),
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

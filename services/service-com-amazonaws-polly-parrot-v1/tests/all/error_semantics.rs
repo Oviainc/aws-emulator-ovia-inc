@@ -71,7 +71,9 @@ fn assert_refusal(
 /// A PLS lexicon with one lexeme whose `element` replacement is `length` characters.
 fn pls_with_replacement(element: &str, length: usize) -> String {
     format!(
-        "<lexicon version=\"1.0\" alphabet=\"ipa\" xml:lang=\"en-US\">\
+        "<lexicon version=\"1.0\" \
+         xmlns=\"http://www.w3.org/2005/01/pronunciation-lexicon\" \
+         alphabet=\"ipa\" xml:lang=\"en-US\">\
          <lexeme><grapheme>G</grapheme><{element}>{}</{element}></lexeme></lexicon>",
         "x".repeat(length)
     )
@@ -383,8 +385,11 @@ async fn every_modeled_error_carries_the_fixed_message_for_its_code() {
         );
     }
     for language in ["xx-ZZ", "klingon", "zz"] {
-        let content =
-            format!("<lexicon version=\"1.0\" alphabet=\"ipa\" xml:lang=\"{language}\"/>");
+        let content = format!(
+            "<lexicon version=\"1.0\" \
+             xmlns=\"http://www.w3.org/2005/01/pronunciation-lexicon\" \
+             alphabet=\"ipa\" xml:lang=\"{language}\"/>"
+        );
         assert_refusal(
             &format!("PutLexicon language {language:?}"),
             &polly.put_lexicon("BadLanguage", &content).await,

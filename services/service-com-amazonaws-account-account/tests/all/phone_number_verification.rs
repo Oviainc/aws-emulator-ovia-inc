@@ -15,10 +15,9 @@
 //! passcode back, which consumes it; every other submission is refused and
 //! advances nothing (a well-formed passcode that is not the outstanding one with
 //! `ValidationException`, a submission with nothing outstanding with
-//! `ConflictException`), and both operations refuse an account with no primary
-//! contact (`ResourceNotFoundException`) or no record at all
-//! (`AccessDeniedException`). `GetContactInformation` reports whatever that
-//! machine last reached as `VerificationStatus`.
+//! `ConflictException`), and both operations refuse an account this emulator
+//! holds no record of (`AccessDeniedException`). `GetContactInformation` reports
+//! whatever that machine last reached as `VerificationStatus`.
 //!
 //! The tables below span that class: rows differ along the form and the length
 //! of the phone number (parenthesised, spaced, each published length bound),
@@ -640,31 +639,29 @@ async fn the_flow_is_keyed_by_the_resolved_account() {
     );
 }
 
-/// With no primary contact stored there is no phone number to verify: both
-/// operations answer `ResourceNotFoundException`, and a submission with nothing
-/// outstanding answers `ConflictException` rather than inventing a status.
+/// A submission with nothing outstanding answers `ConflictException` rather than
+/// inventing a status — before any contact was put (the account's primary
+/// contact is the one its record was created with) and after one was.
 #[tokio::test]
 async fn a_flow_with_nothing_to_act_on_is_refused() {
     let emulator = Emulator::new();
 
-    // (case, the answer, expected status, expected code)
-    let cases: Vec<(&str, Answer, u16, &str)> = vec![
-        (
-            "SendPhoneNumberVerification before any contact is stored",
-            emulator.send_phone_number_verification(json!({})).await,
-            404,
-            "ResourceNotFoundException",
-        ),
-        (
-            "VerifyPhoneNumber before any contact is stored",
-            emulator.verify_phone_number(json!({"Otp": "A1b2C3"})).await,
-            404,
-            "ResourceNotFoundException",
-        ),
-    ];
-    for (case, answer, status, code) in cases {
-        assert_refused(case, &answer, status, code);
-    }
+    // Nothing has been sent to the phone number the record carries, so there is
+    // nothing to evaluate a submission against.
+    let refused = emulator.verify_phone_number(json!({"Otp": "A1b2C3"})).await;
+    assert_refused(
+        "VerifyPhoneNumber before any passcode was sent",
+        &refused,
+        409,
+        "ConflictException",
+    );
+    assert_reported_status(
+        "VerifyPhoneNumber before any passcode was sent",
+        &emulator,
+        json!({}),
+        UNVERIFIED,
+    )
+    .await;
 
     let put = emulator
         .put_contact_information(json!({"ContactInformation": contact_with("+12065550100")}))
@@ -691,6 +688,92 @@ async fn a_flow_with_nothing_to_act_on_is_refused() {
         UNVERIFIED,
     )
     .await;
+}
+
+/// The phone number an account record is CREATED with is a real number in the
+/// store: the passcode flow runs over it before any `PutContactInformation`, for
+/// the caller's own account and for a member account, and the flow verifies a
+/// number without rewriting the contact that number belongs to.
+#[tokio::test]
+async fn the_created_with_phone_number_runs_the_passcode_flow() {
+    let member = "210987654321";
+
+    // (case, the account the request names, the read)
+    let cases: Vec<(&str, Value, Value)> = vec![
+        (
+            "the caller's own account, unnamed",
+            json!({}),
+            json!({}),
+        ),
+        (
+            "a member account, named",
+            json!({"AccountId": member}),
+            json!({"AccountId": member}),
+        ),
+    ];
+
+    for (case, request, read) in cases {
+        let emulator = Emulator::new();
+        let account_id = request["AccountId"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| default_account_id().to_string());
+        if account_id != default_account_id() {
+            // The record comes into existence here, with the primary contact it
+            // is created with — no contact was ever put for it.
+            let created = emulator
+                .call(
+                    "/putAccountName",
+                    json!({"AccountId": account_id, "AccountName": "Member"}),
+                )
+                .await;
+            assert_eq!(
+                created.status, 200,
+                "case {case:?}: PutAccountName must answer 200, got {} with {:?}",
+                created.status, created.body
+            );
+        }
+
+        let before = emulator.get_contact_information(read.clone()).await;
+        assert_eq!(
+            before.status, 200,
+            "case {case:?}: GetContactInformation must answer 200 before any put, got {} \
+             with {:?}",
+            before.status, before.body
+        );
+        assert_eq!(
+            before.verification_status(),
+            UNVERIFIED,
+            "case {case:?}: a number no passcode was sent to must be {UNVERIFIED}, got {:?}",
+            before.body
+        );
+
+        let sent = emulator
+            .send_phone_number_verification(request.clone())
+            .await;
+        assert_status(case, &sent, PENDING);
+        assert_reported_status(case, &emulator, read.clone(), PENDING).await;
+
+        let passcode = emulator
+            .outstanding_passcode(&account_id)
+            .expect("sending a passcode stores one");
+        assert_well_formed_passcode(case, &passcode);
+        let mut submission = request.clone();
+        submission["Otp"] = json!(passcode);
+        let verified = emulator.verify_phone_number(submission).await;
+        assert_status(case, &verified, VERIFIED);
+        assert_reported_status(case, &emulator, read.clone(), VERIFIED).await;
+
+        // The flow moved a status, not the contact: the structure the record was
+        // created with is the one still reported.
+        let after = emulator.get_contact_information(read).await;
+        assert_eq!(
+            after.body["ContactInformation"], before.body["ContactInformation"],
+            "case {case:?}: the passcode flow must leave the primary contact untouched, \
+             got {:?} after {:?}",
+            after.body, before.body
+        );
+    }
 }
 
 /// A value outside `Otp`'s modelled `^[a-zA-Z0-9]{6}$` is refused at the

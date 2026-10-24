@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags the resource its `ResourceArn` addresses carries: the STORED tag map
+//! of that one resource, resolved through the region the request was signed for
+//! ([`crate::state::ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState::tags_of`]),
+//! so what a tagging call or a create wrote is what comes back. A pure read: it writes
+//! nothing, so reading one resource's tags cannot change what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +65,9 @@
 //! * `ResourceNotFoundException` (HTTP 404) — The specified resource does not exist.
 //! * `ThrottlingException` (HTTP 429) — The rate exceeds the limit.
 //! * `UnauthorizedException` (HTTP 401) — You are not authorized to perform this operation.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   this operation's own error list omits the shape, which the SERVICE models, so an
+//!   unreachable store has a modelled failure to answer with.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -83,9 +83,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iotmanagedintegrations-
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iotmanagedintegrations#ListTagsForResource")]
+// `InternalServerException` is widened in through `extra_errors`: this SERVICE models it
+// (and most of its operations declare it) though this operation's own error list omits it,
+// so an unreachable store has a MODELLED failure to answer with instead of a 501, which
+// means "not written yet".
+#[smithy_macros::operation_error(
+    "com.amazonaws.iotmanagedintegrations#ListTagsForResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
+    InternalServerException(InternalServerException),
     InvalidRequestException(InvalidRequestException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
@@ -143,18 +151,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the resource store is unavailable".to_string()),
+            })
+        })?;
+
+        // Every resource of this service is regional, so the ARN is resolved through the
+        // region the request was signed for: an ARN another region minted names nothing
+        // here, exactly as an identifier of another region does.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        let tags = store.tags_of(&region, &input.resource_arn).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::state::tagged_resource_not_found(&input.resource_arn),
+            )
+        })?;
+
+        Ok(ListTagsForResourceOutput {
+            // `TagsMap` is `@length` 1..50, so a resource carrying no tag reports the
+            // member as ABSENT rather than as an empty map outside its own constraint —
+            // the same way every other read of this service reports its tags.
+            tags: (!tags.is_empty()).then(|| tags.clone()),
+        })
     }
 }

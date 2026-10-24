@@ -634,6 +634,19 @@ impl Region {
         }
     }
 
+    /// Start this Region's ENABLEMENT at this record: `RegionStatus::ADDING`, the value
+    /// `RegionMetadata$Status` documents for a Region whose "extension workflow is in
+    /// progress", which is what a Region carries until that workflow finishes and leaves
+    /// it `ACTIVE`.
+    ///
+    /// `RegionStatus` (`ACTIVE | ADDING | REMOVING`) is a DIFFERENT enum from the
+    /// instance-level `InstanceStatus` (`CREATE_IN_PROGRESS | CREATE_FAILED |
+    /// DELETE_IN_PROGRESS | ACTIVE`), so a Region record never carries an instance-level
+    /// value however the enablement was started: this is the one in-flight value it has.
+    pub fn start_addition(&mut self) {
+        self.status = STATUS_ADDING.to_string();
+    }
+
     /// Whether an add or remove Region workflow is in progress on this Region: the two
     /// non-terminal values of the model's `RegionStatus` enum (`ADDING` — "Region extension
     /// workflow is in progress" — and `REMOVING` — "Region removal workflow is in
@@ -794,8 +807,12 @@ impl Instance {
             region,
         );
         instance.status = STATUS_CREATE_IN_PROGRESS.to_string();
+        // The INSTANCE is `CREATE_IN_PROGRESS` (an `InstanceStatus`), while each Region's
+        // own enablement is still in flight, which `RegionStatus` spells `ADDING`: the two
+        // members are typed by different enums, and only the instance-level one admits
+        // `CREATE_IN_PROGRESS`.
         for region in &mut instance.regions {
-            region.status = STATUS_CREATE_IN_PROGRESS.to_string();
+            region.start_addition();
         }
         instance.active_due = Some(now + INSTANCE_ACTIVATION_SPAN);
         instance

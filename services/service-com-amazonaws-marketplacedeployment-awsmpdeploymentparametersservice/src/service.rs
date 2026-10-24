@@ -78,13 +78,43 @@
 //! The request's auth schemes are unaffected — the router reads them off the MODELLED
 //! operation the routing key names — so a front-door refusal is still only reached by a
 //! request whose signature verified.
+//!
+//! ## Naming the request a response answers
+//!
+//! Every response AWS sends names the request it answered, in the response header this
+//! protocol reports that id in (`x-amzn-RequestId`) — on a success and on a failure alike.
+//! It is a property of the RESPONSE, not of any modelled shape: no output or error shape
+//! of this model declares it, so no handler can set it, and the framework's restJson1
+//! renderers do not write it.
+//!
+//! That rule is not stated here: `service_common::query_error_envelope` owns it for every
+//! emulated service, and this file only chooses the report its protocol takes (the header
+//! alone — restJson1 has no envelope element for the id) and wires it at the layers every
+//! response of this service passes through, which are three:
+//!
+//! * [`RequestIdHeaderOperation`], the wrapper [`Service::override_operation`] hands the
+//!   router in place of each modelled operation, covers everything an operation answers —
+//!   a success, a modelled error, and a constraint refusal raised while that operation was
+//!   being served;
+//! * [`RequestIdEnvelopeDefinition::header_only`], the definition wrapper
+//!   [`Service::definition`] hands back, covers a response NO operation produced: a
+//!   routing failure, a transport failure detected up front, and a pre-dispatch
+//!   authentication refusal;
+//! * [`FrontDoorAnswer`] renders its own refusal, so it passes that response through the
+//!   same [`with_request_id_header`] directly.
+//!
+//! Nothing else about a response changes: the status, the other headers and every byte of
+//! the body stay as the renderer wrote them.
 
 use aws_smithy_schema::serde::SerializableStruct;
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::validate;
+use service_common::query_error_envelope::{
+    with_request_id_header, RequestIdEnvelopeDefinition, RequestIdHeaderOperation,
+};
 use smithy_server_runtime::{
-    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, Refusal, Refused, Service,
-    Violation, ViolationKind,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, ErasedServiceDefinition, Operation,
+    Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -149,16 +179,19 @@ impl ErasedOperation for FrontDoorAnswer {
             // same envelope (and the same `x-amzn-errortype` header) as every other
             // error it answers. The status and the error code come from the refusal
             // itself: the shape is not in the model, so there is no modelled error to
-            // read them off.
-            svc.definition()
-                .protocol()
-                .serialize_error(
-                    &self.0,
-                    &crate::scaffolded::FRONT_DOOR_SCHEMA,
-                    self.0.code,
-                    self.0.status,
-                )
-                .unwrap_or_else(|e| svc.definition().framework_error_response(e))
+            // read them off. It is the one response this file renders itself, so it names
+            // the request it answers here (see the module docs).
+            with_request_id_header(
+                svc.definition()
+                    .protocol()
+                    .serialize_error(
+                        &self.0,
+                        &crate::scaffolded::FRONT_DOOR_SCHEMA,
+                        self.0.code,
+                        self.0.status,
+                    )
+                    .unwrap_or_else(|e| svc.definition().framework_error_response(e)),
+            )
         })
     }
 }
@@ -268,9 +301,14 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its three framework-level error renderers wrapped so a
+    /// response no operation produced still names the request it answers.
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
     /// Answers a request the front door will not forward: HTTP 403 `ForbiddenException`.
     forbidden: FrontDoorAnswer,
+    /// Serves every modelled operation, so each response names the request it answers.
+    /// Held, not built per request: `override_operation` returns a reference to it.
+    request_id: RequestIdHeaderOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -279,8 +317,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(engine)),
             forbidden: FrontDoorAnswer(FrontDoorRefusal::forbidden()),
+            request_id: RequestIdHeaderOperation,
         }
     }
 
@@ -353,7 +392,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
-        // The router reads it through this one accessor. Do not edit the entry.
+        // The router reads it through this one accessor. Do not edit the entry: what
+        // is handed back is the shared `RequestIdEnvelopeDefinition`, which reads
+        // identity, protocol and the routing table straight off that entry and adds the
+        // request-id header to the three error renderers (see the module docs).
         &self.entry
     }
 
@@ -393,8 +435,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // module docs): a request carrying a `@sensitive` payload past its modelled
         // maximum is refused there and never reaches the modelled walk at all. That
         // answer is pre-dispatch, which is what this hook is.
-        self.front_door_refuses(req)
-            .then_some(&self.forbidden as &dyn ErasedOperation)
+        if self.front_door_refuses(req) {
+            return Some(&self.forbidden as &dyn ErasedOperation);
+        }
+        // NOT a re-route: every other request is served by the operation this service's
+        // own routing table names for it, through the shared `RequestIdHeaderOperation` —
+        // the one place every operation's response passes, so no operation can answer
+        // without naming the request it answered. A request the table does not answer
+        // declines here exactly as it would there, leaving the router's routing-error path
+        // unchanged.
+        self.entry
+            .routes(req)
+            .then_some(&self.request_id as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -428,8 +480,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501) through the shared
+        // `RequestIdEnvelopeDefinition`, which names the request that failure answers.
+        // Return `Some(resp)` to word that routing failure in your own envelope instead.
         let _ = req;
         None
     }

@@ -13,7 +13,12 @@
 //! Tags supplied here are judged by the same rules as tags supplied to `TagResource`
 //! (`crate::state::invalid_tags_message`): a key outside the modelled `TagKey` bounds,
 //! a key in the reserved `aws:` namespace, or more tags than a resource may carry earn
-//! the modelled `ValidationException` and no feed is minted.
+//! the modelled `ValidationException` and no feed is minted. An output name identifies
+//! an output within its feed, so a request naming one output twice is refused
+//! (`ConflictException`, HTTP 409) rather than minting a feed whose outputs cannot be
+//! told apart, and a list past the feed's output quota is refused with the modelled
+//! `ServiceQuotaExceededException` (HTTP 402), the bound every writer of a feed's
+//! output list is held to.
 //!
 //! The scaffold's own notes on the operation shape and on reaching state are kept
 //! below, minus the line that recorded this operation as a stub.
@@ -239,6 +244,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateFeedErrorModeled::ValidationException(
                 ValidationException { message },
+            )
+            .into());
+        }
+
+        // An output's name identifies it within the feed, so a request naming one
+        // output twice would mint a feed whose outputs are not addressable by name.
+        // The scan is the one every operation that supplies an output list goes
+        // through, and the refusal is the same conflict `AssociateFeed` answers.
+        if let Some(duplicate) = crate::state::first_duplicate_output_name(
+            input.outputs.iter().map(|output| output.name.as_str()),
+        ) {
+            return Err(CreateFeedErrorModeled::ConflictException(ConflictException {
+                message: crate::state::duplicate_output_name_message(duplicate),
+            })
+            .into());
+        }
+
+        // A feed's output list is BOUNDED, and this request SETS that list, so a list
+        // longer than the bound is refused rather than minted — the same quota, and the
+        // same modelled refusal (HTTP 402), that an append past it earns. Decided from
+        // the request's own length, before the lock is taken.
+        if input.outputs.len() > crate::state::MAX_OUTPUTS_PER_FEED {
+            return Err(CreateFeedErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: crate::state::too_many_outputs_message(),
+                },
             )
             .into());
         }

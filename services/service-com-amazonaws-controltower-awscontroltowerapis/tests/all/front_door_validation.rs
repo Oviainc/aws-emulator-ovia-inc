@@ -25,7 +25,7 @@
 use crate::landing_zone_lifecycle::{call, emulator, simple_manifest};
 
 /// The error code the front door names an input-validation refusal with.
-const FRONT_DOOR_CODE: &str = "BadRequestException";
+pub(crate) const FRONT_DOOR_CODE: &str = "BadRequestException";
 
 /// The message that refusal carries. Constant: the front door refuses before the
 /// request is dispatched, so it names neither the member nor the constraint.
