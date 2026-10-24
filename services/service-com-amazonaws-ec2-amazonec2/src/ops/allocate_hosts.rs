@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ALLOWS_MULTIPLE_INSTANCE_TYPES_ON, AMD_SEV_SNP_DISABLED,
             DEDICATED_HOST_TAGGABLE_RESOURCE, DEFAULT_AUTO_PLACEMENT, DEFAULT_HOST_RECOVERY,
             HOST_STATE_AVAILABLE, MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
-            MAX_STORED_DEDICATED_HOSTS,
+            MAX_STORED_DEDICATED_HOSTS, STORED_RECORD_OVERHEAD_BYTES,
         };
 
         // The Region of the request's SigV4 credential scope: a Dedicated Host sits in one
@@ -398,7 +398,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 store.dedicated_hosts.len()
             )));
         }
-        let payload_bytes = bytes_per_host.saturating_mul(quantity);
+        // What the whole batch costs the byte budget: the caller-chosen bytes of each host
+        // plus the fixed overhead the store charges per record, so the gate asks for exactly
+        // what the inserts below charge and a batch of hosts carrying no tags is not free.
+        let payload_bytes = bytes_per_host
+            .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
+            .saturating_mul(quantity);
         if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
             return Err(host_limit_exceeded(format!(
                 "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
@@ -496,7 +501,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // them uncharged — and the batch gate above asked for exactly this many per
             // host.
             debug_assert_eq!(host_payload_bytes(&host), bytes_per_host);
-            host_ids.push(store.insert_dedicated_host(host));
+            // The insert enforces the store's count ceiling for itself, so it can refuse —
+            // which the batch gate above has already made room for, so a refusal here means
+            // this handler and the store disagree rather than that the request was wrong.
+            let Some(host_id) = store.insert_dedicated_host(host) else {
+                return Err(Scaffolded::internal_error(format!(
+                    "the store refused a Dedicated Host the capacity gate had already made \
+                     room for ({} of at most {MAX_STORED_DEDICATED_HOSTS} held)",
+                    store.dedicated_hosts.len()
+                )));
+            };
+            host_ids.push(host_id);
         }
         if let Some(token) = input.client_token.clone() {
             store

@@ -309,7 +309,7 @@
 //! [`MAX_STORED_VPC_ENDPOINT_CONNECTIONS`] (a writer asks
 //! [`ComAmazonawsEc2Amazonec2State::has_vpc_endpoint_connection_capacity`] first and
 //! refuses with EC2's own quota code) and every record costs at least
-//! [`VPC_ENDPOINT_CONNECTION_RECORD_BYTES`] against the byte budget, so repeated writes
+//! [`STORED_RECORD_OVERHEAD_BYTES`] against the byte budget, so repeated writes
 //! cannot grow the store for free. A connection sits in `PendingAcceptance` until the
 //! SERVICE OWNER accepts or rejects it (`AcceptVpcEndpointConnections` /
 //! `RejectVpcEndpointConnections`), which is an action rather than an instant, so —
@@ -522,7 +522,8 @@
 //! VPC, its per-zone default subnets AND that group, and a client provisioning into the
 //! default VPC reads all three before it can name a network. The store holds the modelled
 //! [`SecurityGroup`] shape itself, keyed by `GroupId` in a [`BTreeMap`], for the same
-//! reasons the VPC and subnet stores do.
+//! reasons the VPC and subnet stores do. Its RULES are resources of their own, with ids of
+//! their own — see [`ComAmazonawsEc2Amazonec2State::security_group_rules`].
 //!
 //! ## Transit gateways
 //!
@@ -788,6 +789,10 @@ use crate::ops::types::{
     VpcEndpointConnection,
 };
 use crate::scaffolded::Scaffolded;
+
+// The shapes a security group RULE is made of, imported on their own line so this file's
+// one big `use crate::ops::types::{..}` list stays as it is.
+use crate::ops::types::{Ipv6Range, PrefixListId, ReferencedSecurityGroup, SecurityGroupRule};
 
 /// The Traffic Mirror filter store's own primitives — the id prefix, the bounds, the byte
 /// charge and the error channel `CreateTrafficMirrorFilter` and
@@ -1274,6 +1279,10 @@ pub const INVALID_DHCP_OPTION_ID_NOT_FOUND: &str = "InvalidDhcpOptionID.NotFound
 /// EC2's error code for a request that named a security group no group of the account has.
 pub const INVALID_GROUP_NOT_FOUND: &str = "InvalidGroup.NotFound";
 
+/// EC2's error code for a request that named a security group rule id no rule of the
+/// account has (EC2 API error codes, "InvalidSecurityGroupRuleId.NotFound").
+pub const INVALID_SECURITY_GROUP_RULE_ID_NOT_FOUND: &str = "InvalidSecurityGroupRuleId.NotFound";
+
 /// EC2's error code for a request that named an address-pool id no pool of the account
 /// has — the code the customer-owned-IP surface answers with (`InvalidPoolID.NotFound`,
 /// as recorded for a `CoipPoolId` that names no pool).
@@ -1726,6 +1735,27 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `DescribeSecurityGroups` without a field-by-field copy. Ordered by id, which is the
     /// order the describe reports and pages over.
     pub security_groups: BTreeMap<String, SecurityGroup>,
+    /// Every security group rule the account holds, by `SecurityGroupRuleId`.
+    ///
+    /// "When you add a rule to a security group, it is assigned a unique ID"
+    /// (`SecurityGroupRule`/`DescribeSecurityGroupRules`), and that id is how
+    /// `DescribeSecurityGroupRules`, `ModifySecurityGroupRules` and the authorize/revoke
+    /// pairs name ONE rule — a thing the aggregated `IpPermissions` members of
+    /// [`SecurityGroup`] cannot say, because they bundle every grant of one protocol and
+    /// port range together. So the rules live here as [`SecurityGroupRuleRecord`]s — the
+    /// modelled [`SecurityGroupRule`] shape beside the facts it carries no member for — and
+    /// this is the one source of truth for them: the `IpPermissions` members of the group
+    /// record are the AGGREGATE of what is held here, written only by
+    /// [`Self::resync_security_group_permissions`], so `DescribeSecurityGroups` and
+    /// `DescribeSecurityGroupRules` can never report one group's rules differently.
+    ///
+    /// Bounded the way every other store here is: in records by the published
+    /// per-direction quota ([`MAX_SECURITY_GROUP_RULES_PER_DIRECTION`], and
+    /// [`MAX_SECURITY_GROUP_RULES`] over the whole store) and in bytes by
+    /// [`security_group_rule_payload_bytes`] against [`MAX_STORED_BYTES`], which the delete
+    /// of a group gives back. Ordered by id, which is the order
+    /// `DescribeSecurityGroupRules` reports and pages over.
+    pub security_group_rules: BTreeMap<String, SecurityGroupRuleRecord>,
     /// Every launch template the account holds, by `LaunchTemplateId`, each with its
     /// versions — see the module docs.
     pub launch_templates: BTreeMap<String, LaunchTemplateRecord>,
@@ -2152,6 +2182,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             network_insights_access_scope_analysis_client_tokens: HashMap::new(),
             images: BTreeMap::new(),
             security_groups: BTreeMap::new(),
+            security_group_rules: BTreeMap::new(),
             launch_templates: BTreeMap::new(),
             launch_template_client_tokens: HashMap::new(),
             id_counter: 0,
@@ -2629,8 +2660,15 @@ impl ComAmazonawsEc2Amazonec2State {
     /// the SERVICE chose, which the budget ([`MAX_STORED_BYTES`], a bound on caller-supplied
     /// data) does not count. [`Self::remove_security_group`] gives back on exactly the same
     /// terms.
+    ///
+    /// The rules of `spec`'s permissions are stored through
+    /// [`Self::insert_security_group_rules`], which holds the group to the published
+    /// per-direction rule quota; a writer whose request may exceed it asks
+    /// [`Self::has_security_group_rule_capacity`] first and refuses the whole request
+    /// rather than storing a group with fewer rules than it asked for.
     pub fn insert_security_group(&mut self, spec: SecurityGroupSpec) -> String {
         let group_id = self.next_id("sg");
+        let region = spec.region.clone();
         let group = SecurityGroup {
             group_id: Some(group_id.clone()),
             group_name: Some(spec.group_name),
@@ -2639,15 +2677,334 @@ impl ComAmazonawsEc2Amazonec2State {
             owner_id: Some(::engine::emulator_account_id().to_string()),
             security_group_arn: Some(::engine::emulator_arn(
                 "ec2",
-                &spec.region,
+                &region,
                 &format!("security-group/{group_id}"),
             )),
             tags: Some(spec.tags),
-            ip_permissions: Some(spec.ip_permissions),
-            ip_permissions_egress: Some(spec.ip_permissions_egress),
+            // The group's rules live in `Self::security_group_rules`, where each one has
+            // the id `DescribeSecurityGroupRules` reports it under; these two members are
+            // the AGGREGATE of those rules and are written only by
+            // `Self::resync_security_group_permissions`, which the inserts below call.
+            ip_permissions: Some(Vec::new()),
+            ip_permissions_egress: Some(Vec::new()),
         };
         self.security_groups.insert(group_id.clone(), group);
+        for permission in &spec.ip_permissions {
+            // The permissions a creator stores are the service's own documented defaults —
+            // `CreateSecurityGroup` takes no rules from the request — so their bytes are not
+            // charged to the caller-chosen budget, the same terms the group's own name and
+            // description are stored on.
+            let minted =
+                self.insert_security_group_rules(&group_id, false, permission, false, &region);
+            // Those defaults always fit the published per-direction quota, so a permission
+            // dropped here would be a group stored with fewer rules than its spec named —
+            // the one thing the empty answer of `insert_security_group_rules` could hide.
+            // Asserted rather than returned, because a writer whose permissions may not fit
+            // asks `has_security_group_rule_capacity` and refuses the whole request instead
+            // of reaching here.
+            debug_assert_eq!(
+                minted.len(),
+                ip_permission_grant_count(permission),
+                "every grant of an inbound permission a group is created with mints a rule"
+            );
+        }
+        for permission in &spec.ip_permissions_egress {
+            let minted =
+                self.insert_security_group_rules(&group_id, true, permission, false, &region);
+            debug_assert_eq!(
+                minted.len(),
+                ip_permission_grant_count(permission),
+                "every grant of an outbound permission a group is created with mints a rule"
+            );
+        }
         group_id
+    }
+
+    /// Store the rules one [`IpPermission`] grants on `group_id`, and answer their
+    /// `SecurityGroupRuleId`s.
+    ///
+    /// "If you specify multiple values for a parameter … a separate rule is created for
+    /// each value" (Amazon VPC User Guide, "Security group rules"): a permission naming
+    /// three CIDR blocks is THREE rules, each with its own id and its own description, so
+    /// this expands every grant of the permission — its IPv4 ranges, its IPv6 ranges, its
+    /// prefix lists and the groups it references — into one rule apiece. The protocol and
+    /// the port range are facts of the permission, so every rule it mints carries them.
+    ///
+    /// The group's aggregate `IpPermissions` members are recomputed once at the end, so no
+    /// writer has to remember to keep the two views in step.
+    ///
+    /// ALL OR NOTHING, and BOUNDED: the whole permission is weighed against the published
+    /// per-direction quota ([`MAX_SECURITY_GROUP_RULES_PER_DIRECTION`]) and this store's
+    /// ceiling ([`MAX_SECURITY_GROUP_RULES`]) ONCE, before anything is stored, so a
+    /// permission that does not fit stores NOTHING and answers with no ids rather than
+    /// leaving a group half of what the request asked for — and however many grants a
+    /// request names, the store grows by at most a fixed number of records per group. A
+    /// writer asks [`Self::has_security_group_rule_capacity`] itself so it can answer
+    /// [`rules_per_security_group_limit_exceeded`]; the refusal here is what keeps the
+    /// store finite for a writer that forgets. That bound is also what bounds the recompute
+    /// below, whose cost is the group's rule count times its distinct protocol/port
+    /// combinations.
+    pub fn insert_security_group_rules(
+        &mut self,
+        group_id: &str,
+        is_egress: bool,
+        permission: &IpPermission,
+        caller_supplied: bool,
+        region: &str,
+    ) -> Vec<String> {
+        // One rule per grant the permission names, so the whole batch is what the quota is
+        // weighed against — counted once here rather than per grant, which also keeps the
+        // count off the per-rule path.
+        let grants = ip_permission_grant_count(permission);
+        if !self.has_security_group_rule_capacity(group_id, is_egress, grants) {
+            return Vec::new();
+        }
+        // What every rule of this permission shares; the grant each one names is set on
+        // the clone below.
+        let template = SecurityGroupRule {
+            group_id: Some(group_id.to_string()),
+            group_owner_id: Some(::engine::emulator_account_id().to_string()),
+            is_egress: Some(is_egress),
+            ip_protocol: permission.ip_protocol.clone(),
+            from_port: permission.from_port,
+            to_port: permission.to_port,
+            ..SecurityGroupRule::default()
+        };
+        let mut minted: Vec<String> = Vec::new();
+        for range in permission.ip_ranges.iter().flatten() {
+            let rule = SecurityGroupRule {
+                cidr_ipv4: range.cidr_ip.clone(),
+                description: range.description.clone(),
+                ..template.clone()
+            };
+            minted.extend(self.insert_security_group_rule(rule, None, caller_supplied, region));
+        }
+        for range in permission.ipv6_ranges.iter().flatten() {
+            let rule = SecurityGroupRule {
+                cidr_ipv6: range.cidr_ipv6.clone(),
+                description: range.description.clone(),
+                ..template.clone()
+            };
+            minted.extend(self.insert_security_group_rule(rule, None, caller_supplied, region));
+        }
+        for entry in permission.prefix_list_ids.iter().flatten() {
+            let rule = SecurityGroupRule {
+                prefix_list_id: entry.prefix_list_id.clone(),
+                description: entry.description.clone(),
+                ..template.clone()
+            };
+            minted.extend(self.insert_security_group_rule(rule, None, caller_supplied, region));
+        }
+        for pair in permission.user_id_group_pairs.iter().flatten() {
+            let rule = SecurityGroupRule {
+                // "Describes the security group that is referenced in the rule"
+                // (`SecurityGroupRule$ReferencedGroupInfo`): the same facts the
+                // permission's `UserIdGroupPair` carries, minus the ones that belong to
+                // the grant rather than to the referenced group (its name, which is not a
+                // member of `ReferencedSecurityGroup`, and the description, which is the
+                // rule's own).
+                referenced_group_info: Some(ReferencedSecurityGroup {
+                    group_id: pair.group_id.clone(),
+                    user_id: pair.user_id.clone(),
+                    vpc_id: pair.vpc_id.clone(),
+                    vpc_peering_connection_id: pair.vpc_peering_connection_id.clone(),
+                    peering_status: pair.peering_status.clone(),
+                }),
+                description: pair.description.clone(),
+                ..template.clone()
+            };
+            minted.extend(self.insert_security_group_rule(
+                rule,
+                pair.group_name.clone(),
+                caller_supplied,
+                region,
+            ));
+        }
+        self.resync_security_group_permissions(group_id);
+        minted
+    }
+
+    /// Store one security group rule, and answer the `SecurityGroupRuleId` it was given —
+    /// or `None` when it was not stored.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller: the id and the ARN built from it — so two writers cannot report the same
+    /// rule differently.
+    ///
+    /// Nothing is stored unless the store can hold it, so neither the record count nor the
+    /// bytes this store holds can grow without bound from request input:
+    ///
+    /// * the rule must belong to a group this store HOLDS — a rule for an unknown group
+    ///   would be reported by `DescribeSecurityGroupRules` with no `SecurityGroup`
+    ///   aggregating it, the one disagreement this design exists to prevent;
+    /// * the store must be under [`MAX_SECURITY_GROUP_RULES`] — an O(1) backstop, the
+    ///   per-direction quota having been weighed for the whole permission by
+    ///   [`Self::insert_security_group_rules`], which is the only caller; and
+    /// * the bytes the record retains are charged against the store's budget
+    ///   ([`MAX_STORED_BYTES`]) here when `caller_supplied` says the permission came from a
+    ///   request, which [`Self::remove_security_group`] gives back. That budget bounds
+    ///   CALLER-supplied data, so the service's own documented default rules are not
+    ///   charged for — the same terms a group's name and description are charged on.
+    fn insert_security_group_rule(
+        &mut self,
+        rule: SecurityGroupRule,
+        referenced_group_name: Option<String>,
+        caller_supplied: bool,
+        region: &str,
+    ) -> Option<String> {
+        let group_id = rule.group_id.clone().unwrap_or_default();
+        if !self.security_groups.contains_key(&group_id) {
+            return None;
+        }
+        if self.security_group_rules.len() >= MAX_SECURITY_GROUP_RULES {
+            return None;
+        }
+        let rule_id = self.next_id("sgr");
+        let stored = SecurityGroupRule {
+            security_group_rule_id: Some(rule_id.clone()),
+            security_group_rule_arn: Some(::engine::emulator_arn(
+                "ec2",
+                region,
+                &format!("security-group-rule/{rule_id}"),
+            )),
+            // "The tags applied to the security group rule" (`SecurityGroupRule$Tags`): a
+            // rule nothing has tagged carries an empty set, the way a stored group does.
+            tags: Some(rule.tags.unwrap_or_default()),
+            ..rule
+        };
+        let mut record = SecurityGroupRuleRecord {
+            rule: stored,
+            referenced_group_name,
+            payload_bytes: 0,
+        };
+        if caller_supplied {
+            record.payload_bytes = security_group_rule_payload_bytes(&record);
+        }
+        self.add_stored_bytes(record.payload_bytes);
+        self.security_group_rules.insert(rule_id.clone(), record);
+        Some(rule_id)
+    }
+
+    /// How many rules `group_id` holds in one direction — inbound when `is_egress` is
+    /// false, outbound when it is true. The two directions are counted apart because the
+    /// quota is published per direction.
+    pub fn security_group_rule_count(&self, group_id: &str, is_egress: bool) -> usize {
+        self.security_group_rules
+            .values()
+            .filter(|record| {
+                record.rule.group_id.as_deref() == Some(group_id)
+                    && record.rule.is_egress.unwrap_or(false) == is_egress
+            })
+            .count()
+    }
+
+    /// Whether `additional` more rules fit on `group_id` in one direction: inside the
+    /// published per-direction quota ([`MAX_SECURITY_GROUP_RULES_PER_DIRECTION`]) and inside
+    /// this store's ceiling ([`MAX_SECURITY_GROUP_RULES`]).
+    ///
+    /// The same contract as [`Self::has_security_group_capacity`]: a writer asks this
+    /// BEFORE storing anything and refuses the whole request with
+    /// [`rules_per_security_group_limit_exceeded`] when it answers `false`, so a partially
+    /// applied authorize is never stored.
+    pub fn has_security_group_rule_capacity(
+        &self,
+        group_id: &str,
+        is_egress: bool,
+        additional: usize,
+    ) -> bool {
+        self.security_group_rule_count(group_id, is_egress)
+            .saturating_add(additional)
+            <= MAX_SECURITY_GROUP_RULES_PER_DIRECTION
+            && self.security_group_rules.len().saturating_add(additional) <= MAX_SECURITY_GROUP_RULES
+    }
+
+    /// Recompute the aggregate `IpPermissions` and `IpPermissionsEgress` of `group_id` from
+    /// the rules the store holds for it.
+    ///
+    /// The rules are the resources; the two members of the group record are a VIEW of them,
+    /// in which "rules that have the same protocol and port range are grouped together"
+    /// (`SecurityGroup$IpPermissions` reports one `IpPermission` per protocol and port
+    /// range, with every grant of that combination inside it). Every writer of a rule ends
+    /// by calling this, so `DescribeSecurityGroups` can never disagree with
+    /// `DescribeSecurityGroupRules` about one group.
+    pub fn resync_security_group_permissions(&mut self, group_id: &str) {
+        let mut inbound: Vec<IpPermission> = Vec::new();
+        let mut outbound: Vec<IpPermission> = Vec::new();
+        for record in self
+            .security_group_rules
+            .values()
+            .filter(|record| record.rule.group_id.as_deref() == Some(group_id))
+        {
+            let rule = &record.rule;
+            let permissions = if rule.is_egress.unwrap_or(false) {
+                &mut outbound
+            } else {
+                &mut inbound
+            };
+            // One `IpPermission` per (protocol, from port, to port), in the order the rules
+            // are held in — which is id order, so the view is stable across reads.
+            let position = permissions.iter().position(|permission| {
+                permission.ip_protocol == rule.ip_protocol
+                    && permission.from_port == rule.from_port
+                    && permission.to_port == rule.to_port
+            });
+            let index = match position {
+                Some(index) => index,
+                None => {
+                    permissions.push(IpPermission {
+                        ip_protocol: rule.ip_protocol.clone(),
+                        from_port: rule.from_port,
+                        to_port: rule.to_port,
+                        user_id_group_pairs: Some(Vec::new()),
+                        ip_ranges: Some(Vec::new()),
+                        ipv6_ranges: Some(Vec::new()),
+                        prefix_list_ids: Some(Vec::new()),
+                    });
+                    permissions.len() - 1
+                }
+            };
+            let permission = &mut permissions[index];
+            if let (Some(cidr), Some(ranges)) = (&rule.cidr_ipv4, permission.ip_ranges.as_mut()) {
+                ranges.push(IpRange {
+                    description: rule.description.clone(),
+                    cidr_ip: Some(cidr.clone()),
+                });
+            }
+            if let (Some(cidr), Some(ranges)) = (&rule.cidr_ipv6, permission.ipv6_ranges.as_mut()) {
+                ranges.push(Ipv6Range {
+                    description: rule.description.clone(),
+                    cidr_ipv6: Some(cidr.clone()),
+                });
+            }
+            if let (Some(prefix_list_id), Some(entries)) =
+                (&rule.prefix_list_id, permission.prefix_list_ids.as_mut())
+            {
+                entries.push(PrefixListId {
+                    description: rule.description.clone(),
+                    prefix_list_id: Some(prefix_list_id.clone()),
+                });
+            }
+            if let (Some(referenced), Some(pairs)) = (
+                &rule.referenced_group_info,
+                permission.user_id_group_pairs.as_mut(),
+            ) {
+                pairs.push(UserIdGroupPair {
+                    description: rule.description.clone(),
+                    user_id: referenced.user_id.clone(),
+                    // The name the grant named the referenced group by, which the rule
+                    // itself carries no member for — see [`SecurityGroupRuleRecord`].
+                    group_name: record.referenced_group_name.clone(),
+                    group_id: referenced.group_id.clone(),
+                    vpc_id: referenced.vpc_id.clone(),
+                    vpc_peering_connection_id: referenced.vpc_peering_connection_id.clone(),
+                    peering_status: referenced.peering_status.clone(),
+                });
+            }
+        }
+        if let Some(group) = self.security_groups.get_mut(group_id) {
+            group.ip_permissions = Some(inbound);
+            group.ip_permissions_egress = Some(outbound);
+        }
     }
 
     /// Give `vpc_id` the default security group AWS creates with it, and answer its
@@ -2671,8 +3028,10 @@ impl ComAmazonawsEc2Amazonec2State {
             ip_permissions: Vec::new(),
             ip_permissions_egress: vec![allow_all_egress()],
         });
-        if let Some(group) = self.security_groups.get_mut(&group_id) {
-            group.ip_permissions = Some(vec![IpPermission {
+        self.insert_security_group_rules(
+            &group_id,
+            false,
+            &IpPermission {
                 ip_protocol: Some(ALL_IP_PROTOCOLS.to_string()),
                 from_port: None,
                 to_port: None,
@@ -2691,8 +3050,11 @@ impl ComAmazonawsEc2Amazonec2State {
                 ip_ranges: Some(Vec::new()),
                 ipv6_ranges: Some(Vec::new()),
                 prefix_list_ids: Some(Vec::new()),
-            }]);
-        }
+            },
+            // The rule AWS gives a default group, not one a request named.
+            false,
+            region,
+        );
         group_id
     }
 
@@ -2840,6 +3202,77 @@ pub fn allow_all_egress() -> IpPermission {
         ipv6_ranges: Some(Vec::new()),
         prefix_list_ids: Some(Vec::new()),
     }
+}
+
+/// One stored security group rule: the modelled [`SecurityGroupRule`] every operation that
+/// reports one answers with, beside the one fact that shape carries no member for.
+///
+/// The rule is kept as the modelled shape itself — the way the VPC, subnet and security
+/// group stores keep theirs — so every member a writer sets round-trips through
+/// `DescribeSecurityGroupRules` without a field-by-field copy that can silently drop one.
+#[derive(Debug, Clone)]
+pub struct SecurityGroupRuleRecord {
+    /// The rule as `DescribeSecurityGroupRules` reports it.
+    pub rule: SecurityGroupRule,
+    /// The NAME the grant named the referenced group by, for a rule that references one:
+    /// "[Default VPC] The name of the source security group"
+    /// (`AuthorizeSecurityGroupIngressRequest$SourceSecurityGroupName`). The rule shape has
+    /// no member for it — `SecurityGroupRule$ReferencedGroupInfo` is a
+    /// [`ReferencedSecurityGroup`], which carries only the id — while the aggregate
+    /// `SecurityGroup$IpPermissions` view does (`UserIdGroupPair$GroupName`), so it is held
+    /// beside the rule rather than lost.
+    pub referenced_group_name: Option<String>,
+    /// The bytes this record is charged for — the fixed per-record overhead plus the
+    /// caller-chosen bytes it retains — counted into the store's budget while it is stored,
+    /// and zero for a rule the SERVICE wrote, which the budget
+    /// ([`MAX_STORED_BYTES`], a bound on caller-supplied data) does not count. Held on the
+    /// record so [`ComAmazonawsEc2Amazonec2State::remove_security_group`] gives back exactly
+    /// what the insert took, the way [`LaunchTemplateRecord::payload_bytes`] does.
+    pub payload_bytes: usize,
+}
+
+/// How many rules one [`IpPermission`] grants: one per value it names, since "If you
+/// specify multiple values for a parameter … a separate rule is created for each value"
+/// (Amazon VPC User Guide, "Security group rules").
+///
+/// The ONE definition of that count, shared by
+/// [`ComAmazonawsEc2Amazonec2State::insert_security_group_rules`], which weighs it against
+/// the per-direction quota, and by the writers that assert every grant was stored, so the
+/// quota and the check cannot count a permission differently.
+pub fn ip_permission_grant_count(permission: &IpPermission) -> usize {
+    permission.ip_ranges.iter().flatten().count()
+        + permission.ipv6_ranges.iter().flatten().count()
+        + permission.prefix_list_ids.iter().flatten().count()
+        + permission.user_id_group_pairs.iter().flatten().count()
+}
+
+/// The bytes one stored security group rule holds: the fixed
+/// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, plus every string the record
+/// retains — the grant it names, its description, the group it references and its tags.
+///
+/// The fixed overhead is charged here for the same reason every other store of this module
+/// charges it ([`host_payload_bytes`]'s caller, the launch-template and IPAM-pool inserts):
+/// a rule naming a tiny grant with no description still costs the store a record, so a loop
+/// of authorize calls minting such rules cannot be nearly free against
+/// [`MAX_STORED_BYTES`].
+///
+/// Charged against [`MAX_STORED_BYTES`] by
+/// [`ComAmazonawsEc2Amazonec2State::insert_security_group_rules`] for a rule a REQUEST
+/// named, recorded on [`SecurityGroupRuleRecord::payload_bytes`] and given back by
+/// [`ComAmazonawsEc2Amazonec2State::remove_security_group`], so a group's rules are as
+/// bounded in bytes as the group itself.
+pub fn security_group_rule_payload_bytes(record: &SecurityGroupRuleRecord) -> usize {
+    let rule = &record.rule;
+    let text = |value: &Option<String>| value.as_deref().map_or(0, str::len);
+    let referenced = rule.referenced_group_info.as_ref();
+    STORED_RECORD_OVERHEAD_BYTES
+        + text(&rule.cidr_ipv4)
+        + text(&rule.cidr_ipv6)
+        + text(&rule.prefix_list_id)
+        + text(&rule.description)
+        + text(&record.referenced_group_name)
+        + referenced.map_or(0, |group| text(&group.group_id) + text(&group.user_id))
+        + tag_list_bytes(rule.tags.as_deref().unwrap_or_default())
 }
 
 /// One stored launch template: the modelled [`LaunchTemplate`] every operation that reports
@@ -6605,6 +7038,18 @@ pub fn invalid_group_not_found<E>(group: &str) -> crate::scaffolded::Scaffolded<
     )
 }
 
+/// Refuse a request that named a security group rule id no rule of the account has, the
+/// way EC2 does: HTTP 400 `InvalidSecurityGroupRuleId.NotFound`.
+pub fn invalid_security_group_rule_id_not_found<E>(
+    rule_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SECURITY_GROUP_RULE_ID_NOT_FOUND,
+        400,
+        format!("The security group rule ID '{rule_id}' does not exist"),
+    )
+}
+
 /// The most characters of a refused `CoipPoolId` its message repeats back.
 ///
 /// The message names the pool the request could not resolve, and it is the request's own
@@ -10074,6 +10519,45 @@ pub const SECURITY_GROUP_ID_PREFIX: &str = "sg-";
 /// writer asks first; a create past it refuses with [`SECURITY_GROUP_LIMIT_EXCEEDED`].
 pub const MAX_SECURITY_GROUPS: usize = 2_500;
 
+/// How many rules one security group may hold in ONE direction.
+///
+/// A published AWS quota, not a capacity bound invented here: "Inbound or outbound rules
+/// per security group: 60" (Amazon VPC quotas, "Security groups"). The two directions are
+/// counted apart because the quota is published per direction, which is also why
+/// [`ComAmazonawsEc2Amazonec2State::has_security_group_rule_capacity`] takes one.
+pub const MAX_SECURITY_GROUP_RULES_PER_DIRECTION: usize = 60;
+
+/// The largest number of security group rules this in-memory store holds.
+///
+/// Derived rather than chosen: the published per-direction quota, in both directions, for
+/// every group the store can hold ([`MAX_SECURITY_GROUPS`]). A ceiling is needed for the
+/// reason [`MAX_STORED_INSTANCES`] gives — nothing reclaims a stored rule except the delete
+/// of its group — and a per-group quota alone would not bound a store that can hold many
+/// groups. The bytes each rule retains are charged against [`MAX_STORED_BYTES`] as well
+/// ([`security_group_rule_payload_bytes`]), because a record count alone is not a memory
+/// bound.
+pub const MAX_SECURITY_GROUP_RULES: usize =
+    MAX_SECURITY_GROUPS * 2 * MAX_SECURITY_GROUP_RULES_PER_DIRECTION;
+
+/// EC2's error code for an authorize that would take a security group past its
+/// per-direction rule quota (EC2 API error codes, "RulesPerSecurityGroupLimitExceeded").
+pub const RULES_PER_SECURITY_GROUP_LIMIT_EXCEEDED: &str = "RulesPerSecurityGroupLimitExceeded";
+
+/// Refuse an authorize that would take a security group past
+/// [`MAX_SECURITY_GROUP_RULES_PER_DIRECTION`] rules in one direction: HTTP 400
+/// `RulesPerSecurityGroupLimitExceeded`. A quota, not something the request got wrong, so it
+/// carries the quota code an SDK classifies as one.
+pub fn rules_per_security_group_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        RULES_PER_SECURITY_GROUP_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of rules per security group has been reached \
+             ({MAX_SECURITY_GROUP_RULES_PER_DIRECTION})"
+        ),
+    )
+}
+
 /// EC2's error code for a create that would take the account past its security group
 /// quota (EC2 API error codes, "SecurityGroupLimitExceeded").
 pub const SECURITY_GROUP_LIMIT_EXCEEDED: &str = "SecurityGroupLimitExceeded";
@@ -10624,6 +11108,21 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn remove_security_group(&mut self, group_id: &str) -> Option<SecurityGroup> {
         let was_default = self.is_default_security_group(group_id);
         let group = self.security_groups.remove(group_id)?;
+        // The group's rules are resources of the group: a rule can only be named through
+        // the group it belongs to, so none may outlive it in the store. The bytes each one
+        // was charged go back to the budget, taken from the record itself so a removal gives
+        // back exactly what the insert took.
+        let rule_ids: Vec<String> = self
+            .security_group_rules
+            .iter()
+            .filter(|(_, record)| record.rule.group_id.as_deref() == Some(group_id))
+            .map(|(rule_id, _)| rule_id.clone())
+            .collect();
+        for rule_id in rule_ids {
+            if let Some(record) = self.security_group_rules.remove(&rule_id) {
+                self.release_stored_bytes(record.payload_bytes);
+            }
+        }
         if !was_default {
             self.release_stored_bytes(security_group_payload_bytes(&group));
         }
@@ -14424,12 +14923,27 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 
     /// Store one newly allocated Dedicated Host, charging the caller-chosen bytes it
-    /// holds, and answer its id.
-    pub fn insert_dedicated_host(&mut self, host: Host) -> String {
+    /// holds, and answer its id — or `None` when the store is full.
+    ///
+    /// `None` means the store is at [`MAX_STORED_DEDICATED_HOSTS`] and NOTHING was stored:
+    /// the ceiling is enforced HERE as well as by [`Self::has_dedicated_host_capacity`],
+    /// the way [`Self::insert_vpc_endpoint_connection`] enforces its own, so a writer that
+    /// forgets the batch gate cannot grow the store without bound either. The record's own
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] are charged beside its caller-chosen bytes, so a
+    /// host with no
+    /// tags and no client token is not free against the byte budget.
+    pub fn insert_dedicated_host(&mut self, host: Host) -> Option<String> {
         let host_id = host.host_id.clone().unwrap_or_default();
-        self.add_stored_bytes(host_payload_bytes(&host));
+        // A write that REPLACES a host already stored under this id adds no record, so only
+        // a new key has to fit inside the ceiling.
+        if !self.dedicated_hosts.contains_key(&host_id) && !self.has_dedicated_host_capacity(1) {
+            return None;
+        }
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES.saturating_add(host_payload_bytes(&host)),
+        );
         self.dedicated_hosts.insert(host_id.clone(), host);
-        host_id
+        Some(host_id)
     }
 }
 
@@ -14837,7 +15351,7 @@ pub fn vpc_endpoint_connection_payload_bytes(connection: &VpcEndpointConnection)
                 + entry.hosted_zone_id.as_deref().unwrap_or_default().len()
         })
         .sum();
-    VPC_ENDPOINT_CONNECTION_RECORD_BYTES
+    STORED_RECORD_OVERHEAD_BYTES
         .saturating_add(
             connection
                 .vpc_endpoint_id
@@ -15839,7 +16353,7 @@ pub const MAX_STORED_RECORDS_PER_STORE: usize = 4096;
 
 /// The fixed overhead one of the records the writers below store costs whatever it
 /// carries: the modelled record itself and the map entry holding it, as a CHOSEN constant
-/// in the same spirit as [`VPC_ENDPOINT_CONNECTION_RECORD_BYTES`] — the point is that a
+/// in the same spirit as the count ceilings above — the point is that a
 /// record created with no tags and no optional text is NOT free against
 /// [`MAX_STORED_BYTES`], so repeated writes advance the budget whatever they carry, not
 /// that it is byte-exact.
@@ -16145,12 +16659,6 @@ impl ComAmazonawsEc2Amazonec2State {
         }
     }
 }
-
-/// The fixed overhead one stored VPC endpoint connection costs whatever it carries: the
-/// modelled record itself and the entry holding it, as a CHOSEN constant in the same
-/// spirit as the count ceilings — the point is that a zero-tag connection is not free
-/// against [`MAX_STORED_BYTES`], not that it is byte-exact.
-pub const VPC_ENDPOINT_CONNECTION_RECORD_BYTES: usize = 512;
 
 // =============================================================================
 // The tag keys registered for scheduled event notifications
