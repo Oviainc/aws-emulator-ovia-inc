@@ -124,6 +124,8 @@ mod update_stage_setting_spellings;
 mod usage_plan_key_lifecycle;
 #[path = "all/deployment_collection.rs"]
 mod deployment_collection;
+#[path = "all/authorizer_collection.rs"]
+mod authorizer_collection;
 #[path = "all/update_stage_readers.rs"]
 mod update_stage_readers;
 #[path = "all/execution_logging_prerequisites.rs"]
