@@ -15,20 +15,31 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AddBridgeOutputRequest, AddBridgeSourceRequest, AddMediaStreamRequest, AddOutputRequest,
+    AutomaticEncryptionKeyConfiguration,
     Bridge, BridgeFlowSource, BridgeNetworkOutput, BridgeNetworkSource, BridgeOutput, BridgeSource,
+    ContentQualityAnalysisFeatureConfiguration,
     DestinationConfiguration, EgressGatewayBridge, EncodingConfig, EncodingParameters, Encryption,
-    Entitlement, FabricConfiguration, FailoverConfig, Flow, FlowTransitEncryption, Gateway,
+    Entitlement, FabricConfiguration, FailoverConfig, FailoverRouterInputIndexedStreamDetails,
+    FailoverRouterInputStreamDetails, Flow, FlowTransitEncryption, Gateway,
     GatewayNetwork,
     GatewayBridgeSource, GrantEntitlementRequest, IngressGatewayBridge, InputConfiguration,
     Interface, ListedBridge, ListedFlow,
     ListedGateway,
-    Maintenance, MaintenanceConfiguration, MediaConnectFlowRouterOutputStreamDetails, MediaStream,
+    Maintenance, MaintenanceConfiguration, MediaConnectFlowRouterInputStreamDetails,
+    MediaConnectFlowRouterOutputStreamDetails, MediaStream,
+    MediaLiveChannelRouterInputStreamDetails,
     MediaStreamAttributes, MediaStreamAttributesRequest,
     MediaLiveInputRouterOutputStreamDetails,
     MediaStreamOutputConfiguration, MediaStreamOutputConfigurationRequest,
-    MediaStreamSourceConfiguration, MediaStreamSourceConfigurationRequest, MonitoringConfig,
-    NdiConfig, Output, RouterOutput, RouterOutputConfiguration, RouterOutputMessage,
+    MediaStreamSourceConfiguration, MediaStreamSourceConfigurationRequest,
+    MergeRouterInputIndexedStreamDetails,
+    MergeRouterInputStreamDetails, MonitoringConfig,
+    NdiConfig, Output, RouterContentQualityAnalysisConfiguration, RouterInput,
+    RouterInputConfiguration, RouterInputStreamDetails, RouterInputTransitEncryption,
+    RouterInputTransitEncryptionKeyConfiguration,
+    RouterOutput, RouterOutputConfiguration, RouterOutputMessage,
     RouterOutputProtocolConfiguration, RouterOutputStreamDetails, SetSourceRequest, Source,
+    StandardRouterInputStreamDetails,
     StandardRouterOutputStreamDetails, Transport, UpdateEncryption,
     UpdateFailoverConfig, VpcInterface,
     VpcInterfaceAttachment,
@@ -64,18 +75,6 @@ pub const GATEWAY_STATE_DELETING: &str = "DELETING";
 /// readable resource, so a delete retires the record rather than evicting it (see
 /// [`StoredGateway::deleted_at`]).
 pub const GATEWAY_STATE_DELETED: &str = "DELETED";
-
-/// The `RouterInputState` enum the model declares for a router input
-/// (`smithy_query(query="shape",shape="RouterInputState")`: CREATING | STANDBY | STARTING
-/// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
-/// one a DELETE reaches is named here; the states a router input is created, started,
-/// stopped or updated into belong to those operations, which are still scaffolded.
-///
-/// There is no terminal `DELETED` value beside it — unlike `GatewayState`, which carries
-/// one (see [`GATEWAY_STATE_DELETED`]) — so a deleted router input is a resource that
-/// stops existing rather than one that stays readable: it is reported `DELETING` while the
-/// deletion is in progress and is then gone (see [`StoredRouterInput::removal_due_at`]).
-pub const ROUTER_INPUT_STATE_DELETING: &str = "DELETING";
 
 /// The `BridgeState` enum the model declares for a bridge
 /// (`smithy_query(query="shape",shape="BridgeState")`: CREATING | STANDBY | STARTING |
@@ -130,6 +129,42 @@ pub fn is_stopped_bridge_state(bridge_state: &str) -> bool {
             | BRIDGE_STATE_UPDATING
     )
 }
+
+/// The `RouterInputState` enum the model declares for a router input
+/// (`smithy_query(query="shape",shape="RouterInputState")`: CREATING | STANDBY | STARTING
+/// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
+/// states a router input's create, restart and delete reach are named here; the rest belong
+/// to the router-input operations that are still scaffolded (start, stop, update, migrate).
+///
+/// The non-terminal state a router input is answered in while it is being created; the
+/// clock settles it into [`ROUTER_INPUT_STATE_STANDBY`] one [`TRANSITION_SPAN`] later.
+pub const ROUTER_INPUT_STATE_CREATING: &str = "CREATING";
+/// See [`ROUTER_INPUT_STATE_CREATING`]. A router input that finished being created is not
+/// running yet: it waits in `STANDBY` until StartRouterInput starts it, exactly as a
+/// created bridge waits (see [`BRIDGE_STATE_STANDBY`]).
+pub const ROUTER_INPUT_STATE_STANDBY: &str = "STANDBY";
+/// See [`ROUTER_INPUT_STATE_CREATING`]. The state of a router input that is running.
+pub const ROUTER_INPUT_STATE_ACTIVE: &str = "ACTIVE";
+/// See [`ROUTER_INPUT_STATE_CREATING`]. The non-terminal state a router input is answered
+/// in while a restart is in flight: RestartRouterInput "can be used to recover from errors
+/// or refresh the input state"
+/// (`smithy_query(query="doc",shape="RestartRouterInput")`), which is what this state
+/// reports is happening.
+pub const ROUTER_INPUT_STATE_RECOVERING: &str = "RECOVERING";
+/// See [`ROUTER_INPUT_STATE_CREATING`]. The state of a router input that is not carrying
+/// content because something is wrong with it — the state RestartRouterInput recovers
+/// from. Nothing in this emulator PUTS an input here (there is no data plane to fail), so
+/// it is reached only by a caller seeding the store; a restart of such an input returns it
+/// to [`ROUTER_INPUT_STATE_ACTIVE`].
+pub const ROUTER_INPUT_STATE_ERROR: &str = "ERROR";
+/// See [`ROUTER_INPUT_STATE_CREATING`]. The non-terminal state a router input is answered
+/// in while its deletion is in progress.
+///
+/// There is no terminal `DELETED` value beside it — unlike `GatewayState`, which carries
+/// one (see [`GATEWAY_STATE_DELETED`]) — so a deleted router input is a resource that
+/// stops existing rather than one that stays readable: it is reported `DELETING` while the
+/// deletion is in progress and is then gone (see [`StoredRouterInput::removal_due_at`]).
+pub const ROUTER_INPUT_STATE_DELETING: &str = "DELETING";
 
 /// `ListedBridge$BridgeType` ("the type of the bridge") for a cloud-to-ground bridge —
 /// the kind `Bridge$EgressGatewayBridge` makes it ("an egress bridge is a cloud-to-ground
@@ -353,6 +388,15 @@ pub const MAX_GATEWAY_EGRESS_CIDR_BLOCKS: usize = MAX_FLOW_COLLECTION_ENTRIES;
 /// (never on a read). The number is the emulator's own bound, not a published AWS
 /// default, and it is high enough that no ordinary workflow meets it.
 pub const MAX_BRIDGES: usize = 1_000;
+
+/// The ceiling on how many router inputs this store holds, for the same reason as
+/// [`MAX_GATEWAYS`]: nothing evicts a router input and GetRouterInput must still answer
+/// what CreateRouterInput created, so the store needs a maximum entry count.
+/// CreateRouterInput refuses past it with the service's own modelled
+/// `RouterInputServiceQuotaExceededException`, the 420 error declared on that create alone
+/// (never on a read). The number is the emulator's own bound, not a published AWS default,
+/// and it is high enough that no ordinary workflow meets it.
+pub const MAX_ROUTER_INPUTS: usize = 1_000;
 
 /// The ceiling on how many sources one bridge carries.
 ///
@@ -1516,56 +1560,6 @@ impl StoredGateway {
     }
 }
 
-/// A router input, as the service holds it between calls. Every router input operation's
-/// response is computed from this record.
-///
-/// Keyed in the store by its own ARN, which is what every router input operation addresses
-/// one by (`@httpLabel Arn`) and which carries the input's generated id, so two router
-/// inputs that share a name are still distinct resources.
-#[derive(Debug, Clone)]
-pub struct StoredRouterInput {
-    /// The `RouterInputArn` this service minted for the input — its identity, and the key
-    /// it is stored under.
-    pub arn: String,
-    /// `RouterInput$Name` / `DeleteRouterInputResponse$Name`, as the create request gave
-    /// it.
-    pub name: String,
-    /// `RouterInput$State` / `DeleteRouterInputResponse$State`: one value of the modelled
-    /// `RouterInputState` enum (see [`ROUTER_INPUT_STATE_DELETING`]).
-    pub state: String,
-    /// When the record stops existing, or `None` while the input is not being deleted.
-    ///
-    /// A router input delete is not instantaneous and it is not a soft delete: the input
-    /// reports `DELETING` for one [`TRANSITION_SPAN`], and then it is gone, because
-    /// `RouterInputState` declares no terminal state a deleted input could be reported in.
-    /// Holding the instant rather than sleeping for it is what lets the delete answer
-    /// `DELETING` while a later call sees the input removed; the removal itself is
-    /// materialised by [`ComAmazonawsMediaconnectMediaconnectState::settle_due_transitions`],
-    /// because it was owed at this instant whether or not anybody called.
-    pub removal_due_at: Option<SystemTime>,
-}
-
-impl StoredRouterInput {
-    /// Whether this input is already on its way out: DeleteRouterInput accepted a delete
-    /// for it, so a repeat of that `@idempotent` call answers the same response rather than
-    /// restarting the deletion.
-    pub fn is_deleting(&self) -> bool {
-        self.removal_due_at.is_some()
-    }
-
-    /// Whether the clock has made this input's removal due at `now`.
-    pub fn is_removal_due(&self, now: SystemTime) -> bool {
-        self.removal_due_at.is_some_and(|due_at| now >= due_at)
-    }
-
-    /// Enter `DELETING` now and owe the record's removal once [`TRANSITION_SPAN`] has
-    /// passed — the router input counterpart of [`StoredGateway::begin_transition`].
-    pub fn begin_deletion(&mut self, now: SystemTime) {
-        self.state = ROUTER_INPUT_STATE_DELETING.to_string();
-        self.removal_due_at = Some(now + TRANSITION_SPAN);
-    }
-}
-
 /// The modelled `BridgeSource` a request entry configures, or `None` when the entry
 /// names neither a flow source nor a network source.
 ///
@@ -1782,6 +1776,22 @@ impl StoredBridge {
     }
 }
 
+/// `RouterInputType` (`smithy_query(query="shape",shape="RouterInputType")`: STANDARD |
+/// FAILOVER | MERGE | MEDIACONNECT_FLOW | MEDIALIVE_CHANNEL) — the kind of a router input,
+/// which is DERIVED from the `RouterInputConfiguration` the create carried rather than
+/// asked for: the configuration is a union with one member per kind, and
+/// `RouterInput$InputType` is reported for every input. [`router_input_type`] is the one
+/// mapping.
+pub const ROUTER_INPUT_TYPE_STANDARD: &str = "STANDARD";
+/// See [`ROUTER_INPUT_TYPE_STANDARD`].
+pub const ROUTER_INPUT_TYPE_FAILOVER: &str = "FAILOVER";
+/// See [`ROUTER_INPUT_TYPE_STANDARD`].
+pub const ROUTER_INPUT_TYPE_MERGE: &str = "MERGE";
+/// See [`ROUTER_INPUT_TYPE_STANDARD`].
+pub const ROUTER_INPUT_TYPE_MEDIACONNECT_FLOW: &str = "MEDIACONNECT_FLOW";
+/// See [`ROUTER_INPUT_TYPE_STANDARD`].
+pub const ROUTER_INPUT_TYPE_MEDIALIVE_CHANNEL: &str = "MEDIALIVE_CHANNEL";
+
 /// The `RouterOutputState` enum the model declares for a router output
 /// (`smithy_query(query="shape",shape="RouterOutputState")`: CREATING | STANDBY | STARTING
 /// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
@@ -1815,11 +1825,343 @@ pub const ROUTER_OUTPUT_TYPE_MEDIALIVE_INPUT: &str = "MEDIALIVE_INPUT";
 
 /// The `MaintenanceType` enum the model declares
 /// (`smithy_query(query="shape",shape="MaintenanceType")`: PREFERRED_DAY_TIME | DEFAULT).
-/// Like the output type, it is not a request member: it is the variant of the resource's
-/// `MaintenanceConfiguration` union ([`StoredRouterOutput::maintenance_type`]).
+/// Like a router resource's type, it is not a request member: it is the variant of the
+/// resource's `MaintenanceConfiguration` union, reported through the one mapping
+/// [`maintenance_type`] (which [`StoredRouterOutput::maintenance_type`] also resolves
+/// through).
 pub const MAINTENANCE_TYPE_PREFERRED_DAY_TIME: &str = "PREFERRED_DAY_TIME";
 /// See [`MAINTENANCE_TYPE_PREFERRED_DAY_TIME`].
 pub const MAINTENANCE_TYPE_DEFAULT: &str = "DEFAULT";
+
+/// `RouterContentQualityAnalysisType`
+/// (`smithy_query(query="shape",shape="RouterContentQualityAnalysisType")`): the enum has
+/// exactly ONE value, and `RouterInput$ContentQualityAnalysisType` is reported for every
+/// router input, so this is the value every input reports.
+pub const ROUTER_CQA_TYPE_CONTENT_LEVEL: &str = "CONTENT_LEVEL";
+
+/// The `RouterInputType` of an input configured by `configuration`.
+///
+/// `RouterInputConfiguration` is a union with one member per input kind
+/// (`smithy_query(query="shape",shape="RouterInputConfiguration")`) and `RouterInputType`
+/// names exactly those kinds, so the type an input reports is a function of the
+/// configuration it was created with — never a separate request member. Every projection
+/// of a stored router input resolves it HERE.
+pub fn router_input_type(configuration: &RouterInputConfiguration) -> &'static str {
+    match configuration {
+        RouterInputConfiguration::Standard(_) => ROUTER_INPUT_TYPE_STANDARD,
+        RouterInputConfiguration::Failover(_) => ROUTER_INPUT_TYPE_FAILOVER,
+        RouterInputConfiguration::Merge(_) => ROUTER_INPUT_TYPE_MERGE,
+        RouterInputConfiguration::MediaConnectFlow(_) => ROUTER_INPUT_TYPE_MEDIACONNECT_FLOW,
+        RouterInputConfiguration::MediaLiveChannel(_) => ROUTER_INPUT_TYPE_MEDIALIVE_CHANNEL,
+    }
+}
+
+/// The `MaintenanceType` of a resource whose maintenance is configured by
+/// `configuration` — the union member it carries (`PreferredDayTime` or `Default`), which
+/// is what the `MaintenanceType` enum names.
+pub fn maintenance_type(configuration: &MaintenanceConfiguration) -> &'static str {
+    match configuration {
+        MaintenanceConfiguration::PreferredDayTime(_) => MAINTENANCE_TYPE_PREFERRED_DAY_TIME,
+        MaintenanceConfiguration::Default(_) => MAINTENANCE_TYPE_DEFAULT,
+    }
+}
+
+/// The maximum bitrate, in BITS PER SECOND, a router input of `tier` may carry, or `None`
+/// for a tier this function does not know.
+///
+/// "The tier sets the maximum bitrate, in Mbps, for the router input. Valid values include
+/// the following: INPUT_20 – 20 Mbps, INPUT_50 – 50 Mbps, INPUT_100 – 100 Mbps, INPUT_250
+/// – 250 Mbps, INPUT_500 – 500 Mbps"
+/// (`smithy_query(query="doc",shape="CreateRouterInputRequest",member="Tier")`), so the
+/// tier a create names bounds the `MaximumBitrate` it may ask for. The published numbers
+/// are in Mbps and MediaConnect states a bitrate in bits per second, so each is converted
+/// through [`BITS_PER_MEGABIT`] — the router output side of the same rule is
+/// [`router_output_tier_bitrate_ceiling`].
+pub fn router_input_tier_bitrate_ceiling(tier: &str) -> Option<i64> {
+    let megabits_per_second = match tier {
+        "INPUT_20" => 20,
+        "INPUT_50" => 50,
+        "INPUT_100" => 100,
+        "INPUT_250" => 250,
+        "INPUT_500" => 500,
+        _ => return None,
+    };
+    Some(megabits_per_second * BITS_PER_MEGABIT)
+}
+
+/// The `RouterInputTransitEncryption` an input reports when the create named none.
+///
+/// `RouterInput$TransitEncryption` is a REQUIRED member while
+/// `CreateRouterInputRequest$TransitEncryption` is optional, so the service supplies a
+/// value for an input whose create omitted it: the key configuration union's `Automatic`
+/// member — "automatic" key management, which needs no secret and no role from the caller
+/// — under the matching `AUTOMATIC` key type.
+pub fn default_router_input_transit_encryption() -> RouterInputTransitEncryption {
+    RouterInputTransitEncryption {
+        encryption_key_type: Some(ROUTER_INPUT_TRANSIT_ENCRYPTION_KEY_TYPE_AUTOMATIC.to_string()),
+        encryption_key_configuration: RouterInputTransitEncryptionKeyConfiguration::Automatic(
+            AutomaticEncryptionKeyConfiguration {},
+        ),
+    }
+}
+
+/// `RouterInputTransitEncryptionKeyType`
+/// (`smithy_query(query="shape",shape="RouterInputTransitEncryptionKeyType")`:
+/// SECRETS_MANAGER | AUTOMATIC) — the key type of the transit encryption
+/// [`default_router_input_transit_encryption`] supplies.
+pub const ROUTER_INPUT_TRANSIT_ENCRYPTION_KEY_TYPE_AUTOMATIC: &str = "AUTOMATIC";
+
+/// The `RouterContentQualityAnalysisConfiguration` an input reports when the create named
+/// none.
+///
+/// `RouterInput$ContentQualityAnalysisConfiguration` is reported for every input while
+/// `CreateRouterInputRequest$ContentQualityAnalysisConfiguration` is optional, and the
+/// union has a single member (`ContentLevel`), so an input whose create configured no
+/// content quality analysis reports that member with none of its three features
+/// (`BlackFrames`, `FrozenFrames`, `SilentAudio`) configured — each is optional, and an
+/// absent one is a feature nothing analyses.
+pub fn default_router_content_quality_analysis_configuration()
+-> RouterContentQualityAnalysisConfiguration {
+    RouterContentQualityAnalysisConfiguration::ContentLevel(
+        ContentQualityAnalysisFeatureConfiguration {
+            black_frames: None,
+            frozen_frames: None,
+            silent_audio: None,
+        },
+    )
+}
+
+/// The `RouterInputStreamDetails` of an input configured by `configuration` that is not
+/// carrying a stream.
+///
+/// `RouterInputStreamDetails` is a union whose members are the same five input kinds as
+/// [`router_input_type`]'s, so which member an input reports follows from its
+/// configuration. Every per-source address inside it stays ABSENT: the emulator serves no
+/// media data plane, so no source address has been observed on an input — a failover and a
+/// merge input still report both of their indexed entries, because the model makes those
+/// two members required, and the index is the position the configuration lists the source
+/// at.
+pub fn initial_router_input_stream_details(
+    configuration: &RouterInputConfiguration,
+) -> RouterInputStreamDetails {
+    match configuration {
+        RouterInputConfiguration::Standard(_) => {
+            RouterInputStreamDetails::Standard(StandardRouterInputStreamDetails {
+                source_ip_address: None,
+            })
+        }
+        RouterInputConfiguration::Failover(_) => {
+            RouterInputStreamDetails::Failover(FailoverRouterInputStreamDetails {
+                source_index_zero_stream_details: FailoverRouterInputIndexedStreamDetails {
+                    source_index: 0,
+                    source_ip_address: None,
+                },
+                source_index_one_stream_details: FailoverRouterInputIndexedStreamDetails {
+                    source_index: 1,
+                    source_ip_address: None,
+                },
+            })
+        }
+        RouterInputConfiguration::Merge(_) => {
+            RouterInputStreamDetails::Merge(MergeRouterInputStreamDetails {
+                source_index_zero_stream_details: MergeRouterInputIndexedStreamDetails {
+                    source_index: 0,
+                    source_ip_address: None,
+                },
+                source_index_one_stream_details: MergeRouterInputIndexedStreamDetails {
+                    source_index: 1,
+                    source_ip_address: None,
+                },
+            })
+        }
+        RouterInputConfiguration::MediaConnectFlow(_) => {
+            RouterInputStreamDetails::MediaConnectFlow(MediaConnectFlowRouterInputStreamDetails {})
+        }
+        RouterInputConfiguration::MediaLiveChannel(_) => {
+            RouterInputStreamDetails::MediaLiveChannel(MediaLiveChannelRouterInputStreamDetails {})
+        }
+    }
+}
+
+/// Whether an input configured by `configuration` ingests on a ROUTER NETWORK INTERFACE of
+/// this account — the configurations that carry a `NetworkInterfaceArn`.
+///
+/// Such an input is reachable at an address of its own, which is what
+/// `RouterInput$IpAddress` ("the IP address of the router input") reports; an input that
+/// takes its content from another AWS resource instead (a MediaConnect flow output, a
+/// MediaLive channel output) has no address of its own, so the optional member stays
+/// absent for it rather than carrying an address that addresses nothing.
+pub fn router_input_has_own_address(configuration: &RouterInputConfiguration) -> bool {
+    matches!(
+        configuration,
+        RouterInputConfiguration::Standard(_)
+            | RouterInputConfiguration::Failover(_)
+            | RouterInputConfiguration::Merge(_)
+    )
+}
+
+/// A router input, as the service holds it between calls. Every router input operation's
+/// response is computed from this record.
+///
+/// Keyed in the store by its own ARN, which is what every router input operation addresses
+/// one by (`@httpLabel Arn`) and which carries the input's generated id, so two router
+/// inputs that share a name are still distinct resources.
+#[derive(Debug, Clone)]
+pub struct StoredRouterInput {
+    pub arn: String,
+    /// `RouterInput$Id`: the per-input id the ARN carries, minted by
+    /// [`router_resource_id`].
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    /// The state change the clock owes, if any. See [`TRANSITION_SPAN`].
+    pub pending: Option<PendingStatus>,
+    pub configuration: RouterInputConfiguration,
+    pub maximum_bitrate: i64,
+    pub tier: String,
+    pub routing_scope: String,
+    pub region_name: String,
+    pub availability_zone: String,
+    pub transit_encryption: RouterInputTransitEncryption,
+    pub maintenance_configuration: MaintenanceConfiguration,
+    pub content_quality_analysis_configuration: RouterContentQualityAnalysisConfiguration,
+    pub tags: BTreeMap<String, String>,
+    /// `RouterInput$IpAddress`, for an input that ingests on a network interface of its
+    /// own (see [`router_input_has_own_address`]).
+    pub ip_address: Option<String>,
+    /// The `ClientToken` of the create that minted this input, when it carried one — what
+    /// makes a repeated create with the same token return THIS input rather than mint a
+    /// second one (`CreateRouterInputRequest$ClientToken` is an `@idempotencyToken`).
+    pub client_token: Option<String>,
+    pub created_at: SystemTime,
+    /// When this record was last changed. A restart is such a change, so the member moves;
+    /// a read never moves it.
+    pub updated_at: SystemTime,
+    /// When the record stops existing, or `None` while the input is not being deleted.
+    ///
+    /// A router input delete is not instantaneous and it is not a soft delete: the input
+    /// reports `DELETING` for one [`TRANSITION_SPAN`], and then it is gone, because
+    /// `RouterInputState` declares no terminal state a deleted input could be reported in.
+    /// Holding the instant rather than sleeping for it is what lets the delete answer
+    /// `DELETING` while a later call sees the input removed; the removal itself is
+    /// materialised by [`ComAmazonawsMediaconnectMediaconnectState::settle_due_transitions`],
+    /// because it was owed at this instant whether or not anybody called.
+    pub removal_due_at: Option<SystemTime>,
+}
+
+impl StoredRouterInput {
+    /// Materialise the state change the clock already made due, if it is due at `now`.
+    ///
+    /// As for a flow (see [`StoredFlow::settle`]) this is the only write a reporting
+    /// operation performs: the change was owed at `due_at` whether or not anybody called.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(pending) = self.pending.take() {
+            if now >= pending.due_at {
+                self.state = pending.status;
+            } else {
+                self.pending = Some(pending);
+            }
+        }
+    }
+
+    /// Enter `transient` now and owe `settled` once [`TRANSITION_SPAN`] has passed — the
+    /// router input counterpart of [`StoredFlow::begin_transition`], so every state a
+    /// router input is answered in while the clock still owes a change is started one way.
+    pub fn begin_transition(&mut self, transient: &str, settled: &str, now: SystemTime) {
+        self.state = transient.to_string();
+        self.pending = Some(PendingStatus {
+            status: settled.to_string(),
+            due_at: now + TRANSITION_SPAN,
+        });
+    }
+
+    /// Whether a state change is in flight for this input: the clock still owes it one, so
+    /// the input is between two states rather than settled in one — including the deletion
+    /// it owes once DeleteRouterInput has accepted one, because an input on its way out is
+    /// not an input a later call can still act on.
+    pub fn is_transitioning(&self) -> bool {
+        self.pending.is_some() || self.is_deleting()
+    }
+
+    /// Whether this input is already on its way out: DeleteRouterInput accepted a delete
+    /// for it, so a repeat of that `@idempotent` call answers the same response rather than
+    /// restarting the deletion.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// Whether the clock has made this input's removal due at `now`.
+    pub fn is_removal_due(&self, now: SystemTime) -> bool {
+        self.removal_due_at.is_some_and(|due_at| now >= due_at)
+    }
+
+    /// Enter `DELETING` now and owe the record's removal once [`TRANSITION_SPAN`] has
+    /// passed — the deletion counterpart of [`Self::begin_transition`], which owes a STATE
+    /// instead.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.state = ROUTER_INPUT_STATE_DELETING.to_string();
+        self.removal_due_at = Some(now + TRANSITION_SPAN);
+    }
+
+    /// The modelled `RouterInput` for this record.
+    ///
+    /// `routed_outputs` is the number of router outputs routed to this input, which lives
+    /// on the OUTPUT records rather than here
+    /// ([`ComAmazonawsMediaconnectMediaconnectState::routed_output_count`] counts them), so
+    /// it is passed in by the caller that holds the store.
+    pub fn to_router_input(&self, routed_outputs: i32) -> RouterInput {
+        RouterInput {
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            id: self.id.clone(),
+            state: self.state.clone(),
+            input_type: router_input_type(&self.configuration).to_string(),
+            configuration: self.configuration.clone(),
+            // `RouterInput$RoutedOutputs` is "the number of outputs currently routed to
+            // this input": the router outputs this store holds whose `RoutedInputArn` is
+            // this input's ARN, counted by the caller (see above).
+            routed_outputs,
+            // `MaximumRoutedOutputs` is "the maximum number of outputs that can be
+            // simultaneously routed to this input". AWS publishes no number for it and
+            // nothing in this emulator enforces one, so the optional member stays absent
+            // rather than reporting a ceiling nothing applies.
+            maximum_routed_outputs: None,
+            region_name: self.region_name.clone(),
+            availability_zone: self.availability_zone.clone(),
+            maximum_bitrate: self.maximum_bitrate,
+            tier: self.tier.clone(),
+            routing_scope: self.routing_scope.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+            // `RouterInput$Messages` carries "messages with information about the router
+            // input"; an input this emulator serves has nothing to report about itself, so
+            // the required list is empty.
+            messages: Vec::new(),
+            transit_encryption: self.transit_encryption.clone(),
+            tags: self
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            stream_details: initial_router_input_stream_details(&self.configuration),
+            ip_address: self.ip_address.clone(),
+            maintenance_type: maintenance_type(&self.maintenance_configuration).to_string(),
+            maintenance_configuration: self.maintenance_configuration.clone(),
+            // A maintenance SCHEDULE is the window MediaConnect picked inside the
+            // configured preference, which StartRouterInput reports as it starts an input
+            // (its response makes `MaintenanceScheduleType` and `MaintenanceSchedule`
+            // required). Nothing has scheduled a window for an input this emulator only
+            // created, so both optional members stay absent until the operation that
+            // schedules one is implemented.
+            maintenance_schedule_type: None,
+            maintenance_schedule: None,
+            content_quality_analysis_type: ROUTER_CQA_TYPE_CONTENT_LEVEL.to_string(),
+            content_quality_analysis_configuration: self
+                .content_quality_analysis_configuration
+                .clone(),
+        }
+    }
+}
 
 /// The `FabricLatencyMode` the model documents as the DEFAULT recovery latency mode
 /// (`FabricConfiguration$RecoveryLatencyMode`: "`BALANCED` (default) – Optimizes for
@@ -1912,30 +2254,54 @@ pub fn router_resource_id(suffix: u64) -> String {
     format!("{:012x}", suffix & 0xffff_ffff_ffff)
 }
 
+/// The resource fragment of a ROUTER resource's ARN: `<resource type>:<id>`, with the id
+/// [`router_resource_id`] mints.
+///
+/// Every router resource's modelled ARN pattern has this one shape — the resource type then
+/// the twelve-character id, and no name — so the two fragment helpers
+/// ([`router_input_resource_fragment`], [`router_output_resource_fragment`]) differ only in
+/// that type and are built HERE.
+fn router_resource_fragment(resource_type: &str, id: &str) -> String {
+    format!("{resource_type}:{id}")
+}
+
 /// The resource fragment of a router output ARN: `routerOutput:<id>`, with the id
 /// [`router_resource_id`] mints.
 pub fn router_output_resource_fragment(id: &str) -> String {
-    format!("routerOutput:{id}")
+    router_resource_fragment("routerOutput", id)
 }
 
-/// Whether `arn` is a router output ARN this service could have minted: the prefix
-/// [`has_mintable_arn_prefix`] describes for the `routerOutput` resource type, then an id
-/// of the form [`router_resource_id`] mints.
+/// Whether `arn` is an ARN this service could have minted for the ROUTER resource
+/// `resource_type`: the prefix [`has_mintable_arn_prefix`] describes for that type, then an
+/// id of the form [`router_resource_id`] mints.
 ///
-/// This function is the crate's ONE encoding of the modelled `RouterOutputArn` constraint,
-/// checked segment by segment; the integration test asserts minted ARNs through it, so
-/// there is no second spelling that can drift from it.
-pub fn is_mintable_router_output_arn(arn: &str) -> bool {
+/// The modelled ARN pattern of every router resource
+/// (`smithy_query(query="shape",shape="RouterInputArn")` /
+/// `…shape="RouterOutputArn"` /  `…shape="RouterNetworkInterfaceArn"`:
+/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:<type>:[a-z0-9]{12}$`) differs
+/// only in that resource type, so this is the crate's ONE encoding of all of them, checked
+/// segment by segment. [`is_mintable_router_input_arn`] and
+/// [`is_mintable_router_output_arn`] are the two named entry points, so no second spelling
+/// can drift from this one.
+fn is_mintable_router_resource_arn(arn: &str, resource_type: &str) -> bool {
     let segments: Vec<&str> = arn.split(':').collect();
     let [.., id] = segments.as_slice() else {
         return false;
     };
     segments.len() == 7
-        && has_mintable_arn_prefix(&segments, "routerOutput")
+        && has_mintable_arn_prefix(&segments, resource_type)
         && id.len() == 12
         && id
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Whether `arn` is a router output ARN this service could have minted — the modelled
+/// `RouterOutputArn` constraint, through the one encoding
+/// [`is_mintable_router_resource_arn`]. The integration test asserts minted ARNs through
+/// this function.
+pub fn is_mintable_router_output_arn(arn: &str) -> bool {
+    is_mintable_router_resource_arn(arn, "routerOutput")
 }
 
 /// Whether `zone` is an Availability Zone of the Region `region`.
@@ -2041,12 +2407,10 @@ impl StoredRouterOutput {
     }
 
     /// `RouterOutput$MaintenanceType`, the variant of the output's maintenance
-    /// configuration union.
+    /// configuration union — resolved through the crate's one mapping,
+    /// [`maintenance_type`].
     pub fn maintenance_type(&self) -> &'static str {
-        match &self.maintenance_configuration {
-            MaintenanceConfiguration::PreferredDayTime(_) => MAINTENANCE_TYPE_PREFERRED_DAY_TIME,
-            MaintenanceConfiguration::Default(_) => MAINTENANCE_TYPE_DEFAULT,
-        }
+        maintenance_type(&self.maintenance_configuration)
     }
 
     /// `RouterOutput$StreamDetails` — the union member that matches the output's
@@ -2138,16 +2502,19 @@ pub struct ComAmazonawsMediaconnectMediaconnectState {
     /// the model puts no uniqueness rule on `Bridge$Name`, and the bridge id in the ARN
     /// is what keeps two same-named bridges apart.
     pub bridges: BTreeMap<String, StoredBridge>,
-    /// Every router input the store holds, keyed by its ARN. Ordered, so ListRouterInputs
-    /// pages stably once it is implemented.
+    /// Every router input the store holds, keyed by its ARN — the identity every router
+    /// input operation addresses one by (`@httpLabel Arn`). Ordered, so ListRouterInputs
+    /// can page stably once it is implemented.
     ///
     /// A deleted router input leaves this map one [`TRANSITION_SPAN`] after the delete
     /// (see [`StoredRouterInput::removal_due_at`]): the model declares no terminal
     /// `DELETED` state it could be reported in, so unlike a gateway it is not retained.
     ///
     /// There is no index by name beside it, for the same reason as [`Self::gateways`]: the
-    /// model puts no uniqueness rule on `RouterInput$Name`, and the input id in the ARN is
-    /// what keeps two same-named router inputs apart.
+    /// model puts no uniqueness rule on `RouterInput$Name`, and the router input id in the
+    /// ARN ([`router_resource_id`]) is what keeps two same-named inputs apart — the name is
+    /// not even part of the ARN, which the modelled `RouterInputArn` pattern fixes to the
+    /// id alone.
     pub router_inputs: BTreeMap<String, StoredRouterInput>,
     /// Every router output, keyed by its ARN — the identity every router output
     /// operation addresses one by (`@httpLabel Arn`, and the `Arns` BatchGetRouterOutput
@@ -2172,11 +2539,15 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     /// The tags of the resource `resource_arn` addresses, or `None` when this service
     /// holds no tags for such a resource.
     ///
-    /// A flow is the only resource whose TAGS this emulator persists: a gateway record
-    /// carries no tag map (no gateway operation in the model takes or reports tags) and
-    /// every other MediaConnect create (bridge, router input/output, reservation) is still
-    /// scaffolded — so a tag call resolves its `ResourceArn` against the flow store, and
-    /// any other ARN addresses nothing whose tags exist in the system.
+    /// A flow is the only resource whose tags a `ResourceArn` resolves to HERE: a gateway
+    /// record carries no tag map (no gateway operation in the model takes or reports tags),
+    /// a router input carries its own (`StoredRouterInput::tags`) but is reached by the
+    /// GLOBAL tag operations — TagGlobalResource / UntagGlobalResource /
+    /// ListTagsForGlobalResource, which cover "router inputs, router outputs and router
+    /// network interfaces" and are still scaffolded — and every remaining MediaConnect
+    /// create (bridge, router output, reservation) is still scaffolded. So a TagResource /
+    /// UntagResource / ListTagsForResource call resolves its `ResourceArn` against the flow
+    /// store, and any other ARN addresses nothing whose tags those operations reach.
     pub fn tags_of(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
         self.flows.get(resource_arn).map(|flow| &flow.tags)
     }
@@ -2187,9 +2558,9 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         self.flows.get_mut(resource_arn).map(|flow| &mut flow.tags)
     }
 
-    /// Settle every flow, gateway, bridge and router output whose status change the clock
-    /// already made due, and materialise the removal of every router input whose deletion
-    /// has come due.
+    /// Settle every flow, gateway, bridge, router input and router output whose status
+    /// change the clock already made due, and materialise the removal of every router input
+    /// whose deletion has come due.
     pub fn settle_due_transitions(&mut self, now: SystemTime) {
         for flow in self.flows.values_mut() {
             flow.settle(now);
@@ -2200,6 +2571,9 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         for bridge in self.bridges.values_mut() {
             bridge.settle(now);
         }
+        for router_input in self.router_inputs.values_mut() {
+            router_input.settle(now);
+        }
         for router_output in self.router_outputs.values_mut() {
             router_output.settle(now);
         }
@@ -2209,6 +2583,49 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         // [`StoredRouterInput::removal_due_at`]).
         self.router_inputs
             .retain(|_, router_input| !router_input.is_removal_due(now));
+    }
+
+    /// The router input `arn` addresses, with everything the clock already made due
+    /// materialised first — the state changes it owes, and the removal of an input whose
+    /// deletion has come due, which is why an input the clock has already taken away is
+    /// `None` here.
+    ///
+    /// The one lookup every router input operation resolves an `@httpLabel` ARN through,
+    /// so one request can never see a state another request would not.
+    pub fn router_input_mut(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<&mut StoredRouterInput> {
+        self.settle_due_transitions(now);
+        self.router_inputs.get_mut(arn)
+    }
+
+    /// How many router outputs are currently ROUTED to the router input `input_arn` —
+    /// `RouterInput$RoutedOutputs`.
+    ///
+    /// The relation lives on the output records (`StoredRouterOutput::routed_input_arn`,
+    /// which only TakeRouterInput sets), so it is counted here rather than held a second
+    /// time on the input.
+    pub fn routed_output_count(&self, input_arn: &str) -> i32 {
+        let routed = self
+            .router_outputs
+            .values()
+            .filter(|router_output| router_output.routed_input_arn.as_deref() == Some(input_arn))
+            .count();
+        i32::try_from(routed).unwrap_or(i32::MAX)
+    }
+
+    /// The modelled `RouterInput` the store holds for `arn`, with everything the clock
+    /// already made due materialised first (as [`Self::router_input_mut`] does) and
+    /// [`Self::routed_output_count`] resolved — the one projection every router input
+    /// operation answers from.
+    pub fn router_input_projection(&mut self, arn: &str, now: SystemTime) -> Option<RouterInput> {
+        self.settle_due_transitions(now);
+        let routed_outputs = self.routed_output_count(arn);
+        self.router_inputs
+            .get(arn)
+            .map(|router_input| router_input.to_router_input(routed_outputs))
     }
 
     /// How many LIVE gateways the store holds — the count [`MAX_GATEWAYS`] bounds.
@@ -2318,9 +2735,18 @@ pub fn bridge_resource_fragment(suffix: u64, name: &str) -> String {
 /// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerInput:[a-z0-9]{12}$`)
 /// fixes the id at exactly twelve `[a-z0-9]` characters and carries NO name segment, so
 /// unlike [`flow_resource_fragment`] the fragment is the id alone — the same shape as
-/// [`router_output_resource_fragment`].
+/// [`router_output_resource_fragment`], which is why both are built through
+/// [`router_resource_fragment`].
 pub fn router_input_resource_fragment(id: &str) -> String {
-    format!("routerInput:{id}")
+    router_resource_fragment("routerInput", id)
+}
+
+/// Whether `arn` is a router input ARN this service could have minted — the modelled
+/// `RouterInputArn` constraint, through the one encoding
+/// [`is_mintable_router_resource_arn`] the router output side also uses. The integration
+/// test asserts minted ARNs through this function.
+pub fn is_mintable_router_input_arn(arn: &str) -> bool {
+    is_mintable_router_resource_arn(arn, "routerInput")
 }
 
 /// The resource fragment of an output ARN: `output:<output id>:<name>`.
@@ -2526,11 +2952,13 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 }
 
 /// Whether `region` can be the Region segment of an ARN this service mints: the modelled
-/// `FlowArn` / `RouterOutputArn` patterns constrain that segment to `[a-z0-9-]+`.
+/// `FlowArn` / `RouterInputArn` / `RouterOutputArn` patterns constrain that segment to
+/// `[a-z0-9-]+`.
 ///
 /// The one encoding of that constraint, shared by [`request_region`] (which ignores a
 /// credential scope that is not a region token), [`has_mintable_arn_prefix`] and the
-/// creates that take a Region as a request member (`CreateRouterOutput$RegionName`).
+/// creates that take a Region as a request member (`CreateRouterInput$RegionName`,
+/// `CreateRouterOutput$RegionName`).
 pub fn is_region_token(region: &str) -> bool {
     !region.is_empty()
         && region
@@ -2646,29 +3074,6 @@ pub fn is_mintable_bridge_arn(arn: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && is_valid_bridge_name(bridge_name)
-}
-
-/// Whether `arn` is a router input ARN this service could have minted: the prefix
-/// [`has_mintable_arn_prefix`] describes for the `routerInput` resource type, then an id of
-/// the form [`router_resource_id`] mints — the router input counterpart of
-/// [`is_mintable_router_output_arn`].
-///
-/// This function is the crate's ONE encoding of the modelled `RouterInputArn` constraint
-/// (`smithy_query(query="shape",shape="RouterInputArn")`:
-/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerInput:[a-z0-9]{12}$`),
-/// checked segment by segment; the integration test asserts minted ARNs through it, so
-/// there is no second spelling that can drift from it.
-pub fn is_mintable_router_input_arn(arn: &str) -> bool {
-    let segments: Vec<&str> = arn.split(':').collect();
-    let [.., router_input_id] = segments.as_slice() else {
-        return false;
-    };
-    segments.len() == 7
-        && has_mintable_arn_prefix(&segments, "routerInput")
-        && router_input_id.len() == 12
-        && router_input_id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// Whether `arn` is a flow ARN this service could have minted.

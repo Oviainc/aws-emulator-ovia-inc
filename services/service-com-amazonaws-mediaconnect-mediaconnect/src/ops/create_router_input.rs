@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRouterInput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRouterInput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRouterInput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a router input and persists it in [`crate::state`], so GetRouterInput and
+//! RestartRouterInput answer from the record this call stored.
+//!
+//! What the request does NOT carry is DERIVED here, once, and then stored, so every later
+//! read reports the same value: the input's id and ARN
+//! ([`crate::state::router_resource_id`]), its `InputType` and `StreamDetails` (which follow
+//! from the configuration union member — [`crate::state::router_input_type`]), its
+//! `MaintenanceType`, the transit encryption and content-quality-analysis configuration a
+//! request that named none gets
+//! ([`crate::state::default_router_input_transit_encryption`]), and its Region and
+//! Availability Zone.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +111,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> CreateRouterInputError {
+    CreateRouterInputErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -182,18 +196,212 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRouterInput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRouterInputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRouterInput"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRouterInputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect router input store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // "The tier sets the maximum bitrate, in Mbps, for the router input", and the Tier
+        // doc publishes the Mbps of each tier, so the tier the request names bounds the
+        // `MaximumBitrate` it may ask for (see
+        // `crate::state::router_input_tier_bitrate_ceiling`). A bitrate at or below zero names
+        // no capacity at all.
+        if input.maximum_bitrate <= 0 {
+            return Err(bad_request(format!(
+                "MaximumBitrate must be a positive number of bits per second; this request \
+                 asks for {}.",
+                input.maximum_bitrate
+            )));
+        }
+        if let Some(ceiling) = crate::state::router_input_tier_bitrate_ceiling(&input.tier) {
+            if input.maximum_bitrate > ceiling {
+                return Err(bad_request(format!(
+                    "MaximumBitrate {} exceeds the {} bits per second the {} tier allows.",
+                    input.maximum_bitrate, ceiling, input.tier
+                )));
+            }
+        }
+
+        // "The Amazon Web Services Region for the router input. Defaults to the current
+        // region if not specified" — the current Region being the one this request was
+        // signed for.
+        let signing_region = crate::state::request_region(ctx.parts());
+        let region_name = match input.region_name.as_deref() {
+            Some(region_name) => {
+                if !crate::state::is_region_token(region_name) {
+                    return Err(bad_request(format!(
+                        "RegionName {region_name:?} is not an Amazon Web Services Region name."
+                    )));
+                }
+                region_name.to_string()
+            }
+            None => signing_region.clone(),
+        };
+
+        // `AvailabilityZone` "must be a valid Availability Zone for the region specified by
+        // regionName, or the current region if no regionName is provided": AWS names an
+        // Availability Zone by its Region followed by one lowercase letter, which
+        // `crate::state::is_zone_of_region` is this crate's one encoding of. Which zones a
+        // Region actually has is not something this emulator knows, so nothing narrower is
+        // checked. A request that names none is given the Region's first zone, because
+        // `RouterInput$AvailabilityZone` is reported for every input.
+        let availability_zone = match input.availability_zone.as_deref() {
+            Some(availability_zone) => {
+                if !crate::state::is_zone_of_region(availability_zone, &region_name) {
+                    return Err(bad_request(format!(
+                        "AvailabilityZone {availability_zone:?} is not an Availability Zone of \
+                         Region {region_name:?}."
+                    )));
+                }
+                availability_zone.to_string()
+            }
+            None => crate::state::default_availability_zone(&region_name),
+        };
+
+        // Tags are stored verbatim in a record nothing evicts, so the pairs and their count
+        // are bounded before they are stored, through the same functions every other tag
+        // write in this crate uses.
+        let requested_tags = input.tags.clone().unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(bad_request(format!(
+                "A resource may carry at most {} tags; this request has {}.",
+                crate::state::MAX_TAGS_PER_RESOURCE,
+                requested_tags.len()
+            )));
+        }
+        let mut tags = ::std::collections::BTreeMap::new();
+        for (key, value) in requested_tags {
+            if let Some(rejection) = crate::state::tag_pair_rejection(&key, &value) {
+                return Err(bad_request(rejection));
+            }
+            tags.insert(key, value);
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `ClientToken` is an `@idempotencyToken`, "a unique identifier for the request to
+        // ensure idempotency": a create that repeats a token this store already minted an
+        // input for answers with THAT input instead of minting a second one.
+        if let Some(client_token) = input.client_token.as_deref() {
+            let already_minted = store
+                .router_inputs
+                .values()
+                .find(|router_input| router_input.client_token.as_deref() == Some(client_token))
+                .map(|router_input| router_input.arn.clone());
+            if let Some(arn) = already_minted {
+                let routed_outputs = store.routed_output_count(&arn);
+                if let Some(router_input) = store
+                    .router_inputs
+                    .get(&arn)
+                    .map(|router_input| router_input.to_router_input(routed_outputs))
+                {
+                    return Ok(CreateRouterInputOutput { router_input });
+                }
+            }
+        }
+
+        // The router input store is bounded: nothing evicts a router input and
+        // GetRouterInput must still answer what this operation created, so the create
+        // refuses once the store is full rather than growing it without limit. See
+        // `crate::state::MAX_ROUTER_INPUTS`.
+        if store.router_inputs.len() >= crate::state::MAX_ROUTER_INPUTS {
+            return Err(
+                CreateRouterInputErrorModeled::RouterInputServiceQuotaExceededException(
+                    RouterInputServiceQuotaExceededException {
+                        message: format!(
+                            "This account already holds the maximum of {} router inputs. \
+                             Delete a router input before creating another one.",
+                            crate::state::MAX_ROUTER_INPUTS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Nothing in the model makes a router input name unique, and the id in the ARN
+        // keeps two same-named inputs apart, so a name already in use is NOT refused: each
+        // create mints its own router input.
+        let suffix = store.next_suffix();
+        let id = crate::state::router_resource_id(suffix);
+        // Every ARN this service mints carries the Region the request was signed for — the
+        // control-plane endpoint the call reached — while `RegionName` is where the input
+        // itself lives, which a GLOBAL routing scope lets differ from it.
+        let arn = ::engine::emulator_arn(
+            crate::state::SERVICE_NAMESPACE,
+            &signing_region,
+            &crate::state::router_input_resource_fragment(&id),
+        );
+
+        let configuration = input.configuration.clone();
+        let ip_address = crate::state::router_input_has_own_address(&configuration)
+            .then(|| crate::state::assigned_ingest_ip(suffix));
+
+        store.router_inputs.insert(
+            arn.clone(),
+            crate::state::StoredRouterInput {
+                arn: arn.clone(),
+                id,
+                name: input.name.clone(),
+                // A new router input is not ready yet: the create answers with an input in
+                // the non-terminal `CREATING` state, which the clock settles into
+                // `STANDBY` once `crate::state::TRANSITION_SPAN` has passed — a created
+                // input is not running until StartRouterInput starts it.
+                state: crate::state::ROUTER_INPUT_STATE_CREATING.to_string(),
+                pending: Some(crate::state::PendingStatus {
+                    status: crate::state::ROUTER_INPUT_STATE_STANDBY.to_string(),
+                    due_at: now + crate::state::TRANSITION_SPAN,
+                }),
+                configuration,
+                maximum_bitrate: input.maximum_bitrate,
+                tier: input.tier.clone(),
+                routing_scope: input.routing_scope.clone(),
+                region_name,
+                availability_zone,
+                transit_encryption: input
+                    .transit_encryption
+                    .clone()
+                    .unwrap_or_else(crate::state::default_router_input_transit_encryption),
+                // `MaintenanceConfiguration` is optional on the request and reported for
+                // every input: an input whose create named none takes the union's
+                // `Default` member, the configuration AWS maintains the input under until
+                // a preferred day and time is asked for.
+                maintenance_configuration: input.maintenance_configuration.clone().unwrap_or(
+                    MaintenanceConfiguration::Default(DefaultMaintenanceConfiguration {}),
+                ),
+                content_quality_analysis_configuration: input
+                    .content_quality_analysis_configuration
+                    .clone()
+                    .unwrap_or_else(
+                        crate::state::default_router_content_quality_analysis_configuration,
+                    ),
+                tags,
+                ip_address,
+                client_token: input.client_token.clone(),
+                created_at: now,
+                updated_at: now,
+                // Only DeleteRouterInput owes a record's removal: the input this call
+                // creates is live.
+                removal_due_at: None,
+            },
+        );
+
+        // The response is the STORED record, read back out of the store, not the request.
+        let router_input = store.router_input_projection(&arn, now).ok_or_else(|| {
+            CreateRouterInputError::from(
+                CreateRouterInputErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the router input could not be read back after it was stored"
+                            .to_string(),
+                    },
+                ),
+            )
+        })?;
+        Ok(CreateRouterInputOutput { router_input })
     }
 }

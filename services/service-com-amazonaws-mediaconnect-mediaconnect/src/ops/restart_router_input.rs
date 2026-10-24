@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestartRouterInput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestartRouterInput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestartRouterInput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Restarts the stored router input the request's ARN addresses: the input enters the
+//! non-terminal `RECOVERING` state, which is persisted in [`crate::state`] (so a following
+//! GetRouterInput reports it), and the clock returns it to the operational state it was in
+//! one [`crate::state::TRANSITION_SPAN`] later.
+//!
+//! A restart is refused while a state change is already in flight for the input — the
+//! `ConflictException` the operation models, "the requested operation would cause a
+//! conflict with the current state of a service resource associated with the request" —
+//! and with `NotFoundException` for an ARN that addresses no router input.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +91,21 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The state a router input that was in `state` comes back in once its restart settles.
+///
+/// A restart does not start or stop an input: it "can be used to recover from errors or
+/// refresh the input state" (`smithy_query(query="doc",shape="RestartRouterInput")`), so an
+/// input comes back in the state it was running in. The ONE state that cannot be the
+/// outcome is `ERROR`: recovering from it is what the operation is for, so an input
+/// restarted out of `ERROR` comes back `ACTIVE`.
+fn state_after_restart(state: &str) -> &str {
+    if state == crate::state::ROUTER_INPUT_STATE_ERROR {
+        crate::state::ROUTER_INPUT_STATE_ACTIVE
+    } else {
+        state
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +180,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestartRouterInput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestartRouterInputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestartRouterInput"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RestartRouterInputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect router input store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The lookup materialises a state change the clock already made due before the
+        // restart is judged, so an input whose create has settled is restarted rather than
+        // refused for a transition that is no longer in flight.
+        let Some(router_input) = store.router_input_mut(&input.arn, now) else {
+            return Err(RestartRouterInputErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.arn),
+                },
+            )
+            .into());
+        };
+
+        // A restart moves the input's state, so it cannot be accepted while the clock
+        // already owes it a different one: the input is between two states, which is the
+        // conflict `ConflictException` describes ("would cause a conflict with the current
+        // state of a service resource associated with the request", 409 and retryable — the
+        // caller retries once the transition it is waiting on has settled). The status and
+        // the error code are the contract; the sentence states the precondition, and
+        // carries neither of this service's refusal envelopes, which word a
+        // `BadRequestException` (`crate::state::bad_request_message`) and a
+        // `NotFoundException` (`crate::state::not_found_message`).
+        if router_input.is_transitioning() {
+            return Err(RestartRouterInputErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Router input {} is in state {} and a state change is already in \
+                         progress, so it cannot be restarted yet.",
+                        router_input.arn, router_input.state
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Restarting is not instantaneous: the input reports `RECOVERING` and the clock
+        // owes it the operational state it comes back in one transition span later, so a
+        // caller that reads the input straight afterwards still sees the restart in flight.
+        let settled = state_after_restart(&router_input.state).to_string();
+        router_input.begin_transition(crate::state::ROUTER_INPUT_STATE_RECOVERING, &settled, now);
+        // The restart changed the resource, so the record's `UpdatedAt` moves with it.
+        router_input.updated_at = now;
+
+        // The response is the STORED record: "the current state of the router input after
+        // the restart operation".
+        Ok(RestartRouterInputOutput {
+            arn: router_input.arn.clone(),
+            name: router_input.name.clone(),
+            state: router_input.state.clone(),
+        })
     }
 }

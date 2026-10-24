@@ -21,18 +21,22 @@
 //! input was in, the name it carries, how many inputs the store holds, how often the delete
 //! is repeated and when, and the form of an ARN that addresses nothing.
 //!
-//! Nothing creates a router input over the wire yet — CreateRouterInput is still a scaffold
-//! stub (`issues/things-that-do-not-work/20261024T010542Z-mediaconnect-createrouterinput-stub.md`),
-//! as are GetRouterInput and ListRouterInputs — so each row is set up in the store and read
-//! back through it, the way `lifecycle_preconditions` sets up a flow status no implemented
-//! operation reaches. Every call under test still travels the whole request path (routing,
-//! restJson1 deserialization, constraint validation, handler, serialization) through the
-//! harness [`crate::flow_lifecycle::Emulator`].
+//! Each row is set up in the store rather than through CreateRouterInput, the way
+//! `lifecycle_preconditions` sets up a flow status no implemented operation reaches: the
+//! table spans every value of `RouterInputState`, and a create only ever answers `CREATING`.
+//! Every call under test still travels the whole request path (routing, restJson1
+//! deserialization, constraint validation, handler, serialization) through the harness
+//! [`crate::flow_lifecycle::Emulator`].
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
+use service_com_amazonaws_mediaconnect_mediaconnect::ops::types::{
+    DefaultMaintenanceConfiguration, MaintenanceConfiguration, RouterInputConfiguration,
+    RouterInputProtocolConfiguration, RtpRouterInputConfiguration,
+    StandardRouterInputConfiguration,
+};
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::{Emulator, REGION};
@@ -83,25 +87,63 @@ fn router_input_names() -> Vec<String> {
 /// Put one router input straight into the store and answer the ARN it is keyed by.
 ///
 /// Shaped like a created one: the ARN is minted through the crate's own
-/// [`mc::router_input_resource_fragment`], and the record is live (only DeleteRouterInput
-/// owes its removal).
-fn seed_router_input(emulator: &Emulator, name: &str, state: &str) -> String {
+/// [`mc::router_input_resource_fragment`], the configuration is the smallest CreateRouterInput
+/// would accept and the derived members are the ones that create fills in, and the record is
+/// live (only DeleteRouterInput owes its removal). The STATE, though, is the row's — which is
+/// why the record is seeded rather than created: a create only ever answers `CREATING`.
+///
+/// `pub(crate)` because the router input restart suite fills the store through it too (see
+/// `tests/all/router_input_restart.rs`), so there is one seeding helper rather than one per
+/// suite.
+pub(crate) fn seed_router_input(emulator: &Emulator, name: &str, state: &str) -> String {
     let store = emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();
     let mut store = store.lock();
     let suffix = store.next_suffix();
+    let id = mc::router_resource_id(suffix);
     let arn = engine::emulator_arn(
         mc::SERVICE_NAMESPACE,
         REGION,
-        &mc::router_input_resource_fragment(&mc::router_resource_id(suffix)),
+        &mc::router_input_resource_fragment(&id),
     );
+    let now = SystemTime::now();
     store.router_inputs.insert(
         arn.clone(),
         mc::StoredRouterInput {
             arn: arn.clone(),
+            id,
             name: name.to_string(),
             state: state.to_string(),
+            pending: None,
+            configuration: RouterInputConfiguration::Standard(StandardRouterInputConfiguration {
+                network_interface_arn:
+                    "arn:aws:mediaconnect:us-east-1:000000000000:routerNetworkInterface:0000000000a1"
+                        .to_string(),
+                protocol_configuration: RouterInputProtocolConfiguration::Rtp(
+                    RtpRouterInputConfiguration {
+                        port: 5000,
+                        forward_error_correction: None,
+                    },
+                ),
+                protocol: Some("RTP".to_string()),
+            }),
+            maximum_bitrate: 20_000_000,
+            tier: "INPUT_20".to_string(),
+            routing_scope: "REGIONAL".to_string(),
+            region_name: REGION.to_string(),
+            availability_zone: mc::default_availability_zone(REGION),
+            transit_encryption: mc::default_router_input_transit_encryption(),
+            maintenance_configuration: MaintenanceConfiguration::Default(
+                DefaultMaintenanceConfiguration {},
+            ),
+            content_quality_analysis_configuration:
+                mc::default_router_content_quality_analysis_configuration(),
+            tags: std::collections::BTreeMap::new(),
+            ip_address: Some(mc::assigned_ingest_ip(suffix)),
+            client_token: None,
+            created_at: now,
+            updated_at: now,
             removal_due_at: None,
         },
     );
