@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConnectInstanceIntegrations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConnectInstanceIntegrations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the integrations of an onboarded Connect instance, read out of the
+//! integration store `PutConnectInstanceIntegration` writes: one summary per stored
+//! integration, in the order they were first put, paged by `maxResults` with a
+//! `nextToken` naming the record the page ended at.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConnectInstanceIntegrations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An instance with no finished onboarding job is the modelled
+//! `ResourceNotFoundException` (HTTP 404) — the same gate the put asks — while an
+//! onboarded instance that holds no integration is an empty list.
+//!
+//! A pure report: it writes nothing, so paging it never changes what a later caller
+//! sees.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +151,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConnectInstanceIntegrations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConnectInstanceIntegrationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConnectInstanceIntegrations"))
+        /// The page size when the caller names none: the model's `maxResults`
+        /// upper bound (`range 1..50`), so an unpaged call sees as much as one
+        /// page can carry.
+        const DEFAULT_MAX_RESULTS: usize = 50;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListConnectInstanceIntegrationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the ConnectCampaignsV2 instance integration store is unavailable"
+                            .to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // Whether the instance exists at all is the instance-onboarding store's
+        // answer, the same one the put asks: an instance with no finished onboarding
+        // job is not found, which is a different answer from an onboarded instance
+        // that holds no integration (an empty list).
+        if !store.is_onboarded(&input.connect_instance_id, now) {
+            return Err(
+                ListConnectInstanceIntegrationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::instance_not_found_message(
+                            &input.connect_instance_id,
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let integrations: Vec<&crate::state::StoredIntegration> =
+            store.instance_integrations(&input.connect_instance_id).collect();
+
+        // The cursor is the sequence number the previous page ended at, so this page
+        // is every integration stored after it. An integration removed between two
+        // pages therefore does not invalidate a token already handed out. A token
+        // this service did not mint is a bad request.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(after) = crate::state::decode_next_token(token) else {
+                    return Err(
+                        ListConnectInstanceIntegrationsErrorModeled::ValidationException(
+                            ValidationException {
+                                message: "nextToken is not a cursor this service issued"
+                                    .to_string(),
+                                x_amz_error_type: None,
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                integrations
+                    .iter()
+                    .position(|stored| stored.sequence > after)
+                    .unwrap_or(integrations.len())
+            }
+        };
+
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+        let end = start.saturating_add(page_size).min(integrations.len());
+        let page = &integrations[start..end];
+
+        Ok(ListConnectInstanceIntegrationsOutput {
+            // Absent on the last page: a client stops paging when there is no token.
+            next_token: if end < integrations.len() {
+                page.last()
+                    .map(|stored| crate::state::encode_next_token(stored.sequence))
+            } else {
+                None
+            },
+            integration_summary_list: Some(
+                page.iter()
+                    .map(|stored| stored.to_summary())
+                    .collect(),
+            ),
+        })
     }
 }

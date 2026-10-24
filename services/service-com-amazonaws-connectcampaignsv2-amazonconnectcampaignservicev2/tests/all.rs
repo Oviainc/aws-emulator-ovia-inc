@@ -27,6 +27,8 @@ mod campaign_not_found_message;
 mod campaign_resume;
 #[path = "all/common.rs"]
 mod common;
+#[path = "all/connect_instance_integrations.rs"]
+mod connect_instance_integrations;
 #[path = "all/instance_onboarding.rs"]
 mod instance_onboarding;
 #[path = "all/instance_onboarding_tags_and_outbound_requests.rs"]

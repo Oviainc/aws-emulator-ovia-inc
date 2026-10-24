@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutConnectInstanceIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutConnectInstanceIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Puts one integration of an onboarded Connect instance into the integration store,
+//! which `ListConnectInstanceIntegrations` projects. An integration is identified by
+//! the pair its matching `IntegrationIdentifier` member carries — its kind and the ARN
+//! of the resource it integrates — so a put under a pair the instance already holds
+//! UPDATES that record and a put under a new pair adds one; the operation is
+//! `@idempotent`, and repeating it stores the same single record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutConnectInstanceIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An instance with no finished onboarding job holds no config to integrate anything
+//! with, so the put is the modelled `ResourceNotFoundException` (HTTP 404) and stores
+//! nothing — the same gate, over the same store, that `CreateCampaign` and
+//! `GetConnectInstanceConfig` ask.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +173,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutConnectInstanceIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutConnectInstanceIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutConnectInstanceIntegration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutConnectInstanceIntegrationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the ConnectCampaignsV2 instance integration store is unavailable"
+                            .to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An integration belongs to a Connect instance onboarded to Campaigns: the
+        // instance-onboarding store is the one record of which instances those are,
+        // so an instance whose onboarding job has not finished there has nothing to
+        // integrate and the put is refused BEFORE anything is stored.
+        if !store.is_onboarded(&input.connect_instance_id, now) {
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                "ResourceNotFoundException",
+            );
+            return Err(
+                PutConnectInstanceIntegrationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::instance_not_found_message(
+                            &input.connect_instance_id,
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store decides whether this is an update of an integration the instance
+        // already holds or a new one, from the identity the config carries. The
+        // record it hands back is what the instance now holds; this operation's
+        // modelled output is empty, so `ListConnectInstanceIntegrations` is where it
+        // surfaces.
+        let Some(_stored) =
+            store.put_instance_integration(&input.connect_instance_id, input.integration_config)
+        else {
+            // The store is bounded: past its ceiling the put is refused rather than
+            // growing the process without limit. Of the errors this operation models,
+            // the conflict is the one that fits — the service's own state, not the
+            // request, is what stops it.
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                "ConflictException",
+            );
+            return Err(PutConnectInstanceIntegrationErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "The maximum number of integrations ({}) are already configured for this Connect instance",
+                        crate::state::MAX_INTEGRATIONS_PER_INSTANCE
+                    ),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // The call changed what this service holds for the instance, so it leaves an
+        // audit record naming the caller, the instance and the outcome.
+        crate::state::audit_onboarding_change(
+            ctx.parts(),
+            Self::NAME,
+            &input.connect_instance_id,
+            "accepted",
+        );
+
+        Ok(PutConnectInstanceIntegrationOutput)
     }
 }

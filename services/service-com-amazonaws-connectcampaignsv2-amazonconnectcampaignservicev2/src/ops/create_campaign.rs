@@ -213,9 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.is_onboarded(&input.connect_instance_id, ::std::time::SystemTime::now()) {
             return Err(CreateCampaignErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Connect instance {} does not exist or is not enabled to use Campaigns",
-                        input.connect_instance_id
+                    message: crate::state::instance_not_found_message(
+                        &input.connect_instance_id,
                     ),
                     x_amz_error_type: None,
                 },
