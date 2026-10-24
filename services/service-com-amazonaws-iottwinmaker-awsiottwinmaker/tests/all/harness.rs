@@ -140,6 +140,24 @@ impl Emulator {
         .await
     }
 
+    /// `ListComponents`: POST
+    /// /workspaces/{workspaceId}/entities/{entityId}/components-list, with both
+    /// ids as `@httpLabel`s and `componentPath` and the page members
+    /// (`maxResults`, `nextToken`) carried in the body.
+    pub(crate) async fn list_components(
+        &self,
+        workspace_id: &str,
+        entity_id: &str,
+        body: Value,
+    ) -> Resp {
+        self.call(
+            "POST",
+            &format!("/workspaces/{workspace_id}/entities/{entity_id}/components-list"),
+            Some(body),
+        )
+        .await
+    }
+
     pub(crate) async fn list_entities(&self, workspace_id: &str, body: Value) -> Resp {
         self.call(
             "POST",

@@ -1417,6 +1417,29 @@ pub fn status(state: &str) -> crate::ops::types::Status {
 /// model admits rather than with an invented string.
 pub const TABULAR_GROUP_TYPE: &str = "TABULAR";
 
+/// One stored property group of a COMPONENT as the modelled
+/// `ComponentPropertyGroupResponse`.
+///
+/// Shared by every reader of a component's property groups (`GetEntity`,
+/// `ListComponents`), so one group is reported the same way wherever it is read.
+/// `groupType` is required on the response but optional on the request, so a
+/// group stored without one reports [`TABULAR_GROUP_TYPE`]; nothing is inherited
+/// here, which is why `isInherited` is false (see [`property_definition_response`]).
+/// A component TYPE's own groups are a different modelled shape
+/// (`PropertyGroupResponse`), which `GetComponentType` builds.
+pub fn component_property_group_response(
+    group: &PropertyGroupRecord,
+) -> crate::ops::types::ComponentPropertyGroupResponse {
+    crate::ops::types::ComponentPropertyGroupResponse {
+        group_type: group
+            .group_type
+            .clone()
+            .unwrap_or_else(|| TABULAR_GROUP_TYPE.to_string()),
+        property_names: group.property_names.clone(),
+        is_inherited: false,
+    }
+}
+
 /// Whether storing this property definition would leave a component type that
 /// `extends_from` these parents holding a definition no read can report.
 ///

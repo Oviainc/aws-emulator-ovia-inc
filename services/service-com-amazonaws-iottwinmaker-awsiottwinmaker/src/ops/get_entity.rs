@@ -311,7 +311,10 @@ fn components_response(
                         .property_groups
                         .iter()
                         .map(|(group_name, group)| {
-                            (group_name.clone(), property_group_response(group))
+                            (
+                                group_name.clone(),
+                                crate::state::component_property_group_response(group),
+                            )
                         })
                         .collect(),
                 ),
@@ -359,7 +362,12 @@ fn composite_component_summary(
             composite
                 .property_groups
                 .iter()
-                .map(|(group_name, group)| (group_name.clone(), property_group_response(group)))
+                .map(|(group_name, group)| {
+                    (
+                        group_name.clone(),
+                        crate::state::component_property_group_response(group),
+                    )
+                })
                 .collect(),
         ),
         status: status.clone(),
@@ -385,21 +393,3 @@ fn property_response(property: &crate::state::PropertyRecord) -> PropertyRespons
     }
 }
 
-/// One stored property group as the modelled `ComponentPropertyGroupResponse`.
-///
-/// `groupType` is required on the response but optional on the request; the
-/// model's `GroupType` enum admits exactly one value
-/// ([`crate::state::TABULAR_GROUP_TYPE`]), so a group stored without one reports
-/// that value.
-fn property_group_response(
-    group: &crate::state::PropertyGroupRecord,
-) -> ComponentPropertyGroupResponse {
-    ComponentPropertyGroupResponse {
-        group_type: group
-            .group_type
-            .clone()
-            .unwrap_or_else(|| crate::state::TABULAR_GROUP_TYPE.to_string()),
-        property_names: group.property_names.clone(),
-        is_inherited: false,
-    }
-}

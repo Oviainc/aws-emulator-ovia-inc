@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComponents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComponents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the components of ONE entity — "lists the components of an entity" — a page
+//! at a time, each row built from the STORED component record the entity's create or
+//! update persisted, so a summary says about a component exactly what `GetEntity` says
+//! about it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComponents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The listed SCOPE is one level of the entity's component tree, which is what
+//! `componentPath` selects: a request that names none lists the entity's TOP-LEVEL
+//! components, and one that names a path lists the composite components stored directly
+//! inside the component that path leads to ("the path to the composite component,
+//! starting from the top-level component"), so a caller walks a nested component tree one
+//! level per call instead of reading it all back through `GetEntity`, which truncates at
+//! [`crate::state::MAX_COMPONENTS_RETURNED`]. A workspace, an entity or a component path
+//! this service holds nothing at is refused with the `ResourceNotFoundException`
+//! (HTTP 404) this operation models; a component that holds no composite component is a
+//! page of no rows, not a refusal.
+//!
+//! `maxResults` caps the page. This member's documentation publishes a default of 25 but
+//! no minimum, so the only other bounds that are AWS's here are its modelled `range`
+//! (0..200): a zero is a page of no rows — the maximum number of results returned,
+//! literally — and not a refusal this handler invents, and a request naming none is
+//! served [`crate::state::DEFAULT_PAGE_SIZE`] rather than every component. The service
+//! never serves more than [`crate::state::MAX_PAGE_SIZE`] rows whatever is asked for. The
+//! opaque `nextToken` resumes at the next component NAME rather than at an offset, so a
+//! page boundary survives a component being created or deleted between two pages; it is
+//! bound to the workspace, entity and component path it was minted for, and a token this
+//! listing did not mint is refused with the modelled `ValidationException` (HTTP 400).
+//!
+//! This is a REPORTING operation: it writes nothing. A component has no lifecycle of its
+//! own and an entity settles `ACTIVE` inside its own create (see
+//! [`crate::state::Entity`]), so the clock owes this call no transition to materialise.
+//!
+//! The modelled `AccessDeniedException` and `ThrottlingException` are deliberately
+//! unreachable here: this emulator models no caller principal and no rate state, so
+//! nothing this handler can read would decide either, and a served page is never evidence
+//! that a real authorization or quota check passed.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +182,337 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComponents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComponentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComponents"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and a page served is a read of tenant state.
+        ::tracing::info!(
+            operation = "ListComponents",
+            workspace_id = %input.workspace_id,
+            entity_id = %input.entity_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListComponentsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        // A read, so the store is borrowed immutably: a component carries no
+        // state of its own and an entity settles ACTIVE inside its own create,
+        // so this call has no transition to materialise and nothing a later
+        // caller sees changes because a page was served.
+        let state = state.lock();
+
+        let invalid = |message: String| {
+            ListComponentsErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        };
+        // Unlike this service's workspace-scoped listings, this operation DOES
+        // model a `ResourceNotFoundException`, so a scope it holds nothing at is
+        // reported as the missing resource it is rather than as a bad request.
+        let not_found = |message: String| {
+            ListComponentsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+        };
+
+        // The scope is resolved outside in — workspace, then entity, then the
+        // component the path leads to — so a listing of a resource this service
+        // does not hold is refused for the outermost one that is missing,
+        // whatever else the request carries.
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+            return Err(not_found(crate::state::workspace_not_found_message(
+                &input.workspace_id,
+            ))
+            .into());
+        };
+        let Some(entity) = workspace.entities.get(&input.entity_id) else {
+            return Err(not_found(crate::state::entity_not_found_message(
+                &input.workspace_id,
+                &input.entity_id,
+            ))
+            .into());
+        };
+
+        // ONE level of the entity's component tree: its top-level components
+        // when the request names no path, else the composite components stored
+        // directly inside the component the path leads to.
+        let listed: Vec<Listed<'_>> = match input.component_path.as_deref() {
+            None => entity.components.values().map(Listed::Component).collect(),
+            Some(component_path) => components_under(entity, component_path).ok_or_else(|| {
+                not_found(format!(
+                    "entity {} of workspace {} has no component at componentPath \
+                     {component_path}",
+                    input.entity_id, input.workspace_id
+                ))
+            })?,
+        };
+
+        // A `nextToken` carries the component NAME the page resumes AT
+        // (inclusive), not an offset, so a page boundary survives a component
+        // being added or removed between two pages. It is bound to the
+        // workspace, entity and component path it was minted for, so a token
+        // from another listing — or from this listing taken over another scope —
+        // is refused rather than silently resumed.
+        let scope_path = input.component_path.as_deref().unwrap_or_default();
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                decode_next_token(token, &input.workspace_id, &input.entity_id, scope_path)
+                    .ok_or_else(|| {
+                        // The token itself is NOT echoed back: it is opaque to
+                        // the caller and modelled up to 17880 characters, so the
+                        // refusal names the member and what is wrong with it
+                        // rather than copying an arbitrary request string into
+                        // the response.
+                        invalid("nextToken is not a token this listing minted".to_string())
+                    })?,
+            ),
+        };
+
+        // The page size served. THIS member's documentation publishes a default
+        // of 25 and no minimum, so a zero is served as what it says — a page of
+        // no rows — rather than refused, and a request naming no `maxResults` is
+        // served this service's own default instead of every component the scope
+        // holds. Whatever is asked for, the service serves at most
+        // `crate::state::MAX_PAGE_SIZE`, so the page this call BUILDS is bounded
+        // by this code and not only by the boundary validator.
+        let page_size = match input.max_results {
+            None => crate::state::DEFAULT_PAGE_SIZE,
+            // The conversion can only fail on a NEGATIVE value, which the
+            // modelled range refuses before this handler runs — so this arm is
+            // belt-and-braces. It fails CLOSED (the modelled refusal, naming the
+            // member and the published range) rather than falling back to the
+            // largest page.
+            Some(requested) => usize::try_from(requested)
+                .map_err(|_| {
+                    invalid(format!(
+                        "maxResults must be between 0 and {MODELLED_MAX_RESULTS}, got {requested}"
+                    ))
+                })?
+                .min(crate::state::MAX_PAGE_SIZE),
+        };
+
+        // A component has no lifecycle of its own in this service, so it reports
+        // the status of the entity that holds it — the status `GetEntity`
+        // reports for the very same component.
+        let status = entity.status();
+        // Both stores the scope comes from are keyed so that iteration IS name
+        // order (a composite component's key ends in its own name), so resuming
+        // is a skip to the first name at or past the token's.
+        let mut remaining = listed
+            .into_iter()
+            .skip_while(|listed| resume_at.as_deref().is_some_and(|from| listed.name() < from));
+
+        let mut component_summaries = Vec::new();
+        for listed in remaining.by_ref().take(page_size) {
+            component_summaries.push(listed.summary(&status));
+        }
+        // The token the next call resumes at: the first component this page left
+        // over. Absent on the last page, which is how a caller knows to stop.
+        let next_token = remaining.next().map(|listed| {
+            encode_next_token(
+                &input.workspace_id,
+                &input.entity_id,
+                scope_path,
+                listed.name(),
+            )
+        });
+
+        Ok(ListComponentsOutput {
+            component_summaries,
+            next_token,
+        })
     }
+}
+
+/// One component in the listed scope: a TOP-LEVEL component of the entity, or a
+/// COMPOSITE component stored inside one of them. Both are reported as the same
+/// modelled `ComponentSummary`, and both are named by their own `Name`, which is
+/// what this listing orders and resumes by.
+enum Listed<'a> {
+    Component(&'a crate::state::ComponentRecord),
+    Composite(&'a crate::state::CompositeComponentRecord),
+}
+
+impl Listed<'_> {
+    /// The component's own name: what the summary reports as `componentName`,
+    /// and the key this listing pages by.
+    fn name(&self) -> &str {
+        match self {
+            Self::Component(component) => component.component_name.as_str(),
+            Self::Composite(composite) => composite.component_name.as_str(),
+        }
+    }
+
+    /// This component as the modelled `ComponentSummary`, built from the stored
+    /// record with `status` — the holding entity's, since a component has none
+    /// of its own.
+    ///
+    /// `definedIn` and `syncSource` are absent for the reasons `GetEntity` omits
+    /// them from the same component: this service resolves no inheritance from a
+    /// component type (every `isInherited` it reports is false), and an entity it
+    /// created is not projected from a linked service.
+    fn summary(&self, status: &Status) -> ComponentSummary {
+        match self {
+            Self::Component(component) => ComponentSummary {
+                component_name: component.component_name.clone(),
+                // Required on the summary but optional on the request a
+                // component is created from, so a component stored without one
+                // has no id to report — and is still listed, because a listing
+                // reports the components the entity holds rather than hiding the
+                // ones whose create named no component type.
+                component_type_id: component.component_type_id.clone().unwrap_or_default(),
+                defined_in: None,
+                description: component.description.clone(),
+                property_groups: Some(property_groups(&component.property_groups)),
+                status: status.clone(),
+                sync_source: None,
+                // Absent for a top-level component: `componentPath` is the path
+                // to a COMPOSITE component "starting from the top-level
+                // component", so it is what identifies one of those, while a
+                // top-level component is identified by its name alone — the same
+                // split `GetEntity` reports.
+                component_path: None,
+            },
+            Self::Composite(composite) => ComponentSummary {
+                component_name: composite.component_name.clone(),
+                component_type_id: composite.component_type_id.clone(),
+                defined_in: None,
+                description: composite.description.clone(),
+                property_groups: Some(property_groups(&composite.property_groups)),
+                status: status.clone(),
+                sync_source: None,
+                // The whole path the composite component was created by, which
+                // is what a caller walks one level deeper with.
+                component_path: Some(composite.component_path.clone()),
+            },
+        }
+    }
+}
+
+/// The components stored DIRECTLY inside the component `component_path` leads
+/// to, or `None` when the entity holds no component there.
+///
+/// A path of one segment names a top-level component ("the path to the composite
+/// component, STARTING FROM the top-level component", so the top-level component
+/// is the path's first segment) and a longer one names the composite component
+/// stored under the rest of the path inside it — the key
+/// [`crate::state::ComponentRecord::composite_components`] holds it under, which
+/// is why a child of that path is a key exactly one segment longer.
+fn components_under<'a>(
+    entity: &'a crate::state::Entity,
+    component_path: &str,
+) -> Option<Vec<Listed<'a>>> {
+    let separator = crate::state::COMPONENT_PATH_SEPARATOR;
+    let (component_name, below) = match component_path.split_once(separator) {
+        None => (component_path, None),
+        Some((component_name, below)) => (component_name, Some(below)),
+    };
+    let component = entity.components.get(component_name)?;
+    // The key prefix a child of the named component carries. Empty for a path of
+    // one segment: the children of a top-level component are the composite
+    // components keyed by a single segment inside it.
+    let prefix = match below {
+        None => String::new(),
+        Some(below) => {
+            let nested = format!("{below}{separator}");
+            // The path has to name a composite component of this component.
+            // Nothing requires the intermediate steps of a composite
+            // component's path to have been created themselves, so the path
+            // names one when a composite component is stored AT it or anywhere
+            // BENEATH it.
+            if !component.composite_components.contains_key(below)
+                && !component
+                    .composite_components
+                    .keys()
+                    .any(|key| key.starts_with(&nested))
+            {
+                return None;
+            }
+            nested
+        }
+    };
+    Some(
+        component
+            .composite_components
+            .iter()
+            .filter(|(key, _)| {
+                key.strip_prefix(prefix.as_str())
+                    .is_some_and(|name| !name.is_empty() && !name.contains(separator))
+            })
+            .map(|(_, composite)| Listed::Composite(composite))
+            .collect(),
+    )
+}
+
+/// The stored property groups of one component as the modelled map a summary
+/// carries, through the one projection every reader of a component's property
+/// groups shares ([`crate::state::component_property_group_response`]).
+fn property_groups(
+    groups: &::std::collections::BTreeMap<String, crate::state::PropertyGroupRecord>,
+) -> ::std::collections::HashMap<String, ComponentPropertyGroupResponse> {
+    groups
+        .iter()
+        .map(|(group_name, group)| {
+            (
+                group_name.clone(),
+                crate::state::component_property_group_response(group),
+            )
+        })
+        .collect()
+}
+
+/// The top of the `maxResults` member's modelled `range` (0..200), which is the
+/// only maximum published for it — its documentation names none.
+///
+/// This listing never serves a page larger than [`crate::state::MAX_PAGE_SIZE`],
+/// so that ceiling must be EXACTLY what this operation's member admits — no
+/// larger, or a page could leave the range the model allows; no smaller, or a
+/// `maxResults` this member admits would be silently narrowed — and the default
+/// may never exceed it. Checked at COMPILE time, so moving either past what the
+/// model allows fails the build instead of serving a page the member could not
+/// have asked for or quietly shortening one it did.
+const MODELLED_MAX_RESULTS: usize = 200;
+const _: () = assert!(crate::state::MAX_PAGE_SIZE == MODELLED_MAX_RESULTS);
+const _: () = assert!(crate::state::DEFAULT_PAGE_SIZE <= MODELLED_MAX_RESULTS);
+
+/// The envelope a `nextToken` of this listing carries, so a token minted
+/// elsewhere — by another listing of this service, for another entity or
+/// component path, or by hand — is recognisably not one of ours. The token
+/// itself is the shape every paginated operation of this service mints
+/// ([`crate::state::encode_page_token`]), scoped to the component-tree level
+/// whose page it is.
+const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:components:1:";
+
+/// The opaque `nextToken` for a page of one component-tree level, starting at
+/// `component_name`. The scope is the whole address of that level: the
+/// workspace, the entity and the `componentPath` the page was taken under (the
+/// empty string for the entity's top-level components).
+fn encode_next_token(
+    workspace_id: &str,
+    entity_id: &str,
+    component_path: &str,
+    component_name: &str,
+) -> String {
+    crate::state::encode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &[workspace_id, entity_id, component_path],
+        component_name,
+    )
+}
+
+/// The component name inside a `nextToken` minted for this scope, or `None`
+/// when the token is not one this listing minted for it.
+fn decode_next_token(
+    token: &str,
+    workspace_id: &str,
+    entity_id: &str,
+    component_path: &str,
+) -> Option<String> {
+    crate::state::decode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &[workspace_id, entity_id, component_path],
+        token,
+    )
 }
