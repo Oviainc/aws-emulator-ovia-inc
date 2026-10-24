@@ -34,3 +34,23 @@ $headers.content-type: value_mismatch (expected 'text/xml;charset=UTF-8', got 't
 Boot the ec2 emulator
 Call GetCapacityReservationUsage and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Follow-up after the implementation (what this report asked for is done; one recorded
+## difference remains)
+The operation is implemented and the scaffold census line is gone: it reports the stored
+Capacity Reservation and the instances using it, pages with the service's own `NextToken`,
+and refuses an id the account holds no reservation for with HTTP 400
+`InvalidCapacityReservationId.NotFound` — the code every other reader of a Capacity
+Reservation id in this crate answers, and the code the recording of
+`CreateInterruptibleCapacityReservationAllocation` shows AWS using for the very same id
+(`The capacity-reservation ID 'cr-00000000000000000' does not exist`).
+
+The recorded unit of THIS report expects `InvalidCapacityReservationId.Malformed` for that
+id instead, so it still diverges on the error code. `cr-` plus 17 hexadecimal digits is the
+well-formed id this service mints and the form the model describes, so nothing observable
+says which ids AWS rejects as malformed rather than as not found — and the two recordings
+of the same id disagree with each other. Refusing that one literal id as malformed would be
+fitting the recorded instance rather than a rule, so it is deliberately not done here. A
+`Malformed` code belongs to whichever form check AWS documents; if that rule is ever
+established, it belongs in `require_known_capacity_reservation` (the one lookup every
+Capacity Reservation reader of this crate goes through) rather than in this operation.

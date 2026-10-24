@@ -33,7 +33,7 @@ const TAGS: &str = "/prod/tags";
 /// exactly the set an ARN can name here; each is created by
 /// [`create_resource`]. The rule under test holds for a resource, so the rows of
 /// every table below span this list rather than one chosen type.
-const KINDS: [&str; 9] = [
+const KINDS: [&str; 10] = [
     "channel",
     "input",
     "inputSecurityGroup",
@@ -41,6 +41,7 @@ const KINDS: [&str; 9] = [
     "network",
     "signal-map",
     "multiplex",
+    "node",
     "cloudwatch-alarm-template-group",
     "eventbridge-rule-template-group",
 ];
@@ -232,6 +233,37 @@ async fn create_resource(
             201,
             vec!["multiplex", "arn"],
         ),
+        "node" => {
+            // A node lives IN a cluster, so its create is addressed to that
+            // cluster's node collection
+            // (`smithy_query(query="operation", operation="CreateNode")`: `POST
+            // /prod/clusters/{ClusterId}/nodes`) and the cluster is created
+            // right here — inline rather than through this function, which an
+            // `async fn` may not call recursively.
+            let (status, response) = call(
+                router,
+                "POST",
+                "/prod/clusters",
+                Some(json!({ "name": format!("{name}-cluster"), "clusterType": "ON_PREMISES" })),
+            )
+            .await;
+            assert_eq!(
+                status, 201,
+                "kind {kind:?} ({label}): the node's cluster got {status}: {response}"
+            );
+            let cluster = response["id"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("kind {kind:?} ({label}): the node's cluster has no id: {response}")
+                })
+                .to_string();
+            (
+                format!("/prod/clusters/{cluster}/nodes"),
+                with_tags(json!({ "name": name })),
+                201,
+                vec!["arn"],
+            )
+        }
         "cloudwatch-alarm-template-group" => (
             "/prod/cloudwatch-alarm-template-groups".to_string(),
             with_tags(json!({ "name": name })),
