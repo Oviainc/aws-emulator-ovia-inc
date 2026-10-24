@@ -23,14 +23,31 @@
 
 use crate::lifecycle::{elements, Answer, Emulator};
 
-/// The documented `PlatformBranchSummary$LifecycleState` value set ("Possible
-/// values: beta | supported | deprecated | retired"), restated here so the test
-/// does not read it from the code under test.
-const LIFECYCLE_STATES: &[&str] = &["beta", "deprecated", "retired", "supported"];
+/// The documented `PlatformBranchSummary$LifecycleState` value set as a FILTER
+/// takes it ("Attribute = LifecycleState: Operator: = | != | in | not_in
+/// Values: beta | supported | deprecated | retired"), restated here so the
+/// test does not read it from the code under test.
+pub(crate) const LIFECYCLE_STATES: &[&str] = &["beta", "deprecated", "retired", "supported"];
+
+/// The same four states as a RESPONSE carries them: capitalized, the form the
+/// real service answers `PlatformBranchSummary$LifecycleState` with and the one
+/// `PlatformDescription$PlatformBranchLifecycleState` documents ("Beta |
+/// Supported | Deprecated | Retired"). `reported(state)` below is the mapping
+/// between the two spellings.
+pub(crate) const REPORTED_LIFECYCLE_STATES: &[&str] = &["Beta", "Deprecated", "Retired", "Supported"];
+
+/// The documented filter spelling `state` is reported under.
+pub(crate) fn reported(state: &str) -> String {
+    let mut characters = state.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
+    }
+}
 
 /// The documented `PlatformBranchSummary$SupportedTierList` value set
 /// ("Possible values: WebServer/Standard | Worker/SQS/HTTP").
-const TIERS: &[&str] = &["WebServer/Standard", "Worker/SQS/HTTP"];
+pub(crate) const TIERS: &[&str] = &["WebServer/Standard", "Worker/SQS/HTTP"];
 
 /// "Within each `SearchFilter` item, the `Values` array is limited to 10
 /// items", and "Array size: limited to 10 `SearchFilter` objects".
@@ -38,24 +55,24 @@ const MAX_FILTER_ITEMS: usize = 10;
 
 /// One platform branch as the emulator reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Branch {
-    platform_name: String,
-    branch_name: String,
-    lifecycle_state: String,
-    branch_order: i32,
-    supported_tiers: Vec<String>,
+pub(crate) struct Branch {
+    pub(crate) platform_name: String,
+    pub(crate) branch_name: String,
+    pub(crate) lifecycle_state: String,
+    pub(crate) branch_order: i32,
+    pub(crate) supported_tiers: Vec<String>,
 }
 
 impl Branch {
     /// The identity of a branch: a branch name is unique within its platform.
-    fn key(&self) -> String {
+    pub(crate) fn key(&self) -> String {
         format!("{}/{}", self.platform_name, self.branch_name)
     }
 }
 
 /// Call `ListPlatformBranches` with `params` already rendered as awsQuery form
 /// values.
-async fn list(emulator: &Emulator, params: &[(String, String)]) -> Answer {
+pub(crate) async fn list(emulator: &Emulator, params: &[(String, String)]) -> Answer {
     let borrowed: Vec<(&str, &str)> = params
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
@@ -64,7 +81,7 @@ async fn list(emulator: &Emulator, params: &[(String, String)]) -> Answer {
 }
 
 /// The `PlatformBranchSummaryList` of a 200 answer, in the order it was sent.
-fn branches(answer: &Answer, case: &str) -> Vec<Branch> {
+pub(crate) fn branches(answer: &Answer, case: &str) -> Vec<Branch> {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected 200 from ListPlatformBranches, got {} and body {}",
@@ -98,7 +115,7 @@ fn text(xml: &str, tag: &str) -> String {
 }
 
 /// The whole catalog: no filters, no page size.
-async fn full_catalog(emulator: &Emulator) -> Vec<Branch> {
+pub(crate) async fn full_catalog(emulator: &Emulator) -> Vec<Branch> {
     let answer = list(emulator, &[]).await;
     assert_eq!(
         answer.value("NextToken"),
@@ -112,7 +129,7 @@ async fn full_catalog(emulator: &Emulator) -> Vec<Branch> {
 
 /// One filter term as awsQuery form parameters. `index` is 0-based; the wire
 /// form is 1-based (`Filters.member.1.…`).
-fn filter_params(
+pub(crate) fn filter_params(
     index: usize,
     attribute: &str,
     operator: &str,
@@ -154,11 +171,15 @@ fn term_matches(branch: &Branch, attribute: &str, operator: &str, values: &[Stri
         };
     }
     let subject = match attribute {
-        "BranchName" => &branch.branch_name,
-        "LifecycleState" => &branch.lifecycle_state,
-        "PlatformName" => &branch.platform_name,
+        "BranchName" => branch.branch_name.clone(),
+        // A `LifecycleState` filter value is one of the documented lower-case
+        // spellings, while the member is reported capitalized, so the term is
+        // evaluated against the branch's state in the filter's own spelling.
+        "LifecycleState" => branch.lifecycle_state.to_lowercase(),
+        "PlatformName" => branch.platform_name.clone(),
         other => panic!("no such filter attribute {other:?}"),
     };
+    let subject = &subject;
     let first = values.first().expect("a term carries at least one value");
     match operator {
         "=" => subject == first,
@@ -223,8 +244,8 @@ async fn every_reported_branch_satisfies_the_modelled_value_sets() {
             "case {case:?}: expected a BranchName, got {branch:?}"
         );
         assert!(
-            LIFECYCLE_STATES.contains(&branch.lifecycle_state.as_str()),
-            "case {case:?}: expected LifecycleState in {LIFECYCLE_STATES:?}, got {:?}",
+            REPORTED_LIFECYCLE_STATES.contains(&branch.lifecycle_state.as_str()),
+            "case {case:?}: expected LifecycleState in {REPORTED_LIFECYCLE_STATES:?}, got {:?}",
             branch.lifecycle_state
         );
         assert!(
@@ -254,20 +275,29 @@ async fn every_reported_branch_satisfies_the_modelled_value_sets() {
         "case \"catalog\": expected every (PlatformName, BranchName) pair to appear once, got {keys:?}"
     );
 
-    // Every documented life-cycle state and every documented tier is somewhere
-    // in the catalog: a filter on any of them has something to select, which is
-    // what makes the filter cases below meaningful rather than vacuous.
+    // The catalog publishes branches in more than one life-cycle state and in
+    // both documented tiers: a filter on either has something to select AND
+    // something to exclude, which is what makes the filter cases below
+    // meaningful rather than vacuous. WHICH states are published is catalog
+    // data (AWS moves a branch's state when it deprecates or retires it), so
+    // what is pinned here is that the published set is a non-trivial subset of
+    // the documented one.
+    let mut published: Vec<String> = catalog
+        .iter()
+        .map(|branch| branch.lifecycle_state.clone())
+        .collect();
+    published.sort();
+    published.dedup();
+    assert!(
+        published.len() >= 2,
+        "case \"catalog\": expected branches in at least two life-cycle states, got {published:?}"
+    );
     for state in LIFECYCLE_STATES {
         assert!(
-            catalog
-                .iter()
-                .any(|branch| branch.lifecycle_state == *state),
-            "case {state:?}: expected the catalog to publish at least one branch in this \
-             life-cycle state, got {:?}",
-            catalog
-                .iter()
-                .map(|branch| branch.lifecycle_state.clone())
-                .collect::<Vec<String>>()
+            REPORTED_LIFECYCLE_STATES.contains(&reported(state).as_str()),
+            "case {state:?}: expected the reported spelling of every documented filter value to \
+             be one of {REPORTED_LIFECYCLE_STATES:?}, got {:?}",
+            reported(state)
         );
     }
     for tier in TIERS {
@@ -524,14 +554,19 @@ async fn one_filter_term_is_applied_server_side_for_every_documented_operator() 
     ]
     .into_iter()
     // One `=` row per documented life-cycle state, so every state in the
-    // published value set is exercised, not only the ones a recording used.
+    // published value set is exercised, not only the ones a recording used. A
+    // state the catalog publishes no branch in must answer an EMPTY page rather
+    // than an unfiltered one, so the row's expectation follows the catalog.
     .chain(LIFECYCLE_STATES.iter().map(|state| {
+        let published = catalog
+            .iter()
+            .any(|branch| branch.lifecycle_state == reported(state));
         filter_case(
             format!("LifecycleState = {state}"),
             "LifecycleState",
             "=",
             owned(&[state]),
-            true,
+            published,
         )
     }))
     .collect::<Vec<FilterCase>>();

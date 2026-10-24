@@ -76,8 +76,8 @@ async fn the_catalog_is_reported_whole_and_does_not_change_when_read() {
     // Java SE `jar`, the Tomcat `war`), each named in full.
     assert_eq!(
         listed.values_at("SolutionStacks/member").len(),
-        22,
-        "case {case:?}: expected the 22 stacks the catalog holds, got {}",
+        34,
+        "case {case:?}: expected the 34 stacks the catalog holds, got {}",
         listed.body
     );
     let pinned: &[(&str, &[&str])] = &[
@@ -174,8 +174,10 @@ async fn every_reported_stack_is_a_version_of_a_platform_branch_that_has_not_ret
                     branches.body
                 )
             });
+        // A branch life-cycle state goes on the wire capitalized (`Retired`),
+        // the form every shape that reports one carries.
         assert_ne!(
-            state, "retired",
+            state, "Retired",
             "case {name:?}: a retired branch has no version an account can deploy on, \
              but {branch_name:?} is {state}"
         );

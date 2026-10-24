@@ -7,8 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AuthConfig, AuthMaterial, CapabilityReport, CapabilitySchemaItem, ConfigurationStatus,
-    EndpointConfig, GeneralAuthorizationName, PushConfig, ResourceNotFoundException,
-    SecretsManager, WiFiSimpleSetupConfiguration,
+    DiscoveredDeviceSummary, EndpointConfig, GeneralAuthorizationName, PushConfig,
+    ResourceNotFoundException, RuntimeLogConfigurations, SecretsManager,
+    WiFiSimpleSetupConfiguration,
 };
 
 /// The region an ARN carries when the request names none (the emulator's default
@@ -445,6 +446,283 @@ pub const EVENT_LOG_CONFIGURATION_RESOURCE_NAME: &str = "Event Log Configuration
 /// bound CHOSEN for the emulator, like [`MAX_MANAGED_THINGS`], not a published AWS quota.
 pub const MAX_EVENT_LOG_CONFIGURATIONS: usize = 1_000;
 
+/// How a resource this service identifies by a NAME rather than by a generated id is
+/// keyed: the region its creating request was signed for, and the name that request
+/// carried.
+///
+/// A destination is addressed by its `DestinationName` and a notification configuration by
+/// its `EventType` — neither is a minted identifier — so neither can be keyed by id the way
+/// every other store of this service is. Every resource here is REGIONAL (see
+/// [`ManagedThing::region`]), so the region is part of the key: the same name in two
+/// regions is two resources, exactly as the same id in two regions resolves in only one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RegionalName {
+    pub region: String,
+    pub name: String,
+}
+
+impl RegionalName {
+    /// The key `name` occupies in `region`.
+    pub fn new(region: &str, name: &str) -> Self {
+        Self {
+            region: region.to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
+/// One stored destination: where this account's managed-integrations notifications are
+/// delivered. `CreateDestination` inserts it and `GetDestination` projects it onto its
+/// output shape.
+///
+/// A destination is identified by its NAME ([`RegionalName`]), which is what
+/// `GetDestination` resolves (`GET /destinations/{Name}`) and what a notification
+/// configuration refers to.
+#[derive(Debug, Clone)]
+pub struct Destination {
+    /// The `DestinationName` the create named — the resource's identifier.
+    pub name: String,
+    /// The region the creating request was signed for: only that region's endpoint
+    /// resolves this destination.
+    pub region: String,
+    /// `DeliveryDestinationArn` — the stream notifications are delivered to.
+    pub delivery_destination_arn: String,
+    /// `DeliveryDestinationType` enum value, one of
+    /// [`crate::ops::types::DELIVERY_DESTINATION_TYPE_VALUES`].
+    pub delivery_destination_type: String,
+    /// `RoleArn` — the IAM role that grants the delivery.
+    pub role_arn: String,
+    pub description: Option<String>,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    /// When the destination was last changed. A create stores the instant it ran; an
+    /// update moves it.
+    pub updated_at: SystemTime,
+}
+
+/// The `ResourceType` this service reports a destination under — the Smithy resource name,
+/// as [`MANAGED_THING_RESOURCE_TYPE`] is for a managed thing.
+pub const DESTINATION_RESOURCE_TYPE: &str = "Destination";
+
+/// The destination resource as a READ's reason names it: the resource's name in words
+/// ([`resource_not_found_message`]).
+pub const DESTINATION_RESOURCE_NAME: &str = "Destination";
+
+/// The most destinations one store holds. A create past it is refused rather than grown
+/// into, so a caller cannot make this emulator's memory grow without end. A bound CHOSEN
+/// for the emulator, like [`MAX_MANAGED_THINGS`], not a published AWS quota.
+pub const MAX_DESTINATIONS: usize = 1_000;
+
+/// One stored notification configuration: the destination this account's notifications of
+/// ONE event type are delivered to. `CreateNotificationConfiguration` inserts it and
+/// `GetNotificationConfiguration` projects it onto its output shape.
+///
+/// The configuration is identified by its `EventType` (`GET
+/// /notification-configurations/{EventType}`), so an account holds at most one per event
+/// type per region — which is what makes a second create for an event type a conflict
+/// rather than another record.
+#[derive(Debug, Clone)]
+pub struct NotificationConfiguration {
+    /// `EventType` enum value, one of [`crate::ops::types::EVENT_TYPE_VALUES`] — the
+    /// resource's identifier.
+    pub event_type: String,
+    /// The region the creating request was signed for.
+    pub region: String,
+    /// The `DestinationName` of the [`Destination`] this event type's notifications go to.
+    /// Resolved against the destination store when the configuration is created.
+    pub destination_name: String,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+/// The `ResourceType` this service reports a notification configuration under.
+pub const NOTIFICATION_CONFIGURATION_RESOURCE_TYPE: &str = "NotificationConfiguration";
+
+/// The notification-configuration resource as a READ's reason names it: the resource's
+/// name in words ([`resource_not_found_message`]).
+pub const NOTIFICATION_CONFIGURATION_RESOURCE_NAME: &str = "Notification Configuration";
+
+/// The most notification configurations one store holds — one per `EventType` per region,
+/// so this bound only caps how many REGIONS a caller can spread them over, on the same
+/// terms as [`MAX_CONFIGURED_REGIONS`].
+pub const MAX_NOTIFICATION_CONFIGURATIONS: usize = 1_000;
+
+/// One stored device discovery job: what `StartDeviceDiscovery` started, which
+/// `GetDeviceDiscovery` reports and whose devices `ListDiscoveredDevices` pages over.
+#[derive(Debug, Clone)]
+pub struct DeviceDiscovery {
+    /// The generated `DeviceDiscoveryId` this record is keyed by.
+    pub id: String,
+    /// `DeviceDiscoveryArn`, as [`device_discovery_arn`] builds it.
+    pub arn: String,
+    /// The region the starting request was signed for: only that region's endpoint
+    /// resolves this job.
+    pub region: String,
+    /// `DiscoveryType` enum value, one of [`crate::ops::types::DISCOVERY_TYPE_VALUES`].
+    pub discovery_type: String,
+    /// The `ControllerIdentifier` a hub-connected discovery named, if any.
+    pub controller_id: Option<String>,
+    /// The deprecated `ConnectorAssociationIdentifier` the request named, if any.
+    pub connector_association_id: Option<String>,
+    /// The `AccountAssociationId` a third-party-connected discovery named, if any.
+    pub account_association_id: Option<String>,
+    pub started_at: SystemTime,
+    /// The instant the job's run is over. Before it the job reports
+    /// [`DEVICE_DISCOVERY_STATUS_RUNNING`] and no `FinishedAt`, from it
+    /// [`DEVICE_DISCOVERY_STATUS_SUCCEEDED`] and this instant — see [`Self::status_at`].
+    /// Storing the due instant is what keeps a read a pure read: the status is DERIVED
+    /// from the clock, so nothing is written when the job becomes due.
+    pub finishes_at: SystemTime,
+    pub tags: HashMap<String, String>,
+    /// The devices this job found, as a SNAPSHOT taken when it started: a discovery
+    /// reports what was on the searched surface at that moment, so a managed thing
+    /// created, changed or deleted afterwards does not change this job's result.
+    /// `ListDiscoveredDevices` pages over exactly this list.
+    pub discovered_devices: Vec<DiscoveredDeviceSummary>,
+    /// Monotonic insertion sequence, which is also what makes [`Self::id`] unique.
+    pub sequence: u64,
+}
+
+impl DeviceDiscovery {
+    /// The `DeviceDiscoveryStatus` this job is in at `now`: running until its run is over,
+    /// and succeeded from then on.
+    ///
+    /// `FAILED` and `TIMED_OUT` are the other values the model declares, and no discovery
+    /// this emulator runs fails or times out: the job searches this store, which is always
+    /// reachable.
+    pub fn status_at(&self, now: SystemTime) -> &'static str {
+        if now < self.finishes_at {
+            DEVICE_DISCOVERY_STATUS_RUNNING
+        } else {
+            DEVICE_DISCOVERY_STATUS_SUCCEEDED
+        }
+    }
+
+    /// When the job finished, as of `now`: the due instant once it has passed, and nothing
+    /// while the job is still running.
+    pub fn finished_at(&self, now: SystemTime) -> Option<SystemTime> {
+        (now >= self.finishes_at).then_some(self.finishes_at)
+    }
+
+    /// The managed things this job reported among its discovered devices — what makes a
+    /// later discovery of the same device a re-discovery rather than a first one. Read once
+    /// when the job is INSERTED, to maintain
+    /// [`ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState::discovery_last_seen`],
+    /// so no later request has to scan the stored jobs to classify a device.
+    pub fn reported_things(&self) -> impl Iterator<Item = &str> {
+        self.discovered_devices
+            .iter()
+            .filter_map(|device| device.managed_thing_id.as_deref())
+    }
+}
+
+/// The `DeviceDiscoveryStatus` a job carries while its run is not over.
+pub const DEVICE_DISCOVERY_STATUS_RUNNING: &str = "RUNNING";
+
+/// The `DeviceDiscoveryStatus` a job carries once its run is over.
+pub const DEVICE_DISCOVERY_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// How long after `StartDeviceDiscovery` the job it started is over.
+///
+/// `StartDeviceDiscovery` answers with a job the model reports under
+/// `DeviceDiscoveryStatus`, whose `RUNNING` value says the run outlives the call that
+/// started it: the clock completes it. AWS publishes no duration for a discovery run, so
+/// this span is CHOSEN — inside the emulator's 250..750 ms window, so a caller that reads
+/// straight after the start still observes [`DEVICE_DISCOVERY_STATUS_RUNNING`]. It is
+/// stored as a due instant ([`DeviceDiscovery::finishes_at`]) and never slept on.
+pub const DEVICE_DISCOVERY_DURATION: Duration = Duration::from_millis(500);
+
+/// The `DiscoveryModification` of a device no earlier discovery of this account reported.
+pub const DISCOVERY_MODIFICATION_DISCOVERED: &str = "DISCOVERED";
+
+/// The `DiscoveryModification` of a device an earlier discovery reported and that has
+/// changed since that discovery ran.
+pub const DISCOVERY_MODIFICATION_UPDATED: &str = "UPDATED";
+
+/// The `DiscoveryModification` of a device an earlier discovery reported and that has not
+/// changed since.
+pub const DISCOVERY_MODIFICATION_NO_CHANGE: &str = "NO_CHANGE";
+
+/// The most `DiscoveredDeviceSummary` items one `ListDiscoveredDevices` page carries, and
+/// the page size an absent `MaxResults` gets — the same rule, for the same reason, as
+/// [`MANAGED_THING_PAGE_LIMIT`].
+pub const DISCOVERED_DEVICE_PAGE_LIMIT: usize = 100;
+
+/// The most device discovery jobs one store holds. A start past it retires the jobs the
+/// clock already made due ([`DEVICE_DISCOVERY_RETENTION`]) and then evicts the oldest
+/// remaining one, so the store is bounded however many jobs a caller starts. A bound
+/// CHOSEN for the emulator, like [`MAX_MANAGED_THINGS`].
+pub const MAX_DEVICE_DISCOVERIES: usize = 500;
+
+/// The most devices ONE job records in its snapshot.
+///
+/// A job's result is retained for as long as the job is, so without this the memory one
+/// `StartDeviceDiscovery` retains would be the whole managed-thing store
+/// ([`MAX_MANAGED_THINGS`]) and the memory the discovery store retains would be that times
+/// [`MAX_DEVICE_DISCOVERIES`] — a product neither factor's own cap bounds. With it, the
+/// retained snapshots are bounded by the product of two small numbers. A job whose surface
+/// carries more devices than this reports the first ones it found, the way any bounded
+/// result does. A bound CHOSEN for the emulator.
+pub const MAX_DISCOVERED_DEVICES_PER_DISCOVERY: usize = 200;
+
+/// How long a finished device discovery job, and its snapshot, stay in the store.
+///
+/// A discovery job is a transient record of one run, so it is retired once the clock has
+/// made it due — which is what keeps the snapshots from accumulating for the life of the
+/// process. AWS publishes no retention for a discovery job, so this span is CHOSEN, on the
+/// same terms as [`IDEMPOTENCY_TTL`].
+pub const DEVICE_DISCOVERY_RETENTION: Duration = Duration::from_secs(60 * 60);
+
+/// The most entries the last-seen index ([`ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState::discovery_last_seen`])
+/// keeps. One entry per managed thing a discovery has ever reported, which outlives both
+/// the job and the managed thing, so it is capped like every other map keyed by something a
+/// request supplies: past the cap the oldest entry is evicted.
+pub const MAX_DISCOVERY_LAST_SEEN: usize = MAX_MANAGED_THINGS;
+
+/// The `ResourceType` this service reports a device discovery job under.
+pub const DEVICE_DISCOVERY_RESOURCE_TYPE: &str = "DeviceDiscovery";
+
+/// The device-discovery resource as a READ's reason names it.
+///
+/// Recorded on `ListDiscoveredDevices` for an `Identifier` no `StartDeviceDiscovery`
+/// allocated as `Discovery resource not found.`, which is the read-path sentence every
+/// resource of this service words through [`resource_not_found_message`] with this name.
+pub const DEVICE_DISCOVERY_RESOURCE_NAME: &str = "Discovery";
+
+/// The `ResourceType` this service reports a runtime log configuration under.
+pub const RUNTIME_LOG_CONFIGURATION_RESOURCE_TYPE: &str = "RuntimeLogConfiguration";
+
+/// The runtime-log half of a managed thing, as the reason of a runtime-log read's 404 names
+/// it ([`sub_resource_not_found_message`]) — the same wording a capability read's 404 uses
+/// for the capability half ([`MANAGED_THING_CAPABILITIES_SUB_RESOURCE`]).
+pub const RUNTIME_LOG_CONFIGURATION_SUB_RESOURCE: &str = "runtime log configuration";
+
+/// Whether runtime logging is supported on `thing`.
+///
+/// Runtime logs are the logs the managed-integrations RUNTIME writes on the device, and
+/// only a hub runs that runtime: `HubNetworkMode` and `PutHubConfiguration` exist for the
+/// hub alone, and a managed thing is a hub exactly when a call has set its
+/// `HubNetworkMode` (one of [`HUB_NETWORK_MODE_VALUES`], settable through
+/// `UpdateManagedThing`). A managed thing that is not a hub is a third-party device, which
+/// runs no runtime of this service, so a put for one is refused with the modelled
+/// `ValidationException` — recorded from AWS as `Only 1P device or hub is supported for
+/// Runtime logging`.
+pub fn supports_runtime_logging(thing: &ManagedThing) -> bool {
+    thing.hub_network_mode.is_some()
+}
+
+/// How this service states that the managed thing a runtime-log put named does not run the
+/// managed-integrations runtime, so no runtime log configuration applies to it.
+///
+/// The sentence names the rule and no value of the request, as every refusal of this
+/// service does (`crate::service`): the member at fault is the path the request addressed.
+pub fn runtime_logging_unsupported_message() -> String {
+    "Only a hub managed thing runs the managed integrations runtime, so runtime logging is \
+     not supported for this managed thing"
+        .to_string()
+}
+
 /// One stored account association: the authoritative record every account-association
 /// operation reads and writes. `CreateAccountAssociation` inserts it, and
 /// `GetAccountAssociation` / `ListAccountAssociations` project it onto their output
@@ -587,6 +865,36 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// Insertion order of account-association ids, so `ListAccountAssociations` pages
     /// deterministically. An id is appended on create and removed on delete.
     pub account_association_order: Vec<String>,
+    /// The authoritative destination store, keyed by the region and `DestinationName`
+    /// that name it ([`RegionalName`]). `CreateDestination` inserts a record and
+    /// `GetDestination` projects it onto its output shape.
+    pub destinations: HashMap<RegionalName, Destination>,
+    /// The authoritative notification-configuration store, keyed by the region and the
+    /// `EventType` the configuration is for ([`RegionalName`]): one configuration per
+    /// event type per region.
+    pub notification_configurations: HashMap<RegionalName, NotificationConfiguration>,
+    /// The authoritative device-discovery store, keyed by the generated
+    /// `DeviceDiscoveryId`. `StartDeviceDiscovery` inserts a record, `GetDeviceDiscovery`
+    /// projects it onto its output shape and `ListDiscoveredDevices` pages over the
+    /// devices it found. Bounded by [`MAX_DEVICE_DISCOVERIES`] and
+    /// [`DEVICE_DISCOVERY_RETENTION`], each record's snapshot by
+    /// [`MAX_DISCOVERED_DEVICES_PER_DISCOVERY`].
+    pub device_discoveries: HashMap<String, DeviceDiscovery>,
+    /// When a discovery of a region last REPORTED each managed thing: the region and the
+    /// `ManagedThingId` ([`RegionalName`]) -> the `started_at` of the latest job that found
+    /// it. Maintained when a job is inserted ([`Self::insert_device_discovery`]) so
+    /// classifying a device ([`Self::discovery_modification`]) is one lookup instead of a
+    /// scan over every stored job and every device inside it. It outlives the job that
+    /// wrote it — a device stays one an earlier discovery has seen — and is bounded by
+    /// [`MAX_DISCOVERY_LAST_SEEN`].
+    pub discovery_last_seen: HashMap<RegionalName, SystemTime>,
+    /// The runtime log configuration installed on each managed thing, keyed by the region
+    /// and the `ManagedThingId` ([`RegionalName`]) — the same tuple that resolves the
+    /// managed thing itself ([`Self::managed_thing_in`]), so one region's call can neither
+    /// read nor remove another region's configuration. A managed thing with no entry has
+    /// none installed, which is what its read reports as the modelled 404 and what
+    /// `ResetRuntimeLogConfiguration` returns it to.
+    pub runtime_log_configurations: HashMap<RegionalName, RuntimeLogConfigurations>,
 }
 
 /// One region's hub configuration: the hub token timer expiry an account set there, and
@@ -851,6 +1159,163 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
         self.account_associations
             .get(id)
             .filter(|association| association.region == region)
+    }
+
+    /// The destination `region`'s endpoint holds under `name`, if any. A destination
+    /// created in another region is not visible here, as for every regional resource.
+    pub fn destination_in(&self, region: &str, name: &str) -> Option<&Destination> {
+        self.destinations.get(&RegionalName::new(region, name))
+    }
+
+    /// The notification configuration `region`'s endpoint holds for `event_type`, if any.
+    pub fn notification_configuration_in(
+        &self,
+        region: &str,
+        event_type: &str,
+    ) -> Option<&NotificationConfiguration> {
+        self.notification_configurations
+            .get(&RegionalName::new(region, event_type))
+    }
+
+    /// The device discovery job `region`'s endpoint holds under `id`, if any. A job
+    /// started in another region is not visible here, as for every regional resource.
+    pub fn device_discovery_in(&self, region: &str, id: &str) -> Option<&DeviceDiscovery> {
+        self.device_discoveries
+            .get(id)
+            .filter(|discovery| discovery.region == region)
+    }
+
+    /// The `DiscoveryModification` a discovery running at `now` reports for the managed
+    /// thing `thing`: a device no earlier job of this region reported is
+    /// [`DISCOVERY_MODIFICATION_DISCOVERED`]; one an earlier job reported is
+    /// [`DISCOVERY_MODIFICATION_UPDATED`] when the record changed after that job started,
+    /// and [`DISCOVERY_MODIFICATION_NO_CHANGE`] when it did not.
+    ///
+    /// The comparison point is when the LATEST earlier job reported the device, read from
+    /// [`Self::discovery_last_seen`] in one lookup, so classifying a device costs the same
+    /// however many jobs the store holds.
+    pub fn discovery_modification(&self, region: &str, thing: &ManagedThing) -> &'static str {
+        match self
+            .discovery_last_seen
+            .get(&RegionalName::new(region, &thing.id))
+        {
+            None => DISCOVERY_MODIFICATION_DISCOVERED,
+            Some(seen_at) if thing.updated_at > *seen_at => DISCOVERY_MODIFICATION_UPDATED,
+            Some(_) => DISCOVERY_MODIFICATION_NO_CHANGE,
+        }
+    }
+
+    /// Insert `discovery` and record, for every device it reported, that this region's
+    /// discoveries have now seen that managed thing ([`Self::discovery_last_seen`]) — the
+    /// one place a job enters the store, so the index cannot drift from it.
+    pub fn insert_device_discovery(&mut self, discovery: DeviceDiscovery) {
+        let (region, started_at) = (discovery.region.clone(), discovery.started_at);
+        let seen: Vec<String> = discovery
+            .reported_things()
+            .map(str::to_string)
+            .collect();
+        for id in seen {
+            let key = RegionalName::new(&region, &id);
+            // A job that reports a device later than the index knows moves the comparison
+            // point forward; an older job never moves it back.
+            let entry = self.discovery_last_seen.entry(key);
+            match entry {
+                ::std::collections::hash_map::Entry::Occupied(mut held) => {
+                    if *held.get() < started_at {
+                        held.insert(started_at);
+                    }
+                }
+                ::std::collections::hash_map::Entry::Vacant(free) => {
+                    free.insert(started_at);
+                }
+            }
+        }
+        self.make_room_for_discovery_last_seen();
+        self.device_discoveries.insert(discovery.id.clone(), discovery);
+    }
+
+    /// Retire the device discovery jobs the clock already made due — the ones whose run
+    /// started more than [`DEVICE_DISCOVERY_RETENTION`] before `now`, which were owed
+    /// whether or not anyone called — so a job's snapshot does not occupy memory for the
+    /// life of the process. The last-seen index is left alone: a device an earlier
+    /// discovery saw stays one it saw.
+    pub fn retire_expired_device_discoveries(&mut self, now: SystemTime) {
+        self.device_discoveries
+            .retain(|_, discovery| match now.duration_since(discovery.started_at) {
+                Ok(age) => age < DEVICE_DISCOVERY_RETENTION,
+                // A job started "after" now (a clock that went backwards) is not old.
+                Err(_) => true,
+            });
+    }
+
+    /// Evict the oldest device discovery jobs while the store is at
+    /// [`MAX_DEVICE_DISCOVERIES`], so starting one more cannot push it past the cap.
+    pub fn make_room_for_device_discovery(&mut self) {
+        while self.device_discoveries.len() >= MAX_DEVICE_DISCOVERIES {
+            let oldest = self
+                .device_discoveries
+                .values()
+                .min_by_key(|discovery| discovery.sequence)
+                .map(|discovery| discovery.id.clone());
+            match oldest {
+                Some(id) => {
+                    self.device_discoveries.remove(&id);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Evict the oldest last-seen records while the index is at
+    /// [`MAX_DISCOVERY_LAST_SEEN`], so recording one more cannot push it past the cap.
+    pub fn make_room_for_discovery_last_seen(&mut self) {
+        while self.discovery_last_seen.len() > MAX_DISCOVERY_LAST_SEEN {
+            let oldest = self
+                .discovery_last_seen
+                .iter()
+                .min_by_key(|(_, seen_at)| **seen_at)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => {
+                    self.discovery_last_seen.remove(&key);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// The runtime log configuration `region`'s endpoint holds for the managed thing `id`,
+    /// if any — keyed by the same (region, id) tuple that resolves the managed thing, so a
+    /// configuration another region installed is not visible here.
+    pub fn runtime_log_configuration_in(
+        &self,
+        region: &str,
+        id: &str,
+    ) -> Option<&RuntimeLogConfigurations> {
+        self.runtime_log_configurations
+            .get(&RegionalName::new(region, id))
+    }
+
+    /// Install `configuration` on the managed thing `id` of `region`, REPLACING whatever
+    /// was installed there. The counterpart of [`Self::runtime_log_configuration_in`], so
+    /// the keying rule lives in one place for the read, the write and the reset.
+    pub fn install_runtime_log_configuration(
+        &mut self,
+        region: &str,
+        id: &str,
+        configuration: RuntimeLogConfigurations,
+    ) {
+        self.runtime_log_configurations
+            .insert(RegionalName::new(region, id), configuration);
+    }
+
+    /// Remove the runtime log configuration of the managed thing `id` of `region`,
+    /// answering whether one was installed. Keyed exactly as the read and the write are, so
+    /// a reset cannot reach another region's configuration.
+    pub fn remove_runtime_log_configuration(&mut self, region: &str, id: &str) -> bool {
+        self.runtime_log_configurations
+            .remove(&RegionalName::new(region, id))
+            .is_some()
     }
 
     /// Take the next insertion sequence number.
@@ -1496,6 +1961,115 @@ pub fn account_association_not_found_on_read(identifier: &str) -> ResourceNotFou
         )),
         ..resource_not_found(ACCOUNT_ASSOCIATION_RESOURCE_TYPE, identifier)
     }
+}
+
+/// The modelled `ResourceNotFoundException` a READ answers for a destination the caller's
+/// region holds none of under the `Name` a request named: the read path's reason
+/// ([`resource_not_found_message`]) plus the `ResourceId` and `ResourceType` members every
+/// 404 of this service reports the same way.
+pub fn destination_not_found_on_read(name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(DESTINATION_RESOURCE_NAME)),
+        ..resource_not_found(DESTINATION_RESOURCE_TYPE, name)
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a READ answers for an event type the caller's
+/// region holds no notification configuration for, worded by the same read-path sentence.
+pub fn notification_configuration_not_found_on_read(event_type: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(
+            NOTIFICATION_CONFIGURATION_RESOURCE_NAME,
+        )),
+        ..resource_not_found(NOTIFICATION_CONFIGURATION_RESOURCE_TYPE, event_type)
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a read of the device-discovery surface answers
+/// for an `Identifier` the caller's region holds no job under: the read path's reason
+/// ([`resource_not_found_message`]) with the discovery resource's name
+/// ([`DEVICE_DISCOVERY_RESOURCE_NAME`]), plus the `ResourceId` and `ResourceType` members.
+pub fn device_discovery_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(DEVICE_DISCOVERY_RESOURCE_NAME)),
+        ..resource_not_found(DEVICE_DISCOVERY_RESOURCE_TYPE, identifier)
+    }
+}
+
+/// The modelled `ResourceNotFoundException` `GetRuntimeLogConfiguration` answers for a
+/// managed thing that has no runtime log configuration installed: the sub-resource reason
+/// ([`sub_resource_not_found_message`], as a capability read's 404 words its own), plus the
+/// `ResourceId` and `ResourceType` members every 404 of this service reports the same way.
+pub fn runtime_log_configuration_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(sub_resource_not_found_message(
+            MANAGED_THING_RESOURCE_NAME,
+            RUNTIME_LOG_CONFIGURATION_SUB_RESOURCE,
+        )),
+        ..resource_not_found(RUNTIME_LOG_CONFIGURATION_RESOURCE_TYPE, identifier)
+    }
+}
+
+/// The ARN of a device discovery job in `region`, as the `DeviceDiscoveryArn` pattern
+/// (`^arn:aws:iotmanagedintegrations:[0-9a-zA-Z-]+:[0-9]+:device-discovery/[0-9a-zA-Z]+$`)
+/// requires.
+pub fn device_discovery_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        SERVICE_ARN_NAMESPACE,
+        region,
+        &format!("device-discovery/{id}"),
+    )
+}
+
+/// The `DiscoveredDeviceSummary` a discovery reports for the managed thing `thing` it found
+/// on the searched surface at `discovered_at`, with the `DiscoveryModification` the store
+/// computed for it ([`ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState::discovery_modification`]).
+///
+/// Every member comes from the stored record: the connector device id the thing carries as
+/// a device attribute (see [`DeviceAttribute`]), the name, brand and model the record holds
+/// — whose shapes are the same `Name`, `Brand` and `Model` the summary declares, so a
+/// stored value always satisfies the member it is reported on — and the device type its
+/// classification names ([`device_types_of`]).
+///
+/// `AuthenticationMaterial` stays absent: it is the credential for connecting to the
+/// device, which this emulator never holds for a discovered device and must not invent.
+pub fn discovered_device_summary(
+    thing: &ManagedThing,
+    modification: &str,
+    discovered_at: SystemTime,
+) -> DiscoveredDeviceSummary {
+    DiscoveredDeviceSummary {
+        connector_device_id: CONNECTOR_DEVICE_ID.of(thing),
+        connector_device_name: thing.name.clone(),
+        device_types: device_types_of(thing),
+        managed_thing_id: Some(thing.id.clone()),
+        modification: Some(modification.to_string()),
+        discovered_at: Some(timestamp(discovered_at)),
+        brand: thing.brand.clone(),
+        model: thing.model.clone(),
+        authentication_material: None,
+    }
+}
+
+/// The `DeviceTypes` a discovered device reports: the one type its `Classification` names
+/// ("the classification of the managed thing such as light bulb or thermostat"), or nothing
+/// when the record carries no classification.
+///
+/// `Classification` (len 1..64, no pattern) admits characters `DeviceType` (len ..256,
+/// pattern `^[a-zA-Z0-9=_. ,@\+\-/]+$`) does not, so a classification outside that pattern
+/// is reported as no device type rather than as a value outside its member's shape.
+pub fn device_types_of(thing: &ManagedThing) -> Option<Vec<String>> {
+    thing
+        .classification
+        .as_deref()
+        .filter(|classification| {
+            !classification.is_empty()
+                && classification.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || "=_. ,@+-/".contains(character)
+                })
+        })
+        .map(|classification| vec![classification.to_string()])
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

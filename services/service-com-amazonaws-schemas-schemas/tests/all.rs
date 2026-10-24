@@ -39,6 +39,8 @@ mod published_document_bytes;
 mod registry_schema_lifecycle;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
+#[path = "all/schema_name_collation.rs"]
+mod schema_name_collation;
 #[path = "all/search_schemas.rs"]
 mod search_schemas;
 #[path = "all/state_roundtrip.rs"]
