@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is never locked across that call. Every purely-local refusal is answered here,
         // before any outbound work: a request naming a template or a queue this account
         // does not hold costs no probe.
-        let (template, queue) = {
+        let (template, queue, policy) = {
             let mut store = state.lock();
             store.settle(now);
             if let Some(token) = token.as_deref() {
@@ -303,7 +303,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
-            (template, queue)
+            // The account's input policy is read here too — it is local state, so the
+            // decision it carries costs no probe — and applied below, once the settings
+            // the job will actually run from are known.
+            (template, queue, store.policy.clone())
         };
 
         // "When you create a job, you can either specify a job template or specify the
@@ -340,17 +343,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|record| record.hop_destinations.clone())
                 .unwrap_or_default()
         });
+        // Every input the job will read, which both the policy decision below and the
+        // probe after it are taken against: the request's own
+        // `Settings.Inputs[].FileInput` merged with whatever the referenced template
+        // supplies.
+        let input_uris = crate::state::job_input_uris(&settings);
+        // "An input policy allows or disallows a job you submit to run based on the
+        // conditions that you specify": the account's policy gates the SUBMISSION, so a
+        // job stating an input at a location the policy disallows is refused here —
+        // before any outbound work and before anything is stored.
+        if let Some(refusal) = policy_refusal(policy.as_ref(), &input_uris) {
+            return Err(refusal.into());
+        }
+
         // MediaConvert opens (probes) a job's inputs before it can transcode them. The
         // probe is a REAL read of the job's own `Settings.Inputs[].FileInput` against S3
         // over the in-process callback, run with no lock held; what it found is stored on
         // the job, so the status change the clock later makes due reports the failure that
         // was actually observed rather than one assumed.
-        let unreadable_input = crate::state::unreadable_job_input(
-            ctx,
-            &region,
-            &crate::state::job_input_uris(&settings),
-        )
-        .await;
+        let unreadable_input =
+            crate::state::unreadable_job_input(ctx, &region, &input_uris).await;
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
@@ -398,6 +410,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::state::not_found_message("hopDestinations")),
             })
             .into());
+        }
+
+        // The account's policy is re-read under the guard the job is stored through, for
+        // the same reason the references are: it was read before the probe, so a
+        // `PutPolicy` may have replaced it in the meantime, and the policy a job is
+        // admitted under is the one in force when the job is stored.
+        if let Some(refusal) = policy_refusal(state.policy.as_ref(), &input_uris) {
+            return Err(refusal.into());
         }
 
         // The settings graph is validated at SUBMIT time, against what the job will
@@ -502,4 +522,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             job: Some(job.view(&region)),
         })
     }
+}
+
+/// How a submission is refused when the account's input policy disallows an input the job
+/// states, or `None` when the policy — possibly none at all — allows every one of them.
+///
+/// The refusal is the modelled `ForbiddenException` (403), not the 400 a malformed request
+/// gets: the request is well formed and every resource it names exists, and what refuses
+/// it is a permission the account itself withheld — the same error this service answers
+/// for any other action an account is not allowed to take. The caller returns before
+/// `accept_job`, so nothing is stored.
+fn policy_refusal(
+    policy: Option<&crate::state::PolicyRecord>,
+    inputs: &[String],
+) -> Option<CreateJobErrorModeled> {
+    let (uri, location) = policy?.disallowed_input(inputs)?;
+    Some(CreateJobErrorModeled::ForbiddenException(
+        ForbiddenException {
+            message: Some(crate::state::policy_disallows_input_message(uri, location)),
+        },
+    ))
 }
