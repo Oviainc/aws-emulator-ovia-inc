@@ -990,8 +990,13 @@ async fn create_flow_refuses_past_the_store_ceiling() {
 /// Every collection ONE CreateFlow request can fill is bounded by
 /// [`service_com_amazonaws_mediaconnect_mediaconnect::state::MAX_FLOW_COLLECTION_ENTRIES`]:
 /// a request at the bound is stored, one entry past it is refused with the modelled
-/// `BadRequestException` (400). The table's rows are the five collections and the tag
-/// map, so the rule is asserted over the whole class rather than over `Outputs` alone.
+/// `BadRequestException` (400). The table's rows are those collections and the tag map, so
+/// the rule is asserted over the whole class rather than over `Outputs` alone.
+///
+/// `Sources` is NOT one of them: a flow's source count is bounded by its own failover
+/// state instead ("if the state is inactive, the flow can have only one source. If the
+/// state is active, the flow can have one or two sources", `FailoverConfig$State`), the
+/// subject of `crate::flow_source_failover_bound`.
 #[tokio::test]
 async fn create_flow_bounds_every_request_sized_collection() {
     const LIMIT: usize =
@@ -1004,18 +1009,6 @@ async fn create_flow_bounds_every_request_sized_collection() {
             "source": { "name": "src", "protocol": "rtp", "whitelistCidr": "10.0.0.0/16" }
         });
         match member {
-            "Sources" => {
-                request["source"] = Value::Null;
-                request["sources"] = (0..count)
-                    .map(|index| {
-                        json!({
-                            "name": format!("src-{index}"),
-                            "protocol": "zixi-push",
-                            "whitelistCidr": "10.0.0.0/16"
-                        })
-                    })
-                    .collect();
-            }
             "Outputs" => {
                 request["outputs"] = (0..count)
                     .map(|index| {
@@ -1076,7 +1069,6 @@ async fn create_flow_bounds_every_request_sized_collection() {
     // Every collection a CreateFlow request can fill, from the operation's input shape:
     // `smithy_query(query="operation",operation="CreateFlow")`.
     for member in [
-        "Sources",
         "Outputs",
         "Entitlements",
         "MediaStreams",

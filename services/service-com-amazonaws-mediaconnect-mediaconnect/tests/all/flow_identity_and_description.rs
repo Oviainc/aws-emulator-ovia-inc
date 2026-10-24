@@ -301,6 +301,10 @@ fn description_cases() -> Vec<DescriptionCase> {
             case: "a failover pair whose first source carries the description",
             body: json!({
                 "name": "desc-pair-first",
+                // A flow holding a pair of sources has source failover ACTIVE: "if the
+                // state is active, the flow can have one or two sources"
+                // (`FailoverConfig$State`).
+                "sourceFailoverConfig": { "state": "ENABLED" },
                 "sources": [
                     {
                         "name": "primary",
@@ -322,6 +326,7 @@ fn description_cases() -> Vec<DescriptionCase> {
             case: "a failover pair where only the second source carries one",
             body: json!({
                 "name": "desc-pair-second",
+                "sourceFailoverConfig": { "state": "ENABLED" },
                 "sources": [
                     { "name": "primary", "protocol": "rist", "whitelistCidr": "10.1.0.0/16" },
                     {

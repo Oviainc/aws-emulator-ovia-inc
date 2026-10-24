@@ -59,17 +59,27 @@ pub(crate) async fn remove_flow_source(
         .await
 }
 
-/// Create the flow a case works on, with `initial` sources already on it, and return its
-/// ARN.
-pub(crate) async fn create_flow_with_sources(
+/// The source failover config a flow needs to hold a PAIR of sources:
+/// `FailoverConfig$State` ENABLED — "if the state is active, the flow can have one or two
+/// sources" (`smithy_query(query="doc",shape="FailoverConfig",member="State")`).
+pub(crate) fn failover_active() -> Value {
+    json!({ "state": "ENABLED" })
+}
+
+/// Create the flow a case works on, with `initial` sources already on it and `failover` as
+/// its `SourceFailoverConfig`, and return its ARN.
+pub(crate) async fn create_flow_with_sources_and_failover(
     emulator: &Emulator,
     case: &str,
     name: &str,
     initial: Value,
+    failover: Option<Value>,
 ) -> String {
-    let (status, code, created) = emulator
-        .create_flow(json!({ "name": name, "sources": initial }))
-        .await;
+    let mut body = json!({ "name": name, "sources": initial });
+    if let Some(failover) = failover {
+        body["sourceFailoverConfig"] = failover;
+    }
+    let (status, code, created) = emulator.create_flow(body).await;
     assert_eq!(
         (status, code.as_deref()),
         (201, None),
@@ -79,6 +89,29 @@ pub(crate) async fn create_flow_with_sources(
         .as_str()
         .unwrap_or_default()
         .to_string()
+}
+
+/// Create the flow a case works on, with `initial` sources already on it, and return its
+/// ARN.
+///
+/// A flow holding more than one source needs source failover ACTIVE — "if the state is
+/// inactive, the flow can have only one source" (`FailoverConfig$State`) — so a case that
+/// asks for a pair gets a flow whose failover state is ENABLED.
+pub(crate) async fn create_flow_with_sources(
+    emulator: &Emulator,
+    case: &str,
+    name: &str,
+    initial: Value,
+) -> String {
+    let needs_failover = initial.as_array().is_some_and(|sources| sources.len() > 1);
+    create_flow_with_sources_and_failover(
+        emulator,
+        case,
+        name,
+        initial,
+        needs_failover.then(failover_active),
+    )
+    .await
 }
 
 /// The flow's stored sources, as DescribeFlow reports them.
@@ -152,11 +185,15 @@ struct AddCase {
     expected_max_bitrate: &'static [Option<i64>],
 }
 
-/// The rows differ along what the rule generalises over: how many sources one call adds,
-/// whether each names itself or leaves the service to, which protocol and transport
-/// members it carries (or none at all), whether it is owned or reached through an
-/// entitlement, and whether it asks for an ingest port, a decryption config or router
-/// integration.
+/// The rows differ along what the rule generalises over: whether the added source names
+/// itself or leaves the service to, which protocol and transport members it carries (or
+/// none at all), whether it is owned or reached through an entitlement, and whether it
+/// asks for an ingest port, a decryption config or router integration.
+///
+/// Every row starts from a flow with ONE source and adds ONE more: "if the state is
+/// active, the flow can have one or two sources" (`FailoverConfig$State`), so the pair is
+/// the largest flow an add can build. The bound itself is the subject of
+/// `crate::flow_source_failover_bound`.
 fn add_cases() -> Vec<AddCase> {
     vec![
         AddCase {
@@ -174,21 +211,25 @@ fn add_cases() -> Vec<AddCase> {
             expected_max_bitrate: &[None],
         },
         AddCase {
-            case: "two sources in one call, one named and one not",
+            case: "a named zixi-push source keeps its latency, stream id and description",
             initial: json!([{ "name": "primary", "protocol": "rtp", "whitelistCidr": "10.1.0.0/16" }]),
-            add: json!([
-                {
-                    "name": "zixi",
-                    "protocol": "zixi-push",
-                    "whitelistCidr": "10.4.0.0/16",
-                    "maxLatency": 2000,
-                    "streamId": "s-7",
-                    "description": "the pushed stream"
-                },
-                { "protocol": "rtp-fec", "whitelistCidr": "10.5.0.0/16" }
-            ]),
-            expected_names: &["zixi", "{flow}-3"],
-            expected_max_bitrate: &[None, Some(160_000_000)],
+            add: json!([{
+                "name": "zixi",
+                "protocol": "zixi-push",
+                "whitelistCidr": "10.4.0.0/16",
+                "maxLatency": 2000,
+                "streamId": "s-7",
+                "description": "the pushed stream"
+            }]),
+            expected_names: &["zixi"],
+            expected_max_bitrate: &[None],
+        },
+        AddCase {
+            case: "an unnamed rtp-fec source gets the service's smoothing bitrate",
+            initial: json!([{ "name": "primary", "protocol": "rtp", "whitelistCidr": "10.1.0.0/16" }]),
+            add: json!([{ "protocol": "rtp-fec", "whitelistCidr": "10.5.0.0/16" }]),
+            expected_names: &["{flow}-2"],
+            expected_max_bitrate: &[Some(160_000_000)],
         },
         AddCase {
             case: "an entitled source carries no ingest endpoint and no transport",
@@ -242,10 +283,7 @@ fn add_cases() -> Vec<AddCase> {
         },
         AddCase {
             case: "the srt-caller listener members fold into the transport",
-            initial: json!([
-                { "name": "primary", "protocol": "rtp", "whitelistCidr": "10.1.0.0/16" },
-                { "name": "secondary", "protocol": "rtp", "whitelistCidr": "10.7.0.0/16" }
-            ]),
+            initial: json!([{ "name": "primary", "protocol": "rtp", "whitelistCidr": "10.7.0.0/16" }]),
             add: json!([{
                 "name": "caller",
                 "protocol": "srt-caller",
@@ -275,8 +313,17 @@ async fn add_flow_sources_persists_the_sources_it_returns() {
             expected_max_bitrate,
         } = case_row;
         let flow_name = format!("flow-add-sources-{index}");
-        let flow_arn =
-            create_flow_with_sources(&emulator, case, &flow_name, initial.clone()).await;
+        // The flow carries source failover ACTIVE, because the add gives it a second
+        // source: "if the state is active, the flow can have one or two sources"
+        // (`FailoverConfig$State`).
+        let flow_arn = create_flow_with_sources_and_failover(
+            &emulator,
+            case,
+            &flow_name,
+            initial.clone(),
+            Some(failover_active()),
+        )
+        .await;
         let before = described_sources(&emulator, case, &flow_arn).await;
 
         let (status, code, body) = add_flow_sources(&emulator, &flow_arn, add.clone()).await;
@@ -468,6 +515,17 @@ async fn add_flow_sources_refuses_what_it_cannot_add() {
             status: 400,
             code: "BadRequestException",
         },
+        RefusalCase {
+            // "If the state is inactive, the flow can have only one source"
+            // (`FailoverConfig$State`): this flow carries no `SourceFailoverConfig` at
+            // all, so a second source is one too many. The whole rule is the subject of
+            // `crate::flow_source_failover_bound`.
+            case: "a second source on a flow whose source failover is inactive",
+            flow_arn: flow_arn.clone(),
+            sources: one_source.clone(),
+            status: 400,
+            code: "BadRequestException",
+        },
     ];
 
     for RefusalCase {
@@ -507,142 +565,38 @@ fn numbered_sources(first: usize, count: usize) -> Value {
         .collect()
 }
 
-/// The bound on the sources ONE FLOW holds counts the STORED flow, however many calls
-/// fill it: the call that fills the last slot is accepted, and anything past the bound is
-/// refused with `BadRequestException` (400), the error the model describes for a semantic
-/// error in the request.
-#[tokio::test]
-async fn add_flow_sources_bounds_the_sources_one_flow_holds() {
-    const LIMIT: usize = service_com_amazonaws_mediaconnect_mediaconnect::state::MAX_FLOW_SOURCES;
-
-    let emulator = Emulator::new();
-
-    let case = "filled to the bound over two calls";
-    let flow_arn =
-        create_flow_with_sources(&emulator, case, "flow-source-ceiling", numbered_sources(0, 10))
-            .await;
-    let (status, code, body) =
-        add_flow_sources(&emulator, &flow_arn, numbered_sources(10, LIMIT - 10)).await;
-    assert_eq!(
-        (status, code.as_deref()),
-        (201, None),
-        "case {case:?}: the add that fills the last slot is accepted, got {status} {code:?}: \
-         {body}"
-    );
-    let at_bound = described_sources(&emulator, case, &flow_arn).await;
-    assert_eq!(
-        at_bound.len(),
-        LIMIT,
-        "case {case:?}: the flow holds {LIMIT} sources, got {}",
-        at_bound.len()
-    );
-
-    let case = "one source past the bound";
-    let (status, code, body) =
-        add_flow_sources(&emulator, &flow_arn, numbered_sources(LIMIT, 1)).await;
-    assert_eq!(
-        (status, code.as_deref()),
-        (400, Some("BadRequestException")),
-        "case {case:?}: expected 400 BadRequestException, got {status} {code:?}: {body}"
-    );
-    let after = described_sources(&emulator, case, &flow_arn).await;
-    assert_eq!(
-        after, at_bound,
-        "case {case:?}: the refused add stores nothing, got {} sources",
-        after.len()
-    );
-
-    let case = "one request that would overshoot the bound on its own";
-    let fresh = create_flow_with_sources(
-        &emulator,
-        case,
-        "flow-source-ceiling-single",
-        numbered_sources(0, 1),
-    )
-    .await;
-    let (status, code, body) = add_flow_sources(&emulator, &fresh, numbered_sources(1, LIMIT)).await;
-    assert_eq!(
-        (status, code.as_deref()),
-        (400, Some("BadRequestException")),
-        "case {case:?}: expected 400 BadRequestException, got {status} {code:?}: {body}"
-    );
-    assert_eq!(
-        described_sources(&emulator, case, &fresh).await.len(),
-        1,
-        "case {case:?}: the refused add stores nothing"
-    );
-
-    let case = "one request exactly to the bound";
-    let exact = create_flow_with_sources(
-        &emulator,
-        case,
-        "flow-source-ceiling-exact",
-        numbered_sources(0, 1),
-    )
-    .await;
-    let (status, code, body) =
-        add_flow_sources(&emulator, &exact, numbered_sources(1, LIMIT - 1)).await;
-    assert_eq!(
-        (status, code.as_deref()),
-        (201, None),
-        "case {case:?}: expected 201 with no error, got {status} {code:?}: {body}"
-    );
-    assert_eq!(
-        described_sources(&emulator, case, &exact).await.len(),
-        LIMIT,
-        "case {case:?}: the flow holds {LIMIT} sources"
-    );
-}
-
 /// A source name the service generates is the next free one in the flow's own sequence —
 /// across calls, and around names a caller chose for itself — so no two sources of one
 /// flow are generated with the same name.
 #[tokio::test]
 async fn generated_source_names_stay_unique_across_calls() {
     let emulator = Emulator::new();
-    let case = "generated names skip the ones already taken";
+    let case = "a generated name skips the one already taken";
     let flow_name = "flow-generated-sources";
-    let flow_arn = create_flow_with_sources(
+    // The flow's first source is named `<flow>-2` by the request, which is exactly the
+    // name the service would generate for the source at position 1 — so the add has to
+    // skip it. Source failover is ACTIVE, because the flow ends up with a pair.
+    let flow_arn = create_flow_with_sources_and_failover(
         &emulator,
         case,
         flow_name,
-        json!([
-            { "name": "primary", "protocol": "rtp", "whitelistCidr": "10.1.0.0/16" },
-            { "name": "flow-generated-sources-2", "protocol": "rtp", "whitelistCidr": "10.2.0.0/16" }
-        ]),
+        json!([{ "name": "flow-generated-sources-2", "protocol": "rtp", "whitelistCidr": "10.2.0.0/16" }]),
+        Some(failover_active()),
     )
     .await;
 
-    for (call, expected) in [
-        (
-            json!([{ "protocol": "udp" }, { "protocol": "udp" }]),
-            vec!["flow-generated-sources-3", "flow-generated-sources-4"],
-        ),
-        (
-            json!([{ "protocol": "udp" }]),
-            vec!["flow-generated-sources-5"],
-        ),
-    ] {
-        let (status, code, body) = add_flow_sources(&emulator, &flow_arn, call).await;
-        assert_eq!(
-            (status, code.as_deref()),
-            (201, None),
-            "case {case:?}: expected 201 with no error, got {status} {code:?}: {body}"
-        );
-        let names: Vec<&str> = body["sources"]
-            .as_array()
-            .map(|sources| {
-                sources
-                    .iter()
-                    .map(|source| source["name"].as_str().unwrap_or_default())
-                    .collect()
-            })
-            .unwrap_or_default();
-        assert_eq!(
-            names, expected,
-            "case {case:?}: the generated names are the first free ones, got {names:?}"
-        );
-    }
+    let (status, code, body) =
+        add_flow_sources(&emulator, &flow_arn, json!([{ "protocol": "udp" }])).await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (201, None),
+        "case {case:?}: expected 201 with no error, got {status} {code:?}: {body}"
+    );
+    assert_eq!(
+        body["sources"][0]["name"].as_str(),
+        Some("flow-generated-sources-3"),
+        "case {case:?}: the generated name is the first free one, got {body}"
+    );
 
     let on_the_flow = described_sources(&emulator, case, &flow_arn).await;
     let stored: Vec<&str> = on_the_flow
@@ -667,17 +621,18 @@ async fn remove_flow_source_drops_the_source_it_names() {
     let emulator = Emulator::new();
 
     // The rows differ along which position the removed source holds: the first (so
-    // `Flow.Source` moves), one in the middle, and the last.
+    // `Flow.Source` moves) and the last. A flow holds at most the failover pair
+    // ("if the state is active, the flow can have one or two sources",
+    // `FailoverConfig$State`), so those two positions are every position there is.
     for (case, removed_position) in [
         ("the first source of the flow", 0usize),
-        ("a source in the middle", 1),
-        ("the last source of the flow", 3),
+        ("the last source of the flow", 1),
     ] {
         let flow_arn = create_flow_with_sources(
             &emulator,
             case,
             &format!("flow-remove-source-{removed_position}"),
-            numbered_sources(0, 4),
+            numbered_sources(0, 2),
         )
         .await;
         let before = described_sources(&emulator, case, &flow_arn).await;
@@ -806,11 +761,12 @@ async fn sources_added_then_removed_leave_the_flow_consistent() {
     let emulator = Emulator::new();
     let case = "add, remove, add again";
     let flow_name = "flow-source-round-trip";
-    let flow_arn = create_flow_with_sources(
+    let flow_arn = create_flow_with_sources_and_failover(
         &emulator,
         case,
         flow_name,
         json!([{ "name": "primary", "protocol": "rtp", "whitelistCidr": "10.1.0.0/16" }]),
+        Some(failover_active()),
     )
     .await;
 

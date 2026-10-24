@@ -206,17 +206,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(&input.flow_arn));
         };
 
-        // The bound is on the STORED flow, so it counts the sources already stored plus
-        // the ones this request would add (see `crate::state::MAX_FLOW_SOURCES`).
+        // How many sources a flow may hold is its FAILOVER state's rule, not a generic
+        // collection bound: "If the state is inactive, the flow can have only one source.
+        // If the state is active, the flow can have one or two sources."
+        // (`FailoverConfig$State`). The bound is on the STORED flow, so it counts the
+        // sources already stored plus the ones this request would add, and it is resolved
+        // through the one function the create side and UpdateFlow read it from (see
+        // `crate::state::max_flow_sources`).
         let held = flow.sources.len();
-        if held + input.sources.len() > crate::state::MAX_FLOW_SOURCES {
-            return Err(bad_request(format!(
-                "A flow can hold at most {} sources; flow {} already has {held} and this \
-                 request adds {}.",
-                crate::state::MAX_FLOW_SOURCES,
-                input.flow_arn,
-                input.sources.len()
-            )));
+        if let Some(rejection) = crate::state::flow_source_bound_rejection(
+            flow.source_failover_config.as_ref(),
+            held,
+            input.sources.len(),
+        ) {
+            return Err(bad_request(rejection));
         }
 
         // `Source.Name` is required while `SetSourceRequest.Name` is optional, so a

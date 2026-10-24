@@ -19,9 +19,9 @@
 //!
 //! A request is refused with `BadRequestException` only for something IT carries: a
 //! maintenance window outside the documented formats, an NDI state the resulting flow size
-//! cannot support, failover switched off under a failover pair, or a primary source the
-//! flow does not have. A request that does not touch a setting is never refused for a
-//! value already in the store.
+//! cannot support, a failover state the flow's own source count exceeds, or a primary
+//! source the flow does not have. A request that does not touch a setting is never refused
+//! for a value already in the store.
 //!
 //! The model gives UpdateFlow no status member and documents no status change for it
 //! (`Flow.Status` is "the current status of the flow", and the transient statuses belong
@@ -128,11 +128,6 @@ const NDI_CAPABLE_FLOW_SIZES: [&str; 2] = ["LARGE", "LARGE_4X"];
 /// flow to support NDI sources or outputs". Named in [`crate::state`], where every
 /// operation of this service reads the two values of the `State` enum from.
 const STATE_ENABLED: &str = crate::state::STATE_ENABLED;
-
-/// See [`STATE_ENABLED`]. `UpdateFailoverConfig$State` is "the state of source failover on
-/// the flow. If the state is inactive, the flow can have only one source. If the state is
-/// active, the flow can have one or two sources."
-const STATE_DISABLED: &str = crate::state::STATE_DISABLED;
 
 /// The maintenance start hour applied to a flow whose maintenance window names a day but
 /// no hour: "UTC time when the maintenance will happen. Use 24-hour HH:MM format. Minutes
@@ -423,18 +418,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "If the state is inactive, the flow can have only one source"
-        // (`UpdateFailoverConfig$State`), so failover cannot be switched off under a flow
-        // that is ingesting a failover pair.
         let requested_failover = input.source_failover_config.as_ref();
-        if requested_failover.and_then(|config| config.state.as_deref()) == Some(STATE_DISABLED)
-            && flow.sources.len() > 1
-        {
-            return Err(bad_request(format!(
-                "Source failover cannot be {STATE_DISABLED} on a flow with {} sources: a \
-                 flow whose failover is {STATE_DISABLED} can have only one source.",
-                flow.sources.len()
-            )));
+
+        // "If the state is inactive, the flow can have only one source. If the state is
+        // active, the flow can have one or two sources." (`UpdateFailoverConfig$State`).
+        // The request moves the bound rather than the source count, so it is checked
+        // against the failover config the flow ENDS UP with, under the sources it already
+        // holds — through the one function the create and add paths read the bound from
+        // (`crate::state::max_flow_sources`).
+        // A request that does not touch the failover setting is never refused for the
+        // source count already in the store.
+        let bound_rejection = requested_failover.and_then(|_| {
+            crate::state::flow_source_bound_rejection(
+                source_failover_config.as_ref(),
+                flow.sources.len(),
+                0,
+            )
+        });
+        if let Some(rejection) = bound_rejection {
+            return Err(bad_request(rejection));
         }
 
         // `SourcePriority$PrimarySource` is "the name of the source you choose as the

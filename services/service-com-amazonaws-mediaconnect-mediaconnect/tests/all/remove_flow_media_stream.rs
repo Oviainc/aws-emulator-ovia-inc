@@ -577,6 +577,10 @@ async fn an_association_is_stored_and_lifting_it_frees_the_media_stream() {
     let (status, code, created) = emulator
         .create_flow(json!({
             "name": "flow-ms-assoc-roundtrip",
+            // The case adds a spare source further down (a flow keeps at least one
+            // source), so this flow carries source failover ACTIVE: "if the state is
+            // active, the flow can have one or two sources" (`FailoverConfig$State`).
+            "sourceFailoverConfig": { "state": "ENABLED" },
             "mediaStreams": [
                 { "mediaStreamId": 1, "mediaStreamName": "carried", "mediaStreamType": "video" }
             ],
