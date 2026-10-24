@@ -164,8 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; a read needs none of it.
-        let _ = ctx;
+        // The endpoint this request was signed for: a regional endpoint resolves only
+        // the resources created through it.
+        let region = crate::state::request_region(ctx.parts());
 
         // Every member whose declared constraint this operation's input struct
         // hands over (`skip_validation`) is checked here, so a bad value is
@@ -195,15 +196,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TaggableResourceArn` admits exactly one resource kind — a workflow
         // (`^arn:aws…:airflow-serverless:<region>:<account>:workflow/<name>-<10>$`) — so the
         // entity this operation resolves is the workflow the ARN names. One that the
-        // store does not hold is a lookup miss, not an empty tag map.
-        let workflow = store.workflows.get(&input.resource_arn).ok_or_else(|| {
-            crate::state::lookup_miss(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                crate::state::unresolved(
-                    crate::state::UnresolvedEntity::Workflow,
-                    &input.resource_arn,
-                ),
-            ))
-        })?;
+        // store does not hold is a lookup miss, not an empty tag map — and a workflow
+        // of ANOTHER region is not one this endpoint holds.
+        let workflow = store
+            .workflow_in(&region, &input.resource_arn)
+            .ok_or_else(|| {
+                crate::state::lookup_miss(
+                    ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                        crate::state::unresolved(
+                            crate::state::UnresolvedEntity::Workflow,
+                            &input.resource_arn,
+                        ),
+                    ),
+                )
+            })?;
 
         Ok(ListTagsForResourceOutput {
             // Reported even when the resource carries no tag: `Tags` is modelled with a

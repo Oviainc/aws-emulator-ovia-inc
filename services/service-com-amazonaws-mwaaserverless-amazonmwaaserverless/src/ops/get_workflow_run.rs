@@ -185,8 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; the run is identified by its input.
-        let _ = ctx;
+        // The endpoint this request was signed for: a regional endpoint resolves only
+        // the workflows created through it.
+        let region = crate::state::request_region(ctx.parts());
 
         // Every member whose declared constraint this operation's input struct
         // hands over (`skip_validation`) is checked here, so a bad value is
@@ -213,7 +214,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.reap_deleted_workflows(now);
 
         // The run is what this operation resolves: a workflow the store does not hold
-        // holds no run either, so both misses are the same failure to the caller.
+        // — including one of ANOTHER region, which this endpoint does not serve — holds
+        // no run either, so both misses are the same failure to the caller.
         let unresolved_run = || {
             crate::state::lookup_miss(GetWorkflowRunErrorModeled::ResourceNotFoundException(
                 crate::state::unresolved(
@@ -223,8 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
         let workflow = store
-            .workflows
-            .get_mut(&input.workflow_arn)
+            .workflow_in_mut(&region, &input.workflow_arn)
             .ok_or_else(unresolved_run)?;
         let run = workflow
             .runs

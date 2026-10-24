@@ -206,8 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; the run is identified by its workflow.
-        let _ = ctx;
+        // The endpoint this request was signed for: a regional endpoint resolves only
+        // the workflows created through it.
+        let region = crate::state::request_region(ctx.parts());
 
         // Every member whose declared constraint this operation's input struct
         // hands over (`skip_validation`) is checked here, so a bad value is
@@ -242,16 +243,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let workflow = store
-            .workflows
-            .get(&input.workflow_arn)
+            .workflow_in(&region, &input.workflow_arn)
             .ok_or_else(unresolved_version)?;
         let run_count = workflow.runs.len();
 
         // A repeated @idempotencyToken replays the run it already started. Checked
         // before the version lookup, so a replay answers from the recorded run even
-        // when the version that request named has since been deleted.
+        // when the version that request named has since been deleted. The token is
+        // remembered per region, because a token presented at one regional endpoint
+        // says nothing about what another endpoint started.
         if let Some(token) = input.client_token.as_deref() {
-            if let Some(recorded) = store.idempotency.get(&token_key(token)).cloned() {
+            if let Some(recorded) = store.idempotency.get(&token_key(&region, token)).cloned() {
                 if recorded.request_fingerprint() != fingerprint {
                     return Err(StartWorkflowRunErrorModeled::ConflictException(
                         ConflictException {
@@ -274,8 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(unavailable());
                 };
                 let run = store
-                    .workflows
-                    .get(workflow_arn)
+                    .workflow_in(&region, workflow_arn)
                     .and_then(|workflow| workflow.runs.get(run_id))
                     .ok_or_else(unavailable)?;
                 return Ok(response_for(run));
@@ -290,16 +291,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // shape="ConflictException")`). Checked after the replay above, so a repeated
         // `ClientToken` still answers with the run it already started.
         if store
-            .workflows
-            .get(&input.workflow_arn)
+            .workflow_in(&region, &input.workflow_arn)
             .is_some_and(crate::state::Workflow::is_deleting)
         {
             return Err(tearing_down(&input.workflow_arn));
         }
 
         let version = store
-            .workflows
-            .get(&input.workflow_arn)
+            .workflow_in(&region, &input.workflow_arn)
             .and_then(|workflow| workflow.version(requested))
             .ok_or_else(unresolved_version)?
             .version
@@ -361,14 +360,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let workflow = store
-            .workflows
-            .get_mut(&input.workflow_arn)
+            .workflow_in_mut(&region, &input.workflow_arn)
             .ok_or_else(unavailable)?;
         workflow.runs.insert(run_id.clone(), run);
 
         if let Some(token) = input.client_token.as_deref() {
             store.idempotency.record(
-                token_key(token),
+                token_key(&region, token),
                 crate::state::IdempotentResult::StartWorkflowRun {
                     request_fingerprint: fingerprint,
                     workflow_arn: input.workflow_arn.clone(),
@@ -379,17 +377,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Answer from the stored run, never from the values just computed.
         let stored = store
-            .workflows
-            .get(&input.workflow_arn)
+            .workflow_in(&region, &input.workflow_arn)
             .and_then(|workflow| workflow.runs.get(&run_id))
             .ok_or_else(unavailable)?;
         Ok(response_for(stored))
     }
 }
 
-/// The idempotency-ledger key for a `ClientToken` of THIS operation.
-fn token_key(client_token: &str) -> String {
-    format!("StartWorkflowRun:{client_token}")
+/// The idempotency-ledger key for a `ClientToken` of THIS operation at THIS region's
+/// endpoint, so one token used at two different regional endpoints records two
+/// entries.
+fn token_key(region: &str, client_token: &str) -> String {
+    format!("StartWorkflowRun:{region}:{client_token}")
 }
 
 /// Check every `StartWorkflowRun` input member whose modelled constraint this

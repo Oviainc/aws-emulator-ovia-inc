@@ -110,15 +110,15 @@ fn pending_removal(harness: &Harness, arn: &str) -> Option<SystemTime> {
         .and_then(|workflow| workflow.deletion_due_at)
 }
 
-/// Whether the store still holds a name -> ARN entry for `name`: the index
-/// `CreateWorkflow` conflicts on.
+/// Whether the store still holds a name -> ARN entry for `name` at the harness's
+/// region: the index `CreateWorkflow` conflicts on, which is per region.
 fn name_is_held(harness: &Harness, name: &str) -> bool {
     harness
         .engine()
         .state::<ComAmazonawsMwaaserverlessAmazonmwaaserverlessState>()
         .lock()
-        .workflow_names
-        .contains_key(name)
+        .workflow_arn_named(harness.region(), name)
+        .is_some()
 }
 
 /// The instant `offset_millis` after `reference`.

@@ -3,7 +3,9 @@
 //! What `UpdateFHIRDatastore` writes, member by member, and what it refuses.
 //!
 //! The sibling suite `control_plane_error_semantics` pins the refusal texts and
-//! the ACTIVE-only gate. This one pins the write itself, over a SET of inputs:
+//! the ACTIVE-only gate, and `datastore_update_transition` pins the lifecycle an
+//! update puts the record on. This one pins the write itself, over a SET of
+//! inputs:
 //!
 //! 1. an update replaces EXACTLY the members the request carries, wherever
 //!    `DatastoreProperties` reports each of them, and leaves every other member
@@ -196,12 +198,10 @@ fn expected_properties(baseline: &Value, request: &Value) -> Value {
     expected
 }
 
-/// The `DatastoreProperties` `DescribeFHIRDatastore` reports for `id`.
+/// The `DatastoreProperties` `DescribeFHIRDatastore` reports for `id`, through
+/// the shared harness every suite reads a data store back with.
 async fn described_properties(service: &HealthLake, id: &str) -> Value {
-    service
-        .ok("DescribeFHIRDatastore", &json!({ "DatastoreId": id }))
-        .await["DatastoreProperties"]
-        .clone()
+    service.describe(id).await
 }
 
 /// `UpdateFHIRDatastore`'s request for `id`, carrying `update`'s members.
@@ -223,6 +223,7 @@ async fn update_replaces_the_members_the_request_carries_and_leaves_the_rest() {
         rows.push((case, update, id));
     }
     tokio::time::sleep(PAST_TRANSITION).await;
+    let mut settled = Vec::new();
 
     for (case, update, id) in rows {
         let baseline = described_properties(&service, &id).await;
@@ -231,13 +232,19 @@ async fn update_replaces_the_members_the_request_carries_and_leaves_the_rest() {
             "case {case:?}: the data store must settle to ACTIVE before the update, got {baseline}"
         );
         let expected = expected_properties(&baseline, &update);
+        // Applying the change is asynchronous work, so the record reports the
+        // transient `UPDATING` status while it is in flight; every other member
+        // is the record this update wrote. The settled record is asserted after
+        // the single wait below.
+        let mut updating = expected.clone();
+        updating["DatastoreStatus"] = json!("UPDATING");
 
         let answered = service
             .ok("UpdateFHIRDatastore", &update_request(&id, &update))
             .await;
         let properties = &answered["DatastoreProperties"];
         assert_eq!(
-            properties, &expected,
+            properties, &updating,
             "case {case:?}: UpdateFHIRDatastore must report the requested members replaced and \
              everything else as it was, got {properties}"
         );
@@ -245,8 +252,21 @@ async fn update_replaces_the_members_the_request_carries_and_leaves_the_rest() {
         // The write is in the STORE, not just in the answer.
         let described = described_properties(&service, &id).await;
         assert_eq!(
-            described, expected,
+            described, updating,
             "case {case:?}: DescribeFHIRDatastore must report what the update wrote, \
+             got {described}"
+        );
+        settled.push((case, expected, id));
+    }
+
+    // Once the transition the clock owes has fallen due the record is ACTIVE
+    // again, still holding everything the update wrote.
+    tokio::time::sleep(PAST_TRANSITION).await;
+    for (case, expected, id) in settled {
+        let described = described_properties(&service, &id).await;
+        assert_eq!(
+            described, expected,
+            "case {case:?}: the settled data store must still report what the update wrote, \
              got {described}"
         );
     }
@@ -302,6 +322,10 @@ async fn backup_enabled_at_tracks_when_backup_became_enabled() {
     );
 
     // A later change that leaves backup enabled does not re-enable anything.
+    // The record has to have settled out of `UPDATING` first: a second update
+    // while the first is still being applied is refused (see
+    // `datastore_state_conflict`).
+    tokio::time::sleep(PAST_TRANSITION).await;
     let changed = service
         .ok(
             "UpdateFHIRDatastore",
@@ -329,6 +353,7 @@ async fn backup_enabled_at_tracks_when_backup_became_enabled() {
     );
 
     // Disabling it clears the instant: nothing is enabled any more.
+    tokio::time::sleep(PAST_TRANSITION).await;
     let disabled = service
         .ok(
             "UpdateFHIRDatastore",
@@ -351,6 +376,7 @@ async fn backup_enabled_at_tracks_when_backup_became_enabled() {
 
     // And re-enabling it after that stamps a fresh instant rather than the old
     // one.
+    tokio::time::sleep(PAST_TRANSITION).await;
     let re_enabled = service
         .ok(
             "UpdateFHIRDatastore",

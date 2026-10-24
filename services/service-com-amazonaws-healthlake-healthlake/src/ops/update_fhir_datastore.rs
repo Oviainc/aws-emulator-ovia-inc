@@ -4,11 +4,15 @@
 //!
 //! Applies the members this call carries to the data store `CreateFHIRDatastore`
 //! persisted in [`crate::state`] and reports the record that resulted, so a
-//! later `Describe`/`List` reads exactly what this call wrote. A data store no
-//! record holds — and one whose record has reached the terminal `DELETED` — is a
+//! later `Describe`/`List` reads exactly what this call wrote. Applying the
+//! change is asynchronous work, so the record moves into the transient
+//! `UPDATING` status and the clock owes it the settled `ACTIVE` one — a caller
+//! polling `DescribeFHIRDatastore` observes the transition the same way it does
+//! after a create or a delete. A data store no record holds — and one whose
+//! record has reached the terminal `DELETED` — is a
 //! `ResourceNotFoundException`; one in a lifecycle transition (`CREATING`,
-//! `DELETING`) is refused with the modelled `ConflictException` rather than
-//! mutated.
+//! `UPDATING`, `DELETING`) is refused with the modelled `ConflictException`
+//! rather than mutated.
 //!
 //! ## Shape of an operation
 //!
@@ -196,8 +200,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DatastoreStatus::Active => {}
             // `ConflictException` is modelled as "the data store is in a
             // transition state and the user requested action cannot be
-            // performed" — which is exactly `CREATING` and `DELETING`.
-            crate::state::DatastoreStatus::Creating | crate::state::DatastoreStatus::Deleting => {
+            // performed" — which is exactly `CREATING`, `UPDATING` and
+            // `DELETING`. A data store that is still applying an earlier
+            // configuration change is in a transition like any other, so a
+            // second update is refused rather than racing the first.
+            crate::state::DatastoreStatus::Creating
+            | crate::state::DatastoreStatus::Updating
+            | crate::state::DatastoreStatus::Deleting => {
                 return Err(UpdateFHIRDatastoreErrorModeled::ConflictException(
                     ConflictException {
                         message: Some(crate::state::datastore_in_transition_message(
@@ -248,11 +257,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The data store stays `ACTIVE`: the update is in the record by the time
-        // this call answers, so there is no later transition the clock owes and
-        // nothing for a caller to poll. (`UPDATING` / `UPDATE_FAILED` describe
-        // work that outlives its own call; nothing here performs any, so neither
-        // status is invented.)
+        // Applying a configuration change to a data store is ASYNCHRONOUS work:
+        // the record enters the modelled transient `UPDATING` status and the
+        // clock owes it the settled `ACTIVE` one, exactly as a create owes
+        // `CREATING` -> `ACTIVE` and a delete owes `DELETING` -> `DELETED`. The
+        // due instant is stored and never slept on, so this call answers with
+        // the transient status a caller can then observe through
+        // `DescribeFHIRDatastore` / `ListFHIRDatastores` until it falls due.
+        // (`UPDATE_FAILED` describes a FAILURE of that work; nothing here fails,
+        // so that status is not invented.)
+        datastore.status = crate::state::DatastoreStatus::Updating;
+        datastore.pending = Some((
+            ::std::time::Instant::now() + crate::state::LIFECYCLE_TRANSITION,
+            crate::state::DatastoreStatus::Active,
+        ));
+
         Ok(UpdateFHIRDatastoreOutput {
             datastore_properties: datastore.properties(),
         })

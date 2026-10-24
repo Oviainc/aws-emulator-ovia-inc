@@ -180,8 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; the workflow is named by its input.
-        let _ = ctx;
+        // The endpoint this request was signed for: a regional endpoint resolves only
+        // the workflows created through it.
+        let region = crate::state::request_region(ctx.parts());
 
         // Every member whose declared constraint this operation's input struct
         // hands over (`skip_validation`) is checked here, so a bad value is
@@ -207,15 +208,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.reap_deleted_workflows(now);
 
         // A reference that resolves to nothing is a lookup miss, and the entity THIS
-        // operation resolves is the workflow itself.
-        let workflow = store.workflows.get(&input.workflow_arn).ok_or_else(|| {
-            crate::state::lookup_miss(DeleteWorkflowErrorModeled::ResourceNotFoundException(
-                crate::state::unresolved(
-                    crate::state::UnresolvedEntity::Workflow,
-                    &input.workflow_arn,
-                ),
-            ))
-        })?;
+        // operation resolves is the workflow itself. A workflow of ANOTHER region is
+        // not one this endpoint holds, so its ARN resolves to nothing here either.
+        let workflow = store
+            .workflow_in(&region, &input.workflow_arn)
+            .ok_or_else(|| {
+                crate::state::lookup_miss(DeleteWorkflowErrorModeled::ResourceNotFoundException(
+                    crate::state::unresolved(
+                        crate::state::UnresolvedEntity::Workflow,
+                        &input.workflow_arn,
+                    ),
+                ))
+            })?;
 
         // `WorkflowVersion` is documented as "Optional. The specific version of the
         // workflow to delete. If not specified, all versions of the workflow are
@@ -244,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let already_deleting = workflow.is_deleting();
 
         if !already_deleting {
-            let workflow = store.workflows.get_mut(&arn).ok_or_else(|| {
+            let workflow = store.workflow_in_mut(&region, &arn).ok_or_else(|| {
                 DeleteWorkflowErrorModeled::InternalServerException(InternalServerException {
                     message: "the workflow being deleted could not be read back".to_string(),
                     retry_after_seconds: None,

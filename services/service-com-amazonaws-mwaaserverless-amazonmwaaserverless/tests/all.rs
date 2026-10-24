@@ -15,6 +15,8 @@
 mod arn_validation_errors;
 #[path = "all/missing_resource_lookups.rs"]
 mod missing_resource_lookups;
+#[path = "all/region_isolation.rs"]
+mod region_isolation;
 #[path = "all/resource_tag_listing.rs"]
 mod resource_tag_listing;
 #[path = "all/run_lifecycle_progression.rs"]
