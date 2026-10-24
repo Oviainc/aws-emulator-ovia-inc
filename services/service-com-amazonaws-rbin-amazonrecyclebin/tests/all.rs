@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/error_response_bodies.rs"]
 mod error_response_bodies;
+#[path = "all/resource_tag_pair_quota.rs"]
+mod resource_tag_pair_quota;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/retention_rule_fidelity.rs"]
