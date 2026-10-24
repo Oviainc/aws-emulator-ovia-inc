@@ -46,7 +46,10 @@
 //! [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::record_virtual_machine`] is
 //! the one way a record gets here, it records a machine only on a hypervisor this store
 //! holds, and `ListVirtualMachines` reports exactly those records — a hypervisor whose
-//! inventory has never been synced has none.
+//! inventory has never been synced has none. `GetVirtualMachine` resolves ONE of those
+//! records by its own ARN and reports it in full
+//! ([`StoredVirtualMachine::details`]), including the VMware tags the inventory attached
+//! to it, which no listing carries.
 //!
 //! Every listing pages through one helper ([`page_of_where`], handing back a [`Page`]),
 //! so a page boundary and the token that encodes it mean the same thing whichever
@@ -81,7 +84,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     BandwidthRateLimitInterval, Gateway, GatewayDetails, Hypervisor, HypervisorDetails,
-    MaintenanceStartTime, Tag, VirtualMachine,
+    MaintenanceStartTime, Tag, VirtualMachine, VirtualMachineDetails,
 };
 
 /// The modelled mapping shape a stored property mapping is kept as, re-exported so the
@@ -89,6 +92,12 @@ use crate::ops::types::{
 /// (`smithy_query(query="shape",shape="VmwareToAwsTagMapping")`: `VmwareCategory`,
 /// `VmwareTagName`, `AwsTagKey`, `AwsTagValue`, all required) instead of mirroring it.
 pub use crate::ops::types::VmwareToAwsTagMapping;
+
+/// The modelled VMware tag a stored virtual machine's tags are kept as, re-exported for
+/// the same reason as [`VmwareToAwsTagMapping`]
+/// (`smithy_query(query="shape",shape="VmwareTag")`: `VmwareCategory`, `VmwareTagName`,
+/// `VmwareTagDescription`, none required).
+pub use crate::ops::types::VmwareTag;
 
 /// This service's ARN namespace (`smithy_query(query="service_info")`:
 /// `awsService.arnNamespace`), and the second-to-last ARN segment every gateway ARN
@@ -691,12 +700,24 @@ pub struct StoredVirtualMachine {
     /// `VirtualMachine$LastBackupDate`, absent for a machine that has never been backed
     /// up.
     pub last_backup_date: Option<SystemTime>,
+    /// The VMware tags attached to this machine, in the order its hypervisor's inventory
+    /// reported them.
+    ///
+    /// `VirtualMachineDetails$VmwareTags` — the one member
+    /// `VirtualMachineDetails` carries that the `VirtualMachine` summary does not
+    /// (`smithy_query(query="shape",shape="VirtualMachineDetails")`), so only a read of a
+    /// single machine reports them. A tag is attached to a machine on the hypervisor, not
+    /// through this API, so it reaches the store on the same out-of-band inventory channel
+    /// as the rest of the record ([`VirtualMachineInventory`]), and is kept as the
+    /// MODELLED [`VmwareTag`] shape so a member cannot drift between what is stored and
+    /// what is serialised. Empty for a machine whose inventory reported none.
+    pub vmware_tags: Vec<VmwareTag>,
     /// When this record first entered the store — the instant the sync that discovered
     /// the machine reported it. Kept across a re-sync of the same machine, so
     /// re-reporting an unchanged inventory is visible as the one record it is. No member
     /// of the modelled `VirtualMachine` carries it: it is the record's own provenance,
-    /// which `GetVirtualMachine` and a metadata-sync status (both still scaffolds) read
-    /// to tell a machine discovered by the latest sync from one carried over.
+    /// which a metadata-sync status reads to tell a machine discovered by the latest sync
+    /// from one carried over.
     pub discovered_time: SystemTime,
 }
 
@@ -714,6 +735,28 @@ impl StoredVirtualMachine {
             path: Some(self.path.clone()),
             resource_arn: Some(self.arn.clone()),
             last_backup_date: self.last_backup_date.map(date_time),
+        }
+    }
+
+    /// This record as the `VirtualMachineDetails` shape `GetVirtualMachine` returns.
+    ///
+    /// Every member the `VirtualMachine` summary also carries is taken FROM that summary,
+    /// so a read of one machine and a listing that holds it cannot disagree about it.
+    /// `VmwareTags` is the one member `VirtualMachineDetails` adds
+    /// (`smithy_query(query="shape",shape="VirtualMachineDetails")`): the tags the record
+    /// holds, in the order its inventory reported them, and an EMPTY list — not an absent
+    /// member — for a machine that carries none, because the store knows that it has none
+    /// where an absent member would say it does not know.
+    pub fn details(&self) -> VirtualMachineDetails {
+        let summary = self.summary();
+        VirtualMachineDetails {
+            host_name: summary.host_name,
+            hypervisor_id: summary.hypervisor_id,
+            name: summary.name,
+            path: summary.path,
+            resource_arn: summary.resource_arn,
+            last_backup_date: summary.last_backup_date,
+            vmware_tags: Some(self.vmware_tags.clone()),
         }
     }
 }
@@ -734,6 +777,9 @@ pub struct VirtualMachineInventory {
     pub path: String,
     /// `VirtualMachine$LastBackupDate`, absent for a machine never backed up.
     pub last_backup_date: Option<SystemTime>,
+    /// `VirtualMachineDetails$VmwareTags` — the VMware tags attached to the machine on
+    /// its hypervisor, empty for a machine that carries none.
+    pub vmware_tags: Vec<VmwareTag>,
 }
 
 /// The property mappings SET for one hypervisor.
@@ -1339,6 +1385,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             path: inventory.path,
             hypervisor_arn: hypervisor_arn.to_string(),
             last_backup_date: inventory.last_backup_date,
+            vmware_tags: inventory.vmware_tags,
             discovered_time,
         };
         self.virtual_machines.insert(arn.clone(), record);
