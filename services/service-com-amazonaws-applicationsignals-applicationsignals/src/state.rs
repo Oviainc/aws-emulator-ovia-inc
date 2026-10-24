@@ -29,8 +29,8 @@ use crate::ops::types::{
 // The shapes the time-ranged topology reads project, on their own `use` so this set and the
 // SLO lifecycle's above are edited on separate lines.
 use crate::ops::types::{
-    Dimension, MetricReference, Service, ServiceDependency, ServiceDependent, ServiceOperation,
-    ServiceSummary,
+    AttributeFilter, ChangeEvent, Dimension, MetricReference, Service, ServiceDependency,
+    ServiceDependent, ServiceOperation, ServiceState, ServiceSummary,
 };
 // The dynamic instrumentation shapes, on their own `use` for the same reason.
 use crate::ops::types::{
@@ -126,6 +126,8 @@ pub const SERVICE_DEPENDENTS_TOKEN_TAG: &str = "service-dependents/1/";
 pub const AUDIT_FINDINGS_TOKEN_TAG: &str = "audit-findings/1/";
 /// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListServices`.
 pub const SERVICES_TOKEN_TAG: &str = "services/1/";
+/// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListServiceStates`.
+pub const SERVICE_STATES_TOKEN_TAG: &str = "service-states/1/";
 
 /// Per-service state for com-amazonaws-applicationsignals-applicationsignals. A handler reaches it through [`service_state`].
 ///
@@ -1769,6 +1771,149 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         }
         by_edge.into_values().collect()
     }
+
+    /// The last instant inside the window at which this emulator recorded a change to the
+    /// service `identity` names, or `None` when it recorded none there.
+    ///
+    /// A stored SLO is a configuration of what Application Signals watches on its entity, so
+    /// the instants that record a change to a service are the instants its SLOs were written
+    /// at: each SLO's `CreatedTime` and its `LastUpdatedTime`, read off the stored record
+    /// rather than re-derived, so the instant reported here is one `GetServiceLevelObjective`
+    /// reports for the same SLO. Only an instant INSIDE the window counts: the window is the
+    /// period the caller asks about, so a change before it is not news in it and a change
+    /// after it has not happened yet.
+    fn last_changed_in_window(
+        &self,
+        identity: &HashMap<String, String>,
+        window_start: &DateTime,
+        window_end: &DateTime,
+    ) -> Option<DateTime> {
+        self.slos
+            .values()
+            .filter(|slo| names_same_service(entity_of(slo).key_attributes.as_ref(), identity))
+            .flat_map(|slo| [slo.created_time, slo.last_updated_time])
+            .filter(|at| {
+                window_start.as_secs_f64() <= at.as_secs_f64()
+                    && at.as_secs_f64() <= window_end.as_secs_f64()
+            })
+            .max_by(|left, right| left.as_secs_f64().total_cmp(&right.as_secs_f64()))
+    }
+
+    /// The state of each service this emulator observed over the window, as
+    /// `ListServiceStates` reports it.
+    ///
+    /// The services considered are the DISCOVERED ones ([`Self::observed_services`]), so this
+    /// read cannot report a service `ListServices` does not, and `filters` then narrows that
+    /// set ([`passes_attribute_filter`]). Each reported entry carries the one most recent
+    /// change recorded for its service inside the window
+    /// ([`Self::last_changed_in_window`]) — `ServiceState.LatestChangeEvents` is `@required`
+    /// with `length 1..1`, so a service with no recorded change inside the window has no
+    /// state to report rather than one with an empty event list.
+    ///
+    /// `AttributeFilters` echoes the filters that were applied, which is what the member
+    /// states it carries; a request that named none has none applied, and holding no filters
+    /// and holding an empty set are the same state.
+    ///
+    /// `ChangeEvent` states WHAT changed, WHEN and WHERE: the entity is the identity this
+    /// read reports for the service, the instant is the recorded one, and the account and
+    /// region are this store's account and the caller's own region, exactly as a minted ARN
+    /// renders them. `UserName` and `EventName` stay absent: the store records that a
+    /// configuration changed and when, not who asked for it or what the service would call
+    /// the change.
+    pub fn observed_service_states(
+        &self,
+        window_start: &DateTime,
+        window_end: &DateTime,
+        filters: &[AttributeFilter],
+        region: &str,
+    ) -> Vec<ServiceState> {
+        let applied = (!filters.is_empty()).then(|| filters.to_vec());
+        self.observed_services(window_start, window_end)
+            .into_iter()
+            .filter(|summary| {
+                filters
+                    .iter()
+                    .all(|filter| passes_attribute_filter(&summary.key_attributes, filter))
+            })
+            .filter_map(|summary| {
+                let changed_at =
+                    self.last_changed_in_window(&summary.key_attributes, window_start, window_end)?;
+                Some(ServiceState {
+                    attribute_filters: applied.clone(),
+                    latest_change_events: vec![ChangeEvent {
+                        timestamp: changed_at,
+                        account_id: ::engine::emulator_account_id().to_string(),
+                        region: region.to_string(),
+                        entity: summary.key_attributes.clone(),
+                        change_event_type: CONFIGURATION_CHANGE_EVENT.to_string(),
+                        event_id: UNRECORDED_EVENT_ID.to_string(),
+                        user_name: None,
+                        event_name: None,
+                    }],
+                    service: summary.key_attributes,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The `ChangeEventType` of a change to what Application Signals is configured to watch on a
+/// service (`smithy_query(shape="ChangeEventType")` -> `["DEPLOYMENT", "CONFIGURATION"]`).
+///
+/// Every change this emulator records is of this kind: a deployment is an event of the
+/// customer's own release pipeline, which the real service learns about from the telemetry
+/// and the trail of an instrumented account, and this emulator receives neither.
+pub const CONFIGURATION_CHANGE_EVENT: &str = "CONFIGURATION";
+
+/// `ChangeEvent.EventId` for an event this emulator did not read off a CloudTrail record,
+/// which is the value the member documents for one: "For CloudTrail-based events, this is the
+/// CloudTrail event id. For other events, this will be `Unknown`"
+/// (`smithy_query(query="doc", shape="ChangeEvent", member="EventId")`).
+pub const UNRECORDED_EVENT_ID: &str = "Unknown";
+
+/// Whether two key-attribute maps name the same service.
+///
+/// As few as one of an entity's up to four `Attributes` entries identifies it
+/// ([`attributes_contain`]), so one map names the same service as the other when either is a
+/// subset of it — which is the same rule that lets
+/// [`ComAmazonawsApplicationsignalsApplicationsignalsState::observed_services`] fold a subset
+/// identity into the fuller one rather than reporting two services. A map that names no
+/// attributes at all names no service.
+fn names_same_service(left: Option<&HashMap<String, String>>, right: &HashMap<String, String>) -> bool {
+    let Some(left) = left else {
+        return false;
+    };
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    attributes_contain(Some(left), right) || attributes_contain(Some(right), left)
+}
+
+/// Whether a service's attributes pass one `AttributeFilter`.
+///
+/// The filter names an attribute and the values it accepts for it, and "services that have
+/// any of these values for the attribute will be included in the results"
+/// (`smithy_query(shape="AttributeFilter")`), so one filter passes when the service carries
+/// that attribute with one of those values — and a request's filters narrow together, each
+/// one being a further condition on the same service.
+///
+/// The attributes a service HAS here are its key attributes: the platform, business and other
+/// descriptive attributes a filter may also name (`AttributeFilterName`: "such as `Platform`,
+/// `Environment`, or `BusinessUnit`") reach the real service in the telemetry an instrumented
+/// application sends it, which this emulator never receives — so a filter on an attribute the
+/// service's identity does not carry selects nothing rather than everything.
+fn passes_attribute_filter(
+    key_attributes: &HashMap<String, String>,
+    filter: &AttributeFilter,
+) -> bool {
+    key_attributes
+        .get(&filter.attribute_filter_name)
+        .is_some_and(|value| {
+            filter
+                .attribute_filter_values
+                .iter()
+                .any(|accepted| accepted == value)
+        })
 }
 
 // =============================================================================

@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
         let user = pool
             .user(&input.username)
-            .ok_or_else(|| user_not_found(&input.username))?;
+            .ok_or_else(user_not_found)?;
 
         Ok(AdminGetUserOutput {
             username: user.username.clone(),
@@ -228,10 +228,12 @@ fn user_pool_not_found(user_pool_id: &str) -> AdminGetUserError {
     .into()
 }
 
-/// This operation's `UserNotFoundException` for an absent user.
-fn user_not_found(username: &str) -> AdminGetUserError {
+/// This operation's `UserNotFoundException` for an absent user. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> AdminGetUserError {
     AdminGetUserErrorModeled::UserNotFoundException(UserNotFoundException {
-        message: Some(format!("User {username} does not exist.")),
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

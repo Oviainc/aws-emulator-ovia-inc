@@ -92,6 +92,47 @@ const CHANGE_RETENTION: Duration = Duration::from_secs(3_600);
 /// ten tags could not even be reported on the wire.
 pub const MAX_TAGS_PER_RESOURCE: usize = 10;
 
+/// The most health checks the account may hold.
+///
+/// Route 53's documented account quota ("Health checks: 200 per account"), and
+/// the model declares `TooManyHealthChecks` for the refusal that enforces it.
+pub const MAX_HEALTH_CHECKS: usize = 200;
+
+/// The most reusable delegation sets the account may hold.
+///
+/// Route 53's documented account quota ("Reusable delegation sets: 100 per
+/// account"), which the model's `LimitsExceeded` refusal reports.
+pub const MAX_REUSABLE_DELEGATION_SETS: usize = 100;
+
+/// The most traffic policies the account may hold.
+///
+/// Route 53's documented account quota ("Traffic policies: 50 per account"),
+/// and the model declares `TooManyTrafficPolicies` for the refusal that
+/// enforces it.
+pub const MAX_TRAFFIC_POLICIES: usize = 50;
+
+/// The most traffic policy instances the account may hold.
+///
+/// Route 53's documented account quota ("Traffic policy records: 50 per
+/// account"), and the model declares `TooManyTrafficPolicyInstances` for the
+/// refusal that enforces it.
+pub const MAX_TRAFFIC_POLICY_INSTANCES: usize = 50;
+
+/// The `AccountLimitType` naming the hosted-zone quota (`AccountLimitType` enum).
+pub const ACCOUNT_LIMIT_MAX_HOSTED_ZONES: &str = "MAX_HOSTED_ZONES_BY_OWNER";
+/// The `AccountLimitType` naming the health-check quota (`AccountLimitType` enum).
+pub const ACCOUNT_LIMIT_MAX_HEALTH_CHECKS: &str = "MAX_HEALTH_CHECKS_BY_OWNER";
+/// The `AccountLimitType` naming the reusable-delegation-set quota
+/// (`AccountLimitType` enum).
+pub const ACCOUNT_LIMIT_MAX_REUSABLE_DELEGATION_SETS: &str =
+    "MAX_REUSABLE_DELEGATION_SETS_BY_OWNER";
+/// The `AccountLimitType` naming the traffic-policy quota (`AccountLimitType` enum).
+pub const ACCOUNT_LIMIT_MAX_TRAFFIC_POLICIES: &str = "MAX_TRAFFIC_POLICIES_BY_OWNER";
+/// The `AccountLimitType` naming the traffic-policy-instance quota
+/// (`AccountLimitType` enum).
+pub const ACCOUNT_LIMIT_MAX_TRAFFIC_POLICY_INSTANCES: &str =
+    "MAX_TRAFFIC_POLICY_INSTANCES_BY_OWNER";
+
 /// The `TagResourceType` naming a hosted zone (`TagResourceType` enum).
 pub const TAG_RESOURCE_TYPE_HOSTED_ZONE: &str = "hostedzone";
 /// The `TagResourceType` naming a health check (`TagResourceType` enum).
@@ -378,6 +419,34 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
         }
     }
 
+    /// The account quota for one `AccountLimitType` and how much of it this
+    /// store currently holds, as `(limit value, current count)`. `None` for a
+    /// value outside `AccountLimitType`.
+    ///
+    /// The count is COUNTED off the store on every call rather than tracked
+    /// beside it, so it cannot disagree with the resources the account actually
+    /// holds: creating or deleting one moves the count by itself, and no read
+    /// has to be told about it. The quota is the same constant the create path
+    /// refuses at, so a count that has reached the reported limit is exactly
+    /// the point at which the next create is refused.
+    pub fn account_limit_usage(&self, limit_type: &str) -> Option<(i64, i64)> {
+        let (limit, count) = match limit_type {
+            ACCOUNT_LIMIT_MAX_HOSTED_ZONES => (MAX_HOSTED_ZONES, self.zones.len()),
+            // The entity kinds below have no collection in this store yet —
+            // `CreateHealthCheck`, `CreateReusableDelegationSet`,
+            // `CreateTrafficPolicy` and `CreateTrafficPolicyInstance` are all
+            // still scaffolds, so nothing can bring one into being and the
+            // account holds none of them. Each gets its count from the
+            // collection this struct grows when its create is implemented.
+            ACCOUNT_LIMIT_MAX_HEALTH_CHECKS => (MAX_HEALTH_CHECKS, 0),
+            ACCOUNT_LIMIT_MAX_REUSABLE_DELEGATION_SETS => (MAX_REUSABLE_DELEGATION_SETS, 0),
+            ACCOUNT_LIMIT_MAX_TRAFFIC_POLICIES => (MAX_TRAFFIC_POLICIES, 0),
+            ACCOUNT_LIMIT_MAX_TRAFFIC_POLICY_INSTANCES => (MAX_TRAFFIC_POLICY_INSTANCES, 0),
+            _ => return None,
+        };
+        Some((count_as_i64(limit), count_as_i64(count)))
+    }
+
     /// Mint the four authoritative name servers for a new hosted zone.
     ///
     /// The Route 53 Developer Guide ("NS and SOA Records that Route 53 Creates
@@ -399,6 +468,13 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
 /// The number of characters after the single-letter prefix in a Route 53
 /// resource id (`Z1D633PJN98FT9`, `C2682N5HXP0BZ4`).
 const ID_BODY_LEN: usize = 14;
+
+/// A count or a quota as the `long` the limit shapes carry (`UsageCount` is
+/// `range 0..`, `LimitValue` is `range 1..`), saturating rather than wrapping on
+/// a count no store this size can reach.
+fn count_as_i64(count: usize) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
+}
 
 /// Milliseconds since the Unix epoch, for a `SubmittedAt` timestamp.
 pub fn now_millis() -> i64 {
