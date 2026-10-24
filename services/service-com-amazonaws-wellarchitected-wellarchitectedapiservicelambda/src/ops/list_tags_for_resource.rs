@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the tag map persisted on the resource the ARN names — a
+//! workload, a custom lens, a profile, a review template or an agent profile, resolved
+//! through [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::resource_tags`]
+//! — or answers `ResourceNotFoundException` when it names no resource this store holds.
+//! Reporting only: it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -136,20 +132,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool resource store is unavailable".to_string(),
+            })
+        })?;
+
+        let store = state.lock();
+        // "The WorkloadArn parameter can be a workload ARN, a custom lens ARN, a profile
+        // ARN, or review template ARN": the ARN is resolved against every taggable
+        // resource type at once, and an ARN that names none of them names no resource to
+        // report the tags of.
+        let tags = store.resource_tags(&input.workload_arn).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::state::tagged_resource_not_found(&input.workload_arn),
+            )
+        })?;
+
+        Ok(ListTagsForResourceOutput {
+            // The tags the resource carries, EMPTY when it carries none: `TagMap`'s
+            // `@length(min: 1)` constrains the tags a REQUEST supplies, not what a
+            // resource nobody tagged reports — the same way a workload's and a review
+            // template's own `Tags` member is reported.
+            tags: Some(
+                tags.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        })
     }
 }

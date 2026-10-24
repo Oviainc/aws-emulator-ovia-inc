@@ -68,6 +68,9 @@ mod profile_lifecycle;
 #[path = "all/question_choice_catalog.rs"]
 mod question_choice_catalog;
 
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
+
 #[path = "all/review_template_answers.rs"]
 mod review_template_answers;
 
