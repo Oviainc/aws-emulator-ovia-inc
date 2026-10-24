@@ -18,7 +18,12 @@
 //! to it, bounded by [`MAX_PIPELINE_VERSIONS`], so a read naming an older
 //! version still answers from it. A workspace's tasks live in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::tasks`], keyed and versioned
-//! the same way, bounded by [`MAX_TASK_VERSIONS`]. The service's own settings live here too:
+//! the same way, bounded by [`MAX_TASK_VERSIONS`]. A workspace's dataset export
+//! jobs live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dataset_export_jobs`], keyed by
+//! the workspace and the minted job id, each record carrying the request that
+//! started it and the instant it started, from which a read DERIVES how far the
+//! job has got. The service's own settings live here too:
 //! the logging options, one entry per scope a call named
 //! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::logging_options`]). Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
@@ -33,9 +38,10 @@ use crate::ops::types::{
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
     AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, ComputeNodeExecutionDetails,
     ComputeNodeExecutionStatus, DatasetConfig, DatasetSource, DatasetStatus,
-    ExecutionEnvironmentVariables, ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform,
-    ImageLocation, LoggingOptions, Mount, MountOverrides, PipelineExecutionStatus, PortalStatus,
-    PortalTypeEntry, PropertyType, ResourceStatus, TaskConfiguration, TimeInNanos, Variant,
+    ExecutionEnvironmentVariables, ExportErrorReportLocation, ExpressionVariable,
+    GatewayCapabilitySummary, GatewayPlatform, ImageLocation, LoggingOptions, Mount,
+    MountOverrides, PipelineExecutionStatus, PortalStatus, PortalTypeEntry, ProcessingInput,
+    PropertyType, ResourceStatus, TaskConfiguration, TimeInNanos, TrimSettings, Variant,
     WorkspaceEncryptionConfiguration, WorkspaceStatus,
 };
 
@@ -1680,6 +1686,166 @@ pub fn task_arn(region: &str, workspace_name: &str, task_name: &str) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Dataset export jobs
+//
+// `CreateDatasetExportJob` "starts an asynchronous job that exports dataset and
+// time-series data from a workspace to Amazon S3. The operation returns a jobId
+// immediately; poll DescribeDatasetExportJob to track progress". So the job
+// record and every rule over it live here ONCE: the lifecycle the CLOCK drives,
+// and the identity a reader addresses a job by.
+//
+// What the record does NOT hold is the exported content: the destination is a
+// bucket in the CALLER's account, which this emulator does not serve, and no
+// operation of this API ever answers an exported object. The record — the job's
+// identity, its request, and where its lifecycle has got to — is the whole of
+// what a client of this API can observe.
+// ---------------------------------------------------------------------------
+
+/// The `DatasetExportJobStatus` value a job reports from the instant it is
+/// created (`crate::ops::types::DATASET_EXPORT_JOB_STATUS_VALUES`).
+pub const EXPORT_JOB_SUBMITTED: &str = "SUBMITTED";
+/// The value a job reports once the clock has started it processing.
+pub const EXPORT_JOB_RUNNING: &str = "RUNNING";
+/// The value a job reports once the clock has finished it. Terminal.
+pub const EXPORT_JOB_COMPLETED: &str = "COMPLETED";
+
+/// How long each step of a dataset export job's lifecycle takes: a created job
+/// stays `SUBMITTED` for this long, then reports `RUNNING` for this long, then is
+/// `COMPLETED`.
+///
+/// CHOSEN, not documented: AWS publishes no duration for either step — an export
+/// takes as long as the data it exports. The span is deliberately NON-ZERO, so a
+/// caller that describes a job straight after creating it still observes the
+/// transient status the real service reports, and short enough that a caller can
+/// poll the job through to its terminal status.
+pub const EXPORT_JOB_STEP: Duration = Duration::from_millis(500);
+
+/// How many dataset export jobs one workspace holds.
+///
+/// CHOSEN: a create is the only thing that adds a job and nothing evicts one, so
+/// without a bound a stream of creates would grow one emulator process without
+/// limit.
+pub const MAX_DATASET_EXPORT_JOBS_PER_WORKSPACE: usize = 100;
+
+/// How many dataset export jobs the store holds in total, across every
+/// workspace.
+///
+/// The per-workspace cap above cannot bound the store on its own, for the reason
+/// [`MAX_PIPELINES`] states: `workspaceName` is a caller-supplied string this
+/// service holds no workspace registry to resolve, so a caller naming a fresh
+/// workspace each time would open one more per-workspace bucket every time.
+pub const MAX_DATASET_EXPORT_JOBS: usize = 1_000;
+
+/// One dataset export job, as `CreateDatasetExportJob` starts it and
+/// `DescribeDatasetExportJob` reports it.
+///
+/// Its STATUS is not stored: it is DERIVED from the instant the job was created
+/// ([`Self::status`]), because the lifecycle is owed by the clock rather than by
+/// any call. So a reader reports the status the clock has made due without
+/// writing to the store, and two readers of one job can never disagree about
+/// where it has got to.
+#[derive(Debug, Clone)]
+pub struct DatasetExportJobRecord {
+    /// The `jobId` this job was minted with ([`new_id`]).
+    pub job_id: String,
+    /// The workspace the job was created in. A read is scoped to a workspace, so
+    /// the pair is the job's identity — see [`dataset_export_job_key`].
+    pub workspace_name: String,
+    /// The `destinationS3Uri` the request named: "The S3 URI where output clips
+    /// will be written". This service does not write it.
+    pub destination_s3_uri: String,
+    /// The `errorReportLocation` the request named.
+    pub error_report_location: ExportErrorReportLocation,
+    /// "The processing input that was provided in the CreateDatasetExportJob
+    /// request", kept verbatim so the reader answers the request's own input.
+    pub input: ProcessingInput,
+    /// The `clientToken` the create carried, if any: what makes a retry of that
+    /// same create replay this job rather than start a second one.
+    pub client_token: Option<String>,
+    /// When the job was created, which is the `startedAt` a read reports.
+    pub started_at: SystemTime,
+}
+
+impl DatasetExportJobRecord {
+    /// The job's `status` at `now`: `SUBMITTED` until the first
+    /// [`EXPORT_JOB_STEP`] has elapsed, `RUNNING` until the second has,
+    /// `COMPLETED` after that. `COMPLETED` is terminal, so the status never moves
+    /// again.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        match self.completed_at(now) {
+            Some(_) => EXPORT_JOB_COMPLETED,
+            None if now >= self.started_at + EXPORT_JOB_STEP => EXPORT_JOB_RUNNING,
+            None => EXPORT_JOB_SUBMITTED,
+        }
+    }
+
+    /// "The timestamp when the job completed, or null if the job is still
+    /// running": the instant the terminal status fell due, and `None` until it
+    /// has.
+    pub fn completed_at(&self, now: SystemTime) -> Option<SystemTime> {
+        let completes_at = self.started_at + 2 * EXPORT_JOB_STEP;
+        (now >= completes_at).then_some(completes_at)
+    }
+}
+
+/// The key [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dataset_export_jobs`]
+/// holds a job under: the workspace it was created in and its own id, because
+/// every operation on a job addresses it within a workspace, so a job of one
+/// workspace is not reachable through another.
+pub fn dataset_export_job_key(workspace_name: &str, job_id: &str) -> (String, String) {
+    (workspace_name.to_string(), job_id.to_string())
+}
+
+/// Refuse a `ProcessingInput` whose items break a rule the shapes state, in the
+/// wording the refusal carries; `Ok` for one that keeps them.
+///
+/// The rules come from the shapes themselves: a `TimeseriesItem` is "a single
+/// timeseries item to process. Exactly one of timeSeriesId or propertyAlias must
+/// be provided" (each member is also documented as "mutually exclusive" with the
+/// other), and a `TrimSettings` end time "must be greater than startTime". Both
+/// hold wherever the shapes appear, so they are checked in ONE place.
+pub fn check_processing_input(input: &ProcessingInput) -> Result<(), String> {
+    match input {
+        ProcessingInput::Timeseries(items) => {
+            for (at, item) in items.iter().enumerate() {
+                match (item.time_series_id.as_deref(), item.property_alias.as_deref()) {
+                    (Some(_), Some(_)) => {
+                        return Err(format!(
+                            "input.timeseries[{at}]: timeSeriesId and propertyAlias are mutually exclusive."
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(format!(
+                            "input.timeseries[{at}]: exactly one of timeSeriesId or propertyAlias must be provided."
+                        ));
+                    }
+                    _ => {}
+                }
+                if let Some(trim) = item.trim_settings.as_ref() {
+                    check_trim_settings(trim)
+                        .map_err(|why| format!("input.timeseries[{at}]: {why}"))?;
+                }
+            }
+            Ok(())
+        }
+        ProcessingInput::Dataset(item) => match item.trim_settings.as_ref() {
+            Some(trim) => check_trim_settings(trim).map_err(|why| format!("input.dataset: {why}")),
+            None => Ok(()),
+        },
+    }
+}
+
+/// Refuse a `TrimSettings` whose end time does not follow its start time: "Must
+/// be greater than startTime".
+fn check_trim_settings(trim: &TrimSettings) -> Result<(), String> {
+    if timestamp_key(&trim.end_time) > timestamp_key(&trim.start_time) {
+        Ok(())
+    } else {
+        Err("trimSettings.endTime must be greater than trimSettings.startTime.".to_string())
+    }
+}
+
 /// Refuse a `computations` list that is not a pipeline DAG, in the wording the
 /// refusal carries; `Ok` for one that is.
 ///
@@ -1904,6 +2070,10 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub logging_options: HashMap<String, LoggingOptionsRecord>,
     /// Datasets by `datasetId`.
     pub datasets: HashMap<String, DatasetRecord>,
+    /// Dataset export jobs by [`dataset_export_job_key`] — the workspace they
+    /// were created in and their own id — because every operation on a job
+    /// addresses it within a workspace.
+    pub dataset_export_jobs: HashMap<(String, String), DatasetExportJobRecord>,
     /// Workspaces by `workspaceName`, which is what identifies one in an
     /// account and region.
     pub workspaces: HashMap<String, WorkspaceRecord>,
@@ -2772,6 +2942,9 @@ pub const RESOURCE_TASK: &str = "Task";
 
 /// The resource kind those errors name for a dataset.
 pub const RESOURCE_DATASET: &str = "Dataset";
+
+/// The resource kind those errors name for a dataset export job.
+pub const RESOURCE_DATASET_EXPORT_JOB: &str = "Dataset Export Job";
 
 /// The resource kind those errors name for a workspace.
 pub const RESOURCE_WORKSPACE: &str = "Workspace";
