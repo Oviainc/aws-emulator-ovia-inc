@@ -17,12 +17,13 @@ use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 
 use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::{
-    BUDGET_TYPE_VALUES, COMPARISON_OPERATOR_VALUES, HEALTH_STATUS_VALUE_VALUES,
+    Spend, BUDGET_TYPE_VALUES, COMPARISON_OPERATOR_VALUES, HEALTH_STATUS_VALUE_VALUES,
     NOTIFICATION_STATE_VALUES, NOTIFICATION_TYPE_VALUES, TIME_UNIT_VALUES,
 };
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
-    default_time_period_start, ComAmazonawsBudgetsAwsbudgetservicegatewayState,
-    HEALTH_STATUS_HEALTHY, NOTIFICATION_STATE_OK,
+    default_time_period_start, planned_limit_in_force,
+    ComAmazonawsBudgetsAwsbudgetservicegatewayState, HEALTH_STATUS_HEALTHY,
+    NOTIFICATION_STATE_OK,
 };
 
 /// The service's own constants must BE the values the model and the recording carry —
@@ -68,12 +69,9 @@ fn civil(secs: i64) -> String {
         .unwrap_or_else(|error| panic!("{secs} must render as a date-time: {error}"))
 }
 
-/// The instant `YYYY-MM-DDThh:mm:ssZ` names, in epoch seconds.
-fn civil_secs(rendered: &str) -> i64 {
-    DateTime::from_str(rendered, Format::DateTime)
-        .unwrap_or_else(|error| panic!("{rendered:?} must be a date-time: {error}"))
-        .secs()
-}
+/// The instant `YYYY-MM-DDThh:mm:ssZ` names, in epoch seconds — the shared helper, so
+/// this suite and `tests/all/budget_validation_rules.rs` read dates the same way.
+use super::budget_lifecycle::civil_secs;
 
 /// The `YYYY-MM-DD` date part of a rendered instant.
 fn civil_day(secs: i64) -> String {
@@ -82,6 +80,89 @@ fn civil_day(secs: i64) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+/// The midnight-UTC start of the month containing `secs` — the grid a monthly
+/// `PlannedBudgetLimits` key sits on ("The `key` is the start of the month, `UTC` in
+/// epoch seconds"). Computed with the service's own boundary helper, which the fixed
+/// table in `the_defaulted_start_of_a_known_instant_is_the_period_boundary` pins
+/// instant by instant.
+fn month_start(secs: i64) -> i64 {
+    let at = UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).expect("a positive epoch"));
+    default_time_period_start("MONTHLY", at).secs()
+}
+
+/// The start of the month `months` before (negative) or after (positive) the month
+/// containing now. Walked one month at a time off the month grid — stepping 31 days on
+/// from the first of a month always lands in the next month, never past it — so no
+/// month is skipped whatever its length.
+fn month_start_offset(months: i32) -> i64 {
+    let mut start = month_start(now_secs());
+    for _ in 0..months.abs() {
+        start = if months < 0 {
+            month_start(start - 1)
+        } else {
+            month_start(start + 31 * DAY_SECS)
+        };
+    }
+    start
+}
+
+/// One row of the skipped-key table: the case, the planned entries as
+/// `(key, amount)` pairs, and the amount the derivation must report for them.
+type SkippedKeyRow = (
+    &'static str,
+    Vec<(String, &'static str)>,
+    Option<&'static str>,
+);
+
+/// RULE: a `PlannedBudgetLimits` key that names no period is skipped when the limit in
+/// force is derived, rather than making the read fail. Asserted against the projection
+/// helper directly: the write paths refuse such a key now
+/// (`tests/all/budget_validation_rules.rs`), so a stored budget can only carry one from a
+/// store written before that rule — which a read still has to project.
+#[test]
+fn a_planned_key_that_names_no_period_is_skipped_by_the_derivation() {
+    let spend = |amount: &str| Spend {
+        amount: amount.to_string(),
+        unit: "USD".to_string(),
+    };
+    // Rows differ along the form of the unusable key and whether a usable one remains.
+    let rows: Vec<SkippedKeyRow> = vec![
+        (
+            "a key that is not a number, beside one that is",
+            vec![
+                ("not-an-epoch".to_string(), "5"),
+                (month_start_offset(-1).to_string(), "100"),
+            ],
+            Some("100"),
+        ),
+        (
+            "an empty key, beside one that is a period",
+            vec![
+                (String::new(), "5"),
+                (month_start_offset(-1).to_string(), "7"),
+            ],
+            Some("7"),
+        ),
+        (
+            "no usable key at all",
+            vec![("not-an-epoch".to_string(), "5")],
+            None,
+        ),
+    ];
+    for (case, entries, expected) in rows {
+        let planned: std::collections::HashMap<String, Spend> = entries
+            .into_iter()
+            .map(|(key, amount)| (key, spend(amount)))
+            .collect();
+        let in_force = planned_limit_in_force(&planned, SystemTime::now());
+        let amount = in_force.as_ref().map(|limit| limit.amount.as_str());
+        assert_eq!(
+            amount, expected,
+            "case {case:?}: expected the limit in force to be {expected:?}, got {amount:?}"
+        );
+    }
 }
 
 /// A timestamp member of a read response, in epoch seconds (fractions included: the
@@ -369,10 +450,13 @@ async fn a_read_reports_the_time_period_the_caller_sent_or_the_service_defaulted
             None,
         ),
         (
+            // An end date in the far future, but still before the latest one a budget can
+            // carry (`Budget$TimePeriod`: "The end date must come before 06/15/87 00:00
+            // UTC") — `tests/all/budget_validation_rules.rs` covers that bound itself.
             "only End supplied",
-            json!({"End": 4_102_444_800_i64}),
+            json!({"End": 2_524_608_000_i64}),
             None,
-            Some(4_102_444_800),
+            Some(2_524_608_000),
         ),
     ];
     for (index, (case, period, want_start, want_end)) in supplied.into_iter().enumerate() {
@@ -635,59 +719,51 @@ async fn last_updated_time_is_the_stored_write_time_not_the_time_of_the_read() {
 #[tokio::test]
 async fn a_planned_limit_budget_reports_the_limit_in_force() {
     let (router, engine) = router_with_engine();
-    let now = now_secs();
-    let month = 30 * DAY_SECS;
     // Rows differ along the number of planned periods, whether they are past or future,
-    // the order they are written in, and whether a key names a period at all.
+    // and the order they are written in. Every key is the start of a month, which is
+    // what `Budget$PlannedBudgetLimits` keys a monthly plan by ("The `key` is the start
+    // of the month, `UTC` in epoch seconds") and what the write path now requires.
     let rows: Vec<(&str, Value, &str)> = vec![
         (
             "one period, already started",
-            json!({(now - month).to_string(): {"Amount": "50.0", "Unit": "USD"}}),
+            json!({month_start_offset(-1).to_string(): {"Amount": "50.0", "Unit": "USD"}}),
             "50.0",
         ),
         (
             "several periods, the latest started one is in force",
             json!({
-                (now - 3 * month).to_string(): {"Amount": "10", "Unit": "USD"},
-                (now - 2 * month).to_string(): {"Amount": "20", "Unit": "USD"},
-                (now - month).to_string(): {"Amount": "30", "Unit": "USD"},
-                (now + month).to_string(): {"Amount": "40", "Unit": "USD"}
+                month_start_offset(-3).to_string(): {"Amount": "10", "Unit": "USD"},
+                month_start_offset(-2).to_string(): {"Amount": "20", "Unit": "USD"},
+                month_start_offset(-1).to_string(): {"Amount": "30", "Unit": "USD"},
+                month_start_offset(1).to_string(): {"Amount": "40", "Unit": "USD"}
             }),
             "30",
         ),
         (
             "the same periods written in the opposite order",
             json!({
-                (now + month).to_string(): {"Amount": "40", "Unit": "USD"},
-                (now - month).to_string(): {"Amount": "30", "Unit": "USD"},
-                (now - 2 * month).to_string(): {"Amount": "20", "Unit": "USD"},
-                (now - 3 * month).to_string(): {"Amount": "10", "Unit": "USD"}
+                month_start_offset(1).to_string(): {"Amount": "40", "Unit": "USD"},
+                month_start_offset(-1).to_string(): {"Amount": "30", "Unit": "USD"},
+                month_start_offset(-2).to_string(): {"Amount": "20", "Unit": "USD"},
+                month_start_offset(-3).to_string(): {"Amount": "10", "Unit": "USD"}
             }),
             "30",
         ),
         (
             "the last planned limit continues once the plan runs out",
             json!({
-                (now - 2 * month).to_string(): {"Amount": "70", "Unit": "USD"},
-                (now - month).to_string(): {"Amount": "80", "Unit": "USD"}
+                month_start_offset(-2).to_string(): {"Amount": "70", "Unit": "USD"},
+                month_start_offset(-1).to_string(): {"Amount": "80", "Unit": "USD"}
             }),
             "80",
         ),
         (
             "every planned period is still in the future",
             json!({
-                (now + month).to_string(): {"Amount": "90", "Unit": "USD"},
-                (now + 2 * month).to_string(): {"Amount": "95", "Unit": "USD"}
+                month_start_offset(1).to_string(): {"Amount": "90", "Unit": "USD"},
+                month_start_offset(2).to_string(): {"Amount": "95", "Unit": "USD"}
             }),
             "90",
-        ),
-        (
-            "a key that is not an epoch names no period",
-            json!({
-                "not-an-epoch": {"Amount": "5", "Unit": "USD"},
-                (now - month).to_string(): {"Amount": "100", "Unit": "USD"}
-            }),
-            "100",
         ),
     ];
 
