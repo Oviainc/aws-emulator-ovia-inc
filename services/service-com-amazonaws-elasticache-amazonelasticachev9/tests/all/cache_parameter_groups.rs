@@ -12,7 +12,10 @@
 //! HOLDS (the default group of every published family, plus every created
 //! group), filtered to one when the request names one, refused with
 //! `CacheParameterGroupNotFound` when it names a group the account does not
-//! hold, and paged at the documented `MaxRecords` window.
+//! hold, and paged at the documented `MaxRecords` window. The groups the account
+//! holds from the start are the default group of every published family plus the
+//! cluster-mode-on default of every family that can run cluster mode (the
+//! `catalog_publication` suite is where that second form is pinned).
 //!
 //! Every assertion goes over the wire through the same router the production
 //! emulator mounts, reusing the harness in [`crate::cache_cluster_lifecycle`];
@@ -56,6 +59,37 @@ const FAMILIES: [&str; 12] = [
     "valkey7",
     "valkey8",
 ];
+
+/// The families whose default parameter group comes in BOTH forms: the plain
+/// `default.<family>` and the cluster-mode-on `default.<family>.cluster.on`.
+///
+/// Written out here rather than read from the crate so the test states the
+/// contract independently. Source: cluster mode is a Valkey / Redis OSS feature
+/// of Redis OSS 3.2 and later (`CreateReplicationGroup`'s own documentation: "To
+/// create a Valkey or Redis OSS (cluster mode enabled) replication group, use
+/// CacheParameterGroupName=default.redis3.2.cluster.on"), so every family from
+/// that line onward publishes one and the Memcached and pre-3.2 families — which
+/// cannot run cluster mode at all — publish only the plain default.
+const CLUSTER_MODE_FAMILIES: [&str; 7] = [
+    "redis3.2", "redis4.0", "redis5.0", "redis6.x", "redis7", "valkey7", "valkey8",
+];
+
+/// Every default parameter group this service publishes, in the sorted order a
+/// describe reports them in: one per family in [`FAMILIES`], plus the
+/// cluster-mode-on group of every family in [`CLUSTER_MODE_FAMILIES`].
+fn published_default_groups() -> Vec<String> {
+    let mut names: Vec<String> = FAMILIES
+        .iter()
+        .map(|family| format!("default.{family}"))
+        .chain(
+            CLUSTER_MODE_FAMILIES
+                .iter()
+                .map(|family| format!("default.{family}.cluster.on")),
+        )
+        .collect();
+    names.sort();
+    names
+}
 
 /// Long enough past [`state::CLUSTER_TRANSITION`] that the clock owes a cluster
 /// its next status; the handlers never sleep, so only the test waits.
@@ -176,10 +210,19 @@ async fn every_published_family_has_its_default_group_reported() {
             "case family {family}: expected {expected} among the reported groups, got {names:?}"
         );
     }
+    // A family that can run cluster mode publishes its cluster-mode-on default
+    // beside the plain one, and one that cannot publishes only the plain one.
+    for family in CLUSTER_MODE_FAMILIES {
+        let expected = format!("default.{family}.cluster.on");
+        assert!(
+            names.contains(&expected.as_str()),
+            "case family {family}: expected {expected} among the reported groups, got {names:?}"
+        );
+    }
     assert_eq!(
-        names.len(),
-        FAMILIES.len(),
-        "case describe-all: expected one group per published family, got {names:?}"
+        names,
+        published_default_groups(),
+        "case describe-all: expected exactly the published default groups, got {names:?}"
     );
 
     // A describe is a read: calling it twice reports the same groups.
@@ -198,10 +241,11 @@ async fn every_published_family_has_its_default_group_reported() {
         "case describe-all: every group must report its family, got {families:?}"
     );
     for (name, family) in names.iter().zip(families.iter()) {
-        assert_eq!(
-            *name,
-            format!("default.{family}"),
-            "case group {name}: a default group's name is `default.` plus its family, got {family}"
+        assert!(
+            *name == format!("default.{family}")
+                || *name == format!("default.{family}.cluster.on"),
+            "case group {name}: a default group's name is `default.` plus its family, optionally \
+             with the cluster-mode-on suffix, got {family}"
         );
     }
     let arns = reply.all("CacheParameterGroups/CacheParameterGroup/ARN");
@@ -295,7 +339,7 @@ async fn created_groups_are_reported_and_pages_are_bounded_and_resumable() {
             created.status, created.body
         );
     }
-    let total = custom.len() + FAMILIES.len();
+    let total = custom.len() + published_default_groups().len();
 
     // Each row is a page size: the published bounds of "minimum 20; maximum
     // 100", one past each, and the default when the member is absent.
@@ -586,8 +630,8 @@ async fn a_created_parameter_group_is_read_back_from_persisted_state() {
     }
     assert_eq!(
         names.len(),
-        FAMILIES.len() + cases.len(),
-        "the listing must hold every family default plus every created group, got {names:?}"
+        published_default_groups().len() + cases.len(),
+        "the listing must hold every published default plus every created group, got {names:?}"
     );
 }
 

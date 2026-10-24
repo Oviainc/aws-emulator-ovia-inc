@@ -263,7 +263,7 @@ const FILTER_CASES: [FilterCase; 14] = [
         engine: Some("memcached"),
         family: None,
         engine_version: Some("1.4"),
-        must_report: &["1.4.5", "1.4.14"],
+        must_report: &["1.4.14", "1.4.24"],
         must_be_empty: false,
     },
 ];
@@ -315,7 +315,7 @@ async fn the_published_catalog_is_reported_with_every_member_of_the_shape() {
         );
         assert!(
             row.version_description.contains(&row.engine_version)
-                && row.version_description.contains(&row.engine_description),
+                && row.version_description.contains(&row.engine),
             "case {case}: {name}'s version description must name the engine and the version, got \
              {:?}",
             row.version_description

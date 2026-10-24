@@ -571,7 +571,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the casing the request used.
         let requested_parameter_group = match input.cache_parameter_group_name.as_deref() {
             Some(name) => match store.parameter_group(name) {
-                Some(group) => Some(group.name.clone()),
+                Some(group) => {
+                    // "You cannot use any parameter group which has
+                    // cluster-enabled='yes' when creating a cluster": a group
+                    // that turns cluster mode on belongs to a replication
+                    // group, and this operation "is not supported for Valkey or
+                    // Redis OSS (cluster mode enabled) clusters".
+                    if group.cluster_mode_on() {
+                        return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(format!(
+                                    "Invalid value {name} for CacheParameterGroupName: a \
+                                     parameter group with {}='{}' cannot be used to create a \
+                                     cluster.",
+                                    crate::state::CLUSTER_ENABLED_PARAMETER,
+                                    crate::state::CLUSTER_ENABLED_ON
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                    Some(group.name.clone())
+                }
                 None => {
                     return Err(
                         CreateCacheClusterErrorModeled::CacheParameterGroupNotFoundFault(

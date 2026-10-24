@@ -411,7 +411,7 @@ async fn filter_values_outside_their_documented_sets_are_refused() {
 }
 
 /// One payment-option row: the `OfferingType`, whether its offerings charge a
-/// fixed price up front, and whether they carry an hourly recurring charge.
+/// fixed price up front, and whether their hourly recurring charge is charged.
 struct PaymentCase {
     offering_type: &'static str,
     fixed_price_charged: bool,
@@ -421,9 +421,12 @@ struct PaymentCase {
 #[tokio::test]
 async fn each_payment_option_prices_every_offering_it_stocks() {
     // The rule the catalog is priced by: an all-upfront reservation pays the
-    // whole term as `FixedPrice` and carries no recurring charge, a no-upfront
-    // one pays nothing up front and carries the hourly recurring charge, and a
-    // partial-upfront one does both. `UsagePrice` is zero for all three: the
+    // whole term as `FixedPrice` and its hourly recurring charge is therefore
+    // zero, a no-upfront one pays nothing up front and carries the whole hourly
+    // rate as its recurring charge, and a partial-upfront one does both. Every
+    // offering publishes the recurring charge as a `RecurringCharge` structure
+    // whatever its amount, so a client reads the amount and the frequency off
+    // the same shape for all three. `UsagePrice` is zero for all three: the
     // hourly charge of an upfront-type reservation is the recurring charge.
     let cases = [
         PaymentCase {
@@ -507,22 +510,24 @@ async fn each_payment_option_prices_every_offering_it_stocks() {
 
             let recurring = numbers(&reply, "RecurringChargeAmount");
             let frequencies = reply.all("RecurringChargeFrequency");
-            let expected_charges = if recurring_charged { count } else { 0 };
+            // One recurring charge per offering, whatever the payment option:
+            // the amount is what the option changes, not whether the structure
+            // is there at all.
             assert_eq!(
                 recurring.len(),
-                expected_charges,
-                "case {case:?}: expected {expected_charges} recurring charges, got {recurring:?}"
+                count,
+                "case {case:?}: expected {count} recurring charges, got {recurring:?}"
             );
             assert_eq!(
                 frequencies.len(),
-                expected_charges,
-                "case {case:?}: expected {expected_charges} recurring frequencies, got \
+                count,
+                "case {case:?}: expected {count} recurring frequencies, got \
                  {frequencies:?}"
             );
             for amount in &recurring {
-                assert!(
-                    *amount > 0.0,
-                    "case {case:?}: a recurring charge must be charged, got {amount}"
+                assert_eq!(
+                    *amount > 0.0, recurring_charged,
+                    "case {case:?}: expected recurring_charged={recurring_charged}, got {amount}"
                 );
             }
             for frequency in &frequencies {
