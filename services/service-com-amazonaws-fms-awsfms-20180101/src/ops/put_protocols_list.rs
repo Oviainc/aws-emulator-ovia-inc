@@ -228,10 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // operation writes — `GetProtocolsList` keeps the two apart with
                 // its `DefaultList` member — so an id naming one names no list a
                 // caller can update.
-                let found = store
-                    .protocols_lists
-                    .get(&list_id)
-                    .filter(|record| !record.default_list);
+                let found = store.protocols_list_in_namespace(&list_id, false);
                 let Some(existing) = found else {
                     return Err(PutProtocolsListErrorModeled::ResourceNotFoundException(
                         crate::state::resource_not_found(),

@@ -171,10 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A customer list's id does not name a Firewall Manager managed list, nor
         // the other way round, so the stored flag has to match what was asked for.
-        let found = store
-            .protocols_lists
-            .get(&input.list_id)
-            .filter(|record| record.default_list == input.default_list);
+        let found = store.protocols_list_in_namespace(&input.list_id, input.default_list);
         let Some(record) = found else {
             return Err(GetProtocolsListErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),
