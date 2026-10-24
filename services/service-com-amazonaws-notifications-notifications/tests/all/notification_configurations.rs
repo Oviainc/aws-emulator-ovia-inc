@@ -21,7 +21,7 @@ use service_com_amazonaws_notifications_notifications::ComAmazonawsNotifications
 
 // The HTTP harness this suite drives the service through, shared with every
 // other suite in this crate.
-use crate::harness::{encode_path_label, error_code, Emulator};
+use crate::harness::{encode_path_label, error_code, is_configuration_arn, Emulator};
 
 // The configuration-specific helpers this suite adds to the shared harness. An
 // inherent `impl` on a type declared elsewhere in the same crate is what keeps
@@ -77,38 +77,6 @@ impl Emulator {
             .get(arn)
             .map(|record| record.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
     }
-}
-
-/// The `NotificationConfigurationArn` pattern the model declares,
-/// `^arn:[a-z-]{3,10}:notifications::[0-9]{12}:configuration/[a-z0-9]{27}$`,
-/// checked by hand so the suite needs no regex dependency.
-fn is_configuration_arn(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix("arn:") else {
-        return false;
-    };
-    let Some((partition, rest)) = rest.split_once(':') else {
-        return false;
-    };
-    if !(3..=10).contains(&partition.len())
-        || !partition
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b == b'-')
-    {
-        return false;
-    }
-    let Some(rest) = rest.strip_prefix("notifications::") else {
-        return false;
-    };
-    let Some((account, resource)) = rest.split_once(':') else {
-        return false;
-    };
-    if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    let Some(id) = resource.strip_prefix("configuration/") else {
-        return false;
-    };
-    id.len() == 27 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// One row of the create/get table.

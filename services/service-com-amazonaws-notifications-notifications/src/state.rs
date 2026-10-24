@@ -23,11 +23,14 @@ pub const CONFIGURATION_STATUS_ACTIVE: &str = "ACTIVE";
 /// (`crate::ops::types::NOTIFICATION_CONFIGURATION_SUBTYPE_VALUES`).
 pub const CONFIGURATION_SUBTYPE_ACCOUNT: &str = "ACCOUNT";
 
-/// The alphabet and width of the id segment of a configuration arn, from the
-/// `NotificationConfigurationArn` pattern the model declares:
-/// `^arn:[a-z-]{3,10}:notifications::[0-9]{12}:configuration/[a-z0-9]{27}$`.
-const CONFIGURATION_ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-const CONFIGURATION_ID_LEN: usize = 27;
+/// The alphabet and width of an id segment of this service's arns, from the
+/// patterns the model declares for them — `NotificationConfigurationArn`
+/// (`^arn:[a-z-]{3,10}:notifications::[0-9]{12}:configuration/[a-z0-9]{27}$`)
+/// and `EventRuleArn`, which appends `/rule/[a-z0-9]{27}` to it. Both id
+/// segments are drawn from the same alphabet at the same width, so one pair of
+/// constants serves both.
+const ARN_ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+const ARN_ID_LEN: usize = 27;
 
 /// The most NotificationConfigurations this emulator holds at once.
 ///
@@ -75,8 +78,10 @@ pub struct NotificationConfigurationRecord {
     pub tags: BTreeMap<String, String>,
     /// The sources of the EventRules this configuration carries — what
     /// `ListNotificationConfigurations`'s `eventRuleSource` filter matches a
-    /// configuration on. Empty on every record today: `CreateEventRule` is
-    /// still a 501 stub, and it is the operation that will write here.
+    /// configuration on. An INDEX, derived from the `event_rules` the store
+    /// holds for this configuration by
+    /// [`ComAmazonawsNotificationsNotificationsState::refresh_event_rule_sources`],
+    /// never written by hand: the rules are the one stored copy.
     pub event_rule_sources: BTreeSet<String>,
     /// The arns of the channels associated with this configuration — what
     /// `ListNotificationConfigurations`'s `channelArn` filter matches a
@@ -136,6 +141,146 @@ impl NotificationConfigurationRecord {
         for key in keys {
             self.tags.remove(key);
         }
+    }
+}
+
+/// `CREATING`, the per-Region status a freshly created `EventRule` carries.
+///
+/// One of `EventRuleStatus`'s five modelled values
+/// (`crate::ops::types::EVENT_RULE_STATUS_VALUES`), documented in the model as
+/// "This EventRule is being created. Only GET/LIST calls can be executed." — so
+/// it is transitional, and the clock owes it [`EVENT_RULE_TRANSITION_SPAN`]
+/// later.
+pub const EVENT_RULE_STATUS_CREATING: &str = "CREATING";
+
+/// `ACTIVE`, the per-Region status an `EventRule` settles in: "EventRule is
+/// processing events. Any call can be executed." Terminal — nothing moves a rule
+/// out of it but a caller.
+pub const EVENT_RULE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `reason` reported beside a `CREATING` Region of an `EventRule`.
+///
+/// `EventRuleStatusReason` is an unconstrained string for which the model
+/// declares no values, so this sentence is this emulator's own rendering of the
+/// documentation the model carries for the matching `EventRuleStatus` value:
+/// the status is the contract, this prose is not.
+pub const EVENT_RULE_REASON_CREATING: &str = "The EventRule is being created.";
+
+/// The `reason` reported beside an `ACTIVE` Region of an `EventRule`. See
+/// [`EVENT_RULE_REASON_CREATING`].
+pub const EVENT_RULE_REASON_ACTIVE: &str = "The EventRule can process events.";
+
+/// How long an `EventRule`'s Regions stay [`EVENT_RULE_STATUS_CREATING`] before
+/// the clock makes [`EVENT_RULE_STATUS_ACTIVE`] due.
+///
+/// AWS publishes no duration for the step, so this span is the EMULATOR's own
+/// choice; what matters is that it is never zero — a caller reading straight
+/// after the create still observes the `CREATING` the model declares, and the
+/// "Only GET/LIST calls can be executed" window it names — and that it is short
+/// enough to wait on. Nothing sleeps for it: the due instant is stored and
+/// [`ComAmazonawsNotificationsNotificationsState::settle_due_event_rules`]
+/// materialises whatever it has already made due.
+pub const EVENT_RULE_TRANSITION_SPAN: Duration = Duration::from_millis(500);
+
+/// The most `EventRule`s one `NotificationConfiguration` holds at once.
+///
+/// `event_rules` grows by one record per `CreateEventRule` request that is not a
+/// repeat, and shrinks only on an explicit delete, so without a ceiling its
+/// entry count is set by how many requests a caller makes. AWS bounds the same
+/// thing with an adjustable per-account service quota which is not in the model,
+/// so this number is the EMULATOR's own bound rather than a claim about AWS's,
+/// while the refusal it produces is the error the model declares for exactly
+/// this case: `ServiceQuotaExceededException` (HTTP 402, "Request would cause a
+/// service quota to be exceeded").
+pub const MAX_EVENT_RULES_PER_CONFIGURATION: usize = 100;
+
+/// The most Regions one `EventRule` covers.
+///
+/// The modelled `Regions` list declares `@length(1..)` — a floor and NO ceiling
+/// — so without a bound here the size of one stored rule (its `regions` list and
+/// its one `EventRuleStatusSummary` per Region) and of every response that
+/// reports it are set by how long a list a caller sends. AWS bounds the same
+/// thing by what Regions exist: a Region that is not one cannot send events to
+/// the rule, and there are fewer than this many. The value is therefore the
+/// EMULATOR's own ceiling rather than a claim about AWS's, chosen above the
+/// number of Regions AWS has so no faithful request meets it, while the refusal
+/// it produces names the member and its bound, which is what the modelled
+/// `ValidationException` (HTTP 400) carries in its `fieldList`.
+pub const MAX_REGIONS_PER_EVENT_RULE: usize = 50;
+
+/// One persisted `EventRule`.
+///
+/// This is the single record every EventRule operation reads and writes:
+/// `CreateEventRule` inserts it, `GetEventRule` and `ListEventRules` report it,
+/// `UpdateEventRule` mutates it in place, and `DeleteEventRule` removes it. The
+/// rule is keyed by its own arn, which nests under the arn of the
+/// `NotificationConfiguration` it is associated with.
+#[derive(Debug, Clone)]
+pub struct EventRuleRecord {
+    /// The minted arn — the single key for lookup, update and delete.
+    pub arn: String,
+    /// `notificationConfigurationArn`, the configuration this rule is
+    /// associated with. The rule's own arn nests under it, so this is also its
+    /// prefix; it is persisted because every report of the rule carries it.
+    pub notification_configuration_arn: String,
+    /// `source`, the matched EventBridge event source. Fixed at create: neither
+    /// `UpdateEventRule`'s input nor any other operation can change it.
+    pub source: String,
+    /// `eventType`, the matched EventBridge event type. Fixed at create for the
+    /// same reason as [`Self::source`].
+    pub event_type: String,
+    /// `eventPattern`, the additional filter, or `None` when the create call
+    /// supplied none and no update has set one. `GetEventRule` marks the member
+    /// required, so an absent pattern is reported as the empty string, which
+    /// the modelled `@length(0..4096)` admits.
+    pub event_pattern: Option<String>,
+    /// `regions`, the Regions that send events to this rule, in the order the
+    /// caller gave and without repeats — `statusSummaryByRegion` is keyed by
+    /// Region, so a Region named twice in one request is one Region.
+    pub regions: Vec<String>,
+    /// `creationTime`, set once when the record is inserted and never rewritten.
+    pub creation_time: ::aws_smithy_types::DateTime,
+    /// `statusSummaryByRegion`, one entry per Region in [`Self::regions`].
+    /// Per-Region because the model keys it that way: a rule can be settled in
+    /// one Region while another is still coming up.
+    pub status_by_region: BTreeMap<String, crate::ops::types::EventRuleStatusSummary>,
+    /// When the clock owes this rule its next step, or `None` when every Region
+    /// is settled. See [`EVENT_RULE_TRANSITION_SPAN`].
+    pub due_at: Option<SystemTime>,
+    /// Creation order within this store. `ListEventRules` reports rules in this
+    /// order and pages through it, so a listing is stable and a page token keeps
+    /// meaning across inserts and deletes.
+    pub sequence: u64,
+}
+
+impl EventRuleRecord {
+    /// This rule's `statusSummaryByRegion`, as the wire map every EventRule
+    /// operation returns.
+    pub fn status_summary_by_region(
+        &self,
+    ) -> std::collections::HashMap<String, crate::ops::types::EventRuleStatusSummary> {
+        self.status_by_region
+            .iter()
+            .map(|(region, summary)| (region.clone(), summary.clone()))
+            .collect()
+    }
+
+    /// `eventPattern` as the wire reports it: the stored pattern, or the empty
+    /// string when the rule carries none. See [`Self::event_pattern`].
+    pub fn reported_event_pattern(&self) -> String {
+        self.event_pattern.clone().unwrap_or_default()
+    }
+
+    /// The Amazon EventBridge Managed Rule arns associated with this rule.
+    ///
+    /// ALWAYS EMPTY, and that is the honest answer rather than a placeholder:
+    /// the model documents these as rules "created by User Notifications within
+    /// your account", and this emulator creates no EventBridge rule, so there is
+    /// none to report. `ManagedRuleArns` is a required member with no `@length`
+    /// floor, so an empty list satisfies the model; minting an arn for a rule
+    /// nothing created would report a resource that does not exist.
+    pub fn managed_rules(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -328,6 +473,14 @@ pub struct ComAmazonawsNotificationsNotificationsState {
     /// record's [`NotificationConfigurationRecord::sequence`] and as part of the
     /// uniqueness seed of a new arn, so an id is never reused after a delete.
     pub configurations_minted: u64,
+    /// arn -> EventRule. One flat map keyed by the rule's own arn, which nests
+    /// under its configuration's arn, so a rule is reached by the arn every
+    /// EventRule operation is given without a second lookup.
+    pub event_rules: BTreeMap<String, EventRuleRecord>,
+    /// How many EventRules this store has ever minted. Doubles as the next
+    /// record's [`EventRuleRecord::sequence`] and as part of the uniqueness seed
+    /// of a new arn, so an id is never reused after a delete.
+    pub event_rules_minted: u64,
     /// notificationHubRegion -> hub. One entry per region, as AWS's "maximum of
     /// one NotificationHub per Region" requires.
     pub hubs: BTreeMap<String, NotificationHubRecord>,
@@ -359,21 +512,7 @@ impl ComAmazonawsNotificationsNotificationsState {
     pub fn mint_configuration_arn(&mut self) -> (String, u64) {
         self.configurations_minted += 1;
         let sequence = self.configurations_minted;
-
-        let mut digest = Sha256::new();
-        digest.update(process_seed().to_le_bytes());
-        digest.update(sequence.to_le_bytes());
-        digest.update(nanos_since_epoch().to_le_bytes());
-        let bytes = digest.finalize();
-
-        let id: String = bytes
-            .iter()
-            .take(CONFIGURATION_ID_LEN)
-            .map(|byte| {
-                let index = usize::from(*byte) % CONFIGURATION_ID_ALPHABET.len();
-                char::from(CONFIGURATION_ID_ALPHABET[index])
-            })
-            .collect();
+        let id = mint_arn_id(sequence);
 
         // `notifications` arns carry no region (`notifications::<account>:`),
         // which `emulator_arn` renders from an empty region segment.
@@ -388,6 +527,182 @@ impl ComAmazonawsNotificationsNotificationsState {
             self.configurations.values().collect();
         records.sort_by_key(|record| record.sequence);
         records
+    }
+
+    /// How many `EventRule`s one configuration holds.
+    pub fn event_rule_count(&self, configuration_arn: &str) -> usize {
+        self.event_rules
+            .values()
+            .filter(|rule| rule.notification_configuration_arn == configuration_arn)
+            .count()
+    }
+
+    /// Whether another `EventRule` fits under
+    /// [`MAX_EVENT_RULES_PER_CONFIGURATION`] for this configuration. A create
+    /// that cannot must be refused with the modelled quota error, not served by
+    /// growing the store.
+    pub fn has_event_rule_capacity(&self, configuration_arn: &str) -> bool {
+        self.event_rule_count(configuration_arn) < MAX_EVENT_RULES_PER_CONFIGURATION
+    }
+
+    /// The stored `EventRule` of `configuration_arn` that the given create
+    /// request would produce, if the store already holds one.
+    ///
+    /// This is what makes `CreateEventRule` `@idempotent`, as the model marks
+    /// it: a repeat of a request that has already been served reports the rule
+    /// it made instead of minting a second one with a second arn. Two requests
+    /// are the same request when every member they carry agrees — and `regions`
+    /// agrees as a SET, because `statusSummaryByRegion` is keyed by Region, so
+    /// the order the Regions were listed in is not part of what was asked for.
+    pub fn matching_event_rule(
+        &self,
+        configuration_arn: &str,
+        source: &str,
+        event_type: &str,
+        event_pattern: Option<&str>,
+        regions: &[String],
+    ) -> Option<&EventRuleRecord> {
+        let wanted: BTreeSet<&str> = regions.iter().map(String::as_str).collect();
+        self.event_rules.values().find(|rule| {
+            rule.notification_configuration_arn == configuration_arn
+                && rule.source == source
+                && rule.event_type == event_type
+                && rule.event_pattern.as_deref() == event_pattern
+                // A stored rule's `regions` is already deduplicated, so equal
+                // lengths plus containment IS set equality — and it needs no
+                // per-rule allocation, which keeps this scan linear in the
+                // stored Regions rather than sorting each rule's list again.
+                && rule.regions.len() == wanted.len()
+                && rule
+                    .regions
+                    .iter()
+                    .all(|region| wanted.contains(region.as_str()))
+        })
+    }
+
+    /// Mint a fresh `EventRule` arn under `configuration_arn` and reserve its
+    /// creation sequence.
+    ///
+    /// `EventRuleArn` is the configuration's own arn followed by
+    /// `/rule/[a-z0-9]{27}`, so the rule's arn is built from its parent's rather
+    /// than assembled again, and the id segment is minted the same way a
+    /// configuration's is (see [`mint_arn_id`]).
+    pub fn mint_event_rule_arn(&mut self, configuration_arn: &str) -> (String, u64) {
+        self.event_rules_minted += 1;
+        let sequence = self.event_rules_minted;
+        let id = mint_arn_id(sequence);
+        (format!("{configuration_arn}/rule/{id}"), sequence)
+    }
+
+    /// Insert an `EventRule` for `configuration_arn` with every Region in
+    /// [`EVENT_RULE_STATUS_CREATING`] and its settling due
+    /// [`EVENT_RULE_TRANSITION_SPAN`] after `now`, and return its arn.
+    ///
+    /// The caller has already established that the configuration exists, that
+    /// the store has capacity for another rule, and that `regions` is within
+    /// [`MAX_REGIONS_PER_EVENT_RULE`]; a longer list is truncated here rather
+    /// than trusted, so no allocation is sized by an unbounded request field.
+    pub fn insert_event_rule(
+        &mut self,
+        configuration_arn: &str,
+        source: String,
+        event_type: String,
+        event_pattern: Option<String>,
+        regions: &[String],
+        now: SystemTime,
+    ) -> String {
+        // `statusSummaryByRegion` is keyed by Region, so a Region named twice in
+        // one request is one Region: keep the first mention and drop the repeat
+        // rather than reporting one Region twice in `regions` and once in the
+        // status map. The capacity is clamped to
+        // [`MAX_REGIONS_PER_EVENT_RULE`] and the already-seen test is a set
+        // lookup, so neither the allocation nor the work is sized by a
+        // caller-chosen list length (the caller refuses a longer list outright).
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut ordered: Vec<String> =
+            Vec::with_capacity(regions.len().min(MAX_REGIONS_PER_EVENT_RULE));
+        for region in regions.iter().take(MAX_REGIONS_PER_EVENT_RULE) {
+            if seen.insert(region.as_str()) {
+                ordered.push(region.clone());
+            }
+        }
+        let creating = crate::ops::types::EventRuleStatusSummary {
+            status: EVENT_RULE_STATUS_CREATING.to_string(),
+            reason: EVENT_RULE_REASON_CREATING.to_string(),
+        };
+        let status_by_region = ordered
+            .iter()
+            .map(|region| (region.clone(), creating.clone()))
+            .collect();
+
+        let (arn, sequence) = self.mint_event_rule_arn(configuration_arn);
+        let record = EventRuleRecord {
+            arn: arn.clone(),
+            notification_configuration_arn: configuration_arn.to_string(),
+            source,
+            event_type,
+            event_pattern,
+            regions: ordered,
+            creation_time: ::aws_smithy_types::DateTime::from(now),
+            status_by_region,
+            due_at: Some(now + EVENT_RULE_TRANSITION_SPAN),
+            sequence,
+        };
+        self.event_rules.insert(arn.clone(), record);
+        self.refresh_event_rule_sources(configuration_arn);
+        arn
+    }
+
+    /// Drop every `EventRule` of `configuration_arn` — what deleting the
+    /// configuration does to the rules associated with it, so a later create
+    /// cannot reach a rule whose configuration is gone.
+    pub fn remove_event_rules_of_configuration(&mut self, configuration_arn: &str) {
+        self.event_rules
+            .retain(|_, rule| rule.notification_configuration_arn != configuration_arn);
+    }
+
+    /// Recompute the `event_rule_sources` index on a configuration record from
+    /// the `EventRule`s the store holds for it.
+    ///
+    /// That index is what `ListNotificationConfigurations`'s `eventRuleSource`
+    /// filter matches on; deriving it here, from the rules themselves, keeps it
+    /// a view of one stored set rather than a second copy of it. Call it
+    /// wherever the set of a configuration's rules changes.
+    pub fn refresh_event_rule_sources(&mut self, configuration_arn: &str) {
+        let sources: BTreeSet<String> = self
+            .event_rules
+            .values()
+            .filter(|rule| rule.notification_configuration_arn == configuration_arn)
+            .map(|rule| rule.source.clone())
+            .collect();
+        if let Some(configuration) = self.configurations.get_mut(configuration_arn) {
+            configuration.event_rule_sources = sources;
+        }
+    }
+
+    /// Materialise every `EventRule` transition the clock has already made due,
+    /// as of `now`: a Region in `CREATING` becomes `ACTIVE`.
+    ///
+    /// Every EventRule operation calls this first, including the reporting ones:
+    /// the step was owed at that instant whether or not anybody called, so
+    /// applying it is not a mutation this request chose. Nothing here sleeps or
+    /// depends on a request's shape.
+    pub fn settle_due_event_rules(&mut self, now: SystemTime) {
+        for rule in self.event_rules.values_mut() {
+            let Some(due_at) = rule.due_at else {
+                continue;
+            };
+            if due_at > now {
+                continue;
+            }
+            rule.due_at = None;
+            for summary in rule.status_by_region.values_mut() {
+                if summary.status == EVENT_RULE_STATUS_CREATING {
+                    summary.status = EVENT_RULE_STATUS_ACTIVE.to_string();
+                    summary.reason = EVENT_RULE_REASON_ACTIVE.to_string();
+                }
+            }
+        }
     }
 
     /// Materialise every hub transition the clock has already made due, as of
@@ -506,6 +821,28 @@ impl ComAmazonawsNotificationsNotificationsState {
         self.organization_access = OrganizationAccessRecord::default();
         &self.organization_access
     }
+}
+
+/// One id segment of an arn this store mints: [`ARN_ID_LEN`] characters drawn
+/// from [`ARN_ID_ALPHABET`], derived from a SHA-256 over a per-process random
+/// seed, the minting counter the caller passes and the current instant — so two
+/// mints never collide, not even for identical input, and the id is not a
+/// function of the request.
+fn mint_arn_id(sequence: u64) -> String {
+    let mut digest = Sha256::new();
+    digest.update(process_seed().to_le_bytes());
+    digest.update(sequence.to_le_bytes());
+    digest.update(nanos_since_epoch().to_le_bytes());
+    let bytes = digest.finalize();
+
+    bytes
+        .iter()
+        .take(ARN_ID_LEN)
+        .map(|byte| {
+            let index = usize::from(*byte) % ARN_ID_ALPHABET.len();
+            char::from(ARN_ID_ALPHABET[index])
+        })
+        .collect()
 }
 
 /// A random value fixed for the life of the process, so configuration ids are
