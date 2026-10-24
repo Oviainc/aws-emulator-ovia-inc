@@ -50,6 +50,9 @@ mod cloud_watch_alarm_templates;
 #[path = "all/cluster_alerts.rs"]
 mod cluster_alerts;
 
+#[path = "all/cluster_creation.rs"]
+mod cluster_creation;
+
 #[path = "all/cluster_listing.rs"]
 mod cluster_listing;
 
