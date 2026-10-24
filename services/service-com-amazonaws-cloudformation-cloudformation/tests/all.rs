@@ -53,6 +53,8 @@ mod provisioned_resources;
 mod published_type_schema;
 #[path = "all/rds_stack_resources.rs"]
 mod rds_stack_resources;
+#[path = "all/s3vectors_resource_types.rs"]
+mod s3vectors_resource_types;
 #[path = "all/resolved_properties.rs"]
 mod resolved_properties;
 #[path = "all/sam_deployed_resources.rs"]

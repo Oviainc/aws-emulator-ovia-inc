@@ -1462,15 +1462,16 @@ const MAX_IDENTITY_ROUNDS: usize = 4;
 /// Whether a resource type's published identifier is a function of ANOTHER resource of the
 /// template, so it can only be computed once that resource's identity is known.
 ///
-/// Three of the catalogued types are: an Amazon ECS service's ARN carries the CLUSTER that
-/// hosts it (`service/<cluster>/<name>`), and an ELBv2 listener's and listener rule's ARNs
-/// nest inside the ARN of the load balancer and the listener their declaration names. Every
-/// other type's return values are functions of its own name and its own declared
-/// properties, so one pass computes them.
+/// Four of the catalogued types are: an Amazon ECS service's ARN carries the CLUSTER that
+/// hosts it (`service/<cluster>/<name>`), an ELBv2 listener's and listener rule's ARNs nest
+/// inside the ARN of the load balancer and the listener their declaration names, and an
+/// Amazon S3 Vectors index's nests inside the ARN of the vector bucket its declaration
+/// names. Every other type's return values are functions of its own name and its own
+/// declared properties, so one pass computes them.
 fn identity_depends_on_another_resource(resource_type: &str) -> bool {
     matches!(
         resource_type,
-        ECS_SERVICE | ELB_LISTENER | ELB_LISTENER_RULE
+        ECS_SERVICE | ELB_LISTENER | ELB_LISTENER_RULE | S3VECTORS_INDEX
     )
 }
 
@@ -1955,6 +1956,13 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // `CreateTargetGroup.Name`: each "can have a maximum of 32 characters" (Elastic
         // Load Balancing API reference) — the ELBv2 model carries no `@length` for either.
         ELB_LOAD_BALANCER | ELB_TARGET_GROUP => rules(32, Characters::AsGenerated),
+        // Amazon S3 Vectors `CreateVectorBucket.vectorBucketName` and
+        // `CreateIndex.indexName`: each `@length(min: 3, max: 63)` with pattern
+        // `[a-z0-9][a-z0-9-.]{1,61}[a-z0-9]` (that service's own Smithy model), which
+        // admits no upper case and requires an alphanumeric at each end.
+        S3VECTORS_VECTOR_BUCKET | S3VECTORS_INDEX => {
+            rules(63, Characters::LowercaseAlphanumeric)
+        }
         // Amazon RDS `DBInstanceIdentifier` / `DBClusterIdentifier`: each "must contain
         // from 1 to 63 letters, numbers, or hyphens", "can't end with a hyphen or contain
         // two consecutive hyphens", and is "stored as all lowercase" (Amazon RDS API
@@ -2368,6 +2376,8 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::RDS::DBInstance",
     "AWS::RUM::AppMonitor",
     S3_BUCKET,
+    S3VECTORS_INDEX,
+    S3VECTORS_VECTOR_BUCKET,
     SNS_TOPIC,
     SQS_QUEUE,
     "AWS::SecretsManager::Secret",
@@ -2480,6 +2490,44 @@ fn return_values(
                 format!("http://{name}.s3-website-{region}.{URL_SUFFIX}"),
             );
             (name.to_string(), attributes)
+        }
+        // "Ref returns the vector bucket ARN": this type's primary identifier is its
+        // `VectorBucketArn`, which is also its one published `Fn::GetAtt` attribute. It is
+        // the type `super::provisioning` creates in Amazon S3 Vectors itself, which then
+        // answers with the bucket's own ARN — the same ARN this computes, since both are
+        // built from the one account id this emulator mints and the bucket's name, which is
+        // how S3 Vectors keys a vector bucket (`bucket_arn` in that service's own state
+        // module).
+        S3VECTORS_VECTOR_BUCKET => {
+            let arn = ::emulator_server::emulator_arn(
+                S3VECTORS_ARN_NAMESPACE,
+                region,
+                &format!("{S3VECTORS_BUCKET_SEGMENT}{name}"),
+            );
+            attributes.insert("VectorBucketArn".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // "Ref returns the vector index ARN", and an index ARN NESTS inside the ARN of the
+        // vector bucket that holds it (`bucket/<bucket>/index/<name>`), so it is resolved
+        // once that bucket's identity is known ([`resolve_dependent_identities`]). The
+        // declaration names the bucket the two ways S3 Vectors' own API addresses one — by
+        // name or by ARN ([`declared_vector_bucket`]) — and one that names neither leaves
+        // the index with CloudFormation's own generated identity rather than an ARN built
+        // on a bucket nothing named.
+        S3VECTORS_INDEX => {
+            let bucket = declared_vector_bucket(properties, scope, budget);
+            match bucket {
+                Some(bucket) => {
+                    let arn = ::emulator_server::emulator_arn(
+                        S3VECTORS_ARN_NAMESPACE,
+                        region,
+                        &format!("{S3VECTORS_BUCKET_SEGMENT}{bucket}/index/{name}"),
+                    );
+                    attributes.insert("IndexArn".to_string(), arn.clone());
+                    (arn, attributes)
+                }
+                None => (name.to_string(), attributes),
+            }
         }
         // "Ref returns the distribution ID"; Fn::GetAtt: DomainName, Id. CloudFront
         // ASSIGNS both — the type has no name property for a template to set — so a
@@ -3189,6 +3237,8 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
             "RegionalDomainName",
             "WebsiteURL",
         ],
+        S3VECTORS_VECTOR_BUCKET => &["VectorBucketArn"],
+        S3VECTORS_INDEX => &["IndexArn"],
         "AWS::DynamoDB::Table" => &["Arn"],
         "AWS::Lambda::Function" => &["Arn"],
         "AWS::Logs::LogGroup" => &["Arn"],
@@ -3290,6 +3340,28 @@ pub const AOSS_SECURITY_POLICY: &str = "AWS::OpenSearchServerless::SecurityPolic
 /// bucket's physical resource id is the name its owning service creates it under — which
 /// is why [`naming_rules`] holds a GENERATED one to S3's bucket naming rules.
 pub const S3_BUCKET: &str = "AWS::S3::Bucket";
+
+/// The types of the two Amazon S3 Vectors resources a stack creates. The middle segment is
+/// that model's own sdk identity (`smithy_query(query="service_info",
+/// model_path="services/service-com-amazonaws-s3vectors-s3vectors/smithy-model/\
+/// com-amazonaws-s3vectors-s3vectors.json")` reports `sdkId: S3Vectors`), beside the
+/// sibling bucket variants `AWS::S3::Bucket` and `AWS::S3Tables::TableBucket`.
+///
+/// Each type's primary identifier is its own ARN — a vector bucket is
+/// `bucket/<name>` and an index `bucket/<bucket>/index/<name>` under the ARN namespace
+/// below — so `Ref` resolves to the ARN its owning service keys the resource by, which is
+/// what `GetVectorBucket`/`GetIndex` take as `vectorBucketArn`/`indexArn`.
+pub const S3VECTORS_VECTOR_BUCKET: &str = "AWS::S3Vectors::VectorBucket";
+pub const S3VECTORS_INDEX: &str = "AWS::S3Vectors::Index";
+
+/// Amazon S3 Vectors' ARN namespace, which is its model's own `awsService.arnNamespace`
+/// (`s3vectors`) rather than the `S3Vectors` its resource types are spelled with.
+pub const S3VECTORS_ARN_NAMESPACE: &str = "s3vectors";
+
+/// The segment a vector bucket occupies in an Amazon S3 Vectors ARN, from the
+/// `VectorBucketArn` pattern that model declares
+/// (`…:s3vectors:<region>:<account>:bucket/<name>`).
+pub const S3VECTORS_BUCKET_SEGMENT: &str = "bucket/";
 
 /// The type of an Amazon EMR cluster: the EMR model carries
 /// `awsService.cloudFormationName: EMR`. "Ref returns the cluster ID", the `j-` job-flow id
@@ -3760,6 +3832,50 @@ fn ecs_cluster_name(reference: &str) -> String {
         Some((_, name)) => name.to_string(),
         None => reference.to_string(),
     }
+}
+
+/// The vector bucket an `AWS::S3Vectors::Index` declaration holds its index in: the
+/// `VectorBucketName` it names, or the bucket its `VectorBucketArn` names.
+///
+/// Those are the two ways Amazon S3 Vectors' own API addresses a vector bucket — "you can
+/// either use both the vector bucket name and the index name, or you can use the vector
+/// index ARN" is how its reads put it, and `CreateIndex` takes `vectorBucketName` or
+/// `vectorBucketArn` — so a declaration spelling either names the same bucket.
+///
+/// `None` where the declaration names neither, or names one this module could not evaluate:
+/// there is then no bucket to nest the index's ARN inside.
+fn declared_vector_bucket(
+    properties: &Value,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> Option<String> {
+    let named = properties
+        .get("VectorBucketName")
+        .and_then(|value| text(value, scope, 0, budget))
+        .filter(|name| !name.is_empty());
+    if named.is_some() {
+        return named;
+    }
+    properties
+        .get("VectorBucketArn")
+        .and_then(|value| text(value, scope, 0, budget))
+        .as_deref()
+        .and_then(vector_bucket_of_arn)
+}
+
+/// The bucket name an Amazon S3 Vectors vector-bucket ARN carries:
+/// `arn:aws:s3vectors:<region>:<account>:bucket/<name>` names `<name>`.
+///
+/// `None` for anything that is not one — the resource portion past the fifth `:` has to be
+/// exactly one `bucket/<name>` segment, which is what that model's `VectorBucketArn`
+/// pattern fixes — so an index's ARN is never nested inside a value that is not a vector
+/// bucket's.
+fn vector_bucket_of_arn(arn: &str) -> Option<String> {
+    let bucket = arn
+        .splitn(6, ':')
+        .nth(5)?
+        .strip_prefix(S3VECTORS_BUCKET_SEGMENT)?;
+    (!bucket.is_empty() && !bucket.contains('/')).then(|| bucket.to_string())
 }
 
 /// A service-assigned identifier of the canonical UUID form, derived from `name` under
@@ -4558,6 +4674,9 @@ mod tests {
                     "arn:{PARTITION}:elasticloadbalancing:us-east-1:000000000000:\
                      listener/app/a-name/0123456789abcdef/fedcba9876543210"
                 ),
+                // The vector bucket an `AWS::S3Vectors::Index` declares its index in,
+                // whose ARN that index's own ARN nests inside.
+                "VectorBucketName": "a-vector-bucket",
             }),
             condition: None,
             declaration: Value::Null,
