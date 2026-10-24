@@ -438,10 +438,30 @@ async fn quick_create_mints_the_catch_all_route_with_the_api() {
             expect_key,
             "case {label:?}: wrong RouteKey on the quick-create route, got {routes}"
         );
+        // The route is wired to the integration quick create minted from the `Target`
+        // ("Quick create produces an API with an integration, a default catch-all
+        // route, …", `CreateApi$Target`), which is the resource that carries the
+        // endpoint address; `integrations/{IntegrationId}` is the form a route's target
+        // takes. The whole quick-create set is `quick_create_servable_set`'s rule.
+        let target = as_str(&items[0], "target");
+        let integration_id = target.strip_prefix("integrations/").unwrap_or_else(|| {
+            panic!("case {label:?}: the quick-create route must target an integration, got {routes}")
+        });
+        let (status, integration) = call(
+            &emulator,
+            "GET",
+            &format!("/v2/apis/{api_id}/integrations/{integration_id}"),
+            None,
+        )
+        .await;
         assert_eq!(
-            as_str(&items[0], "target"),
+            status, 200,
+            "case {label:?}: expected 200 from GetIntegration for {target:?}, got {status} {integration}"
+        );
+        assert_eq!(
+            as_str(&integration, "integrationUri"),
             "https://example.com/upstream",
-            "case {label:?}: the quick-create route must carry the Target, got {routes}"
+            "case {label:?}: the quick-create integration must carry the Target, got {integration}"
         );
         assert_eq!(
             items[0]["apiGatewayManaged"].as_bool(),

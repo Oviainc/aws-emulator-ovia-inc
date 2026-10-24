@@ -316,36 +316,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // routes and integrations to it straight away — which is what makes the
             // stage callable. Deploying is synchronous here, exactly as
             // `CreateDeployment` resolves it, so the release is complete by the time
-            // this call answers.
-            if api.deployments.len() < crate::state::MAX_DEPLOYMENTS_PER_API {
-                let released = api.mint_deployment_id();
-                api.deployments.insert(
-                    released.clone(),
-                    crate::state::Deployment {
-                        deployment_id: released.clone(),
-                        // The service released this one; no caller described it.
-                        description: ::std::option::Option::None,
-                        deployment_status: crate::state::DEPLOYMENT_STATUS_DEPLOYED.to_string(),
-                        deployment_status_message: ::std::option::Option::None,
-                        auto_deployed: true,
-                        created_date: now,
-                    },
-                );
-                last_deployment_status_message = Some(format!(
-                    "Successfully deployed stage with deployment id '{released}'"
-                ));
-                deployment_id = Some(released);
-            } else {
-                // The api is at its deployments quota, so there is no deployment to
-                // release to the stage. The stage is still created — the quota belongs
-                // to the deployment, not to the stage — and reports why its last
-                // deployment did not happen.
-                last_deployment_status_message = Some(format!(
-                    "Failed to deploy stage: the maximum number of deployments ({}) for \
-                     this API has been reached.",
-                    crate::state::MAX_DEPLOYMENTS_PER_API
-                ));
-            }
+            // this call answers. The same release is what quick create's `$default`
+            // stage gets, so both go through the one helper on the api record.
+            let (released, status_message) = api.release_auto_deployment(now);
+            deployment_id = released;
+            last_deployment_status_message = status_message;
         }
 
         let record = crate::state::Stage {

@@ -5,10 +5,11 @@
 //! and answers with that STORED record. This is the ONLY file to touch for this
 //! operation.
 //!
-//! Quick create (`Target`, with an optional `RouteKey`) mints the catch-all route
-//! alongside the api; the integration and the auto-deploy stage quick create also
-//! produces belong to the integration and stage slices, whose operations are still
-//! scaffolded.
+//! Quick create (`Target`, with an optional `RouteKey`) mints the whole servable set
+//! alongside the api — "an integration, a default catch-all route, and a default stage
+//! which is configured to automatically deploy changes" (`CreateApi$Target`) — each of
+//! them the resource API Gateway manages, with the route wired to that integration and
+//! the stage serving the deployment the service released to it.
 //!
 //! ## Shape of an operation
 //!
@@ -365,10 +366,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the caller is told is what a later GetApi will report.
         let stored = store.apis.entry(api_id).or_insert(record);
 
-        // Quick create's catch-all route, minted with the api so a later GetRoutes
-        // reports it. `$default` "acts as a catch-all for any request made to your API"
-        // (`CreateApi$RouteKey`) and is the route API Gateway manages.
+        // Quick create: "Quick create produces an API with an integration, a default
+        // catch-all route, and a default stage which is configured to automatically
+        // deploy changes" (`CreateApi$Target`). All three are minted with the api, so
+        // each of GetIntegration/GetRoutes/GetStage reports one, and each is the
+        // resource API Gateway manages rather than one the caller asked for.
+        //
+        // ONE clock reading for the whole set: the api and the resources quick create
+        // mints with it came into being at the same instant, so no two of them can
+        // disagree about when that was.
         if let Some(target) = input.target.as_ref() {
+            let now = stored.created_date;
+
+            // "For HTTP integrations, specify a fully qualified URL. For Lambda
+            // integrations, specify a function ARN. The type of the integration will be
+            // HTTP_PROXY or AWS_PROXY, respectively" (`CreateApi$Target`) — an ARN is
+            // what carries the `arn:` scheme, a fully qualified URL does not.
+            let is_function_arn = target.starts_with(ARN_SCHEME_PREFIX);
+            let integration_id = stored.mint_integration_id();
+            stored.integrations.insert(
+                integration_id.clone(),
+                crate::state::Integration {
+                    integration_id: integration_id.clone(),
+                    integration_type: if is_function_arn {
+                        AWS_PROXY_INTEGRATION_TYPE
+                    } else {
+                        HTTP_PROXY_INTEGRATION_TYPE
+                    }
+                    .to_string(),
+                    // The target IS the integration's endpoint: "For a Lambda
+                    // integration, specify the URI of a Lambda function. For an HTTP
+                    // integration, specify a fully-qualified URL"
+                    // (`Integration$IntegrationUri`).
+                    integration_uri: Some(target.clone()),
+                    // "This property is part of quick create. It specifies the
+                    // credentials required for the integration"
+                    // (`CreateApi$CredentialsArn`) — the integration quick create mints
+                    // is the resource those credentials belong to.
+                    credentials_arn: input.credentials_arn.clone(),
+                    // "The default value is INTERNET" (`Integration$ConnectionType`).
+                    connection_type: crate::state::DEFAULT_CONNECTION_TYPE.to_string(),
+                    // "Specifies the format of the payload sent to an integration.
+                    // Required for HTTP APIs. Supported values for Lambda proxy
+                    // integrations are 1.0 and 2.0. For all other integrations, 1.0 is
+                    // the only supported value"
+                    // (`Integration$PayloadFormatVersion`): quick create is supported
+                    // only for HTTP APIs, so the integration always carries one, and a
+                    // Lambda proxy carries the later of the two values it supports.
+                    payload_format_version: Some(
+                        if is_function_arn {
+                            LAMBDA_PROXY_PAYLOAD_FORMAT_VERSION
+                        } else {
+                            ONLY_PAYLOAD_FORMAT_VERSION
+                        }
+                        .to_string(),
+                    ),
+                    // "The default timeout is … 30 seconds for HTTP APIs"
+                    // (`CreateIntegration$TimeoutInMillis`), and quick create is
+                    // HTTP-only.
+                    timeout_in_millis: crate::state::DEFAULT_HTTP_TIMEOUT_MILLIS,
+                    // "If you created an API using quick create, the resulting
+                    // integration is managed by API Gateway"
+                    // (`Integration$ApiGatewayManaged`).
+                    api_gateway_managed: true,
+                    ..Default::default()
+                },
+            );
+
+            // The catch-all route, wired to that integration: `$default` "acts as a
+            // catch-all for any request made to your API" (`CreateApi$RouteKey`) and is
+            // the route API Gateway manages. `integrations/{IntegrationId}` is the form
+            // a route's target takes, so the route resolves to the integration above
+            // rather than carrying a backend address of its own.
             let route_key = input
                 .route_key
                 .clone()
@@ -380,9 +449,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     route_id,
                     api_gateway_managed: route_key == DEFAULT_ROUTE_KEY,
                     route_key,
-                    target: Some(target.clone()),
+                    target: Some(format!(
+                        "{}{integration_id}",
+                        crate::state::INTEGRATION_TARGET_PREFIX
+                    )),
                     authorization_type: crate::state::DEFAULT_AUTHORIZATION_TYPE.to_string(),
                     ..Default::default()
+                },
+            );
+
+            // The default stage, "configured to automatically deploy changes": an
+            // auto-deploying stage has its deployments released by the service, so the
+            // routes and integrations the api now holds are released to it at this same
+            // instant — which is what makes the api callable on its endpoint. "If you
+            // created an API using quick create, the $default stage is managed by API
+            // Gateway" (`Stage$ApiGatewayManaged`).
+            let (deployment_id, last_deployment_status_message) =
+                stored.release_auto_deployment(now);
+            stored.stages.insert(
+                crate::state::DEFAULT_STAGE_NAME.to_string(),
+                crate::state::Stage {
+                    stage_name: crate::state::DEFAULT_STAGE_NAME.to_string(),
+                    description: ::std::option::Option::None,
+                    auto_deploy: true,
+                    // The stage is the service's, so nothing tagged it; the api's own
+                    // tags belong to the api.
+                    tags: ::std::collections::BTreeMap::new(),
+                    deployment_id,
+                    access_log_settings: ::std::option::Option::None,
+                    client_certificate_id: ::std::option::Option::None,
+                    default_route_settings: ::std::option::Option::None,
+                    route_settings: ::std::collections::BTreeMap::new(),
+                    stage_variables: ::std::collections::BTreeMap::new(),
+                    last_deployment_status_message,
+                    created_date: now,
+                    // Nothing has rewritten the record yet, so it was last updated when
+                    // it was created.
+                    last_updated_date: now,
+                    api_gateway_managed: true,
                 },
             );
         }
@@ -414,3 +518,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`CreateApi$RouteKey`: "If you don't specify a routeKey, a default route of
 /// $default is created").
 const DEFAULT_ROUTE_KEY: &str = "$default";
+
+/// What every Amazon Resource Name begins with, and what a fully qualified URL does
+/// not: the one thing that tells quick create's two documented forms of `Target`
+/// apart ("For HTTP integrations, specify a fully qualified URL. For Lambda
+/// integrations, specify a function ARN", `CreateApi$Target`).
+const ARN_SCHEME_PREFIX: &str = "arn:";
+
+/// The `IntegrationType` quick create gives a `Target` that is a function ARN, from
+/// `INTEGRATION_TYPE_VALUES`: "The type of the integration will be HTTP_PROXY or
+/// AWS_PROXY, respectively" (`CreateApi$Target`).
+const AWS_PROXY_INTEGRATION_TYPE: &str = "AWS_PROXY";
+
+/// The `IntegrationType` quick create gives a `Target` that is a fully qualified URL
+/// (`CreateApi$Target`, as above).
+const HTTP_PROXY_INTEGRATION_TYPE: &str = "HTTP_PROXY";
+
+/// The later of the two `PayloadFormatVersion` values a Lambda proxy integration
+/// supports: "Supported values for Lambda proxy integrations are 1.0 and 2.0"
+/// (`Integration$PayloadFormatVersion`).
+const LAMBDA_PROXY_PAYLOAD_FORMAT_VERSION: &str = "2.0";
+
+/// The one `PayloadFormatVersion` every other integration type supports: "For all
+/// other integrations, 1.0 is the only supported value"
+/// (`Integration$PayloadFormatVersion`).
+const ONLY_PAYLOAD_FORMAT_VERSION: &str = "1.0";

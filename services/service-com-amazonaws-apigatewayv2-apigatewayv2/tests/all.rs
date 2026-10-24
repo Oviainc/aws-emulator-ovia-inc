@@ -39,6 +39,8 @@ mod model_lifecycle;
 mod portal_product_lifecycle;
 #[path = "all/protocol_type_gating.rs"]
 mod protocol_type_gating;
+#[path = "all/quick_create_servable_set.rs"]
+mod quick_create_servable_set;
 #[path = "all/route_request_parameter.rs"]
 mod route_request_parameter;
 #[path = "all/route_response_lifecycle.rs"]

@@ -469,6 +469,52 @@ impl Api {
         self.authorizer_id_seed = self.authorizer_id_seed.wrapping_add(1);
         mint_id(self.authorizer_id_seed)
     }
+
+    /// Release a deployment of this api's current configuration BY THE SERVICE, for a
+    /// stage whose `AutoDeploy` is on.
+    ///
+    /// Such a stage has its deployments released by the service rather than by a caller
+    /// ("Specifies whether a deployment was automatically released",
+    /// [`Deployment::auto_deployed`]), so the api's routes and integrations — which this
+    /// record already holds — are released to it at `now`, the same instant the call
+    /// that asked for the stage is resolving at. Both the stage quick create mints
+    /// alongside an api and a `CreateStage` that asks for auto-deploy go through here,
+    /// so one api cannot release two differently shaped deployments.
+    ///
+    /// Answers `(DeploymentId, LastDeploymentStatusMessage)`: the id of the deployment
+    /// released, with the message the stage reports for it, or no id at all when the api
+    /// is already at [`MAX_DEPLOYMENTS_PER_API`] — the quota belongs to the deployment,
+    /// not to the stage, so the stage still exists and reports why its last deployment
+    /// did not happen.
+    pub fn release_auto_deployment(
+        &mut self,
+        now: SystemTime,
+    ) -> (Option<String>, Option<String>) {
+        if self.deployments.len() >= MAX_DEPLOYMENTS_PER_API {
+            return (
+                None,
+                Some(format!(
+                    "Failed to deploy stage: the maximum number of deployments \
+                     ({MAX_DEPLOYMENTS_PER_API}) for this API has been reached."
+                )),
+            );
+        }
+        let released = self.mint_deployment_id();
+        self.deployments.insert(
+            released.clone(),
+            Deployment {
+                deployment_id: released.clone(),
+                // The service released this one; no caller described it.
+                description: None,
+                deployment_status: DEPLOYMENT_STATUS_DEPLOYED.to_string(),
+                deployment_status_message: None,
+                auto_deployed: true,
+                created_date: now,
+            },
+        );
+        let message = format!("Successfully deployed stage with deployment id '{released}'");
+        (Some(released), Some(message))
+    }
 }
 
 impl Api {
