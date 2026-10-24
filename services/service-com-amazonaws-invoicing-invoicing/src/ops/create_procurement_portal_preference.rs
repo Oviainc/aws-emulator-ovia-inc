@@ -218,6 +218,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A resource holds at most `crate::state::MAX_RESOURCE_TAGS` tags however the
+        // tags got there — the quota `TagResource` refuses a write past — so a create
+        // carrying more distinct keys than that is refused before it mints or persists
+        // anything, rather than leaving a resource holding more tags than any later tag
+        // write would be allowed to put on it. This operation models
+        // `ServiceQuotaExceededException` (HTTP 402), the same error the tag plane
+        // answers for this quota, so that is what the refusal is.
+        let resource_tags = crate::state::resource_tags_for_new_resource(input.resource_tags)
+            .map_err(|_| {
+                CreateProcurementPortalPreferenceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: crate::state::TAG_QUOTA_EXCEEDED_MESSAGE.to_string(),
+                        // The procurement-portal plane keys the text as `Message` (see
+                        // `crate::ops::types::MessageKey`).
+                        message_key: MessageKey::Capitalised,
+                    },
+                )
+            })?;
+
         let identity = crate::state::procurement_portal_preference_identity(
             &input.procurement_portal_name,
             &input.buyer_domain,
@@ -355,12 +374,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The tag plane is the one this service already serves for every taggable
         // resource, keyed by ARN, so `ListTagsForResource` reports these without knowing
         // what kind of resource they are on.
-        if let Some(tags) = input.resource_tags {
-            let tags = tags
-                .into_iter()
-                .map(|tag| (tag.key, tag.value))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            store.resource_tags.insert(arn.clone(), tags);
+        if !resource_tags.is_empty() {
+            store.resource_tags.insert(arn.clone(), resource_tags);
         }
 
         store.record_result(Self::NAME, &identity, client_token, &arn);
