@@ -747,18 +747,28 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         self.tags_for(arn).into_iter().collect()
     }
 
-    /// Whether `arn` names a resource this service currently holds: the ARN of a live
-    /// `Domain`, or of a live `Subscription` under one.
+    /// Whether `arn` names a resource this service currently holds: the ARN of a
+    /// `Domain` record still in this store, or of a live `Subscription` under one.
     ///
-    /// The SAME liveness the readers use ([`Self::live_domain`] /
-    /// [`Self::live_subscription`]), so a resource a caller can read is exactly the one
-    /// it can address by ARN — tags can never attach to an ARN no reader resolves, and a
-    /// purged resource's ARN stops resolving with it.
+    /// Holding a record is what makes a resource addressable, NOT the lifecycle status
+    /// that record reports: a `Domain` whose deletion is in flight is a resource the
+    /// service still holds — its own reader answers it ([`Self::domains`] is what
+    /// `GetDomain` looks it up in, and `ListDomains` lists it under its non-terminal
+    /// status) — so its ARN resolves for exactly as long as the record does. The one
+    /// place an ARN stops resolving is [`Self::purge_due_deletions`], which drops the
+    /// record together with the tag entries keyed by its ARN. An ARN this resolves is
+    /// therefore always one some reader resolves too, and the ARN-addressed operations
+    /// and the resource's own reader never disagree about whether it exists.
+    ///
+    /// A `Subscription` is resolved through its own reader's liveness
+    /// ([`Self::live_subscription`]): a subscription already `DELETED` is gone for that
+    /// reader and gone here, which covers every subscription of a domain being deleted —
+    /// `DeleteDomain` marks them all `DELETED` as it records the deletion.
     pub fn holds_resource_arn(&self, arn: &str) -> bool {
         self.domains.values().any(|domain| {
-            domain.status == DomainStatus::Active
-                && (domain.arn == arn
-                    || domain
+            domain.arn == arn
+                || (domain.status == DomainStatus::Active
+                    && domain
                         .subscriptions
                         .values()
                         .any(|subscription| subscription.is_live() && subscription.arn == arn))

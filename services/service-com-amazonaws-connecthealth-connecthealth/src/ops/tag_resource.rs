@@ -191,8 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the ARN of a resource whose deletion has fallen due no longer resolves here.
         store.purge_due_deletions(now);
 
-        // The ARN has to name a resource this service holds: tags live beside the
-        // resource, so there is nothing to attach them to otherwise.
+        // The ARN has to name a resource this service HOLDS: tags live beside the
+        // resource, so there is nothing to attach them to otherwise. The same resolution
+        // `ListTagsForResource` reads through, so the write and the read never disagree
+        // about whether the ARN names a resource.
         if !store.holds_resource_arn(&input.resource_arn) {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
