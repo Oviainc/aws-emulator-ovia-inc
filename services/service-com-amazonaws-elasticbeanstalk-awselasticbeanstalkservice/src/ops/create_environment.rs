@@ -420,7 +420,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .or_else(|| resolved_stack.map(|stack| stack.name()));
         let created = crate::state::now();
-        let environment = crate::state::Environment {
+        let mut environment = crate::state::Environment {
             environment_id: environment_id.clone(),
             environment_name: environment_name.clone(),
             arn: crate::state::environment_arn(
@@ -428,6 +428,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.application_name,
                 &environment_name,
             ),
+            region: region.clone(),
             application_name: input.application_name.clone(),
             version_label: input.version_label.clone(),
             solution_stack_name,
@@ -436,8 +437,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description.clone(),
             cname: crate::state::environment_cname(&cname_prefix, &region),
             // `EndpointURL` is "the URL to the LoadBalancer" or "the IP address
-            // of the instance". This emulator provisions neither, so there is no
-            // endpoint to report and none is invented.
+            // of the instance". Neither serves application traffic here, so
+            // there is no reachable endpoint to report and none is invented.
             endpoint_url: None,
             // The tier the request named, with every member it left out filled
             // in from the defaults the model documents: a Standard-mode
@@ -458,12 +459,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             date_terminated: None,
             tags: input.tags.clone().unwrap_or_default(),
             sequence,
+            // Provisioned below, from the tier and the options this record now
+            // carries, so the inventory is derived from the stored environment
+            // rather than from the request a second time.
+            resources: None,
             // The launch the clock owes: `Launching` -> `Ready`.
             pending_status: Some(crate::state::PendingStatus::launch_completion(
                 &request_id,
                 &environment_name,
             )),
         };
+        // "Launches an environment for the specified application using the
+        // specified configuration": the launch provisions the environment's own
+        // Amazon Web Services resources — its Auto Scaling group, the launch
+        // template it launches instances from, those instances, and the load
+        // balancer or the worker queue its tier and its options call for — which
+        // is what `DescribeEnvironmentResources` then reports.
+        environment.provision_resources();
 
         let output = crate::state::environment_description!(CreateEnvironmentOutput, &environment);
         let subject = environment.event_subject();

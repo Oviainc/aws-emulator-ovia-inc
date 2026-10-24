@@ -501,6 +501,68 @@ pub fn is_iam_role_arn(arn: &str) -> bool {
     partition_is_named && account_is_an_id && names_a_role
 }
 
+/// This service's ARN namespace, from the model's own `aws.api#service` trait
+/// (`smithy_query(query="service_info")`: `arnNamespace: cognito-identity`). It is the
+/// third field of every ARN that names one of this service's resources.
+pub const ARN_NAMESPACE: &str = "cognito-identity";
+
+/// The resource type an identity pool's ARN names. An Amazon Cognito identity pool is
+/// named by `arn:<partition>:cognito-identity:<region>:<account>:identitypool/<IdentityPoolId>`,
+/// which is the ARN form the tagging operations' `ResourceArn` carries.
+pub const IDENTITY_POOL_RESOURCE_TYPE: &str = "identitypool";
+
+/// The ARN that names the identity pool `identity_pool_id`: this service's namespace, the
+/// region the pool's own id names, the emulator's canonical account id
+/// ([`::engine::emulator_account_id`]) and the pool as the resource.
+pub fn identity_pool_arn(identity_pool_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region_of(identity_pool_id),
+        &format!("{IDENTITY_POOL_RESOURCE_TYPE}/{identity_pool_id}"),
+    )
+}
+
+/// The `IdentityPoolId` an identity-pool ARN names, or `None` when `arn` does not name an
+/// identity pool of this service at all (a different ARN namespace or resource type, a
+/// malformed account or partition, or no pool id after the resource type).
+///
+/// Only the ARN's FORM is checked here, and only the pool id is returned: an
+/// `IdentityPoolId` is unique across this service, so it is the id — not the ARN's region
+/// or account, which are the naming context around it — that selects the stored pool.
+/// Whether that pool exists is the caller's lookup, which is what distinguishes a
+/// malformed `ResourceArn` (an input error) from one naming a resource that is not stored
+/// (a missing resource).
+pub fn identity_pool_id_from_arn(arn: &str) -> Option<&str> {
+    let mut fields = arn.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some(namespace), Some(region), Some(account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    let partition_is_named = !partition.is_empty()
+        && partition
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    // An AWS account id is twelve digits.
+    let account_is_an_id = account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit());
+    if namespace != ARN_NAMESPACE
+        || !partition_is_named
+        || !is_region_like(region)
+        || !account_is_an_id
+    {
+        return None;
+    }
+    resource
+        .strip_prefix(IDENTITY_POOL_RESOURCE_TYPE)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|identity_pool_id| !identity_pool_id.is_empty())
+}
+
 /// An opaque pagination token naming the pool it was minted for and the item a page
 /// resumes at. Hex, so the token is opaque to a caller and still matches the modelled
 /// `^[\S]+$` pattern.

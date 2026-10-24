@@ -52,11 +52,16 @@ pub const CHECK_FAILED: &str = "FAILED";
 ///
 /// The model declares `CREATING | CREATED | UPDATING | DELETING | DELETED |
 /// CREATE_FAILED | UPDATE_FAILED` (`smithy_query(query="shape", shape="HostState")`). The
-/// two named here are the ones `CreateEnvironmentHost` produces: a host is `CREATING`
+/// first two are the ones `CreateEnvironmentHost` produces: a host is `CREATING`
 /// while the ESX host is built and `CREATED` once it has joined the environment.
+/// `DELETED` is the terminal state a host that has been removed rests in, and the ONE
+/// state in which a host no longer occupies its environment
+/// ([`StoredEnvironment::live_hosts`]).
 pub const HOST_CREATING: &str = "CREATING";
 /// See [`HOST_CREATING`].
 pub const HOST_CREATED: &str = "CREATED";
+/// See [`HOST_CREATING`].
+pub const HOST_DELETED: &str = "DELETED";
 
 /// The `ValidationExceptionReason` values this service refuses with.
 pub const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
@@ -947,6 +952,26 @@ impl StoredEnvironment {
             .usable_addresses()
             .map(|address| address.to_string())
             .find(|address| !taken.contains(&address.as_str()))
+    }
+
+    /// The hosts that still OCCUPY this environment: every stored host whose
+    /// `HostState` has not reached [`HOST_DELETED`].
+    ///
+    /// "Amazon EVS environments will only be enabled for deletion once the hosts are
+    /// deleted. You can delete hosts using the DeleteEnvironmentHost action."
+    /// (`DeleteEnvironment` doc), so these are the hosts whose presence blocks the
+    /// environment's own deletion — a host that is still being built (`CREATING`) or
+    /// on its way out (`DELETING`) is as present as one that is `CREATED`, and only the
+    /// terminal `DELETED` state means the host is gone.
+    pub fn live_hosts(&self) -> impl Iterator<Item = &StoredHost> {
+        self.hosts
+            .values()
+            .filter(|host| host.state != HOST_DELETED)
+    }
+
+    /// How many hosts still occupy this environment ([`Self::live_hosts`]).
+    pub fn live_host_count(&self) -> usize {
+        self.live_hosts().count()
     }
 
     /// `environmentStatus`: the roll-up of the environment's `checks`, which

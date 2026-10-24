@@ -171,6 +171,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let page_size = crate::state::page_size(input.max_results);
+
+        // The filter is checked ONCE, before any record is read: whether an
+        // expression is one the service can evaluate is a property of the
+        // expression, not of the rows it would be applied to, so a malformed
+        // filter is refused even for an account that holds no usage records.
+        if let Some(filter) = input.filter.as_ref() {
+            check_expression(filter, 0)?;
+        }
+
         let store = state.lock();
         let records = store.usages_for(crate::state::caller_account_id());
 
@@ -178,10 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // token is an offset into the records and not into the filtered view.
         let mut selected: Vec<(usize, &crate::state::UsageRecord)> = Vec::new();
         for (position, record) in records.iter().enumerate().skip(offset) {
-            let keep = match input.filter.as_ref() {
-                None => true,
-                Some(filter) => matches_expression(record, filter, 0)?,
-            };
+            let keep = input
+                .filter
+                .as_ref()
+                .is_none_or(|filter| matches_expression(record, filter));
             if keep {
                 selected.push((position, record));
             }
@@ -217,6 +226,19 @@ const MAX_FILTER_DEPTH: usize = 16;
 /// magnitude (`shared_types::DIMENSION_VALUES` lists every dimension).
 const DIMENSION_USAGE_PERCENTAGE: &str = "USAGE_PERCENTAGE";
 
+/// The root operators of an `Expression`, by the names the model gives its
+/// members (`Or`, `And`, `Not`, `Dimensions`). A filter sets exactly one of
+/// them; see [`check_expression`].
+const ROOT_OR: &str = "Or";
+/// See [`ROOT_OR`].
+const ROOT_AND: &str = "And";
+/// See [`ROOT_OR`].
+const ROOT_NOT: &str = "Not";
+/// See [`ROOT_OR`].
+const ROOT_DIMENSIONS: &str = "Dimensions";
+/// Every root operator, in the order the model declares the members.
+const ROOT_OPERATORS: [&str; 4] = [ROOT_OR, ROOT_AND, ROOT_NOT, ROOT_DIMENSIONS];
+
 /// `MatchOption` values, from the model's enum of the same name
 /// (`shared_types::MATCH_OPTION_VALUES`).
 const MATCH_EQUALS: &str = "EQUALS";
@@ -241,73 +263,90 @@ fn render(record: &crate::state::UsageRecord) -> FreeTierUsage {
     }
 }
 
-/// Whether `record` satisfies `filter`.
+/// Check that `filter` is an expression the service can evaluate, refusing it
+/// with the modelled `ValidationException` otherwise.
 ///
-/// Each member of an `Expression` is honoured as the model documents it: `And`
-/// matches all of its expressions, `Or` any of them, `Not` the negation of its
-/// expression, and `Dimensions` one dimension comparison. An expression that
-/// sets several of them must satisfy each, and one that sets none expresses no
-/// condition at all and is refused rather than ignored.
-fn matches_expression(
-    record: &crate::state::UsageRecord,
-    filter: &Expression,
-    depth: usize,
-) -> Result<bool, GetFreeTierUsageError> {
+/// An `Expression` sets EXACTLY ONE root operator: "In the following Contents,
+/// you must specify exactly one of the following root operators" (the
+/// `Expression` shape, whose members are `Or`, `And`, `Not` and `Dimensions`).
+/// An expression that sets none states no condition, and one that sets several
+/// states several with nothing in the model saying how they combine — a
+/// conjunction would be this emulator's invention — so every arity but one is
+/// refused. The same rule governs every level of the tree, so each nested
+/// expression is checked the same way, as is the expression a logical operator
+/// carries no operand for.
+///
+/// Checking is separate from evaluating ([`matches_expression`]) because
+/// whether a filter is well formed depends on the filter alone: the answer must
+/// not vary with how many records the account happens to hold.
+fn check_expression(filter: &Expression, depth: usize) -> Result<(), GetFreeTierUsageError> {
     if depth > MAX_FILTER_DEPTH {
         return Err(validation(format!(
             "filter: the expression nests more than {MAX_FILTER_DEPTH} levels"
         )));
     }
 
-    let mut matched = true;
-    let mut members = 0;
-
-    if let Some(all) = filter.and.as_ref() {
-        members += 1;
-        for inner in all {
-            matched &= matches_expression(record, inner, depth + 1)?;
-        }
+    let mut roots: Vec<&str> = Vec::new();
+    if filter.or.is_some() {
+        roots.push(ROOT_OR);
+    }
+    if filter.and.is_some() {
+        roots.push(ROOT_AND);
+    }
+    if filter.not.is_some() {
+        roots.push(ROOT_NOT);
+    }
+    if filter.dimensions.is_some() {
+        roots.push(ROOT_DIMENSIONS);
     }
 
-    if let Some(any) = filter.or.as_ref() {
-        members += 1;
-        let mut or_matched = false;
-        for inner in any {
-            or_matched |= matches_expression(record, inner, depth + 1)?;
+    if roots.len() != 1 {
+        let set = if roots.is_empty() {
+            "none".to_string()
+        } else {
+            roots.join(", ")
+        };
+        return Err(validation(format!(
+            "filter: an expression must set exactly one of {}, but this one sets {set}",
+            ROOT_OPERATORS.join(", ")
+        )));
+    }
+
+    // `Or` and `And` carry a list of expressions each; a list that holds none
+    // states no condition, exactly as an expression with no root operator does.
+    for (name, branches) in [(ROOT_OR, filter.or.as_ref()), (ROOT_AND, filter.and.as_ref())] {
+        if let Some(branches) = branches {
+            if branches.is_empty() {
+                return Err(validation(format!(
+                    "filter.{name}: a logical operator must list at least one expression"
+                )));
+            }
+            for inner in branches {
+                check_expression(inner, depth + 1)?;
+            }
         }
-        matched &= or_matched;
     }
 
     if let Some(inner) = filter.not.as_ref() {
-        members += 1;
-        matched &= !matches_expression(record, inner, depth + 1)?;
+        check_expression(inner, depth + 1)?;
     }
 
     if let Some(dimensions) = filter.dimensions.as_ref() {
-        members += 1;
-        matched &= matches_dimension(record, dimensions)?;
+        check_dimension(dimensions)?;
     }
 
-    if members == 0 {
-        return Err(validation(
-            "filter: an expression must set one of And, Or, Not or Dimensions",
-        ));
-    }
-
-    Ok(matched)
+    Ok(())
 }
 
-/// Whether `record`'s value for one dimension matches the filter's values.
+/// Check one `Dimensions` comparison: the dimension it names, the values it
+/// compares against, and the single match option it compares under.
 ///
-/// The record matches when its value matches AT LEAST ONE of `Values` ("the
-/// results all match at least one of the specified values",
-/// `DimensionValues$Values`) under the single match option `MatchOptions`
-/// carries ("You can specify only one of these values in the array",
-/// `DimensionValues$MatchOptions`).
-fn matches_dimension(
-    record: &crate::state::UsageRecord,
-    dimensions: &DimensionValues,
-) -> Result<bool, GetFreeTierUsageError> {
+/// `MatchOptions` carries exactly one option ("You can specify only one of
+/// these values in the array", `DimensionValues$MatchOptions`), it has to be one
+/// the dimension's kind can be compared by, and comparing magnitudes needs
+/// values that are magnitudes — none of which depends on a record, so all of it
+/// is settled here.
+fn check_dimension(dimensions: &DimensionValues) -> Result<(), GetFreeTierUsageError> {
     let key = dimensions.key.as_str();
     if !DIMENSION_VALUES.contains(&key) {
         return Err(validation(format!(
@@ -336,14 +375,14 @@ fn matches_dimension(
         )));
     }
 
-    let Some(value) = record.dimension_value(key) else {
+    let Some(kind) = crate::state::dimension_kind(key) else {
         return Err(validation(format!(
             "filter.Dimensions.Key: {key} names no Free Tier usage member"
         )));
     };
 
-    match value {
-        crate::state::DimensionValue::Text(text) => {
+    match kind {
+        crate::state::DimensionKind::Text => {
             if option == MATCH_GREATER_THAN_OR_EQUAL {
                 return Err(validation(format!(
                     "filter.Dimensions.MatchOptions: {MATCH_GREATER_THAN_OR_EQUAL} compares \
@@ -351,12 +390,8 @@ fn matches_dimension(
                      {key}"
                 )));
             }
-            Ok(dimensions
-                .values
-                .iter()
-                .any(|wanted| matches_text(&text, wanted, option)))
         }
-        crate::state::DimensionValue::Number(number) => {
+        crate::state::DimensionKind::Number => {
             if option != MATCH_EQUALS && option != MATCH_GREATER_THAN_OR_EQUAL {
                 return Err(validation(format!(
                     "filter.Dimensions.MatchOptions: {key} is a number, so it compares with \
@@ -364,22 +399,72 @@ fn matches_dimension(
                 )));
             }
             for wanted in &dimensions.values {
-                let Ok(wanted) = wanted.trim().parse::<f64>() else {
+                if wanted.trim().parse::<f64>().is_err() {
                     return Err(validation(format!(
                         "filter.Dimensions.Values: {wanted} is not a number, and {key} compares \
                          numbers"
                     )));
-                };
-                let matched = if option == MATCH_EQUALS {
-                    (number - wanted).abs() < f64::EPSILON
-                } else {
-                    number >= wanted
-                };
-                if matched {
-                    return Ok(true);
                 }
             }
-            Ok(false)
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether `record` satisfies `filter`.
+///
+/// Evaluates an expression [`check_expression`] has already accepted, so
+/// exactly one root operator is set at every level and each is honoured as the
+/// model documents it: `And` matches all of its expressions, `Or` any of them,
+/// `Not` the negation of its expression, and `Dimensions` one dimension
+/// comparison. Total rather than fallible: every expression the service cannot
+/// evaluate was refused before any record was read.
+fn matches_expression(record: &crate::state::UsageRecord, filter: &Expression) -> bool {
+    if let Some(all) = filter.and.as_ref() {
+        return all.iter().all(|inner| matches_expression(record, inner));
+    }
+    if let Some(any) = filter.or.as_ref() {
+        return any.iter().any(|inner| matches_expression(record, inner));
+    }
+    if let Some(inner) = filter.not.as_ref() {
+        return !matches_expression(record, inner);
+    }
+    filter
+        .dimensions
+        .as_ref()
+        .is_some_and(|dimensions| matches_dimension(record, dimensions))
+}
+
+/// Whether `record`'s value for one dimension matches the filter's values.
+///
+/// The record matches when its value matches AT LEAST ONE of `Values` ("the
+/// results all match at least one of the specified values",
+/// `DimensionValues$Values`) under the single match option `MatchOptions`
+/// carries. [`check_dimension`] has already refused every comparison this
+/// cannot make.
+fn matches_dimension(record: &crate::state::UsageRecord, dimensions: &DimensionValues) -> bool {
+    let [option] = dimensions.match_options.as_slice() else {
+        return false;
+    };
+    let option = option.as_str();
+
+    match record.dimension_value(dimensions.key.as_str()) {
+        None => false,
+        Some(crate::state::DimensionValue::Text(text)) => dimensions
+            .values
+            .iter()
+            .any(|wanted| matches_text(&text, wanted, option)),
+        Some(crate::state::DimensionValue::Number(number)) => {
+            dimensions.values.iter().any(|wanted| {
+                wanted.trim().parse::<f64>().is_ok_and(|wanted| {
+                    if option == MATCH_GREATER_THAN_OR_EQUAL {
+                        number >= wanted
+                    } else {
+                        (number - wanted).abs() < f64::EPSILON
+                    }
+                })
+            })
         }
     }
 }

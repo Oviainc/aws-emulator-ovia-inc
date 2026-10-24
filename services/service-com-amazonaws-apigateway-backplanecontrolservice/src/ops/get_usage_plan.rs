@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetUsagePlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetUsagePlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the `UsagePlan` record [`crate::state`] holds under the
+//! `usagePlanId` path label, and the modelled `NotFoundException` when no stored plan
+//! answers to it. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetUsagePlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: it reports the stored record and writes nothing, so reading a plan cannot
+//! change what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +82,28 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::UsagePlanEntry;
+
+impl From<&UsagePlanEntry> for GetUsagePlanOutput {
+    /// The `UsagePlan` body for a stored plan. `GetUsagePlan` and `CreateUsagePlan`
+    /// share the `UsagePlan` shape but the scaffold renders it as two Rust types, so
+    /// this mirrors the `CreateUsagePlanOutput` conversion member for member rather than
+    /// rendering the record a second way.
+    fn from(entry: &UsagePlanEntry) -> Self {
+        let body = CreateUsagePlanOutput::from(entry);
+        Self {
+            id: body.id,
+            name: body.name,
+            description: body.description,
+            api_stages: body.api_stages,
+            throttle: body.throttle,
+            quota: body.quota,
+            product_code: body.product_code,
+            tags: body.tags,
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -156,18 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetUsagePlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetUsagePlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetUsagePlan"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+        let entry = store.usage_plans.get(&input.usage_plan_id).ok_or_else(|| {
+            GetUsagePlanErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_USAGE_PLAN.to_string()),
+            })
+        })?;
+        Ok(GetUsagePlanOutput::from(entry))
     }
 }
