@@ -169,6 +169,23 @@ pub struct HostLaunch<'a> {
     pub service_access_subnet_id: &'a str,
 }
 
+/// The physical processor cores one host running on `instance_type` has — the cores a
+/// VCF license has to cover for that host, which is what the `KEY_COVERAGE` check
+/// ("Verifies that the VCF license key allocates sufficient vCPU cores for all deployed
+/// hosts") counts.
+///
+/// Amazon EC2's OWN fact about the instance type, read through its instance-type record
+/// (`VCpuInfo$DefaultCores`, what `DescribeInstanceTypes` reports): an Amazon EVS host
+/// IS an EC2 bare metal instance, so its core count is EC2's to state and never a number
+/// of this service's own. A fact about the TYPE, so it reads no store and takes no lock.
+///
+/// `None` for an instance type EC2 holds no record for, because the cores of a host
+/// running on it are then not known at all.
+pub fn instance_type_cores(instance_type: &str) -> Option<u64> {
+    let record = ec2::instance_type_record(instance_type)?;
+    u64::try_from(record.default_cores).ok()
+}
+
 /// Launch the EC2 bare metal instance an ESX host IS, and attach its ENIs.
 ///
 /// "An ESX host that runs on an Amazon EC2 bare metal instance" (`Host` doc): the host

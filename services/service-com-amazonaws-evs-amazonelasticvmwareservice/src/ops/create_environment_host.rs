@@ -351,8 +351,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Adding a host changes the environment, so the record is re-stamped and the
         // summary this operation answers with reports that.
         environment.modified_at_ms = created_at_ms;
-        let environment_summary = environment.to_summary();
         state.note_transition_due(due_at);
+        // The new host is part of what the environment's health checks read (the host
+        // count, and the cores a license has to cover), so they are recomputed before
+        // the summary is built.
+        state.recompute_environment_checks();
+        let environment_summary = state
+            .environment_in_region(&region, &input.environment_id)
+            .map(|environment| environment.to_summary())
+            .ok_or_else(|| {
+                CreateEnvironmentHostErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "The environment the host was added to is no longer stored."
+                            .to_string(),
+                    },
+                )
+            })?;
 
         Ok(CreateEnvironmentHostOutput {
             environment_summary: Some(environment_summary),

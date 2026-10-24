@@ -1302,21 +1302,14 @@ async fn requests_that_break_an_unmodelled_rule_are_refused_and_the_rest_accepte
         "ResourceNotFoundException",
     );
 
-    // The members this slice does not serve are refused honestly, with the 501 that says
-    // the feature is not written yet — never accepted and silently dropped.
-    // (`autoScalingSpecification` is NOT among them: it is stored and reported by
-    // `GetTableAutoScalingSettings` — see `tests/all/column_types_and_auto_scaling.rs`.)
-    let unserved: [(&str, Value); 3] = [
-        (
-            "replicaSpecifications",
-            json!([{"region": "eu-west-1", "readCapacityUnits": 5}]),
-        ),
-        ("cdcSpecification", json!({"status": "ENABLED"})),
-        (
-            "warmThroughputSpecification",
-            json!({"readUnitsPerSecond": 12000, "writeUnitsPerSecond": 4000}),
-        ),
-    ];
+    // The ONE member this slice does not serve is refused honestly, with the 501 that says
+    // the feature is not written yet — never accepted and silently dropped. (The other
+    // optional specifications ARE served: `autoScalingSpecification` and
+    // `replicaSpecifications` are reported by `GetTable` /
+    // `GetTableAutoScalingSettings` and `warmThroughputSpecification` by `GetTable` — see
+    // `tests/all/column_types_and_auto_scaling.rs` and
+    // `tests/all/update_table_scaling_settings.rs`.)
+    let unserved: [(&str, Value); 1] = [("cdcSpecification", json!({"status": "ENABLED"}))];
     for (member, value) in unserved {
         let mut request = json!({
             "keyspaceName": keyspace,

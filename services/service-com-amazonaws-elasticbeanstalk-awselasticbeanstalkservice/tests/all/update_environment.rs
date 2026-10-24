@@ -10,7 +10,14 @@
 //! stood, and starts the update the model describes: `Updating` ("Environment is
 //! in the process of updating its configuration settings or application
 //! version"), `AbortableOperationInProgress` true, health checks suspended, with
-//! the return to `Ready` owed by the clock. A request that names no environment,
+//! the return to `Ready` owed by the clock. The configuration it deploys is the
+//! environment's DRAFT until that return is due — "when updating the
+//! configuration settings to a new template or individual settings, a draft
+//! configuration is created and DescribeConfigurationSettings for this
+//! environment returns two setting descriptions with different DeploymentStatus
+//! values" — and becomes the configuration the environment runs, and the
+//! resources follow, when the clock completes the deployment. A request that
+//! names no environment,
 //! names one in no state to be updated, names a value nothing answers to, changes
 //! the tier ("if you change the tier version, name, or type, Elastic Beanstalk
 //! returns InvalidParameterValue error") or asks for both a release and a
@@ -128,13 +135,24 @@ fn remove_params(options: &[(&str, &str, &str)]) -> Vec<(String, String)> {
     params
 }
 
-/// The option settings `DescribeConfigurationSettings` reports as deployed to
-/// `environment` — the configuration set "associated with a running environment".
-async fn deployed_options(
+/// The option settings one configuration-settings description reports, as
+/// `(Namespace, OptionName, Value, ResourceName)` per option — the shape
+/// [`reported_options`] answers in.
+type Options = Vec<(String, String, String, String)>;
+
+/// One configuration-settings description: its `DeploymentStatus` and the
+/// option settings it holds.
+type ConfigurationSet = (String, Options);
+
+/// Every configuration-settings description `DescribeConfigurationSettings`
+/// reports for `environment`, as `(DeploymentStatus, option settings)` in
+/// document order — read description by description, so a description's status
+/// and its options cannot be re-aligned across descriptions.
+async fn configuration_sets(
     emulator: &Emulator,
     case: &str,
     environment: &str,
-) -> Vec<(String, String, String, String)> {
+) -> Vec<ConfigurationSet> {
     let described = ok(
         emulator,
         case,
@@ -142,7 +160,59 @@ async fn deployed_options(
         &[("ApplicationName", APPLICATION), ("EnvironmentName", environment)],
     )
     .await;
-    reported_options(&described)
+    described
+        .elements_at("ConfigurationSettings/member")
+        .iter()
+        .map(|member| {
+            (
+                member
+                    .value("DeploymentStatus")
+                    .unwrap_or_default()
+                    .to_string(),
+                reported_options(member),
+            )
+        })
+        .collect()
+}
+
+/// The option settings `DescribeConfigurationSettings` reports as deployed to
+/// `environment` — "the configuration that is currently deployed to the
+/// associated running environment". A running environment reports exactly one
+/// such description, whatever else it carries as a draft.
+async fn deployed_options(emulator: &Emulator, case: &str, environment: &str) -> Options {
+    let reported = configuration_sets(emulator, case, environment).await;
+    let deployed: Vec<&ConfigurationSet> = reported
+        .iter()
+        .filter(|(status, _)| status == eb::state::DEPLOYMENT_STATUS_DEPLOYED)
+        .collect();
+    assert_eq!(
+        deployed.len(),
+        1,
+        "case {case:?}: expected exactly one deployed configuration set, got {reported:?}"
+    );
+    deployed[0].1.clone()
+}
+
+/// The DRAFT configuration `environment` carries, as `(DeploymentStatus, option
+/// settings)`, or `None` when it carries none: "a draft configuration of an
+/// environment that is either in the process of deployment or that failed to
+/// deploy" — the description whose status is not `deployed`.
+async fn draft_configuration(
+    emulator: &Emulator,
+    case: &str,
+    environment: &str,
+) -> Option<ConfigurationSet> {
+    let reported = configuration_sets(emulator, case, environment).await;
+    let drafts: Vec<ConfigurationSet> = reported
+        .iter()
+        .filter(|(status, _)| status != eb::state::DEPLOYMENT_STATUS_DEPLOYED)
+        .cloned()
+        .collect();
+    assert!(
+        drafts.len() <= 1,
+        "case {case:?}: an environment carries at most one draft configuration, got {drafts:?}"
+    );
+    drafts.into_iter().next()
 }
 
 /// The `names` members `DescribeEnvironments` reports for `environment`.
@@ -304,13 +374,46 @@ async fn an_update_deploys_exactly_the_configuration_change_the_request_names() 
             updated.body
         );
 
-        // The deployed configuration is what a later reader sees — twice, so a
-        // read cannot change what the next one reports.
+        // "When updating the configuration settings to a new template or
+        // individual settings, a draft configuration is created and
+        // DescribeConfigurationSettings for this environment returns two
+        // setting descriptions with different DeploymentStatus values": the
+        // configuration this update deploys is waiting to be deployed, and the
+        // environment is still running the one it was launched with. A row that
+        // changes no option deploys no configuration change, so it creates no
+        // draft at all.
+        let expected_draft = (expected_options(expected) != expected_options(INITIAL)).then(|| {
+            (
+                eb::state::DEPLOYMENT_STATUS_PENDING.to_string(),
+                expected_options(expected),
+            )
+        });
+        assert_eq!(
+            draft_configuration(&emulator, case, environment).await,
+            expected_draft,
+            "case {case:?}: unexpected draft configuration while the update is in flight"
+        );
+        assert_eq!(
+            deployed_options(&emulator, case, environment).await,
+            expected_options(INITIAL),
+            "case {case:?}: the environment runs the configuration it had until the \
+             deployment completes"
+        );
+
+        // The deployment the clock owed has completed: the draft is now the
+        // configuration the environment runs, and it is a draft no longer. Read
+        // twice, so a read cannot change what the next one reports.
+        std::thread::sleep(PAST_DUE);
         for read in 1..=2 {
             assert_eq!(
                 deployed_options(&emulator, case, environment).await,
                 expected_options(expected),
                 "case {case:?}: unexpected deployed configuration on read {read}"
+            );
+            assert_eq!(
+                draft_configuration(&emulator, case, environment).await,
+                None,
+                "case {case:?}: a deployed configuration is no draft, on read {read}"
             );
         }
     }
@@ -461,6 +564,9 @@ async fn an_update_deploys_the_description_release_template_and_platform_it_name
             values,
             "case {case:?}: the update must be what a later read reports"
         );
+        // The configuration an update deploys becomes the environment's once
+        // the deployment the clock owed has completed.
+        std::thread::sleep(PAST_DUE);
         assert_eq!(
             deployed_options(&emulator, case, environment).await,
             expected_options(expected_settings),
@@ -606,11 +712,14 @@ async fn an_update_follows_the_configuration_without_reprovisioning_the_environm
     );
 
     // An update that raises the Auto Scaling minimum grows the group's
-    // membership; the group keeps the name it was provisioned under, because an
+    // membership once the deployment it started has completed — the resources
+    // follow the configuration the environment RUNS, not the draft waiting to
+    // be deployed; the group keeps the name it was provisioned under, because an
     // update is not the reprovision `RebuildEnvironment` performs.
     let mut params = owned(&[("EnvironmentName", "env-resources")]);
     params.extend(option_params(&[(ASG, "MinSize", "5", "")]));
     ok(&emulator, case, "UpdateEnvironment", &as_params(&params)).await;
+    std::thread::sleep(PAST_DUE);
 
     let after = ok(&emulator, case, "DescribeEnvironmentResources", &read).await;
     let kept = inventory(&after, instance_path);

@@ -30,6 +30,8 @@ mod entitlement_connector;
 mod entitlements;
 #[path = "all/environment_deletion_hosts.rs"]
 mod environment_deletion_hosts;
+#[path = "all/environment_health_checks.rs"]
+mod environment_health_checks;
 #[path = "all/environment_lifecycle.rs"]
 mod environment_lifecycle;
 #[path = "all/error_wire_status.rs"]

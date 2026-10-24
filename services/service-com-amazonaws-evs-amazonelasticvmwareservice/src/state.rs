@@ -11,7 +11,7 @@
 //! the stored record, built by the `to_*` methods below so that every operation
 //! reports one resource identically.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use smithy_server_runtime::{Violation, ViolationKind};
@@ -47,6 +47,56 @@ pub const CHECK_PASSED: &str = "PASSED";
 pub const CHECK_UNKNOWN: &str = "UNKNOWN";
 /// See [`CHECK_PASSED`].
 pub const CHECK_FAILED: &str = "FAILED";
+
+/// The `CheckType` of one environment health check this service RUNS — the checks that
+/// are decidable from facts this emulator holds. `CheckType` declares thirteen values
+/// (`smithy_query(query="shape", shape="CheckType")`); these three are the ones whose
+/// subject is the environment's own stored record:
+///
+/// * `KEY_REUSE` — "Verifies that the VCF license key is not used by another Amazon EVS
+///   environment": every environment's `licenseInfo` is stored, so reuse across the
+///   store is decidable ([`StoredEnvironment::license_keys`]).
+/// * `KEY_COVERAGE` — "Verifies that the VCF license key allocates sufficient vCPU
+///   cores for all deployed hosts": the environment's hosts give the cores to cover
+///   and the account's own `vcfPortedCoreCount` setting the cores its VCF licenses
+///   allocate.
+/// * `HOST_COUNT` — "Verifies that the environment meets the minimum host count": the
+///   environment's hosts decide it against [`MINIMUM_HOST_COUNT`].
+///
+/// The other ten types each probe something OUTSIDE this emulator — SDDC Manager,
+/// vCenter Server, Operations Manager, or the appliance behind a connector, none of
+/// which this emulator runs or contacts (the same reason [`StoredConnector::checks`] is
+/// always empty) — so no check of those types has run and none is reported: a result
+/// there would claim a probe nothing performed.
+pub const CHECK_TYPE_KEY_REUSE: &str = "KEY_REUSE";
+/// See [`CHECK_TYPE_KEY_REUSE`].
+pub const CHECK_TYPE_KEY_COVERAGE: &str = "KEY_COVERAGE";
+/// See [`CHECK_TYPE_KEY_REUSE`].
+pub const CHECK_TYPE_HOST_COUNT: &str = "HOST_COUNT";
+
+/// The fewest hosts an Amazon EVS environment meets its host count with — what the
+/// `HOST_COUNT` check ("Verifies that the environment meets the minimum host count")
+/// judges an environment against.
+///
+/// Four, because that is the number of hosts an environment is BUILT with:
+/// `CreateEnvironmentRequest$hosts` is modelled `@length(min: 4, max: 4)`
+/// (`smithy_query(query="operation", operation="CreateEnvironment")`), so an
+/// environment cannot be created with fewer, and an environment holding fewer than four
+/// no longer meets the count.
+pub const MINIMUM_HOST_COUNT: usize = 4;
+
+/// The `Check$id` of one check of one environment: "A unique ID for the check."
+///
+/// A check is identified by the environment it ran on and the `CheckType` it is, so the
+/// id is built from exactly those two: unique across environments and check types, and
+/// the SAME on every read, because a freshly minted id per read would make one check
+/// look like a different check on each call.
+pub fn check_id(environment_id: &str, check_type: &str) -> String {
+    format!(
+        "{environment_id}-{}",
+        check_type.to_ascii_lowercase().replace('_', "-")
+    )
+}
 
 /// The `HostState` values a stored host moves through.
 ///
@@ -876,13 +926,30 @@ pub struct StoredEnvironment {
     pub vlans: Vec<StoredVlan>,
     /// The ESX hosts the create request asked for, kept as supplied.
     ///
-    /// `CreateEnvironment` accepts them, so losing them would discard caller input;
-    /// materialising them into `Host` records is the host slice's work
-    /// (`CreateEnvironmentHost` / `ListEnvironmentHosts` still answer 501), so nothing
-    /// reports them yet.
+    /// `CreateEnvironment` accepts them, so losing them would discard caller input.
+    /// They are not materialised into `Host` records of their own \u2014 `CreateEnvironmentHost`
+    /// is what adds a reportable host to [`Self::hosts`] \u2014 but they ARE hosts the
+    /// environment is deployed with, so the environment health checks count them
+    /// ([`Self::deployed_hosts`]).
     pub requested_hosts: Vec<crate::ops::types::HostInfoForCreate>,
-    /// Environment checks, the roll-up [`Self::environment_status`] reports.
+    /// The environment health checks, as [`Self::refresh_checks`] last ran them, and
+    /// the roll-up [`Self::environment_status`] reports.
+    ///
+    /// DERIVED: a pure function of this environment's record, the other environments'
+    /// license keys and the account's settings, recomputed by
+    /// [`ComAmazonawsEvsAmazonelasticvmwareserviceState::recompute_environment_checks`]
+    /// before any operation reports the environment. Nothing appends to it.
     pub checks: Vec<Check>,
+    /// When each FAILING check's impairment began, keyed by `CheckType` \u2014
+    /// `Check$impairedSince`, "The time when environment health began to be impaired".
+    ///
+    /// The one part of a check a recomputation cannot read off the store, because it is
+    /// about WHEN the check started failing: it is written by the recomputation that
+    /// first finds the check failing and dropped as soon as the check stops failing. The
+    /// instant written is the one the facts that check reads last changed at
+    /// ([`Self::health_changed_at_ms`]) and never the instant of the read, so two reads
+    /// of an unchanged environment report one `impairedSince`.
+    pub impaired_since_ms: BTreeMap<String, i64>,
     /// The Windows Server License entitlements created in this environment, keyed by
     /// [`entitlement_key`]. A `BTreeMap` so `ListVmEntitlements` has one stable order
     /// to page over, and bounded by [`MAX_ENTITLEMENTS_PER_ENVIRONMENT`].
@@ -1020,20 +1087,181 @@ impl StoredEnvironment {
 
     /// `environmentStatus`: the roll-up of the environment's `checks`, which
     /// "reports impaired functionality that stems from issues internal to the
-    /// environment". A failed check is `FAILED`; an environment whose checks cannot
-    /// have run yet (it is not `CREATED`) is `UNKNOWN`; anything else is `PASSED`.
+    /// environment".
+    ///
+    /// A failed check makes it `FAILED`; otherwise a check that passed makes it
+    /// `PASSED`; and an environment NO check has decided — one whose checks cannot have
+    /// run yet because it is not `CREATED`, or one whose every check was undecidable —
+    /// is `UNKNOWN`. So a check this emulator could not decide never impairs an
+    /// environment whose other checks passed, and an environment nothing checked never
+    /// reports health nothing verified.
     pub fn environment_status(&self) -> &'static str {
-        if self
-            .checks
+        let results = || self.checks.iter().filter_map(|check| check.result.as_deref());
+        if results().any(|result| result == CHECK_FAILED) {
+            CHECK_FAILED
+        } else if results().any(|result| result == CHECK_PASSED) {
+            CHECK_PASSED
+        } else {
+            CHECK_UNKNOWN
+        }
+    }
+
+    /// Every VCF license key this environment carries: the solution key and the vSAN key
+    /// of each `licenseInfo` entry.
+    ///
+    /// The set `KEY_REUSE` compares across the store. Both members count, because each
+    /// is a Broadcom-issued license key ("Amazon EVS requires two license keys: a VCF
+    /// solution key and a vSAN license key", `LicenseInfo` doc) and reuse is about the
+    /// KEY, not about which member carried it; a key given twice is one key.
+    pub fn license_keys(&self) -> BTreeSet<String> {
+        self.license_info
             .iter()
-            .any(|check| check.result.as_deref() == Some(CHECK_FAILED))
+            .flat_map(|license| [license.solution_key.clone(), license.vsan_key.clone()])
+            .collect()
+    }
+
+    /// The hosts this environment is DEPLOYED with, as `hostName -> instanceType`: the
+    /// ESX hosts added through `CreateEnvironmentHost` that still occupy it
+    /// ([`Self::live_hosts`]), together with the hosts the create request asked Amazon
+    /// EVS to deploy the environment with (`CreateEnvironmentRequest$hosts`, kept on
+    /// [`Self::requested_hosts`]).
+    ///
+    /// Keyed by `hostName` because that is what identifies a host ("DNS hostnames for
+    /// hosts must be unique across Amazon EVS environments and within VCF",
+    /// `HostInfoForCreate$hostName` doc), so a name that appears in both is one host and
+    /// counts once — and the added record wins, since it is the one the service built.
+    /// This is the host population the `HOST_COUNT` and `KEY_COVERAGE` checks read.
+    pub fn deployed_hosts(&self) -> BTreeMap<&str, &str> {
+        self.requested_hosts
+            .iter()
+            .map(|host| (host.host_name.as_str(), host.instance_type.as_str()))
+            .chain(
+                self.live_hosts()
+                    .map(|host| (host.host_name.as_str(), host.instance_type.as_str())),
+            )
+            .collect()
+    }
+
+    /// The physical processor cores the hosts this environment is deployed with run on —
+    /// what a VCF license has to cover, since `termsAccepted` is the customer's
+    /// confirmation of "the required number of VCF software licenses to cover all
+    /// physical processor cores in the Amazon EVS environment" (its own doc).
+    ///
+    /// Each host's cores are Amazon EC2's own fact about the bare metal instance type
+    /// the host runs on ([`ec2_resources::instance_type_cores`]), never a number of this
+    /// service's own. `None` when some host runs on an instance type EC2 describes no
+    /// record for, because the environment's core count is then not known at all.
+    pub fn deployed_core_count(&self) -> Option<u64> {
+        self.deployed_hosts()
+            .values()
+            .try_fold(0u64, |total, instance_type| {
+                Some(total.saturating_add(ec2_resources::instance_type_cores(instance_type)?))
+            })
+    }
+
+    /// The latest instant a fact the environment health checks read was changed: this
+    /// environment's own `modifiedAt`, and that of every host it holds.
+    ///
+    /// A check that has started failing has been failing since no earlier than this, so
+    /// it is the instant [`Self::refresh_checks`] dates an impairment from. A STORED
+    /// instant, so `impairedSince` does not depend on when anybody read the environment.
+    fn health_changed_at_ms(&self) -> i64 {
+        self.hosts
+            .values()
+            .map(|host| host.modified_at_ms)
+            .chain(::std::iter::once(self.modified_at_ms))
+            .max()
+            .unwrap_or(self.modified_at_ms)
+    }
+
+    /// Run this environment's health checks and store their results, so every operation
+    /// that reports the environment reports the checks that hold at that instant.
+    ///
+    /// `key_users` counts, per license key, how many live environments of the store
+    /// carry it, and `ported_core_count` is the VCF license cores the account has ported
+    /// to Amazon EVS in this environment's Region: the two facts a check of ONE
+    /// environment cannot read off that environment, gathered once per recomputation by
+    /// [`ComAmazonawsEvsAmazonelasticvmwareserviceState::recompute_environment_checks`].
+    ///
+    /// A check whose facts the environment does not carry reports `UNKNOWN` — "the check
+    /// result" of a check that could not be decided — rather than `PASSED`, which would
+    /// claim a verification nothing performed.
+    pub fn refresh_checks(
+        &mut self,
+        key_users: &BTreeMap<String, usize>,
+        ported_core_count: Option<u64>,
+    ) {
+        // A check runs on a SETTLED environment: while one is still being created, or is
+        // being or has been deleted, no check of it has run, so it reports none and
+        // carries no impairment.
+        if self.state != STATE_CREATED {
+            self.checks.clear();
+            self.impaired_since_ms.clear();
+            return;
+        }
+        let keys = self.license_keys();
+        // "Verifies that the VCF license key is not used by another Amazon EVS
+        // environment": a key this environment carries that another live environment
+        // carries too is used twice over. An environment carrying no key leaves nothing
+        // to verify.
+        let key_reuse = if keys.is_empty() {
+            CHECK_UNKNOWN
+        } else if keys
+            .iter()
+            .any(|key| key_users.get(key).copied().unwrap_or_default() > 1)
         {
             CHECK_FAILED
-        } else if self.state != STATE_CREATED {
-            CHECK_UNKNOWN
         } else {
             CHECK_PASSED
+        };
+        // "Verifies that the VCF license key allocates sufficient vCPU cores for all
+        // deployed hosts": the cores the deployed hosts run on, against the cores the
+        // account's VCF licenses allocate. Undecidable — so UNKNOWN — when the
+        // environment carries no key, when the account has not stated how many cores its
+        // licenses allocate, or when a host's cores are not known.
+        let key_coverage = match (keys.is_empty(), ported_core_count, self.deployed_core_count()) {
+            (false, Some(allocated), Some(required)) if required <= allocated => CHECK_PASSED,
+            (false, Some(_), Some(_)) => CHECK_FAILED,
+            _ => CHECK_UNKNOWN,
+        };
+        // "Verifies that the environment meets the minimum host count."
+        let host_count = if self.deployed_hosts().len() >= MINIMUM_HOST_COUNT {
+            CHECK_PASSED
+        } else {
+            CHECK_FAILED
+        };
+
+        let impaired_at_ms = self.health_changed_at_ms();
+        let environment_id = self.environment_id.clone();
+        let results = [
+            (CHECK_TYPE_KEY_REUSE, key_reuse),
+            (CHECK_TYPE_KEY_COVERAGE, key_coverage),
+            (CHECK_TYPE_HOST_COUNT, host_count),
+        ];
+        let mut checks = Vec::with_capacity(results.len());
+        for (check_type, result) in results {
+            // `impairedSince` is "the time when environment health began to be
+            // impaired", so only a FAILING check carries one, and it is the instant
+            // already remembered for this check type if it was failing before.
+            let impaired_since_ms = if result == CHECK_FAILED {
+                Some(
+                    *self
+                        .impaired_since_ms
+                        .entry(check_type.to_string())
+                        .or_insert(impaired_at_ms),
+                )
+            } else {
+                self.impaired_since_ms.remove(check_type);
+                None
+            };
+            checks.push(Check {
+                r#type: Some(check_type.to_string()),
+                id: Some(check_id(&environment_id, check_type)),
+                result: Some(result.to_string()),
+                impaired_since: impaired_since_ms.map(timestamp),
+            });
         }
+        self.checks = checks;
     }
 
     /// This environment as the modelled `Environment` shape.
@@ -1188,9 +1416,18 @@ pub struct AccountSettingSpec {
 /// ([`account_setting_failures`]). Add a row here when the model documents another
 /// setting; nothing else needs to change.
 pub const ACCOUNT_SETTINGS: &[AccountSettingSpec] = &[AccountSettingSpec {
-    name: "vcfPortedCoreCount",
+    name: VCF_PORTED_CORE_COUNT,
     maximum: 1_000_000,
 }];
+
+/// The name of the setting that states how many VCF license cores the account has
+/// ported to Amazon EVS in a Region: "The total number of VCF license cores ported to
+/// Amazon EVS for the account in that Region" (`AccountSetting$name` doc).
+///
+/// Named here because it is read by more than the settings operations: it is the core
+/// allocation the `KEY_COVERAGE` check judges an environment's hosts against
+/// ([`ComAmazonawsEvsAmazonelasticvmwareserviceState::recompute_environment_checks`]).
+pub const VCF_PORTED_CORE_COUNT: &str = "vcfPortedCoreCount";
 
 /// The setting `name` names, if it is one this service accepts.
 pub fn account_setting_spec(name: &str) -> Option<&'static AccountSettingSpec> {
@@ -1342,12 +1579,27 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
         format!("eipassoc-{value:017x}")
     }
 
-    /// Apply every lifecycle transition the clock has made due, so a reporting
-    /// operation answers with the states that are owed at this instant.
+    /// Apply every lifecycle transition the clock has made due and recompute every
+    /// environment's health checks, so a reporting operation answers with the states and
+    /// the health that are owed at this instant.
+    ///
+    /// Both halves are what a REPORTING operation may do: the first materialises a
+    /// change the clock had already made due, and the second recomputes a derived value
+    /// ([`Self::recompute_environment_checks`]).
+    pub fn materialise_due_transitions(&mut self) {
+        self.materialise_due_lifecycle_transitions();
+        // The checks read the states the transitions above just settled, so they are
+        // recomputed after them — and on every call, because a host deleted, a license
+        // key freed or a core count set changes an environment's health at once and
+        // nothing else would notice.
+        self.recompute_environment_checks();
+    }
+
+    /// Apply every lifecycle transition the clock has made due.
     ///
     /// O(1) until the earliest due instant arrives: only then is the store walked, and
     /// the walk is bounded by [`MAX_ENVIRONMENTS`].
-    pub fn materialise_due_transitions(&mut self) {
+    fn materialise_due_lifecycle_transitions(&mut self) {
         let now = Instant::now();
         if self.next_transition_at.is_none_or(|due_at| now < due_at) {
             return;
@@ -1363,6 +1615,51 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
             }
         }
         self.next_transition_at = next_transition_at;
+    }
+
+    /// Recompute every environment's health checks, so each operation that reports an
+    /// environment reports the checks that hold at this instant.
+    ///
+    /// The checks are a DERIVED value — a pure function of the stored environments,
+    /// their hosts and the account's settings — so recomputing them on a read changes
+    /// nothing a later caller sees; the only thing carried over from one recomputation
+    /// to the next is when a failing check started failing
+    /// ([`StoredEnvironment::impaired_since_ms`]).
+    ///
+    /// The two facts no single environment carries are gathered once here: how many live
+    /// environments carry each VCF license key (`KEY_REUSE` is about reuse "by another
+    /// Amazon EVS environment", so its scope is the whole store, exactly as a host name
+    /// is unique across environments) and the VCF license cores the account has ported
+    /// in each Region (`KEY_COVERAGE`). Bounded by [`MAX_ENVIRONMENTS`] and the hosts
+    /// those environments hold.
+    pub fn recompute_environment_checks(&mut self) {
+        let mut key_users: BTreeMap<String, usize> = BTreeMap::new();
+        for environment in self.environments.values() {
+            // A DELETED environment carries its license key no longer, exactly as it
+            // carries its name no longer ([`Self::name_is_taken`]): the key is free for
+            // another environment again, so it is not counted as a user of it.
+            if environment.state == STATE_DELETED {
+                continue;
+            }
+            for key in environment.license_keys() {
+                *key_users.entry(key).or_default() += 1;
+            }
+        }
+        // The cores the account's VCF licenses allocate, per Region: the value of the
+        // `vcfPortedCoreCount` setting where the account has set one. Read from the
+        // settings map directly, so the environments can be walked mutably below.
+        let ported_cores: BTreeMap<&str, u64> = self
+            .account_settings
+            .iter()
+            .filter_map(|(region, settings)| {
+                let cores = settings.get(VCF_PORTED_CORE_COUNT)?.parse().ok()?;
+                Some((region.as_str(), cores))
+            })
+            .collect();
+        for environment in self.environments.values_mut() {
+            let ported = ported_cores.get(environment.region.as_str()).copied();
+            environment.refresh_checks(&key_users, ported);
+        }
     }
 
     /// Record that a transition is owed at `due_at`, so

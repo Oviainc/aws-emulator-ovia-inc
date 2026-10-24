@@ -5,10 +5,14 @@
 //! [`crate::state`], leaves it `UPDATING` until the clock owes it `ACTIVE` again, and
 //! answers with the table's ARN. This is the ONLY file to touch for `UpdateTable`.
 //!
-//! Four input members are NOT served here and are refused with a 501 that says so rather
-//! than stored and forgotten: `autoScalingSpecification`, `replicaSpecifications`,
-//! `cdcSpecification` and `warmThroughputSpecification`, each of which is reported by an
-//! operation that is still scaffolded. `CreateTable` refuses the same four.
+//! Every table setting the model gives this operation is applied here — added columns,
+//! capacity mode, auto scaling, per-Region replica settings, warm throughput, encryption,
+//! point-in-time recovery, ttl, default ttl and client-side timestamps — and is reported
+//! back by `GetTable` or `GetTableAutoScalingSettings`. The ONE exception is
+//! `cdcSpecification`, which no report here can answer for (`GetTable` has no CDC summary
+//! to carry yet) and which is refused with a 501 that says so rather than stored and
+//! forgotten; `CreateTable` refuses the same member. See the open issue "Keyspaces CDC
+//! never enabled".
 //!
 //! The paragraphs below are the scaffold's own notes on how an operation is shaped and
 //! how it reaches state; they still describe this file.
@@ -220,41 +224,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
-        // Members this slice cannot serve faithfully yet — the same four `CreateTable`
-        // refuses, for the same reasons: an update of `autoScalingSpecification` is not
-        // applied here, `replicaSpecifications` overrides read capacity and read capacity
-        // auto scaling PER Region, which no report here can distinguish from the table's own
-        // (`GetTable` and `GetTableAutoScalingSettings` report the table's settings in each
-        // Region the owning keyspace replicates it to), and the CDC and warm-throughput
-        // summaries are still scaffolded. Accepting one would mean storing a setting nothing
-        // here can answer for. The honest 501 says so, and is worded so it is not read as
-        // "UpdateTable is a stub": the operation IS implemented, this part of its surface is
-        // not.
-        let unimplemented: Vec<&str> = [
-            (
-                "autoScalingSpecification",
-                input.auto_scaling_specification.is_some(),
-            ),
-            ("replicaSpecifications", input.replica_specifications.is_some()),
-            ("cdcSpecification", input.cdc_specification.is_some()),
-            (
-                "warmThroughputSpecification",
-                input.warm_throughput_specification.is_some(),
-            ),
-        ]
-        .iter()
-        .filter(|(_, present)| *present)
-        .map(|(name, _)| *name)
-        .collect();
-        if !unimplemented.is_empty() {
+        // The ONE member this slice cannot serve faithfully yet, the same one `CreateTable`
+        // refuses: a CDC stream has no summary any report here carries, so accepting it
+        // would mean storing a setting nothing can answer for. The honest 501 says so, and
+        // is worded so it is not read as "UpdateTable is a stub": the operation IS
+        // implemented, this part of its surface is not.
+        if input.cdc_specification.is_some() {
             return Err(crate::scaffolded::Scaffolded::NotImplemented(
                 crate::scaffolded::NotImplemented {
-                    message: format!(
-                        "UpdateTable is implemented in this emulator, but not its {} \
-                         member(s): omit them, or the table would be stored with settings \
-                         no operation here can report.",
-                        unimplemented.join(", ")
-                    ),
+                    message: "UpdateTable is implemented in this emulator, but not its \
+                              cdcSpecification member: omit it, or the table would be stored \
+                              with a CDC stream setting no operation here can report."
+                        .to_string(),
                 },
             ));
         }
@@ -274,6 +255,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ("addColumns", input.add_columns.is_some()),
             ("capacitySpecification", input.capacity_specification.is_some()),
             (
+                "autoScalingSpecification",
+                input.auto_scaling_specification.is_some(),
+            ),
+            ("replicaSpecifications", input.replica_specifications.is_some()),
+            (
+                "warmThroughputSpecification",
+                input.warm_throughput_specification.is_some(),
+            ),
+            (
                 "encryptionSpecification",
                 input.encryption_specification.is_some(),
             ),
@@ -292,7 +282,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if requested.len() != 1 {
             return Err(invalid(if requested.is_empty() {
                 "UpdateTable requires one table setting to update: addColumns, \
-                 capacitySpecification, encryptionSpecification, pointInTimeRecovery, \
+                 capacitySpecification, autoScalingSpecification, replicaSpecifications, \
+                 warmThroughputSpecification, encryptionSpecification, pointInTimeRecovery, \
                  ttl, defaultTimeToLive or clientSideTimestamps"
                     .to_string()
             } else {
@@ -344,6 +335,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The Regions this keyspace replicates its tables to, which is what a per-Region
+        // setting may name; taken before the table is borrowed mutably, since it is the
+        // KEYSPACE that holds the replication group.
+        let replica_regions: Option<Vec<String>> =
+            keyspace.table_replica_regions().map(<[String]>::to_vec);
         let Some(table) = keyspace.tables.get_mut(&input.table_name) else {
             return Err(UpdateTableErrorModeled::ResourceNotFoundException(
                 crate::state::table_not_found(&region, &input.keyspace_name, &input.table_name),
@@ -368,6 +364,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+
+        // The change is accepted now and the table is `UPDATING` until the clock owes it
+        // `ACTIVE` one span from here; `settle` materialises that, and nothing sleeps.
+        let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
+
+        // Auto scaling, the per-Region settings and the warm throughput are each resolved
+        // against the table AS IT STANDS NOW — the capacity mode it is in, the Regions its
+        // keyspace replicates it to, and the warm throughput it was already pre-warmed for
+        // — so none of them can be checked before the store is reached. All three are
+        // checked here, BEFORE anything is written, so a refused update still leaves the
+        // table exactly as it was.
+        //
+        // Every table a caller created carries the capacity specification its `CreateTable`
+        // stored; the only tables without one are the service-managed ones, refused above.
+        let Some(stored_capacity) = table.capacity_specification.clone() else {
+            return Err(invalid(crate::state::service_managed_rejection(
+                &input.keyspace_name,
+            )));
+        };
+        let auto_scaling_specification = match input.auto_scaling_specification {
+            Some(supplied) => crate::state::resolve_auto_scaling(Some(supplied), &stored_capacity)
+                .map_err(invalid)?,
+            None => None,
+        };
+        let replica_specifications = match input.replica_specifications {
+            Some(supplied) => Some(
+                crate::state::resolve_replica_specifications(
+                    supplied,
+                    &table.replica_specifications,
+                    Some(&stored_capacity),
+                    replica_regions.as_deref(),
+                )
+                .map_err(invalid)?,
+            ),
+            None => None,
+        };
+        let warm_throughput_specification = match input.warm_throughput_specification.as_ref() {
+            Some(supplied) => Some(
+                crate::state::resolve_warm_throughput(
+                    supplied,
+                    table.warm_throughput_specification.as_ref(),
+                    settles_at,
+                )
+                .map_err(invalid)?,
+            ),
+            None => None,
+        };
 
         if let Some(added) = input.add_columns {
             // Every table reachable here carries the schema its `CreateTable` stored: the
@@ -466,10 +509,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(client_side_timestamps) = input.client_side_timestamps {
             table.client_side_timestamps = Some(client_side_timestamps);
         }
+        if let Some(supplied) = auto_scaling_specification {
+            // "If auto scaling is already enabled for the table, you can use UpdateTable to
+            // update the minimum and maximum values or the auto scaling policy settings
+            // independently": the two capacities are configured independently of each
+            // other, so a request carrying one of them leaves the other's settings where
+            // they are instead of dropping them.
+            let stored = table
+                .auto_scaling_specification
+                .get_or_insert_with(AutoScalingSpecification::default);
+            if let Some(read) = supplied.read_capacity_auto_scaling {
+                stored.read_capacity_auto_scaling = Some(read);
+            }
+            if let Some(write) = supplied.write_capacity_auto_scaling {
+                stored.write_capacity_auto_scaling = Some(write);
+            }
+        }
+        if let Some(replicas) = replica_specifications {
+            // Already merged onto the Regions the table had settings for, so a request
+            // naming one Region leaves the others' settings alone.
+            table.replica_specifications = replicas;
+        }
+        if let Some(warm) = warm_throughput_specification {
+            table.warm_throughput_specification = Some(warm);
+        }
 
-        // The change is accepted now and the table is `UPDATING` until the clock owes it
-        // `ACTIVE` one span from here; `settle` materialises that, and nothing sleeps.
-        let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
         table.status = crate::state::TABLE_STATUS_UPDATING.to_string();
         table.status_due_at = Some(settles_at);
         let resource_arn = table.resource_arn.clone();

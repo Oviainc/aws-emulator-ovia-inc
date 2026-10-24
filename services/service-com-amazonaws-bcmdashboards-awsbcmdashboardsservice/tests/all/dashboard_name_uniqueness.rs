@@ -17,6 +17,8 @@
 //! what an SDK client sees, and every acceptance is read back through `GetDashboard` /
 //! `ListDashboards` from the persisted record.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -293,5 +295,94 @@ async fn update_dashboard_holds_the_name_to_the_same_rule() {
                 "case {label}: the refused update must leave the name holder alone: {other}"
             );
         }
+    }
+}
+
+/// A refused rename is not a partial write: the WHOLE stored record reads back exactly as
+/// it did before the call — including `updatedAt`, which a refusal that had written the
+/// record first would have moved — whatever else the refused update carried.
+#[tokio::test]
+async fn a_refused_rename_leaves_the_whole_record_untouched() {
+    // (label, the name the OTHER dashboard already holds, the extra members the refused
+    // update carries alongside `arn` and that name). Rows span the name table's classes —
+    // both published `DashboardName` bounds (2..50), spaces, every admitted character
+    // class — and span what else the update would have written: nothing, a replacement
+    // description, a replacement widget list, both.
+    let cases: Vec<(&str, String, Value)> = vec![
+        (
+            "the held name at the 2-character minimum, nothing else to write",
+            "Em".to_string(),
+            json!({}),
+        ),
+        (
+            "a two-word held name, the update also setting a description",
+            "Monthly Spend".to_string(),
+            json!({"description": "A description the refusal must not store"}),
+        ),
+        (
+            "a held name using every admitted character class, the update also replacing the widgets",
+            "A_b-C 1".to_string(),
+            json!({"widgets": one_widget()}),
+        ),
+        (
+            "the held name at the 50-character maximum, the update carrying both",
+            format!("A{}z", "b".repeat(48)),
+            json!({"description": "Another refused description", "widgets": []}),
+        ),
+    ];
+
+    for (label, held_name, extra) in cases {
+        let router = router();
+        let holder = create(&router, &json!({"name": held_name, "widgets": []})).await;
+        let subject = create(
+            &router,
+            &json!({
+                "name": "Subject Dashboard",
+                "description": "Before",
+                "widgets": one_widget()
+            }),
+        )
+        .await;
+        let before = ok_call(&router, "GetDashboard", &json!({"arn": subject})).await;
+
+        // Let the clock move on, so an `updatedAt` the refused call had written would read
+        // back differently from the one the create stored.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut request = json!({"arn": subject, "name": held_name});
+        if let Value::Object(members) = &extra {
+            for (member, value) in members {
+                request[member] = value.clone();
+            }
+        }
+        let (status, body) = call(&router, "UpdateDashboard", &request).await;
+        assert_eq!(
+            status, 400,
+            "case {label}: renaming onto the held name {held_name:?} must be refused, got {status}: {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("ValidationException"),
+            "case {label}: expected ValidationException, got {}: {body}",
+            error_code(&body)
+        );
+
+        let after = ok_call(&router, "GetDashboard", &json!({"arn": subject})).await;
+        assert_eq!(
+            after, before,
+            "case {label}: the refused rename must leave the whole record untouched (updatedAt included), got {after} after {before}"
+        );
+
+        // And the account still holds exactly the two dashboards, each under its own name.
+        let mut stored = listed(&router).await;
+        stored.sort();
+        let mut expected = vec![
+            (holder, held_name.clone()),
+            (subject, "Subject Dashboard".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(
+            stored, expected,
+            "case {label}: the account must still hold one dashboard per name, got {stored:?}"
+        );
     }
 }

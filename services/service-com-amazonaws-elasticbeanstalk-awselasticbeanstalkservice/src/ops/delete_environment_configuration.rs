@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEnvironmentConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEnvironmentConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: deletes the DRAFT configuration of the running environment the request
+//! names — the configuration set an update created and the clock has not deployed, or
+//! one a cancelled deployment left behind — so `DescribeConfigurationSettings` reports
+//! only the deployed configuration afterwards. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEnvironmentConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The delete is idempotent: an environment carrying no draft has nothing to delete, so
+//! the call still succeeds, exactly as deleting the same draft twice does.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +151,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEnvironmentConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEnvironmentConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEnvironmentConfiguration"))
+        // This operation deletes a record the store holds; nothing here is
+        // derived from the request's region.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteEnvironmentConfigurationError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        let request_id = crate::state::new_request_id();
+        // A status change the clock has already made due is settled first: an
+        // update whose completion is due has already deployed its draft, so
+        // there is no longer a draft for this call to delete.
+        store.materialize_due_transitions();
+
+        // "ApplicationName: the name of the application the environment is
+        // associated with" and "EnvironmentName: the name of the environment to
+        // delete the draft configuration from" — both required, so the pair
+        // names one environment: the stored record carrying that name under
+        // that application. A terminated environment runs nothing, so it is no
+        // "running environment" to delete a draft configuration from, and a
+        // request naming another application's environment names none of this
+        // one's — the resolution `DescribeConfigurationSettings` makes for the
+        // same pair.
+        let environment_id = store
+            .environment_name_index
+            .get(&input.environment_name)
+            .cloned();
+        let environment = environment_id
+            .and_then(|environment_id| store.environments.get_mut(&environment_id))
+            .filter(|environment| {
+                !environment.is_terminated()
+                    && environment.application_name == input.application_name
+            });
+        let Some(environment) = environment else {
+            return Err(
+                DeleteEnvironmentConfigurationError::invalid_parameter_value(
+                    crate::state::missing_environment_message(
+                        None,
+                        Some(input.environment_name.as_str()),
+                    ),
+                ),
+            );
+        };
+
+        // "Deletes the draft configuration associated with the running
+        // environment. … The draft configuration remains in existence until it
+        // is deleted with this action." Only the draft goes: the configuration
+        // the environment is RUNNING is not a draft, and nothing else about the
+        // environment is touched. An environment carrying no draft has nothing
+        // to delete, which is not a failure — the model declares no error for
+        // this operation at all.
+        environment.draft_configuration = None;
+        let subject = environment.event_subject();
+        store.record_completed_activity(
+            &request_id,
+            "deleteEnvironmentConfiguration",
+            None,
+            subject,
+        );
+
+        // This operation's output shape is `Unit`: the acknowledgement is the
+        // 200 itself, and the deletion is observed through
+        // `DescribeConfigurationSettings`, which afterwards reports only the
+        // deployed configuration set.
+        Ok(DeleteEnvironmentConfigurationOutput)
     }
 }

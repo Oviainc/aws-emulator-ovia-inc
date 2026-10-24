@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplicationAssignment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplicationAssignment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: grants one principal a DIRECT assignment to an existing application and
+//! stores it in this service's state (`crate::state`), so
+//! `DescribeApplicationAssignment` reads the same grant back. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplicationAssignment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The assignment's identity is the tuple (application, principal type, principal id):
+//! granting the same one twice grants it ONCE and adds no second row, and the operation
+//! answers with the empty output its model declares. An `ApplicationArn` this account
+//! holds no application for is refused with the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +161,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplicationAssignment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationAssignmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplicationAssignment"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateApplicationAssignmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, so this create resolves the same
+        // application a read at this instant would resolve.
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // "Grant application access to a user or group": the application the access is
+        // granted to must exist. Never created, or created under an instance that has
+        // since gone — the same answer either way.
+        if store.application(&input.application_arn).is_none() {
+            return Err(
+                CreateApplicationAssignmentErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::application_not_found_message(
+                            &input.application_arn,
+                        )),
+                        // The model's `ResourceNotFoundExceptionReason` enum carries only
+                        // KMS key states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // (application, principal type, principal id) is the assignment's identity, so
+        // re-creating one that already exists grants nothing further: it must not add a
+        // second row for access the principal already holds.
+        if store
+            .application_assignment_position(
+                &input.application_arn,
+                &input.principal_type,
+                &input.principal_id,
+            )
+            .is_some()
+        {
+            return Ok(CreateApplicationAssignmentOutput {});
+        }
+
+        // The emulator's own memory ceiling: this store grows one row per distinct
+        // assignment and shrinks only on a delete.
+        if store.application_assignments.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(
+                CreateApplicationAssignmentErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::quota_exceeded_message(
+                            "application assignments",
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store
+            .application_assignments
+            .push(crate::state::ApplicationAssignmentRecord {
+                application_arn: input.application_arn,
+                principal_type: input.principal_type,
+                principal_id: input.principal_id,
+            });
+        // The model declares an EMPTY output for this operation, so the grant itself is
+        // the whole answer: `DescribeApplicationAssignment` is what reads it back.
+        Ok(CreateApplicationAssignmentOutput {})
     }
 }

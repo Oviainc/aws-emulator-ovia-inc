@@ -3,8 +3,10 @@
 //! @op GetEnvironment
 //! Reads one environment out of [`crate::state`] and reports it: the record
 //! `CreateEnvironment` stored, with any lifecycle transition the clock has made due
-//! already applied. An id this service holds no environment for is a
-//! `ResourceNotFoundException`.
+//! already applied and its health checks recomputed from the store
+//! (`Environment$checks` and the `environmentStatus` roll-up are DERIVED — see
+//! [`crate::state::StoredEnvironment::refresh_checks`]). An id this service holds no
+//! environment for is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!

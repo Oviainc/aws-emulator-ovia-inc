@@ -447,6 +447,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.tier.as_ref(),
             )),
             option_settings: input.option_settings.clone().unwrap_or_default(),
+            // A launch deploys the configuration the request carries, so there
+            // is no configuration waiting to be deployed beside it: a DRAFT
+            // configuration is what an UPDATE of a running environment creates.
+            draft_configuration: None,
             operations_role: input.operations_role.clone(),
             // "Launching: Environment is in the process of initial deployment."
             status: crate::state::STATUS_LAUNCHING.to_string(),

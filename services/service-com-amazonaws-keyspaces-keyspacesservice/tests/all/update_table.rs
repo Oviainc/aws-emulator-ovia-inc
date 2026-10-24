@@ -18,8 +18,10 @@
 //! 4. A request that breaks a rule the model cannot state is refused with the error the
 //!    model declares for it, and the refusal leaves the table untouched — including the
 //!    documented "you can only update one specific table setting per update operation".
-//! 5. A setting this slice cannot report is refused with the scaffold's 501 rather than
-//!    stored and forgotten.
+//! 5. The ONE setting no report here can answer for — `cdcSpecification` — is refused with
+//!    the scaffold's 501 rather than stored and forgotten; every other modelled setting is
+//!    applied (see `tests/all/update_table_scaling_settings.rs` for auto scaling, the
+//!    per-Region settings and warm throughput).
 //! 6. A stored schema only grows, so growing one past the emulator's column cap is
 //!    refused with the quota error the model declares — in one call or across several.
 
@@ -897,7 +899,7 @@ async fn growing_a_schema_past_the_column_cap_is_the_modelled_quota_error() {
     );
 }
 
-/// RULE 5: a setting no operation in this slice can report is refused with the honest
+/// RULE 5: the one setting no operation in this slice can report is refused with the honest
 /// 501, never stored, and never answered as a success.
 #[tokio::test]
 async fn a_setting_this_slice_cannot_report_is_refused_with_the_scaffold_501() {
@@ -914,26 +916,12 @@ async fn a_setting_this_slice_cannot_report_is_refused_with_the_scaffold_501() {
     tokio::time::sleep(settle_wait()).await;
     let untouched = get_table(&emulator, keyspace, table).await;
 
-    let unimplemented: Vec<(&str, Value)> = vec![
-        (
-            "autoScalingSpecification",
-            json!({"autoScalingSpecification": {
-                "readCapacityAutoScaling": {"autoScalingDisabled": true},
-            }}),
-        ),
-        (
-            "replicaSpecifications",
-            json!({"replicaSpecifications": [{"region": "us-east-1"}]}),
-        ),
-        (
-            "cdcSpecification",
-            json!({"cdcSpecification": {"status": "ENABLED"}}),
-        ),
-        (
-            "warmThroughputSpecification",
-            json!({"warmThroughputSpecification": {"readUnitsPerSecond": 12000}}),
-        ),
-    ];
+    // `cdcSpecification` alone: `GetTable` has no CDC summary to report, so storing it
+    // would mean answering for a setting nothing here can read back.
+    let unimplemented: Vec<(&str, Value)> = vec![(
+        "cdcSpecification",
+        json!({"cdcSpecification": {"status": "ENABLED"}}),
+    )];
 
     for (case, members) in unimplemented {
         let mut request = members;

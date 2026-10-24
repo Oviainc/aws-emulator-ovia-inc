@@ -17,9 +17,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AWSLocation, Bandwidth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
-    CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment, Device, GlobalNetwork,
-    Link, LinkAssociation, Location, ResourceNotFoundException, Site, Tag, ValidationException,
+    AWSLocation, AccountStatus, Bandwidth, CoreNetwork, CoreNetworkEdge,
+    CoreNetworkNetworkFunctionGroup, CoreNetworkPolicyError, CoreNetworkPolicyException,
+    CoreNetworkSegment, Device, GlobalNetwork, Link, LinkAssociation, Location,
+    OrganizationStatus, ResourceNotFoundException, Site, Tag, ValidationException,
     ValidationExceptionField,
 };
 
@@ -687,6 +688,129 @@ impl CoreNetworkRecord {
     }
 }
 
+/// The two `Action` values `StartOrganizationServiceAccessUpdate` accepts, in the order
+/// its documentation lists them.
+///
+/// The model types `Action` as a free-form string of length 0..50 and enumerates nothing
+/// (`smithy_query shape=Action`); the catalog is the member's own documentation — "The
+/// action to take for the update request. This can be either ENABLE or DISABLE"
+/// (`smithy_query query="doc" shape="StartOrganizationServiceAccessUpdateRequest"
+/// member="Action"`) — so a value outside it is refused by the handler rather than by the
+/// schema.
+pub const SERVICE_ACCESS_ACTIONS: [&str; 2] = ["ENABLE", "DISABLE"];
+
+/// The input member a refused `StartOrganizationServiceAccessUpdate` names in
+/// `ValidationException$Fields[].Name`, and the one a listing names for a token it did not
+/// mint.
+pub const FIELD_ACTION: &str = "Action";
+/// See [`FIELD_ACTION`].
+pub const FIELD_NEXT_TOKEN: &str = "NextToken";
+
+/// The two values `OrganizationAwsServiceAccessStatus` carries: "The status of the
+/// organization's AWS service access. This will be ENABLED or DISABLED" (`smithy_query
+/// query="doc" shape="OrganizationStatus" member="OrganizationAwsServiceAccessStatus"`).
+/// The modelled string enumerates nothing, so the pair lives here.
+pub const SERVICE_ACCESS_ENABLED: &str = "ENABLED";
+/// See [`SERVICE_ACCESS_ENABLED`].
+pub const SERVICE_ACCESS_DISABLED: &str = "DISABLED";
+
+/// The two values `SLRDeploymentStatus` carries: "The status of the SLR deployment for the
+/// account. This will be either SUCCEEDED or IN_PROGRESS" (`smithy_query query="doc"
+/// shape="OrganizationStatus" member="SLRDeploymentStatus"`). A deployment is IN_PROGRESS
+/// until the span [`SETTLE_DELAY`] the clock owes has passed, then SUCCEEDED.
+pub const SLR_DEPLOYMENT_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`SLR_DEPLOYMENT_IN_PROGRESS`].
+pub const SLR_DEPLOYMENT_SUCCEEDED: &str = "SUCCEEDED";
+
+/// The id prefix of an Amazon Web Services Organization. The model constrains the id
+/// itself: `OrganizationId` carries `pattern ^o-([0-9a-f]{8,17})$` (`smithy_query
+/// shape=OrganizationId`), which the 17 hex digits of
+/// [`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`] satisfy.
+pub const ORGANIZATION_KIND: &str = "o";
+
+/// This account's Network Manager service-access record for its Amazon Web Services
+/// Organization: whether the service has organization-wide access, and the state of the
+/// service-linked-role (SLR) deployment that enabling it started.
+///
+/// There is at most ONE such record, because this emulator presents exactly one account
+/// ([`::engine::emulator_account_id`]) and an account belongs to at most one organization.
+/// `SLRDeploymentStatus` is not a stored field: it is a function of the clock
+/// ([`OrganizationServiceAccessRecord::slr_deployment_status_at`]), so reading one never
+/// writes.
+#[derive(Debug, Clone)]
+pub struct OrganizationServiceAccessRecord {
+    /// The minted `o-<hex>` id of the organization the record belongs to. Minted once and
+    /// kept across later enable/disable updates: the organization does not change when
+    /// service access to it does.
+    pub organization_id: String,
+    /// [`SERVICE_ACCESS_ENABLED`] or [`SERVICE_ACCESS_DISABLED`].
+    pub service_access_status: String,
+    /// The accounts the SLR deployment in effect covers, in account-id order.
+    ///
+    /// The organization's membership is not knowable from inside this service — the
+    /// Organizations emulator's own `ListAccounts` is a scaffold stub, and this emulator
+    /// presents exactly one account — so an enabled organization's deployment covers that
+    /// single (management) account. EMPTY while service access is disabled: no SLR is
+    /// deployed then, so there is no deployment status to report for the organization or
+    /// for any account in it.
+    pub deployed_accounts: Vec<String>,
+    /// The instant the SLR deployment the enabling call started becomes due, i.e. when
+    /// `IN_PROGRESS` becomes `SUCCEEDED`.
+    pub deployed_at: SystemTime,
+}
+
+impl OrganizationServiceAccessRecord {
+    /// The SLR deployment status of every account this deployment covers, as of `now`, or
+    /// `None` while no SLR is deployed at all (see [`Self::deployed_accounts`]).
+    ///
+    /// One due instant covers the whole deployment, so this is also the organization-wide
+    /// aggregate: `IN_PROGRESS` until it passes, `SUCCEEDED` after.
+    pub fn slr_deployment_status_at(&self, now: SystemTime) -> Option<&'static str> {
+        if self.deployed_accounts.is_empty() {
+            return None;
+        }
+        Some(if now >= self.deployed_at {
+            SLR_DEPLOYMENT_SUCCEEDED
+        } else {
+            SLR_DEPLOYMENT_IN_PROGRESS
+        })
+    }
+
+    /// One modelled `AccountStatus` per account the deployment covers, keyed by account id
+    /// so [`paginate`] can page over them in a stable order.
+    pub fn account_statuses_at(&self, now: SystemTime) -> Vec<(String, AccountStatus)> {
+        let status = self.slr_deployment_status_at(now);
+        self.deployed_accounts
+            .iter()
+            .map(|account_id| {
+                (
+                    account_id.clone(),
+                    AccountStatus {
+                        account_id: Some(account_id.clone()),
+                        slr_deployment_status: status.map(str::to_string),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The modelled `OrganizationStatus` for this record as of `now`, carrying
+    /// `account_status_list` — the page of accounts the caller asked for, which is why the
+    /// list is passed in rather than computed here.
+    pub fn to_shape(
+        &self,
+        now: SystemTime,
+        account_status_list: Vec<AccountStatus>,
+    ) -> OrganizationStatus {
+        OrganizationStatus {
+            organization_id: Some(self.organization_id.clone()),
+            organization_aws_service_access_status: Some(self.service_access_status.clone()),
+            slr_deployment_status: self.slr_deployment_status_at(now).map(str::to_string),
+            account_status_list: Some(account_status_list),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-networkmanager-networkmanager. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
@@ -722,6 +846,12 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// at most [`MAX_RESOURCE_POLICIES`] ARNs hold a policy, each document at most
     /// [`MAX_RESOURCE_POLICY_CHARS`] characters, so no caller can grow it without end.
     pub resource_policies: BTreeMap<String, String>,
+    /// This account's organization service-access record, or `None` while no
+    /// `StartOrganizationServiceAccessUpdate` has ever been called: this service then
+    /// knows of no organization, so `ListOrganizationServiceAccessStatus` reports no
+    /// `OrganizationStatus` at all. One record, not a map — see
+    /// [`OrganizationServiceAccessRecord`].
+    pub organization_service_access: Option<OrganizationServiceAccessRecord>,
     /// Monotonic source for generated resource-id suffixes, so ids are unique within a
     /// run and deterministic across runs.
     pub id_counter: u64,
@@ -736,6 +866,53 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
     pub fn next_id(&mut self, prefix: &str) -> String {
         self.id_counter = self.id_counter.saturating_add(1);
         format!("{prefix}-{:017x}", self.id_counter)
+    }
+
+    /// Apply an organization service-access update to the stored record and answer the
+    /// record it leaves behind.
+    ///
+    /// `enable` is the `ENABLE` / `DISABLE` the request's `Action` named (see
+    /// [`SERVICE_ACCESS_ACTIONS`]).
+    ///
+    /// * `ENABLE` on an organization whose access is already `ENABLED` changes NOTHING —
+    ///   not the organization id, and not the SLR deployment already in flight — so a
+    ///   client that repeats the call does not restart the deployment it is waiting for.
+    /// * `ENABLE` otherwise records `ENABLED` and starts a fresh SLR deployment, due
+    ///   [`SETTLE_DELAY`] from `now`, covering the accounts of the organization.
+    /// * `DISABLE` records `DISABLED` and drops the deployment: with no SLR deployed there
+    ///   is no deployment status to report. The organization id is kept, so re-enabling
+    ///   reports the same organization.
+    pub fn update_organization_service_access(
+        &mut self,
+        enable: bool,
+        now: SystemTime,
+    ) -> OrganizationServiceAccessRecord {
+        let held = self.organization_service_access.clone();
+        let organization_id = match &held {
+            Some(record) => record.organization_id.clone(),
+            None => self.next_id(ORGANIZATION_KIND),
+        };
+        let record = match held {
+            Some(record)
+                if enable && record.service_access_status == SERVICE_ACCESS_ENABLED =>
+            {
+                record
+            }
+            _ if enable => OrganizationServiceAccessRecord {
+                organization_id,
+                service_access_status: SERVICE_ACCESS_ENABLED.to_string(),
+                deployed_accounts: vec![::engine::emulator_account_id().to_string()],
+                deployed_at: now + SETTLE_DELAY,
+            },
+            _ => OrganizationServiceAccessRecord {
+                organization_id,
+                service_access_status: SERVICE_ACCESS_DISABLED.to_string(),
+                deployed_accounts: Vec::new(),
+                deployed_at: now,
+            },
+        };
+        self.organization_service_access = Some(record.clone());
+        record
     }
 
     /// The ARN of a resource of this service: `arn:aws:networkmanager::<account>:<kind>/<id>`.
