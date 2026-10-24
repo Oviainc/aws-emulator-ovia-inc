@@ -23,9 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AutoScalingSpecification, CapacitySpecification, ClientSideTimestamps, Comment,
-    EncryptionSpecification, FieldDefinition, PointInTimeRecovery, ResourceNotFoundException,
-    SchemaDefinition, Tag, TimeToLive,
+    AutoScalingSettings, AutoScalingSpecification, CapacitySpecification, ClientSideTimestamps,
+    Comment, EncryptionSpecification, FieldDefinition, PointInTimeRecovery, ReplicaSpecification,
+    ResourceNotFoundException, SchemaDefinition, Tag, TimeToLive, WarmThroughputSpecification,
 };
 
 /// The `cassandra` ARN namespace / SigV4 signing name of Amazon Keyspaces
@@ -136,6 +136,18 @@ pub const MAX_TARGET_VALUE: f64 = 90.0;
 
 /// `PointInTimeRecoveryStatus` = `ENABLED`.
 pub const POINT_IN_TIME_RECOVERY_ENABLED: &str = "ENABLED";
+
+/// `WarmThroughputStatus` = `AVAILABLE`: "the current status of the warm throughput
+/// configuration. Valid values are `AVAILABLE` when the configuration is active, and
+/// `UPDATING` when changes are being applied"
+/// (`WarmThroughputSpecificationSummary$status`). Both constants are members of the
+/// model's `WarmThroughputStatus` value set
+/// (`crate::ops::types::WARM_THROUGHPUT_STATUS_VALUES`).
+pub const WARM_THROUGHPUT_STATUS_AVAILABLE: &str = "AVAILABLE";
+/// `WarmThroughputStatus` = `UPDATING`: the status a warm throughput configuration holds
+/// while the change that set it is still being applied. See
+/// [`WARM_THROUGHPUT_STATUS_AVAILABLE`].
+pub const WARM_THROUGHPUT_STATUS_UPDATING: &str = "UPDATING";
 
 /// `rs` (replication strategy) = `SINGLE_REGION`: a keyspace replicated only in
 /// the region it was created in, and the strategy a keyspace gets when
@@ -684,9 +696,108 @@ pub struct Table {
     pub comment: Option<Comment>,
     /// The supplied client-side-timestamps setting, if any.
     pub client_side_timestamps: Option<ClientSideTimestamps>,
+    /// The Amazon Web Services Region specific settings of this table as a multi-Region
+    /// table, keyed by `ReplicaSpecification$region` — "For a multi-Region table, you can
+    /// configure the table's read capacity differently per Amazon Web Services Region".
+    ///
+    /// Keyed by Region because a Region holds ONE such setting: a later
+    /// `CreateTable`/`UpdateTable` entry for a Region it already has replaces that
+    /// Region's setting rather than adding a second one. A Region this map does not hold
+    /// provisions the table's own read capacity and auto scaling
+    /// ([`Self::read_capacity_units_in`], [`Self::auto_scaling_in`]), and so does one
+    /// whose entry carries neither override.
+    pub replica_specifications: BTreeMap<String, ReplicaSpecification>,
+    /// The warm throughput this table was pre-warmed for, if any was ever configured.
+    pub warm_throughput_specification: Option<WarmThroughput>,
     /// This table's tags: what `CreateTable` attached, plus what `TagResource` added and
     /// `UntagResource` removed since.
     pub tags: TagSet,
+}
+
+/// A table's warm throughput configuration: "Pre-warming a table by specifying warm
+/// throughput pre-provisions read and write capacity units to help avoid capacity
+/// exceeded exceptions and reduce latency when your table starts receiving traffic"
+/// (`WarmThroughputSpecification`).
+///
+/// Both unit counts are stored unconditionally rather than as options, because the
+/// summary that reports them declares each `@required`
+/// (`WarmThroughputSpecificationSummary$readUnitsPerSecond` /
+/// `$writeUnitsPerSecond`); [`resolve_warm_throughput`] is what turns the request's two
+/// optional members into them.
+#[derive(Debug, Clone)]
+pub struct WarmThroughput {
+    /// `readUnitsPerSecond`: "the number of read capacity units per second currently
+    /// configured for warm throughput".
+    pub read_units_per_second: i64,
+    /// `writeUnitsPerSecond`, the same for writes.
+    pub write_units_per_second: i64,
+    /// When the clock owes this configuration its [`WARM_THROUGHPUT_STATUS_AVAILABLE`]
+    /// status, or `None` once it holds it. Never slept for:
+    /// [`ComAmazonawsKeyspacesKeyspacesserviceState::settle`] compares it against the
+    /// clock, exactly as it does a table's own status.
+    pub status_due_at: Option<SystemTime>,
+}
+
+impl WarmThroughput {
+    /// The `WarmThroughputStatus` this configuration reports: "`AVAILABLE` when the
+    /// configuration is active, and `UPDATING` when changes are being applied"
+    /// (`WarmThroughputSpecificationSummary$status`).
+    pub fn status(&self) -> &'static str {
+        match self.status_due_at {
+            Some(_) => WARM_THROUGHPUT_STATUS_UPDATING,
+            None => WARM_THROUGHPUT_STATUS_AVAILABLE,
+        }
+    }
+}
+
+impl Table {
+    /// The read capacity units this table provisions in `region`: the Region's own
+    /// `replicaSpecifications.readCapacityUnits` override when one is stored, and the
+    /// table's `capacitySpecification.readCapacityUnits` otherwise.
+    ///
+    /// "For a multi-Region table, you can configure the table's read capacity differently
+    /// per Amazon Web Services Region" (`ReplicaSpecification`) — the write capacity has
+    /// no such member, because it "remains synchronized between all replicas to ensure
+    /// that there's enough capacity to replicate writes across all Regions".
+    pub fn read_capacity_units_in(&self, region: &str) -> Option<i64> {
+        self.replica_specifications
+            .get(region)
+            .and_then(|replica| replica.read_capacity_units)
+            .or_else(|| {
+                self.capacity_specification
+                    .as_ref()
+                    .and_then(|capacity| capacity.read_capacity_units)
+            })
+    }
+
+    /// The auto scaling settings this table reports in `region`: the table's, with the
+    /// Region's own `replicaSpecifications.readCapacityAutoScaling` override applied when
+    /// one is stored, or `None` when neither exists.
+    pub fn auto_scaling_in(&self, region: &str) -> Option<AutoScalingSpecification> {
+        let mut specification = self.auto_scaling_specification.clone();
+        if let Some(read) = self
+            .replica_specifications
+            .get(region)
+            .and_then(|replica| replica.read_capacity_auto_scaling.clone())
+        {
+            specification
+                .get_or_insert_with(AutoScalingSpecification::default)
+                .read_capacity_auto_scaling = Some(read);
+        }
+        specification
+    }
+
+    /// Whether this table has a scalable target at all — the table's own auto scaling
+    /// settings, or a per-Region read capacity auto scaling override. `GetTableAutoScalingSettings`
+    /// reports the settings of a table that has one and answers the modelled not-found
+    /// for a table that has none.
+    pub fn has_auto_scaling(&self) -> bool {
+        self.auto_scaling_specification.is_some()
+            || self
+                .replica_specifications
+                .values()
+                .any(|replica| replica.read_capacity_auto_scaling.is_some())
+    }
 }
 
 /// One user-defined type: the fields `CreateType` was given, plus what the service
@@ -1016,6 +1127,8 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                             default_time_to_live: None,
                             comment: None,
                             client_side_timestamps: None,
+                            replica_specifications: BTreeMap::new(),
+                            warm_throughput_specification: None,
                             tags: TagSet::new(),
                         },
                     )
@@ -1052,7 +1165,8 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
 
     /// Materialise every status transition the clock already owes at `now`: a keyspace
     /// whose `CREATING` or `UPDATING` span has elapsed becomes `ACTIVE`, a table whose `CREATING` or
-    /// `UPDATING` span has elapsed becomes `ACTIVE`, a type whose `CREATING` span has
+    /// `UPDATING` span has elapsed becomes `ACTIVE`, a table's warm throughput
+    /// configuration whose span has elapsed becomes `AVAILABLE`, a type whose `CREATING` span has
     /// elapsed becomes `ACTIVE`, and a table whose
     /// `DELETING` span has elapsed is gone.
     ///
@@ -1087,6 +1201,18 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                 None => {}
             }
             keyspace.tables.retain(|_, table| {
+                // A warm throughput configuration settles on ITS own instant: it is
+                // `UPDATING` "when changes are being applied" and `AVAILABLE` once they
+                // are, which is a different clock from the table's status, since a later
+                // update of any other setting puts the table back in `UPDATING` without
+                // changing the warm throughput at all.
+                if let Some(warm) = table.warm_throughput_specification.as_mut() {
+                    match warm.status_due_at {
+                        Some(due) if now < due => earliest = earlier_of(earliest, due),
+                        Some(_) => warm.status_due_at = None,
+                        None => {}
+                    }
+                }
                 let Some(due) = table.status_due_at else {
                     return true;
                 };
@@ -1408,17 +1534,61 @@ pub fn validate_schema(schema: &SchemaDefinition) -> Result<(), String> {
     Ok(())
 }
 
-/// The auto scaling settings a table is created with: the caller's, checked against what
-/// the service documents for them, or `None`.
+/// One `AutoScalingSettings`, checked against what the service documents for it; `member`
+/// names the request member it came from, so a refusal tells the caller what to fix.
+///
+/// For a capacity auto scaling is turned on for ("This optional parameter enables auto
+/// scaling for the table if set to `false`"), "you must specify the following parameters":
+/// `minimumUnits`, `maximumUnits` and `scalingPolicy`, whose target tracking configuration
+/// defines `targetValue` as "a percentage. A `double` between 20 and 90". The model states
+/// none of that, only that the unit members are `long`s with a minimum of 1 — so it holds
+/// wherever the shape appears: `autoScalingSpecification`'s two capacities and a
+/// `replicaSpecifications` entry's `readCapacityAutoScaling`.
+pub fn validate_auto_scaling_settings(
+    member: &str,
+    settings: &AutoScalingSettings,
+) -> Result<(), String> {
+    if settings.auto_scaling_disabled {
+        return Ok(());
+    }
+    let target_value = settings
+        .scaling_policy
+        .as_ref()
+        .and_then(|policy| policy.target_tracking_scaling_policy_configuration.as_ref())
+        .map(|configuration| configuration.target_value);
+    let (Some(minimum), Some(maximum), Some(target_value)) =
+        (settings.minimum_units, settings.maximum_units, target_value)
+    else {
+        return Err(format!(
+            "{member} with autoScalingDisabled false requires minimumUnits, maximumUnits and \
+             scalingPolicy.targetTrackingScalingPolicyConfiguration.targetValue"
+        ));
+    };
+    if minimum > maximum {
+        return Err(format!(
+            "{member}.minimumUnits ({minimum}) must not exceed maximumUnits ({maximum})"
+        ));
+    }
+    if !(MIN_TARGET_VALUE..=MAX_TARGET_VALUE).contains(&target_value) {
+        return Err(format!(
+            "{member}.scalingPolicy.targetTrackingScalingPolicyConfiguration.targetValue \
+             ({target_value}) must be between {MIN_TARGET_VALUE} and {MAX_TARGET_VALUE}"
+        ));
+    }
+    Ok(())
+}
+
+/// The auto scaling settings a table is created or updated with: the caller's, checked
+/// against what the service documents for them, or `None`.
 ///
 /// Auto scaling is "The optional auto scaling settings for a table in provisioned capacity
 /// mode" (`CreateTableRequest$autoScalingSpecification`), so it belongs to
-/// `throughputMode:PROVISIONED` and to nothing else. For each capacity it is turned on for
-/// ("This optional parameter enables auto scaling for the table if set to `false`"),
-/// "you must specify the following parameters": `minimumUnits`, `maximumUnits` and
-/// `scalingPolicy`, whose target tracking configuration defines `targetValue` as "a
-/// percentage. A `double` between 20 and 90". The model states none of that, only that the
-/// unit members are `long`s with a minimum of 1.
+/// `throughputMode:PROVISIONED` and to nothing else; each capacity's settings are then
+/// what [`validate_auto_scaling_settings`] holds them to. `UpdateTable` is THE operation
+/// that changes the setting afterwards — "If auto scaling is already enabled for the
+/// table, you can use UpdateTable to update the minimum and maximum values or the auto
+/// scaling policy settings independently" — so it resolves the caller's specification
+/// against the capacity mode the table is in now.
 pub fn resolve_auto_scaling(
     supplied: Option<AutoScalingSpecification>,
     capacity: &CapacitySpecification,
@@ -1446,35 +1616,139 @@ pub fn resolve_auto_scaling(
         let Some(settings) = settings else {
             continue;
         };
-        if settings.auto_scaling_disabled {
-            continue;
-        }
-        let target_value = settings
-            .scaling_policy
-            .as_ref()
-            .and_then(|policy| policy.target_tracking_scaling_policy_configuration.as_ref())
-            .map(|configuration| configuration.target_value);
-        let (Some(minimum), Some(maximum), Some(target_value)) =
-            (settings.minimum_units, settings.maximum_units, target_value)
-        else {
-            return Err(format!(
-                "{member} with autoScalingDisabled false requires minimumUnits, maximumUnits and \
-                 scalingPolicy.targetTrackingScalingPolicyConfiguration.targetValue"
-            ));
-        };
-        if minimum > maximum {
-            return Err(format!(
-                "{member}.minimumUnits ({minimum}) must not exceed maximumUnits ({maximum})"
-            ));
-        }
-        if !(MIN_TARGET_VALUE..=MAX_TARGET_VALUE).contains(&target_value) {
-            return Err(format!(
-                "{member}.scalingPolicy.targetTrackingScalingPolicyConfiguration.targetValue \
-                 ({target_value}) must be between {MIN_TARGET_VALUE} and {MAX_TARGET_VALUE}"
-            ));
-        }
+        validate_auto_scaling_settings(member, settings)?;
     }
     Ok(Some(specification))
+}
+
+/// The per-Region settings a table is created or updated with, keyed by Region and
+/// merged onto the ones it already holds.
+///
+/// `replicaSpecifications` is "The Amazon Web Services Region specific settings of a
+/// multi-Region table": for one "you can configure the table's read capacity differently
+/// per Amazon Web Services Region" through `readCapacityUnits` and
+/// `readCapacityAutoScaling` (`ReplicaSpecification`). So the rules the model cannot
+/// state are:
+///
+/// * the Regions are the ones the table IS replicated in — `replica_regions` is
+///   [`Keyspace::table_replica_regions`], and a table of a single-Region keyspace has
+///   none, so it takes no per-Region setting at all;
+/// * a Region appears once, since a Region holds one such setting;
+/// * a read capacity override belongs to `throughputMode:PROVISIONED`, the only mode
+///   whose read capacity is provisioned at all; and
+/// * a `readCapacityAutoScaling` is held to the same rules as the table's own
+///   ([`validate_auto_scaling_settings`]).
+///
+/// An entry carrying neither override states that its Region uses the table's own read
+/// capacity and auto scaling, which is what a Region with no entry does
+/// ([`Table::read_capacity_units_in`], [`Table::auto_scaling_in`]) — so it is accepted
+/// and resets that Region.
+pub fn resolve_replica_specifications(
+    supplied: Vec<ReplicaSpecification>,
+    existing: &BTreeMap<String, ReplicaSpecification>,
+    capacity: Option<&CapacitySpecification>,
+    replica_regions: Option<&[String]>,
+) -> Result<BTreeMap<String, ReplicaSpecification>, String> {
+    // The one cap on a caller-chosen entry count (`ReplicaSpecificationList` is modelled
+    // `len 1..` with no maximum), applied before the list is walked or cloned: a table is
+    // replicated in at most [`MAX_REPLICATION_REGIONS`] Regions, so a longer list cannot
+    // name a Region per entry anyway.
+    if supplied.len() > MAX_REPLICATION_REGIONS {
+        return Err(format!(
+            "replicaSpecifications carries {} entries, which exceeds the limit of \
+             {MAX_REPLICATION_REGIONS} replication Regions per keyspace",
+            supplied.len()
+        ));
+    }
+    let Some(replica_regions) = replica_regions else {
+        return Err(
+            "replicaSpecifications is the Amazon Web Services Region specific setting of a \
+             multi-Region table, and this table's keyspace is replicated in one Region only"
+                .to_string(),
+        );
+    };
+    let mut resolved = existing.clone();
+    let mut named: BTreeSet<&str> = BTreeSet::new();
+    for specification in &supplied {
+        if !replica_regions.contains(&specification.region) {
+            return Err(format!(
+                "replicaSpecifications names Region '{}', which the table is not replicated \
+                 in: its Regions are {}",
+                specification.region,
+                replica_regions.join(", ")
+            ));
+        }
+        if !named.insert(specification.region.as_str()) {
+            return Err(format!(
+                "replicaSpecifications names Region '{}' more than once, and a Region holds \
+                 one set of per-Region settings",
+                specification.region
+            ));
+        }
+        let overrides_read_capacity = specification.read_capacity_units.is_some()
+            || specification.read_capacity_auto_scaling.is_some();
+        let throughput_mode = capacity.map(|capacity| capacity.throughput_mode.as_str());
+        if overrides_read_capacity && throughput_mode != Some(PROVISIONED_THROUGHPUT_MODE) {
+            return Err(format!(
+                "replicaSpecifications entry for Region '{}' overrides the read capacity of a \
+                 table in capacity mode '{PROVISIONED_THROUGHPUT_MODE}'; \
+                 capacitySpecification.throughputMode is '{}'",
+                specification.region,
+                throughput_mode.unwrap_or("unset")
+            ));
+        }
+        if let Some(settings) = specification.read_capacity_auto_scaling.as_ref() {
+            validate_auto_scaling_settings(
+                &format!(
+                    "replicaSpecifications entry for Region '{}' readCapacityAutoScaling",
+                    specification.region
+                ),
+                settings,
+            )?;
+        }
+        resolved.insert(specification.region.clone(), specification.clone());
+    }
+    Ok(resolved)
+}
+
+/// The warm throughput a table is created or updated with: the caller's two optional unit
+/// counts, merged onto the configuration the table already holds, and owed its
+/// [`WARM_THROUGHPUT_STATUS_AVAILABLE`] status at `settles_at`.
+///
+/// Both members of `WarmThroughputSpecification` are optional on the request, but the
+/// summary that reports the result declares each `@required`
+/// (`WarmThroughputSpecificationSummary`), so a unit the request omits is the one the
+/// table was already pre-warmed for — "you can update the read and write capacity units
+/// to adjust the pre-provisioned throughput"
+/// (`UpdateTableRequest$warmThroughputSpecification`). A unit that has never been
+/// configured has no value to keep, and Amazon Keyspaces publishes no default for it, so
+/// the first configuration must carry both rather than have one invented for it.
+pub fn resolve_warm_throughput(
+    supplied: &WarmThroughputSpecification,
+    existing: Option<&WarmThroughput>,
+    settles_at: SystemTime,
+) -> Result<WarmThroughput, String> {
+    let read = supplied
+        .read_units_per_second
+        .or_else(|| existing.map(|warm| warm.read_units_per_second));
+    let write = supplied
+        .write_units_per_second
+        .or_else(|| existing.map(|warm| warm.write_units_per_second));
+    let (Some(read_units_per_second), Some(write_units_per_second)) = (read, write) else {
+        return Err(
+            "warmThroughputSpecification requires readUnitsPerSecond and writeUnitsPerSecond \
+             for a table that has no warm throughput configured yet; afterwards either one \
+             may be updated on its own"
+                .to_string(),
+        );
+    };
+    Ok(WarmThroughput {
+        read_units_per_second,
+        write_units_per_second,
+        // "UPDATING when changes are being applied": the pre-warming the caller asked for
+        // is owed at the same instant as the table's own status, and nothing sleeps for it.
+        status_due_at: Some(settles_at),
+    })
 }
 
 /// The replication strategy and region list a keyspace is created with.

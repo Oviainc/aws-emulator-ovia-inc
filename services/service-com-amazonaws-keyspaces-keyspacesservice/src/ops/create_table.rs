@@ -4,11 +4,12 @@
 //! IMPLEMENTED: records a table under its keyspace in [`crate::state`] and answers with
 //! the ARN it minted for it. This is the ONLY file to touch for `CreateTable`.
 //!
-//! Three input members are NOT served here and are refused with a 501 that says so rather
-//! than stored and forgotten: `replicaSpecifications`, `cdcSpecification` and
-//! `warmThroughputSpecification`, each of which is reported by an operation that is still
-//! scaffolded. `autoScalingSpecification` IS served: it is stored on the table and
-//! reported back by `GetTableAutoScalingSettings`.
+//! ONE input member is NOT served here and is refused with a 501 that says so rather than
+//! stored and forgotten: `cdcSpecification`, which no report in this slice can answer for.
+//! Every other member IS served, including `autoScalingSpecification` and
+//! `replicaSpecifications` (reported back by `GetTable` and
+//! `GetTableAutoScalingSettings`) and `warmThroughputSpecification` (reported back by
+//! `GetTable`).
 //!
 //! The paragraphs below are the scaffold's own notes on how an operation is shaped and
 //! how it reaches state; they still describe this file.
@@ -243,35 +244,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
-        // Members this slice cannot serve faithfully yet, so accepting them would mean
-        // storing a request and never answering for it: `replicaSpecifications` overrides
-        // the read capacity and read capacity auto scaling PER Region, which no report here
-        // can distinguish from the table's own (`GetTable` and `GetTableAutoScalingSettings`
-        // report the table's settings in each Region the owning keyspace replicates it to),
-        // and the CDC and warm-throughput summaries are still scaffolded. Answer the honest
-        // 501 instead, worded so it is not counted as "CreateTable is a stub": the operation
-        // IS implemented, this part of its surface is not.
-        let unimplemented: Vec<&str> = [
-            ("replicaSpecifications", input.replica_specifications.is_some()),
-            ("cdcSpecification", input.cdc_specification.is_some()),
-            (
-                "warmThroughputSpecification",
-                input.warm_throughput_specification.is_some(),
-            ),
-        ]
-        .iter()
-        .filter(|(_, present)| *present)
-        .map(|(name, _)| *name)
-        .collect();
-        if !unimplemented.is_empty() {
+        // The ONE member this slice cannot serve faithfully yet: a CDC stream has no
+        // summary any report here carries, so accepting it would mean storing a request and
+        // never answering for it. Answer the honest 501 instead, worded so it is not counted
+        // as "CreateTable is a stub": the operation IS implemented, this part of its surface
+        // is not.
+        if input.cdc_specification.is_some() {
             return Err(crate::scaffolded::Scaffolded::NotImplemented(
                 crate::scaffolded::NotImplemented {
-                    message: format!(
-                        "CreateTable is implemented in this emulator, but not its {} \
-                         member(s): omit them, or the table would be stored with settings \
-                         no operation here can report.",
-                        unimplemented.join(", ")
-                    ),
+                    message: "CreateTable is implemented in this emulator, but not its \
+                              cdcSpecification member: omit it, or the table would be stored \
+                              with a CDC stream setting no operation here can report."
+                        .to_string(),
                 },
             ));
         }
@@ -406,6 +390,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_arn =
             crate::state::table_arn(&region, &input.keyspace_name, &input.table_name);
         let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
+        // The per-Region settings a multi-Region table is created with: which Regions they
+        // may name is the OWNING keyspace's replication group, so this is resolved here
+        // rather than before the store was reached, and still before anything is stored.
+        let replica_specifications = match input.replica_specifications {
+            Some(supplied) => crate::state::resolve_replica_specifications(
+                supplied,
+                &::std::collections::BTreeMap::new(),
+                Some(&capacity_specification),
+                keyspace.table_replica_regions(),
+            )
+            .map_err(invalid)?,
+            None => ::std::collections::BTreeMap::new(),
+        };
+        // "Specifies the warm throughput settings for a table": a table being created has
+        // none to merge onto, so a create carries both unit counts or neither.
+        let warm_throughput_specification = match input.warm_throughput_specification.as_ref() {
+            Some(supplied) => Some(
+                crate::state::resolve_warm_throughput(supplied, None, settles_at)
+                    .map_err(invalid)?,
+            ),
+            None => None,
+        };
         keyspace.tables.insert(
             input.table_name.clone(),
             crate::state::Table {
@@ -431,6 +437,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 default_time_to_live: input.default_time_to_live,
                 comment: input.comment,
                 client_side_timestamps: input.client_side_timestamps,
+                replica_specifications,
+                warm_throughput_specification,
                 tags,
             },
         );

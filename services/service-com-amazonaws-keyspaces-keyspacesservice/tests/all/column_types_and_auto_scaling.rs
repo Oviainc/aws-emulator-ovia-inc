@@ -43,7 +43,10 @@ fn schema_with_type(column_type: &str) -> Value {
 
 /// Compare one member of a response body, by JSON pointer, tolerating the integer and the
 /// double spelling of the same number.
-fn assert_member(case: &str, body: &Value, pointer: &str, expected: &Value) {
+///
+/// Shared with `tests/all/update_table_scaling_settings.rs`, so there is ONE such
+/// comparator in this test binary rather than a copy per suite.
+pub(crate) fn assert_member(case: &str, body: &Value, pointer: &str, expected: &Value) {
     let actual = body.pointer(pointer).unwrap_or(&Value::Null);
     let equal = match (actual.as_f64(), expected.as_f64()) {
         (Some(actual), Some(expected)) => (actual - expected).abs() < 1e-9,

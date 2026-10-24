@@ -218,22 +218,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The table's throughput summary, reported both for the table as a whole and, for a
-        // multi-Region table, once per Region it is replicated in: a per-Region read
-        // capacity override is `replicaSpecifications` on `CreateTable`/`UpdateTable`,
-        // which this slice refuses with a 501, so no stored table's Region differs from the
-        // table's own capacity.
-        let capacity_specification = table.capacity_specification.as_ref().map(|capacity| {
-            CapacitySpecificationSummary {
-                throughput_mode: capacity.throughput_mode.clone(),
-                read_capacity_units: capacity.read_capacity_units,
-                write_capacity_units: capacity.write_capacity_units,
-                // Set by an `UpdateTable` that moved this table's throughput mode to
-                // PAY_PER_REQUEST, and absent while no update ever has.
-                last_update_to_pay_per_request_timestamp: table
-                    .last_update_to_pay_per_request
-                    .map(::aws_smithy_types::DateTime::from),
-            }
-        });
+        // multi-Region table, once per Region it is replicated in — there with that Region's
+        // own `replicaSpecifications.readCapacityUnits` override applied when one is stored
+        // ("For a multi-Region table, you can configure the table's read capacity
+        // differently per Amazon Web Services Region"); the write capacity has no such
+        // override, because it "remains synchronized between all replicas".
+        let capacity_summary = |read_capacity_units: Option<i64>| {
+            table.capacity_specification.as_ref().map(|capacity| {
+                CapacitySpecificationSummary {
+                    throughput_mode: capacity.throughput_mode.clone(),
+                    read_capacity_units,
+                    write_capacity_units: capacity.write_capacity_units,
+                    // Set by an `UpdateTable` that moved this table's throughput mode to
+                    // PAY_PER_REQUEST, and absent while no update ever has.
+                    last_update_to_pay_per_request_timestamp: table
+                        .last_update_to_pay_per_request
+                        .map(::aws_smithy_types::DateTime::from),
+                }
+            })
+        };
+        let capacity_specification = capacity_summary(
+            table
+                .capacity_specification
+                .as_ref()
+                .and_then(|capacity| capacity.read_capacity_units),
+        );
+        // "Contains the current warm throughput settings for a table, including the
+        // configured capacity units and the current status of the warm throughput
+        // configuration": a table nothing ever pre-warmed has none to report.
+        let warm_throughput_specification =
+            table
+                .warm_throughput_specification
+                .as_ref()
+                .map(|warm| WarmThroughputSpecificationSummary {
+                    read_units_per_second: warm.read_units_per_second,
+                    write_units_per_second: warm.write_units_per_second,
+                    status: warm.status().to_string(),
+                });
 
         Ok(GetTableOutput {
             keyspace_name: table.keyspace_name.clone(),
@@ -247,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_timestamp: table.creation_timestamp.map(::aws_smithy_types::DateTime::from),
             status: Some(table.status.clone()),
             schema_definition: table.schema_definition.clone(),
-            capacity_specification: capacity_specification.clone(),
+            capacity_specification,
             encryption_specification: table.encryption_specification.clone(),
             point_in_time_recovery: table.point_in_time_recovery.as_ref().map(|recovery| {
                 PointInTimeRecoverySummary {
@@ -276,21 +297,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|replication_region| ReplicaSpecificationSummary {
                         region: Some(replication_region.clone()),
                         status: Some(table.status.clone()),
-                        capacity_specification: capacity_specification.clone(),
-                        // Warm throughput is configured by a member `CreateTable` and
-                        // `UpdateTable` answer 501 for, so no table has one to report —
-                        // per Region or overall (see `warmThroughputSpecification` below).
-                        warm_throughput_specification: None,
+                        capacity_specification: capacity_summary(
+                            table.read_capacity_units_in(replication_region),
+                        ),
+                        // "The warm throughput settings for this replica": warm throughput
+                        // is configured for the TABLE (`WarmThroughputSpecification` carries
+                        // no Region, and `ReplicaSpecification` no warm throughput), so each
+                        // replica reports the table's.
+                        warm_throughput_specification: warm_throughput_specification.clone(),
                     })
                     .collect()
             }),
-            // A stream ARN, CDC and warm throughput are never configured by anything this
-            // slice implements: `RestoreTable` is still scaffolded, and `CreateTable` and
-            // `UpdateTable` answer 501 for exactly those members rather than storing a
-            // setting no operation can report.
+            // A stream ARN and a CDC stream are never configured by anything this slice
+            // implements: `RestoreTable` is still scaffolded, and `CreateTable` and
+            // `UpdateTable` answer 501 for `cdcSpecification` rather than storing a setting
+            // no operation can report.
             latest_stream_arn: None,
             cdc_specification: None,
-            warm_throughput_specification: None,
+            warm_throughput_specification,
         })
     }
 }

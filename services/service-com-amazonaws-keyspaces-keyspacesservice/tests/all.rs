@@ -37,3 +37,5 @@ mod type_lifecycle;
 mod update_keyspace;
 #[path = "all/update_table.rs"]
 mod update_table;
+#[path = "all/update_table_scaling_settings.rs"]
+mod update_table_scaling_settings;

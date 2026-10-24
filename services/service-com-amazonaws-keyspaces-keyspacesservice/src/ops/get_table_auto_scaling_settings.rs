@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTableAutoScalingSettings
-//! IMPLEMENTED: reports the auto scaling settings `CreateTable` stored for the named
-//! table, and — when the owning keyspace is `MULTI_REGION`, which makes its tables
-//! multi-Region tables — one Region-specific entry per Region the keyspace replicates the
-//! table to. This is the ONLY file to touch for `GetTableAutoScalingSettings`.
+//! IMPLEMENTED: reports the auto scaling settings `CreateTable` or `UpdateTable` stored
+//! for the named table, and — when the owning keyspace is `MULTI_REGION`, which makes its
+//! tables multi-Region tables — one Region-specific entry per Region the keyspace
+//! replicates the table to, each with that Region's own
+//! `replicaSpecifications.readCapacityAutoScaling` override applied when one is stored.
+//! This is the ONLY file to touch for `GetTableAutoScalingSettings`.
 //!
 //! A table's auto scaling settings are a resource of their own — the scalable target this
 //! operation needs `application-autoscaling:DescribeScalableTargets` to read — so a table
@@ -213,9 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         // The settings this operation reads are the table's scalable target, which exists
-        // only for a table auto scaling was configured for: for any other table the
-        // operation "tried to access a ... resource that doesn't exist".
-        let Some(auto_scaling_specification) = table.auto_scaling_specification.clone() else {
+        // only for a table auto scaling was configured for — for the table itself, or for
+        // one of the Regions it is replicated in. For any other table the operation "tried
+        // to access a ... resource that doesn't exist".
+        if !table.has_auto_scaling() {
             return Err(
                 GetTableAutoScalingSettingsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -228,27 +231,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        };
+        }
 
         Ok(GetTableAutoScalingSettingsOutput {
             keyspace_name: table.keyspace_name.clone(),
             table_name: table.table_name.clone(),
             resource_arn: table.resource_arn.clone(),
-            auto_scaling_specification: Some(auto_scaling_specification.clone()),
+            auto_scaling_specification: table.auto_scaling_specification.clone(),
             // "The Amazon Web Services Region specific settings of a multi-Region table.
             // Returns the settings for all Regions the table is replicated in": one entry
             // per Region the OWNING keyspace replicates this table to, each carrying the
-            // table's auto scaling settings in that Region. A per-Region read capacity
-            // auto scaling override is `replicaSpecifications` on `CreateTable` /
-            // `UpdateTable`, which this slice refuses with a 501, so no stored table's
-            // Region differs from the table's own settings; a table of a single-Region
-            // keyspace is replicated in one Region and reports none.
+            // table's auto scaling settings in that Region — the table's own, with the
+            // Region's `replicaSpecifications.readCapacityAutoScaling` override applied when
+            // one is stored. A table of a single-Region keyspace is replicated in one Region
+            // and reports none.
             replica_specifications: keyspace.table_replica_regions().map(|regions| {
                 regions
                     .iter()
                     .map(|replication_region| ReplicaAutoScalingSpecification {
                         region: Some(replication_region.clone()),
-                        auto_scaling_specification: Some(auto_scaling_specification.clone()),
+                        auto_scaling_specification: table.auto_scaling_in(replication_region),
                     })
                     .collect()
             }),

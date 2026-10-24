@@ -279,13 +279,13 @@ async fn assert_replicas(
         );
         assert_eq!(
             entry["capacitySpecification"], report["capacitySpecification"],
-            "case {case:?}: the Region's capacity summary is the table's, which no \
-             per-Region override can differ from here, got {report}"
+            "case {case:?}: with no per-Region override stored, the Region's capacity \
+             summary is the table's, got {report}"
         );
         assert!(
             entry["warmThroughputSpecification"].is_null(),
-            "case {case:?}: no warm throughput is configurable, so none is reported per \
-             Region, got {report}"
+            "case {case:?}: nothing pre-warmed this table, so no warm throughput is \
+             reported per Region, got {report}"
         );
     }
 }
@@ -420,8 +420,8 @@ async fn get_table_auto_scaling_settings_reports_one_entry_per_replication_regio
                     );
                     assert_eq!(
                         entry["autoScalingSpecification"], report["autoScalingSpecification"],
-                        "case {:?}: the Region's auto scaling settings are the table's, which \
-                         no per-Region override can differ from here, got {report}",
+                        "case {:?}: with no per-Region override stored, the Region's auto \
+                         scaling settings are the table's, got {report}",
                         case.name
                     );
                 }
