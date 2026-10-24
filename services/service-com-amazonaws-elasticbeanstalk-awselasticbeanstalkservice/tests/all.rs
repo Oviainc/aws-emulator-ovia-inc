@@ -27,6 +27,8 @@ mod describe_application_versions;
 mod dns_availability;
 #[path = "all/environment_draft_configuration.rs"]
 mod environment_draft_configuration;
+#[path = "all/environment_info.rs"]
+mod environment_info;
 #[path = "all/environment_operations.rs"]
 mod environment_operations;
 #[path = "all/environment_resources.rs"]
