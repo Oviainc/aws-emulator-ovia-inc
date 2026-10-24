@@ -208,13 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let changes = crate::state::ChannelPlacementGroupChanges {
             name: input.name,
-            // Stored verbatim by the slice, exactly as `CreateChannelPlacementGroup`
-            // stores the node ids ITS request carries: the two operations write
-            // the same member of the same record, so neither resolves it while
-            // the other does not. Resolving a node id against the node slice
-            // that has since landed — for the documented "The Node and the
-            // ChannelPlacementGroup must be in the same Cluster" — is one change
-            // to the create and the update together, not to this handler alone.
+            // Handed to the slice, which resolves every node id against the
+            // cluster's own nodes exactly as `CreateChannelPlacementGroup`
+            // does: the two operations write the same member of the same
+            // record, so a node id reaches a stored group through neither of
+            // them unless it names a node of that cluster ("The Node and the
+            // ChannelPlacementGroup must be in the same Cluster").
             nodes: input.nodes,
         };
         // The slice checks every refusal BEFORE the first write, so a refused
@@ -226,7 +225,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 changes,
                 now,
             )
-            .map_err(|refusal| refused(refusal, &input.channel_placement_group_id))?;
+            .map_err(|refusal| {
+                refused(
+                    refusal,
+                    &input.cluster_id,
+                    &input.channel_placement_group_id,
+                )
+            })?;
 
         // Read back out of the store, so the response reports what was written
         // rather than what the request asked for: `State` and `Channels` are the
@@ -256,9 +261,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (409) is for — the create, which models none, answers the same clash with its
 /// own 422. A `Nodes` list past the documented single node is a request that
 /// cannot be processed: `UnprocessableEntityException` (422) naming the member it
-/// was found at, exactly as the create reports it.
+/// was found at, exactly as the create reports it. A `Nodes` entry that names no
+/// node of this cluster the group can be associated with is the same class of
+/// refusal, worded by the same helper the create uses.
 fn refused(
     refusal: crate::state::ChannelPlacementGroupUpdateRefusal,
+    cluster_id: &str,
     group_id: &str,
 ) -> UpdateChannelPlacementGroupError {
     use crate::state::ChannelPlacementGroupUpdateRefusal as Refusal;
@@ -278,6 +286,13 @@ fn refused(
                 ))),
             })
         }
+        Refusal::UnassociableNode { node_id } => {
+            // The same class as the node bound, and the create's wording:
+            // `Nodes` names the Node to associate the group with, so an id that
+            // names no node of this cluster leaves nothing to associate and the
+            // request cannot be processed.
+            unprocessable_nodes(crate::state::unassociable_node_message(cluster_id, &node_id))
+        }
         Refusal::NameTaken => {
             UpdateChannelPlacementGroupErrorModeled::ConflictException(ConflictException {
                 message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
@@ -286,19 +301,28 @@ fn refused(
         Refusal::TooManyNodes { count } => {
             // The one wording for this refusal lives in the slice, so the create
             // and the update cannot word the same documented bound differently.
-            let message = crate::state::too_many_nodes_message(count);
-            UpdateChannelPlacementGroupErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(message.clone()),
-                    validation_errors: Some(vec![ValidationError {
-                        element_path: Some("nodes".to_string()),
-                        error_message: Some(message),
-                    }]),
-                },
-            )
+            unprocessable_nodes(crate::state::too_many_nodes_message(count))
         }
     }
     .into()
+}
+
+/// One `UnprocessableEntityException` (422) carrying `message` and the single
+/// `ValidationErrors` entry naming `Nodes`, the member both of this operation's
+/// 422s are found at.
+///
+/// The shape is stated ONCE, so the two refusals of that class cannot report it
+/// differently.
+fn unprocessable_nodes(message: String) -> UpdateChannelPlacementGroupErrorModeled {
+    UpdateChannelPlacementGroupErrorModeled::UnprocessableEntityException(
+        UnprocessableEntityException {
+            message: Some(message.clone()),
+            validation_errors: Some(vec![ValidationError {
+                element_path: Some("nodes".to_string()),
+                error_message: Some(message),
+            }]),
+        },
+    )
 }
 
 /// The engine this operation was built from is not the shared in-memory engine,
