@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataTransformationProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataTransformationProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataTransformationProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Rewrites the DRAFT (version 0) of a data transformation profile
+//! `CreateDataTransformationProfile` persisted in [`crate::state`] with the content
+//! this call carries, and reports the record that resulted — so
+//! `GetDataTransformationProfile` reads back exactly what this call wrote. The write
+//! is a FULL REPLACEMENT of the DRAFT's content, as the model documents it, never a
+//! merge: a file the new content omits is gone from the DRAFT.
+//!
+//! Published versions are immutable snapshots and are left alone; only the DRAFT
+//! moves. A profile no record holds is a `ResourceNotFoundException`, and content the
+//! modelled `ProfileMapping` could not carry — or more bytes than this emulator
+//! retains for one mapping — is refused with `ValidationException` BEFORE anything is
+//! written, so a refused update leaves the stored DRAFT exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +163,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataTransformationProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDataTransformationProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataTransformationProfile"))
+        // A profile version is the same for every caller, so `ctx` carries nothing
+        // this write needs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server(
+                "the HealthLake data transformation profile registry is unavailable",
+            ));
+        };
+
+        // The content, in the ordered form the store holds a version's mapping in, so
+        // a read reports it the same way on every call. Built and checked BEFORE the
+        // store is touched: content this emulator will not retain must leave the
+        // stored DRAFT untouched.
+        let mapping: ::std::collections::BTreeMap<String, String> = input
+            .profile_mapping
+            .iter()
+            .map(|(path, content)| (path.clone(), content.clone()))
+            .collect();
+        crate::state::validate_profile_mapping(&mapping).map_err(validation)?;
+
+        let mut store = state.lock();
+        let Some(profile) = store.profiles.get_mut(&input.profile_id) else {
+            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+        };
+
+        // "The update replaces all existing DRAFT content": the DRAFT's mapping
+        // becomes exactly what this call carried, so a file the new content omits is
+        // no longer in the DRAFT. Only the DRAFT moves — a published version is an
+        // immutable snapshot of the DRAFT as it stood when it was published.
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        profile.draft.mapping = mapping;
+        // `ChangeDescription` describes "what changed in this update", so it belongs to
+        // the change this call made: an update that carries none leaves the DRAFT with
+        // no description rather than keeping the previous update's sentence, which no
+        // longer describes the content now stored.
+        profile.draft.change_description = input.change_description;
+        profile.draft.last_updated_at = now;
+
+        // The DRAFT exists from this instant — nothing here outlives its own call — so
+        // the profile owes the clock no transition and the new content is readable
+        // immediately.
+        Ok(UpdateDataTransformationProfileOutput {
+            profile_id: profile.id.clone(),
+            source_format: profile.source_format.clone(),
+            target_format: profile.target_format.clone(),
+            profile_name: Some(profile.name.clone()),
+            last_updated_at: profile.draft.last_updated_at,
+        })
     }
+}
+
+/// This operation's 400 refusal, as the modelled `ValidationException` it declares.
+fn validation(message: impl Into<String>) -> UpdateDataTransformationProfileError {
+    UpdateDataTransformationProfileErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// This operation's 404, worded without quoting the requested identifier — the
+/// wording this service's not-found text uses.
+fn not_found(message: &str) -> UpdateDataTransformationProfileError {
+    UpdateDataTransformationProfileErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's 500, for a store the handler could not reach at all.
+fn internal_server(message: &str) -> UpdateDataTransformationProfileError {
+    UpdateDataTransformationProfileErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

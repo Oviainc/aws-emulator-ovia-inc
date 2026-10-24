@@ -13,8 +13,9 @@
 //! exactly the same operations.
 //!
 //! The data transformation profile is the second: `CreateDataTransformationProfile`
-//! mints one in DRAFT here and `GetDataTransformationProfile` reads the SAME
-//! record back, version by version.
+//! mints one in DRAFT here, `UpdateDataTransformationProfile` rewrites that DRAFT's
+//! content in place, and `GetDataTransformationProfile` reads the SAME record back,
+//! version by version.
 //!
 //! The FHIR export job is the third: a job record belongs to the data store it
 //! exports, `StartFHIRExportJob` MINTS one here, and `DescribeFHIRExportJob` /
@@ -375,13 +376,13 @@ pub const MAX_PROFILE_MAPPING_VALUE_LEN: usize = 102_400;
 /// budgets [`MAX_FHIR_RESOURCE_BYTES`]). This ceiling is this emulator's, not an AWS
 /// quota: it admits ten modelled-maximum files, or all 500 small ones, which is more
 /// than a profile needs, and it is what bounds the retained profile content —
-/// [`MAX_PROFILES`] profiles times this, because
-/// `CreateDataTransformationProfile` is the ONLY operation that writes profile
-/// content today (`UpdateDataTransformationProfile` and
-/// `PublishDataTransformationProfile` are still 501 scaffolds, so no profile can
-/// hold a second version).
+/// [`MAX_PROFILES`] profiles times this, because no profile can hold a second
+/// version yet: `CreateDataTransformationProfile` writes the DRAFT and
+/// `UpdateDataTransformationProfile` REPLACES it in place, and
+/// `PublishDataTransformationProfile` — the operation that would snapshot the DRAFT
+/// into a version of its own — is still a 501 scaffold.
 ///
-/// WHOEVER IMPLEMENTS either of those must also charge a per-profile retained-byte
+/// WHOEVER IMPLEMENTS that one must also charge a per-profile retained-byte
 /// budget, the way the FHIR data plane charges
 /// [`MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE`] against
 /// [`Datastore::fhir_resource_bytes`]: a profile may then hold
@@ -1203,7 +1204,7 @@ pub struct DataTransformationProfile {
     pub kms_key_id: Option<String>,
     pub created_at: ::aws_smithy_types::DateTime,
     /// Version [`DRAFT_PROFILE_VERSION`], the one `UpdateDataTransformationProfile`
-    /// rewrites. A profile always has one: it is created in DRAFT state.
+    /// rewrites in place. A profile always has one: it is created in DRAFT state.
     pub draft: ProfileVersionRecord,
     /// The published versions, by version number (1..=[`MAX_PROFILE_VERSION`]).
     /// A `BTreeMap` so "the latest published version" is its last key and a
