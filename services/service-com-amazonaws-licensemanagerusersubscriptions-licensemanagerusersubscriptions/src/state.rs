@@ -813,8 +813,22 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             }
         }
         let mut dropped = false;
+        let mut dropped_keys: Vec<String> = Vec::new();
         for arn in deregistered {
-            dropped |= self.drop_identity_provider(&arn).is_some();
+            if let Some(record) = self.drop_identity_provider(&arn) {
+                dropped = true;
+                if let Ok(key) = provider_key(&record.identity_provider) {
+                    if !dropped_keys.contains(&key) {
+                        dropped_keys.push(key);
+                    }
+                }
+            }
+        }
+        // No association outlives the last live registration of its directory: the drop
+        // above is one of the two routes a registration leaves the store by, and both
+        // enforce that the same way.
+        for key in &dropped_keys {
+            self.drop_instance_users_orphaned_by(key);
         }
         // The views those drops changed are recomputed ONCE for the whole sweep, not once
         // per dropped registration, and not at all when the sweep dropped nothing.
@@ -1054,6 +1068,39 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             let naming = self.associations_naming(&instance_id);
             self.apply_instance_view(&instance_id, &naming, &products_by_key);
         }
+    }
+
+    /// Drop every user association made through the directory `key` once that directory
+    /// has no LIVE registration left.
+    ///
+    /// An association exists only through a registration of its directory — that is the
+    /// resolution `AssociateUser` and `ListUserAssociations` both run before they report
+    /// anything — so a directory that has just lost its last live registration holds no
+    /// association any more: the integration every association through it depended on is
+    /// being torn down with the registration. Dropping them here is what keeps the store
+    /// from holding an association no operation can report and keeps an instance from
+    /// being reported providing no product at all: the drop goes through
+    /// [`drop_instance_users`](Self::drop_instance_users), so each instance's view is
+    /// recomputed from the associations that are left and the instance leaves the view
+    /// with the last one naming it.
+    ///
+    /// A directory that still has a live registration for ANY product keeps its
+    /// associations: an association names a directory and no product, so it outlives the
+    /// deregistration of any one product for that directory.
+    fn drop_instance_users_orphaned_by(&mut self, key: &str) {
+        if self.provider_key_is_registered(key) {
+            return;
+        }
+        let orphaned: Vec<String> = self
+            .instance_user_order
+            .iter()
+            .filter_map(|arn| self.instance_users.get(arn))
+            .filter(|record| record.provider_key == key)
+            .map(|record| record.arn.clone())
+            .collect();
+        // ONE batched drop however many associations the directory held, so a directory
+        // with many users does not cost a rebuild of the association order per user.
+        self.drop_instance_users(&orphaned);
     }
 
     /// Accept the disassociation of one user association: it enters `DISASSOCIATING` now
@@ -1606,9 +1653,12 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// enter `DELETING` and reach `DELETED` when the clock owes it — because how an
     /// endpoint's deletion becomes observable does not depend on what asked for it.
     ///
-    /// User ASSOCIATIONS are not removed: an association names a directory and no
-    /// product (`AssociateUser` carries no `Product`), so it outlives the registration
-    /// of any one product for that directory.
+    /// An association names a directory and no product (`AssociateUser` carries no
+    /// `Product`), so a user association outlives the deregistration of any ONE product
+    /// for its directory — but not of the LAST one: the associations made through a
+    /// directory that has no live registration left go with the integration they depended
+    /// on, see
+    /// [`drop_instance_users_orphaned_by`](Self::drop_instance_users_orphaned_by).
     ///
     /// Returns the record as the deregistration left it (`DEREGISTERING`), or `None` when
     /// the ARN names no stored registration. A registration whose deregistration was
@@ -1639,6 +1689,12 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         for endpoint_arn in orphaned {
             self.begin_license_server_endpoint_deletion(&endpoint_arn, now);
         }
+        // The user associations made through this directory, when this was the last live
+        // registration it had: nothing is associated through a directory this service no
+        // longer integrates with.
+        if let Ok(key) = provider_key(&deregistering.identity_provider) {
+            self.drop_instance_users_orphaned_by(&key);
+        }
         // Which products the instances in view provide is read from the LIVE
         // registrations, so a registration leaving that set changes those views.
         self.refresh_every_instance_view();
@@ -1660,6 +1716,11 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// outlives the provider it was subscribed through however the drop was reached.
     pub fn remove_identity_provider(&mut self, arn: &str) -> Option<IdentityProviderRecord> {
         let record = self.drop_identity_provider(arn)?;
+        // No association outlives the last live registration of its directory, however the
+        // registration's removal was reached.
+        if let Ok(key) = provider_key(&record.identity_provider) {
+            self.drop_instance_users_orphaned_by(&key);
+        }
         // Which products the instances in view provide is read from the registrations, so
         // removing one changes those views.
         self.refresh_every_instance_view();
