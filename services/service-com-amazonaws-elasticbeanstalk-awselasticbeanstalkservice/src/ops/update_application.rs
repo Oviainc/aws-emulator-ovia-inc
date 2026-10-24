@@ -140,12 +140,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // update never applies to a record that no longer exists.
         store.materialize_due_application_removals();
 
-        // Read from the version store before the application is borrowed
-        // mutably, so the reported `Versions` list is the version store's own
-        // content rather than a second copy of it. A name the store holds no
+        // Read from the version and template stores before the application is
+        // borrowed mutably, so the reported `Versions` and
+        // `ConfigurationTemplates` lists are those stores' own content rather
+        // than a second copy of them. A name the store holds no
         // application under has no versions either, so this is answered for the
         // refusal below as well.
         let versions = store.version_labels(&input.application_name);
+        let templates = store.template_names(&input.application_name);
 
         // "The name of the application to update. If no such application is
         // found, UpdateApplication returns an InvalidParameterValue error." The
@@ -173,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         Ok(UpdateApplicationOutput {
-            application: Some(application.to_description(versions)),
+            application: Some(application.to_description(versions, templates)),
         })
     }
 }

@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-elasticbeanstalk-awselasticbeanstalkservice service.
 //!
 //! This is the single store every handler in `src/ops/` reads and writes: the
-//! applications, the application versions, the custom platform versions and the
+//! applications, the application versions, the configuration templates, the
+//! custom platform versions and the
 //! environments the lifecycle
 //! operations create, describe and delete, plus the managed platform branch
 //! catalog the service publishes and the event log those operations append to
@@ -308,9 +309,9 @@ pub const MAX_ENVIRONMENTS: usize = 200;
 
 /// See [`MAX_APPLICATIONS`]: the same published table gives 300 configuration
 /// templates (saved configurations) per account per region. Reported by
-/// DescribeAccountAttributes as `ConfigurationTemplateQuota`;
-/// `CreateConfigurationTemplate` is still scaffolded, so this is the allowance
-/// that create will be held to rather than one anything enforces yet.
+/// DescribeAccountAttributes as `ConfigurationTemplateQuota` and enforced by
+/// `CreateConfigurationTemplate`, which is also what bounds
+/// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::configuration_templates`].
 pub const MAX_CONFIGURATION_TEMPLATES: usize = 300;
 
 /// How many custom platform versions one account may hold here.
@@ -331,6 +332,31 @@ pub const MAX_PLATFORM_VERSIONS: usize = 50;
 /// operation considers both the number of tags the resource already has and the
 /// tags this operation would add if it succeeded."
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// How many option settings ONE configuration — a template or an environment's
+/// own set — may carry here.
+///
+/// Elastic Beanstalk publishes no quota for it, so this bound is CHOSEN: it is
+/// comfortably above the size of the service's whole published option catalogue
+/// (a few hundred options across all namespaces, which is the most a complete
+/// configuration can name once, since an option is identified by
+/// [`option_setting_key`] and so appears at most once in a configuration). It is
+/// what bounds the SIZE of one stored template — the template COUNT is bounded
+/// by [`MAX_CONFIGURATION_TEMPLATES`] — and what bounds the work
+/// [`merge_option_settings`] does for one request, which is why the refusal is
+/// made on the request's own list BEFORE the merge and on the merged result
+/// after it.
+pub const MAX_CONFIGURATION_OPTION_SETTINGS: usize = 500;
+
+/// The message a request carrying more than [`MAX_CONFIGURATION_OPTION_SETTINGS`]
+/// option settings is refused with, built from the request: the member, the count
+/// it sent and the bound it exceeded.
+pub fn too_many_option_settings_message(count: usize) -> String {
+    format!(
+        "Parameter OptionSettings carries {count} option settings. A configuration can hold \
+         at most {MAX_CONFIGURATION_OPTION_SETTINGS}."
+    )
+}
 
 /// How many storage locations this account may hold — the bound
 /// `CreateStorageLocation`'s modelled `TooManyBucketsException` names ("The
@@ -976,6 +1002,24 @@ pub fn application_version_arn(region: &str, application_name: &str, version_lab
     )
 }
 
+/// `arn:aws:elasticbeanstalk:<region>:<account>:configurationtemplate/<app>/<template>`
+/// — the ARN form Elastic Beanstalk names a saved configuration by, which is the
+/// `configurationtemplate` member of [`TAGGABLE_RESOURCE_TYPES`] and the form
+/// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::resolve_tagged_resource`]
+/// resolves back to a stored template. No modelled response carries a
+/// template's ARN, so this is the one statement of that form.
+pub fn configuration_template_arn(
+    region: &str,
+    application_name: &str,
+    template_name: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("configurationtemplate/{application_name}/{template_name}"),
+    )
+}
+
 /// `arn:aws:elasticbeanstalk:<region>:<account>:environment/<app>/<env name>`.
 pub fn environment_arn(region: &str, application_name: &str, environment_name: &str) -> String {
     ::engine::emulator_arn(
@@ -1058,6 +1102,8 @@ pub enum TaggedResource {
     Application(String),
     /// An application version, by `(ApplicationName, VersionLabel)`.
     ApplicationVersion(String, String),
+    /// A configuration template, by `(ApplicationName, TemplateName)`.
+    ConfigurationTemplate(String, String),
     /// An environment, by `EnvironmentId`.
     Environment(String),
 }
@@ -1202,9 +1248,6 @@ pub struct Application {
     /// a record always carries one and every read reports it. See
     /// [`resource_lifecycle_config_with_defaults`].
     pub resource_lifecycle_config: ApplicationResourceLifecycleConfig,
-    /// Template names, carried so DescribeApplications reports them; creating a
-    /// configuration template is its own (still scaffolded) operation.
-    pub configuration_templates: Vec<String>,
     pub tags: Vec<Tag>,
     /// The deletion the clock owes this application, once `DeleteApplication`
     /// has started one. See [`PendingDeletion`].
@@ -1247,10 +1290,17 @@ impl Application {
         self.pending_deletion.is_some()
     }
 
-    /// The modelled `ApplicationDescription` for this record. `versions` is
-    /// derived by the caller from [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::version_labels`],
-    /// so the list is never a second copy of the version store.
-    pub fn to_description(&self, versions: Vec<String>) -> ApplicationDescription {
+    /// The modelled `ApplicationDescription` for this record. `versions` and
+    /// `configuration_templates` are derived by the caller from
+    /// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::version_labels`]
+    /// and
+    /// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::template_names`],
+    /// so neither list is a second copy of the store it is read from.
+    pub fn to_description(
+        &self,
+        versions: Vec<String>,
+        configuration_templates: Vec<String>,
+    ) -> ApplicationDescription {
         ApplicationDescription {
             application_arn: Some(self.arn.clone()),
             application_name: Some(self.name.clone()),
@@ -1258,7 +1308,7 @@ impl Application {
             date_created: Some(self.date_created),
             date_updated: Some(self.date_updated),
             versions: Some(versions),
-            configuration_templates: Some(self.configuration_templates.clone()),
+            configuration_templates: Some(configuration_templates),
             resource_lifecycle_config: Some(self.resource_lifecycle_config.clone()),
         }
     }
@@ -1306,6 +1356,129 @@ impl ApplicationVersion {
         }
     }
 }
+
+/// A stored configuration template — a "saved configuration", the settings a
+/// `CreateConfigurationTemplate` call persisted under one `(ApplicationName,
+/// TemplateName)` pair.
+///
+/// A template is NEVER associated with an environment: "Templates aren't
+/// associated with any environment. The `EnvironmentName` response element is
+/// always null", and `DeploymentStatus` is documented as "null: This
+/// configuration is not associated with a running environment" — so neither
+/// member is stored here, and the projection below reports both as absent.
+#[derive(Debug, Clone)]
+pub struct ConfigurationTemplate {
+    pub application_name: String,
+    pub template_name: String,
+    pub description: Option<String>,
+    /// The platform version the settings belong to, by solution stack name and
+    /// by ARN. Either can be absent: a CUSTOM platform version has no solution
+    /// stack name this service can derive, and a template created from a
+    /// solution stack the catalogue does not publish has no ARN to report.
+    pub solution_stack_name: Option<String>,
+    pub platform_arn: Option<String>,
+    /// The option settings this configuration holds, in the order they were
+    /// supplied, de-duplicated by the key an option is identified by
+    /// (`Namespace`, `OptionName`, `ResourceName`).
+    pub option_settings: Vec<ConfigurationOptionSetting>,
+    pub date_created: ::aws_smithy_types::DateTime,
+    pub date_updated: ::aws_smithy_types::DateTime,
+    pub tags: Vec<Tag>,
+}
+
+impl ConfigurationTemplate {
+    /// The store key for this record: a template name "must be unique per
+    /// application", so the pair is the identity.
+    pub fn key(&self) -> (String, String) {
+        (self.application_name.clone(), self.template_name.clone())
+    }
+
+    /// The resources an event about this template belongs to.
+    pub fn event_subject(&self) -> EventSubject {
+        EventSubject {
+            application_name: Some(self.application_name.clone()),
+            template_name: Some(self.template_name.clone()),
+            platform_arn: self.platform_arn.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+/// The key an option setting is identified by — `(Namespace, OptionName,
+/// ResourceName)`, the same three members `OptionSpecification` names one by.
+/// Two settings sharing it are the SAME option, so the later value replaces the
+/// earlier one rather than being appended beside it.
+pub fn option_setting_key(setting: &ConfigurationOptionSetting) -> (String, String, String) {
+    (
+        setting.namespace.clone().unwrap_or_default(),
+        setting.option_name.clone().unwrap_or_default(),
+        setting.resource_name.clone().unwrap_or_default(),
+    )
+}
+
+/// `base` with every setting in `overrides` applied: a setting whose
+/// [`option_setting_key`] `base` already carries replaces that one in place, and
+/// one it does not carry is appended. This is what "Values specified in
+/// `OptionSettings` override any values obtained from the `SourceConfiguration`"
+/// means, and it is also how a request that lists the same option twice settles
+/// on one value.
+///
+/// ONE pass over the two lists, with each element's key computed ONCE and the
+/// position of the setting holding it looked up in a map: the work is linear in
+/// the combined length, so a caller-chosen list cannot turn into quadratic work
+/// inside the store's critical section. The result length is bounded by the
+/// caller — see [`MAX_CONFIGURATION_OPTION_SETTINGS`], which the handler refuses
+/// a longer request and a longer merged result with.
+pub fn merge_option_settings(
+    base: &[ConfigurationOptionSetting],
+    overrides: &[ConfigurationOptionSetting],
+) -> Vec<ConfigurationOptionSetting> {
+    let mut merged: Vec<ConfigurationOptionSetting> = Vec::new();
+    let mut positions: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+    for setting in base.iter().chain(overrides.iter()) {
+        match positions.get(&option_setting_key(setting)) {
+            Some(&at) => merged[at] = setting.clone(),
+            None => {
+                positions.insert(option_setting_key(setting), merged.len());
+                merged.push(setting.clone());
+            }
+        }
+    }
+    merged
+}
+
+/// Build one of the generated `ConfigurationSettingsDescription` structs from a
+/// stored configuration template.
+///
+/// The model binds `ConfigurationSettingsDescription` as the output of
+/// `CreateConfigurationTemplate`, `UpdateConfigurationTemplate` and (as a list
+/// member) `DescribeConfigurationSettings`, and the scaffold emits a DISTINCT
+/// Rust struct per operation for it with identical members, so the mapping is
+/// written once here and the struct is the parameter — the same seam
+/// [`environment_description`] provides for `EnvironmentDescription`.
+macro_rules! configuration_settings_description {
+    ($ty:path, $template:expr) => {{
+        let template: &$crate::state::ConfigurationTemplate = $template;
+        $ty {
+            solution_stack_name: template.solution_stack_name.clone(),
+            platform_arn: template.platform_arn.clone(),
+            application_name: Some(template.application_name.clone()),
+            template_name: Some(template.template_name.clone()),
+            description: template.description.clone(),
+            // "Templates aren't associated with any environment. The
+            // EnvironmentName response element is always null", and a
+            // configuration that is not associated with a running environment
+            // reports a null `DeploymentStatus`.
+            environment_name: None,
+            deployment_status: None,
+            date_created: Some(template.date_created),
+            date_updated: Some(template.date_updated),
+            option_settings: Some(template.option_settings.clone()),
+        }
+    }};
+}
+
+pub(crate) use configuration_settings_description;
 
 /// The resources one recorded event is about — exactly the members
 /// `DescribeEvents` filters on, so a filter and a recording cannot disagree
@@ -2163,6 +2336,12 @@ pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     pub applications: BTreeMap<String, Application>,
     /// Application versions by `(ApplicationName, VersionLabel)`.
     pub application_versions: BTreeMap<(String, String), ApplicationVersion>,
+    /// Configuration templates (saved configurations) by `(ApplicationName,
+    /// TemplateName)` — "this name must be unique per application". Populated by
+    /// `CreateConfigurationTemplate`; `DescribeApplications` reports an
+    /// application's template names from here rather than from a second list on
+    /// the application record.
+    pub configuration_templates: BTreeMap<(String, String), ConfigurationTemplate>,
     /// Custom platform versions by `PlatformArn`. Populated by
     /// `CreatePlatformVersion`; a `PlatformArn` no entry here answers to names no
     /// platform this account holds.
@@ -2202,6 +2381,7 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
         Self {
             applications: BTreeMap::new(),
             application_versions: BTreeMap::new(),
+            configuration_templates: BTreeMap::new(),
             platform_versions: BTreeMap::new(),
             environments: BTreeMap::new(),
             environment_name_index: BTreeMap::new(),
@@ -2348,6 +2528,23 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             .collect()
     }
 
+    /// An application's configuration template names, in the one order
+    /// `DescribeApplications` reports them: alphabetically, which is the store's
+    /// own key order for the application's slice of the template map.
+    pub fn template_names(&self, application_name: &str) -> Vec<String> {
+        self.configuration_templates
+            .values()
+            .filter(|template| template.application_name == application_name)
+            .map(|template| template.template_name.clone())
+            .collect()
+    }
+
+    /// How many configuration templates this account holds — the count the
+    /// configuration-template quota covers.
+    pub fn configuration_template_count(&self) -> usize {
+        self.configuration_templates.len()
+    }
+
     /// The id of the environment named by `EnvironmentId` or `EnvironmentName`,
     /// whichever the caller supplied.
     pub fn resolve_environment_id(
@@ -2388,7 +2585,8 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// The record `arn` names, for the two tag operations.
     ///
     /// The ARN forms are this service's own ([`application_arn`],
-    /// [`application_version_arn`], [`environment_arn`]), so the same ARN a
+    /// [`application_version_arn`], [`configuration_template_arn`],
+    /// [`environment_arn`]), so the same ARN a
     /// create answered with resolves back to the record it minted. The resource
     /// path after the type is matched against the names the store HOLDS rather
     /// than split on `/`, because an application name, a version label and an
@@ -2417,6 +2615,19 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
                     TaggedResource::ApplicationVersion(
                         application_name.clone(),
                         version_label.clone(),
+                    )
+                })
+                .ok_or(ResourceArnRefusal::NotFound),
+            "configurationtemplate" => self
+                .configuration_templates
+                .keys()
+                .find(|(application_name, template_name)| {
+                    format!("{application_name}/{template_name}") == path
+                })
+                .map(|(application_name, template_name)| {
+                    TaggedResource::ConfigurationTemplate(
+                        application_name.clone(),
+                        template_name.clone(),
                     )
                 })
                 .ok_or(ResourceArnRefusal::NotFound),
@@ -2454,6 +2665,10 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
                 .application_versions
                 .get(&(application_name.clone(), version_label.clone()))
                 .map(|record| &record.tags),
+            TaggedResource::ConfigurationTemplate(application_name, template_name) => self
+                .configuration_templates
+                .get(&(application_name.clone(), template_name.clone()))
+                .map(|record| &record.tags),
             TaggedResource::Environment(environment_id) => {
                 self.environments.get(environment_id).map(|record| &record.tags)
             }
@@ -2469,6 +2684,10 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             TaggedResource::ApplicationVersion(application_name, version_label) => self
                 .application_versions
                 .get_mut(&(application_name.clone(), version_label.clone()))
+                .map(|record| &mut record.tags),
+            TaggedResource::ConfigurationTemplate(application_name, template_name) => self
+                .configuration_templates
+                .get_mut(&(application_name.clone(), template_name.clone()))
                 .map(|record| &mut record.tags),
             TaggedResource::Environment(environment_id) => self
                 .environments
@@ -2758,8 +2977,9 @@ pub fn missing_platform_message(platform_arn: &str) -> String {
 /// The message that records a created resource, the middle event of the
 /// sequence [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::record_completed_activity`]
 /// describes: `Created new <kind>: <identifier>`, the form the real service's
-/// `Created new Application: <name>` event uses. [`RESOURCE_APPLICATION`] and
-/// [`RESOURCE_APPLICATION_VERSION`] are the kinds this service creates
+/// `Created new Application: <name>` event uses. [`RESOURCE_APPLICATION`],
+/// [`RESOURCE_APPLICATION_VERSION`] and [`RESOURCE_CONFIGURATION_TEMPLATE`] are
+/// the kinds this service creates
 /// synchronously.
 pub fn resource_created_event(kind: &str, identifier: &str) -> String {
     format!("Created new {kind}: {identifier}")
@@ -2771,6 +2991,22 @@ pub const RESOURCE_APPLICATION: &str = "Application";
 /// The resource kind an application version's created-event names. See
 /// [`resource_created_event`].
 pub const RESOURCE_APPLICATION_VERSION: &str = "Application Version";
+/// The resource kind a configuration template's created-event names. See
+/// [`resource_created_event`].
+pub const RESOURCE_CONFIGURATION_TEMPLATE: &str = "Configuration Template";
+
+/// The message this service refuses a request with `InvalidParameterValue` for
+/// when the `(ApplicationName, TemplateName)` pair it supplied names no stored
+/// configuration template, built from the request: `No Configuration Template
+/// named '<name>' found.`
+///
+/// The same shape as the not-found sentences the create operations answer a bad
+/// `ApplicationName` or `VersionLabel` with (`No Application named '<name>'
+/// found.`), read from the one place every caller reads it, so two operations
+/// cannot word one refusal two ways.
+pub fn missing_configuration_template_message(template_name: &str) -> String {
+    format!("No Configuration Template named '{template_name}' found.")
+}
 
 /// How many characters an `EnvironmentId` body carries: `e-` plus 13 lowercase
 /// alphanumerics is the form the real service issues one in.

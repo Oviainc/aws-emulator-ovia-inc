@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfigurationTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfigurationTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfigurationTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores the configuration template (a saved configuration) under its
+//! application and answers with the `ConfigurationSettingsDescription` built from what
+//! was stored, recording the event `DescribeEvents` reports for it. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -203,18 +198,283 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfigurationTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfigurationTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region = crate::state::request_region(ctx);
+
+        // A statement about the REQUEST is answered before any resource the
+        // request names is resolved: an absent or contradictory input does not
+        // depend on what this account holds, so it cannot be reported as a
+        // problem with the application.
+
+        // "You define application configuration settings in a configuration
+        // template": the settings come from exactly one of four places — a
+        // solution stack ("It also determines the set of configuration options
+        // as well as the possible and default values"), a custom platform
+        // version, a running environment ("the ID of an environment whose
+        // settings you want to use") or another template
+        // (`SourceConfiguration`). Each member is documented as required when
+        // the other three are absent, so a request naming none of them says
+        // nothing about what to configure.
+        if input.solution_stack_name.is_none()
+            && input.platform_arn.is_none()
+            && input.environment_id.is_none()
+            && input.source_configuration.is_none()
+        {
+            return Err(CreateConfigurationTemplateError::missing_parameter(
+                "You must specify either SolutionStackName, PlatformArn, EnvironmentId or \
+                 SourceConfiguration.",
+            ));
+        }
+
+        // "If you specify PlatformArn, then don't specify SolutionStackName" —
+        // the two name the platform version two ways, so a request carrying both
+        // asks for one configuration from two sources.
+        if input.solution_stack_name.is_some() && input.platform_arn.is_some() {
+            return Err(
+                CreateConfigurationTemplateError::invalid_parameter_combination(
+                    "You cannot specify both SolutionStackName and PlatformArn.",
+                ),
+            );
+        }
+
+        // How many option settings one configuration may carry is a bound on the
+        // REQUEST, so it is answered here: the list the caller sent is refused
+        // before anything is resolved, and the merged result is checked again
+        // below, so neither the stored record nor the merge's own work is
+        // unbounded. See `crate::state::MAX_CONFIGURATION_OPTION_SETTINGS`.
+        let requested_settings = input.option_settings.as_deref().unwrap_or_default();
+        if requested_settings.len() > crate::state::MAX_CONFIGURATION_OPTION_SETTINGS {
+            return Err(CreateConfigurationTemplateError::invalid_parameter_value(
+                crate::state::too_many_option_settings_message(requested_settings.len()),
+            ));
+        }
+
+        // "An Elastic Beanstalk configuration template to base this one on":
+        // the template is named by `SourceConfiguration$TemplateName`, so a
+        // source configuration that names none identifies nothing to copy.
+        let source_configuration = match input.source_configuration.as_ref() {
+            Some(source) => {
+                let Some(template_name) = source.template_name.clone() else {
+                    return Err(
+                        CreateConfigurationTemplateError::missing_required_parameter(
+                            "Must specify a TemplateName in SourceConfiguration.",
+                        ),
+                    );
+                };
+                // "The name of the application associated with the
+                // configuration." A template name is unique per APPLICATION, so
+                // the pair is what resolves one; a source configuration that
+                // names no application is resolved inside the application this
+                // call creates the new template in, the only one the request
+                // names.
+                let application_name = source
+                    .application_name
+                    .clone()
+                    .unwrap_or_else(|| input.application_name.clone());
+                Some((application_name, template_name))
+            }
+            None => None,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConfigurationTemplateError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // An application the clock has already finished deleting holds no
+        // templates, and an environment whose termination has come due is no
+        // longer a source of settings, so both are settled before anything is
+        // resolved.
+        store.materialize_due_transitions();
+
+        // A configuration template is "associated with a specific Elastic
+        // Beanstalk application", so there has to be one to associate it with.
+        if !store.applications.contains_key(&input.application_name) {
+            return Err(CreateConfigurationTemplateError::invalid_parameter_value(
+                format!("No Application named '{}' found.", input.application_name),
+            ));
+        }
+
+        // "Constraint: This name must be unique per application."
+        let key = (input.application_name.clone(), input.template_name.clone());
+        if store.configuration_templates.contains_key(&key) {
+            return Err(CreateConfigurationTemplateError::invalid_parameter_value(
+                format!(
+                    "Configuration Template {} already exists.",
+                    input.template_name
+                ),
+            ));
+        }
+
+        // "TooManyConfigurationTemplatesException: The specified account has
+        // reached its limit of configuration templates." Enforcing the quota is
+        // also what bounds this store.
+        if store.configuration_template_count() >= crate::state::MAX_CONFIGURATION_TEMPLATES {
+            return Err(
+                CreateConfigurationTemplateErrorModeled::TooManyConfigurationTemplatesException(
+                    TooManyConfigurationTemplatesException {
+                        message: Some(format!(
+                            "The number of configuration templates in this account has reached \
+                             the limit of {}.",
+                            crate::state::MAX_CONFIGURATION_TEMPLATES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The configuration this template starts from: the platform version it
+        // runs on, and the option settings already set on whatever it is based
+        // on. A solution stack or a platform version contributes the platform
+        // alone — its option DEFAULTS are the service's published option
+        // catalog, which `DescribeConfigurationOptions` owns — while a source
+        // template or an environment contributes both.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfigurationTemplate"))
+        // PRECEDENCE, where a request names more than one source: the source
+        // that carries a whole configuration wins over one that names only a
+        // platform version, and `SourceConfiguration` wins over `EnvironmentId`.
+        // Each of the four members is documented as the one to use "if you don't
+        // specify" the other three, so a request naming two of them is outside
+        // what the model describes; the order here is from most to least
+        // specific about the configuration, and the one contradiction the model
+        // DOES state — a solution stack that is not the source template's — is
+        // refused below rather than resolved by precedence.
+        let mut solution_stack_name = input.solution_stack_name.clone();
+        let mut platform_arn = input.platform_arn.clone();
+        let mut inherited: Vec<ConfigurationOptionSetting> = Vec::new();
+
+        if let Some((source_application, source_template)) = source_configuration {
+            let Some(source) = store
+                .configuration_templates
+                .get(&(source_application, source_template.clone()))
+            else {
+                return Err(CreateConfigurationTemplateError::invalid_parameter_value(
+                    crate::state::missing_configuration_template_message(&source_template),
+                ));
+            };
+            // "Constraint: If both solution stack name and source configuration
+            // are specified, the solution stack of the source configuration
+            // template must match the specified solution stack name."
+            if let Some(requested) = solution_stack_name.as_ref() {
+                if source.solution_stack_name.as_ref() != Some(requested) {
+                    return Err(
+                        CreateConfigurationTemplateError::invalid_parameter_combination(format!(
+                            "Configuration template '{source_template}' does not use solution \
+                             stack '{requested}'.",
+                        )),
+                    );
+                }
+            }
+            // "Elastic Beanstalk uses the configuration values from the
+            // specified configuration template to create a new configuration."
+            solution_stack_name = source.solution_stack_name.clone();
+            platform_arn = source.platform_arn.clone();
+            inherited = source.option_settings.clone();
+        } else if let Some(environment_id) = input.environment_id.as_ref() {
+            let Some(environment) = store
+                .environments
+                .get(environment_id)
+                .filter(|environment| !environment.is_terminated())
+            else {
+                return Err(CreateConfigurationTemplateError::invalid_parameter_value(
+                    crate::state::missing_environment_message(Some(environment_id), None),
+                ));
+            };
+            solution_stack_name = environment.solution_stack_name.clone();
+            platform_arn = environment.platform_arn.clone();
+            inherited = environment.option_settings.clone();
+        } else if let Some(platform_arn) = platform_arn.as_ref() {
+            // "PlatformArn: The Amazon Resource Name (ARN) of the custom
+            // platform." A platform version is either CUSTOM — created in this
+            // account by `CreatePlatformVersion` — or MANAGED, one of the
+            // versions this service publishes, and an ARN that answers to
+            // neither names nothing a configuration can be built for. The same
+            // resolution `CreateEnvironment` makes for the member.
+            match store.platform_versions.get(platform_arn) {
+                Some(platform_version) if !platform_version.is_ready() => {
+                    return Err(CreateConfigurationTemplateError::invalid_parameter_value(
+                        format!(
+                            "Platform '{platform_arn}' is not ready to be used; its status is {}.",
+                            platform_version.status
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None if crate::state::managed_platform_version(&region, platform_arn).is_some() => {}
+                None => {
+                    return Err(CreateConfigurationTemplateError::invalid_parameter_value(
+                        format!("No Platform named '{platform_arn}' found."),
+                    ));
+                }
+            }
+        }
+
+        // A platform version is named by its ARN and by its solution stack name,
+        // and a configuration reports BOTH for the version it is for: the form
+        // the request did not use is resolved from the service's published
+        // catalog, exactly as `CreateEnvironment` resolves it. A name or an ARN
+        // the catalog does not publish resolves to nothing and the member stays
+        // absent rather than carrying a made-up value — a CUSTOM platform
+        // version, in particular, has no solution stack name this service can
+        // derive.
+        let resolved_stack = solution_stack_name
+            .as_deref()
+            .and_then(crate::state::solution_stack_named)
+            .or_else(|| {
+                platform_arn
+                    .as_deref()
+                    .and_then(|arn| crate::state::managed_platform_version(&region, arn))
+            });
+        let platform_arn =
+            platform_arn.or_else(|| resolved_stack.map(|stack| stack.platform_arn(&region)));
+        let solution_stack_name =
+            solution_stack_name.or_else(|| resolved_stack.map(|stack| stack.name()));
+
+        // "If specified, these values override the values obtained from the
+        // solution stack or the source configuration." The result is bounded the
+        // same way the request's own list is: a configuration whose inherited
+        // settings plus the request's would exceed the bound is refused rather
+        // than stored.
+        let option_settings = crate::state::merge_option_settings(&inherited, requested_settings);
+        if option_settings.len() > crate::state::MAX_CONFIGURATION_OPTION_SETTINGS {
+            return Err(CreateConfigurationTemplateError::invalid_parameter_value(
+                crate::state::too_many_option_settings_message(option_settings.len()),
+            ));
+        }
+
+        let created = crate::state::now();
+        let template = crate::state::ConfigurationTemplate {
+            application_name: input.application_name.clone(),
+            template_name: input.template_name.clone(),
+            description: input.description.clone(),
+            solution_stack_name,
+            platform_arn,
+            option_settings,
+            date_created: created,
+            date_updated: created,
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output =
+            crate::state::configuration_settings_description!(CreateConfigurationTemplateOutput, &template);
+        let subject = template.event_subject();
+        let template_name = template.template_name.clone();
+        store.configuration_templates.insert(template.key(), template);
+
+        // The activity this call performed, recorded for `DescribeEvents`: the
+        // operation starting, the template it created, and the operation
+        // completing, all under this request's id.
+        store.record_completed_activity(
+            &crate::state::new_request_id(),
+            "createConfigurationTemplate",
+            Some(crate::state::resource_created_event(
+                crate::state::RESOURCE_CONFIGURATION_TEMPLATE,
+                &template_name,
+            )),
+            subject,
+        );
+
+        Ok(output)
     }
 }

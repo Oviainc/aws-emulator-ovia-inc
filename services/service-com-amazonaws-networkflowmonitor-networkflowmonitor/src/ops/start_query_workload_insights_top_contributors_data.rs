@@ -191,6 +191,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The FORM of the `scopeId` is a property of the request alone too: a value
+        // that cannot be an identifier this service generates is the modelled 400,
+        // decided before the store is consulted.
+        if !crate::state::is_scope_id(&input.scope_id) {
+            return Err(
+                StartQueryWorkloadInsightsTopContributorsDataErrorModeled::ValidationException(
+                    crate::state::invalid_scope_id(),
+                )
+                .into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 StartQueryWorkloadInsightsTopContributorsDataErrorModeled::InternalServerException(
@@ -204,13 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         state.settle(now);
 
+        // The scope the query hangs off has to exist. This operation models no
+        // `ResourceNotFoundException`, so a well-formed reference the store cannot
+        // resolve — and therefore cannot authorize — is the modelled 403, not a 400.
         if !state.scopes.contains_key(&input.scope_id) {
             return Err(
-                StartQueryWorkloadInsightsTopContributorsDataErrorModeled::ValidationException(
-                    crate::state::field_validation(
-                        "scopeId",
-                        format!("scope {} was not found", input.scope_id),
-                    ),
+                StartQueryWorkloadInsightsTopContributorsDataErrorModeled::AccessDeniedException(
+                    crate::state::reference_denied(crate::state::SCOPE_RESOURCE),
                 )
                 .into(),
             );

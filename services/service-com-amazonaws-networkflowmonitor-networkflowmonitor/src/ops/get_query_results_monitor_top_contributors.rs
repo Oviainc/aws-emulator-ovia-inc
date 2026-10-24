@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetQueryResultsMonitorTopContributorsErrorModeled::InternalServerException(
@@ -196,6 +196,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
         state.settle(::std::time::SystemTime::now());
+
+        // The monitor the query hangs off, before the query itself: this operation
+        // DOES model `ResourceNotFoundException`, so a monitor reference the store
+        // cannot resolve is reported as the absence it is — in this service's
+        // missing-monitor wording — rather than as a refusal naming the `queryId`.
+        if !state.monitors.contains_key(&input.monitor_name) {
+            return Err(
+                GetQueryResultsMonitorTopContributorsErrorModeled::ResourceNotFoundException(
+                    crate::state::monitor_not_found(&region, &input.monitor_name),
+                )
+                .into(),
+            );
+        }
 
         let Some(query) = state.query(
             crate::state::QueryKind::MonitorTopContributors,
