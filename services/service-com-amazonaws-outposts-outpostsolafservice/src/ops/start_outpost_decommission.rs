@@ -190,12 +190,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         let mut store = state.lock();
-        // Only the quote statuses matter to this call, and a quote expires on the
-        // clock, so settle them before reading what is still associated with the
-        // Outpost. That writes only the expiry that was already due at this same
-        // instant — nothing a later caller would not have seen anyway. The Outpost's
-        // own lifecycle status is not read here, so it is not settled.
+        // Only the quote and order statuses matter to this call, and each moves on
+        // the clock — a quote expires, an order gets past being prepared — so settle
+        // both before reading what is still associated with the Outpost. That writes
+        // only what was already due at this same instant — nothing a later caller
+        // would not have seen anyway. The Outpost's own lifecycle status is not read
+        // here, so it is not settled.
         store.settle_quotes();
+        store.settle_orders();
 
         // A decommission is of ONE Outpost, so an identifier the store holds no
         // Outpost for is the not-found error this operation models, worded as the

@@ -53,9 +53,10 @@ const CAPACITY_TASK_ID_LENGTH: usize = 21;
 /// accepts it, and naming nothing.
 pub(crate) const ABSENT_CAPACITY_TASK_ID: &str = "cap-00000000000000000";
 
-/// An `OrderId` of the modelled form `^oo-[a-f0-9]{17}$`. Orders are not persisted
-/// by this slice (`CreateOrder` is still a scaffold stub), so an order id is only
-/// ever a value a capacity task carries and is keyed by.
+/// An `OrderId` of the modelled form `^oo-[a-f0-9]{17}$`. A capacity task names the
+/// order it belongs to without that order having to be one this store holds, so an
+/// order id here is only ever a value a capacity task carries and is keyed by (what a
+/// persisted order is, is exercised in [`crate::order_lifecycle`]).
 const ORDER_ID: &str = "oo-1111111111111111a";
 /// A second order, for the case that shows the one-active-task rule is per order.
 const OTHER_ORDER_ID: &str = "oo-2222222222222222b";

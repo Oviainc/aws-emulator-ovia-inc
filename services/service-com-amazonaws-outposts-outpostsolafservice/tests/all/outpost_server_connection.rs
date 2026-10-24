@@ -27,8 +27,8 @@
 //!    anything.
 //!
 //! Where the hardware comes from: an asset is a PHYSICAL unit of hardware that
-//! arrives with a fulfilled order, and the operations an order arrives through
-//! (`CreateOrder`, `GetOrder`) are still scaffold stubs with issues of their own, so
+//! arrives with a fulfilled order, and no order this emulator accepts is ever carried
+//! as far as being delivered and installed (see [`crate::order_lifecycle`]), so
 //! each row RECORDS its asset on the stored Outpost through this crate's store —
 //! exactly as [`crate::outpost_assets`] does, whose two recording helpers this suite
 //! reuses.

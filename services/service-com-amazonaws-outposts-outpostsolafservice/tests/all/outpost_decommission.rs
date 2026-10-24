@@ -64,10 +64,11 @@ fn status(output: &Value) -> String {
 
 /// Move a stored quote into `quote_status`.
 ///
-/// This is state a later slice of the API produces — an order submitted from a quote
-/// (`CreateOrder` is still a scaffold stub) — reached through the shared engine, the
-/// way [`Outposts::store`] exists to be reached. Every assertion about behaviour still
-/// goes over the wire.
+/// Reached through the shared engine, the way [`Outposts::store`] exists to be
+/// reached: the two statuses other than `CREATED` are reached by time passing or by
+/// an order being submitted from the quote, and a case about what each status BLOCKS
+/// must not depend on which. Every assertion about behaviour still goes over the
+/// wire.
 fn set_quote_status(outposts: &Outposts, quote_id: &str, quote_status: &str) {
     let store = outposts.store();
     let mut store = store.lock();

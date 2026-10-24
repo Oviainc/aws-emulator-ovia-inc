@@ -28,9 +28,9 @@
 //! Where the recorded assets come from: an asset is a PHYSICAL unit of hardware —
 //! a compute or storage server, a powershelf, a switch — that Amazon Web Services
 //! installs on the site once an order is fulfilled, so no call in this API creates
-//! one, and the operations an Outpost's installed hardware would arrive with
-//! (`CreateOrder`, `GetOrder`, `StartConnection`) are still 501 scaffold stubs with
-//! issues of their own. Each row therefore RECORDS its assets on the stored Outpost
+//! one, and the order `CreateOrder` accepts is never carried as far as being
+//! delivered and installed (see [`crate::order_lifecycle`]). Each row therefore
+//! RECORDS its assets on the stored Outpost
 //! through the same store seam [`crate::renewal_pricing`] records an Outpost's priced
 //! options through, and then asks over the wire: what the list answers about what is
 //! recorded is the whole of rules 1 to 3. The hardware below is the rows' own data;

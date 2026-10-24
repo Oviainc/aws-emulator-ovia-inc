@@ -7,7 +7,8 @@
 //! two Availability Zone identities, selecting a site's two addresses by the
 //! modelled `AddressType` and keeping the `Site` projection of the operating one in
 //! step with it, materialising the Outpost lifecycle transition,
-//! the quote expiry and the capacity-task progression the clock owes, allocating the
+//! the quote expiry, the order's progress and the capacity-task progression the
+//! clock owes, allocating the
 //! tunnel an Outpost-server installation connection is reported as, cutting an
 //! ordered list into pages with the modelled `Token` the next page resumes from, the
 //! orderable-instance-type catalog this service publishes, and
@@ -21,8 +22,8 @@ use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
     Address, AssetInfo, AssetInstance, CapacityTaskFailure, ConnectionDetails,
-    DetailedInstanceTypeItem, FormFactorConfig, InstanceTypeCapacity, InstancesToExclude, Outpost,
-    PricingOption, PrivateConnectivityConfig, Quote, Site,
+    DetailedInstanceTypeItem, FormFactorConfig, InstanceTypeCapacity, InstancesToExclude, Order,
+    Outpost, PricingOption, PrivateConnectivityConfig, Quote, Site,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -98,12 +99,85 @@ pub const QUOTE_STATUS_EXPIRED: &str = "EXPIRED";
 /// model's "`ORDER_SUBMITTED` - An order has been submitted for the quote", which
 /// is also what makes the quote's `SubmittedOrderId` present.
 ///
-/// No operation in this slice reaches it yet (`CreateOrder` is still a scaffold
-/// stub), but it is the one record this service's store can hold of an Outpost
-/// ORDER placed against an Outpost, which is what
-/// `StartOutpostDecommission` reads to decide whether an order still blocks a
-/// decommission.
+/// `CreateOrder` is what moves a quote into it, naming the order it minted in the
+/// quote's `SubmittedOrderId`. It is also one of the two records this store holds of
+/// an Outpost ORDER placed against an Outpost — the other being the order itself
+/// ([`OrderRecord`]) — which is what `StartOutpostDecommission` reads to decide
+/// whether an order still blocks a decommission.
 pub const QUOTE_STATUS_ORDER_SUBMITTED: &str = "ORDER_SUBMITTED";
+
+/// The `OrderStatus` a just-submitted order carries: the model's "`PREPARING` -
+/// Order is received and being prepared".
+pub const ORDER_STATUS_PREPARING: &str = "PREPARING";
+
+/// The `OrderStatus` an order moves to once Amazon Web Services has started on the
+/// hardware: the model's "`IN_PROGRESS` - Order is either being built or shipped. To
+/// get more details, see the line item status".
+///
+/// This is as far as the clock carries an order. The two statuses past it —
+/// `DELIVERED` ("Order was delivered to the Outpost site") and `COMPLETED` ("Order
+/// is complete") — are reached by hardware physically arriving at the site and being
+/// installed, which leaves a record this emulator does not have: an installed asset
+/// on the Outpost ([`OutpostRecord::assets`]), reported by `ListAssets` and by the
+/// line item's own `AssetInformationList`. Reporting an order delivered or complete
+/// with no asset behind it would be a claim about hardware nothing installed, so the
+/// emulator stops where it still has a record to show.
+pub const ORDER_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The `OrderStatus` of a cancelled order — the model's "`CANCELLED` - Order is
+/// cancelled". No call in the implemented slice reaches it (`CancelOrder` is still a
+/// scaffold stub with an issue of its own); it is named here because it is one of the
+/// two statuses in which an order is FINISHED and so no longer outstanding on its
+/// Outpost. See [`ORDER_STATUS_SETTLED`].
+pub const ORDER_STATUS_CANCELLED: &str = "CANCELLED";
+
+/// The `OrderStatus` of an order that ran to its end — the model's "`COMPLETED` -
+/// Order is complete". See [`ORDER_STATUS_IN_PROGRESS`] for why the clock does not
+/// carry an order this far, and [`ORDER_STATUS_SETTLED`].
+pub const ORDER_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// Every `OrderStatus` in which an order is FINISHED: nothing more will happen to it
+/// and it no longer holds anything up. An order in any other status is still
+/// outstanding on its Outpost, which is what
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::blocking_resource_types`] reads.
+///
+/// `ERROR` ("Customer should contact support") is deliberately NOT here: an order in
+/// it is not finished but waiting for a human, which the modelled
+/// `BlockingResourceType` enum names a value of its own for. Nothing in this service
+/// produces that status.
+pub const ORDER_STATUS_SETTLED: &[&str] = &[ORDER_STATUS_CANCELLED, ORDER_STATUS_COMPLETED];
+
+/// The `LineItemStatus` a line item of a just-submitted order carries, the item-level
+/// counterpart of [`ORDER_STATUS_PREPARING`].
+pub const LINE_ITEM_STATUS_PREPARING: &str = "PREPARING";
+
+/// The `LineItemStatus` a line item moves to with its order's
+/// [`ORDER_STATUS_IN_PROGRESS`]: that status is "either being built or shipped", and
+/// the line item is what says which. The emulator reports the first of the two —
+/// `SHIPPED` is a claim about hardware in transit, which it has no record of (see
+/// [`ORDER_STATUS_IN_PROGRESS`]).
+pub const LINE_ITEM_STATUS_BUILDING: &str = "BUILDING";
+
+/// The `OrderType` of an order placed for an Outpost, from the modelled enum
+/// (`OUTPOST | REPLACEMENT`).
+///
+/// `CreateOrder` places this kind: it names the Outpost the hardware is for and the
+/// catalog items to install on it. A `REPLACEMENT` order is one Amazon Web Services
+/// raises to replace hardware already installed — its line items name the item they
+/// replace (`LineItem$PreviousLineItemId` / `$PreviousOrderId`) — and no input of
+/// this API carries that, so no call here places one.
+pub const ORDER_TYPE_OUTPOST: &str = "OUTPOST";
+
+/// How long after `CreateOrder` the order's [`ORDER_STATUS_PREPARING`] ->
+/// [`ORDER_STATUS_IN_PROGRESS`] transition falls due.
+///
+/// AWS publishes no duration for preparing an order, so this span is the emulator's
+/// own, chosen for the reason [`OUTPOST_PROVISIONING`]'s is: short enough that a
+/// workflow waiting for the order to move on finishes at once, and long enough that a
+/// caller reading the order straight after submitting it still sees the status the
+/// submit reported. It is never zero — a transition the clock owes is owed at an
+/// instant, not on the next read.
+pub const ORDER_PREPARATION: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The `DecommissionRequestStatus` `StartOutpostDecommission` answers when a
 /// resource still associated with the Outpost stops the decommission from
@@ -321,9 +395,10 @@ pub struct OutpostRecord {
     /// reason `CreateQuote` reports no `QuoteOption` — so this holds only priced
     /// options that were actually recorded and never a number the emulator made
     /// up. Nothing in the implemented slice of this API records one: an Outpost's
-    /// priced subscriptions arrive with its order, and `CreateOrder`,
-    /// `CreateRenewal` and `GetOutpostBillingInformation` are all still scaffold
-    /// stubs with issues of their own. So a `CreateOutpost` leaves this empty, and
+    /// priced subscriptions arrive with its order, and the order `CreateOrder`
+    /// accepts carries no price for the same reason a quote carries none, while
+    /// `CreateRenewal` and `GetOutpostBillingInformation` are still scaffold stubs
+    /// with issues of their own. So a `CreateOutpost` leaves this empty, and
     /// an Outpost with no recorded option cannot be priced.
     pub renewal_pricing: Vec<PricingOption>,
     /// The hardware assets INSTALLED on this Outpost — what `ListAssets` reports
@@ -339,10 +414,10 @@ pub struct OutpostRecord {
     /// An asset is a PHYSICAL unit — a rack, a compute or storage server, a
     /// powershelf, a switch — that Amazon Web Services installs on the site after an
     /// order is fulfilled, so no call in this API creates one and `CreateOutpost`
-    /// leaves this empty: the operations an Outpost's installed hardware would
-    /// arrive with (`CreateOrder`, `GetOrder`, `StartConnection`) are still scaffold
-    /// stubs with issues of their own. This therefore holds only the assets that
-    /// were actually recorded for the Outpost, exactly as
+    /// leaves this empty: an order this service accepts is never carried as far as
+    /// being delivered and installed, because that is exactly the record it would
+    /// have to invent (see [`ORDER_STATUS_IN_PROGRESS`]). This therefore holds only
+    /// the assets that were actually recorded for the Outpost, exactly as
     /// [`OutpostRecord::renewal_pricing`] holds only recorded prices, and an Outpost
     /// with no installed hardware is reported as having none rather than as having
     /// hardware the emulator made up.
@@ -558,6 +633,33 @@ pub struct QuoteRecord {
     pub sequence: u64,
     /// The quote as `CreateQuote` / `GetQuote` return it.
     pub quote: Quote,
+}
+
+/// A persisted order: the modelled [`Order`] plus its creation order and the instant
+/// the transition the clock owes it falls due.
+#[derive(Debug, Clone)]
+pub struct OrderRecord {
+    /// See [`SiteRecord::sequence`].
+    pub sequence: u64,
+    /// The order as `CreateOrder` / `GetOrder` return it.
+    pub order: Order,
+    /// When this order's [`ORDER_STATUS_PREPARING`] -> [`ORDER_STATUS_IN_PROGRESS`]
+    /// transition falls due, or `None` once it has been materialised. Stored as an
+    /// instant for the reason [`OutpostRecord::active_at`] is: nothing ever sleeps
+    /// for it, and the first call made at or after it reports exactly the status the
+    /// order would hold had nobody called at all.
+    pub in_progress_at: Option<std::time::Instant>,
+}
+
+impl OrderRecord {
+    /// Whether this order is still OUTSTANDING on its Outpost: it is in neither of
+    /// the two statuses in which an order is finished ([`ORDER_STATUS_SETTLED`]).
+    pub fn is_outstanding(&self) -> bool {
+        self.order
+            .status
+            .as_deref()
+            .is_none_or(|status| !ORDER_STATUS_SETTLED.contains(&status))
+    }
 }
 
 /// A persisted Outpost-server installation connection: the tunnel
@@ -1003,6 +1105,9 @@ pub struct ComAmazonawsOutpostsOutpostsolafserviceState {
     /// Every persisted quote, keyed by its bare `QuoteId` (`oq-…`), which is how
     /// `GetQuote` resolves one.
     pub quotes: BTreeMap<String, QuoteRecord>,
+    /// Every persisted order, keyed by the `OrderId` (`oo-…`) `CreateOrder` minted
+    /// for it, which is how `GetOrder` resolves one.
+    pub orders: BTreeMap<String, OrderRecord>,
     /// Every persisted Outpost-server installation connection, keyed by the
     /// `ConnectionId` `StartConnection` minted for it, which is how `GetConnection`
     /// resolves one.
@@ -1034,6 +1139,7 @@ impl Default for ComAmazonawsOutpostsOutpostsolafserviceState {
             outposts: BTreeMap::new(),
             capacity_tasks: BTreeMap::new(),
             quotes: BTreeMap::new(),
+            orders: BTreeMap::new(),
             connections: BTreeMap::new(),
             connection_server_public_key: None,
             orderable_instance_types: orderable_instance_type_catalog(),
@@ -1112,6 +1218,35 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         }
     }
 
+    /// Materialise every order transition the clock has already made due.
+    ///
+    /// Every operation that reports an order calls this FIRST, for the same reason
+    /// [`Self::settle_outposts`] exists: a read answers the status the order holds at
+    /// the instant it is asked for. It writes only what the clock already owed at
+    /// that same instant, so reading changes nothing a later caller would not have
+    /// seen anyway, and an order whose transition has been materialised is left
+    /// alone.
+    ///
+    /// A line item moves with its order: the order's `IN_PROGRESS` is "being built or
+    /// shipped. To get more details, see the line item status", so the item-level
+    /// status is what carries that detail. Only an item still in the status the
+    /// submit gave it is moved.
+    pub fn settle_orders(&mut self) {
+        let now = std::time::Instant::now();
+        for record in self.orders.values_mut() {
+            if record.in_progress_at.is_none_or(|due| now < due) {
+                continue;
+            }
+            record.order.status = Some(ORDER_STATUS_IN_PROGRESS.to_string());
+            for item in record.order.line_items.iter_mut().flatten() {
+                if item.status.as_deref() == Some(LINE_ITEM_STATUS_PREPARING) {
+                    item.status = Some(LINE_ITEM_STATUS_BUILDING.to_string());
+                }
+            }
+            record.in_progress_at = None;
+        }
+    }
+
     /// The capacity task that is still ACTIVE on `outpost_id`, if any.
     ///
     /// "You can have one active capacity task for each order and each Outpost", so
@@ -1153,12 +1288,14 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// them are resources THIS service's store can hold. The first:
     ///
     /// * [`BLOCKING_OUTPOST_ORDER_CANCELLABLE`] — an Outpost order still outstanding
-    ///   on the Outpost. The store's one record of such an order is a quote of this
-    ///   Outpost that an order was submitted from: the modelled `QuoteStatus`
-    ///   [`QUOTE_STATUS_ORDER_SUBMITTED`], whose `SubmittedOrderId` names it. Nothing
-    ///   in this slice moves an order past submission, so an order the store knows
-    ///   about is one that can still be cancelled, and a decommission has to wait for
-    ///   it.
+    ///   on the Outpost. This store holds two records of such an order: the order
+    ///   itself, which `CreateOrder` persists against the Outpost it names and which
+    ///   is outstanding until it is finished ([`OrderRecord::is_outstanding`]), and a
+    ///   quote of this Outpost that an order was submitted from — the modelled
+    ///   `QuoteStatus` [`QUOTE_STATUS_ORDER_SUBMITTED`], whose `SubmittedOrderId`
+    ///   names it. Nothing in this slice moves an order past being prepared or built,
+    ///   so an order the store knows about is one that can still be cancelled, and a
+    ///   decommission has to wait for it.
     ///
     /// A second is a resource it CAN hold:
     ///
@@ -1181,11 +1318,12 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     ///   slice produces: no order the store knows about ever fails or stalls, so the
     ///   emulator never claims one needs intervention.
     ///
-    /// Callers settle first (see [`Self::settle_quotes`]), so the quote statuses read
-    /// here are the ones the quotes hold at that instant.
+    /// Callers settle first (see [`Self::settle_quotes`] and [`Self::settle_orders`]),
+    /// so the statuses read here are the ones the quotes and orders hold at that
+    /// instant.
     pub fn blocking_resource_types(&self, outpost_id: &str) -> Vec<String> {
         let mut blocking: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let order_outstanding = self.quotes.values().any(|record| {
+        let quote_ordered_from = self.quotes.values().any(|record| {
             let quote_outpost = record
                 .quote
                 .outpost_arn
@@ -1194,7 +1332,10 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             quote_outpost.as_deref() == Some(outpost_id)
                 && record.quote.quote_status.as_deref() == Some(QUOTE_STATUS_ORDER_SUBMITTED)
         });
-        if order_outstanding {
+        let order_outstanding = self.orders.values().any(|record| {
+            record.order.outpost_id.as_deref() == Some(outpost_id) && record.is_outstanding()
+        });
+        if quote_ordered_from || order_outstanding {
             blocking.insert(BLOCKING_OUTPOST_ORDER_CANCELLABLE.to_string());
         }
         let instance_running = self
@@ -1252,9 +1393,10 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// and return it with the creation sequence to record on the new resource.
     ///
     /// `OutpostId` (`^op-[a-f0-9]{17}$`), `SiteId` (`^os-[a-f0-9]{17}$`),
-    /// `QuoteId` (`^oq-[a-f0-9]{17}$`) and `CapacityTaskId` (`^cap-[a-f0-9]{17}$`)
-    /// are each a short literal prefix and exactly 17 lowercase hex characters, so
-    /// one helper serves them all. `created` advances on every call and is hashed
+    /// `QuoteId` (`^oq-[a-f0-9]{17}$`), `OrderId` (`^oo-[a-f0-9]{17}$`),
+    /// `LineItemId` (`^ooi-[a-f0-9]{17}$`) and `CapacityTaskId`
+    /// (`^cap-[a-f0-9]{17}$`) are each a short literal prefix and exactly 17
+    /// lowercase hex characters, so one helper serves them all. `created` advances on every call and is hashed
     /// into the seed with the wall clock and the process id, so repeated calls never
     /// return the same id.
     pub fn mint_id(&mut self, prefix: &str) -> (String, u64) {
@@ -1873,6 +2015,10 @@ pub const ASSET_ID_MEMBER: &str = "assetId";
 /// Amazon Web Services Outposts order by. See [`SITE_ID_MEMBER`].
 pub const ORDER_ID_MEMBER: &str = "orderId";
 
+/// The validation-path name of the `LineItems` input member `CreateOrder` takes the
+/// line items that make up an order in. See [`SITE_ID_MEMBER`].
+pub const LINE_ITEMS_MEMBER: &str = "lineItems";
+
 /// The validation-path name of the `ConnectionId` input member an operation names
 /// an Outpost-server installation connection by. See [`SITE_ID_MEMBER`].
 pub const CONNECTION_ID_MEMBER: &str = "connectionId";
@@ -2077,6 +2223,39 @@ pub fn outpost_identifier_pattern_report() -> String {
     )
 }
 
+/// The report an order that names neither the line items that make it up nor a quote
+/// to take them from states.
+///
+/// `CreateOrder` models both members optional, but an order has to get its contents
+/// from one of the two: an order is built out of catalog items, named either directly
+/// or through the quote they were priced on. AWS publishes no wording for the refusal,
+/// so the sentence is the emulator's own; what a caller branches on is the modelled
+/// `ValidationException` code (HTTP 400). It is worded by the same rule as every
+/// other constraint this service reports — the member and the requirement, never the
+/// value.
+pub fn order_contents_report() -> String {
+    validation_report(&[clause(
+        LINE_ITEMS_MEMBER,
+        "either the line items that make up the order or the quote to take them from \
+         must be specified",
+    )])
+}
+
+/// How this service states that an order cannot be submitted from a quote in the
+/// status that quote is in.
+///
+/// An order is submitted from a quote once: the modelled `QuoteStatus`
+/// `ORDER_SUBMITTED` is "An order has been submitted for the quote" and `EXPIRED` is
+/// a quote that can no longer be ordered from, so only a quote still `CREATED` can
+/// take an order. AWS publishes no wording for the refusal, so the sentence is the
+/// emulator's own; what a caller branches on is the modelled `ConflictException`
+/// code (HTTP 409) and the `ResourceId` naming the quote. The message names the
+/// status the quote is in, so the caller can tell an expired quote from one already
+/// ordered from.
+pub fn quote_status_conflict(quote_id: &str, status: &str) -> String {
+    format!("an order cannot be submitted from quote {quote_id}, which is {status}")
+}
+
 /// The report a `ResourceArn` that is not an Outposts resource ARN states for a
 /// handler that reads that ARN itself.
 ///
@@ -2163,15 +2342,15 @@ pub const SUPPORTED_INSTANCE_TYPE_PAGE: &str = "supportedInstanceTypes";
 /// the ceiling the model declares for it (`MaxResults1000`, `range(1..1000)`).
 pub const MAX_RESULTS: i32 = 1000;
 
-/// The ceiling on how many sites, how many Outposts, how many quotes, and how many
-/// capacity tasks this store holds.
+/// The ceiling on how many sites, how many Outposts, how many quotes, how many
+/// orders, and how many capacity tasks this store holds.
 ///
 /// A generated emulator keeps its resources in memory for the life of the process
 /// and a create is the only thing that adds one, so the store needs a maximum entry
 /// count: neither a TTL nor an eviction policy is available to it, because `GetSite`
 /// must still answer what `CreateSite` created, and `GetCapacityTask` must still
 /// answer a task that has long since completed. Past the cap the creating operation
-/// refuses the request rather than growing: the two creates that model
+/// refuses the request rather than growing: the three creates that model
 /// `ServiceQuotaExceededException` (HTTP 402) answer it (it is modelled on exactly
 /// them and on no read), `CreateQuote`, whose model declares no quota error, refuses
 /// the create as a bad request (400 `ValidationException`) rather than inventing an

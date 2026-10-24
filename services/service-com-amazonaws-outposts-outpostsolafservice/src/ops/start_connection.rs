@@ -10,9 +10,9 @@
 //! that record.
 //!
 //! The asset has to be one an Outpost of the store holds, as it does at AWS. No
-//! operation in this API records hardware on an Outpost yet — hardware arrives with
-//! a fulfilled order, and `CreateOrder` / `GetOrder` are still scaffold stubs with
-//! issues of their own — so today that precondition is reachable only for an
+//! operation in this API records hardware on an Outpost — hardware arrives with
+//! a fulfilled order, and no order this emulator accepts is ever carried as far as
+//! being delivered and installed — so that precondition is reachable only for an
 //! Outpost whose assets were recorded through the store.
 //!
 //! ## Shape of an operation

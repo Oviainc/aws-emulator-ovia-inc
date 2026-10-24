@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOrder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOrder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOrder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints an `OrderId`, persists the order the request describes against
+//! the Outpost it names, and answers it from what was persisted — which is what
+//! `GetOrder` reads back. Every line item the request sent gets a minted `LineItemId`
+//! and the status a just-submitted item carries; an order taken from a quote records
+//! that quote and moves it to `ORDER_SUBMITTED`, naming this order in the quote's
+//! `SubmittedOrderId`. The order is submitted in the non-terminal `PREPARING` status
+//! and the clock carries it to `IN_PROGRESS`
+//! ([`crate::state::ORDER_PREPARATION`]); nothing here reports it delivered or
+//! complete, because those are claims about hardware installed on the Outpost that
+//! this emulator has no record of (see [`crate::state::ORDER_STATUS_IN_PROGRESS`]).
+//! No price is reported: an order's prices come from AWS's own price list, which this
+//! emulator does not have, exactly as `CreateQuote` reports no `QuoteOption`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,20 +160,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // Everything this order records comes from `input` and the store: an order
+        // carries no ARN and no region-dependent member, so nothing here reads the
+        // request's metadata.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOrder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOrderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOrder"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateOrderErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
+        // the same stored Outpost, and `Order$OutpostId` is the bare id either way
+        // (`OutpostIdOnly`, `^op-[a-f0-9]{17}$`).
+        let outpost_identifier = input.outpost_identifier;
+        let outpost_id = crate::state::resolve_outpost_id(&outpost_identifier).ok_or_else(|| {
+            CreateOrderErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::outpost_identifier_pattern_report()),
+            })
+        })?;
+        // `QuoteIdentifier` accepts the same two forms for a quote.
+        let quote_identifier = crate::state::non_empty(input.quote_identifier);
+        let quote_id = match quote_identifier.as_deref() {
+            Some(identifier) => Some(crate::state::resolve_quote_id(identifier).ok_or_else(|| {
+                CreateOrderErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::quote_identifier_pattern_report()),
+                })
+            })?),
+            None => None,
+        };
+        // An order is built out of catalog items, named either directly in
+        // `LineItems` or through the quote they were priced on. The model marks both
+        // members optional, so a request that names NEITHER is the one this handler
+        // has to refuse itself — as the bad request it is (400 `ValidationException`),
+        // never as an order with nothing in it.
+        let line_items = input.line_items.unwrap_or_default();
+        if line_items.is_empty() && quote_id.is_none() {
+            return Err(CreateOrderErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::order_contents_report()),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // Whether a quote can still be ordered from depends on the status it holds
+        // NOW, and a quote expires on the clock, so the expiry that was already due
+        // at this instant is materialised before the status is read.
+        store.settle_quotes();
+        // An order is placed ON an Outpost, so an identifier the store holds no
+        // Outpost for cannot take one: the not-found error this operation models,
+        // worded as the identifier echo of the value AS SUPPLIED — not of the bare id
+        // an ARN resolved to.
+        if !store.outposts.contains_key(&outpost_id) {
+            return Err(CreateOrderErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                        &outpost_identifier,
+                    )),
+                },
+            )
+            .into());
+        }
+        // A quote named for the order has to exist, and has to be one an order can
+        // still be submitted from: the modelled `ORDER_SUBMITTED` is "An order has
+        // been submitted for the quote" and `EXPIRED` is a quote past its own
+        // `ExpirationDate`, so only a quote still `CREATED` can take one. A second
+        // order from the same quote, or one from an expired quote, is the conflict
+        // this operation models, naming the quote in `ResourceId`.
+        if let (Some(quote_id), Some(supplied)) = (quote_id.as_deref(), quote_identifier.as_deref())
+        {
+            let status = store
+                .quotes
+                .get(quote_id)
+                .map(|record| record.quote.quote_status.clone().unwrap_or_default())
+                .ok_or_else(|| {
+                    CreateOrderErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(crate::state::identifier_not_found(
+                            crate::state::QUOTE_IDENTIFIER_MEMBER,
+                            supplied,
+                        )),
+                    })
+                })?;
+            if status != crate::state::QUOTE_STATUS_CREATED {
+                return Err(CreateOrderErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::quote_status_conflict(quote_id, &status)),
+                    resource_id: Some(quote_id.to_string()),
+                    // The modelled `ResourceType` enum names only `ORDER` and
+                    // `OUTPOST`, and the resource this conflict is about is neither,
+                    // so the member is absent rather than carrying a value that
+                    // would name the wrong kind of resource.
+                    resource_type: None,
+                })
+                .into());
+            }
+        }
+        // See `MAX_RESOURCES`: an order is never released (`GetOrder` must still
+        // answer it), so the store this insert grows is capped, and past the cap the
+        // create is refused with the quota error this operation models.
+        if store.orders.len() >= crate::state::MAX_RESOURCES {
+            return Err(CreateOrderErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the number of orders would exceed the limit of {}",
+                        crate::state::MAX_RESOURCES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let (order_id, sequence) = store.mint_id("oo");
+        // Each line item of the order gets its own minted `LineItemId`, and reports
+        // the catalog item and quantity the request asked for. What it does NOT
+        // report is anything that would be a claim about hardware: a
+        // `ShipmentInformation` is a carrier's tracking number for a unit in transit,
+        // an `AssetInformationList` is the hardware installed for the item, and the
+        // two `Previous…` members belong to a replacement order — none of which this
+        // request carries or this emulator records.
+        let line_items: Vec<LineItem> = line_items
+            .into_iter()
+            .map(|requested| {
+                let (line_item_id, _) = store.mint_id("ooi");
+                LineItem {
+                    catalog_item_id: requested.catalog_item_id,
+                    line_item_id: Some(line_item_id),
+                    quantity: requested.quantity,
+                    status: Some(crate::state::LINE_ITEM_STATUS_PREPARING.to_string()),
+                    shipment_information: None,
+                    asset_information_list: None,
+                    previous_line_item_id: None,
+                    previous_order_id: None,
+                }
+            })
+            .collect();
+        let order = Order {
+            outpost_id: Some(outpost_id),
+            // The quote this order was taken from, reported as the quote's OWN id
+            // whichever of the two identifier forms the request named it by — the
+            // same rule `CreateQuote` reports an Outpost association by. A quote
+            // option is an option OF that quote, so the id travels as supplied.
+            quote_identifier: quote_id.clone(),
+            quote_option_identifier: crate::state::non_empty(input.quote_option_identifier),
+            order_id: Some(order_id.clone()),
+            // A just-submitted order is received and being prepared, so it reports
+            // that non-terminal status until the transition the clock owes falls due;
+            // every read materialises it through `settle_orders`.
+            status: Some(crate::state::ORDER_STATUS_PREPARING.to_string()),
+            // An order taken from a quote with no line items of its own has line
+            // items AWS priced on the quote option it was built from — which this
+            // store has no record of, for the reason `CreateQuote` reports no
+            // `QuoteOption` — so the order reports none rather than inventing catalog
+            // items nobody ordered.
+            line_items: match line_items.is_empty() {
+                true => None,
+                false => Some(line_items),
+            },
+            payment_option: Some(input.payment_option),
+            order_submission_date: Some(crate::state::now_timestamp()),
+            // "The fulfillment date for the order": nothing is fulfilled by
+            // submitting it, and the emulator never carries an order as far as being
+            // installed, so the member stays absent.
+            order_fulfilled_date: None,
+            payment_term: crate::state::non_empty(input.payment_term),
+            order_type: Some(crate::state::ORDER_TYPE_OUTPOST.to_string()),
+        };
+        store.orders.insert(
+            order_id.clone(),
+            crate::state::OrderRecord {
+                sequence,
+                order: order.clone(),
+                in_progress_at: Some(std::time::Instant::now() + crate::state::ORDER_PREPARATION),
+            },
+        );
+        // An order submitted from a quote is what makes that quote's status
+        // `ORDER_SUBMITTED` and its `SubmittedOrderId` present — "An order has been
+        // submitted for the quote", naming this one.
+        if let Some(record) = quote_id.and_then(|quote_id| store.quotes.get_mut(&quote_id)) {
+            record.quote.quote_status =
+                Some(crate::state::QUOTE_STATUS_ORDER_SUBMITTED.to_string());
+            record.quote.submitted_order_id = Some(order_id);
+        }
+
+        Ok(CreateOrderOutput { order: Some(order) })
     }
 }

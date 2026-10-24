@@ -28,11 +28,14 @@
 //! configuration", so the per-type counts an asset's `InstanceTypeCapacities` records
 //! are deliberately not consulted.
 //!
-//! An `OrderId` names an Amazon Web Services Outposts ORDER, and this store holds no
-//! order record — an order is placed by `CreateOrder` and read by `GetOrder`, both
-//! still scaffold stubs with issues of their own — so an `OrderId` names no order this
-//! emulator holds and is answered with the not-found error this operation models,
-//! exactly as an `OutpostIdentifier` the store does not hold is.
+//! An `OrderId` names an Amazon Web Services Outposts ORDER, which scopes the report
+//! to the hardware that order is for: an order this store holds — `CreateOrder`
+//! persists one against the Outpost it names — has to be an order of THIS Outpost,
+//! and one that is not, or one the store holds no record of at all, is answered with
+//! the not-found error this operation models, exactly as an `OutpostIdentifier` the
+//! store does not hold is. An order of this Outpost narrows the report by nothing: what
+//! it would narrow by is the catalog items its line items name, and this emulator has
+//! no catalog behind those SKUs.
 //!
 //! ## Shape of an operation
 //!
@@ -233,21 +236,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         })?;
-        // An order this emulator holds no record of names no hardware to scope the
-        // report to; see this module's header. Checked before the asset, so a request
+        // An order scopes the report to the hardware THAT order is for, so it has to
+        // be an order of this Outpost: one this store holds no record of, or one
+        // placed against another Outpost, names no hardware here and is the same
+        // not-found error, echoed on the member it arrived in. An order it does hold
+        // narrows nothing — what an order would narrow by is the catalog items its
+        // line items name, and this emulator has no catalog behind those SKUs
+        // (`GetCatalogItem` is still a scaffold stub with an issue of its own) — so
+        // the report is the Outpost's own. Checked before the asset, so a request
         // naming both is answered about the coarser scope it could not resolve.
         if let Some(order_id) = input.order_id.as_deref().filter(|id| !id.is_empty()) {
-            return Err(
-                GetOutpostSupportedInstanceTypesErrorModeled::NotFoundException(
-                    NotFoundException {
-                        message: Some(crate::state::identifier_not_found(
-                            crate::state::ORDER_ID_MEMBER,
-                            order_id,
-                        )),
-                    },
-                )
-                .into(),
-            );
+            let places_this_outpost = store
+                .orders
+                .get(order_id)
+                .is_some_and(|record| record.order.outpost_id.as_deref() == Some(&outpost_id));
+            if !places_this_outpost {
+                return Err(
+                    GetOutpostSupportedInstanceTypesErrorModeled::NotFoundException(
+                        NotFoundException {
+                            message: Some(crate::state::identifier_not_found(
+                                crate::state::ORDER_ID_MEMBER,
+                                order_id,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
         // The hardware the request scopes the report to: one named asset of this
         // Outpost, or the Outpost itself. An `AssetId` that names none of its assets

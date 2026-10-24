@@ -29,9 +29,10 @@
 //!    recorded hardware is left exactly as it was.
 //! 4. An identifier that names nothing this store holds is 404 `NotFoundException`
 //!    with the identifier echo of the value AS SUPPLIED — the Outpost, an `AssetId`
-//!    that names none of its assets, and an `OrderId`, of which this store holds no
-//!    record at all (`CreateOrder`/`GetOrder` are still 501 scaffold stubs with issues
-//!    of their own). One that is no identifier at all is 400 `ValidationException`.
+//!    that names none of its assets, and an `OrderId` this store holds no order of
+//!    this Outpost for (what an order of it scopes is exercised in
+//!    [`crate::order_lifecycle`]). One that is no identifier at all is 400
+//!    `ValidationException`.
 //!
 //! Where the recorded assets come from: an asset is a PHYSICAL unit of hardware that
 //! Amazon Web Services installs once an order is fulfilled, so no call in this API

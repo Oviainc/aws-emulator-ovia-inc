@@ -23,9 +23,11 @@
 //!
 //! Where the recorded options come from: a renewal price is a figure from AWS's own
 //! price list for the hardware an Outpost's order installed, so nothing this
-//! emulator computes — `CreateOrder`, `CreateRenewal` and
-//! `GetOutpostBillingInformation`, the operations an Outpost's priced subscriptions
-//! would arrive with, are still 501 scaffold stubs with issues of their own. Each
+//! emulator computes — the order `CreateOrder` accepts carries no price for the same
+//! reason a quote carries none, and `CreateRenewal` and
+//! `GetOutpostBillingInformation`, the other operations an Outpost's priced
+//! subscriptions would arrive with, are still 501 scaffold stubs with issues of their
+//! own. Each
 //! row therefore RECORDS its options on the stored Outpost through the same store
 //! seam [`crate::quote_lifecycle`] ages a quote through, and then asks over the
 //! wire: what the read answers about what is recorded is the whole of rule 1. The
