@@ -14,6 +14,11 @@
 //! ARN asked for), and only then does the operation read or write the stored record. The
 //! tags and the policy an operation reports are the ones the store holds and nothing else.
 //!
+//! The existence step binds an operation to the catalog's own record of the resource — the
+//! tagging surface throughout, and `PutResourcePolicy` — while reporting and clearing a
+//! resource POLICY are addressed by the ARN alone (`resource_policy_lifecycle.rs`), since
+//! a policy is recorded per ARN rather than on that record.
+//!
 //! The rows differ along what that rule generalises over: which operation, which resource
 //! kind (entity or change set), which entity type, how many tags, which keys, and which
 //! policy document.
@@ -60,6 +65,12 @@ const JSON: &str = "application/json";
 /// the service invents for a resource that carries none.
 const MINIMAL_POLICY_DOCUMENT: &str = "{\"Version\":\"2012-10-17\",\"Statement\":\
      [{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"aws-marketplace:DescribeEntity\"}]}";
+
+/// The document a resource carrying no resource-based policy reports: the empty JSON
+/// policy document, which states no `Statement` and so grants what no attached policy
+/// grants. `PutResourcePolicy` refuses it, so reading it back can only mean that nothing
+/// is attached (see `resource_policy_lifecycle.rs`).
+const EMPTY_POLICY_DOCUMENT: &str = "{}";
 
 /// How long after the start a change set has certainly reached `SUCCEEDED`: the two spans
 /// the implementation publishes, plus a margin for a slow machine.
@@ -595,25 +606,20 @@ async fn a_resource_policy_is_reported_from_what_was_attached() {
     let (entity_arn, change_set_arn) = created_resources(&router, "AmiProduct").await;
 
     for arn in [&entity_arn, &change_set_arn] {
-        // A resource the catalog holds that carries no policy has no document to
-        // report: `Policy` targets `ResourcePolicyJson` (`@length(min: 1)`), so the read
-        // is refused as not found rather than answered with a synthesised document.
+        // A resource the catalog holds that carries no policy has no attached document to
+        // report: `Policy` targets `ResourcePolicyJson` (`@length(min: 1)`), so what the
+        // read answers is the EMPTY policy document, which grants what no attached policy
+        // grants.
         let fresh = get_resource_policy(&router, arn).await;
         assert_eq!(
             (
                 fresh.status,
-                fresh.error_code(),
-                fresh.content_type.as_str(),
-                fresh.errortype.as_str(),
+                fresh.text("/Policy"),
+                fresh.content_type.clone(),
             ),
-            (
-                404,
-                "ResourceNotFoundException",
-                JSON,
-                "ResourceNotFoundException",
-            ),
-            "case {arn:?}: a resource with no policy attached must be refused 404 \
-             ResourceNotFoundException as application/json, got {} {:?} with {:?}",
+            (200, EMPTY_POLICY_DOCUMENT.to_string(), JSON.to_string()),
+            "case {arn:?}: a resource with no policy attached must report the empty policy \
+             document with 200 application/json, got {} {:?} with {:?}",
             fresh.status,
             fresh.content_type,
             fresh.body
@@ -656,10 +662,10 @@ async fn a_resource_policy_is_reported_from_what_was_attached() {
 
         let after_delete = get_resource_policy(&router, arn).await;
         assert_eq!(
-            (after_delete.status, after_delete.error_code()),
-            (404, "ResourceNotFoundException"),
+            (after_delete.status, after_delete.text("/Policy")),
+            (200, EMPTY_POLICY_DOCUMENT.to_string()),
             "case {arn:?}: a resource whose policy was deleted must read back as one with \
-             no policy to report, got {} with {:?}",
+             no policy attached, got {} with {:?}",
             after_delete.status,
             after_delete.body
         );
@@ -694,15 +700,16 @@ async fn a_resource_policy_is_reported_from_what_was_attached() {
     }
 }
 
-/// The whole policy surface binds to the catalog's own record: reporting a resource's
-/// policy, attaching one and clearing one each refuse an ARN of this catalog naming a
-/// resource the store holds no record of with the modelled `ResourceNotFoundException`,
-/// naming the resource that was asked for.
+/// Attaching a policy binds to the catalog's own record: `PutResourcePolicy` refuses an
+/// ARN of this catalog naming a resource the store holds no record of with the modelled
+/// `ResourceNotFoundException`, naming the resource that was asked for — while reporting
+/// and clearing a policy, which are addressed by the ARN alone, answer the resource's
+/// (absent) policy instead.
 ///
 /// The rows differ along the entity type and id named by an ARN the store holds no record
 /// for.
 #[tokio::test]
-async fn the_policy_surface_refuses_a_resource_the_catalog_does_not_hold() {
+async fn attaching_a_policy_refuses_a_resource_the_catalog_does_not_hold() {
     // (case, entity type, entity id) — ids of `ResourceId`'s `^[\w\-]+$` that no change
     // set in this emulator ever created.
     let rows: [(&str, &str, &str); 3] = [
@@ -715,29 +722,6 @@ async fn the_policy_surface_refuses_a_resource_the_catalog_does_not_hold() {
     for (case, entity_type, entity_id) in rows {
         let arn =
             format!("arn:aws:aws-marketplace:{REGION}:{ACCOUNT}:{CATALOG}/{entity_type}/{entity_id}");
-
-        let read = get_resource_policy(&router, &arn).await;
-        assert_eq!(
-            (
-                read.status,
-                read.error_code(),
-                read.content_type.as_str(),
-                read.errortype.as_str(),
-                read.message(),
-            ),
-            (
-                404,
-                "ResourceNotFoundException",
-                JSON,
-                "ResourceNotFoundException",
-                format!("Requested entity '{entity_id}' does not exist."),
-            ),
-            "case {case:?}: GetResourcePolicy must refuse an entity the catalog does not \
-             hold with 404 ResourceNotFoundException naming it, got {} {:?} with {:?}",
-            read.status,
-            read.error_code(),
-            read.body
-        );
 
         let attached = put_resource_policy(&router, &arn, MINIMAL_POLICY_DOCUMENT).await;
         assert_eq!(
@@ -762,26 +746,24 @@ async fn the_policy_surface_refuses_a_resource_the_catalog_does_not_hold() {
             attached.body
         );
 
+        let read = get_resource_policy(&router, &arn).await;
+        assert_eq!(
+            (read.status, read.text("/Policy")),
+            (200, EMPTY_POLICY_DOCUMENT.to_string()),
+            "case {case:?}: GetResourcePolicy must report the empty policy document for an \
+             ARN nothing is attached to, got {} with {:?}",
+            read.status,
+            read.body
+        );
+
         let cleared = delete_resource_policy(&router, &arn).await;
         assert_eq!(
-            (
-                cleared.status,
-                cleared.error_code(),
-                cleared.content_type.as_str(),
-                cleared.errortype.as_str(),
-                cleared.message(),
-            ),
-            (
-                404,
-                "ResourceNotFoundException",
-                JSON,
-                "ResourceNotFoundException",
-                format!("Requested entity '{entity_id}' does not exist."),
-            ),
-            "case {case:?}: DeleteResourcePolicy must refuse an entity the catalog does \
-             not hold with 404 ResourceNotFoundException naming it, got {} {:?} with {:?}",
+            (cleared.status, cleared.content_type.as_str(), &cleared.body),
+            (200, JSON, &json!({})),
+            "case {case:?}: DeleteResourcePolicy must answer an empty 200 for an ARN \
+             nothing is attached to, got {} {:?} with {:?}",
             cleared.status,
-            cleared.error_code(),
+            cleared.content_type,
             cleared.body
         );
     }
@@ -793,9 +775,10 @@ async fn the_policy_surface_refuses_a_resource_the_catalog_does_not_hold() {
 /// in this account is `AccessDeniedException`, because authorization is evaluated on the
 /// ARN before anything is looked up; and an ARN of this catalog's own form naming a
 /// resource the store holds no record for is `ResourceNotFoundException` naming that
-/// resource — from EVERY one of them, the reads (`ListTagsForResource`,
-/// `GetResourcePolicy`) as much as the writes, since the catalog's record of the resource
-/// is what each one reports or updates.
+/// resource — from every operation whose answer IS that record: the tagging surface's read
+/// (`ListTagsForResource`) as much as its writes, and `PutResourcePolicy`. Reporting and
+/// clearing a resource POLICY are addressed by the ARN alone, so that last step does not
+/// apply to them and they answer the resource's (absent) policy instead.
 ///
 /// The rows differ along the operation, its HTTP binding (query-bound or body-bound ARN)
 /// and the class of ARN.
@@ -930,28 +913,43 @@ async fn a_resource_arn_is_refused_by_syntax_then_authorization_then_existence()
         }
 
         let answered = invoke(absent.clone()).await;
-        assert_eq!(
-            (
+        // The existence step belongs to the operations whose answer IS the catalog's
+        // record of the resource; the policy report and clear are addressed by the ARN
+        // alone, so for them an ARN the store holds no record of is served.
+        if matches!(operation, "GetResourcePolicy" | "DeleteResourcePolicy") {
+            assert_eq!(
+                (answered.status, answered.content_type.as_str()),
+                (200, JSON),
+                "case {operation} {absent:?}: a policy report or clear is addressed by the \
+                 ARN alone and must be served 200 application/json, got {} {:?} with {:?}",
+                answered.status,
+                answered.content_type,
+                answered.body
+            );
+        } else {
+            assert_eq!(
+                (
+                    answered.status,
+                    answered.error_code(),
+                    answered.content_type.as_str(),
+                    answered.errortype.as_str(),
+                    answered.message(),
+                ),
+                (
+                    404,
+                    "ResourceNotFoundException",
+                    JSON,
+                    "ResourceNotFoundException",
+                    format!("Requested entity '{ABSENT_ENTITY}' does not exist."),
+                ),
+                "case {operation} {absent:?}: an ARN of this catalog naming a resource the \
+                 store does not hold must be refused 404 ResourceNotFoundException naming \
+                 it, got {} {:?} with {:?}",
                 answered.status,
                 answered.error_code(),
-                answered.content_type.as_str(),
-                answered.errortype.as_str(),
-                answered.message(),
-            ),
-            (
-                404,
-                "ResourceNotFoundException",
-                JSON,
-                "ResourceNotFoundException",
-                format!("Requested entity '{ABSENT_ENTITY}' does not exist."),
-            ),
-            "case {operation} {absent:?}: an ARN of this catalog naming a resource the \
-             store does not hold must be refused 404 ResourceNotFoundException naming it, \
-             got {} {:?} with {:?}",
-            answered.status,
-            answered.error_code(),
-            answered.body
-        );
+                answered.body
+            );
+        }
 
         // The same operation against the resource that DOES exist is not refused at all,
         // which is what makes the refusals above about the ARN and not about the
