@@ -30,3 +30,58 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the cloudtrail emulator
 Call LookupEvents and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+
+`LookupEvents` is implemented in
+`services/service-com-amazonaws-cloudtrail-cloudtrail-20131101/src/ops/lookup_events.rs`
+(the `SCAFFOLDED, NOT IMPLEMENTED` header line is gone) and serves the account's
+management-event log — the shared store `services/common/src/management_events.rs`, held
+once in the engine, written by the service that SERVED a call. CloudTrail's four
+trail-mutating handlers (`CreateTrail`, `DeleteTrail`, `StartLogging`, `StopLogging`)
+record their calls there, successes and refusals alike. End-to-end coverage lives in
+`services/service-com-amazonaws-cloudtrail-cloudtrail-20131101/tests/all/management_event_lookup.rs`.
+
+A boundary refusal of `LookupEvents`'s `EventCategory` or of anything under its
+`LookupAttributes` is answered in the error the model declares for exactly that case
+(`InvalidEventCategoryException` / `InvalidLookupAttributesException`, `src/service.rs`'s
+`override_refusal`) rather than in the service-wide `ValidationException` envelope — the
+same rule the event- and Insights-selector refusals already follow. The two rows that
+asserted the generic envelope for those members in
+`tests/all/enum_refusal_wording.rs` therefore moved into that suite's new
+`a_lookup_events_enum_violation_keeps_its_modelled_error`, which spans several
+out-of-set values and both the top-level and the list-nested attribute path.
+
+Three things this change deliberately does NOT do, recorded here so a later issue can
+pick them up rather than rediscover them (plus the recorders it does not wire up, item 4):
+
+1. **`MaxResults` outside `1..50` answers `ValidationException`, not the modelled
+   `InvalidMaxResultsException`.** The modelled `@range` is refused at the framework
+   boundary before any handler runs, and the only seam that can reword a boundary refusal
+   (`Service::override_refusal`) is not told which operation was called — while a dozen
+   operations of this model carry a `MaxResults` member and model DIFFERENT errors for a
+   bad one (`InvalidMaxResultsException`, `InvalidParameterException`, or none at all), so
+   a service-wide rewording would answer the wrong code for most of them. The structural
+   fix is to pass the resolved operation to `override_refusal` in
+   `vendor/smithy-server-runtime`, which is outside an emulator fixer's reach (the
+   `vendor/` tree is read-only). Until then the unit
+   `cloudtrail.lookup-events-max-results-bound-and-token-stability` may still diverge on
+   that error code alone; the page bound and the token stability it also checks are
+   implemented and tested.
+2. **Read-only management events are not recorded.** An audit record is state, and in this
+   emulator a reporting call must not change what a later reader sees, so `LookupEvents`,
+   `GetTrail`, `GetTrailStatus`, `DescribeTrails` and `ListTrails` record nothing and every
+   recorded event carries `readOnly: false`.
+3. **Cross-service recording is not wired up.** The units
+   `cloudtrail__lambda.*`, `cloudtrail__sts.*` and `cloudtrail__cognito-identity.*` expect
+   those services' calls to be audited; that needs each of those services' handlers to
+   append to the shared log (which is why the store lives in `services/common`), and their
+   handlers belong to their own issues.
+4. **Only this service's four trail-mutating handlers record.** `CreateTrail`,
+   `DeleteTrail`, `StartLogging` and `StopLogging` call `record_management_event`; the
+   other state-changing operations this crate implements (the dashboard, event data store,
+   import, Lake query and tagging handlers) still serve their calls without an audit
+   record, so a `LookupEvents` caller sees an audit log without them. Each needs its own
+   `requestParameters` projection of the nested modelled shapes it takes, which belongs
+   with that handler; the helper they call is already in place and nothing about the log is
+   per-operation.

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op LookupEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `LookupEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the account's recorded management events from the shared management-event log
+//! (`service_common::management_events`, reached through `crate::state`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`LookupEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A lookup is a REPORTING call: it reads the log and writes nothing to it, so two
+//! identical lookups answer the same page and a lookup never shows up in a later one.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +113,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::service_common::management_events::{
+    ManagementEvent, EVENT_CATEGORY_INSIGHT, EVENT_CATEGORY_MANAGEMENT, EVENT_RETENTION,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -191,18 +191,349 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `LookupEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(LookupEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("LookupEvents"))
+        // "You can look up events that occurred in a Region": the lookup reports the
+        // events recorded in the Region the request was made in.
+        let region = crate::state::request_region(ctx.parts());
+        let now = millis_of(::std::time::SystemTime::now());
+
+        let category = wanted_category(input.event_category.as_deref())?;
+        let attribute = single_attribute(input.lookup_attributes)?;
+
+        // "Specifies that only events that occur after or at the specified time are
+        // returned" / "before or at", so both bounds are INCLUSIVE; "If the specified
+        // start time is after the specified end time, an error is returned."
+        let requested_start = input.start_time.as_ref().map(datetime_millis);
+        let requested_end = input.end_time.as_ref().map(datetime_millis);
+        if let (Some(start), Some(end)) = (requested_start, requested_end) {
+            if start > end {
+                return Err(LookupEventsErrorModeled::InvalidTimeRangeException(
+                    InvalidTimeRangeException {
+                        message: Some(format!(
+                            "StartTime ({start} ms since the epoch) is after EndTime \
+                             ({end} ms since the epoch): the start of a lookup window \
+                             must not be after its end"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        // Nothing older than the retention window is retrievable, so the window a
+        // lookup reads is the requested one intersected with it.
+        let retention_floor = now.saturating_sub(retention_millis());
+        let from = requested_start.map_or(retention_floor, |start| start.max(retention_floor));
+        // With no EndTime the window has no upper bound; no recorded event lies in the
+        // future, so a window entirely in the future selects nothing.
+        let to = requested_end.unwrap_or(i64::MAX);
+
+        // The token is tied to the FILTER the original call stated — "This token must be
+        // passed in with the same parameters that were specified in the original call" —
+        // so a token replayed against a different filter is refused instead of paging
+        // through a different result set. `MaxResults` is deliberately NOT part of it: it
+        // states how many of the filtered events one page carries, not WHICH events the
+        // lookup selects, and the page boundary the token carries is honoured whatever
+        // page size the continuing call asks for.
+        let fingerprint = filter_fingerprint(
+            &region,
+            category,
+            attribute.as_ref(),
+            requested_start,
+            requested_end,
+        );
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(read_token(token, &fingerprint).ok_or_else(|| {
+                LookupEventsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                    message: Some(
+                        "NextToken is not valid: pass the token exactly as the previous \
+                         LookupEvents call returned it, with the same lookup parameters"
+                            .to_string(),
+                    ),
+                })
+            })?),
+        };
+
+        let state = crate::state::management_event_log(&*self.engine).ok_or_else(|| {
+            LookupEventsErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "LookupEvents needs the account's management-event log, which this \
+                     engine does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let log = state.lock();
+
+        let mut selected: Vec<&ManagementEvent> = log
+            .iter()
+            .filter(|event| event.call.aws_region == region)
+            .filter(|event| event.event_category == category)
+            .filter(|event| (from..=to).contains(&event.event_time_millis()))
+            .filter(|event| {
+                attribute
+                    .as_ref()
+                    .is_none_or(|lookup| matches_attribute(event, lookup))
+            })
+            .collect();
+        // "The events list is sorted by time. The most recent event is listed first."
+        // The log's ordinal breaks a tie, so two events recorded in the same
+        // millisecond still have one definite order and a page boundary is stable.
+        selected.sort_by_key(|event| ::std::cmp::Reverse(position_of(event)));
+        if let Some(cursor) = cursor {
+            selected.retain(|event| position_of(event) < cursor);
+        }
+
+        // "The number of events to return. Possible values are 1 through 50. The default
+        // is 50."
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(MAX_RESULTS_DEFAULT)
+                .clamp(MAX_RESULTS_MIN, MAX_RESULTS_MAX),
+        )
+        .unwrap_or(MAX_RESULTS_DEFAULT as usize);
+
+        let events: Vec<Event> = selected
+            .iter()
+            .copied()
+            .take(page_size)
+            .map(to_event)
+            .collect();
+        // "If the token does not appear, there are no more results to return."
+        let next_token = (selected.len() > page_size)
+            .then(|| mint_token(&fingerprint, position_of(selected[page_size - 1])));
+
+        Ok(LookupEventsOutput {
+            events: Some(events),
+            next_token,
+        })
     }
+}
+
+/// `MaxResults`'s modelled lower bound (`range 1..50`).
+const MAX_RESULTS_MIN: i32 = 1;
+/// `MaxResults`'s modelled UPPER bound (`range 1..50`, "with a maximum of 50 possible").
+const MAX_RESULTS_MAX: i32 = 50;
+/// `MaxResults`'s documented default: "The default number of results returned is 50".
+/// The same number as [`MAX_RESULTS_MAX`] today, but a different model fact.
+const MAX_RESULTS_DEFAULT: i32 = 50;
+
+/// The version prefix inside a pagination token, so a token minted by an older form of
+/// the encoding is refused rather than misread.
+const TOKEN_VERSION: &str = "v1";
+
+/// The two values the `ReadOnly` lookup attribute takes: the event's `readOnly` flag
+/// rendered as a string, which is what the modelled `Event$ReadOnly` carries.
+const READ_ONLY_VALUES: [&str; 2] = ["true", "false"];
+
+/// The `EventCategory` value the model declares (`EVENT_CATEGORY_VALUES`), named here
+/// because the category a request asks for is mapped from it one value at a time.
+const INSIGHT_EVENT_CATEGORY: &str = "insight";
+
+/// The record category a request asks for.
+///
+/// `EventCategory` is modelled with the single value `insight`, and the doc states the
+/// consequence of leaving it out: "if you do not specify insight as the value of
+/// EventCategory, no Insights events are returned" — so an absent category asks for
+/// management events, and `insight` asks for Insights events. The mapping is explicit
+/// per value: a category a later model revision adds is refused until it is mapped here,
+/// rather than silently read as a request for Insights events.
+fn wanted_category(requested: Option<&str>) -> Result<&'static str, LookupEventsError> {
+    match requested {
+        None => Ok(EVENT_CATEGORY_MANAGEMENT),
+        Some(INSIGHT_EVENT_CATEGORY) => Ok(EVENT_CATEGORY_INSIGHT),
+        Some(value) => Err(LookupEventsErrorModeled::InvalidEventCategoryException(
+            InvalidEventCategoryException {
+                message: Some(format!(
+                    "EventCategory '{value}' is not valid: the supported event \
+                     categories are [{}]",
+                    EVENT_CATEGORY_VALUES.join(", ")
+                )),
+            },
+        )
+        .into()),
+    }
+}
+
+/// The one lookup attribute a request may filter on.
+///
+/// "Contains a list of lookup attributes. Currently the list can contain only one
+/// item.", and an attribute outside what Lookup supports is an
+/// `InvalidLookupAttributesException` ("Occurs when a lookup attribute is specified that
+/// is not valid").
+fn single_attribute(
+    requested: Option<Vec<LookupAttribute>>,
+) -> Result<Option<LookupAttribute>, LookupEventsError> {
+    let refuse = |message: String| {
+        LookupEventsErrorModeled::InvalidLookupAttributesException(
+            InvalidLookupAttributesException {
+                message: Some(message),
+            },
+        )
+    };
+
+    let requested = requested.unwrap_or_default();
+    if requested.len() > 1 {
+        return Err(refuse(format!(
+            "LookupAttributes carries {} attributes: a lookup filters on at most one \
+             attribute",
+            requested.len()
+        ))
+        .into());
+    }
+    let Some(attribute) = requested.into_iter().next() else {
+        return Ok(None);
+    };
+    if !LOOKUP_ATTRIBUTE_KEY_VALUES.contains(&attribute.attribute_key.as_str()) {
+        return Err(refuse(format!(
+            "AttributeKey '{}' is not valid: the supported lookup attributes are [{}]",
+            attribute.attribute_key,
+            LOOKUP_ATTRIBUTE_KEY_VALUES.join(", ")
+        ))
+        .into());
+    }
+    if attribute.attribute_key == READ_ONLY_ATTRIBUTE_KEY
+        && !READ_ONLY_VALUES.contains(&attribute.attribute_value.as_str())
+    {
+        return Err(refuse(format!(
+            "AttributeValue '{}' is not valid for AttributeKey {READ_ONLY_ATTRIBUTE_KEY}: \
+             the supported values are [{}]",
+            attribute.attribute_value,
+            READ_ONLY_VALUES.join(", ")
+        ))
+        .into());
+    }
+    Ok(Some(attribute))
+}
+
+/// The `LookupAttributeKey` whose value is a boolean rather than free text.
+const READ_ONLY_ATTRIBUTE_KEY: &str = "ReadOnly";
+
+/// Whether `event` satisfies the one attribute the request filters on.
+///
+/// Each arm reads the SAME field of the record that the event reports under that name,
+/// so a lookup by an attribute selects exactly the events whose reported value matches.
+/// `ResourceType` / `ResourceName` match an event that refers to ANY such resource,
+/// which is what a list of referenced resources means.
+fn matches_attribute(event: &ManagementEvent, attribute: &LookupAttribute) -> bool {
+    let value = attribute.attribute_value.as_str();
+    match attribute.attribute_key.as_str() {
+        "EventId" => event.event_id == value,
+        "EventName" => event.call.event_name == value,
+        READ_ONLY_ATTRIBUTE_KEY => event.call.read_only.to_string() == value,
+        "Username" => event.call.user_name.as_deref() == Some(value),
+        "ResourceType" => event
+            .call
+            .resources
+            .iter()
+            .any(|resource| resource.resource_type == value),
+        "ResourceName" => event
+            .call
+            .resources
+            .iter()
+            .any(|resource| resource.resource_name == value),
+        "EventSource" => event.call.event_source == value,
+        "AccessKeyId" => event.call.access_key_id.as_deref() == Some(value),
+        // Every other key was refused by `single_attribute`.
+        _ => false,
+    }
+}
+
+/// A record's place in the reported order: its time, then the log's ordinal as the
+/// tie-breaker. Reported most recent first, so the page boundary is the SMALLEST
+/// position on the page and the next page is everything strictly below it — a cursor
+/// that stays valid as newer events are recorded.
+fn position_of(event: &ManagementEvent) -> (i64, u64) {
+    (event.event_time_millis(), event.seq)
+}
+
+/// Project a record onto the modelled `Event` shape.
+fn to_event(event: &ManagementEvent) -> Event {
+    Event {
+        event_id: Some(event.event_id.clone()),
+        event_name: Some(event.call.event_name.clone()),
+        // `Event$ReadOnly` is modelled as a string: "Information about whether the event
+        // is a write event or a read event."
+        read_only: Some(event.call.read_only.to_string()),
+        access_key_id: event.call.access_key_id.clone(),
+        event_time: Some(::aws_smithy_types::DateTime::from(event.event_time)),
+        event_source: Some(event.call.event_source.clone()),
+        username: event.call.user_name.clone(),
+        resources: Some(
+            event
+                .call
+                .resources
+                .iter()
+                .map(|resource| Resource {
+                    resource_type: Some(resource.resource_type.clone()),
+                    resource_name: Some(resource.resource_name.clone()),
+                })
+                .collect(),
+        ),
+        // "A JSON string that contains a representation of the event returned."
+        cloud_trail_event: Some(event.to_cloudtrail_event_json().to_string()),
+    }
+}
+
+/// The filter a token belongs to, mixed into one opaque value: the Region, the event
+/// category, the lookup attribute and the requested window.
+fn filter_fingerprint(
+    region: &str,
+    category: &str,
+    attribute: Option<&LookupAttribute>,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> String {
+    let bound = |value: Option<i64>| value.map(|v| v.to_string()).unwrap_or_default();
+    ::service_common::stable_hex_id(&[
+        region,
+        category,
+        attribute.map(|a| a.attribute_key.as_str()).unwrap_or(""),
+        attribute.map(|a| a.attribute_value.as_str()).unwrap_or(""),
+        &bound(start),
+        &bound(end),
+    ])
+}
+
+/// The token that continues this filter's lookup below `cursor`.
+///
+/// Opaque to a caller (hex-encoded) but carrying everything the next page needs: the
+/// encoding's version, the filter it belongs to, and the position the page ended at.
+fn mint_token(fingerprint: &str, cursor: (i64, u64)) -> String {
+    let (millis, seq) = cursor;
+    ::hex::encode(format!("{TOKEN_VERSION}:{fingerprint}:{millis}:{seq}"))
+}
+
+/// Read a token back, or `None` for one this service did not mint, that was minted for
+/// a different filter, or that is malformed.
+fn read_token(token: &str, fingerprint: &str) -> Option<(i64, u64)> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let mut fields = decoded.split(':');
+    if fields.next()? != TOKEN_VERSION || fields.next()? != fingerprint {
+        return None;
+    }
+    let millis = fields.next()?.parse().ok()?;
+    let seq = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some((millis, seq))
+}
+
+/// A caller-supplied timestamp as whole milliseconds since the epoch — the resolution a
+/// recorded event's time is compared at.
+fn datetime_millis(value: &::aws_smithy_types::DateTime) -> i64 {
+    value
+        .secs()
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(value.subsec_nanos() / 1_000_000))
+}
+
+/// An instant as whole milliseconds since the epoch.
+fn millis_of(at: ::std::time::SystemTime) -> i64 {
+    at.duration_since(::std::time::UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// The retention window in milliseconds.
+fn retention_millis() -> i64 {
+    i64::try_from(EVENT_RETENTION.as_millis()).unwrap_or(i64::MAX)
 }

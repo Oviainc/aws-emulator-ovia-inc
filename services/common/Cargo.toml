@@ -38,6 +38,8 @@ serde_json = { workspace = true }
 # `query_error_envelope`: the v4 UUID an awsQuery error envelope reports as its
 # `<RequestId>`, from the maintained crate the framework's own request-id minter and the
 # service-local copies of that writer use, rather than derived here.
+# `management_events`: the `eventID` / `requestID` a recorded event carries are version-4
+# UUIDs, minted by the same maintained crate rather than by laying the form out here.
 uuid = { version = "1", features = ["v4"] }
 
 [lints]

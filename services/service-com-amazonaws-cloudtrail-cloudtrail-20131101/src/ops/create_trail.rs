@@ -332,7 +332,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
+        // What the audit record reports about this call. Read off the request BEFORE it
+        // is served, because serving it consumes the input.
+        let request_parameters = crate::state::recorded_members([
+            ("name", ::serde_json::json!(input.name)),
+            ("s3BucketName", ::serde_json::json!(input.s3_bucket_name)),
+            ("s3KeyPrefix", ::serde_json::json!(input.s3_key_prefix)),
+            ("snsTopicName", ::serde_json::json!(input.sns_topic_name)),
+            (
+                "includeGlobalServiceEvents",
+                ::serde_json::json!(input.include_global_service_events),
+            ),
+            (
+                "isMultiRegionTrail",
+                ::serde_json::json!(input.is_multi_region_trail),
+            ),
+            (
+                "enableLogFileValidation",
+                ::serde_json::json!(input.enable_log_file_validation),
+            ),
+            (
+                "cloudWatchLogsLogGroupArn",
+                ::serde_json::json!(input.cloud_watch_logs_log_group_arn),
+            ),
+            (
+                "cloudWatchLogsRoleArn",
+                ::serde_json::json!(input.cloud_watch_logs_role_arn),
+            ),
+            ("kmsKeyId", ::serde_json::json!(input.kms_key_id)),
+            (
+                "isOrganizationTrail",
+                ::serde_json::json!(input.is_organization_trail),
+            ),
+            (
+                "recursiveLogging",
+                ::serde_json::json!(input.recursive_logging),
+            ),
+        ]);
+        let resources = crate::state::trail_resources(&input.name, &region);
 
+        let outcome = self.create(input, &region);
+
+        let (error_code, error_message) = crate::state::failure_of(&outcome);
+        let response_elements = outcome.as_ref().ok().map(|created| {
+            crate::state::recorded_members([
+                ("name", ::serde_json::json!(created.name)),
+                ("s3BucketName", ::serde_json::json!(created.s3_bucket_name)),
+                ("s3KeyPrefix", ::serde_json::json!(created.s3_key_prefix)),
+                ("snsTopicARN", ::serde_json::json!(created.sns_topic_arn)),
+                (
+                    "includeGlobalServiceEvents",
+                    ::serde_json::json!(created.include_global_service_events),
+                ),
+                (
+                    "isMultiRegionTrail",
+                    ::serde_json::json!(created.is_multi_region_trail),
+                ),
+                ("trailARN", ::serde_json::json!(created.trail_arn)),
+                (
+                    "logFileValidationEnabled",
+                    ::serde_json::json!(created.log_file_validation_enabled),
+                ),
+                (
+                    "cloudWatchLogsLogGroupArn",
+                    ::serde_json::json!(created.cloud_watch_logs_log_group_arn),
+                ),
+                (
+                    "cloudWatchLogsRoleArn",
+                    ::serde_json::json!(created.cloud_watch_logs_role_arn),
+                ),
+                ("kmsKeyId", ::serde_json::json!(created.kms_key_id)),
+                (
+                    "isOrganizationTrail",
+                    ::serde_json::json!(created.is_organization_trail),
+                ),
+                (
+                    "recursiveLogging",
+                    ::serde_json::json!(created.recursive_logging),
+                ),
+            ])
+        });
+        crate::state::record_management_event(
+            &*self.engine,
+            ctx.parts(),
+            crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                // A create is a write event, whether it succeeded or was refused.
+                read_only: false,
+                resources,
+                request_parameters,
+                response_elements,
+                error_code,
+                error_message,
+            },
+        );
+        outcome
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> {
+    /// Serve the call: everything `CreateTrail` does to the trail registry, with the
+    /// audit record its caller writes left to [`smithy_server_runtime::Operation::handle`]
+    /// so that every path out of here — the refusals included — is recorded the same way.
+    fn create(
+        &self,
+        input: CreateTrailInput,
+        region: &str,
+    ) -> Result<CreateTrailOutput, CreateTrailError> {
+        let region = region.to_string();
         // `Name` must satisfy the trail-name rules the model documents; the boundary
         // validator cannot refuse them because the model carries no pattern for them.
         crate::state::validate_trail_name(&input.name).map_err(|rejection| {

@@ -177,6 +177,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
+        // What the audit record reports about this call, read off the request before
+        // serving it consumes the input.
+        let request_parameters =
+            crate::state::recorded_members([("name", ::serde_json::json!(input.name))]);
+        let resources = crate::state::trail_resources(&input.name, &region);
+
+        let outcome = self.start(input, &region);
+
+        let (error_code, error_message) = crate::state::failure_of(&outcome);
+        crate::state::record_management_event(
+            &*self.engine,
+            ctx.parts(),
+            crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                // Turning logging on is a write event, whether it succeeded or was
+                // refused.
+                read_only: false,
+                resources,
+                request_parameters,
+                // `StartLoggingResponse` models no members, so the call answers with
+                // nothing to record.
+                response_elements: None,
+                error_code,
+                error_message,
+            },
+        );
+        outcome
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartLogging<Eng> {
+    /// Serve the call: everything `StartLogging` does to the trail registry, with the
+    /// audit record its caller writes left to [`smithy_server_runtime::Operation::handle`]
+    /// so that every path out of here — the refusals included — is recorded the same way.
+    fn start(
+        &self,
+        input: StartLoggingInput,
+        region: &str,
+    ) -> Result<StartLoggingOutput, StartLoggingError> {
+        let region = region.to_string();
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartLoggingErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
                 message: Some(

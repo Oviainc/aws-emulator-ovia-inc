@@ -23,13 +23,20 @@
 //! (`ops::types`), not written out here, so a value an enum gains cannot leave this
 //! suite asserting a stale set.
 //!
-//! Two control cases pin the other half of the rule: a class this service has no
+//! Three control cases pin the other half of the rule: a class this service has no
 //! recorded value-free wording for (`@length`) keeps the framework's own sentence, value
-//! and all, and an out-of-set enum inside a trail's event or Insights selectors is
+//! and all; an out-of-set enum inside a trail's event or Insights selectors is
 //! answered with the modelled `InvalidEventSelectorsException` /
 //! `InvalidInsightSelectorsException` instead — the refusals `src/service.rs` and those
 //! handlers answer ahead of this envelope, whose own rows live in
-//! `tests/all/refusal_fidelity.rs` and `tests/all/insight_selectors.rs`.
+//! `tests/all/refusal_fidelity.rs` and `tests/all/insight_selectors.rs`; and a
+//! `LookupEvents` member for which the model declares an error OF ITS OWN for exactly
+//! this case — `EventCategory` (`InvalidEventCategoryException`, "Occurs if an event
+//! category that is not valid is specified as a value of EventCategory") and
+//! `LookupAttributes` (`InvalidLookupAttributesException`, "Occurs when a lookup
+//! attribute is specified that is not valid") — is answered in THAT error, by the same
+//! rule the selectors follow: where the model names the error for a case, a client
+//! branches on that code, and the generic envelope would hide it.
 
 use serde_json::{json, Value};
 
@@ -128,27 +135,13 @@ async fn a_value_outside_a_modelled_enum_is_refused_without_quoting_it() {
             "insightType",
             INSIGHT_TYPE_VALUES,
         ),
-        (
-            // An operation that is still a scaffold stub: the boundary refuses the
-            // request before any handler runs, so the wording does not depend on one.
-            "an EventCategory outside its enum",
-            "LookupEvents",
-            json!({"EventCategory": "management"}),
-            "eventCategory",
-            EVENT_CATEGORY_VALUES,
-        ),
-        (
-            // A member nested inside a LIST element, which the validating walk spells
-            // with a 1-based `<index>.member` step.
-            "an AttributeKey outside its enum, on the second lookup attribute",
-            "LookupEvents",
-            json!({"LookupAttributes": [
-                {"AttributeKey": LOOKUP_ATTRIBUTE_KEY_VALUES[0], "AttributeValue": "AKIA"},
-                {"AttributeKey": "EventNames", "AttributeValue": "PutObject"},
-            ]}),
-            "lookupAttributes.2.member.attributeKey",
-            LOOKUP_ATTRIBUTE_KEY_VALUES,
-        ),
+        // The nested-list-element path (`<member>.<1-based index>.member.<member>`) is
+        // covered by [`a_lookup_events_enum_violation_keeps_its_modelled_error`] below,
+        // whose second lookup attribute sits at
+        // `lookupAttributes.2.member.attributeKey`: every list-nested enum member of
+        // this model belongs to a member for which the model declares an error of its
+        // own (a lookup attribute, an event selector, an Insights selector), so the
+        // nested case is asserted there rather than on this envelope.
     ];
 
     for (case, operation, request, member, allowed) in rows {
@@ -158,9 +151,9 @@ async fn a_value_outside_a_modelled_enum_is_refused_without_quoting_it() {
     }
 
     // Every value the model's enum declares is accepted by the boundary, so the rows
-    // above are about the values outside it. `LookupEvents` is a scaffold stub, so an
-    // accepted request reaches its 501 rather than a refusal — which is exactly the
-    // signal that the boundary let it through.
+    // above are about the values outside it. `LookupEvents` is implemented, so an
+    // accepted request is answered rather than refused — which is exactly the signal
+    // that the boundary let it through.
     for value in EVENT_CATEGORY_VALUES {
         let reply = emulator
             .call("LookupEvents", &json!({"EventCategory": value}))
@@ -170,6 +163,77 @@ async fn a_value_outside_a_modelled_enum_is_refused_without_quoting_it() {
             "case the {value} event category: a value the model declares must not be \
              refused by the boundary, got {:?}",
             reply.body
+        );
+    }
+}
+
+/// A `LookupEvents` member the model declares an error OF ITS OWN for is refused in THAT
+/// error rather than in the `ValidationException` envelope above — the same rule the
+/// selectors follow (see [`an_enum_violation_inside_a_selector_keeps_its_modelled_error`]).
+///
+/// `InvalidEventCategoryException` is modelled "Occurs if an event category that is not
+/// valid is specified as a value of EventCategory" and
+/// `InvalidLookupAttributesException` "Occurs when a lookup attribute is specified that is
+/// not valid", both on `LookupEvents` (`smithy_query(query="operation",
+/// operation="LookupEvents")`), and `ValidationException` is not an error that operation
+/// declares at all — so a client catching the modelled error would miss these refusals
+/// altogether. The message is built from the request (the value it sent, the member it
+/// sat at and the rule it broke), so the RULE is the requirement and not one sentence.
+#[tokio::test]
+async fn a_lookup_events_enum_violation_keeps_its_modelled_error() {
+    let emulator = Emulator::new();
+
+    // Rows: a value of another category's spelling, a lower-cased modelled value, a
+    // value of the nested `AggregationConfiguration` enum, and the empty string. The
+    // rule is about the VALUE being outside the set, so what varies is the value.
+    for value in ["management", "Insight", "INSIGHT", "Data", ""] {
+        let case = format!("an EventCategory of {value:?}");
+        let reply = emulator
+            .call("LookupEvents", &json!({"EventCategory": value}))
+            .await;
+        reply.expect_error(&case, 400, "InvalidEventCategoryException");
+        assert!(
+            reply.message().contains("eventCategory")
+                && EVENT_CATEGORY_VALUES
+                    .iter()
+                    .all(|allowed| reply.message().contains(allowed)),
+            "case {case}: the refusal must name the member and the model's value set, \
+             got {:?}",
+            reply.message()
+        );
+    }
+
+    // Rows: an unknown key on the ONLY attribute, the same key on the SECOND attribute
+    // (the nested `lookupAttributes.<1-based>.member.attributeKey` path), a key that
+    // differs from a modelled one only in case, and the empty key.
+    let attribute_rows: Vec<(&str, Value)> = vec![
+        (
+            "one attribute whose key is not modelled",
+            json!({"LookupAttributes": [{"AttributeKey": "EventNames", "AttributeValue": "PutObject"}]}),
+        ),
+        (
+            "the second attribute's key is not modelled",
+            json!({"LookupAttributes": [
+                {"AttributeKey": LOOKUP_ATTRIBUTE_KEY_VALUES[0], "AttributeValue": "AKIA"},
+                {"AttributeKey": "EventNames", "AttributeValue": "PutObject"},
+            ]}),
+        ),
+        (
+            "a key differing from a modelled one only in case",
+            json!({"LookupAttributes": [{"AttributeKey": "eventname", "AttributeValue": "PutObject"}]}),
+        ),
+        (
+            "an empty key",
+            json!({"LookupAttributes": [{"AttributeKey": "", "AttributeValue": "PutObject"}]}),
+        ),
+    ];
+    for (case, request) in &attribute_rows {
+        let reply = emulator.call("LookupEvents", request).await;
+        reply.expect_error(case, 400, "InvalidLookupAttributesException");
+        assert!(
+            reply.message().contains("ttributeKey"),
+            "case {case}: the refusal must name the member at fault, got {:?}",
+            reply.message()
         );
     }
 }

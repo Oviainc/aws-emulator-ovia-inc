@@ -8,7 +8,7 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
-# `service-common` carries two readers this crate needs.
+# `service-common` carries three readers this crate needs.
 # `rpc_target`: the one reading of an `awsJson` `X-Amz-Target` — which service and which
 # operation it names — which this service's routing seams read because its published
 # target prefix is the fully qualified Coral name and so carries dots of its own.
@@ -16,6 +16,8 @@ engine = { workspace = true }
 # the resource type and the id of a resource of that type), which every tagging call
 # reads its `ResourceId` through and which the resource-policy operations read their
 # `ResourceArn` through.
+# `management_events`: the account's management-event (audit) log, shared with every
+# service whose calls CloudTrail records and reports through `LookupEvents`.
 service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -45,7 +47,8 @@ sqlparser = { version = "0.59", features = ["visitor"] }
 # query run (36 characters of `^[a-f0-9\-]+$`): a v4 UUID, the form CloudTrail Lake
 # uses.
 uuid = { version = "1", features = ["v4"] }
-# Hex-codes the opaque `ListChannels` pagination token (`src/ops/list_channels.rs`).
+# Hex-codes the opaque `ListChannels` pagination token (`src/ops/list_channels.rs`) and
+# the opaque `LookupEvents` one (`src/ops/lookup_events.rs`), which it also reads back.
 hex = { workspace = true }
 
 [build-dependencies]

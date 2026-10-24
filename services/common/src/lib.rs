@@ -47,7 +47,7 @@
 //!   which operation it names — for every service whose published target prefix carries
 //!   dots of its own, which the framework's first-dot readers cannot route;
 //!
-//! Beside them, two SHARED STORES live here, each held once in the shared engine so
+//! Beside them, three SHARED STORES live here, each held once in the shared engine so
 //! the services on either side of a hand-off cannot hold two copies of one fact:
 //!
 //! * [`iot_job_executions`], the IoT job-execution store the IoT control plane writes
@@ -56,7 +56,11 @@
 //! * [`db_data_sources`], the directory of which database service minted an immutable
 //!   DB resource id — written by the database control planes when they mint one, read
 //!   by the services that monitor those resources, which cannot tell an RDS id from a
-//!   DocumentDB id by its form.
+//!   DocumentDB id by its form;
+//! * [`management_events`], the account's management-event (audit) log — written by the
+//!   service that SERVED an API call, which is the only one that knows the call
+//!   happened, and read by CloudTrail, which is the service that reports it
+//!   (`LookupEvents`).
 //!
 //! # Why a shared rule
 //!
@@ -178,6 +182,7 @@ pub mod iam_trust_policy;
 pub mod iot_commands;
 pub mod iot_job_executions;
 pub mod lex;
+pub mod management_events;
 pub mod network;
 pub mod query_error_envelope;
 pub mod rfc3339;

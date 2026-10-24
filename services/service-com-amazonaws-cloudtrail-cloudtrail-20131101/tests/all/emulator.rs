@@ -104,6 +104,18 @@ impl Emulator {
             .expect("the in-memory engine carries this service's state")
     }
 
+    /// The account's management-event log in the shared engine — the SAME log the
+    /// handlers record into and `LookupEvents` reports from, which is how a suite
+    /// seeds an event served at a known instant.
+    pub fn management_event_log(
+        &self,
+    ) -> engine::ServiceState<service_common::management_events::ManagementEventLog> {
+        service_com_amazonaws_cloudtrail_cloudtrail_20131101::state::management_event_log(
+            &*self.engine,
+        )
+        .expect("the in-memory engine carries the management-event log")
+    }
+
     /// Call `operation` from `region` with `body`, under the target prefix every
     /// SDK sends ([`TARGET_PREFIX`]).
     pub async fn call_in(&self, operation: &str, region: &str, body: &Value) -> Reply {

@@ -9,6 +9,13 @@
 //! shapes. It lives here, not in one handler, because seven operations apply the same
 //! rules and two copies of them would drift.
 //!
+//! It also owns this service's half of the account's MANAGEMENT-EVENT log — the audit
+//! record `LookupEvents` serves. The log itself is the shared
+//! [`service_common::management_events::ManagementEventLog`], because CloudTrail records
+//! the management calls of EVERY service and only the service that served a call knows
+//! it happened; what lives here is how a CloudTrail call is written into it
+//! ([`record_management_event`]), reached from each mutating handler.
+//!
 //! It owns the CloudTrail Lake registries on the same terms. An event data store
 //! and the queries run against it are named by a dozen operations (`StartQuery`,
 //! `DescribeQuery`, `CancelQuery`, `ListQueries`, `GetQueryResults`, the event
@@ -36,6 +43,12 @@
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime};
+
+use service_common::management_events::{
+    AuditedResource, ManagementEventLog, ServedApiCall, PRINCIPAL_TYPE_ASSUMED_ROLE,
+    PRINCIPAL_TYPE_IAM_USER, PRINCIPAL_TYPE_UNKNOWN,
+};
+use smithy_server_runtime::OperationError;
 
 use crate::ops::types::{
     AdvancedEventSelector, AggregationConfiguration, ContextKeySelector, EventSelector,
@@ -3386,3 +3399,190 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsCloudtrailCloudtrail20131101State>)
 }
+
+/// The account's management-event log in the shared engine.
+///
+/// A SHARED type — [`service_common::management_events::ManagementEventLog`] — and not a
+/// field of this service's own state: CloudTrail reports the management calls of every
+/// service, and the service that served a call is the only one that knows it happened,
+/// so recorder and reporter must reach one log rather than two copies of it.
+///
+/// `None` is answered differently on the two sides, deliberately: a READER (`LookupEvents`)
+/// cannot report what it cannot read, so it refuses with the modelled
+/// `UnsupportedOperationException`, while a RECORDER still serves the caller's write and
+/// only traces a warning — refusing a write because the audit log is unreachable would be
+/// a worse answer than serving it unrecorded.
+pub fn management_event_log<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<ManagementEventLog>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<ManagementEventLog>)
+}
+
+/// This service's `eventSource` on an audit record: CloudTrail's endpoint prefix
+/// (`awsService.endpointPrefix` in the model) in the `<prefix>.amazonaws.com` form
+/// CloudTrail stamps on every event.
+pub const EVENT_SOURCE: &str = "cloudtrail.amazonaws.com";
+
+/// The CloudFormation-style type name of the resource a trail event refers to, as
+/// CloudTrail reports it in an event's `Resources`.
+pub const TRAIL_RESOURCE_TYPE: &str = "AWS::CloudTrail::Trail";
+
+/// The IAM user name a long-term access key speaks for in this emulator.
+///
+/// The emulator publishes ONE long-term credential, and it belongs to the IAM user
+/// `user/emulator` — the identity STS answers `GetCallerIdentity` with for a caller
+/// presenting it. CloudTrail reports that name as an event's `Username`, which is what a
+/// lookup by the `Username` attribute filters on. A request signed with a TEMPORARY
+/// credential speaks for a session whose role name this service cannot resolve, so it is
+/// recorded without a user name rather than with a guessed one.
+pub const AMBIENT_USER_NAME: &str = "emulator";
+
+/// The access-key-id prefix of a temporary (session) credential, from the IAM
+/// "unique identifier prefixes" table: `ASIA` for a temporary access key, `AKIA` for an
+/// IAM user's long-term one.
+const TEMPORARY_ACCESS_KEY_PREFIX: &str = "ASIA";
+
+/// What a handler reports about the call it has just served, for the audit record.
+pub struct ServedCall<'a> {
+    /// The operation's modelled name (`Self::NAME`).
+    pub operation: &'a str,
+    /// The Region the call was served in.
+    pub region: &'a str,
+    /// Whether the call only READ state.
+    pub read_only: bool,
+    /// The resources the call acted on.
+    pub resources: Vec<AuditedResource>,
+    /// The request's parameters, named as the model spells them.
+    pub request_parameters: ::serde_json::Value,
+    /// The values the response carried, or `None` for a call that failed or that
+    /// answers with nothing.
+    pub response_elements: Option<::serde_json::Value>,
+    /// The wire error code the call answered with, if it failed.
+    pub error_code: Option<String>,
+    /// The message that went with it.
+    pub error_message: Option<String>,
+}
+
+/// The `requestParameters` / `responseElements` of an audit record, from the members a
+/// request carried or a response answered with.
+///
+/// A member that was ABSENT is left out rather than recorded as null: CloudTrail records
+/// what the call actually carried, so a lookup reading the event back cannot tell an
+/// absent member from one explicitly set to null if nulls are written. Members are named
+/// as the event document names them — the modelled member name with a lower-case first
+/// letter.
+pub fn recorded_members<const N: usize>(
+    members: [(&str, ::serde_json::Value); N],
+) -> ::serde_json::Value {
+    members
+        .into_iter()
+        .filter(|(_, value)| !value.is_null())
+        .map(|(name, value)| (name.to_string(), value))
+        .collect::<::serde_json::Map<String, ::serde_json::Value>>()
+        .into()
+}
+
+/// The wire error code and message an outcome carries: `(None, None)` for a success.
+///
+/// Read off the operation's own error channel, so the recorded code is exactly the one
+/// the caller was answered with.
+pub fn failure_of<T, E: OperationError + ::std::fmt::Display>(
+    outcome: &Result<T, E>,
+) -> (Option<String>, Option<String>) {
+    match outcome {
+        Ok(_) => (None, None),
+        Err(error) => (
+            Some(error.shape_name().to_string()),
+            Some(error.to_string()),
+        ),
+    }
+}
+
+/// The resources an audit record reports for a call that addressed one trail.
+///
+/// A malformed identifier addresses no trail, so such a call is recorded with no
+/// resource rather than with an ARN built from an identifier the service rejected.
+pub fn trail_resources(identifier: &str, request_region: &str) -> Vec<AuditedResource> {
+    parse_trail_identifier(identifier)
+        .ok()
+        .map(|parsed| {
+            AuditedResource::new(
+                TRAIL_RESOURCE_TYPE,
+                trail_arn(parsed.region().unwrap_or(request_region), parsed.name()),
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
+/// Record a call this service served in the account's management-event log, so
+/// `LookupEvents` reports it.
+///
+/// Called from the handlers that CHANGE state. A reporting operation records nothing:
+/// an audit record is state, and a read must not change what a later reader sees — so
+/// every event this service writes carries `readOnly: false`.
+///
+/// Recording is best-effort by design: an engine that carries no log (a unit test
+/// constructing an operation over a bare engine) still serves the call, because failing
+/// a caller's write because the audit log is unreachable would be a worse answer than
+/// serving it unrecorded.
+pub fn record_management_event<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    parts: &http::request::Parts,
+    call: ServedCall<'_>,
+) {
+    let Some(log) = management_event_log(engine) else {
+        // Not silent: an unrecorded audit write leaves no trace in the log by
+        // definition, so it leaves one here instead.
+        ::tracing::warn!(
+            operation = call.operation,
+            "the engine carries no management-event log: the call was served unrecorded"
+        );
+        return;
+    };
+    let access_key_id = caller_access_key_id(parts);
+    let principal_type = match access_key_id.as_deref() {
+        None => PRINCIPAL_TYPE_UNKNOWN,
+        Some(key) if key.starts_with(TEMPORARY_ACCESS_KEY_PREFIX) => PRINCIPAL_TYPE_ASSUMED_ROLE,
+        Some(_) => PRINCIPAL_TYPE_IAM_USER,
+    };
+    let user_name = (principal_type == PRINCIPAL_TYPE_IAM_USER).then(|| AMBIENT_USER_NAME.to_string());
+    log.lock().record(
+        ServedApiCall {
+            event_name: call.operation.to_string(),
+            event_source: EVENT_SOURCE.to_string(),
+            aws_region: call.region.to_string(),
+            read_only: call.read_only,
+            access_key_id,
+            user_name,
+            principal_type: principal_type.to_string(),
+            account_id: ::engine::emulator_account_id().to_string(),
+            user_agent: parts
+                .headers
+                .get(http::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            resources: call.resources,
+            request_parameters: call.request_parameters,
+            response_elements: call.response_elements,
+            error_code: call.error_code,
+            error_message: call.error_message,
+        },
+        SystemTime::now(),
+    );
+}
+
+/// The access key id the request was signed with, or `None` for an unsigned request.
+///
+/// `extract_akid` answers the sentinel `"default"` when the request carried no SigV4
+/// credential at all, which names no caller — so it is reported as an absent key rather
+/// than as one with that id.
+pub fn caller_access_key_id(parts: &http::request::Parts) -> Option<String> {
+    let access_key_id = ::engine::extract_akid(&parts.headers);
+    (access_key_id != UNSIGNED_ACCESS_KEY_ID).then_some(access_key_id)
+}
+
+/// What `extract_akid` answers for a request that carried no SigV4 credential.
+const UNSIGNED_ACCESS_KEY_ID: &str = "default";

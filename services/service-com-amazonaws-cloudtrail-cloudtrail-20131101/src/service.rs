@@ -75,6 +75,24 @@ const INVALID_TAG_PARAMETER_EXCEPTION: &str = "InvalidTagParameterException";
 /// The HTTP status that shape's `@httpError` declares.
 const INVALID_TAG_PARAMETER_EXCEPTION_STATUS: u16 = 400;
 
+/// The member path of `LookupEventsRequest$EventCategory`, as the framework spells a
+/// member path (lowerCamel, dotted from the request's root). The match is on the WHOLE
+/// path, not its last segment: `AggregationConfiguration` carries an `EventCategory`
+/// member too, and that one belongs to another operation's refusal.
+const EVENT_CATEGORY_PATH: &str = "eventCategory";
+
+/// The member path prefix of `LookupEventsRequest$LookupAttributes` — the list, its
+/// elements and their members, which no other request shape carries.
+const LOOKUP_ATTRIBUTES_PATH: &str = "lookupAttributes";
+
+/// The wire error code of the modelled `InvalidEventCategoryException`: "Occurs if an
+/// event category that is not valid is specified as a value of EventCategory."
+const INVALID_EVENT_CATEGORY_CODE: &str = "InvalidEventCategoryException";
+
+/// The wire error code of the modelled `InvalidLookupAttributesException`: "Occurs when
+/// a lookup attribute is specified that is not valid."
+const INVALID_LOOKUP_ATTRIBUTES_CODE: &str = "InvalidLookupAttributesException";
+
 /// The target rule in isolation, as THIS service's prefix forms exercise it: which
 /// operation an `X-Amz-Target` names, over the prefix forms a client can write.
 ///
@@ -549,7 +567,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this service
-        // reword it. Three classes are reworded, each from the model or a recorded
+        // reword it. Four classes are reworded, each from the model or a recorded
         // answer, and in this order because a request can break several:
         //
         // * a tag key or value outside its modelled length is
@@ -560,14 +578,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // * a value inside `EventSelectors` / `AdvancedEventSelectors` outside its
         //   modelled constraint is `InvalidEventSelectorsException`, the error the
         //   model declares for exactly that case ([`invalid_event_selectors`]);
+        // * a `LookupEvents` member for which THIS service models an error of its own AND
+        //   which no other request shape carries at its root — `EventCategory` and the
+        //   `LookupAttributes` list — is that modelled error
+        //   (`InvalidEventCategoryException` / `InvalidLookupAttributesException`). Both
+        //   the code and the message are replaced, because a client branches on the code;
+        //   the message is built from the request (the value it sent and the rule it
+        //   broke);
         // * a violated `@pattern`, a value outside a modelled `@range` bound, and a value
         //   outside an enumerated type's value set are a `ValidationException` whose
         //   clause names the member and the requirement WITHOUT the value that broke it
         //   ([`value_free_envelope`]). The code stays the one the framework would have
         //   answered — a client branches on the code, so only the wording changes.
         //
-        // Every other refusal, authentication included, keeps the framework's wording
-        // because every reader declines it.
+        // NOT reworded: `MaxResults`. A dozen operations carry a `MaxResults` member and
+        // they model DIFFERENT errors for a bad one (`InvalidMaxResultsException`,
+        // `InvalidParameterException`, or none at all), and this seam is not told which
+        // operation was called — so the `@range` clause above stays rather than a code
+        // that would be wrong for most of them. Every other refusal, authentication
+        // included, keeps the framework's wording because every reader declines it.
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };
@@ -576,6 +605,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
         if let Some(refused) = invalid_event_selectors(violations) {
             return Some(refused);
+        }
+        let modelled = violations.iter().find_map(|violation| {
+            if violation.path == EVENT_CATEGORY_PATH {
+                Some((INVALID_EVENT_CATEGORY_CODE, violation))
+            } else if is_under(&violation.path, LOOKUP_ATTRIBUTES_PATH) {
+                Some((INVALID_LOOKUP_ATTRIBUTES_CODE, violation))
+            } else {
+                None
+            }
+        });
+        if let Some((code, violation)) = modelled {
+            return Some(Refused {
+                code: code.to_string(),
+                message: refusal_message(violation),
+            });
         }
         Some(Refused {
             code: VALIDATION_EXCEPTION.to_string(),
@@ -610,4 +654,46 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// Whether `path` names `member` itself or something INSIDE it.
+///
+/// Anchored at a path separator, so a sibling member whose name merely starts with the
+/// same characters (`lookupAttributesLimit`, say — in this model revision or a later one)
+/// is not read as part of `member` and does not inherit its error code.
+fn is_under(path: &str, member: &str) -> bool {
+    path == member
+        || path
+            .strip_prefix(member)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// How this service states a refusal it words itself: the value the request sent, the
+/// member it sent it at, and the rule that value broke — enough for a caller to fix the
+/// request from the message alone.
+fn refusal_message(violation: &Violation) -> String {
+    let sent = violation.value.clone().unwrap_or_default();
+    let requirement = match &violation.kind {
+        ViolationKind::MissingRequiredMember => "the member is required".to_string(),
+        ViolationKind::EnumValue(allowed) => {
+            format!("the supported values are [{}]", allowed.join(", "))
+        }
+        ViolationKind::MinLength(min) => {
+            format!("the value must be at least {min} characters long")
+        }
+        ViolationKind::MaxLength(max) => format!("the value must be at most {max} characters long"),
+        ViolationKind::MinValue(min) => format!("the value must be {min} or more"),
+        ViolationKind::MaxValue(max) => format!("the value must be {max} or less"),
+        ViolationKind::Pattern(pattern) => {
+            format!("the value must match the pattern {pattern}")
+        }
+        ViolationKind::UniqueItems => "the values must be unique".to_string(),
+        // `ViolationKind` is `#[non_exhaustive]`: a constraint the framework adds later
+        // is still stated, just without its own sentence.
+        _ => "the value is not valid".to_string(),
+    };
+    format!(
+        "Value '{sent}' at '{}' is not valid: {requirement}",
+        violation.path
+    )
 }
