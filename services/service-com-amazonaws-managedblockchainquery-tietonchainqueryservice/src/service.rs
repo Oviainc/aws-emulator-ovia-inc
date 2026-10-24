@@ -21,8 +21,11 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. THIS SERVICE USES IT: every modelled operation is served behind
+//!   [`ModelledValidation`], which answers a request refused BEFORE the handler
+//!   runs — an absent `@required` member — in the service's own modelled
+//!   `ValidationException` instead of the framework's two-field refusal body, and
+//!   hands every other request to the generated operation unchanged.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. THIS SERVICE REWORDS IT: a constraint violation is
 //!   stated in AWS's validation-framework form, with a `@pattern` quoted
@@ -42,8 +45,11 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
+    Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
+use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// The error code this service answers a refused request with: the modelled
@@ -152,11 +158,13 @@ fn is_collection_size(violation: &Violation) -> bool {
 /// Render one constraint violation the way AWS's validation framework states it: the
 /// submitted value, the member's dotted path, and the constraint it failed.
 ///
-/// `pub(crate)` because the two refusal paths share it: this file's
-/// [`Service::override_refusal`] for the refusals the framework still makes (an absent
-/// `@required` member), and `crate::state::validation` for the modelled constraints the
-/// handlers check themselves so the answer can carry the modelled `reason` and
-/// `fieldList`.
+/// `pub(crate)` because the two refusal paths share it: `crate::state::validation` words
+/// BOTH of them with it — the modelled constraints the handlers check themselves, and the
+/// one refusal no handler can make (an absent `@required` member, which
+/// [`ModelledValidation`] below collects from the framework's own deserializer) — so the
+/// answer always carries the modelled `reason` and `fieldList`. This file's
+/// [`Service::override_refusal`] uses it for whatever is left: a refusal the framework
+/// still renders itself, which that hook can reword but not reshape.
 pub(crate) fn constraint_clause(violation: &Violation) -> Option<String> {
     let requirement = requirement(&violation.kind)?;
     let path = &violation.path;
@@ -202,6 +210,13 @@ pub(crate) fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// One [`ModelledValidation`] per modelled operation, keyed by the routing key the
+    /// model names that operation by ([`Operation::NAME`], the same key the generated
+    /// routing table uses). Built once here, never per request; each entry is zero-sized,
+    /// so this is a table of NAMES rather than a second set of operations — the operation
+    /// that serves a request is still the one the generated table built from the shared
+    /// engine.
+    refusals: HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -211,8 +226,224 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            refusals: modelled_validation_table::<Eng>(),
         }
     }
+}
+
+/// The modelled-refusal wrapper for EVERY operation this service serves.
+///
+/// `ValidationException` is a common error of this service — the model declares it on all
+/// nine operations (`smithy_query(query="digest")`: `common_errors`) — so every operation
+/// states a request refused before its handler ran the same way, and there is no operation
+/// whose boundary refusal may answer in the framework's envelope instead. An operation
+/// added to the model later is wrapped by adding one line here.
+fn modelled_validation_table<Eng: Send + Sync + 'static>(
+) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
+    let mut refusals: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
+    register::<crate::ops::batch_get_token_balance::BatchGetTokenBalance<Eng>>(&mut refusals);
+    register::<crate::ops::get_asset_contract::GetAssetContract<Eng>>(&mut refusals);
+    register::<crate::ops::get_token_balance::GetTokenBalance<Eng>>(&mut refusals);
+    register::<crate::ops::get_transaction::GetTransaction<Eng>>(&mut refusals);
+    register::<crate::ops::list_asset_contracts::ListAssetContracts<Eng>>(&mut refusals);
+    register::<crate::ops::list_filtered_transaction_events::ListFilteredTransactionEvents<Eng>>(
+        &mut refusals,
+    );
+    register::<crate::ops::list_token_balances::ListTokenBalances<Eng>>(&mut refusals);
+    register::<crate::ops::list_transaction_events::ListTransactionEvents<Eng>>(&mut refusals);
+    register::<crate::ops::list_transactions::ListTransactions<Eng>>(&mut refusals);
+    refusals
+}
+
+/// Register one operation's modelled-refusal wrapper under the key the model names that
+/// operation by, read off the operation itself so the table cannot be keyed by a
+/// hand-typed name that drifts from the model.
+fn register<Op: Operation>(refusals: &mut HashMap<&'static str, Box<dyn ErasedOperation>>) {
+    refusals.insert(Op::NAME, Box::new(ModelledValidation::<Op>::new()));
+}
+
+/// One modelled operation, served so that a request refused BEFORE its handler runs is
+/// answered in this service's modelled `ValidationException` — with the model-required
+/// `reason` and a `fieldList` — rather than in the framework's refusal body, which carries
+/// an error code and a `message` and nothing else
+/// (`smithy_server_runtime::Refused`).
+///
+/// The refusal this closes is the one no handler can make: an ABSENT `@required` member is
+/// found while the request is being READ, so no input value ever reaches a handler to
+/// check (the model makes such a member non-`Option` on the generated input struct). Every
+/// other refusal of this service is already made inside the handler, through
+/// `crate::state::validation`, and is untouched here.
+///
+/// Zero-sized: the wrapper holds no engine and no operation instance. It carries the
+/// operation TYPE, which is all it needs — the input shape to read the request into and
+/// the input `Schema` to read it against — and hands a request the model accepts to the
+/// one operation instance the generated routing table built from the shared engine. There
+/// is therefore no second instance of any operation and no second store.
+///
+/// A request this wrapper does not refuse is READ TWICE, once here and once in the
+/// operation's own sequence, because the framework hands no already-built input to an
+/// operation. That cost is deliberate and bounded by the body limits the framework already
+/// enforces; it is what buys the refusal a shape only the handler side could otherwise
+/// have.
+struct ModelledValidation<Op> {
+    operation: PhantomData<fn() -> Op>,
+}
+
+impl<Op> ModelledValidation<Op> {
+    const fn new() -> Self {
+        Self {
+            operation: PhantomData,
+        }
+    }
+}
+
+impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            // The protocol is read, used and dropped inside this one block:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let refused = {
+                let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
+                let violations = pre_handler_violations::<Op>(protocol, req);
+                match crate::state::validation::boundary_exception(&violations) {
+                    Some(modelled) => match protocol.serialize_error(
+                        &modelled,
+                        &crate::ops::types::SCHEMA_VALIDATION_EXCEPTION,
+                        VALIDATION_EXCEPTION,
+                        VALIDATION_EXCEPTION_STATUS,
+                    ) {
+                        Ok(response) => Some(response),
+                        // A refusal that will not serialize leaves the request to the
+                        // framework, which refuses it in its own envelope — the very
+                        // divergence this wrapper removes, so it is logged rather than
+                        // passed over silently.
+                        Err(error) => {
+                            tracing::warn!(
+                                operation = Op::NAME,
+                                %error,
+                                "this service's modelled refusal would not serialize; it \
+                                 falls back to the framework's own envelope"
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            };
+            if let Some(response) = refused {
+                // The row the framework sequence would have recorded for this request, so
+                // a refused one is not a hole in the telemetry series.
+                record_refusal::<Op>(ctx, started.elapsed());
+                return response;
+            }
+            // Nothing to state: the request is served by the generated operation, which
+            // runs the whole framework sequence (deserialize, validate, handle, serialize)
+            // plus its telemetry over the same bytes. Reached through the routing table
+            // rather than through `override_operation`, which would route straight back
+            // here.
+            match svc.definition().routing_table().get(Op::NAME) {
+                Some(operation) => operation.run(svc, req, ctx).await,
+                // Unreachable in practice: this wrapper is only reachable under the key
+                // the generated table registered. Answer the framework's own
+                // no-such-operation response rather than inventing one.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+
+    /// `None` — the framework reads the schemes off the MODELLED operation the request's
+    /// routing key names (the generated table's instance), which is what the model bakes
+    /// them on, so wrapping an operation cannot change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+}
+
+/// Every violation that refuses `req` before `Op`'s handler runs, in the order the
+/// framework finds them.
+///
+/// This is the framework's OWN boundary walk, in the framework's order and with the
+/// framework's own code — read the request into the operation's input shape
+/// ([`smithy_server_runtime::DeserializableStruct`]), then run the constraint-trait walk
+/// over what was read ([`::aws_smithy_schema_server::constraints::validate`]) — so it
+/// cannot find a different violation set from the sequence that follows it. Only the
+/// WORDING of the answer is this service's, and that lives in
+/// [`crate::state::validation`].
+///
+/// For this service the set is the ABSENCE the deserializer found: every constrained
+/// member of every input shape carries `skip_validation` in `src/ops/types/`, so no
+/// constraint trait is left at the boundary for the second step to fire on — but the step
+/// stays, so a member added to the model without `skip_validation` is answered in the
+/// modelled shape too rather than in the framework's.
+///
+/// EMPTY for a request the model accepts, and empty for a failure that is NOT a refusal (a
+/// body the codec cannot read at all, a member of the wrong type): that is not a violation
+/// of a modelled rule, so it keeps the framework's own envelope. `member_name` arrives
+/// already spelled as a violation path (`aws_smithy_schema_server::missing_member` applies
+/// `constraints::path::member` and each enclosing member prepends its own segment), so it
+/// places exactly as a constraint violation's path does.
+///
+/// The same two steps are collected by `service_common::validation::refusing_violations`,
+/// which additionally restores each echoed value to the bytes the caller sent. This service
+/// echoes no value on THIS path — an absent member has none — and the handler side already
+/// owns the echo for the values it refuses, so the two framework calls are named directly
+/// here, as the sibling crates that validate at this seam without that dependency do
+/// (`wellarchitected`'s `modelled_refusal`). Migrating this service onto the shared walk is
+/// that module's own change; nothing here re-implements a check.
+fn pre_handler_violations<Op: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &aws_smithy_runtime_api::http::Request,
+) -> Vec<Violation> {
+    let Ok(mut deserializer) = protocol.deserialize_input(req, Op::INPUT_SCHEMA) else {
+        return Vec::new();
+    };
+    let read = <Op::Input as DeserializableStruct>::deserialize(&mut *deserializer);
+    drop(deserializer);
+    match read {
+        Ok(input) => ::aws_smithy_schema_server::constraints::validate(&input, Op::INPUT_SCHEMA),
+        Err(::aws_smithy_schema::serde::SerdeError::MissingMember { member_name }) => {
+            vec![Violation {
+                path: member_name,
+                kind: ViolationKind::MissingRequiredMember,
+                value: None,
+            }]
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `ValidationException`'s modelled `@httpError`
+/// (`smithy_query(query="shape",shape="ValidationException")`).
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
+
+/// Record the refusal answered above as the operation row the framework sequence would
+/// have recorded, so a request refused by the wrapper is not a hole in the telemetry
+/// series: the same classification (from the refusal's status and error shape), the same
+/// folded handle (this service's signing name and the operation's own name), and the same
+/// already-sanitized request metadata. Everything is gated on a client collecting, exactly
+/// as the framework gates it.
+fn record_refusal<Op: Operation>(ctx: &OperationContext<'_>, latency: std::time::Duration) {
+    if !emulator_telemetry::recording_active() {
+        return;
+    }
+    let handle =
+        emulator_telemetry::OperationHandle::folded(ctx.identity().signing_name_static(), Op::NAME);
+    emulator_telemetry::record_generated_operation_with_handle(
+        &handle,
+        latency,
+        Some(emulator_telemetry::OperationFailure::classify(
+            VALIDATION_EXCEPTION_STATUS,
+            VALIDATION_EXCEPTION,
+        )),
+        smithy_server_runtime::RequestTelemetry::from_headers(&ctx.parts().headers).into_metadata(),
+    );
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -237,12 +468,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve every modelled operation through its [`ModelledValidation`] wrapper, so a
+        // request this service refuses before the handler runs is stated in the service's
+        // OWN modelled `ValidationException` — with the model-required `reason` and a
+        // `fieldList` — instead of the framework's two-field refusal body. The wrapper
+        // hands every request it does not refuse to the generated operation in the routing
+        // table, which remains the only thing that serves one.
+        //
+        // Keyed by the protocol's own routing key, so a request the model names no
+        // operation for resolves to nothing here and keeps the framework's routing
+        // failure.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.refusals.get(key).map(|wrapper| &**wrapper)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -256,6 +493,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // AWS validation-framework form — one clause per violation, naming the submitted
         // value, the member path and the constraint, with a `@pattern` quoted as the
         // expression itself rather than as the model's anchored spelling.
+        //
+        // This hook can reword a refusal but not RESHAPE it: `Refused` carries a code and
+        // a message, so nothing reached through here can carry the `reason` the model
+        // marks `@required` on `ValidationException`. Every refusal of this service is
+        // therefore made where the modelled shape can be returned — in a handler, or in
+        // [`ModelledValidation`] for the absence a handler never sees — and this stays as
+        // the wording of last resort for a refusal that still renders here (a codec
+        // failure the wrapper declines, say).
         //
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure.
