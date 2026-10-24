@@ -34,7 +34,7 @@ use crate::harness::{call, emulator_with_analysed_services, error_code, opt_in};
 /// that carries what it reports, and whether the store this emulator starts with holds an
 /// analysis for that resource type (an Amazon ECS service recommendation is computed over
 /// the ECS services the ECS emulator holds, and this suite creates none).
-const READERS: [(&str, &str, bool); 5] = [
+const READERS: [(&str, &str, bool); 6] = [
     (
         "GetAutoScalingGroupRecommendations",
         "autoScalingGroupRecommendations",
@@ -47,6 +47,7 @@ const READERS: [(&str, &str, bool); 5] = [
         true,
     ),
     ("GetRecommendationSummaries", "recommendationSummaries", true),
+    ("GetLicenseRecommendations", "licenseRecommendations", true),
     (
         "GetECSServiceRecommendations",
         "ecsServiceRecommendations",

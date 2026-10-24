@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLicenseRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLicenseRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLicenseRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns license recommendations for Amazon EC2 instances that run on a specific license.
+//!
+//! A REPORTING operation: it selects, filters and pages over the licensed EC2 instances this
+//! service OBSERVES ([`crate::state::ObservedLicensedInstance`]) and derives every
+//! recommendation it reports from that observation — the finding and its reason code from
+//! what the instance's CloudWatch Application Insights metric source reports and the license
+//! feature set the workload was observed using, the recommendation option from that feature
+//! set, and the saving from the per-core license prices
+//! ([`crate::state::license_core_monthly_price`]). It writes nothing: Compute Optimizer's own
+//! analysis of an observed workload is what produces a license recommendation, so no request
+//! to this API creates one and this handler never invents one — a resource the service holds
+//! no license recommendation for is reported in the response's `errors` list, which is what
+//! the model says that list is ("An array of objects that describe errors of the request").
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +180,240 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLicenseRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLicenseRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Compute Optimizer is a REGIONAL service, so the request addresses ONE region's
+        // endpoint: the instances it asks about are that region's, and the ARNs its answer
+        // names carry that region.
+        let region = crate::state::request_region(ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetLicenseRecommendationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The Compute Optimizer recommendation store is unavailable.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A malformed request is refused BEFORE the store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as it
+        // does in this service's other readers; so is every request that asks about an
+        // account this service cannot answer for (see [`foreign_account`]).
+        let account_id = requested_account_id(input.account_ids.as_deref())?;
+
+        // `resourceArns`: "The ARN that identifies the Amazon EC2 instance" — so each value
+        // is an ARN, and one that names another account's instance asks about an account this
+        // service cannot report on. WHICH resource an ARN of the requested account names is
+        // not checked here: a well-formed ARN this service holds no license recommendation
+        // for is reported in `errors` below, not refused.
+        let resource_arns = input.resource_arns.clone().unwrap_or_default();
+        for value in &resource_arns {
+            let Some(parsed) = crate::state::parse_arn(value) else {
+                return Err(invalid_parameter(format!(
+                    "The value supplied for parameter resourceArns is not valid: {value} is not \
+                     an Amazon Resource Name (ARN)."
+                )));
+            };
+            if parsed.account_id != account_id {
+                return Err(foreign_account());
+            }
+        }
+
+        // The filter vocabulary is the model's own; a name or value outside it is refused
+        // rather than silently matching nothing. The modelled `@enum` on
+        // `LicenseRecommendationFilter$name` already refuses an unmodelled name at the
+        // request boundary, so this covers the VALUES a filter carries and a filter with no
+        // name.
+        let filters = input.filters.clone().unwrap_or_default();
+        if let Some(reason) = crate::state::license_filter_rejection(&filters) {
+            return Err(invalid_parameter(reason));
+        }
+
+        // The page token carries this operation's name and the selection it was taken with,
+        // so resuming a walk with a different selection, or with a token another operation
+        // issued, is refused rather than answered with a page of a different result set.
+        let selection_fingerprint = crate::state::fingerprint(&(
+            Self::NAME,
+            &resource_arns,
+            &account_id,
+            &filters,
+            &region,
+        ));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let cursor = crate::state::decode_offset_page_token(token)
+                    .filter(|cursor| cursor.selection_fingerprint == selection_fingerprint);
+                let Some(cursor) = cursor else {
+                    return Err(invalid_parameter(
+                        "The value supplied for parameter nextToken is not valid: it must be a \
+                         token returned by a previous GetLicenseRecommendations call for the same \
+                         resourceArns, accountIds and filters."
+                            .to_string(),
+                    ));
+                };
+                cursor.offset
+            }
+        };
+
+        // `maxResults` is modelled 0..1000 (the request boundary refuses anything outside
+        // that). Whatever it asks for, the page is capped at `MAX_PAGE_SIZE` so no number a
+        // request carries can size the response or the allocation that builds it; a request
+        // naming no size — or the range's lower bound `0`, which the service documents no
+        // meaning for — gets `DEFAULT_PAGE_SIZE` plus a `nextToken` to walk the rest, the
+        // same rule this service's other 0..1000-paged readers follow.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .filter(|requested| *requested > 0)
+            .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
+            .min(crate::state::MAX_PAGE_SIZE);
+
+        let guard = state.lock();
+        // "The account is not opted in to Compute Optimizer": the service analyses an
+        // account's resources only once it has opted in, so an account that never did — or
+        // that opted back out — reads no recommendations at all.
+        if !guard.enrollment.is_opted_in() {
+            return Err(GetLicenseRecommendationsErrorModeled::OptInRequiredException(
+                OptInRequiredException {
+                    message: Some("The account is not opted in to Compute Optimizer.".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The look-back period in force for this account's licenses decides how long a
+        // period each recommendation reports as analysed, resolved once per request through
+        // this service's ONE resolution, so a reader and
+        // `GetEffectiveRecommendationPreferences` cannot disagree about it.
+        let look_back_period = guard
+            .effective_look_back_period(crate::state::SOURCE_TYPE_LICENSE, &account_id);
+
+        // When these recommendations were last generated: the analysis the account's
+        // enrollment started, which came due one analysis span after the enrollment record
+        // was written. Derived from the store, so every read reports the same instant — the
+        // same rule this service's other recommendation readers report their refresh with.
+        let last_refresh_timestamp = guard.enrollment.last_updated_timestamp.map(|written| {
+            ::aws_smithy_types::DateTime::from_secs_f64(
+                written.as_secs_f64() + crate::state::ANALYSIS_DELAY.as_secs_f64(),
+            )
+        });
+
+        // The account's observed licenses in this Region, each with the ARN it is reported
+        // under, built ONCE: both the selection and the `errors` list below read this one
+        // walk of the inventory. A caller sees the observation only once the analysis its
+        // enrollment started is due.
+        let observed: Vec<(&crate::state::ObservedLicensedInstance, String)> = guard
+            .visible_licenses()
+            .filter(|license| license.account_id == account_id)
+            .map(|license| (license, license.instance_arn(&region)))
+            .collect();
+        // The ARNs each side selects on, indexed once so both passes below are lookups: the
+        // resources the request named, and the resources the service holds a recommendation
+        // for.
+        let requested_arns: ::std::collections::BTreeSet<&str> =
+            resource_arns.iter().map(String::as_str).collect();
+        let observed_arns: ::std::collections::BTreeSet<&str> = observed
+            .iter()
+            .map(|(_, resource_arn)| resource_arn.as_str())
+            .collect();
+
+        // The licenses the request selects: those of the named resources, whose
+        // recommendation satisfies every filter. A member the request omits selects nothing
+        // away.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLicenseRecommendations"))
+        // The recommendation is computed first and filtered second: `Finding`,
+        // `FindingReasonCode` and `LicenseName` filter on what this service DERIVED, not on
+        // anything the request supplied.
+        let selected: Vec<LicenseRecommendation> = observed
+            .iter()
+            .filter(|(_, resource_arn)| {
+                requested_arns.is_empty() || requested_arns.contains(resource_arn.as_str())
+            })
+            .map(|(license, _)| {
+                license.to_recommendation(&region, &look_back_period, last_refresh_timestamp)
+            })
+            .filter(|recommendation| {
+                crate::state::license_recommendation_matches_filters(recommendation, &filters)
+            })
+            .collect();
+
+        // Every ARN the request named that this service holds no license recommendation for,
+        // whatever the filters select. Reported with each page, because it describes the
+        // request rather than the page.
+        let errors: Vec<GetRecommendationError> = resource_arns
+            .iter()
+            .filter(|arn| !observed_arns.contains(arn.as_str()))
+            .map(|arn| GetRecommendationError {
+                identifier: Some(arn.clone()),
+                code: Some(crate::state::NO_RECOMMENDATION_CODE.to_string()),
+                message: Some(
+                    "Compute Optimizer has no license recommendation for the resource this \
+                     identifier names."
+                        .to_string(),
+                ),
+            })
+            .collect();
+
+        // One page of the selected sequence. A next token is handed out only when the
+        // sequence continues past this page, and it resumes exactly where this page stopped.
+        let page: Vec<LicenseRecommendation> = selected
+            .into_iter()
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .collect();
+        let has_more = page.len() > page_size;
+        let page: Vec<LicenseRecommendation> = page.into_iter().take(page_size).collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_offset_page_token(&crate::state::PageCursor {
+                offset: offset.saturating_add(page.len()),
+                selection_fingerprint,
+            })
+        });
+
+        Ok(GetLicenseRecommendationsOutput {
+            next_token,
+            license_recommendations: Some(page),
+            errors: Some(errors),
+        })
     }
+}
+
+/// The 400 `InvalidParameterValueException` this operation refuses a bad request with: "The
+/// value supplied for the input parameter is out of range or not valid."
+fn invalid_parameter(message: String) -> GetLicenseRecommendationsError {
+    GetLicenseRecommendationsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// A 400 `InvalidParameterValueException` for a request that asks about an account other
+/// than the one this service answers for.
+///
+/// `accountIds` is how a MANAGEMENT account names a member account of its organization: "If
+/// your account is the management account of an organization, use this parameter to specify
+/// the member account for which you want to return license recommendations." This emulator
+/// presents one standalone account (`::engine::emulator_account_id`) and records no
+/// organization, so no other account is a member account it can be asked about — in
+/// `accountIds`, or through a `resourceArns` entry that names one. The refusal is worded once
+/// for the whole crate ([`crate::state::CROSS_ACCOUNT_MESSAGE`]) so no two readers differ.
+fn foreign_account() -> GetLicenseRecommendationsError {
+    invalid_parameter(crate::state::CROSS_ACCOUNT_MESSAGE.to_string())
+}
+
+/// The account whose recommendations this request asks for: the one id `accountIds` carries,
+/// or the caller's own account when it carries none.
+///
+/// The rule is the crate's ([`crate::state::requested_account_id`]): "Only one account ID can
+/// be specified per request" (`GetLicenseRecommendations$accountIds`), an `AccountId` is a
+/// 12-digit Amazon Web Services account id (`Scope$value`), and an id that is well-formed but
+/// names another account is refused by [`foreign_account`] rather than used as a filter key.
+/// This wrapper only lifts the reason into this operation's error channel.
+fn requested_account_id(
+    account_ids: Option<&[String]>,
+) -> Result<String, GetLicenseRecommendationsError> {
+    crate::state::requested_account_id(account_ids).map_err(invalid_parameter)
 }
