@@ -694,6 +694,12 @@ fn is_service_arn(candidate: &str, resource_type: &str) -> bool {
 
 /// Whether `candidate` has the shape of a connection ARN this service mints:
 /// `arn:<partition>:codeconnections:<region>:<12 digits>:connection/<id>`.
+///
+/// The ARN this service MINTS, which is narrower than the one its published
+/// connection-ARN expression ADMITS (`service::validation`'s own check, which also admits
+/// the legacy `codestar-connections` namespace): the only ARN that can be a page token is
+/// one this service issued itself, so widening this to what a caller may hold would make
+/// the reader accept a position it never wrote.
 fn is_connection_arn(candidate: &str) -> bool {
     is_service_arn(candidate, "connection")
 }
