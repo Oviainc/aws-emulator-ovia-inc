@@ -61,12 +61,45 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 pub const DATASTORE_NOT_FOUND_MESSAGE: &str = "Could not find specified datastore.";
 
 /// The sentence this service refuses a mutation with when the target data store
-/// exists but its `DatastoreStatus` is not `ACTIVE` (`CREATING`, `DELETING` or
-/// the terminal `DELETED`), beside `AccessDeniedException` (HTTP 403).
+/// exists but its `DatastoreStatus` is a lifecycle TRANSITION state (`CREATING`
+/// or `DELETING`), beside the `ConflictException` (HTTP 409) the model documents
+/// as "The data store is in a transition state and the user requested action
+/// cannot be performed."
 ///
-/// Like [`DATASTORE_NOT_FOUND_MESSAGE`] it names no identifier and no status: it
-/// is one fixed text for "the data store cannot be written to right now".
-pub const DATASTORE_NOT_ACTIVE_MESSAGE: &str = "Specified datastore is not active.";
+/// `action` names the refused mutation. The status is the SERVICE's own state,
+/// so the sentence states it; like [`DATASTORE_NOT_FOUND_MESSAGE`] it quotes
+/// nothing from the request. Every mutation in this crate states its
+/// resource-state conflict through this one function, so none of them can drift
+/// into a different shape of refusal or into echoing the identifier.
+pub fn datastore_in_transition_message(status: DatastoreStatus, action: DatastoreAction) -> String {
+    format!(
+        "Specified datastore is in status {} and cannot be {}.",
+        status.as_wire(),
+        action.as_participle()
+    )
+}
+
+/// A mutation of a data store record, as [`datastore_in_transition_message`]
+/// names it when the record's state refuses it.
+///
+/// A typed value rather than a free-form word: the two mutations of this
+/// resource cannot drift into two different spellings of the same sentence, and
+/// a new one has to add its variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatastoreAction {
+    Update,
+    Delete,
+}
+
+impl DatastoreAction {
+    /// The past participle the conflict sentence states this action with.
+    pub fn as_participle(self) -> &'static str {
+        match self {
+            Self::Update => "updated",
+            Self::Delete => "deleted",
+        }
+    }
+}
 
 /// The sentence this service refuses a point-in-time restore with when the
 /// source data store exists but holds no enabled backup to restore from.

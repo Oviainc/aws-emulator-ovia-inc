@@ -11,11 +11,10 @@
 //! 2. a refusal for a value outside an enumerated type's value set names the
 //!    member and the permitted set and does NOT echo the rejected value, while
 //!    every other constraint class keeps the AWS framing that quotes the value;
-//! 3. `UpdateFHIRDatastore` applies its members to the stored record only while
-//!    that record is `ACTIVE`; any other status is refused with
-//!    `AccessDeniedException` and nothing is written. Its wire STATUS is 400, not the
-//!    `@httpError(403)` the shape declares: see `tests/all/error_envelopes.rs` for
-//!    that rule, which holds for every modelled client error of this service.
+//! 3. `UpdateFHIRDatastore` applies its members to the stored record while that
+//!    record is `ACTIVE`. What a mutation on a record that is NOT `ACTIVE`
+//!    answers is the resource-state rule, pinned over every status and every
+//!    mutation in `tests/all/datastore_state_conflict.rs`.
 //!
 //! Every call goes through [`MultiServiceRouter::dispatch`] by way of the shared
 //! harness in `fhir_datastore_lifecycle`, so routing, deserialization, the
@@ -23,7 +22,7 @@
 
 use serde_json::{json, Value};
 
-use crate::fhir_datastore_lifecycle::{error_code, HealthLake, PAST_TRANSITION};
+use crate::fhir_datastore_lifecycle::{error_code, error_message, HealthLake, PAST_TRANSITION};
 
 /// The text this service answers a data store it holds no record of with, as
 /// `service_com_amazonaws_healthlake_healthlake::state` spells it. Read from the
@@ -33,22 +32,6 @@ const NOT_FOUND: &str = service_com_amazonaws_healthlake_healthlake::state::DATA
 /// holds with.
 const PROFILE_NOT_FOUND: &str =
     service_com_amazonaws_healthlake_healthlake::state::PROFILE_NOT_FOUND_MESSAGE;
-
-/// The text this service refuses a mutation on a data store that is not
-/// `ACTIVE` with.
-const NOT_ACTIVE: &str =
-    service_com_amazonaws_healthlake_healthlake::state::DATASTORE_NOT_ACTIVE_MESSAGE;
-
-/// The `message` of an error envelope, under either casing a protocol uses for
-/// it (`Message` on the modelled shapes, `message` on a framework refusal).
-fn error_message(payload: &Value) -> String {
-    for member in ["Message", "message"] {
-        if let Some(text) = payload.get(member).and_then(Value::as_str) {
-            return text.to_string();
-        }
-    }
-    panic!("an error body must carry a message, got {payload}")
-}
 
 /// The enum clause this service states for `path` and `allowed`: the member and
 /// the permitted set, with no echo of the rejected value.
@@ -459,75 +442,3 @@ async fn update_applies_its_members_to_the_active_record_and_leaves_the_rest() {
     }
 }
 
-#[tokio::test]
-async fn update_refuses_a_data_store_that_is_not_active_with_403_and_writes_nothing() {
-    let service = HealthLake::new();
-
-    // One row per non-ACTIVE status a data store reaches in this slice, each
-    // reached through the real lifecycle rather than by poking the state.
-    for (case, settle_before_delete, settle_after_delete) in [
-        ("CREATING", false, false),
-        ("DELETING", true, false),
-        ("DELETED", true, true),
-    ] {
-        let (id, _) = service
-            .create(&json!({ "DatastoreTypeVersion": "R4", "DatastoreName": "gated" }))
-            .await;
-        if settle_before_delete {
-            tokio::time::sleep(PAST_TRANSITION).await;
-            service
-                .ok("DeleteFHIRDatastore", &json!({ "DatastoreId": &id }))
-                .await;
-        }
-        if settle_after_delete {
-            tokio::time::sleep(PAST_TRANSITION).await;
-        }
-
-        let described = service
-            .ok("DescribeFHIRDatastore", &json!({ "DatastoreId": &id }))
-            .await;
-        assert_eq!(
-            described["DatastoreProperties"]["DatastoreStatus"], case,
-            "case {case:?}: the row must put the data store in that status, got {described}"
-        );
-
-        let (status, payload) = service
-            .call(
-                "UpdateFHIRDatastore",
-                &json!({ "DatastoreId": &id, "DatastoreName": "renamed-after-the-fact" }),
-            )
-            .await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: a mutation on a non-ACTIVE data store must answer 400, got {status}: {payload}"
-        );
-        assert_eq!(
-            error_code(&payload),
-            "AccessDeniedException",
-            "case {case:?}: must answer AccessDeniedException, got {payload}"
-        );
-        let message = error_message(&payload);
-        assert_eq!(
-            message, NOT_ACTIVE,
-            "case {case:?}: expected {NOT_ACTIVE:?}, got {message:?}"
-        );
-
-        // The refusal wrote nothing: the name is still the one the create set,
-        // and the lifecycle the record was already on is undisturbed — the
-        // transition the clock owed still lands, and a terminal record stays
-        // terminal.
-        tokio::time::sleep(PAST_TRANSITION).await;
-        let after = service
-            .ok("DescribeFHIRDatastore", &json!({ "DatastoreId": &id }))
-            .await;
-        assert_eq!(
-            after["DatastoreProperties"]["DatastoreName"], "gated",
-            "case {case:?}: a refused update must not rename the data store, got {after}"
-        );
-        let settled = if case == "CREATING" { "ACTIVE" } else { "DELETED" };
-        assert_eq!(
-            after["DatastoreProperties"]["DatastoreStatus"], settled,
-            "case {case:?}: a refused update must leave the lifecycle alone, expected {settled}, got {after}"
-        );
-    }
-}
