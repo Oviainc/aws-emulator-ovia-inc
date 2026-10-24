@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetServerStrategies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetServerStrategies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetServerStrategies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Retrieves the recommended strategies and tools for one server of this account's
+//! portfolio: the strategies [`crate::state::ServerRecord`] holds for it — the option
+//! `UpdateServerConfig` stored as the account's preference, and the recommendation the
+//! service holds for the server — each reported with whether it is the preferred one
+//! ([`crate::state::ServerRecord::to_server_strategies`]).
+//!
+//! A read: it computes its answer from the record and writes nothing, so a server nothing
+//! recommended and nobody chose a preference for reports an empty list rather than a
+//! canned strategy, and a `serverId` naming no server of the portfolio is refused with the
+//! modelled 404 `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +75,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::server_not_found;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +149,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetServerStrategies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetServerStrategiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetServerStrategies"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetServerStrategiesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the migrationhub-strategy server inventory is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A read: the store is only looked at here, so running GetServerStrategies
+        // changes nothing a later caller sees.
+        let store = state.lock();
+        let Some(server) = store.servers.get(&input.server_id) else {
+            return Err(
+                GetServerStrategiesErrorModeled::ResourceNotFoundException(server_not_found())
+                    .into(),
+            );
+        };
+
+        Ok(GetServerStrategiesOutput {
+            server_strategies: Some(server.to_server_strategies()),
+        })
     }
 }

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartVirtualMachinesMetadataSync
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartVirtualMachinesMetadataSync`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartVirtualMachinesMetadataSync::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a metadata sync on the hypervisor an ARN names and PERSISTS it in
+//! [`crate::state`]: the record keeps the instant the sync was requested, and every later
+//! read of the hypervisor reports the `SyncMetadataStatus` the clock has reached since —
+//! `CREATED`, then `RUNNING`, then `SUCCEEDED` with the time it succeeded at. A sync runs
+//! under the IAM role the hypervisor's PROPERTY MAPPINGS name, so a request for an ARN no
+//! mappings are set for is refused with the modelled `AccessDeniedException` (HTTP 403)
+//! before any resource lookup — that gate answers alike whether or not the ARN names a
+//! hypervisor this store holds. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -84,11 +83,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `StartVirtualMachinesMetadataSyncError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#StartVirtualMachinesMetadataSync")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#StartVirtualMachinesMetadataSync",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum StartVirtualMachinesMetadataSyncErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,18 +145,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartVirtualMachinesMetadataSync` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartVirtualMachinesMetadataSyncErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartVirtualMachinesMetadataSyncErrorModeled::InternalServerException(
+                InternalServerException {
+                    error_code: None,
+                    message: Some(
+                        "Backup gateway state is unavailable on this engine.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // One guard spans the gate and the write, so the record the gate passed is the
+        // record the sync is started on.
+        let mut store = state.lock();
+
+        // `HypervisorArn`'s length and pattern are refused by the boundary validator
+        // before `handle` runs, so reaching here means the ARN is well formed.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartVirtualMachinesMetadataSync"))
+        // The PERMISSION gate comes first. A metadata sync reads the virtual machines of
+        // the hypervisor and writes their tags under the IAM role the hypervisor's
+        // property mappings name, so with no mappings set there is no role the caller
+        // permitted the service to act with: the modelled `AccessDeniedException`, "the
+        // operation cannot proceed because you have insufficient permissions". That
+        // question is about the MAPPINGS, not about the hypervisor, so it is answered the
+        // same way for an ARN this store holds no hypervisor under — which is why a
+        // never-imported ARN is refused here, and not as a missing resource.
+        if !store.property_mappings_configured(&input.hypervisor_arn) {
+            return Err(
+                StartVirtualMachinesMetadataSyncErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        error_code: crate::state::MAPPINGS_NOT_CONFIGURED.to_string(),
+                        message: Some(crate::state::MAPPINGS_NOT_CONFIGURED_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Past the gate the mappings exist, and they are a member of the hypervisor
+        // record — so the record exists too, and with one guard spanning both this
+        // refusal cannot be reached. It is written all the same, through the same
+        // `crate::state::MissingResource` choice of status and `ErrorCode` every other
+        // operation of this service refuses a missing hypervisor with, so a sync asked
+        // for a record the store does not hold can only ever answer that one way.
+        let started = store.start_metadata_sync(
+            &input.hypervisor_arn,
+            ::std::time::SystemTime::now(),
+        );
+        let Some(started) = started else {
+            let missing = crate::state::MissingResource::Hypervisor;
+            let error = StartVirtualMachinesMetadataSyncErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.hypervisor_arn)),
+                },
+            );
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
+        };
+
+        // The ARN comes back off the record the store now holds, not off the request.
+        Ok(StartVirtualMachinesMetadataSyncOutput {
+            hypervisor_arn: Some(started.arn),
+        })
     }
 }

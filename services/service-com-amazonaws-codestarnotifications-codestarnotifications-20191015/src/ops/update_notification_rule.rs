@@ -146,7 +146,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
-        let now = ::std::time::Instant::now();
         let region = st::request_region(ctx.parts());
 
         if let Some(detail_type) = input.detail_type.as_deref() {
@@ -176,7 +175,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let mut store = state.lock();
-        store.apply_due_target_activations(now);
 
         let Some(current) = store.rule_in_region(&region, &input.arn).cloned() else {
             return Err(UpdateNotificationRuleErrorModeled::ResourceNotFoundException(
@@ -259,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.unregister_target(&arn, &address);
         }
         for target in new_targets.into_iter().flatten() {
-            store.register_target(&arn, &target, now);
+            store.register_target(&arn, &target);
         }
 
         Ok(UpdateNotificationRuleOutput {})
