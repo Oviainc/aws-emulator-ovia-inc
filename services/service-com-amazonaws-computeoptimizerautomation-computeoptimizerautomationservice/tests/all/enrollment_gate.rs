@@ -66,6 +66,7 @@ fn gated_calls() -> Vec<(&'static str, Value, u16)> {
         ),
         ("GetAutomationRule", json!({"ruleArn": arn}), 404),
         ("ListAutomationEvents", json!({}), 200),
+        ("ListAccounts", json!({}), 200),
         (
             "ListAutomationEventSteps",
             json!({"eventId": ABSENT_EVENT_ID}),
@@ -162,6 +163,7 @@ fn seed_enrollment(engine: &Arc<engine::InMemoryEngine>, status: &str) {
         state::caller_account_id(),
         state::EnrollmentConfig {
             status: status.to_string(),
+            last_updated_timestamp: Some(state::now()),
             ..state::EnrollmentConfig::default()
         },
     );

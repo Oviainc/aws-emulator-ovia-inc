@@ -169,29 +169,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         // This reports "a resource-based policy of an entity that is identified
-        // by its resource ARN": an ARN the catalog holds no record of identifies
-        // no such entity, so there is nothing to report it for — the same
-        // existence test every ARN-addressed operation of this service applies,
-        // reads included.
-        if !store.holds_resource(&resource) {
+        // by its resource ARN", so the only thing it refuses as not found is an
+        // ARN that identifies no resource of this catalog at all — a resource
+        // type the catalog does not have, or an id it holds under another type.
+        if !store.may_carry_policy(&resource) {
             return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(&resource),
             )
             .into());
         }
 
-        // The policy itself is what is being read, out of the resource-POLICY
-        // store, which holds an entry only for a resource one was attached to.
-        // A resource carrying none has no document to report — `Policy` targets
-        // `ResourcePolicyJson` (`@length(min: 1)`) — so the read is refused as
-        // not found rather than answered with a synthesised document the
-        // resource does not carry.
-        let Some(policy) = store.resource_policies.get(&resource.policy_key()).cloned() else {
-            return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
-                crate::state::resource_policy_not_found(&resource),
-            )
-            .into());
-        };
+        // What the resource carries is what the resource-POLICY store holds for
+        // it, which holds an entry only for a resource one was attached to: a
+        // resource nothing is attached to carries the EMPTY policy document
+        // (`crate::state::EMPTY_RESOURCE_POLICY`), the one document that grants
+        // what no attached policy grants and that no `PutResourcePolicy` can
+        // store.
+        let policy = store
+            .resource_policies
+            .get(&resource.policy_key())
+            .cloned()
+            .unwrap_or_else(|| crate::state::EMPTY_RESOURCE_POLICY.to_string());
 
         Ok(GetResourcePolicyOutput {
             policy: Some(policy),

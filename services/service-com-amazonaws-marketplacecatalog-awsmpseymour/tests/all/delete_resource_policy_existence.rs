@@ -6,14 +6,16 @@
 //! deserialization, the boundary validator, the handler, the persisted state and
 //! serialization — the same path a client takes.
 //!
-//! The rule under test: an operation addressed by a resource ARN acts on the one record
-//! the store holds for the resource that ARN names — its catalog, its resource type AND
-//! its id — so an ARN of this catalog's own form that names no held resource is refused
-//! with the modelled `ResourceNotFoundException` (HTTP 404) naming the resource that was
-//! asked for, and only an ARN that names a held resource is acted on. Clearing the policy
-//! of a held resource asks for an end state (no policy attached), so it answers 200 with
-//! an empty document whether or not one was attached, and a refused call changes nothing
-//! another caller can see.
+//! The rule under test: a resource-based policy is recorded per RESOURCE ARN, so clearing
+//! one asks for an end state (no policy attached) and answers 200 with an empty document
+//! whether or not one was attached, for any ARN of this catalog's own form. What is refused
+//! with the modelled `ResourceNotFoundException` (HTTP 404), naming the resource asked for,
+//! is an ARN that identifies no resource of this catalog at all: a resource type this
+//! catalog does not have, or an id this catalog holds a record of under ANOTHER resource
+//! type or kind, since the type is part of what the ARN names. An id this catalog simply
+//! holds no record of is not such an ARN — the catalog's own records are the resources this
+//! emulator's change sets created, not every resource an account holds — and a refused call
+//! changes nothing another caller can see.
 //!
 //! The rows differ along the resource kind the ARN names (entity or change set), the
 //! entity type, whether the id is held at all, whether it is held under ANOTHER type or
@@ -57,6 +59,12 @@ const CHANGE_SET_RESOURCE_TYPE: &str = "ChangeSet";
 /// the service never invents one for a resource that carries none.
 const MINIMAL_POLICY_DOCUMENT: &str = "{\"Version\":\"2012-10-17\",\"Statement\":\
      [{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"aws-marketplace:DescribeEntity\"}]}";
+
+/// The document a resource carrying no resource-based policy reports: the empty JSON
+/// policy document, which states no `Statement` and so grants what no attached policy
+/// grants. `PutResourcePolicy` refuses it, so reading it back can only mean that nothing
+/// is attached (see `resource_policy_lifecycle.rs`).
+const EMPTY_POLICY_DOCUMENT: &str = "{}";
 
 /// How long after the start a change set has certainly reached `SUCCEEDED`: the two spans
 /// the implementation publishes, plus a margin for a slow machine.
@@ -298,22 +306,24 @@ fn change_set_missing(id: &str) -> String {
     format!("Requested change set '{id}' does not exist.")
 }
 
-/// Every ARN of this catalog's form that names no resource the store holds is refused by
+/// An ARN of this catalog's form that identifies no resource of this catalog is refused by
 /// `DeleteResourcePolicy` with 404 `ResourceNotFoundException` naming the resource asked
-/// for — including an ARN whose ID IS held, but under another resource type or another
-/// resource kind, since the type is part of what the ARN names — and such a refusal leaves
-/// the policy of a resource the catalog does hold exactly as it was.
+/// for — an ARN whose ID IS held, but under another resource type or another resource kind,
+/// since the type is part of what the ARN names, and an ARN whose type this catalog does
+/// not have at all — and such a refusal leaves the policy of a resource the catalog does
+/// hold exactly as it was. An ARN whose id this catalog merely holds no record of is NOT
+/// refused: the clear asks for an end state that ARN is already in.
 ///
 /// The rows differ along the resource kind, the resource type, and whether the id is held
 /// at all, held under another entity type, or held as the other kind of resource.
 #[tokio::test]
-async fn delete_resource_policy_refuses_an_arn_the_catalog_holds_no_record_for() {
+async fn delete_resource_policy_refuses_an_arn_naming_no_resource_of_this_catalog() {
     let router = emulator();
     let (entity_arn, change_set_arn) = created_resources(&router, "AmiProduct").await;
     let held_entity_id = resource_id_of(&entity_arn);
     let held_change_set_id = resource_id_of(&change_set_arn);
 
-    // A resource that IS held, carrying a policy, so each refusal below is shown to be
+    // A resource that IS held, carrying a policy, so each answer below is shown to be
     // about the ARN rather than about the operation — and to leave that policy alone.
     let attached = put_resource_policy(&router, &entity_arn, MINIMAL_POLICY_DOCUMENT).await;
     assert_eq!(
@@ -323,31 +333,11 @@ async fn delete_resource_policy_refuses_an_arn_the_catalog_holds_no_record_for()
     );
 
     // (case, the ARN, the sentence the refusal must state)
-    let rows: Vec<(&str, String, String)> = vec![
-        (
-            "an AmiProduct id nothing created",
-            catalog_arn("AmiProduct", "prod-b2c3d4e5f6g7h"),
-            entity_missing("prod-b2c3d4e5f6g7h"),
-        ),
-        (
-            "a SaaSProduct id nothing created",
-            catalog_arn("SaaSProduct", "prod-c3d4e5f6g7h8i"),
-            entity_missing("prod-c3d4e5f6g7h8i"),
-        ),
-        (
-            "an id of an entity type nothing created",
-            catalog_arn("Offer", "offer-1a2b3c4d5e6f7"),
-            entity_missing("offer-1a2b3c4d5e6f7"),
-        ),
+    let refused_rows: Vec<(&str, String, String)> = vec![
         (
             "the held entity's id under another entity type",
             catalog_arn("SaaSProduct", &held_entity_id),
             entity_missing(&held_entity_id),
-        ),
-        (
-            "a change set id nothing started",
-            catalog_arn(CHANGE_SET_RESOURCE_TYPE, "cs-000000000009"),
-            change_set_missing("cs-000000000009"),
         ),
         (
             "the held entity's id as a change set",
@@ -359,9 +349,19 @@ async fn delete_resource_policy_refuses_an_arn_the_catalog_holds_no_record_for()
             catalog_arn("AmiProduct", &held_change_set_id),
             entity_missing(&held_change_set_id),
         ),
+        (
+            "a resource type this catalog does not have",
+            catalog_arn("Bucket", "prod-d4e5f6g7h8i9j"),
+            entity_missing("prod-d4e5f6g7h8i9j"),
+        ),
+        (
+            "a plural of a resource type this catalog has",
+            catalog_arn("ChangeSets", "cs-000000000009"),
+            entity_missing("cs-000000000009"),
+        ),
     ];
 
-    for (case, arn, missing) in rows {
+    for (case, arn, missing) in refused_rows {
         let refused = delete_resource_policy(&router, &arn).await;
         assert_eq!(
             (
@@ -404,6 +404,54 @@ async fn delete_resource_policy_refuses_an_arn_the_catalog_holds_no_record_for()
             (200, MINIMAL_POLICY_DOCUMENT.to_string()),
             "case {case:?}: the refused call must leave the held resource's policy as it \
              was, got {} with {:?}",
+            held.status,
+            held.body
+        );
+    }
+
+    // The ARNs this catalog simply holds no record of: the clear asks for the end state
+    // they are already in, so it is served, and it still leaves the held resource's own
+    // policy alone.
+    let served_rows: Vec<(&str, String)> = vec![
+        (
+            "an AmiProduct id nothing created",
+            catalog_arn("AmiProduct", "prod-b2c3d4e5f6g7h"),
+        ),
+        (
+            "a SaaSProduct id nothing created",
+            catalog_arn("SaaSProduct", "prod-c3d4e5f6g7h8i"),
+        ),
+        (
+            "an id of an entity type nothing created",
+            catalog_arn("Offer", "offer-1a2b3c4d5e6f7"),
+        ),
+        (
+            "a change set id nothing started",
+            catalog_arn(CHANGE_SET_RESOURCE_TYPE, "cs-000000000009"),
+        ),
+    ];
+
+    for (case, arn) in served_rows {
+        for round in 0..2 {
+            let cleared = delete_resource_policy(&router, &arn).await;
+            assert_eq!(
+                (cleared.status, cleared.content_type.as_str(), &cleared.body),
+                (200, JSON, &json!({})),
+                "case {case:?} round {round}: clearing the policy of an ARN this catalog \
+                 holds no record of must answer 200 application/json with an empty \
+                 document, got {} {:?} with {:?}",
+                cleared.status,
+                cleared.content_type,
+                cleared.body
+            );
+        }
+
+        let held = get_resource_policy(&router, &entity_arn).await;
+        assert_eq!(
+            (held.status, held.text("/Policy")),
+            (200, MINIMAL_POLICY_DOCUMENT.to_string()),
+            "case {case:?}: a clear on another ARN must leave the held resource's policy \
+             as it was, got {} with {:?}",
             held.status,
             held.body
         );
@@ -462,22 +510,15 @@ async fn delete_resource_policy_clears_the_policy_of_a_resource_the_catalog_hold
             cleared.body
         );
 
-        // The end state: the resource is still held — the policy read reaches the handler
-        // and is refused for the POLICY rather than for the resource — and carries no
-        // document, so clearing again is the same success.
+        // The end state: the resource is still held — the read reaches the handler and
+        // reports the resource's policy, which is now the EMPTY policy document — so
+        // clearing again is the same success.
         let read = get_resource_policy(&router, arn).await;
         assert_eq!(
-            (read.status, read.error_code(), read.message()),
-            (
-                404,
-                "ResourceNotFoundException",
-                format!(
-                    "Requested resource policy of '{}' does not exist.",
-                    resource_id_of(arn)
-                ),
-            ),
-            "case {case:?}: after the clear the resource must carry no policy and the \
-             refusal must be about the policy, got {} {:?} with {:?}",
+            (read.status, read.text("/Policy")),
+            (200, EMPTY_POLICY_DOCUMENT.to_string()),
+            "case {case:?}: after the clear the resource must carry no policy and report \
+             the empty policy document, got {} {:?} with {:?}",
             read.status,
             read.error_code(),
             read.body

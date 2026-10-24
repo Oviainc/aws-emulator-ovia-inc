@@ -67,7 +67,11 @@
 //! delivery destination", which `PutDeliveryDestination` creates or updates and
 //! `GetDeliveryDestination` reports — live in
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::delivery_destinations`], each one a
-//! [`DeliveryDestinationRecord`], keyed by the name that identifies one.
+//! [`DeliveryDestinationRecord`], keyed by the name that identifies one. A destination's
+//! delivery destination policy lives on that destination
+//! ([`DeliveryDestinationRecord::policy`]), because `PutDeliveryDestinationPolicy` "assigns
+//! an IAM policy to the destination" and nothing but the destination names one: one
+//! destination holds at most one, and removing the destination takes its policy with it.
 //!
 //! The account's delivery sources — each "a logical object that represents the resource that
 //! is actually sending the logs", which `PutDeliverySource` creates or updates and
@@ -1384,6 +1388,16 @@ pub struct DeliveryDestinationRecord {
     /// destination." A `BTreeMap` so the stored order is stable; `Tags` is `@length(min: 1)`,
     /// so a destination carrying none reports no member at all.
     pub tags: BTreeMap<String, String>,
+    /// `Policy$deliveryDestinationPolicy` — "The contents of the delivery destination
+    /// policy", the IAM policy `PutDeliveryDestinationPolicy` assigns to this destination and
+    /// `GetDeliveryDestinationPolicy` reports. `None` for a destination no policy has been
+    /// assigned to, which is what makes a get on one report no policy at all rather than
+    /// refuse.
+    ///
+    /// It is NOT one of the "delivery destination parameters" a later put overwrites: the
+    /// policy is assigned by its own operation, so a put that updates the destination's
+    /// parameters leaves it where it is.
+    pub policy: Option<String>,
 }
 
 impl DeliveryDestinationRecord {
@@ -1403,6 +1417,7 @@ impl DeliveryDestinationRecord {
             destination_resource_arn: None,
             role_arn: None,
             tags: BTreeMap::new(),
+            policy: None,
         }
     }
 
@@ -4568,6 +4583,14 @@ pub fn mint_query_definition_id(seq: u64) -> String {
 pub fn resource_not_found_message(resource_kind: &str) -> String {
     format!("The specified {resource_kind} does not exist.")
 }
+
+/// The refusal CloudWatch Logs answers a delivery-destination POLICY operation with when the
+/// `deliveryDestinationName` it names is not one this account holds. The delivery destination
+/// policy operations state that the requested destination is not in the account rather than
+/// the generic [`resource_not_found_message`] sentence, and they say it per NAME rather than
+/// per request value, so every name the account does not hold is refused identically.
+pub const DELIVERY_DESTINATION_NOT_FOUND_MESSAGE: &str =
+    "Requested Delivery Destination does not exist in this account.";
 
 /// The refusal CloudWatch Logs builds from the request when the resource policy the
 /// caller named is not there. The message interpolates the requested `policyName`, so a

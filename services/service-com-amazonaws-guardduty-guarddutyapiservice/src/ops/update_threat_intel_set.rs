@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateThreatIntelSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateThreatIntelSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the members a request carries to the threat list the
+//! request's detector holds under `ThreatIntelSetId`, leaving every member the
+//! request omits where it was, so `GetThreatIntelSet` reports the updated list.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateThreatIntelSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +143,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateThreatIntelSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateThreatIntelSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateThreatIntelSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateThreatIntelSetErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // Every refusal is classified BEFORE the clock moves, so a refused update
+        // leaves nothing behind: not the list, and not the service clock either —
+        // the ordering `DeleteThreatIntelSet` and `CreateThreatIntelSet` follow.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            // Classified from the REQUEST, the way every other threat-list operation
+            // classifies a `DetectorId` it cannot resolve.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::detector_id_rejection(&input.detector_id),
+            ));
+        };
+        // A list whose delete has already been accepted is no longer one the account
+        // can act on, so it is refused exactly like an id the detector never held.
+        // The delete itself stays idempotent — it asks for the state the record is
+        // already in — while an update would otherwise walk a `DELETED` record back
+        // into use.
+        if detector
+            .threat_intel_set(&input.threat_intel_set_id)
+            .is_none_or(crate::state::ThreatIntelSetRecord::is_deleting)
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::minted_id_rejection(
+                    crate::state::THREAT_INTEL_SET_ID_MEMBER,
+                    &input.threat_intel_set_id,
+                ),
+            ));
+        }
+
+        // Past the refusals this is a MUTATION, so it advances this state's clock:
+        // the instant it hands out is what a transition `Activate` starts is owed
+        // from.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector resolved above under the same lock, so this cannot be
+            // reached; answering the modelled server fault keeps it from panicking.
+            return Err(
+                UpdateThreatIntelSetErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // The change the clock already owed every one of this detector's threat
+        // lists, materialised before this call looks at any status — the same write
+        // `GetThreatIntelSet` performs, so this shows no caller a status a read
+        // would not have shown anyway, and `Activate` is compared against the
+        // status the list has really got to.
+        detector.settle_threat_intel_sets(now);
+
+        let Some(set) = detector
+            .threat_intel_sets
+            .get_mut(&input.threat_intel_set_id)
+        else {
+            // The id resolved above under the same lock, so this cannot be reached.
+            return Err(
+                UpdateThreatIntelSetErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // Every member but the two ids is OPTIONAL and documented as "the updated
+        // …" value (`smithy_query(operation="UpdateThreatIntelSet")`), so this is a
+        // PARTIAL update: a member the request carries replaces the stored one, a
+        // member it omits leaves the stored one exactly where it was. `Format` is
+        // not among them — the format of an existing list cannot be changed — and
+        // neither is `Tags`.
+        if let Some(name) = input.name {
+            set.name = name;
+        }
+        if let Some(location) = input.location {
+            set.location = location;
+        }
+        // `ExpectedBucketOwner` "appears in the response only if it was provided
+        // during ThreatIntelSet creation or update"
+        // (`smithy_query(operation="GetThreatIntelSet")`): an update that provides it
+        // records it, and one that does not leaves whatever the create or an earlier
+        // update recorded.
+        if let Some(owner) = input.expected_bucket_owner {
+            set.expected_bucket_owner = Some(owner);
+        }
+
+        // "The updated Boolean value that specifies whether the ThreateIntelSet is
+        // active or not" (`smithy_query(operation="UpdateThreatIntelSet")`): the same
+        // activation transition `CreateThreatIntelSet` starts, so it goes through the
+        // record's own `set_activation` — asking for the status it already has owes
+        // nothing, and asking for the other one opens the transitional status only
+        // the clock settles.
+        if let Some(activate) = input.activate {
+            set.set_activation(activate, now);
+        }
+
+        // `Unit` output: success is the modelled 200 and an empty body. The
+        // detector's own `UpdatedAt` does not move: the set of sub-resources it holds
+        // is unchanged, and only this threat list's record changed.
+        Ok(UpdateThreatIntelSetOutput {})
     }
 }

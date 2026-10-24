@@ -219,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = state.tick_millis();
         let id = state.mint_id();
-        let record = crate::state::ThreatIntelSetRecord {
+        let mut record = crate::state::ThreatIntelSetRecord {
             id: id.clone(),
             name: input.name.clone(),
             format: input.format.clone(),
@@ -243,21 +243,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the call returns, so it reports the transient `ACTIVATING` until the
             // activation this call started comes due. A list nobody asked to
             // activate is `INACTIVE` straight away, and stays there — the clock owes
-            // it nothing.
-            status: if input.activate {
-                crate::state::THREAT_INTEL_SET_ACTIVATING.to_string()
-            } else {
-                crate::state::THREAT_INTEL_SET_INACTIVE.to_string()
-            },
-            pending_status: if input.activate {
-                Some((
-                    crate::state::THREAT_INTEL_SET_ACTIVE.to_string(),
-                    now.saturating_add(crate::state::THREAT_INTEL_SET_ACTIVATION_SPAN_MILLIS),
-                ))
-            } else {
-                None
-            },
+            // it nothing. `set_activation` below is what opens that transition, the
+            // same seam `UpdateThreatIntelSet` goes through, so a create and an
+            // update cannot disagree about it.
+            status: crate::state::THREAT_INTEL_SET_INACTIVE.to_string(),
+            pending_status: None,
         };
+        record.set_activation(input.activate, now);
 
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // The detector resolved above under the same lock, so this cannot be
