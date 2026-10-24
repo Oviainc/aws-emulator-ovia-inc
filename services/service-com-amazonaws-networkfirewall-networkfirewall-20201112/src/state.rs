@@ -386,6 +386,76 @@ pub fn shared_resource_kind(arn: &str) -> Option<SharedResource> {
     }
 }
 
+/// The resource kinds Network Firewall tags: "You can tag the Amazon Web Services
+/// resources that you manage through Network Firewall: firewalls, firewall
+/// policies, and rule groups" (`TagResource`, `UntagResource` and
+/// `ListTagsForResource` all state it), which is exactly the set of resources
+/// this state holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggableResource {
+    /// A firewall, named by a `firewall/<name>` ARN.
+    Firewall,
+    /// A firewall policy, named by a `firewall-policy/<name>` ARN.
+    FirewallPolicy,
+    /// A rule group, named by a `*-rulegroup/<name>` ARN.
+    RuleGroup,
+}
+
+/// What `arn` names, or `None` when it names a resource kind Network Firewall
+/// does not tag — an ARN "that is malformed, or corresponds to a resource that
+/// isn't valid in the context of the request", which is what
+/// `InvalidRequestException` documents.
+pub fn taggable_resource_kind(arn: &str) -> Option<TaggableResource> {
+    let resource = arn.split(':').next_back()?;
+    let (resource_type, _) = resource.split_once('/')?;
+    match resource_type {
+        "firewall" => Some(TaggableResource::Firewall),
+        "firewall-policy" => Some(TaggableResource::FirewallPolicy),
+        "stateless-rulegroup" | "stateful-rulegroup" | "stateful-domain-rulegroup" => {
+            Some(TaggableResource::RuleGroup)
+        }
+        _ => None,
+    }
+}
+
+/// How many tags one resource may carry: "You can specify one or more tags to add
+/// to each Amazon Web Services resource, up to 50 tags for a resource"
+/// (`TagResource`, and the same sentence on `UntagResource` and
+/// `ListTagsForResource`). DOCUMENTED, not chosen — and it is also what bounds the
+/// tag state one resource can accumulate.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// What a tag write that would take a resource past [`MAX_TAGS_PER_RESOURCE`] is
+/// refused with. The ceiling is a property of the service, not of the request, so
+/// the message names the limit and the resulting count and quotes nothing from the
+/// request.
+pub fn tag_limit_message(requested: usize) -> String {
+    format!(
+        "A resource can have at most {MAX_TAGS_PER_RESOURCE} tags; this request would leave it \
+         with {requested}."
+    )
+}
+
+/// What a request naming an ARN of a kind Network Firewall does not tag is refused
+/// with: the service's one request-derived shape (see [`parameter_message`]), a
+/// fixed stem plus the offending ARN in parameter brackets.
+pub fn untaggable_arn_message(arn: &str) -> String {
+    parameter_message(
+        "resource ARN does not name a firewall, firewall policy or rule group",
+        arn,
+    )
+}
+
+/// Why a tag write could not be served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagWriteBreach {
+    /// No stored resource carries that ARN.
+    NotFound,
+    /// The write would leave the resource with more than
+    /// [`MAX_TAGS_PER_RESOURCE`] tags, carrying the count it would reach.
+    TooManyTags(usize),
+}
+
 /// Why `document` is not a resource policy this service accepts for a resource of
 /// `kind`, or `None` when it validates.
 ///
@@ -864,6 +934,11 @@ pub const PAGE_KIND_FIREWALL_POLICIES: &str = "firewall-policies";
 /// stamps on its cursors. See [`PAGE_KIND_FIREWALLS`].
 pub const PAGE_KIND_FLOW_OPERATIONS: &str = "flow-operations";
 
+/// The listing kind
+/// [`ListTagsForResource`](crate::ops::list_tags_for_resource) stamps on its
+/// cursors. See [`PAGE_KIND_FIREWALLS`].
+pub const PAGE_KIND_TAGS: &str = "tags";
+
 /// Base64 of `<kind>:<key>` standing for "resume after this key" in that
 /// listing's order.
 ///
@@ -905,30 +980,47 @@ pub struct InvalidPageToken;
 /// Resuming by KEY rather than by offset keeps a resumed page correct across a
 /// delete between the two calls: the second page starts at the first key after
 /// the one the token names, whether or not that key still exists.
+///
+/// A `max_results` of 0 is a page of no items — `TagsPaginationMaxResults` admits
+/// it — and is answered like any other full page: with the cursor that resumes
+/// where this call left off, so nothing is lost and nothing is repeated.
 pub fn paginate<T>(
     mut entries: Vec<(String, T)>,
     kind: &str,
     next_token: Option<&str>,
     max_results: Option<i32>,
 ) -> Result<Page<T>, InvalidPageToken> {
+    // Where this page starts: the key the incoming cursor names, and the empty
+    // key — which sorts before every real one — for a first page.
+    let mut resume_after = String::new();
     if let Some(token) = next_token {
         let after = decode_page_token(kind, token).ok_or(InvalidPageToken)?;
         entries.retain(|(key, _)| key.as_str() > after.as_str());
+        resume_after = after;
     }
-    // `MaxResults` carries the modelled `PaginationMaxResults` range (1..100),
-    // which the boundary validator already refused outside, so this clamp is
-    // unreachable defence and never the rule: an out-of-range value is answered
-    // with a 400 before this runs, not silently narrowed.
+    // `MaxResults` carries its listing's modelled range (`PaginationMaxResults`
+    // is 1..100, `TagsPaginationMaxResults` 0..100), which the boundary validator
+    // already refused outside, so this clamp is unreachable defence and never the
+    // rule: an out-of-range value is answered with a 400 before this runs, not
+    // silently narrowed.
     debug_assert!(
-        max_results.is_none_or(|requested| (1..=MAX_PAGE_SIZE).contains(&requested)),
+        max_results.is_none_or(|requested| (0..=MAX_PAGE_SIZE).contains(&requested)),
         "MaxResults should have been refused at the boundary: {max_results:?}"
     );
-    let limit = max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
-    let limit = usize::try_from(limit).unwrap_or(1);
+    let limit = max_results.unwrap_or(MAX_PAGE_SIZE).clamp(0, MAX_PAGE_SIZE);
+    let limit = usize::try_from(limit).unwrap_or(0);
     let next_token = if entries.len() > limit {
-        entries
-            .get(limit - 1)
-            .map(|(key, _)| encode_page_token(kind, key))
+        // The cursor names the LAST key this page carries, so a page of zero
+        // items hands back the cursor this call resumed from: a caller that asks
+        // for no objects is told where to carry on from, not sent back to the
+        // start of the listing.
+        let after = match limit.checked_sub(1) {
+            Some(last) => entries
+                .get(last)
+                .map_or_else(|| resume_after.clone(), |(key, _)| key.clone()),
+            None => resume_after.clone(),
+        };
+        Some(encode_page_token(kind, &after))
     } else {
         None
     };
@@ -1925,6 +2017,100 @@ impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
             }
         }
         None
+    }
+
+    /// Add or overwrite `tags` on the resource `arn` names.
+    ///
+    /// A tag is a key:value pair, so a key the resource already carries takes
+    /// the value this request gives and keeps the position it was first applied
+    /// at, while a key it does not carry is appended in request order; a key
+    /// repeated within one request ends up with the last value given. The
+    /// documented ceiling ([`MAX_TAGS_PER_RESOURCE`]) is checked against the
+    /// MERGED list before anything is stored, so a refused write leaves the
+    /// resource's tags exactly as they were.
+    pub fn apply_tags(&mut self, arn: &str, tags: Vec<Tag>) -> Result<(), TagWriteBreach> {
+        let slot = self.resource_tags_mut(arn).ok_or(TagWriteBreach::NotFound)?;
+        let mut merged = slot.clone().unwrap_or_default();
+        for tag in tags {
+            match merged.iter_mut().find(|stored| stored.key == tag.key) {
+                Some(stored) => stored.value = tag.value,
+                None => merged.push(tag),
+            }
+        }
+        if merged.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(TagWriteBreach::TooManyTags(merged.len()));
+        }
+        *slot = Some(merged);
+        Ok(())
+    }
+
+    /// Remove the tags `keys` names from the resource `arn` names, and answer
+    /// `None` when `arn` names no stored resource of a taggable kind.
+    ///
+    /// Removal is by key, so a key the resource does not carry removes nothing
+    /// and is not an error: `UntagResource` "removes the tags with the specified
+    /// keys", which is a statement about the resulting tag set rather than about
+    /// each key having been present. A resource left with no tags carries the
+    /// member ABSENT, exactly as one created with no `Tags` does.
+    pub fn remove_tags(&mut self, arn: &str, keys: &[String]) -> Option<()> {
+        let slot = self.resource_tags_mut(arn)?;
+        let mut remaining = slot.take().unwrap_or_default();
+        remaining.retain(|tag| !keys.iter().any(|key| key == &tag.key));
+        *slot = (!remaining.is_empty()).then_some(remaining);
+        Some(())
+    }
+
+    /// The tags of the resource `arn` names — empty when it carries none — or
+    /// `None` when `arn` names no stored resource of a kind this service tags.
+    ///
+    /// READ ONLY: a tag listing reports what the tag writes left behind and
+    /// changes nothing a later caller sees.
+    pub fn resource_tags(&self, arn: &str) -> Option<&[Tag]> {
+        let stored = match taggable_resource_kind(arn)? {
+            TaggableResource::Firewall => {
+                &self.firewalls.get(self.firewall_arn_index.get(arn)?)?.tags
+            }
+            TaggableResource::FirewallPolicy => {
+                &self
+                    .firewall_policies
+                    .get(self.firewall_policy_arn_index.get(arn)?)?
+                    .tags
+            }
+            TaggableResource::RuleGroup => {
+                &self
+                    .rule_groups
+                    .get(self.rule_group_arn_index.get(arn)?)?
+                    .tags
+            }
+        };
+        Some(stored.as_deref().unwrap_or_default())
+    }
+
+    /// The tag list of the resource `arn` names, for writing, or `None` when
+    /// `arn` names no stored resource of a kind this service tags.
+    ///
+    /// Every resource that can be tagged keeps its tags on its OWN record — the
+    /// same list its create, describe and delete responses project — so a tag
+    /// write and a resource read can never disagree about one resource's tags.
+    pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut Option<Vec<Tag>>> {
+        match taggable_resource_kind(arn)? {
+            TaggableResource::Firewall => {
+                let key = self.firewall_arn_index.get(arn)?.clone();
+                self.firewalls.get_mut(&key).map(|record| &mut record.tags)
+            }
+            TaggableResource::FirewallPolicy => {
+                let key = self.firewall_policy_arn_index.get(arn)?.clone();
+                self.firewall_policies
+                    .get_mut(&key)
+                    .map(|record| &mut record.tags)
+            }
+            TaggableResource::RuleGroup => {
+                let key = self.rule_group_arn_index.get(arn)?.clone();
+                self.rule_groups
+                    .get_mut(&key)
+                    .map(|record| &mut record.tags)
+            }
+        }
     }
 
     /// Drop the resource policy attached to `resource_arn`, if any.
