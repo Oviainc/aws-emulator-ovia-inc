@@ -21,9 +21,13 @@
 //!    `ValidationException` carrying `reason` = `fieldValidationFailed` and one
 //!    `fieldList` entry per rejected member, naming that member and the constraint it
 //!    failed — not `message` alone.
-//! 3. A request naming a resource that is not in state is answered HTTP 404
-//!    `ResourceNotFoundException` whose `message` is the CONSTANT sentence the shape
-//!    documents and whose ARN member carries the ARN that was asked for.
+//! 3. A request naming a resource of the INVOICE-UNIT or TAG plane that is not in state
+//!    is answered HTTP 404 `ResourceNotFoundException` whose `message` is the sentence
+//!    the shape documents — those planes' recorded bodies carry it whatever was asked
+//!    for — and whose ARN member carries the ARN that was asked for. (The
+//!    procurement-portal plane words its own 404 from the request instead; that rule is
+//!    pinned by `procurement_portal_error_message_key.rs` and
+//!    `own_account_and_request_derived_refusals.rs`.)
 //! 4. Tags are state: what a create or a `TagResource` writes is what
 //!    `ListTagsForResource` reports, and `UntagResource` removes exactly the keys it
 //!    names.
@@ -40,9 +44,10 @@ const INVOICE_UNIT_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
 /// model's `awsJson1_0` protocol trait declares.
 const TAG_PLANE_MEDIA_TYPE: &str = "application/x-amz-json-1.0";
 
-/// The `message` of a `ResourceNotFoundException`: the sentence the shape's own
-/// documentation gives (`smithy_query(query="shape",
-/// shape="ResourceNotFoundException")`), whatever was asked for.
+/// The `message` of a `ResourceNotFoundException` of the INVOICE-UNIT and TAG planes: the
+/// sentence the shape's own documentation gives (`smithy_query(query="shape",
+/// shape="ResourceNotFoundException")`), which those planes' recorded bodies carry
+/// whatever was asked for.
 const NOT_FOUND_MESSAGE: &str = "The resource could not be found.";
 
 /// The `ValidationExceptionReason` a rejected member value is stated with.
@@ -309,11 +314,12 @@ async fn a_modelled_failure_announces_the_media_type_of_its_plane() {
     }
 }
 
-/// RULE 3: a resource that is not in state is reported with the CONSTANT documented
-/// message and the ARN that was asked for in its own member — never spliced into the
-/// prose, and never under the name the published model spells.
+/// RULE 3: a resource of the invoice-unit or tag plane that is not in state is reported
+/// with the message the shape documents and with the ARN that was asked for in its own
+/// member — never spliced into the prose, and never under the name the published model
+/// spells.
 #[tokio::test]
-async fn an_absent_resource_reports_the_constant_message_and_the_arn_in_its_own_member() {
+async fn an_absent_resource_reports_the_documented_message_and_the_arn_in_its_own_member() {
     let router = emulator();
     // One unit exists, so these rows are reported absent on their own account rather
     // than because the store is empty.
@@ -368,7 +374,7 @@ async fn an_absent_resource_reports_the_constant_message_and_the_arn_in_its_own_
         assert_eq!(
             answer.member("message"),
             Some(NOT_FOUND_MESSAGE),
-            "case {operation} on {arn}: the message is a constant, got {answer:?}"
+            "case {operation} on {arn}: expected the documented message, got {answer:?}"
         );
         assert_eq!(
             answer.member("resourceId"),

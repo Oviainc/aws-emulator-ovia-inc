@@ -41,18 +41,26 @@
 //! * a write that would take the resident store past
 //!   [`crate::state::MAX_STORED_REGISTRATIONS`] is refused with the modelled
 //!   `ConflictException`; see that constant for why the store is bounded.
+//! * the `additionalTaxInformation` and the other members the entry's country
+//!   requires, which are the per-country business rules
+//!   [`crate::state::COUNTRY_RULES`] carries and
+//!   [`crate::state::check_country_requirements`] applies.
 //!
-//! Beyond those, this handler applies the per-country business rules the
-//! operation's own model documentation states for `taxRegistrationEntry` — "Kenya
-//! You must specify the `personType` in the `kenyaAdditionalInfo` field of the
+//! Every one of these is decided by
+//! [`crate::state::check_tax_registration_entry`], the one place both this
+//! operation and `BatchPutTaxRegistration` judge an entry.
+//!
+//! The per-country rules are the sentences the operation's own model
+//! documentation states for `taxRegistrationEntry` — "Kenya You must specify the
+//! `personType` in the `kenyaAdditionalInfo` field of the
 //! `additionalTaxInformation` object", and the equivalent sentence for every
 //! other country the documentation names. They live in
 //! [`crate::state::COUNTRY_RULES`], one row per documented sentence, and are
-//! applied by [`crate::state::check_country_requirements`] BEFORE the state
-//! write, so an entry AWS refuses is refused here with the modelled
-//! `ValidationException` and nothing is persisted. They are in `state.rs` rather
-//! than in this file so every writer of a `TaxRegistrationEntry`
-//! (`BatchPutTaxRegistration`, when it is implemented) applies the same set.
+//! applied BEFORE the state write, so an entry AWS refuses is refused here with
+//! the modelled `ValidationException` and nothing is persisted. They are in
+//! `state.rs` rather than in this file so every writer of a
+//! `TaxRegistrationEntry` — `BatchPutTaxRegistration`, the per-account fan-out of
+//! this operation — applies the same set.
 //!
 //! ## Shape of an operation
 //!
@@ -232,88 +240,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = crate::state::resolve_account_id(input.account_id);
         let entry = &input.tax_registration_entry;
 
-        // A registration type whose legal address AWS derives from the tax
-        // number itself does not take one from the request.
-        crate::state::check_registration_type_members(entry)
-            .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
-
-        // Both shapes that report a registration (`TaxRegistration`,
-        // `TaxRegistrationWithJurisdiction`) mark `legalName` and `legalAddress`
-        // `@required`, so a record missing either could never be read back:
-        // refuse the write rather than store one.
-        let Some(legal_name) = entry.legal_name.as_deref() else {
-            return Err(PutTaxRegistrationErrorModeled::ValidationException(
-                crate::state::validation(
-                    crate::state::ERROR_CODE_MISSING_INPUT,
-                    "taxRegistrationEntry.legalName",
-                    "legalName is required to store a tax registration.",
-                ),
-            )
-            .into());
-        };
-        let Some(legal_address) = entry.legal_address.as_ref() else {
-            return Err(PutTaxRegistrationErrorModeled::ValidationException(
-                crate::state::validation(
-                    crate::state::ERROR_CODE_MISSING_INPUT,
-                    "taxRegistrationEntry.legalAddress",
-                    "legalAddress is required to store a tax registration.",
-                ),
-            )
-            .into());
-        };
-
-        // `registrationId`, `legalName` and the address lines carry the model's
-        // non-blank pattern `^(?!\s*$)[\s\S]+$`, a negative lookahead the
-        // boundary validator's regex engine cannot compile, so a blank value
-        // reaches this handler having satisfied every constraint the boundary
-        // could check. Everything else on this input (the 12-digit `accountId`,
-        // the 1..=200 lengths, the closed `TaxRegistrationType` / `Sector` value
-        // sets, the `certifiedEmailId` pattern, the 1..=5 document list) it
-        // already refused before this handler ran.
-        crate::state::check_not_blank(
-            "taxRegistrationEntry.registrationId",
-            &entry.registration_id,
-        )
-        .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
-        crate::state::check_not_blank("taxRegistrationEntry.legalName", legal_name)
-            .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
-        crate::state::check_address("taxRegistrationEntry.legalAddress", legal_address)
-            .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
-
-        // The per-country business rules the model documents for this operation
-        // (`crate::state::COUNTRY_RULES`), keyed off the entry's
-        // `legalAddress.countryCode`: an entry the country's rules refuse is
-        // refused here, BEFORE the write, so nothing is persisted.
-        crate::state::check_country_requirements(entry)
+        // Whether this entry is storable at all is decided in ONE place, which
+        // `BatchPutTaxRegistration` uses too, so the two writers cannot disagree
+        // about one entry: the refusals the module header lists (a legal address
+        // submitted for a type AWS derives it from, a missing legal name or
+        // address, a blank value the boundary validator's regex engine could not
+        // refuse) and then the per-country business rules the model documents,
+        // keyed off the entry's `legalAddress.countryCode` — all of it BEFORE the
+        // write, so an entry AWS refuses persists nothing. Everything else on
+        // this input (the 12-digit `accountId`, the 1..=200 lengths, the closed
+        // `TaxRegistrationType` / `Sector` value sets, the `certifiedEmailId`
+        // pattern, the 1..=5 document list) the boundary validator already
+        // refused before this handler ran.
+        crate::state::check_tax_registration_entry(entry)
             .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
 
         // A write replaces the account's record and bumps its revision, which the
-        // document access tokens derived below carry. `accountId` is
-        // caller-supplied, so a write that would ADD a record is refused once the
-        // store holds as many as this emulator keeps resident; rewriting an
-        // account that already has one adds nothing and is always allowed.
-        let mut store = state.lock();
-        let previous_revision = store
-            .registrations
-            .get(&account_id)
-            .map(|stored| stored.revision);
-        if previous_revision.is_none()
-            && store.registrations.len() >= crate::state::MAX_STORED_REGISTRATIONS
-        {
-            return Err(PutTaxRegistrationErrorModeled::ConflictException(
-                crate::state::registration_store_full(),
-            )
-            .into());
-        }
-        let revision = previous_revision.map_or(1, |revision| revision.saturating_add(1));
-        let stored = crate::state::StoredTaxRegistration::from_entry(
-            entry,
-            &account_id,
-            revision,
-            ::std::time::Instant::now(),
-        );
-        let status = stored.status.clone();
-        store.registrations.insert(account_id, stored);
+        // document access tokens derived from it carry; the store is bounded, so
+        // a write that would ADD a record past that bound is refused. The write
+        // itself lives in `state.rs` so this operation and
+        // `BatchPutTaxRegistration` cannot store one entry two different ways.
+        let status = state
+            .lock()
+            .store_registration(&account_id, entry, ::std::time::Instant::now())
+            .map_err(PutTaxRegistrationErrorModeled::ConflictException)?;
 
         Ok(PutTaxRegistrationOutput {
             status: Some(status),

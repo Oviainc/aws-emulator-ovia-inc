@@ -230,13 +230,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One platform device hosts at most one gateway, so a create naming a device
-        // some gateway already runs on collides with THAT gateway.
-        if let Some(existing) = store
-            .gateway_devices
-            .get(&device)
-            .and_then(|id| store.gateways.get(id))
-        {
-            return Err(already_exists(existing));
+        // some gateway already runs on is refused. The collision is NOT this gateway's
+        // identity — the caller supplied no gateway id and the id a create would mint
+        // is free — but a request ATTRIBUTE already in use by another resource, so it is
+        // the terminal request error `InvalidRequestException` (400) naming the member
+        // the caller actually sent and its value, and not
+        // `ResourceAlreadyExistsException`, which this service uses when the resource
+        // the request would create is itself already there.
+        //
+        // The check is on `device` — the key the index is actually keyed by — and is
+        // never gated on whether the message can name the platform member: a
+        // platform whose dimension this service cannot name still occupies its
+        // device, and skipping the check for it would let this create OVERWRITE the
+        // index entry of the gateway that already holds that device.
+        if store.gateway_devices.contains_key(&device) {
+            let message =
+                match crate::state::gateway_device_dimension(&input.gateway_platform) {
+                    Some((member, value)) => format!(
+                        "The {member} {value} is already registered to another gateway."
+                    ),
+                    None => format!(
+                        "The device {device} that gatewayPlatform names is already \
+                         registered to another gateway."
+                    ),
+                };
+            return Err(invalid_request(message));
         }
 
         // `gatewayName` is "A unique name for the gateway", so a second gateway may
@@ -286,6 +304,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// HTTP 409 `ResourceAlreadyExistsException` naming the gateway the create collided
 /// with: its own stored id and the ARN it was minted with, never one rebuilt from
 /// this request's region.
+///
+/// Reserved for a collision on the gateway's own IDENTITY — the unique
+/// `gatewayName` a create claims. A collision on some OTHER attribute of the
+/// request (the platform device, say) is not this error: see the device check in
+/// the handler.
 fn already_exists(existing: &crate::state::GatewayRecord) -> CreateGatewayError {
     CreateGatewayError::Modeled(CreateGatewayErrorModeled::ResourceAlreadyExistsException(
         ResourceAlreadyExistsException {

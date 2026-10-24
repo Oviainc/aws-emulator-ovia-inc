@@ -51,6 +51,21 @@ pub const SCHEDULED_REPORT_ARN_SEGMENT: &str = ":scheduled-report/";
 /// normal use never meets it, while the store a caller can grow stays bounded.
 pub const MAX_DASHBOARDS: usize = 1_000;
 
+/// The most tags this emulator stores on ONE dashboard or scheduled report. A merge
+/// that would carry a resource past it is refused by `TagResource` with its modelled
+/// `ValidationException`, storing nothing.
+///
+/// The model states no per-resource tag quota for this service, so the ceiling is
+/// CHOSEN, not cited — and chosen to be exactly `ResourceTagList`'s own modelled maximum
+/// (length 0..200, `smithy_query(query="shape",shape="ResourceTagList")`): a resource
+/// holds at most as many tags as one request may carry. That is what bounds the store a
+/// caller can grow by repeating `TagResource` with fresh keys, and with it the linear
+/// scan a merge runs while the state lock is held. The create-time tag path needs no
+/// second check for the same reason: `CreateDashboard`'s and `CreateScheduledReport`'s
+/// `resourceTags` are that same 0..200 list, so the boundary validator already refuses a
+/// create that would enter the store above this ceiling.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
 /// How the TAGGING path words a `ResourceArn` that resolves to no stored resource.
 ///
 /// A constant, carrying nothing from the request — which is what the recorded

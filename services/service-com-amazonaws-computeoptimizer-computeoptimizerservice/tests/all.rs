@@ -15,6 +15,8 @@
 mod auto_scaling_group_recommendations;
 #[path = "all/ebs_volume_recommendations.rs"]
 mod ebs_volume_recommendations;
+#[path = "all/ecs_service_recommendations.rs"]
+mod ecs_service_recommendations;
 #[path = "all/enrollment_and_preferences.rs"]
 mod enrollment_and_preferences;
 #[path = "all/harness.rs"]

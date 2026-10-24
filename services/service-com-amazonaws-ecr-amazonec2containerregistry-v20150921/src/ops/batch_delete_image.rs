@@ -242,6 +242,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The repository's image set changed, and a manifest list's size is a statement
+        // about the images stored beside it, so what every remaining image reports is
+        // recomputed once the deletes are done.
+        repo.refresh_image_sizes();
+
         // Both members are reported, empty or not: the answer to a batch is the two
         // lists it partitions into.
         Ok(BatchDeleteImageOutput {

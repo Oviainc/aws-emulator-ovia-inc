@@ -91,6 +91,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
+        //
+        // NOTE for whoever fixes `codestar-connections`'s dispatch gap (the open issue
+        // `…-implemented-connection-operations-answer-501-notimplemented-instead-of.md`):
+        // this service's published awsJson1_0 target prefix is the Coral service name,
+        // dots and all (`com.amazonaws.codestar.connections.CodeStar_connections_20191201`),
+        // and the framework resolves an awsJson routing key as everything after the FIRST
+        // dot of `x-amz-target`, so an SDK's target resolves to a key no modeled
+        // operation is wired under and EVERY operation of this crate is refused here with
+        // the framework's unrouted 501 before its handler runs. The rule that fixes it —
+        // the operation is the segment after the target's LAST dot, the service the
+        // segment before it — is already stated once in `service_common::rpc_target`, and
+        // the CodeConnections crate's seam shows the two calls to make
+        // (`requested_operation` here, `target_operation_of` in `can_handle`). It is one
+        // service-wide change for all 27 operations, so it belongs to that issue rather
+        // than to any one operation's.
         let _ = req;
         None
     }

@@ -223,7 +223,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // through the same index `GetAssetPropertyValue` and
                 // `BatchPutAssetPropertyValue` resolve aliases with — and, for an
                 // alias no property carries, for the stream itself, which
-                // `DisassociateTimeSeriesFromAssetProperty` leaves standing.
+                // `DisassociateTimeSeriesFromAssetProperty` leaves standing and
+                // alias-addressed ingestion creates.
                 match store.property_alias_index.get(alias) {
                     Some((asset_id, property_id)) => {
                         Identified::Property(asset_id.clone(), property_id.clone())
@@ -295,9 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // The series is the property's own: its data type is the property's, its alias
-        // is whatever alias the property is bound to (none, for a property no alias
-        // names), and it has existed since the asset materialised the property.
+        // The series is the property's own: its data type is the property's, its
+        // alias is whatever alias the property is bound to (none, for a property no
+        // alias names), and it has existed since the asset materialised the property.
         let time_series_id = crate::state::time_series_id(&asset.id, &property.id);
         Ok(DescribeTimeSeriesOutput {
             asset_id: Some(asset.id.clone()),

@@ -154,6 +154,12 @@ impl Emulator {
             .await
     }
 
+    /// `ListWorkspaces`: POST /workspaces-list, with any page members
+    /// (`maxResults`, `nextToken`) carried in the body.
+    pub(crate) async fn list_workspaces(&self, request: Value) -> Resp {
+        self.call("POST", "/workspaces-list", Some(request)).await
+    }
+
     pub(crate) async fn execute_query(&self, body: Value) -> Resp {
         self.call("POST", "/queries/execution", Some(body)).await
     }

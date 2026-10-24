@@ -17,6 +17,8 @@ mod invoice_profiles;
 mod invoice_summaries;
 #[path = "all/invoice_unit_lifecycle.rs"]
 mod invoice_unit_lifecycle;
+#[path = "all/own_account_and_request_derived_refusals.rs"]
+mod own_account_and_request_derived_refusals;
 #[path = "all/procurement_portal_error_message_key.rs"]
 mod procurement_portal_error_message_key;
 #[path = "all/procurement_portal_preference_lifecycle.rs"]

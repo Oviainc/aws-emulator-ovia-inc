@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSinks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSinks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSinks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +101,79 @@ impl From<ListSinksErrorModeled> for ListSinksError {
     }
 }
 
+/// The largest page this operation will ever build, and the page size applied when
+/// the request omits `MaxResults`.
+///
+/// It is the maximum of the modelled `MaxResults` range (1..100, from
+/// `smithy_query(query="operation",operation="ListSinks")`), which the centralized
+/// walk already refuses values outside of — but this handler does not depend on
+/// that: the size is clamped to this constant here, so the page it allocates is
+/// decided by the server, never by the request.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The longest `NextToken` this operation will look at.
+///
+/// The member carries no modelled length, and the tokens this operation issues are a
+/// hex-encoded Region, separator and UUID (fewer than 210 characters), so this bound
+/// accepts every real token while keeping a caller from handing over an arbitrarily
+/// long one to decode.
+const MAX_PAGE_TOKEN_LEN: usize = 512;
+
+/// A page token naming the Region whose sinks are being enumerated and the sink the
+/// NEXT page starts at.
+///
+/// `NextToken` is modelled opaque, so the pair is hex-encoded rather than handed back
+/// in the clear — which makes the token opaque to a caller, not secret: hex is
+/// trivially reversible and the token carries nothing but a Region and an id this
+/// caller already reads off every sink ARN. Neither half can contain the separator:
+/// [`crate::state::request_region`] admits only alphanumerics and hyphens, and a sink
+/// id is a UUID.
+fn encode_page_token(region: &str, sink_id: &str) -> String {
+    hex::encode(format!("{region}:{sink_id}"))
+}
+
+/// The sink id a page token names, or the modelled 400 refusal when the token is not
+/// one this operation issued for `region`.
+///
+/// The token is a position to resume THIS Region's sorted enumeration at, not a handle
+/// on a live record: a token whose sink has since been deleted still resumes correctly
+/// (the enumeration continues from where that id sat). What it may not do is resume
+/// another Region's enumeration, so the Region the token was issued for must be the one
+/// being enumerated now. The refusal is this operation's modelled
+/// `InvalidParameterException` ("A parameter is specified incorrectly") with a FIXED,
+/// request-independent message, so nothing of the token leaks back out.
+fn decode_page_token(token: &str, region: &str) -> Result<String, ListSinksError> {
+    let refused = || {
+        ListSinksErrorModeled::InvalidParameterException(InvalidParameterException {
+            message: Some(
+                "NextToken is not a pagination token this ListSinks call can resume".to_string(),
+            ),
+            ..Default::default()
+        })
+        .into()
+    };
+    // `NextToken` carries no modelled length, so the token is bounded HERE, before
+    // anything is decoded from it.
+    if token.len() > MAX_PAGE_TOKEN_LEN {
+        return Err(refused());
+    }
+    let decoded = hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(refused)?;
+    let (token_region, sink_id) = decoded.split_once(':').ok_or_else(refused)?;
+    if token_region != region
+        || sink_id.is_empty()
+        || sink_id.len() > 64
+        || !sink_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(refused());
+    }
+    Ok(sink_id.to_string())
+}
+
 /// The `ListSinks` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -146,18 +210,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSinks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSinksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSinks"))
+        // `MaxResults`' 1..100 range is a modelled constraint, already refused by the
+        // centralized walk before this body runs. This operation is `@readonly`: it
+        // enumerates stored sinks and writes nothing.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSinksErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the sink store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        // "Use this operation in a monitoring account to return the list of sinks
+        // created in that account": every sink this emulator holds belongs to the one
+        // canonical emulator account, and a sink is created in — and its ARN names —
+        // the Region the request was signed for, so the enumeration is the sinks stored
+        // in THIS request's Region, as every other lookup in this service is.
+        let region = crate::state::request_region(ctx.parts());
+        // Decoded against the Region being enumerated, so a token can only resume the
+        // enumeration it was issued for.
+        let start = input
+            .next_token
+            .as_deref()
+            .map(|token| decode_page_token(token, &region))
+            .transpose()?;
+        // The page size is the server's own decision: clamped into 1..=MAX_PAGE_SIZE
+        // whatever the request asked for, so no allocation below is sized by input.
+        let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {
+            requested.clamp(1, MAX_PAGE_SIZE as i32) as usize
+        });
+
+        let store = state.lock();
+        // `sinks` is keyed by sink id, so this walks a stable total order and a page
+        // token can name the id the next page starts at. Only this Region's sinks: a
+        // regional endpoint sees its own Region's resources.
+        let remaining = match &start {
+            Some(id) => store.sinks.range(id.clone()..),
+            None => store.sinks.range::<String, _>(..),
+        }
+        .map(|(_id, sink)| sink)
+        .filter(|sink| sink.region == region);
+
+        let mut items = Vec::with_capacity(page_size.min(store.sinks.len()));
+        let mut next_token = None;
+        for sink in remaining {
+            // The first sink that does not fit becomes the next page's start, and only
+            // then is a `NextToken` emitted — the last page carries none.
+            if items.len() == page_size {
+                next_token = Some(encode_page_token(&region, &sink.id));
+                break;
+            }
+            // Every member is read off the sink's own stored record, so what this
+            // reports is what `CreateSink` stored and `GetSink` reads back.
+            items.push(ListSinksItem {
+                arn: Some(sink.arn.clone()),
+                id: Some(sink.id.clone()),
+                name: Some(sink.name.clone()),
+            });
+        }
+
+        // `Items` is `@required`, so a Region with no sink reports an empty list rather
+        // than omitting the member.
+        Ok(ListSinksOutput { items, next_token })
     }
 }
+

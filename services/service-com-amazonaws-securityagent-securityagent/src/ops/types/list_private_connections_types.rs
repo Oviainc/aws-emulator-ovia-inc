@@ -18,14 +18,44 @@ pub struct ListPrivateConnectionsInput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#ListPrivateConnectionsOutput")]
+/// `ListPrivateConnectionsOutput`, with its schema and serializer written out because
+/// its ELEMENT shape is: the derive's read path for the list member demands a
+/// `DeserializableStruct` on [`PrivateConnectionSummary`], which an output-only shape
+/// has no caller for (see `super::wire_shape`). The wire form of this shape is
+/// otherwise exactly the model's.
 #[derive(Debug, Clone, Default)]
 pub struct ListPrivateConnectionsOutput {
     pub private_connections: Vec<PrivateConnectionSummary>,
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#PrivateConnectionSummary")]
+sa_schema_and_codec!(
+    ListPrivateConnectionsOutput,
+    LIST_PRIVATE_CONNECTIONS_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#ListPrivateConnectionsOutput",
+    "com.amazonaws.securityagent",
+    "ListPrivateConnectionsOutput",
+    modelled: [
+        (
+            M_PRIVATE_CONNECTIONS,
+            private_connections,
+            "privateConnections",
+            0,
+            req,
+            list_of_struct(PrivateConnectionSummary)
+        ),
+        (M_NEXT_TOKEN, next_token, "nextToken", 1, opt, string),
+    ],
+    recorded: [],
+);
+
+/// `PrivateConnectionSummary`, with its schema and serializer written out instead of
+/// derived: `certificateExpiryTime` carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="PrivateConnectionSummary",
+/// model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+/// which the derive drops, so it would go onto the wire as an epoch-second number where
+/// the model requires an RFC 3339 string. Same reason, same machinery as the other
+/// `date-time`-bearing shapes of this service — see `super::wire_shape`.
 #[derive(Debug, Clone, Default)]
 pub struct PrivateConnectionSummary {
     pub name: String,
@@ -40,4 +70,40 @@ pub struct PrivateConnectionSummary {
     pub failure_message: Option<String>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+sa_schema_and_codec!(
+    PrivateConnectionSummary,
+    PRIVATE_CONNECTION_SUMMARY_SCHEMA,
+    "com.amazonaws.securityagent#PrivateConnectionSummary",
+    "com.amazonaws.securityagent",
+    "PrivateConnectionSummary",
+    modelled: [
+        (M_NAME, name, "name", 0, req, string),
+        (M_TYPE, r#type, "type", 1, req, string),
+        (M_STATUS, status, "status", 2, req, string),
+        (M_RESOURCE_GATEWAY_ID, resource_gateway_id, "resourceGatewayId", 3, opt, string),
+        (M_HOST_ADDRESS, host_address, "hostAddress", 4, opt, string),
+        (M_VPC_ID, vpc_id, "vpcId", 5, opt, string),
+        (
+            M_RESOURCE_CONFIGURATION_ID,
+            resource_configuration_id,
+            "resourceConfigurationId",
+            6,
+            opt,
+            string
+        ),
+        (
+            M_CERTIFICATE_EXPIRY_TIME,
+            certificate_expiry_time,
+            "certificateExpiryTime",
+            7,
+            opt,
+            date_time
+        ),
+        (M_DNS_RESOLUTION, dns_resolution, "dnsResolution", 8, opt, string),
+        (M_FAILURE_MESSAGE, failure_message, "failureMessage", 9, opt, string),
+        (M_TAGS, tags, "tags", 10, opt, map_of_string),
+    ],
+    recorded: [],
+);
 

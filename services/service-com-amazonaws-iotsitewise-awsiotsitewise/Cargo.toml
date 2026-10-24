@@ -25,6 +25,9 @@ tracing = { workspace = true }
 # same recipe the other services in this workspace use.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The SQL parser for `ExecuteQuery`: the IoT SiteWise query language is SQL, so its
+# statements are parsed by a real parser rather than matched on as text.
+sqlparser = "0.59"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

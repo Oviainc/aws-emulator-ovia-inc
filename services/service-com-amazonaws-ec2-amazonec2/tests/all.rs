@@ -47,6 +47,8 @@ mod create_security_group;
 mod dedicated_hosts;
 #[path = "all/default_network.rs"]
 mod default_network;
+#[path = "all/delete_security_group.rs"]
+mod delete_security_group;
 #[path = "all/delete_vpc.rs"]
 mod delete_vpc;
 #[path = "all/describe_images.rs"]

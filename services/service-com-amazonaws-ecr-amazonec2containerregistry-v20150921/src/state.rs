@@ -80,10 +80,36 @@ pub const MAX_REPOSITORY_CREATION_TEMPLATES: usize = 1_000;
 /// pull time update exclusions, so this is the emulator's own bound.
 pub const MAX_PULL_TIME_UPDATE_EXCLUSIONS: usize = 1_000;
 
-/// The `ImageStatus` of an image in standard storage. Every image this emulator
-/// stores is in standard storage (moving one to archive is `UpdateImageStorageClass`,
-/// still a 501 stub), so every stored image reports `ACTIVE`.
+/// The `ImageStatus` of an image in Amazon ECR standard storage: what a push stores,
+/// and what an image restored out of archive is back in. Which status an image has is
+/// per-image state ([`ImageRecord::status`]) that `UpdateImageStorageClass` moves, so a
+/// read reports the stored one rather than this constant.
 pub const ACTIVE_IMAGE_STATUS: &str = "ACTIVE";
+
+/// The `ImageStatus` of an image whose storage class is Amazon ECR archive:
+/// `UpdateImageStorageClass` with `targetStorageClass` `ARCHIVE` is the only thing that
+/// puts an image in it, and it is the signal that a pull needs a restore first.
+pub const ARCHIVED_IMAGE_STATUS: &str = "ARCHIVED";
+
+/// The `ImageStatus` of an image being restored out of Amazon ECR archive: the status a
+/// `targetStorageClass` `STANDARD` transition puts it in until the restore the clock owes
+/// falls due ([`IMAGE_RESTORE_DELAY`]).
+pub const ACTIVATING_IMAGE_STATUS: &str = "ACTIVATING";
+
+/// How long after a restore is requested the `ACTIVATING` -> `ACTIVE` transition falls
+/// due.
+///
+/// Restoring an archived image is not instantaneous — the status enum carries
+/// `ACTIVATING` for exactly that reason — and AWS publishes no duration for it, so the
+/// span is this emulator's own: short enough that no workflow waits on it, and never
+/// zero, so a caller reading the image straight after the call still sees `ACTIVATING`.
+/// The instant the transition falls due is STORED ([`ImageRecord::activate_due_at`]) and
+/// materialised by whoever next looks at the image; nothing sleeps for it.
+pub const IMAGE_RESTORE_DELAY: Duration = Duration::from_millis(400);
+
+/// The `LifecyclePolicyStorageClass` of an archived image — the storage class that goes
+/// with [`ARCHIVED_IMAGE_STATUS`], as a lifecycle policy preview spells it.
+pub const ARCHIVE_STORAGE_CLASS: &str = "ARCHIVE";
 
 /// The `ScanFrequency` of a repository whose scan on push is switched on: a push is what
 /// triggers its scan.
@@ -144,10 +170,23 @@ pub const PREVIEW_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// completion due. See [`PREVIEW_STATUS_IN_PROGRESS`].
 pub const PREVIEW_STATUS_COMPLETE: &str = "COMPLETE";
 
-/// The `LifecyclePolicyStorageClass` every image this emulator stores is in: moving one
-/// to archive is `UpdateImageStorageClass`, still a 501 stub, so every previewed image
-/// reports standard storage.
+/// The `LifecyclePolicyStorageClass` of an image in standard storage — the storage class
+/// that goes with [`ACTIVE_IMAGE_STATUS`], as a lifecycle policy preview spells it.
 pub const STANDARD_STORAGE_CLASS: &str = "STANDARD";
+
+/// The `LifecyclePolicyStorageClass` of an image whose `ImageStatus` is `status`.
+///
+/// The two vocabularies describe one piece of state: an image is either in Amazon ECR
+/// standard storage (`ACTIVE`) or in Amazon ECR archive, which is what `storageClass`
+/// reports. An image being restored (`ACTIVATING`) is still in archive until the restore
+/// is due.
+pub fn storage_class_of_status(status: &str) -> &'static str {
+    if status == ACTIVE_IMAGE_STATUS {
+        STANDARD_STORAGE_CLASS
+    } else {
+        ARCHIVE_STORAGE_CLASS
+    }
+}
 
 /// The `ImageActionType` an `expire` rule applies — the modelled spelling (from
 /// `IMAGE_ACTION_TYPE_VALUES`) of what a policy document writes in lower case.
@@ -256,10 +295,10 @@ pub fn account_setting_spec(name: &str) -> Result<&'static AccountSettingSpec, F
 
 /// The `LayerAvailability` of a blob the repository holds and can serve.
 ///
-/// The third value the enum carries is not reachable from this store: `ARCHIVED`
-/// belongs to an image whose storage class is archive (`UpdateImageStorageClass`, still
-/// a 501 stub, is the only thing that archives one, so every stored image is
-/// [`ACTIVE_IMAGE_STATUS`]).
+/// The third value the enum carries is not reachable from this store: `ARCHIVED` is a
+/// statement about a LAYER's storage, and what this registry archives is an IMAGE
+/// (`UpdateImageStorageClass` moves an image's storage class; the repository's blob
+/// record, which is what availability is read from, is untouched by it).
 pub const AVAILABLE_LAYER_AVAILABILITY: &str = "AVAILABLE";
 
 /// The `LayerAvailability` of a layer the repository does not hold: the digest is a
@@ -318,6 +357,134 @@ pub struct LayerBlob {
     pub media_type: Option<String>,
 }
 
+/// How many levels of manifest list [`Repo::refresh_image_sizes`] resolves when it
+/// recomputes the size of every stored image.
+///
+/// A list entry may name another list, so a list's size can rest on a chain of them; the
+/// documents and the chain are both caller-supplied, so the resolution is bounded. Four
+/// is well past anything a registry client builds (an index over image manifests is one
+/// level).
+pub const MAX_MANIFEST_LIST_DEPTH: usize = 4;
+
+/// The most `manifests[*]` entries this service reads out of one manifest list.
+///
+/// A list's entries are caller-supplied and `imageManifest` is modelled
+/// `@length(1..4194304)`, so one document can name tens of thousands of children; this
+/// is the bound that, with [`MAX_MANIFEST_LIST_DEPTH`] and
+/// [`MAX_IMAGES_PER_REPOSITORY`], caps the work of recomputing image sizes. AWS
+/// publishes no limit on the entries of an index, and a real index carries one entry per
+/// platform (a handful), so a document naming more children than this states no size
+/// this service reports rather than being read in part.
+pub const MAX_MANIFEST_LIST_ENTRIES: usize = 100;
+
+/// The most blob descriptors this service reads out of ONE image manifest: its `layers`
+/// (or `fsLayers`) entries plus its `config` descriptor.
+///
+/// The same reasoning as [`MAX_MANIFEST_LIST_ENTRIES`], for the other arm of the same
+/// document: the descriptors are caller-supplied and `imageManifest` is modelled
+/// `@length(1..4194304)`, so one document can name tens of thousands of blobs, and
+/// reading them all would let a single `PutImage` body decide how much work this registry
+/// does. AWS publishes no limit on the layers of an image (the Docker and OCI formats put
+/// a real image at tens of layers), so a document naming more blobs than this states no
+/// size this service reports rather than being read in part.
+pub const MAX_MANIFEST_BLOB_ENTRIES: usize = 1_000;
+
+/// What content a stored manifest document references.
+///
+/// A registry manifest is one of two things: an image manifest, which references the blobs
+/// of one image, or a manifest list / OCI image index, which lists other manifests by
+/// digest. Anything else references nothing this registry can size.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ManifestContent {
+    /// An image manifest: the DISTINCT blobs it references — its layers and its image
+    /// configuration — each carrying the size its descriptor states (`None` for a
+    /// descriptor that states no usable size, which the repository's own record of the
+    /// blob then supplies).
+    Blobs(Vec<LayerBlob>),
+    /// A manifest list or OCI image index: the distinct digests of the manifests it
+    /// references.
+    List(BTreeSet<String>),
+    /// A document that references neither blobs nor manifests.
+    #[default]
+    Opaque,
+}
+
+/// Read a manifest document for the content it references.
+///
+/// An image manifest carries OCI content descriptors — a `mediaType`, a `digest` and a
+/// `size` — under `config` (the image configuration blob) and `layers` (the filesystem
+/// layers), and a V2 schema 1 manifest lists its layers as `fsLayers[].blobSum`; a
+/// manifest list or index carries `manifests` instead, which are other images rather than
+/// this one's content. What a manifest references is therefore exactly what
+/// [`manifest_blobs`] reads, DEDUPLICATED by digest: one blob a manifest names twice (as
+/// its configuration and as its only layer, which is what the recorded probe images do)
+/// is one blob in the repository, and is counted once.
+///
+/// A descriptor's `size` is the byte count of the blob it points at, so a value that is
+/// absent, not an integer, or below zero states no size at all: the document is
+/// caller-supplied, and nothing it says may be read as a byte count it did not give. The
+/// digest is kept beside it, because what the manifest does not state about a blob the
+/// repository's own record of that blob does (see [`Repo::refresh_image_sizes`]).
+///
+/// A list's digests are collected as a SET, so naming one child a thousand times costs
+/// what naming it once costs, and a document naming more than
+/// [`MAX_MANIFEST_LIST_ENTRIES`] children is [`ManifestContent::Opaque`] rather than
+/// read in part.
+pub fn manifest_content(manifest: &str) -> ManifestContent {
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(manifest) else {
+        return ManifestContent::Opaque;
+    };
+    if let Some(manifests) = document.get("manifests").and_then(|m| m.as_array()) {
+        if manifests.len() > MAX_MANIFEST_LIST_ENTRIES {
+            return ManifestContent::Opaque;
+        }
+        return ManifestContent::List(
+            manifests
+                .iter()
+                .filter_map(|descriptor| descriptor.get("digest"))
+                .filter_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .collect(),
+        );
+    }
+    // A document that names none of the three arrays is not a manifest of anything: it
+    // references no blob, which is different from an image manifest whose `layers` array
+    // is empty (that one references no layer content, and says so).
+    let declares_content = ["config", "layers", "fsLayers"]
+        .iter()
+        .any(|member| document.get(member).is_some());
+    if !declares_content {
+        return ManifestContent::Opaque;
+    }
+    let mut blobs = manifest_blobs(manifest);
+    if blobs.len() > MAX_MANIFEST_BLOB_ENTRIES {
+        return ManifestContent::Opaque;
+    }
+    // De-duplicated through a SET of the digests already kept, so one document naming a
+    // blob many times costs its length rather than its length squared.
+    let mut kept: BTreeSet<String> = BTreeSet::new();
+    blobs.retain(|blob| kept.insert(blob.digest.clone()));
+    ManifestContent::Blobs(blobs)
+}
+
+/// The `artifactMediaType` of an image, read out of its manifest.
+///
+/// "The artifact media type of the image" is the media type of the artifact the manifest
+/// describes, which a manifest states in its `config` descriptor: the Docker image
+/// manifest V2 schema 2 and the OCI image manifest both carry `config.mediaType`, and
+/// for a container image that is the image-configuration type. A manifest that carries
+/// no config descriptor (a manifest list, a V2 schema 1 manifest, a document that is not
+/// a manifest) describes no artifact type, and the member is then absent rather than
+/// invented.
+pub fn manifest_artifact_media_type(manifest: &str) -> Option<String> {
+    let document: serde_json::Value = serde_json::from_str(manifest).ok()?;
+    document
+        .get("config")?
+        .get("mediaType")?
+        .as_str()
+        .map(ToString::to_string)
+}
+
 /// One stored image: the manifest as pushed, its digest, and every tag pointing at it.
 #[derive(Debug, Clone)]
 pub struct ImageRecord {
@@ -326,11 +493,59 @@ pub struct ImageRecord {
     pub manifest: String,
     pub manifest_media_type: Option<String>,
     pub artifact_media_type: Option<String>,
-    pub size_in_bytes: i64,
+    /// What [`Self::manifest`] references, read ONCE when the image was stored (see
+    /// [`manifest_content`]): the layer sizes of an image manifest, or the digests a
+    /// manifest list names. Sizing an image never re-parses a manifest document.
+    pub references: ManifestContent,
+    /// `imageSizeInBytes`: the size of the IMAGE in the repository, derived from
+    /// [`Self::references`] and, for a manifest list, from the images stored beside it.
+    /// Maintained by [`Repo::refresh_image_sizes`] whenever the repository's image set
+    /// changes, so a read projects it in constant time; `None` when nothing stored states
+    /// a size for this image.
+    pub size_in_bytes: Option<i64>,
     pub pushed_at: SystemTime,
+    /// This image's `ImageStatus`: [`ACTIVE_IMAGE_STATUS`] while it is in Amazon ECR
+    /// standard storage and [`ARCHIVED_IMAGE_STATUS`] once `UpdateImageStorageClass` has
+    /// moved it to Amazon ECR archive. Per image, so archiving one image in a repository
+    /// leaves its neighbours where they are.
+    pub status: String,
+    /// `lastArchivedAt`: when this image was last transitioned to Amazon ECR archive, or
+    /// `None` while it never has been.
+    pub last_archived_at: Option<SystemTime>,
+    /// `lastActivatedAt`: when this image was last restored from Amazon ECR archive to
+    /// Amazon ECR standard, or `None` while it never has been. A push does not set it —
+    /// an image that was never archived was never restored either.
+    pub last_activated_at: Option<SystemTime>,
+    /// When the `ACTIVATING` -> `ACTIVE` transition a restore started falls due, or `None`
+    /// when no restore is in flight. See [`IMAGE_RESTORE_DELAY`].
+    pub activate_due_at: Option<SystemTime>,
 }
 
 impl ImageRecord {
+    /// A freshly pushed image: in standard storage, never archived, and sized by
+    /// [`Repo::refresh_image_sizes`] once it is in the repository.
+    pub fn pushed(
+        digest: String,
+        manifest: String,
+        manifest_media_type: Option<String>,
+        pushed_at: SystemTime,
+    ) -> Self {
+        Self {
+            digest,
+            tags: BTreeSet::new(),
+            artifact_media_type: manifest_artifact_media_type(&manifest),
+            references: manifest_content(&manifest),
+            manifest,
+            manifest_media_type,
+            size_in_bytes: None,
+            pushed_at,
+            status: ACTIVE_IMAGE_STATUS.to_string(),
+            last_archived_at: None,
+            last_activated_at: None,
+            activate_due_at: None,
+        }
+    }
+
     /// The `ImageDetail` `DescribeImages` reports for this image.
     pub fn to_detail(&self, registry_id: &str, repository_name: &str) -> ImageDetail {
         ImageDetail {
@@ -343,12 +558,74 @@ impl ImageRecord {
             } else {
                 Some(self.tags.iter().cloned().collect())
             },
-            image_size_in_bytes: Some(self.size_in_bytes),
+            image_size_in_bytes: self.size_in_bytes,
             image_pushed_at: Some(::aws_smithy_types::DateTime::from(self.pushed_at)),
             image_manifest_media_type: self.manifest_media_type.clone(),
             artifact_media_type: self.artifact_media_type.clone(),
-            image_status: Some(ACTIVE_IMAGE_STATUS.to_string()),
+            image_status: Some(self.status.clone()),
+            last_archived_at: self.last_archived_at.map(::aws_smithy_types::DateTime::from),
+            last_activated_at: self
+                .last_activated_at
+                .map(::aws_smithy_types::DateTime::from),
             ..ImageDetail::default()
+        }
+    }
+
+    /// The byte length of the stored manifest document — `imageManifestSize`, the size of
+    /// the manifest a read returns, as distinct from [`Self::size_in_bytes`], the size of
+    /// the image content that manifest references.
+    pub fn manifest_size(&self) -> i64 {
+        // `imageManifest` is modelled `@length(1..4194304)`, far inside `i64`.
+        i64::try_from(self.manifest.len()).unwrap_or(i64::MAX)
+    }
+
+    /// Whether this image's storage class is Amazon ECR archive — including while a
+    /// restore of it is in flight, which is a transition out of archive that has not
+    /// completed.
+    pub fn is_archived(&self) -> bool {
+        self.status != ACTIVE_IMAGE_STATUS
+    }
+
+    /// Whether a restore of this image is in flight.
+    pub fn is_activating(&self) -> bool {
+        self.status == ACTIVATING_IMAGE_STATUS
+    }
+
+    /// Transition this image to Amazon ECR archive at `now`, recording the instant of the
+    /// transition as its `lastArchivedAt`. A restore in flight is abandoned: the image is
+    /// in archive again, so there is no activation left to fall due.
+    pub fn archive(&mut self, now: SystemTime) {
+        self.status = ARCHIVED_IMAGE_STATUS.to_string();
+        self.last_archived_at = Some(now);
+        self.activate_due_at = None;
+    }
+
+    /// Start restoring this image from Amazon ECR archive to Amazon ECR standard at
+    /// `now`.
+    ///
+    /// The image enters `ACTIVATING` and the completion the clock owes falls due
+    /// [`IMAGE_RESTORE_DELAY`] later ([`Self::settle_storage_class`] materialises it).
+    /// `lastActivatedAt` is the instant the image was restored, which is what a caller
+    /// reading it while it activates sees.
+    pub fn activate(&mut self, now: SystemTime) {
+        self.status = ACTIVATING_IMAGE_STATUS.to_string();
+        self.last_activated_at = Some(now);
+        self.activate_due_at = Some(now + IMAGE_RESTORE_DELAY);
+    }
+
+    /// Materialise the `ACTIVATING` -> `ACTIVE` transition the clock has already made due
+    /// at `now`.
+    ///
+    /// The transition is owed by the clock, not by a call: it falls due whether or not
+    /// anybody asks, so every operation that looks at an image writes down what was
+    /// already due before reporting it.
+    pub fn settle_storage_class(&mut self, now: SystemTime) {
+        let Some(due) = self.activate_due_at else {
+            return;
+        };
+        if due <= now {
+            self.status = ACTIVE_IMAGE_STATUS.to_string();
+            self.activate_due_at = None;
         }
     }
 
@@ -674,6 +951,10 @@ pub struct PreviewedImage {
     pub applied_rule_priority: i32,
     pub action_type: String,
     pub target_storage_class: Option<String>,
+    /// `storageClass`: "the storage class of the image" as it stood when the preview was
+    /// started, read from the image's own storage class rather than assumed (see
+    /// [`storage_class_of_status`]).
+    pub storage_class: String,
 }
 
 impl PreviewedImage {
@@ -694,7 +975,7 @@ impl PreviewedImage {
                 target_storage_class: self.target_storage_class.clone(),
             }),
             applied_rule_priority: Some(self.applied_rule_priority),
-            storage_class: Some(STANDARD_STORAGE_CLASS.to_string()),
+            storage_class: Some(self.storage_class.clone()),
         }
     }
 }
@@ -1197,6 +1478,7 @@ pub fn evaluate_lifecycle_policy(
                     applied_rule_priority: rule.priority,
                     action_type: rule.action_type.clone(),
                     target_storage_class: rule.target_storage_class.clone(),
+                    storage_class: storage_class_of_status(&image.status).to_string(),
                 },
             );
         }
@@ -1452,12 +1734,108 @@ impl Repo {
     /// blob ([`manifest_blobs`]), and so names no missing one.
     pub fn missing_layers(&self, manifest: &str) -> Vec<String> {
         let mut missing: Vec<String> = Vec::new();
+        // The digests already named, as a SET: a document naming one blob many times
+        // costs its length rather than its length squared.
+        let mut named: BTreeSet<String> = BTreeSet::new();
         for blob in manifest_blobs(manifest) {
-            if !self.layer_blobs.contains_key(&blob.digest) && !missing.contains(&blob.digest) {
+            if !self.layer_blobs.contains_key(&blob.digest) && named.insert(blob.digest.clone()) {
                 missing.push(blob.digest);
             }
         }
         missing
+    }
+
+    /// Materialise every image's clock-owed storage-class transition at `now` (see
+    /// [`ImageRecord::settle_storage_class`]), so a read reports what was already due
+    /// before it looked.
+    pub fn settle_image_storage_classes(&mut self, now: SystemTime) {
+        for image in self.images.values_mut() {
+            image.settle_storage_class(now);
+        }
+    }
+
+    /// Recompute the `imageSizeInBytes` every image in this repository reports.
+    ///
+    /// `ImageDetail$imageSizeInBytes` is "the size, in bytes, of the image in the
+    /// repository": the total of the sizes of the DISTINCT blobs the image's manifest
+    /// references — its filesystem layers and its image configuration — which is the
+    /// content this repository stores for that image, never the size of the manifest
+    /// document itself. A blob a manifest names twice counts once. "If the image is a
+    /// manifest list, this will be the max size of all manifests in the list", so a list
+    /// reports the largest of the images it references, each child's size being its own
+    /// blob total.
+    ///
+    /// A list's size is a statement about other images in the repository, so it is
+    /// recomputed whenever the image set changes — a push or a delete — rather than
+    /// frozen when the list itself arrived, and every read then projects
+    /// [`ImageRecord::size_in_bytes`] in constant time. The recomputation reads no
+    /// manifest document (each one was parsed once, into [`ImageRecord::references`]) and
+    /// its work is the product of three documented bounds:
+    /// [`MAX_IMAGES_PER_REPOSITORY`] entries, each resolving at most
+    /// [`MAX_MANIFEST_LIST_ENTRIES`] children (or [`MAX_MANIFEST_BLOB_ENTRIES`] blobs),
+    /// over at most [`MAX_MANIFEST_LIST_DEPTH`] levels of nesting.
+    ///
+    /// A size is `None` for an image nothing stored states one for: the member is neither
+    /// required nor defaulted, so an unknown size is absent rather than zero. That covers
+    /// a document that references no blob and no manifest at all, a blob whose size
+    /// neither its descriptor nor this repository's record of it states, a total no `long`
+    /// can represent — the addends are caller-supplied, so they are added with checked
+    /// arithmetic and never wrapped — and a list none of whose children the repository
+    /// holds. An image manifest with an EMPTY `layers` array and no configuration blob is
+    /// a statement, not a gap: it references no content, so its total is `0`.
+    ///
+    /// What a blob's size is read from: the size its descriptor declares, else the byte
+    /// count this repository recorded when the layer upload was completed
+    /// ([`Self::layer_blobs`]) — a manifest form that states no size (a V2 schema 1
+    /// `fsLayers` entry, a descriptor without `size`) still references content the
+    /// registry has counted.
+    pub fn refresh_image_sizes(&mut self) {
+        // An image manifest's total rests on its own descriptors and on the blobs this
+        // repository holds for them.
+        let mut sizes: BTreeMap<String, Option<i64>> = self
+            .images
+            .iter()
+            .map(|(digest, image)| {
+                let own = match &image.references {
+                    ManifestContent::Blobs(blobs) => blobs.iter().try_fold(0i64, |total, blob| {
+                        let size = blob.size.or_else(|| {
+                            self.layer_blobs.get(&blob.digest).and_then(|held| held.size)
+                        })?;
+                        total.checked_add(size)
+                    }),
+                    ManifestContent::List(_) | ManifestContent::Opaque => None,
+                };
+                (digest.clone(), own)
+            })
+            .collect();
+
+        // A manifest list is the max over the images it names, so a list of lists settles
+        // one level per pass; a pass that changes nothing has settled.
+        for _ in 0..MAX_MANIFEST_LIST_DEPTH {
+            let mut settled = true;
+            let mut next = sizes.clone();
+            for (digest, image) in &self.images {
+                if let ManifestContent::List(children) = &image.references {
+                    let resolved = children
+                        .iter()
+                        .filter_map(|child| sizes.get(child).copied().flatten())
+                        .max();
+                    if next.insert(digest.clone(), resolved) != Some(resolved) {
+                        settled = false;
+                    }
+                }
+            }
+            sizes = next;
+            if settled {
+                break;
+            }
+        }
+
+        for (digest, size) in sizes {
+            if let Some(image) = self.images.get_mut(&digest) {
+                image.size_in_bytes = size;
+            }
+        }
     }
 
     /// Apply `incoming` to this repository's metadata tags: a key the repository already
@@ -2122,11 +2500,12 @@ pub fn repository_not_found_message(name: &str) -> String {
 /// The wording ECR uses for an upload id this registry cannot resolve against the
 /// repository the request named — the state `UploadNotFoundException` documents: "the
 /// upload could not be found, or the specified upload ID is not valid for this
-/// repository". One wording for every operation that addresses an upload.
+/// repository". One wording for every operation that addresses an upload, naming the
+/// three things the request gave: the upload id, the repository and the registry.
 pub fn upload_not_found_message(upload_id: &str, repository_name: &str) -> String {
     format!(
-        "Upload not found with ID: '{upload_id}' for repository '{repository_name}' in \
-         the registry with id '{}'",
+        "The upload with id '{upload_id}' in the repository with name \
+         '{repository_name}' in registry with id '{}' does not exist",
         registry_id()
     )
 }

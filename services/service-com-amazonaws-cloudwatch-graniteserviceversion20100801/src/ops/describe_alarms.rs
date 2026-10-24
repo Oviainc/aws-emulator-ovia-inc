@@ -200,9 +200,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MaxRecords` is modelled `range 1..100`, so 100 is the most a caller can ask for
         // and the only default that cannot exceed what the model permits.
         const MAX_RECORDS_CAP: i32 = 100;
-        // "If you omit this parameter, only metric alarms are returned, even if composite
-        // alarms or log alarms exist in the account." (DescribeAlarmsInput$AlarmTypes)
-        const DEFAULT_ALARM_TYPE: &str = "MetricAlarm";
 
         let names: &[String] = input.alarm_names.as_deref().unwrap_or_default();
         if !names.is_empty() && input.alarm_name_prefix.is_some() {
@@ -223,6 +220,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?),
         };
+
+        // One page size for every path below, so paging behaves the same whichever filter
+        // was used.
+        let limit = usize::try_from(
+            input
+                .max_records
+                .unwrap_or(MAX_RECORDS_CAP)
+                .clamp(1, MAX_RECORDS_CAP),
+        )
+        .unwrap_or(1);
+
+        let now = crate::state::now_secs();
+        let mut store = state.lock();
+        // A composite alarm's state is its `AlarmRule` evaluated over the alarms the rule
+        // references, and each evaluation is due a span after the write that configured it.
+        // Materialising what the clock has already made due before reporting is what keeps
+        // this read's answer the same for every later caller.
+        store.evaluate_composite_alarms(now);
 
         // "If you specify ChildrenOfAlarmName, you cannot specify any other parameters in
         // the request except for MaxRecords and NextToken" — likewise ParentsOfAlarmName.
@@ -251,72 +266,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
             // Both members describe composite-alarm relationships, which are carried by a
-            // composite alarm's `AlarmRule`. No composite alarm can exist yet
-            // (`PutCompositeAlarm` is still scaffolded), so no alarm is a child or a parent.
+            // composite alarm's `AlarmRule`: its children are the alarms the rule
+            // references, and an alarm's parents are the composite alarms whose rule
+            // references it.
+            let of_children = input.children_of_alarm_name.is_some();
+            let mut related = match input.children_of_alarm_name.as_deref() {
+                Some(alarm_name) => store.composite_alarm_children(alarm_name),
+                None => store.composite_alarm_parents(
+                    input.parents_of_alarm_name.as_deref().unwrap_or_default(),
+                ),
+            };
+            // The alarm NAME is the identity and therefore the paging order and the cursor
+            // on this path too.
+            related.sort();
+            let from = match start_at.as_deref() {
+                None => 0,
+                Some(cursor) => related.partition_point(|name| name.as_str() < cursor),
+            };
+            let page = related.get(from..).unwrap_or_default();
+            let next_token = page
+                .get(limit)
+                .map(|name| crate::state::encode_page_token(name));
+            let mut metric_alarms: Vec<MetricAlarm> = Vec::new();
+            let mut composite_alarms: Vec<CompositeAlarm> = Vec::new();
+            for name in page.iter().take(limit) {
+                // "Only the Alarm Name, ARN, StateValue (OK/ALARM/INSUFFICIENT_DATA), and
+                // StateUpdatedTimestamp information are returned by this operation when you
+                // use [ChildrenOfAlarmName]"; for `ParentsOfAlarmName`, "Only the Alarm Name
+                // and ARN are returned". A member this path does not report is absent, not
+                // defaulted, so a caller cannot read a stale value out of it.
+                if let Some(stored) = store.alarms.get(name) {
+                    metric_alarms.push(MetricAlarm {
+                        alarm_name: stored.alarm.alarm_name.clone(),
+                        alarm_arn: stored.alarm.alarm_arn.clone(),
+                        state_value: of_children
+                            .then(|| stored.alarm.state_value.clone())
+                            .flatten(),
+                        state_updated_timestamp: of_children
+                            .then_some(stored.alarm.state_updated_timestamp)
+                            .flatten(),
+                        ..MetricAlarm::default()
+                    });
+                } else if let Some(stored) = store.composite_alarms.get(name) {
+                    composite_alarms.push(CompositeAlarm {
+                        alarm_name: stored.alarm.alarm_name.clone(),
+                        alarm_arn: stored.alarm.alarm_arn.clone(),
+                        state_value: of_children
+                            .then(|| stored.alarm.state_value.clone())
+                            .flatten(),
+                        state_updated_timestamp: of_children
+                            .then_some(stored.alarm.state_updated_timestamp)
+                            .flatten(),
+                        ..CompositeAlarm::default()
+                    });
+                }
+            }
             return Ok(DescribeAlarmsOutput {
-                composite_alarms: Some(Vec::new()),
-                metric_alarms: Some(Vec::new()),
+                composite_alarms: Some(composite_alarms),
+                metric_alarms: Some(metric_alarms),
+                // No log alarm can exist yet: `PutLogAlarm` is still scaffolded, so nothing
+                // has created one.
                 log_alarms: Some(Vec::new()),
-                next_token: None,
+                next_token,
             });
         }
 
-        let wants_metric_alarms = input
-            .alarm_types
-            .as_deref()
-            .is_none_or(|types| types.iter().any(|kind| kind == DEFAULT_ALARM_TYPE));
-
-        let store = state.lock();
-        let mut matching: Vec<(&String, &crate::state::StoredAlarm)> = if wants_metric_alarms {
-            store
-                .alarms
-                .iter()
-                .filter(|(name, stored)| {
-                    let alarm = &stored.alarm;
-                    let name = name.as_str();
-                    if !names.is_empty() && !names.iter().any(|wanted| wanted == name) {
-                        return false;
-                    }
-                    if input
-                        .alarm_name_prefix
-                        .as_deref()
-                        .is_some_and(|prefix| !name.starts_with(prefix))
-                    {
-                        return false;
-                    }
-                    if input
-                        .state_value
-                        .as_deref()
-                        .is_some_and(|wanted| alarm.state_value.as_deref() != Some(wanted))
-                    {
-                        return false;
-                    }
-                    if let Some(prefix) = input.action_prefix.as_deref() {
-                        // "only those alarms that use a certain alarm action"
-                        // (DescribeAlarmsInput$ActionPrefix)
-                        let uses = [
-                            &alarm.ok_actions,
-                            &alarm.alarm_actions,
-                            &alarm.insufficient_data_actions,
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .any(|action| action.starts_with(prefix));
-                        if !uses {
-                            return false;
-                        }
-                    }
-                    true
-                })
-                .collect()
-        } else {
-            Vec::new()
+        // "If you omit this parameter, only metric alarms are returned, even if composite
+        // alarms or log alarms exist in the account." (DescribeAlarmsInput$AlarmTypes)
+        let wanted_types: Option<&[String]> = match input.alarm_types.as_deref() {
+            Some(types) if !types.is_empty() => Some(types),
+            _ => None,
         };
-        // The store KEY is the alarm's identity (`PutMetricAlarm` writes an alarm under its
-        // own name and the name is `length 1..255`, so the key is never empty), so it is
-        // both the stable paging order and the cursor: a token names the alarm the next page
-        // starts at and therefore always advances.
+        let wants = |kind: &str| {
+            wanted_types.map_or(kind == crate::state::ALARM_TYPE_METRIC, |types| {
+                types.iter().any(|wanted| wanted == kind)
+            })
+        };
+
+        let mut matching: Vec<(&String, Reported<'_>)> = Vec::new();
+        if wants(crate::state::ALARM_TYPE_METRIC) {
+            matching.extend(
+                store
+                    .alarms
+                    .iter()
+                    .map(|(name, stored)| (name, Reported::Metric(&stored.alarm))),
+            );
+        }
+        if wants(crate::state::ALARM_TYPE_COMPOSITE) {
+            matching.extend(
+                store
+                    .composite_alarms
+                    .iter()
+                    .map(|(name, stored)| (name, Reported::Composite(&stored.alarm))),
+            );
+        }
+        matching.retain(|(name, alarm)| {
+            let name = name.as_str();
+            if !names.is_empty() && !names.iter().any(|wanted| wanted == name) {
+                return false;
+            }
+            if input
+                .alarm_name_prefix
+                .as_deref()
+                .is_some_and(|prefix| !name.starts_with(prefix))
+            {
+                return false;
+            }
+            if input
+                .state_value
+                .as_deref()
+                .is_some_and(|wanted| alarm.state_value() != Some(wanted))
+            {
+                return false;
+            }
+            if input
+                .action_prefix
+                .as_deref()
+                .is_some_and(|prefix| !alarm.uses_action(prefix))
+            {
+                return false;
+            }
+            true
+        });
+        // The store KEY is the alarm's identity (a writer stores an alarm under its own name
+        // and the name is `length 1..255`, so the key is never empty), so it is both the
+        // stable paging order and the cursor: a token names the alarm the next page starts
+        // at and therefore always advances. One order over BOTH kinds, so a page carrying
+        // metric and composite alarms still advances exactly once.
         matching.sort_by(|left, right| left.0.cmp(right.0));
 
         let from = match start_at.as_deref() {
@@ -324,30 +400,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(cursor) => matching.partition_point(|(name, _)| name.as_str() < cursor),
         };
         let page = matching.get(from..).unwrap_or_default();
-
-        let limit = usize::try_from(
-            input
-                .max_records
-                .unwrap_or(MAX_RECORDS_CAP)
-                .clamp(1, MAX_RECORDS_CAP),
-        )
-        .unwrap_or(1);
         let next_token = page
             .get(limit)
             .map(|(name, _)| crate::state::encode_page_token(name));
 
+        let mut metric_alarms: Vec<MetricAlarm> = Vec::new();
+        let mut composite_alarms: Vec<CompositeAlarm> = Vec::new();
+        for (_, alarm) in page.iter().take(limit) {
+            match alarm {
+                Reported::Metric(alarm) => metric_alarms.push((*alarm).clone()),
+                Reported::Composite(alarm) => composite_alarms.push((*alarm).clone()),
+            }
+        }
+
         Ok(DescribeAlarmsOutput {
-            // No composite or log alarm can exist yet: `PutCompositeAlarm` and
-            // `PutLogAlarm` are still scaffolded, so nothing has created one.
-            composite_alarms: Some(Vec::new()),
-            metric_alarms: Some(
-                page.iter()
-                    .take(limit)
-                    .map(|(_, stored)| stored.alarm.clone())
-                    .collect(),
-            ),
+            composite_alarms: Some(composite_alarms),
+            metric_alarms: Some(metric_alarms),
+            // No log alarm can exist yet: `PutLogAlarm` is still scaffolded, so nothing has
+            // created one.
             log_alarms: Some(Vec::new()),
             next_token,
         })
+    }
+}
+
+/// One alarm this operation may report, whichever store holds it.
+///
+/// `AlarmNames`, `AlarmNamePrefix`, `StateValue` and `ActionPrefix` are filters on an alarm,
+/// not on a kind of alarm, so they are applied through this one view and cannot drift
+/// between the metric-alarm and composite-alarm lists.
+enum Reported<'a> {
+    /// A metric alarm, reported under `MetricAlarms`.
+    Metric(&'a MetricAlarm),
+    /// A composite alarm, reported under `CompositeAlarms`.
+    Composite(&'a CompositeAlarm),
+}
+
+impl Reported<'_> {
+    /// The alarm's current state value.
+    fn state_value(&self) -> Option<&str> {
+        match self {
+            Self::Metric(alarm) => alarm.state_value.as_deref(),
+            Self::Composite(alarm) => alarm.state_value.as_deref(),
+        }
+    }
+
+    /// Whether any of the alarm's three action lists carries an action starting with
+    /// `prefix`: "only those alarms that use a certain alarm action"
+    /// (`DescribeAlarmsInput$ActionPrefix`).
+    fn uses_action(&self, prefix: &str) -> bool {
+        let lists = match self {
+            Self::Metric(alarm) => [
+                &alarm.ok_actions,
+                &alarm.alarm_actions,
+                &alarm.insufficient_data_actions,
+            ],
+            Self::Composite(alarm) => [
+                &alarm.ok_actions,
+                &alarm.alarm_actions,
+                &alarm.insufficient_data_actions,
+            ],
+        };
+        lists
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|action| action.starts_with(prefix))
     }
 }

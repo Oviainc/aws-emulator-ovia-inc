@@ -137,9 +137,10 @@ pub(crate) use alarm_template_groups::alarm_template_group_output;
 pub mod alarm_templates;
 
 pub use alarm_templates::{
-    AlarmTemplateRefusal, CloudWatchAlarmTemplateRecord, NewCloudWatchAlarmTemplate,
-    MAX_ALARM_PERIOD_SECONDS, MAX_ALARM_TEMPLATES, MAX_ALARM_TEMPLATE_TOKENS, MAX_METRIC_NAME_LEN,
-    MIN_ALARM_DATAPOINTS, MIN_ALARM_PERIOD_SECONDS,
+    AlarmTemplateRefusal, AlarmTemplateUpdateRefusal, CloudWatchAlarmTemplateChanges,
+    CloudWatchAlarmTemplateRecord, NewCloudWatchAlarmTemplate, MAX_ALARM_PERIOD_SECONDS,
+    MAX_ALARM_TEMPLATES, MAX_ALARM_TEMPLATE_TOKENS, MAX_METRIC_NAME_LEN, MIN_ALARM_DATAPOINTS,
+    MIN_ALARM_PERIOD_SECONDS,
 };
 
 pub(crate) use alarm_templates::alarm_template_output;

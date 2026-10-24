@@ -480,6 +480,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_secs();
         let mut store = state.lock();
 
+        // An alarm name names ONE alarm whatever kind it is ("This name must be unique within
+        // the Region." — `PutCompositeAlarmInput$AlarmName`), so this writer refuses a name a
+        // composite alarm already holds, exactly as `PutCompositeAlarm` refuses one a metric
+        // alarm holds. Without both halves the store could hold two alarms under one name.
+        if store.composite_alarms.contains_key(&input.alarm_name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "a composite alarm named {} already exists in this Region",
+                input.alarm_name
+            )));
+        }
+
         // "When this operation creates an alarm, the alarm state is immediately set to
         // INSUFFICIENT_DATA. For PromQL alarms, the alarm state is instead immediately set
         // to OK." … "When you update an existing alarm, its state is left unchanged, but

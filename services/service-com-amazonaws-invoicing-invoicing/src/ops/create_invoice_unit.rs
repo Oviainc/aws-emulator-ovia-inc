@@ -219,11 +219,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that EXIST: the model documents `Name` as changeable only by deleting the unit
         // and recreating it, so a deleted unit's name is free again.
         //
-        // The message states the service's own template over the requested `Name`, which
-        // is where the name a caller or operator reads out of the refusal comes from.
+        // The message states the service's own TEMPLATE over the requested `Name`: the
+        // name is enclosed in angle brackets, which is what makes the offending name
+        // recoverable from the refusal even when it contains the spaces `Name`'s
+        // `@pattern` permits internally.
         if store.live_invoice_units().any(|unit| unit.name == input.name) {
             return Err(CreateInvoiceUnitErrorModeled::ValidationException(ValidationException {
-                message: Some(format!("Invoice Unit already exists with name: {}", input.name)),
+                message: Some(format!(
+                    "Invoice Unit already exists with name: <{}>",
+                    input.name
+                )),
                 reason: Some("duplicateInvoiceUnit".to_string()),
                 ..Default::default()
             })

@@ -29,6 +29,12 @@
 //! written the documented way grants the action it names and not another), so the rule is
 //! not asserted for a single action id.
 //!
+//! The gate decides about the actions the run CARRIES OUT, which is what the experiment
+//! options select: the last case below starts one under-privileged template twice, under
+//! `actionsMode` `run-all` and `skip-all`, and starts a second one whose action names a
+//! target that resolved to nothing under `emptyTargetResolutionMode: skip` — an action a
+//! run leaves out cannot be refused a privilege, because nothing ran it.
+//!
 //! # What the gate this suite drives does, and what it cannot do
 //!
 //! Recorded here because it is what the last case below pins, and because it is the whole
@@ -934,5 +940,213 @@ async fn settled_state(router: &MultiServiceRouter, experiment_id: &str, denied:
         if !denied || reported == "failed" || began.elapsed() >= FAILURE_BUDGET {
             return state;
         }
+    }
+}
+
+/// RULE (the complement the experiment options make): the gate decides only about the
+/// actions the run CARRIES OUT, so an action the options leave out of the run earns no
+/// failure attributed to it — the experiment is not failed for a privilege the role lacks
+/// for an action nothing ran, and it reports that action as `skipped` instead.
+///
+/// The rows are the two ways an option leaves an action out, against ONE role that carries
+/// no permission at all: `actionsMode: skip-all` (the same template as the row that fails,
+/// started under the other mode, so the option is the only difference) and
+/// `emptyTargetResolutionMode: skip` on an action whose target resolved to no resources.
+#[tokio::test]
+async fn an_action_the_experiment_options_skip_earns_no_privilege_failure() {
+    /// How long a row waits for a run that completes: the compressed floor plus the
+    /// transitions around it and slack for a loaded machine.
+    const COMPLETION_BUDGET: Duration = Duration::from_secs(20);
+
+    let router = emulator();
+
+    // One role, created through the real `CreateRole`, carrying NO identity policy: the
+    // account's own records therefore show it may not perform `cloudwatch:DescribeAlarms`,
+    // which is the permission `aws:cloudwatch:assert-alarm-state` needs.
+    let (status, created) = iam(
+        &router,
+        "CreateRole",
+        &[
+            ("RoleName", "fis-permissions-skipped"),
+            ("AssumeRolePolicyDocument", fis_trust().as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "expected CreateRole to persist the role, got {status}: {created}"
+    );
+    let role_arn = element(&created, "Arn");
+
+    let action = json!({
+        "actionId": "aws:cloudwatch:assert-alarm-state",
+        "parameters": { "alarmArns": ALARM_ARN, "alarmStates": "INSUFFICIENT_DATA" }
+    });
+    // Two templates: one plain, and one whose action names a target identified by TAG —
+    // which this emulator resolves to nothing — under the mode that skips such an action.
+    let mut tagged_action = action.clone();
+    tagged_action["targets"] = json!({ "Alarms": "tagged" });
+    let templates = [
+        (
+            "plain",
+            json!({
+                "clientToken": "skipped-permission-template-plain",
+                "description": "an under-privileged action, carried out or skipped",
+                "roleArn": role_arn,
+                "stopConditions": [{ "source": "none" }],
+                "actions": { "underTest": action }
+            }),
+        ),
+        (
+            "empty-target-skip",
+            json!({
+                "clientToken": "skipped-permission-template-empty",
+                "description": "an under-privileged action whose target resolves to nothing",
+                "roleArn": role_arn,
+                "stopConditions": [{ "source": "none" }],
+                "experimentOptions": { "emptyTargetResolutionMode": "skip" },
+                "targets": {
+                    "tagged": {
+                        "resourceType": "aws:ec2:instance",
+                        "resourceTags": { "Stage": "test" },
+                        "selectionMode": "ALL"
+                    }
+                },
+                "actions": { "underTest": tagged_action }
+            }),
+        ),
+    ];
+    let mut template_ids = std::collections::BTreeMap::new();
+    for (label, body) in templates {
+        let (status, template) = fis(&router, "POST", "/experimentTemplates", Some(body)).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected the template to be created, got {status}: {template}"
+        );
+        template_ids.insert(
+            label,
+            template["experimentTemplate"]["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+
+    // (case, template, the actionsMode the start names, whether the run must fail on
+    // privileges, whether the action must report `skipped`)
+    let rows: [(&str, &str, Option<&str>, bool, bool); 3] = [
+        ("run-all carries the action out", "plain", Some("run-all"), true, false),
+        ("skip-all carries it out not at all", "plain", Some("skip-all"), false, true),
+        (
+            "an empty target under skip leaves it out",
+            "empty-target-skip",
+            None,
+            false,
+            true,
+        ),
+    ];
+
+    for (index, (case, template, actions_mode, must_fail, must_skip)) in rows.iter().enumerate() {
+        let (case, template, actions_mode, must_fail, must_skip) =
+            (*case, *template, *actions_mode, *must_fail, *must_skip);
+        let mut body = json!({
+            "clientToken": format!("skipped-permission-start-{index}"),
+            "experimentTemplateId": template_ids[template]
+        });
+        if let Some(mode) = actions_mode {
+            body["experimentOptions"] = json!({ "actionsMode": mode });
+        }
+        let (status, started) = fis(&router, "POST", "/experiments", Some(body)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the start to be accepted, got {status}: {started}"
+        );
+        let experiment_id = started["experiment"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            started["experiment"]["actions"]["underTest"]["state"]["status"].as_str(),
+            must_skip.then_some("skipped"),
+            "case {case:?}: expected the action's state at the start to say whether the run \
+             carries it out, got {started}"
+        );
+
+        let experiment = poll_terminal(&router, &experiment_id, COMPLETION_BUDGET).await;
+        let state = experiment["state"].clone();
+        let reason = state["reason"].as_str().unwrap_or_default().to_string();
+        if must_fail {
+            assert_eq!(
+                state["status"].as_str(),
+                Some("failed"),
+                "case {case:?}: expected the run that carries the action out to fail on \
+                 privileges, got {experiment}"
+            );
+            assert!(
+                reason.to_lowercase().contains(PRIVILEGES_ATTRIBUTION),
+                "case {case:?}: expected the privileges attribution, got {reason:?}"
+            );
+            assert_eq!(
+                state["error"]["location"].as_str(),
+                Some("actions.underTest"),
+                "case {case:?}: expected the error to locate the action, got {state}"
+            );
+        } else {
+            assert_eq!(
+                state["status"].as_str(),
+                Some("completed"),
+                "case {case:?}: expected a run that carried the action out not at all to \
+                 complete, got {experiment}"
+            );
+            assert!(
+                !reason.to_lowercase().contains(PRIVILEGES_ATTRIBUTION),
+                "case {case:?}: no privilege can be lacked for an action nothing ran, \
+                 got {reason:?}"
+            );
+            assert!(
+                state["error"].is_null(),
+                "case {case:?}: a run that completed reports no error, got {state}"
+            );
+        }
+        assert_eq!(
+            experiment["actions"]["underTest"]["state"]["status"].as_str(),
+            must_skip.then_some("skipped"),
+            "case {case:?}: expected the action's state to survive the run, got {experiment}"
+        );
+    }
+}
+
+/// The experiment once it has reached a terminal status, or as it was last read when
+/// `budget` ran out.
+async fn poll_terminal(
+    router: &MultiServiceRouter,
+    experiment_id: &str,
+    budget: Duration,
+) -> Value {
+    const INTERVAL: Duration = Duration::from_millis(100);
+    let began = std::time::Instant::now();
+    loop {
+        let (status, read) = fis(
+            router,
+            "GET",
+            &format!("/experiments/{experiment_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "expected GetExperiment to answer for {experiment_id}, got {status}: {read}"
+        );
+        let experiment = read["experiment"].clone();
+        let reported = experiment["state"]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if ["completed", "failed", "stopped", "cancelled"].contains(&reported.as_str())
+            || began.elapsed() >= budget
+        {
+            return experiment;
+        }
+        tokio::time::sleep(INTERVAL).await;
     }
 }

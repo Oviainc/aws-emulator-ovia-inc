@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutCompositeAlarm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutCompositeAlarm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutCompositeAlarm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates a composite alarm. Implemented here — this is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,6 +151,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest number of alarms one composite alarm's rule may reference: "The rule
+/// expression of a composite alarm can include as many as 100 underlying alarms."
+/// (`PutCompositeAlarm` documentation)
+const MAX_RULE_ALARMS: usize = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -188,10 +186,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutCompositeAlarmOutput 
 // here — hence the `PutCompositeAlarmError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#PutCompositeAlarm")]
+//
+// `InternalServiceFault` is widened in: it is THIS service's own server fault (every
+// metric operation declares it), and it is the only honest answer when the shared store
+// cannot be reached. Reporting that as a 4xx would tell the caller to fix its request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#PutCompositeAlarm",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum PutCompositeAlarmErrorModeled {
     LimitExceededFault(LimitExceededFault),
+    InternalServiceFault(InternalServiceFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -245,18 +251,199 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutCompositeAlarm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutCompositeAlarmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutCompositeAlarm"))
+        // The rule is what this alarm's state is computed from, so a rule the service
+        // cannot read is refused before anything is written rather than stored as an alarm
+        // that could never be evaluated.
+        let rule = crate::state::parse_alarm_rule(&input.alarm_rule)
+            .map_err(|error| crate::scaffolded::Scaffolded::validation_error(error.message))?;
+        // "The rule expression of a composite alarm can include as many as 100 underlying
+        // alarms." (`PutCompositeAlarm`)
+        let children = crate::state::alarm_rule_child_names(&rule);
+        if children.len() > MAX_RULE_ALARMS {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "AlarmRule references {} alarms, which is more than the {MAX_RULE_ALARMS} a \
+                 composite alarm's rule can include",
+                children.len()
+            )));
+        }
+
+        // "WaitPeriod is required only when ActionsSuppressor is specified." / "ExtensionPeriod
+        // is required only when ActionsSuppressor is specified."
+        // (`PutCompositeAlarmInput$ActionsSuppressorWaitPeriod` /
+        // `$ActionsSuppressorExtensionPeriod`) — required, so a suppressor without them is a
+        // combination the service cannot act on.
+        if input.actions_suppressor.is_some() {
+            for (member, period) in [
+                (
+                    "ActionsSuppressorWaitPeriod",
+                    input.actions_suppressor_wait_period,
+                ),
+                (
+                    "ActionsSuppressorExtensionPeriod",
+                    input.actions_suppressor_extension_period,
+                ),
+            ] {
+                if period.is_none() {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                        "{member} is required when ActionsSuppressor is specified"
+                    )));
+                }
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutCompositeAlarmErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch alarm store is unavailable".into()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_secs();
+        let mut store = state.lock();
+
+        // "The name for the composite alarm. This name must be unique within the Region."
+        // (`PutCompositeAlarmInput$AlarmName`) — one name names ONE alarm, so a name a metric
+        // alarm already holds cannot also name a composite alarm.
+        if store.alarms.contains_key(&input.alarm_name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "a metric alarm named {} already exists in this Region",
+                input.alarm_name
+            )));
+        }
+
+        // "When you update an existing alarm, its state is left unchanged, but the update
+        // completely overwrites the previous configuration of the alarm." — the alarm this
+        // call replaces, when it replaces one: its state carries over (below) and its
+        // configuration is what the history document records as the configuration replaced.
+        let previous = store
+            .composite_alarms
+            .get(&input.alarm_name)
+            .map(|stored| stored.alarm.clone());
+        let is_update = previous.is_some();
+
+        // "The quota for alarms for this customer has already been reached." — CloudWatch's
+        // published quota is 5,000 alarms per Region per account, counted over every kind of
+        // alarm. Replacing an alarm that already exists adds none, so it is never refused.
+        if !is_update
+            && store.alarms.len() + store.composite_alarms.len() >= crate::state::MAX_ALARMS
+        {
+            return Err(PutCompositeAlarmErrorModeled::LimitExceededFault(
+                LimitExceededFault {
+                    message: Some(format!(
+                        "the quota of {} alarms has already been reached",
+                        crate::state::MAX_ALARMS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "When this operation creates an alarm, the alarm state is immediately set to
+        // INSUFFICIENT_DATA. The alarm is then evaluated and its state is set appropriately.
+        // … For a composite alarm, this initial time after creation is the only time that the
+        // alarm can be in INSUFFICIENT_DATA state."
+        let carried_state = previous.as_ref().map(|alarm| {
+            (
+                alarm.state_value.clone(),
+                alarm.state_reason.clone(),
+                alarm.state_reason_data.clone(),
+                alarm.state_updated_timestamp,
+                alarm.state_transitioned_timestamp,
+            )
+        });
+        let (state_value, state_reason, state_reason_data, state_updated, state_transitioned) =
+            carried_state.unwrap_or_else(|| {
+                (
+                    Some(crate::state::ALARM_STATE_INSUFFICIENT_DATA.to_string()),
+                    Some("Unchecked: initial alarm creation".to_string()),
+                    None,
+                    Some(crate::state::to_timestamp(now)),
+                    Some(crate::state::to_timestamp(now)),
+                )
+            });
+
+        let alarm = CompositeAlarm {
+            alarm_name: Some(input.alarm_name.clone()),
+            alarm_arn: Some(crate::state::alarm_arn(&region, &input.alarm_name)),
+            alarm_description: input.alarm_description.clone(),
+            alarm_rule: Some(input.alarm_rule.clone()),
+            alarm_configuration_updated_timestamp: Some(crate::state::to_timestamp(now)),
+            // "Indicates whether actions should be executed during any changes to the alarm
+            // state of the composite alarm. The default is TRUE."
+            // (`PutCompositeAlarmInput$ActionsEnabled`)
+            actions_enabled: Some(input.actions_enabled.unwrap_or(true)),
+            ok_actions: input.ok_actions.clone(),
+            alarm_actions: input.alarm_actions.clone(),
+            insufficient_data_actions: input.insufficient_data_actions.clone(),
+            state_value,
+            state_reason,
+            state_reason_data,
+            state_updated_timestamp: state_updated,
+            state_transitioned_timestamp: state_transitioned,
+            // Suppression is a fact about the suppressor alarm's CURRENT state, so it is
+            // computed by the evaluation below rather than taken from the request.
+            actions_suppressed_by: None,
+            actions_suppressed_reason: None,
+            actions_suppressor: input.actions_suppressor.clone(),
+            actions_suppressor_wait_period: input.actions_suppressor_wait_period,
+            actions_suppressor_extension_period: input.actions_suppressor_extension_period,
+            action_configuration: input.action_configuration.clone(),
+        };
+
+        // "Data about the alarm, in JSON format." (`AlarmHistoryItem$HistoryData`) — the
+        // configuration this call stored, and the one it replaced when it replaced an alarm.
+        let history_data =
+            crate::state::composite_configuration_update_history_data(previous.as_ref(), &alarm);
+
+        // "If you are using this operation to update an existing alarm, any tags you specify
+        // in this parameter are ignored." (`PutCompositeAlarmInput$Tags`)
+        let tags = match &previous {
+            Some(_) => store
+                .composite_alarms
+                .get(&input.alarm_name)
+                .map(|stored| stored.tags.clone())
+                .unwrap_or_default(),
+            None => input.tags.clone().unwrap_or_default(),
+        };
+
+        store.composite_alarms.insert(
+            input.alarm_name.clone(),
+            crate::state::StoredCompositeAlarm {
+                alarm,
+                // Parsed ONCE, here: every later evaluation and relationship read walks this
+                // tree rather than parsing the rule text again.
+                rule,
+                tags,
+                // The evaluation this write owes is due a span after it, so the alarm a
+                // caller reads straight back still carries the state this write left.
+                evaluation_due_secs: now + crate::state::COMPOSITE_EVALUATION_DELAY_SECS,
+                // The stored state is this write's own, not one `SetAlarmState` forced.
+                forced_child_states: None,
+            },
+        );
+        store.record_history(
+            &input.alarm_name,
+            now,
+            AlarmHistoryItem {
+                alarm_name: Some(input.alarm_name.clone()),
+                alarm_contributor_id: None,
+                alarm_type: Some(crate::state::ALARM_TYPE_COMPOSITE.to_string()),
+                timestamp: Some(crate::state::to_timestamp(now)),
+                history_item_type: Some("ConfigurationUpdate".to_string()),
+                history_summary: Some(if is_update {
+                    "Alarm updated from configuration".to_string()
+                } else {
+                    "Alarm created".to_string()
+                }),
+                history_data: Some(history_data),
+                alarm_contributor_attributes: None,
+            },
+        );
+        // Evaluations other writes already made due are materialised here too, so the store
+        // this call leaves behind is as current as the clock makes it. The alarm this call
+        // wrote is not among them: its own evaluation is not due yet.
+        store.evaluate_composite_alarms(now);
+
+        Ok(PutCompositeAlarmOutput)
     }
 }

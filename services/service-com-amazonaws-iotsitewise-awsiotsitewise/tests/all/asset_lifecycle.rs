@@ -883,10 +883,22 @@ async fn batch_put_reports_one_error_entry_per_entry_it_cannot_resolve() {
             Some("ResourceNotFoundException"),
         ),
         (
-            "unknown alias",
+            // An alias no asset property carries is NOT a missing resource: IoT
+            // SiteWise accepts alias-addressed ingestion and implicitly creates the
+            // DISASSOCIATED time series the alias names (the `time_series_ingestion`
+            // suite covers what that series then reports).
+            "an alias nothing is bound to yet",
             json!({"entryId": "noalias", "propertyAlias": "/no/such/stream",
                    "propertyValues": [{"value": {"integerValue": 3}, "timestamp": timestamp}]}),
-            Some("ResourceNotFoundException"),
+            None,
+        ),
+        (
+            // The series a new alias creates takes its data type from the first value
+            // ingested, so a first value that names no type establishes nothing.
+            "a new alias whose first value names no type",
+            json!({"entryId": "notype", "propertyAlias": "/no/such/stream/untyped",
+                   "propertyValues": [{"value": {}, "timestamp": timestamp}]}),
+            Some("InvalidRequestException"),
         ),
         (
             "no identifier at all",

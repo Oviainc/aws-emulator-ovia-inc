@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/findings_reports_listing.rs"]
 mod findings_reports_listing;
+#[path = "all/notification_channels.rs"]
+mod notification_channels;
 #[path = "all/notification_configuration.rs"]
 mod notification_configuration;
 #[path = "all/permission_writes.rs"]

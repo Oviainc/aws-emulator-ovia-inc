@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateRegexPatternSetErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
-                    message: Some("the AWS WAF RegexPatternSet store is unavailable".to_string()),
+                    message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
                 },
             )
         })?;
@@ -184,11 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.regex_pattern_sets.len() >= crate::state::MAX_REGEX_PATTERN_SETS {
             return Err(CreateRegexPatternSetErrorModeled::WAFLimitsExceededException(
                 WAFLimitsExceededException {
-                    message: Some(format!(
-                        "The request would exceed the maximum number of RegexPatternSet \
-                         objects ({}) allowed for this account",
-                        crate::state::MAX_REGEX_PATTERN_SETS
-                    )),
+                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
                 },
             )
             .into());
@@ -201,11 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.consume_change_token(&input.change_token) {
             return Err(CreateRegexPatternSetErrorModeled::WAFStaleDataException(
                 WAFStaleDataException {
-                    message: Some(format!(
-                        "The change token {} is not a change token this request can use; \
-                         call GetChangeToken for a new one",
-                        input.change_token
-                    )),
+                    // This exception type's own fixed sentence: the token the caller
+                    // submitted is never reflected back into the error body.
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
                 },
             )
             .into());

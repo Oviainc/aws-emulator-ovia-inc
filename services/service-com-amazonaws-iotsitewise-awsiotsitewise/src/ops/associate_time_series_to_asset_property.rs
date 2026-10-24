@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateTimeSeriesToAssetProperty
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateTimeSeriesToAssetProperty`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateTimeSeriesToAssetProperty::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation binds the time series an alias names to an asset
+//! property in the shared engine store (`crate::state`), moving the samples the
+//! alias ingested onto that property's series; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -183,20 +177,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateTimeSeriesToAssetProperty` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateTimeSeriesToAssetPropertyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateTimeSeriesToAssetProperty"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateTimeSeriesToAssetPropertyError::Modeled(
+                AssociateTimeSeriesToAssetPropertyErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> outcome mapping, so a retry with the same token is judged on the
+        // state it finds, exactly like a first call.
+        let mut store = state.lock();
+
+        // Both ids are modelled `CustomID`: the raw UUID or the
+        // `externalId:<externalId>` form, resolved through the shared resolvers.
+        let asset_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET,
+                &input.asset_id,
+            ))
+        })?;
+        let property = store
+            .assets
+            .get(&asset_id)
+            .and_then(|asset| asset.property(&input.property_id))
+            .ok_or_else(|| {
+                not_found(format!(
+                    "The asset {} has no property {}.",
+                    input.asset_id, input.property_id
+                ))
+            })?;
+        let property_id = property.id.clone();
+        let property_data_type = property.data_type.clone();
+        let property_data_type_spec = property.data_type_spec.clone();
+        let property_alias = property.alias.clone();
+
+        // The time series the alias names has to exist: this operation binds an
+        // existing data stream to a property, it does not create one. A disassociated
+        // stream is created by ingesting against the alias, or left behind by
+        // `DisassociateTimeSeriesFromAssetProperty`.
+        let (series_data_type, series_data_type_spec) = match store
+            .disassociated_stream_type(&input.alias)
+        {
+            Some((data_type, data_type_spec)) => {
+                (data_type.to_string(), data_type_spec.map(ToString::to_string))
+            }
+            None => {
+                // An alias an asset property already carries names an ASSOCIATED
+                // stream: it has to be disassociated before it can be bound again,
+                // which is a terminal request error — unless it is already bound to
+                // the very property the request names, which is the state the caller
+                // asked for.
+                return match store.resolve_alias_series(&input.alias) {
+                    Some(crate::state::SeriesKey::Property(bound_asset, bound_property))
+                        if bound_asset == asset_id && bound_property == property_id =>
+                    {
+                        Ok(AssociateTimeSeriesToAssetPropertyOutput)
+                    }
+                    Some(crate::state::SeriesKey::Property(bound_asset, bound_property)) => {
+                        Err(invalid_request(format!(
+                            "The time series {} is already associated with the asset \
+                             property ({bound_asset}, {bound_property}). Disassociate it \
+                             first.",
+                            input.alias
+                        )))
+                    }
+                    _ => Err(not_found(format!(
+                        "The time series {} could not be found.",
+                        input.alias
+                    ))),
+                };
+            }
+        };
+
+        // One property carries one alias, so a property that already carries a
+        // different one cannot take this series.
+        if property_alias
+            .as_deref()
+            .is_some_and(|alias| alias != input.alias)
+        {
+            return Err(invalid_request(format!(
+                "The asset property {property_id} already carries the property alias {}. \
+                 Disassociate it first.",
+                property_alias.unwrap_or_default()
+            )));
+        }
+
+        // The stream holds readings of its own data type and the property holds
+        // readings of the property's, so binding one to the other is only meaningful
+        // when the two agree — and the stream's samples may only join a history that
+        // can hold them.
+        if series_data_type != property_data_type
+            || series_data_type_spec != property_data_type_spec
+        {
+            return Err(invalid_request(format!(
+                "The time series {} has data type {series_data_type}, but the asset \
+                 property {property_id} has data type {property_data_type}.",
+                input.alias
+            )));
+        }
+
+        // The binding, and with it the samples the stream holds: `set_property_alias`
+        // moves them onto the property's series, so the history the alias ingested and
+        // the history written through the pair are one history from here on.
+        store.set_property_alias(&asset_id, &property_id, Some(input.alias.clone()));
+
+        Ok(AssociateTimeSeriesToAssetPropertyOutput)
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> AssociateTimeSeriesToAssetPropertyError {
+    AssociateTimeSeriesToAssetPropertyError::Modeled(
+        AssociateTimeSeriesToAssetPropertyErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException { message },
+        ),
+    )
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> AssociateTimeSeriesToAssetPropertyError {
+    AssociateTimeSeriesToAssetPropertyError::Modeled(
+        AssociateTimeSeriesToAssetPropertyErrorModeled::InvalidRequestException(
+            InvalidRequestException { message },
+        ),
+    )
 }

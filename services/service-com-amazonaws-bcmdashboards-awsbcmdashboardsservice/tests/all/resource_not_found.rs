@@ -13,8 +13,8 @@
 //!
 //! The rows below are a TABLE spanning that class rather than the one recorded request:
 //! they differ in the OPERATION refused (a dashboard read, a dashboard update, a policy
-//! read, a scheduled-report read and both tagging operations — including one that would
-//! have written), in the RESOURCE TYPE the ARN names (`dashboard` and `scheduled-report`,
+//! read, a scheduled-report read and all three tagging operations — including the two that
+//! would have written), in the RESOURCE TYPE the ARN names (`dashboard` and `scheduled-report`,
 //! the two `ResourceArn` admits), in the ARN's FORM (partition, account id, the wildcard
 //! resource id the pattern admits, a one-character id, a 32-hex id of the form this
 //! emulator mints) and in the resource's HISTORY (never created, versus created and then
@@ -58,9 +58,8 @@ struct Reader {
 }
 
 /// Every operation of this service whose handler resolves an ARN against stored state.
-/// `TagResource` is absent because it is still a scaffold (HTTP 501); `DeleteDashboard`
-/// is absent because it models no not-found error at all and answers its modelled
-/// `ValidationException` instead (pinned by `dashboard_lifecycle`).
+/// `DeleteDashboard` is absent because it models no not-found error at all and answers
+/// its modelled `ValidationException` instead (pinned by `dashboard_lifecycle`).
 const READERS: &[Reader] = &[
     Reader {
         operation: "GetDashboard",
@@ -98,6 +97,12 @@ const READERS: &[Reader] = &[
         kinds: &["dashboard", "scheduled-report"],
         others: &[],
     },
+    Reader {
+        operation: "TagResource",
+        member: "resourceArn",
+        kinds: &["dashboard", "scheduled-report"],
+        others: &[],
+    },
 ];
 
 /// The request `reader` sends for `arn`.
@@ -107,10 +112,16 @@ fn request(reader: &Reader, arn: &str) -> Value {
     for (member, value) in reader.others {
         body.insert((*member).to_string(), Value::String((*value).to_string()));
     }
-    // `UntagResource`'s second required member is a list, so it is added here rather than
-    // in the string-valued `others` table.
+    // `UntagResource`'s and `TagResource`'s second required member is a list, so each is
+    // added here rather than in the string-valued `others` table.
     if reader.operation == "UntagResource" {
         body.insert("resourceTagKeys".to_string(), json!(["env"]));
+    }
+    if reader.operation == "TagResource" {
+        body.insert(
+            "resourceTags".to_string(),
+            json!([{"key": "env", "value": "prod"}]),
+        );
     }
     Value::Object(body)
 }
@@ -269,7 +280,7 @@ async fn an_unresolvable_arn_is_refused_with_400_and_the_requested_resource_id()
     assert_eq!(
         tags["resourceTags"],
         json!([{"key": "env", "value": "prod"}]),
-        "case the live dashboard: a refused UntagResource must remove no tag, got {tags}"
+        "case the live dashboard: a refused tagging write must change no tag, got {tags}"
     );
     let report = ok_call(
         &router,

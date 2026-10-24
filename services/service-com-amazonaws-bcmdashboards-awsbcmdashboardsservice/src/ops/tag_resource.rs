@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the tags the request carries into the tags stored on the resource a
+//! `ResourceArn` identifies: a key the resource already carries takes the request's
+//! value in place (keeping its position in the stored list), a key it does not carry
+//! is appended in request order, and every key the request does not name keeps its
+//! value. A key the request names twice settles on its LAST value, so one request is
+//! one well-defined merge. The merge is idempotent: tagging with the tags a resource
+//! already carries leaves it unchanged. An ARN that names no stored resource is
+//! refused with the service's not-found answer -- HTTP 400 with the error code
+//! `ResourceNotFoundException` and a `resourceId` member carrying the requested ARN,
+//! as `crate::scaffolded::Scaffolded::resource_not_found` renders it (the model's
+//! `@httpError` for that shape is 404, which is not what the recorded service
+//! answers).
+//!
+//! The stored tag list is bounded by [`crate::state::MAX_TAGS_PER_RESOURCE`]: the
+//! modelled `resourceTags` length bounds one REQUEST, not the list a merge grows, so a
+//! merge that would carry a resource past that ceiling is refused with this operation's
+//! modelled `ValidationException` and stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +154,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the dashboard store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The ARN is resolved against the stored resources first — both resource types
+        // `ResourceArn` admits — so tagging a resource that does not exist is refused
+        // instead of silently succeeding or storing tags no resource owns.
+        let Some(tags) = state.resource_tags_mut(&input.resource_arn) else {
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                &input.resource_arn,
+                "ResourceNotFoundException",
+            );
+            return Err(crate::scaffolded::Scaffolded::resource_not_found(
+                &input.resource_arn,
+                crate::state::TAGGING_RESOURCE_NOT_FOUND_MESSAGE,
+            ));
+        };
+
+        // Merge, keyed by tag key: a key the resource already carries is UPDATED where it
+        // already sits, so the order the tagging read reports stays stable across a
+        // re-tag, and a key it does not carry yet is APPENDED in the order the request
+        // listed it. Every key the request does not name is left alone. The entries are
+        // applied in request order, so a key the request repeats settles on its last
+        // value — the same answer as sending those entries as separate requests.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The merged list is computed beside the stored one and only then stored, so a
+        // merge that would carry the resource past the bound below is refused without
+        // having applied half of itself.
+        let mut merged = tags.clone();
+        for tag in input.resource_tags {
+            match merged.iter_mut().find(|stored| stored.key == tag.key) {
+                Some(stored) => stored.value = tag.value,
+                None => merged.push(tag),
+            }
+        }
+
+        // The modelled `resourceTags` length (0..200) bounds ONE REQUEST, not the stored
+        // list a merge grows: without this ceiling a caller could repeat `TagResource`
+        // with fresh keys and grow one resource's tags without limit. A merge past it is
+        // refused with this operation's modelled `ValidationException` and stores
+        // nothing.
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                &input.resource_arn,
+                "ValidationException",
+            );
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "The merged tag set would hold {} tags; a resource holds at most {}.",
+                    merged.len(),
+                    crate::state::MAX_TAGS_PER_RESOURCE
+                ),
+            })
+            .into());
+        }
+        *tags = merged;
+
+        // Record that this call changed state, for the audit stream.
+        crate::state::record_state_change(ctx, Self::NAME, &input.resource_arn, "SUCCESS");
+
+        Ok(TagResourceOutput {})
     }
 }

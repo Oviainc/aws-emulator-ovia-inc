@@ -55,6 +55,16 @@
 //!
 //! * `agentSpaces` (AgentSpaceList) — The list of agent spaces that were found.
 //! * `notFound` (AgentSpaceIdList) — The list of agent space identifiers that were not found.
+//!
+//! ## Recorded, not modelled
+//!
+//! Both lists above are always present, empty when nothing fell on that side of the
+//! partition, and each agent space carries `id`, `ownerId`, `arn` and the resolved
+//! `targetDomains` beside the modelled members. Beside the partition the recorded 200
+//! carries a second pair of lists, `agentInstances` and `ids`, which the service keeps
+//! in the response and does not fill. The wire form, and the evidence for it, live on
+//! `BatchGetAgentSpacesOutput` and `AgentSpace` in
+//! `src/ops/types/batch_get_agent_spaces_types.rs`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -152,17 +162,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             match state.agent_spaces.get(agent_space_id) {
-                // The stored record's own projection, never the request's text.
-                Some(record) => agent_spaces.push(record.modelled()),
+                // The stored record's own projection, never the request's text — the
+                // same one `CreateAgentSpace` answered, so the read reports the record
+                // member for member.
+                Some(record) => agent_spaces.push(record.modelled(&state.target_domains)),
                 // An unknown id is part of the answer, not a failure of the call: the
                 // operation models no error for it and reports it in `notFound`.
                 None => not_found.push(agent_space_id.clone()),
             }
         }
 
+        // Both lists always, even when empty: every requested id lands in exactly one of
+        // them, so a caller iterates both unconditionally (the fields are plain `Vec`s
+        // for that reason — see `BatchGetAgentSpacesOutput`).
         Ok(BatchGetAgentSpacesOutput {
-            agent_spaces: Some(agent_spaces),
-            not_found: Some(not_found),
+            agent_spaces,
+            not_found,
         })
     }
 }

@@ -459,17 +459,23 @@ async fn the_per_resource_tag_ceiling_is_reported_and_never_exceeded() {
             replaced.len()
         );
 
-        // One key past the ceiling: refused, and nothing stored.
+        // One key past the ceiling: refused, and nothing stored. The request itself
+        // is well-formed — it carries ONE tag, which violates no `@length` — so what
+        // it meets is the resource's accumulated-count QUOTA, and the refusal is the
+        // modelled `LimitExceededException` (410), the error a client catches to
+        // prune a tag and retry.
         let (status, body) = tag_resource(&router, &arn, json!({ "overflow": "x" })).await;
         assert_eq!(
             (status, error_code(&body)),
-            (400, "TooManyTagsException"),
+            (410, "LimitExceededException"),
             "case {case:?}: one key past the ceiling must be refused, got {status} {body}"
         );
-        assert_eq!(
-            body.get("resourceName").and_then(Value::as_str),
-            Some(arn.as_str()),
-            "case {case:?}: the refusal must name the resource it was about, got {body}"
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains(&MAX_TAGS_PER_RESOURCE.to_string()),
+            "case {case:?}: the refusal must state the ceiling it was about, got {body}"
         );
         let after = stored_tags(&router, &arn, case).await;
         assert_eq!(

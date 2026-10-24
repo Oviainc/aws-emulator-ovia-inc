@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTimeSeries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTimeSeries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTimeSeries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation lists, from the shared engine store (`crate::state`),
+//! every time series this service holds — the ones minted for a `propertyAlias` and
+//! the one each stored asset property owns — filtered by `assetId`, `aliasPrefix`
+//! and `timeSeriesType`; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTimeSeries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTimeSeriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTimeSeries"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTimeSeriesError::Modeled(ListTimeSeriesErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        // `workspaceName` scopes the listing to one SiteWise workspace. Workspaces are
+        // created by `CreateWorkspace`, which is still a scaffold stub here, so no
+        // workspace exists for a request to name and the one it names is absent — the
+        // same answer `DescribeTimeSeries` gives a workspace-scoped lookup.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            return Err(not_found(format!(
+                "The workspace {workspace} could not be found."
+            )));
+        }
+
+        // The label is either the raw UUID or the `externalId:<externalId>` alias form.
+        let asset_id = match input.asset_id.as_deref() {
+            Some(label) => Some(store.resolve_asset_id(label).ok_or_else(|| {
+                not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_ASSET,
+                    label,
+                ))
+            })?),
+            None => None,
+        };
+
+        // Every time series this store holds, from the two places one can come from:
+        // a DISASSOCIATED stream, which no asset property owns and which carries its
+        // own id and dates, and the series an asset property IS (derived from the
+        // stored property, the same derivation `DescribeTimeSeries` reports). The two
+        // sets are disjoint by construction — an alias names an associated stream or a
+        // disassociated one, never both — so no series is listed twice.
+        let mut summaries: Vec<TimeSeriesSummary> = store
+            .disassociated_time_series
+            .values()
+            .map(|series| disassociated_summary(series, &region))
+            .collect();
+        for asset in store.assets.values() {
+            for property in &asset.properties {
+                summaries.push(property_summary(asset, property, &region));
+            }
+        }
+
+        // The filters: an asset's own series only, aliases under one prefix, and the
+        // series type — "ASSOCIATED – The time series is associated with an asset
+        // property. DISASSOCIATED – The time series isn't associated with any asset
+        // property."
+        summaries.retain(|summary| {
+            asset_id
+                .as_deref()
+                .is_none_or(|id| summary.asset_id.as_deref() == Some(id))
+                && input.alias_prefix.as_deref().is_none_or(|prefix| {
+                    summary
+                        .alias
+                        .as_deref()
+                        .is_some_and(|alias| alias.starts_with(prefix))
+                })
+                && input.time_series_type.as_deref().is_none_or(|wanted| {
+                    let kind = if summary.asset_id.is_some() {
+                        crate::state::TIME_SERIES_TYPE_ASSOCIATED
+                    } else {
+                        crate::state::TIME_SERIES_TYPE_DISASSOCIATED
+                    };
+                    kind == wanted
+                })
+        });
+
+        // A stable order is what makes `nextToken` resumable: oldest first, ties broken
+        // by id so two series created in the same instant still order deterministically.
+        summaries.sort_by(|left, right| {
+            (
+                left.time_series_creation_date.secs(),
+                left.time_series_creation_date.subsec_nanos(),
+            )
+                .cmp(&(
+                    right.time_series_creation_date.secs(),
+                    right.time_series_creation_date.subsec_nanos(),
+                ))
+                .then_with(|| left.time_series_id.cmp(&right.time_series_id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the id of the first series of
+        // the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration is
+        // refused rather than answered with an empty page, which would report absence
+        // as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                summaries
+                    .iter()
+                    .position(|summary| summary.time_series_id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(summaries.len());
+        let next_token = summaries
+            .get(end)
+            .map(|summary| ::hex::encode(summary.time_series_id.as_bytes()));
+
+        Ok(ListTimeSeriesOutput {
+            time_series_summaries: summaries[start..end].to_vec(),
+            next_token,
+            // Reported only for a listing scoped to a workspace, which is refused above.
+            workspace_name: None,
+        })
     }
+}
+
+/// The page size AWS documents for this operation when the caller gives no
+/// `maxResults`: "Default: 50".
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// A stream no asset property owns, as a summary.
+///
+/// It reports no `assetId`/`propertyId` — that is exactly what makes it
+/// `DISASSOCIATED` in this listing — and the id, data type and dates the record
+/// holds, the same values `DescribeTimeSeries` answers for it.
+fn disassociated_summary(
+    series: &crate::state::DisassociatedTimeSeriesRecord,
+    region: &str,
+) -> TimeSeriesSummary {
+    TimeSeriesSummary {
+        asset_id: None,
+        property_id: None,
+        alias: Some(series.alias.clone()),
+        data_type: series.data_type.clone(),
+        data_type_spec: series.data_type_spec.clone(),
+        time_series_creation_date: crate::state::to_date_time(series.creation_date),
+        time_series_last_update_date: crate::state::to_date_time(series.last_update_date),
+        time_series_arn: crate::state::time_series_arn(region, &series.time_series_id),
+        time_series_id: series.time_series_id.clone(),
+    }
+}
+
+/// The series an asset property owns, as a summary: the same derivation
+/// `DescribeTimeSeries` reports for a pair, so the listing and the describe cannot
+/// disagree about one property's series.
+fn property_summary(
+    asset: &crate::state::AssetRecord,
+    property: &AssetProperty,
+    region: &str,
+) -> TimeSeriesSummary {
+    let time_series_id = crate::state::time_series_id(&asset.id, &property.id);
+    TimeSeriesSummary {
+        asset_id: Some(asset.id.clone()),
+        property_id: Some(property.id.clone()),
+        alias: property.alias.clone(),
+        data_type: property.data_type.clone(),
+        data_type_spec: property.data_type_spec.clone(),
+        time_series_creation_date: crate::state::to_date_time(asset.creation_date),
+        time_series_last_update_date: crate::state::to_date_time(asset.last_update_date),
+        time_series_arn: crate::state::time_series_arn(region, &time_series_id),
+        time_series_id,
+    }
+}
+
+/// Decode a `nextToken` back into the `timeSeriesId` it resumes from.
+fn decode_token(token: &str) -> Result<String, ListTimeSeriesError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListTimeSeriesError {
+    ListTimeSeriesError::Modeled(ListTimeSeriesErrorModeled::InvalidRequestException(
+        InvalidRequestException {
+            message: "The nextToken is not a token this operation issued.".to_string(),
+        },
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> ListTimeSeriesError {
+    ListTimeSeriesError::Modeled(ListTimeSeriesErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException { message },
+    ))
 }

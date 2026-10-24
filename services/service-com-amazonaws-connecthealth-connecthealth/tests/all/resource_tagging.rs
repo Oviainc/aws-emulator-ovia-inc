@@ -33,11 +33,10 @@
 //!   the SERVICE models, widened into this operation).
 //!
 //! The reader used for the round trip is `GetDomain`, whose `tags` member reports the
-//! stored set. A `Subscription`'s own tag reader is `ListTagsForResource`, still a
-//! scaffold stub under its own issue
-//! (`issues/things-that-do-not-work/20261023T115949Z-connecthealth-listtagsforresource-stub.md`),
-//! so a subscription ARN is asserted here through acceptance and through the isolation of
-//! its tag set from its domain's.
+//! stored set. `ListTagsForResource`, the reader that addresses either resource kind by
+//! ARN, has its own suite (`tests/all/list_tags_for_resource.rs`), which reuses the
+//! helpers below; a subscription ARN is asserted here through acceptance and through the
+//! isolation of its tag set from its domain's.
 
 use std::collections::BTreeMap;
 
@@ -52,7 +51,7 @@ use crate::domain_subscription_lifecycle::{error_code, string_at, tag_map, Emula
 /// The path `TagResource` is addressed at, with the ARN percent-encoded into the single
 /// non-greedy `{resourceArn}` label — the `:` and `/` of an ARN are exactly what an SDK
 /// encodes there.
-fn tags_path(arn: &str) -> String {
+pub(crate) fn tags_path(arn: &str) -> String {
     format!("/tags/{}", arn.replace(':', "%3A").replace('/', "%2F"))
 }
 
@@ -61,7 +60,7 @@ fn tags_path(arn: &str) -> String {
 ///
 /// The account is the 5th colon-separated field of every ARN
 /// (`arn:<partition>:<service>:<region>:<account>:<resource>`).
-fn under_another_account(arn: &str) -> String {
+pub(crate) fn under_another_account(arn: &str) -> String {
     let mut fields: Vec<&str> = arn.split(':').collect();
     fields[4] = "999999999999";
     fields.join(":")
@@ -71,7 +70,7 @@ fn under_another_account(arn: &str) -> String {
 ///
 /// A domain always reports a `tags` member, empty when it carries none, so an absent
 /// member is a failure rather than "no tags".
-async fn domain_tags(emulator: &Emulator, domain_id: &str) -> BTreeMap<String, String> {
+pub(crate) async fn domain_tags(emulator: &Emulator, domain_id: &str) -> BTreeMap<String, String> {
     let (status, body) = emulator
         .send("GET", &format!("/domain/{domain_id}"), None)
         .await;
@@ -98,7 +97,7 @@ async fn domain_tags(emulator: &Emulator, domain_id: &str) -> BTreeMap<String, S
 ///
 /// `tags` is the tag map itself; `resourceArn` is an `@httpLabel`, so the map is the one
 /// body member the request carries (`{"tags": {..}}`).
-async fn tag_resource(emulator: &Emulator, case: &str, arn: &str, tags: &Value) {
+pub(crate) async fn tag_resource(emulator: &Emulator, case: &str, arn: &str, tags: &Value) {
     let (status, body) = emulator
         .send("POST", &tags_path(arn), Some(&json!({ "tags": tags })))
         .await;
@@ -114,7 +113,7 @@ async fn tag_resource(emulator: &Emulator, case: &str, arn: &str, tags: &Value) 
 
 /// The entries of a JSON object as a map, for applying the merge rule independently of
 /// the emulator.
-fn entries(tags: &Value) -> Vec<(String, String)> {
+pub(crate) fn entries(tags: &Value) -> Vec<(String, String)> {
     tags.as_object()
         .unwrap_or_else(|| panic!("a tags map, got {tags}"))
         .iter()

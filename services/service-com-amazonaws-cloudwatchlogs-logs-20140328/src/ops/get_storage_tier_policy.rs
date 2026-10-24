@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStorageTierPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetStorageTierPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetStorageTierPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's storage tier policy: the `storageTier` the last
+//! `PutStorageTierPolicy` set and the instant it set it. The policy is the account's, so
+//! the request selects nothing; an account no put has touched yet is at the default tier
+//! (`STANDARD`) with no `lastUpdatedTime`, never a missing resource. A read reports only:
+//! it stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +141,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetStorageTierPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetStorageTierPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The input shape has no members and `ctx` carries only request metadata: the
+        // policy this call reports is the account's, so nothing about the request selects
+        // it.
+        let _ = (&input, ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetStorageTierPolicyError::from(
+                GetStorageTierPolicyErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        // "Returns the storage tier policy for the account." There is exactly one policy
+        // per account and nothing creates it, so an account no put has touched yet is at
+        // the default tier rather than a resource that does not exist: this operation
+        // never answers `ResourceNotFoundException`. `lastUpdatedTime` is the instant of
+        // the last put, so an account that was never put reports none.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetStorageTierPolicy"))
+        // A read reports; it stores nothing, so the default is not written back and the
+        // next put is still the first update.
+        Ok(match store.storage_tier_policy.as_ref() {
+            Some(policy) => GetStorageTierPolicyOutput {
+                storage_tier: Some(policy.storage_tier.clone()),
+                last_updated_time: Some(policy.last_updated_time_ms),
+            },
+            None => GetStorageTierPolicyOutput {
+                storage_tier: Some(crate::state::DEFAULT_STORAGE_TIER.to_string()),
+                last_updated_time: None,
+            },
+        })
     }
 }

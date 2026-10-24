@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutStorageTierPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutStorageTierPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutStorageTierPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the account's storage tier policy: the `storageTier` the request names becomes
+//! the account's tier, replacing whatever tier it was at, and `lastUpdatedTime` becomes
+//! the instant of this put. There is one policy per account, so the put names no
+//! resource, and every later `GetStorageTierPolicy` reports what it stored.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +148,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutStorageTierPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutStorageTierPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries only request metadata: the policy this call sets is the account's,
+        // so nothing about the request selects a resource to set it on.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutStorageTierPolicyError::from(
+                PutStorageTierPolicyErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `storageTier` is a modelled `@required` member of the `StorageTier` enum, so the
+        // boundary validator has already refused an absent member and a value outside
+        // `STORAGE_TIER_VALUES` with this operation's `InvalidParameterException`:
+        // reaching here means the tier is one the model declares.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutStorageTierPolicy"))
+        // "Sets the storage tier policy for the account": one policy per account, so a
+        // put replaces the tier the account was at, and "the time when the storage tier
+        // policy was last updated" is the instant of this put.
+        let record = crate::state::StorageTierPolicyRecord {
+            storage_tier: input.storage_tier,
+            last_updated_time_ms: crate::state::now_ms(),
+        };
+        // The output reports the policy as it now stands, built from the same record the
+        // store keeps, so the response and a later `GetStorageTierPolicy` cannot disagree.
+        let output = PutStorageTierPolicyOutput {
+            storage_tier: Some(record.storage_tier.clone()),
+            last_updated_time: Some(record.last_updated_time_ms),
+        };
+        store.storage_tier_policy = Some(record);
+
+        Ok(output)
     }
 }

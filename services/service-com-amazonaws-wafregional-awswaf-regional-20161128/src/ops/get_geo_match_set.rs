@@ -145,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetGeoMatchSetErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
-                message: Some("the AWS WAF GeoMatchSet store is unavailable".to_string()),
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
             })
         })?;
         // A read: it writes nothing, so what a later caller sees is unchanged.
@@ -157,10 +157,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetGeoMatchSetErrorModeled::WAFNonexistentItemException(
                     WAFNonexistentItemException {
-                        message: Some(format!(
-                            "GeoMatchSet {} does not exist",
-                            input.geo_match_set_id
-                        )),
+                        // This exception type's own fixed sentence: it says nothing about
+                        // the id that was asked for.
+                        message: Some(crate::state::MESSAGE_NONEXISTENT_ITEM.to_string()),
                     },
                 )
             })?;
