@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAdminScope
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAdminScope`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAdminScope::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the `AdminScope` an administrator account may manage, and that
+//! account's `OrganizationStatus` — the read side of `PutAdminAccount`, which
+//! is what persists the scope
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::organization_admins`]).
+//!
+//! Two kinds of administrator answer here, and the scope of each comes from
+//! where that scope is decided:
+//!
+//! * an administrator `PutAdminAccount` onboarded answers the scope STORED for
+//!   it, and the status the clock has reached on its onboarding
+//!   ([`crate::state::OrganizationAdminRecord::status_at`]);
+//! * the organization's DEFAULT administrator has no stored scope, because
+//!   being the default administrator IS its scope ("full administrative scope
+//!   that allows administration of all policy types, accounts, organizational
+//!   units, and Regions", `AssociateAdminAccount`): it answers the derived
+//!   [`crate::state::default_admin_scope`], and the `OrganizationStatus` that
+//!   follows from its role status
+//!   ([`crate::state::default_admin_organization_status`]).
+//!
+//! An account that is neither is no administrator resource to report, which is
+//! the modelled `ResourceNotFoundException`.
+//!
+//! A REPORTING operation: the only write it makes is the one the CLOCK already
+//! made due — the `ONBOARDING` → `ONBOARDING_COMPLETE` transition owed at this
+//! instant whether or not anybody called — so it reports that transition rather
+//! than causing it, and two reads in a row answer identically.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +181,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAdminScope` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAdminScopeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAdminScope"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAdminScopeErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The authorization gate, BEFORE the account is looked up, so a caller
+        // that is not entitled to an organization-scoped call cannot learn
+        // whether an account is an administrator.
+        let default_admin = crate::state::require_administrator(&store, &region)?.clone();
+
+        if input.admin_account == default_admin.account_id {
+            return Ok(GetAdminScopeOutput {
+                admin_scope: Some(crate::state::default_admin_scope()),
+                status: Some(
+                    crate::state::default_admin_organization_status(&default_admin.role_status)
+                        .to_string(),
+                ),
+            });
+        }
+
+        // Materialise the onboarding the clock has already completed, so the
+        // status reported here is the one that holds at this instant.
+        let Some(admin) = store.organization_admin_at(&input.admin_account, now) else {
+            return Err(GetAdminScopeErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        };
+        Ok(GetAdminScopeOutput {
+            admin_scope: Some(admin.admin_scope.clone()),
+            status: Some(admin.status_at(now).to_string()),
+        })
     }
 }

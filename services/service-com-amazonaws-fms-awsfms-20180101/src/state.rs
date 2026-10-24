@@ -13,8 +13,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AppsListData, DiscoveredResource, Policy, PolicySummary, ProtocolsListData,
-    ProtocolsListDataSummary, ResourceNotFoundException, ResourceSet, ResourceSetSummary, Tag,
+    AccountScope, AdminScope, AppsListData, DiscoveredResource, OrganizationalUnitScope, Policy,
+    PolicySummary, PolicyTypeScope, ProtocolsListData, ProtocolsListDataSummary, RegionScope,
+    ResourceNotFoundException, ResourceSet, ResourceSetSummary, Tag,
 };
 
 /// The Region an emulated service reports when the request carries no SigV4
@@ -85,10 +86,15 @@ impl AdminAccountRecord {
 /// usable. One of [`crate::ops::types::ACCOUNT_ROLE_STATUS_VALUES`].
 pub const ROLE_STATUS_READY: &str = "READY";
 
-/// `AccountRoleStatus` of an administrator account whose role deletion has been
-/// requested (by `DisassociateAdminAccount`) and has not completed yet. One of
-/// [`crate::ops::types::ACCOUNT_ROLE_STATUS_VALUES`].
+/// `AccountRoleStatus` of an administrator account whose role deletion has
+/// been requested (by `DisassociateAdminAccount`) and has not completed yet. One
+/// of [`crate::ops::types::ACCOUNT_ROLE_STATUS_VALUES`].
 pub const ROLE_STATUS_PENDING_DELETION: &str = "PENDING_DELETION";
+
+/// `AccountRoleStatus` of an administrator account whose role is being deleted:
+/// the other non-terminal status of a tear-down in flight. One of
+/// [`crate::ops::types::ACCOUNT_ROLE_STATUS_VALUES`].
+pub const ROLE_STATUS_DELETING: &str = "DELETING";
 
 /// `AccountRoleStatus` of an administrator account whose role deletion has
 /// completed: the account is no longer the default administrator. One of
@@ -106,6 +112,106 @@ pub const ROLE_STATUS_DELETED: &str = "DELETED";
 /// after asking for the disassociation still observes that transient status,
 /// and short enough that a caller that waits does not wait long.
 pub const DISASSOCIATION_SPAN: Duration = Duration::from_millis(500);
+
+/// `OrganizationStatus` of an administrator account the service is onboarding
+/// as a Firewall Manager administrator ("the account is onboarding to Firewall
+/// Manager as an administrator", `AdminAccountSummary$Status`). One of
+/// [`crate::ops::types::ORGANIZATION_STATUS_VALUES`].
+pub const ORGANIZATION_STATUS_ONBOARDING: &str = "ONBOARDING";
+
+/// `OrganizationStatus` of an administrator account that is onboarded and "can
+/// perform actions on the resources defined in their AdminScope"
+/// (`AdminAccountSummary$Status`). One of
+/// [`crate::ops::types::ORGANIZATION_STATUS_VALUES`].
+pub const ORGANIZATION_STATUS_ONBOARDING_COMPLETE: &str = "ONBOARDING_COMPLETE";
+
+/// `OrganizationStatus` of an administrator account that "is being removed as
+/// an Firewall Manager administrator" (`AdminAccountSummary$Status`). One of
+/// [`crate::ops::types::ORGANIZATION_STATUS_VALUES`].
+pub const ORGANIZATION_STATUS_OFFBOARDING: &str = "OFFBOARDING";
+
+/// `OrganizationStatus` of an administrator account that "has been removed as
+/// an Firewall Manager administrator" (`AdminAccountSummary$Status`). One of
+/// [`crate::ops::types::ORGANIZATION_STATUS_VALUES`].
+pub const ORGANIZATION_STATUS_OFFBOARDING_COMPLETE: &str = "OFFBOARDING_COMPLETE";
+
+/// How long an administrator account `PutAdminAccount` onboarded stays
+/// `ONBOARDING` before the clock makes `ONBOARDING_COMPLETE` due.
+///
+/// A CHOSEN span, not a documented one: Firewall Manager publishes no duration
+/// for onboarding an administrator, only the non-terminal `ONBOARDING` status
+/// its `AdminAccountSummary$Status` passes through on the way. It is
+/// deliberately NON-ZERO and inside the emulator's 250-750 ms band, so a caller
+/// that reads the administrator straight after the call still observes that
+/// transient status, and short enough that a caller that waits does not wait
+/// long. The due instant is STORED on the record
+/// ([`OrganizationAdminRecord::settles_at`]); nothing sleeps for it.
+pub const ADMIN_ONBOARDING_SPAN: Duration = Duration::from_millis(500);
+
+/// One Firewall Manager administrator account the organization's management
+/// account onboarded with `PutAdminAccount`, keyed in
+/// [`ComAmazonawsFmsAwsfms20180101State::organization_admins`] by its account
+/// id.
+///
+/// This is the administrator that HAS A SCOPE: `PutAdminAccount` "creates or
+/// updates an Firewall Manager administrator account" and configures "the
+/// resources that the specified Firewall Manager administrator can manage"
+/// (`PutAdminAccountRequest$AdminScope`), and `GetAdminScope` reports that
+/// scope back. The organization's ONE DEFAULT administrator is the separate
+/// [`AdminAccountRecord`] association `AssociateAdminAccount` makes: that one
+/// "has full administrative scope that allows administration of all policy
+/// types, accounts, organizational units, and Regions"
+/// (`AssociateAdminAccount`), so its scope follows from being the default
+/// administrator and is derived ([`default_admin_scope`]) rather than stored.
+///
+/// `settles_to` / `settles_at` carry the transition the CLOCK owes, exactly as
+/// [`ThirdPartyFirewallRecord`] does: an account being onboarded reaches
+/// `ONBOARDING_COMPLETE` [`ADMIN_ONBOARDING_SPAN`] after the call that started
+/// it, whether or not anybody asks. Readers materialise it with [`Self::settle`].
+///
+/// `onboarded_at` / `updated_at` are recorded but not yet reported: no modelled
+/// member of `AdminAccountSummary` or `GetAdminScopeResponse` carries them, and
+/// they are what a later slice (the administrator enumeration) reads.
+#[derive(Debug, Clone)]
+pub struct OrganizationAdminRecord {
+    pub account_id: String,
+    pub admin_scope: AdminScope,
+    pub status: String,
+    pub settles_to: Option<String>,
+    pub settles_at: Option<SystemTime>,
+    pub onboarded_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl OrganizationAdminRecord {
+    /// The `OrganizationStatus` this administrator account has AT `now`,
+    /// derived from the CLOCK: once [`Self::settles_at`] has passed the status
+    /// IS [`Self::settles_to`], because that transition was owed at that instant
+    /// even if nobody had called. Readers answer from here, so none of them can
+    /// disagree with another about whether the onboarding has completed.
+    pub fn status_at(&self, now: SystemTime) -> &str {
+        match (&self.settles_to, self.settles_at) {
+            (Some(settled), Some(at)) if now >= at => settled.as_str(),
+            _ => self.status.as_str(),
+        }
+    }
+
+    /// Write the clock-due transition into the record — the ONLY write a
+    /// reporting operation makes, and the persisted form of what
+    /// [`Self::status_at`] already derives.
+    pub fn settle(&mut self, now: SystemTime) {
+        let due = self
+            .settles_at
+            .is_some_and(|at| now >= at)
+            .then(|| self.settles_to.clone())
+            .flatten();
+        if let Some(status) = due {
+            self.status = status;
+            self.settles_to = None;
+            self.settles_at = None;
+        }
+    }
+}
 
 /// The `CustomerPolicyScopeIdType` key under which a policy's `IncludeMap` /
 /// `ExcludeMap` holds ACCOUNT IDS (the only other key, `ORG_UNIT`, holds
@@ -593,6 +699,17 @@ pub fn shield_attack_key_prefix(policy_id: &str) -> String {
 pub struct ComAmazonawsFmsAwsfms20180101State {
     /// The single Firewall Manager administrator association, if one was made.
     pub admin_account: Option<AdminAccountRecord>,
+    /// The Firewall Manager administrator accounts `PutAdminAccount` onboarded,
+    /// with the `AdminScope` each of them may manage, keyed by account id.
+    ///
+    /// A `BTreeMap` for the same reason as [`Self::policies`]: a page boundary
+    /// of the administrator enumeration is then a key in a total order rather
+    /// than a held cursor.
+    ///
+    /// The organization's DEFAULT administrator is not in here — it is
+    /// [`Self::admin_account`], whose scope is the whole organization — so the
+    /// two cannot hold two scopes for one role.
+    pub organization_admins: BTreeMap<String, OrganizationAdminRecord>,
     /// Stored policies, keyed by the `PolicyId` this service minted.
     pub policies: BTreeMap<String, PolicyRecord>,
     /// Tags of every Firewall Manager resource, keyed by its ARN: the ARN-keyed
@@ -702,6 +819,37 @@ impl ComAmazonawsFmsAwsfms20180101State {
     ) -> Option<&mut AdminAccountRecord> {
         self.settle_admin_account_at(now);
         self.admin_account.as_mut().filter(|a| a.is_active_at(now))
+    }
+
+    /// Materialise, as of `now`, the onboarding transitions the CLOCK has
+    /// already made due on every administrator account `PutAdminAccount`
+    /// onboarded (see [`OrganizationAdminRecord::settle`]).
+    ///
+    /// It is the one write a reporting operation (`GetAdminScope`) may make: the
+    /// transition was owed at this instant whether or not anybody called, so
+    /// performing it here changes nothing a later caller could not have derived
+    /// from [`OrganizationAdminRecord::status_at`] itself.
+    pub fn settle_organization_admins_at(&mut self, now: SystemTime) {
+        for admin in self.organization_admins.values_mut() {
+            admin.settle(now);
+        }
+    }
+
+    /// The administrator account `PutAdminAccount` onboarded for `account_id`,
+    /// after settling what the clock owes it. `None` when that account was never
+    /// onboarded as an administrator.
+    ///
+    /// The DEFAULT administrator is deliberately not resolved here: it is a
+    /// different record with a derived scope, and a caller that reports either
+    /// of them resolves both explicitly rather than having one stand in for the
+    /// other.
+    pub fn organization_admin_at(
+        &mut self,
+        account_id: &str,
+        now: SystemTime,
+    ) -> Option<&OrganizationAdminRecord> {
+        self.settle_organization_admins_at(now);
+        self.organization_admins.get(account_id)
     }
 
     /// The stored Firewall Manager resource whose ARN is `arn` — whatever KIND of
@@ -824,15 +972,36 @@ impl ComAmazonawsFmsAwsfms20180101State {
     /// An association `DisassociateAdminAccount` has torn down
     /// ([`AdminAccountRecord::is_active`] is false) manages nothing any more, so
     /// it is left out.
-    pub fn managing_admin_accounts(&self) -> Vec<String> {
-        let mut accounts: Vec<String> = self
+    ///
+    /// An administrator `PutAdminAccount` onboarded manages only what its
+    /// `AdminScope` says it may, so it is reported here exactly when its
+    /// `AccountScope` covers the calling account
+    /// ([`admin_scope_manages_account`]) — the store's own answer to "which
+    /// administrators manage this account", rather than a second reading of the
+    /// scopes it holds.
+    ///
+    /// It takes `now` for the same reason [`AdminAccountRecord::is_active_at`]
+    /// does: one request decides from ONE reading of a clock that is not
+    /// monotonic, so two reads inside one handler cannot straddle a settle
+    /// boundary.
+    pub fn managing_admin_accounts(&self, now: SystemTime) -> Vec<String> {
+        let caller = ::engine::emulator_account_id();
+        let mut accounts: BTreeSet<String> = self
             .admin_account
             .iter()
-            .filter(|admin| admin.is_active())
+            .filter(|admin| admin.is_active_at(now))
             .map(|admin| admin.account_id.clone())
             .collect();
-        accounts.sort();
-        accounts
+        accounts.extend(
+            self.organization_admins
+                .values()
+                .filter(|admin| {
+                    admin.status_at(now) == ORGANIZATION_STATUS_ONBOARDING_COMPLETE
+                        && admin_scope_manages_account(&admin.admin_scope, caller)
+                })
+                .map(|admin| admin.account_id.clone()),
+        );
+        accounts.into_iter().collect()
     }
 
     /// The accounts of the administrator's organization this store records, in
@@ -866,6 +1035,12 @@ impl ComAmazonawsFmsAwsfms20180101State {
         if let Some(admin) = self.admin_account.as_ref().filter(|a| a.is_active()) {
             accounts.insert(admin.account_id.clone());
         }
+        // Every account `PutAdminAccount` onboarded as an administrator: that
+        // operation documents that the account "must be a member of the
+        // organization that was onboarded to Firewall Manager by
+        // AssociateAdminAccount", so the store was told about it as a member of
+        // the organization.
+        accounts.extend(self.organization_admins.keys().cloned());
         for record in self.policies.values() {
             for scope_map in [&record.policy.include_map, &record.policy.exclude_map]
                 .into_iter()
@@ -1025,6 +1200,179 @@ pub fn require_administrator<'store, E>(
         .as_ref()
         .filter(|admin| admin.is_active())
         .ok_or_else(|| no_administrator_refusal(region))
+}
+
+/// The `AdminScope` of the organization's DEFAULT administrator: everything.
+///
+/// Derived rather than stored, because it follows from the role: the default
+/// administrator "has full administrative scope that allows administration of
+/// all policy types, accounts, organizational units, and Regions"
+/// (`AssociateAdminAccount`), which is exactly every "all … enabled" member of
+/// `AdminScope`'s four scopes set. Nothing can narrow it, so there is no stored
+/// copy that could drift from the role.
+pub fn default_admin_scope() -> AdminScope {
+    AdminScope {
+        account_scope: Some(AccountScope {
+            accounts: None,
+            all_accounts_enabled: true,
+            exclude_specified_accounts: false,
+        }),
+        organizational_unit_scope: Some(OrganizationalUnitScope {
+            organizational_units: None,
+            all_organizational_units_enabled: true,
+            exclude_specified_organizational_units: false,
+        }),
+        region_scope: Some(RegionScope {
+            regions: None,
+            all_regions_enabled: true,
+        }),
+        policy_type_scope: Some(PolicyTypeScope {
+            policy_types: None,
+            all_policy_types_enabled: true,
+        }),
+    }
+}
+
+/// The `OrganizationStatus` of the DEFAULT administrator association, from the
+/// `AccountRoleStatus` of its role.
+///
+/// The two enums describe the same association from two sides — the role's
+/// lifecycle (`AccountRoleStatus`) and the account's onboarding as an
+/// administrator (`OrganizationStatus`) — so the second follows from the first:
+/// a role that is being created is an account that is `ONBOARDING`, a `READY`
+/// role is an onboarded administrator, and a role being or already deleted is
+/// an administrator being or already removed.
+pub fn default_admin_organization_status(role_status: &str) -> &'static str {
+    match role_status {
+        ROLE_STATUS_READY => ORGANIZATION_STATUS_ONBOARDING_COMPLETE,
+        ROLE_STATUS_DELETED => ORGANIZATION_STATUS_OFFBOARDING_COMPLETE,
+        ROLE_STATUS_PENDING_DELETION | ROLE_STATUS_DELETING => ORGANIZATION_STATUS_OFFBOARDING,
+        _ => ORGANIZATION_STATUS_ONBOARDING,
+    }
+}
+
+/// Whether an administrator holding `scope` may apply policies to
+/// `account_id`.
+///
+/// This is `AccountScope`'s own documented reading, in one place so no reader
+/// re-derives it: `AllAccountsEnabled` covers every account in the
+/// organization; otherwise the listed `Accounts` are the accounts covered, or —
+/// when `ExcludeSpecifiedAccounts` is set — the accounts NOT covered. An
+/// administrator whose scope configures no `AccountScope` at all has been
+/// granted no account, so it covers none.
+pub fn admin_scope_manages_account(scope: &AdminScope, account_id: &str) -> bool {
+    let Some(account_scope) = scope.account_scope.as_ref() else {
+        return false;
+    };
+    if account_scope.all_accounts_enabled {
+        return true;
+    }
+    let listed = account_scope
+        .accounts
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|listed| listed == account_id);
+    if account_scope.exclude_specified_accounts {
+        !listed
+    } else {
+        listed
+    }
+}
+
+/// The `SecurityServiceType` of a THIRD-PARTY firewall policy: the policy type
+/// `PolicyTypeScope$AllPolicyTypesEnabled` excepts, because "third-party policy
+/// types can only be managed by the Firewall Manager default administrator".
+/// One of [`crate::ops::types::SECURITY_SERVICE_TYPE_VALUES`].
+pub const SECURITY_SERVICE_THIRD_PARTY_FIREWALL: &str = "THIRD_PARTY_FIREWALL";
+
+/// Why `scope` is not an administrative scope this service can grant, or `None`
+/// when it is — the service-level validation of an `AdminScope` a caller sends,
+/// built from the request so the refusal names the member and the constraint it
+/// broke.
+///
+/// Each rule is one the model's own documentation states:
+///
+/// * "You can either enable management of all accounts through this operation,
+///   or you can specify a list of accounts to manage in
+///   `AccountScope$Accounts`. You cannot specify both."
+///   (`AccountScope$AllAccountsEnabled`), and the same sentence for excluding
+///   accounts (`AccountScope$ExcludeSpecifiedAccounts`);
+/// * the identical pair for organizational units
+///   (`OrganizationalUnitScope$AllOrganizationalUnitsEnabled` /
+///   `$ExcludeSpecifiedOrganizationalUnits`);
+/// * "Third-party policy types can only be managed by the Firewall Manager
+///   default administrator" (`PolicyTypeScope$AllPolicyTypesEnabled`), so a
+///   delegated administrator's `PolicyTypes` may not name one;
+/// * an `AccountScope$Accounts` entry must be an `AWSAccountId` (the model's
+///   `com.amazonaws.fms#AWSAccountId`: length 1..1024, `^[0-9]+$`).
+///
+/// It is a free function, not a method on a handler, so every writer of an
+/// administrative scope validates it identically.
+pub fn admin_scope_error(scope: &AdminScope) -> Option<String> {
+    if let Some(account_scope) = scope.account_scope.as_ref() {
+        let listed = account_scope.accounts.as_deref().unwrap_or_default();
+        if account_scope.all_accounts_enabled && !listed.is_empty() {
+            return Some(
+                "AccountScope$AllAccountsEnabled and AccountScope$Accounts cannot both be \
+                 specified: either enable management of all accounts or list the accounts to \
+                 manage"
+                    .to_string(),
+            );
+        }
+        if account_scope.all_accounts_enabled && account_scope.exclude_specified_accounts {
+            return Some(
+                "AccountScope$AllAccountsEnabled and AccountScope$ExcludeSpecifiedAccounts \
+                 cannot both be specified: either enable management of all accounts or exclude \
+                 the accounts in AccountScope$Accounts"
+                    .to_string(),
+            );
+        }
+        if let Some(invalid) = listed.iter().find(|id| !is_account_id(id)) {
+            return Some(format!(
+                "AccountScope$Accounts may only name Amazon Web Services account ids \
+                 (^[0-9]+$, length 1..1024), found {invalid:?}"
+            ));
+        }
+    }
+    if let Some(ou_scope) = scope.organizational_unit_scope.as_ref() {
+        let listed = ou_scope.organizational_units.as_deref().unwrap_or_default();
+        if ou_scope.all_organizational_units_enabled && !listed.is_empty() {
+            return Some(
+                "OrganizationalUnitScope$AllOrganizationalUnitsEnabled and \
+                 OrganizationalUnitScope$OrganizationalUnits cannot both be specified: either \
+                 enable management of all organizational units or list the ones to manage"
+                    .to_string(),
+            );
+        }
+        if ou_scope.all_organizational_units_enabled
+            && ou_scope.exclude_specified_organizational_units
+        {
+            return Some(
+                "OrganizationalUnitScope$AllOrganizationalUnitsEnabled and \
+                 OrganizationalUnitScope$ExcludeSpecifiedOrganizationalUnits cannot both be \
+                 specified: either enable management of all organizational units or exclude the \
+                 ones in OrganizationalUnitScope$OrganizationalUnits"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(policy_type_scope) = scope.policy_type_scope.as_ref() {
+        let names_third_party = policy_type_scope
+            .policy_types
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|policy_type| policy_type == SECURITY_SERVICE_THIRD_PARTY_FIREWALL);
+        if names_third_party {
+            return Some(format!(
+                "PolicyTypeScope$PolicyTypes may not name \
+                 {SECURITY_SERVICE_THIRD_PARTY_FIREWALL}: third-party policy types can only be \
+                 managed by the Firewall Manager default administrator"
+            ));
+        }
+    }
+    None
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

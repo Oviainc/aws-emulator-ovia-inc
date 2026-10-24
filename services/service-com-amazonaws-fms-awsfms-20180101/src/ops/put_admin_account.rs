@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAdminAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAdminAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAdminAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates a Firewall Manager administrator account and the
+//! `AdminScope` it may manage, persisting it in
+//! [`crate::state::ComAmazonawsFmsAwsfms20180101State::organization_admins`] so
+//! `GetAdminScope` reports it back.
+//!
+//! ### What this operation writes
+//!
+//! A DELEGATED administrator: an account of the organization, with the scope
+//! the caller configured. It is a different record from the organization's ONE
+//! DEFAULT administrator ([`crate::state::AdminAccountRecord`], written by
+//! `AssociateAdminAccount`), which "has full administrative scope" — so this
+//! operation naming the default administrator's own account is refused with the
+//! modelled `InvalidOperationException` ("the operation failed because there
+//! was nothing to do or the operation wasn't possible"): that account's scope
+//! is already the whole organization and the model offers no way to narrow it.
+//!
+//! Creating is distinguished from updating by whether the account is already an
+//! administrator, since the account id — not a service-minted id — is the
+//! resource's identity:
+//!
+//! * a CREATE records the account with the scope sent (an absent `AdminScope`
+//!   grants nothing yet) and starts it `ONBOARDING`, the non-terminal
+//!   `OrganizationStatus` the clock completes
+//!   ([`crate::state::ADMIN_ONBOARDING_SPAN`]);
+//! * an UPDATE replaces the stored scope, leaves the account's onboarding and
+//!   its `onboarded_at` alone, and — following this service's convention for an
+//!   absent optional member of a `Put` payload — treats an absent `AdminScope`
+//!   as "unchanged", so a repeated call is idempotent.
+//!
+//! Whether the account really is a member of the organization is
+//! Organizations' fact, which this emulator does not stand in for (see
+//! [`crate::state::ComAmazonawsFmsAwsfms20180101State::member_accounts`]), so
+//! it is not checked here; the onboarded account IS recorded as one of the
+//! organization's member accounts from then on.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +115,18 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The number of Firewall Manager administrator accounts this service onboards
+/// for one organization before it refuses another.
+///
+/// An EMULATOR-CHOSEN bound, not an AWS-documented quota number: Firewall
+/// Manager's published administrator quota is adjustable, so the exact value is
+/// ours. What is modelled is the BEHAVIOUR — the service bounds how many
+/// objects an account can create and answers `LimitExceededException` once the
+/// bound is reached, the condition that error's own documentation names — so
+/// the store cannot grow without limit. The organization's default
+/// administrator is a separate record and does not count against it.
+const MAX_ADMIN_ACCOUNTS: usize = 10;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -180,18 +218,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAdminAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAdminAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAdminAccount"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutAdminAccountErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The authorization gate, BEFORE any member of the payload is examined:
+        // the organization must have been onboarded to Firewall Manager by
+        // `AssociateAdminAccount` for there to be an organization to onboard an
+        // administrator into.
+        let default_admin = crate::state::require_administrator(&store, &region)?
+            .account_id
+            .clone();
+
+        // The default administrator's scope is the whole organization, and this
+        // operation is the only way a scope is configured — so there is nothing
+        // it could do to that account.
+        if input.admin_account == default_admin {
+            return Err(PutAdminAccountErrorModeled::InvalidOperationException(
+                InvalidOperationException {
+                    message: Some(format!(
+                        "account {default_admin} is the Firewall Manager default administrator, \
+                         which has full administrative scope"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The scope the caller sent, checked against the constraints the model
+        // documents for `AdminScope`, before anything is written.
+        if let Some(reason) = input
+            .admin_scope
+            .as_ref()
+            .and_then(crate::state::admin_scope_error)
+        {
+            return Err(PutAdminAccountErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        store.settle_organization_admins_at(now);
+        let onboarded = store.organization_admins.len();
+        match store.organization_admins.get_mut(&input.admin_account) {
+            // UPDATE: this account already is an administrator, so only its
+            // scope changes; an absent `AdminScope` leaves the stored one as it
+            // is, which is what makes a repeated call idempotent.
+            Some(existing) => {
+                if let Some(scope) = input.admin_scope.clone() {
+                    existing.admin_scope = scope;
+                }
+                existing.updated_at = now;
+            }
+            // CREATE: record the account and start the onboarding the clock
+            // completes.
+            None => {
+                if onboarded >= MAX_ADMIN_ACCOUNTS {
+                    return Err(PutAdminAccountErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "the maximum of {MAX_ADMIN_ACCOUNTS} Firewall Manager \
+                                 administrator accounts has already been onboarded for this \
+                                 organization"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                store.organization_admins.insert(
+                    input.admin_account.clone(),
+                    crate::state::OrganizationAdminRecord {
+                        account_id: input.admin_account.clone(),
+                        admin_scope: input.admin_scope.clone().unwrap_or_default(),
+                        status: crate::state::ORGANIZATION_STATUS_ONBOARDING.to_string(),
+                        settles_to: Some(
+                            crate::state::ORGANIZATION_STATUS_ONBOARDING_COMPLETE.to_string(),
+                        ),
+                        settles_at: Some(now + crate::state::ADMIN_ONBOARDING_SPAN),
+                        onboarded_at: now,
+                        updated_at: now,
+                    },
+                );
+            }
+        }
+        Ok(PutAdminAccountOutput)
     }
 }

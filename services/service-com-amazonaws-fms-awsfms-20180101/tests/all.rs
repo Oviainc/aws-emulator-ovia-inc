@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
+#[path = "all/admin_account_scopes.rs"]
+mod admin_account_scopes;
 #[path = "all/administrator_gated_operations.rs"]
 mod administrator_gated_operations;
 #[path = "all/apps_list_reporting.rs"]
