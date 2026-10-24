@@ -27,6 +27,8 @@ mod signing_name_routing;
 mod stages;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/storage_configurations.rs"]
+mod storage_configurations;
 #[path = "all/tagging.rs"]
 mod tagging;
 #[path = "all/wire_probe.rs"]
