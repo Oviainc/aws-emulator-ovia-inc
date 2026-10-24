@@ -919,6 +919,113 @@ pub fn origin_endpoint_assumed_roles(
 }
 
 // ---------------------------------------------------------------------------
+// What a log-group member has to NAME
+//
+// A member that names a CloudWatch Logs log group is an instruction to WRITE access logs
+// into that group, so the value has to be a name CloudWatch Logs can actually hold: the
+// empty string, a name past CloudWatch's ceiling and a name carrying a character outside
+// its set each name no group this service could ever write to. Such a request is refused
+// with `UnprocessableEntityException` (422, keyed by the member) before anything is
+// stored, instead of being kept and reported by every later read as a live log
+// subscription that collects nothing.
+//
+// The model targets the member at the bare `__string` and publishes no `@length` or
+// `@pattern`
+// (`smithy_query(query="shape",shape="com.amazonaws.mediapackage#IngressAccessLogs,com.amazonaws.mediapackage#EgressAccessLogs",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`
+// reports a single `LogGroupName` member on each, documented as "Customize the log group
+// name"), so the framework's constraint walk cannot refuse any of it: the rule is the
+// service's own, enforced here for EVERY member of the class by the one function.
+// ---------------------------------------------------------------------------
+
+/// The shortest log group name CloudWatch Logs holds — so the empty string names no group.
+///
+/// CloudWatch Logs' own log-group-name rule: a name is 1 to
+/// [`MAX_LOG_GROUP_NAME_CHARS`] characters long.
+pub const MIN_LOG_GROUP_NAME_CHARS: usize = 1;
+
+/// The longest log group name CloudWatch Logs holds; see [`MIN_LOG_GROUP_NAME_CHARS`].
+///
+/// This is the ceiling of the service MediaPackage writes into, NOT this emulator's
+/// generic string guard ([`MAX_STRING_CHARS`]): a longer name is one CloudWatch Logs
+/// would never accept, whatever memory it would occupy here.
+pub const MAX_LOG_GROUP_NAME_CHARS: usize = 512;
+
+/// The non-alphanumeric characters a log group name may carry, as the refusal names them.
+const LOG_GROUP_PUNCTUATION_CHARACTERS: &str = ". - _ / #";
+
+/// Whether `c` is a character a CloudWatch Logs log group name may carry.
+///
+/// CloudWatch Logs' documented set: letters, digits, and the characters
+/// [`LOG_GROUP_PUNCTUATION_CHARACTERS`] names. The letters-and-digits half is ASCII-ONLY
+/// here — unlike a tag's ([`is_tag_character`]), whose restrictions say "Unicode letters,
+/// digits" — because the log-group rule publishes the set as `a-z`, `A-Z` and `0-9`, so an
+/// accented or non-Latin name is not one CloudWatch Logs holds.
+fn is_log_group_character(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '#')
+}
+
+/// Whether `value` is a name CloudWatch Logs can hold: between
+/// [`MIN_LOG_GROUP_NAME_CHARS`] and [`MAX_LOG_GROUP_NAME_CHARS`] characters, every one of
+/// them in [`is_log_group_character`]'s set.
+pub fn is_log_group_name(value: &str) -> bool {
+    let length = value.chars().count();
+    (MIN_LOG_GROUP_NAME_CHARS..=MAX_LOG_GROUP_NAME_CHARS).contains(&length)
+        && value.chars().all(is_log_group_character)
+}
+
+/// The requirement a refused log group name failed: the member's WHOLE accepted domain, in
+/// one sentence, so a name refused for its length and one refused for a character it
+/// carries are answered with the same rule.
+///
+/// Built here rather than written at each call site, so the sentence and the bounds it
+/// states cannot disagree and the suite asserting it reads the service's own words.
+pub fn log_group_name_requirement() -> String {
+    format!(
+        "must be {MIN_LOG_GROUP_NAME_CHARS} to {MAX_LOG_GROUP_NAME_CHARS} characters of \
+         letters, numbers and `{LOG_GROUP_PUNCTUATION_CHARACTERS}`"
+    )
+}
+
+/// Refuse a member whose value is not a log group name CloudWatch Logs could hold, keyed by
+/// the member path the wire names.
+pub fn check_log_group_name(member: &str, value: &str) -> Result<(), ServiceError> {
+    if is_log_group_name(value) {
+        return Ok(());
+    }
+    Err(member_invalid(member, log_group_name_requirement()))
+}
+
+/// The wire path of the ingress access-log group member, which its refusal is keyed by
+/// (`IngressAccessLogs` is `@jsonName("ingressAccessLogs")` and carries `LogGroupName` as
+/// `@jsonName("logGroupName")`).
+pub const INGRESS_LOG_GROUP_MEMBER: &str = "ingressAccessLogs.logGroupName";
+
+/// The wire path of the egress access-log group member; see [`INGRESS_LOG_GROUP_MEMBER`].
+pub const EGRESS_LOG_GROUP_MEMBER: &str = "egressAccessLogs.logGroupName";
+
+/// Refuse a channel's access-log subscription when either direction names a log group
+/// CloudWatch Logs could not hold.
+///
+/// The two members carry the same kind of value, so both are judged by the one rule, in the
+/// request's own member order — ingress then egress — so one request is always refused by
+/// the same member. A direction the request leaves out, or sends without a `LogGroupName`,
+/// names no group and is nothing to judge: it unsubscribes that direction.
+pub fn check_access_log_group_names(
+    ingress: Option<&str>,
+    egress: Option<&str>,
+) -> Result<(), ServiceError> {
+    for (member, value) in [
+        (INGRESS_LOG_GROUP_MEMBER, ingress),
+        (EGRESS_LOG_GROUP_MEMBER, egress),
+    ] {
+        if let Some(value) = value {
+            check_log_group_name(member, value)?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Durations in seconds
 //
 // Several members of an OriginEndpoint are a NUMBER OF SECONDS: a window of content to
