@@ -558,7 +558,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             vlans,
             requested_hosts,
+            // Health is DERIVED from the record: nothing is checked on an environment
+            // that is still CREATING, and every reporting operation recomputes the
+            // checks from the store
+            // (`ComAmazonawsEvsAmazonelasticvmwareserviceState::recompute_environment_checks`).
             checks: Vec::new(),
+            impaired_since_ms: std::collections::BTreeMap::new(),
             entitlements: std::collections::BTreeMap::new(),
             connectors: std::collections::BTreeMap::new(),
             hosts: std::collections::BTreeMap::new(),

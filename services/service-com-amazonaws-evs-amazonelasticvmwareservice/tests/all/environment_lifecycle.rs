@@ -393,9 +393,23 @@ async fn an_environment_round_trips_through_create_get_list_vlans_and_delete() {
     );
     assert_eq!(
         settled["environment"]["environmentStatus"],
-        json!("PASSED"),
-        "get settled: a CREATED environment with no failing check is PASSED, got {}",
-        settled["environment"]["environmentStatus"]
+        json!("FAILED"),
+        "get settled: this environment holds no host, so its HOST_COUNT check fails and \
+         the roll-up is FAILED, got {} from {}",
+        settled["environment"]["environmentStatus"],
+        settled["environment"]["checks"]
+    );
+    assert_eq!(
+        settled["environment"]["checks"]
+            .as_array()
+            .map(|checks| checks
+                .iter()
+                .filter(|check| check["result"] == json!("FAILED"))
+                .filter_map(|check| check["type"].as_str())
+                .collect::<Vec<&str>>()),
+        Some(vec!["HOST_COUNT"]),
+        "get settled: the failing check is the minimum host count, got {}",
+        settled["environment"]["checks"]
     );
     let created_at = settled["environment"]["createdAt"]
         .as_f64()

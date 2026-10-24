@@ -245,10 +245,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let transition_due_at = environment.pending.as_ref().map(|pending| pending.due_at);
-        let deleted = environment.to_wire();
         if let Some(due_at) = transition_due_at {
             state.note_transition_due(due_at);
         }
+        // The deletion just changed the environment's state, and its health checks are
+        // derived from that state, so they are recomputed before it is reported: an
+        // environment that is going away reports no check.
+        state.recompute_environment_checks();
+        let deleted = state
+            .environment_in_region(&region, &input.environment_id)
+            .map(|environment| environment.to_wire())
+            .ok_or_else(|| {
+                DeleteEnvironmentErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
         // "Environment deletion also deletes the associated Amazon EVS VLAN subnets":
         // the subnets this service provisioned in the account's own Amazon EC2 store
         // are removed from it here, so no other service is left holding a subnet of a
