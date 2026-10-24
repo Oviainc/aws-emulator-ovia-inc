@@ -319,7 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // by the CLOCK one `TRANSITION_SPAN` from here and a caller that reads straight
         // back still sees the update under way. Any step the deployment still owed is
         // replaced: these settings are what it is applying now.
-        deployment.status = crate::state::STATUS_UPDATE_IN_PROGRESS.to_string();
+        deployment.enter_status(crate::state::STATUS_UPDATE_IN_PROGRESS.to_string());
         deployment.status_reason = None;
         deployment.modified_at = now;
         deployment.append_event(crate::state::DeploymentEvent::new(

@@ -63,6 +63,12 @@ pub const STATUS_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
 pub const STATUS_DELETE_INITIATING: &str = "DELETE_INITIATING";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETED: &str = "DELETED";
+/// See [`STATUS_CREATING`].
+///
+/// Not a status this slice MOVES a deployment into — the emulator reaches no failure
+/// status — but a `DeploymentStatus` member all the same, so [`status_has_resources`]
+/// classifies it rather than leaving it to a default.
+pub const STATUS_DELETE_FAILED: &str = "DELETE_FAILED";
 
 /// `EventStatus` members this slice records on a deployment event. Every value is one
 /// of `EVENT_STATUS_VALUES` (the model's `EventStatus` enum).
@@ -580,9 +586,13 @@ pub struct Deployment {
     pub status_reason: Option<String>,
     /// The submitted `specifications` (the model marks the map `@sensitive`).
     pub specifications: BTreeMap<String, String>,
-    /// `DeploymentData$resourceGroup`. Launch Wizard reports the Resource Groups group
-    /// it created for the deployment; this emulator creates none, so it stays absent
-    /// rather than naming a group that does not exist.
+    /// `DeploymentData$resourceGroup`: the group the service created to hold this
+    /// deployment's own resources, named by [`resource_group_name`].
+    ///
+    /// Absent until the deployment's resources start being provisioned — see
+    /// [`Deployment::enter_status`] — because until then the group does not exist. Once
+    /// assigned it never changes: the name is derived from the deployment's name, which
+    /// no operation in this model rewrites.
     pub resource_group: Option<String>,
     pub deployment_arn: String,
     /// Tags live here, on the deployment, keyed by nothing else — so the tagging
@@ -607,6 +617,23 @@ pub struct Deployment {
 }
 
 impl Deployment {
+    /// Move this deployment into `status`, maintaining everything the record owes that
+    /// status.
+    ///
+    /// EVERY status change goes through here — the clock-owed steps
+    /// ([`Deployment::materialize_due`]) and the ones a call applies synchronously —
+    /// so the deployment-scoped resources a status implies cannot depend on which
+    /// path moved it: a deployment that reaches a status in which its resources are
+    /// being or have been provisioned ([`status_has_resources`]) owns the resource
+    /// group [`resource_group_name`] names from that moment on, and one whose
+    /// provisioning never started owns none.
+    pub fn enter_status(&mut self, status: String) {
+        if self.resource_group.is_none() && status_has_resources(&status) {
+            self.resource_group = Some(resource_group_name(&self.name));
+        }
+        self.status = status;
+    }
+
     /// Append `event` to this deployment's history, dropping the OLDEST events once
     /// the log is over [`MAX_EVENTS_PER_DEPLOYMENT`].
     ///
@@ -633,7 +660,7 @@ impl Deployment {
             let Some(step) = self.pending.pop_front() else {
                 break;
             };
-            self.status = step.status;
+            self.enter_status(step.status);
             self.modified_at = step.due_at;
             if self.status == STATUS_DELETED {
                 self.deleted_at = Some(step.due_at);
@@ -1532,6 +1559,57 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// The ARN of a deployment: `arn:aws:launchwizard:<region>:<account>:deployment/<id>`.
 pub fn deployment_arn(region: &str, deployment_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("deployment/{deployment_id}"))
+}
+
+/// The prefix the group holding a deployment's resources carries: the group is named
+/// after the deployment whose resources it holds, so the name identifies the
+/// deployment it belongs to rather than being opaque.
+///
+/// The prefix itself is CHOSEN (like [`TRANSITION_SPAN`]): no part of the model states
+/// it, so it is this emulator's own convention — what the model fixes is that the
+/// member names the deployment's group, which is why the name is derived from the
+/// deployment rather than drawn per run.
+pub const RESOURCE_GROUP_NAME_PREFIX: &str = "LaunchWizard-";
+
+/// The name of the resource group a deployment named `deployment_name` owns.
+///
+/// Derived from the deployment's own name, so it is stable across reads, unique to the
+/// deployment (no two live deployments share a name — see
+/// [`ComAmazonawsLaunchwizardLaunchwizardState::live_name_taken`]) and the same for
+/// every reader. The result is within the name rules a resource group has: a
+/// `DeploymentName` is len 1..50 over `^[A-Za-z0-9_\.-]+$`, so this is at most 63
+/// characters of letters, digits, hyphens, underscores and periods.
+pub fn resource_group_name(deployment_name: &str) -> String {
+    format!("{RESOURCE_GROUP_NAME_PREFIX}{deployment_name}")
+}
+
+/// True for a `DeploymentStatus` in which a deployment's own resources are being or
+/// have been provisioned.
+///
+/// Stated as the complement of the statuses in which they are NOT: the ones a
+/// deployment is in before provisioning starts ([`STATUS_CREATING`], and
+/// [`STATUS_VALIDATING`], where its settings are still being checked) and the ones a
+/// delete moves it through, which release the deployment's resources rather than
+/// provision any. A deployment that is deleted before provisioning started therefore
+/// never owns a resource group.
+///
+/// Every other `DeploymentStatus` member (`DEPLOYMENT_STATUS_VALUES`) falls to the
+/// default, which is right for each of them: `IN_PROGRESS`, `COMPLETED`,
+/// `UPDATE_IN_PROGRESS` and `UPDATE_COMPLETED` are the provisioning and provisioned
+/// statuses themselves, and `FAILED`, `UPDATE_FAILED`, `UPDATE_ROLLBACK_COMPLETED` and
+/// `UPDATE_ROLLBACK_FAILED` are reached only from them — a deployment whose
+/// provisioning or update failed may well have created resources, so it is not treated
+/// as owning none.
+pub fn status_has_resources(status: &str) -> bool {
+    !matches!(
+        status,
+        STATUS_CREATING
+            | STATUS_VALIDATING
+            | STATUS_DELETE_INITIATING
+            | STATUS_DELETE_IN_PROGRESS
+            | STATUS_DELETE_FAILED
+            | STATUS_DELETED
+    )
 }
 
 /// The resource-type segment of a deployment ARN, as [`deployment_arn`] builds it.
