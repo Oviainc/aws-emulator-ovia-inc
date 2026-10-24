@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBillingTransferPreference
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBillingTransferPreference`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBillingTransferPreference::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the auto billing group creation preference the
+//! store holds for the billing transfer the request names, and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBillingTransferPreference` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBillingTransferPreferenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBillingTransferPreference"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetBillingTransferPreferenceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        // "Retrieves the auto billing group creation preference for a billing transfer":
+        // a REPORTING operation (`@readonly`), so this handler takes a shared read of the
+        // store and writes nothing — two calls in a row answer the same thing.
+        let state = state.lock();
+        let transfer_arn = input.responsibility_transfer_arn;
+
+        // The transfer has to be one of THIS organization's: its ARN carries the
+        // management account of the organization that owns it, and the only organization
+        // this store can answer for is the one whose management account it records as
+        // the payer (see `crate::state::transfer_belongs_to_this_organization`). An ARN
+        // owned by any other account names a transfer this organization does not have,
+        // which is this operation's modelled 404 — "The request references a resource
+        // that doesn't exist."
+        if !state.transfer_belongs_to_this_organization(&transfer_arn) {
+            return Err(GetBillingTransferPreferenceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: "the billing transfer does not exist".to_string(),
+                    resource_id: transfer_arn,
+                    resource_type: TRANSFER_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // A transfer of this organization that nobody has set a preference for holds no
+        // record: the preference is then the documented default (`Enabled`: "The
+        // preference is disabled by default", and no pricing plan, which is the only
+        // form a disabled preference takes) and `LastModifiedTime` is EMPTY — "This value
+        // is empty if the preference has never been set for the billing transfer." So
+        // "never set" is the ABSENCE of a record, never a stored zero instant.
+        let stored = state.billing_transfer_preference(&transfer_arn);
+        Ok(GetBillingTransferPreferenceOutput {
+            responsibility_transfer_arn: transfer_arn,
+            auto_billing_transfer_billing_group_creation:
+                AutoTransferBillingGroupCreationPreference {
+                    enabled: stored.is_some_and(|record| record.enabled),
+                    pricing_plan_arn: stored.and_then(|record| record.pricing_plan_arn.clone()),
+                },
+            last_modified_time: stored.map(|record| record.last_modified_time_millis),
+        })
     }
 }
+
+/// `ResourceNotFoundException.ResourceType` for a billing transfer: the resource-type
+/// segment of the ARN the request named (`…:transfer/o-…`), the same convention this
+/// service's other not-found answers follow (`pricingplan`, `billinggroup`).
+const TRANSFER_RESOURCE_TYPE: &str = "transfer";

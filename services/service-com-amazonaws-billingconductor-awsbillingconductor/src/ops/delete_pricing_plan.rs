@@ -207,13 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ConflictException` describes, and `ConflictExceptionReason` enumerates the
         // case by name. The caller points the group at another plan, or deletes the
         // group, first.
-        //
-        // A billing TRANSFER PREFERENCE also names a pricing plan
-        // (`AutoTransferBillingGroupCreationPreference.PricingPlanArn`, the
-        // `PRICING_PLAN_REFERENCED_BY_PREFERENCE_DELETE_CONFLICT` reason), but the only
-        // operation that records one (`UpdateBillingTransferPreference`) is still a
-        // scaffold, so no such reference can exist in this store yet: that conflict
-        // belongs with the operation that can create one.
         let holders = state.billing_groups_referencing_pricing_plan(&plan_arn);
         if let Some(group_arn) = holders.first() {
             return Err(DeletePricingPlanErrorModeled::ConflictException(ConflictException {
@@ -225,6 +218,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 resource_id: plan_arn,
                 resource_type: "pricingplan".to_string(),
                 reason: Some("PRICING_PLAN_ATTACHED_TO_BILLING_GROUP_DELETE_CONFLICT".to_string()),
+            })
+            .into());
+        }
+
+        // A billing TRANSFER PREFERENCE also names a pricing plan
+        // (`AutoTransferBillingGroupCreationPreference.PricingPlanArn`): "While a
+        // pricing plan is specified in an enabled preference, you can't delete that
+        // pricing plan" (`UpdateBillingTransferPreference`'s own documentation), and
+        // `ConflictExceptionReason` enumerates that case by name. The caller points the
+        // preference at another plan, or disables it, first.
+        let preferences = state.billing_transfer_preferences_referencing_pricing_plan(&plan_arn);
+        if let Some(transfer_arn) = preferences.first() {
+            return Err(DeletePricingPlanErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "the pricing plan is specified in {} enabled billing transfer \
+                     preference(s), including the one for {transfer_arn}",
+                    preferences.len()
+                ),
+                resource_id: plan_arn,
+                resource_type: "pricingplan".to_string(),
+                reason: Some(
+                    "PRICING_PLAN_REFERENCED_BY_PREFERENCE_DELETE_CONFLICT".to_string(),
+                ),
             })
             .into());
         }

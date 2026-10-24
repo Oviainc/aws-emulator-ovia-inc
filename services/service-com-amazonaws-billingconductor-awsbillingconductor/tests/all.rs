@@ -17,6 +17,8 @@ mod account_exclusivity_refusal;
 mod associate_pricing_rules;
 #[path = "all/billing_group_core_loop.rs"]
 mod billing_group_core_loop;
+#[path = "all/billing_transfer_preference.rs"]
+mod billing_transfer_preference;
 #[path = "all/custom_line_item_and_create_name_refusals.rs"]
 mod custom_line_item_and_create_name_refusals;
 #[path = "all/disassociate_accounts.rs"]

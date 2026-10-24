@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBillingTransferPreference
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBillingTransferPreference`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBillingTransferPreference::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation records the auto billing group creation preference of the
+//! billing transfer the request names and answers with what it stored. It is implemented
+//! here beside `GetBillingTransferPreference` (whose stub issue this change closes)
+//! because it is the only writer of that preference, so the reader has something to read
+//! back; see `issues/.../billingconductor-updatebillingtransferpreference-stub.md`.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +171,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBillingTransferPreference` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBillingTransferPreferenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBillingTransferPreference"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateBillingTransferPreferenceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let transfer_arn = input.responsibility_transfer_arn;
+        let requested = input.auto_billing_transfer_billing_group_creation;
+
+        // The transfer has to be one of THIS organization's — the same rule, from the
+        // same state method, that `GetBillingTransferPreference` reads it by: a billing
+        // transfer is an AWS Organizations resource whose ARN carries the management
+        // account of the organization that owns it, and this store answers for the one
+        // organization whose management account it records as the payer. Any other
+        // account's transfer is this operation's modelled 404.
+        if !state.transfer_belongs_to_this_organization(&transfer_arn) {
+            return Err(UpdateBillingTransferPreferenceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: "the billing transfer does not exist".to_string(),
+                    resource_id: transfer_arn,
+                    resource_type: TRANSFER_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // `ClientToken` is `@idempotencyToken`: "if the original request completes
+        // successfully, any subsequent retries complete successfully without performing
+        // any further actions." A retry therefore answers with the preference the store
+        // holds for that transfer and does NOT move `LastModifiedTime`. The token is
+        // scoped to this operation and to the transfer its first call addressed, so the
+        // same token used against a different transfer is a different request — and so
+        // is one whose preference the store has since forgotten at its cap, which falls
+        // through and records the request as a first call.
+        let replay = state
+            .replayed_idempotent_arn(Self::NAME, input.client_token.as_deref())
+            .filter(|recorded| *recorded == transfer_arn)
+            .and_then(|_| state.billing_transfer_preference(&transfer_arn))
+            .map(render);
+        if let Some(answer) = replay {
+            return Ok(answer);
+        }
+
+        // "This value is required when `Enabled` is `true`, and must be omitted when
+        // `Enabled` is `false`" (`AutoTransferBillingGroupCreationPreference.PricingPlanArn`).
+        // The model cannot express a conditional member, so the rule is enforced here,
+        // in this service's modelled 400 `ValidationException`:
+        // `MISSING_PRICING_PLAN_ARN` is the reason `ValidationExceptionReason` enumerates
+        // for the absent one, and a plan named beside a disabled preference is a value
+        // the member's own rule forbids (`FIELD_VALIDATION_FAILED`).
+        let plan_arn = requested
+            .pricing_plan_arn
+            .as_deref()
+            .map(crate::state::normalize_pricing_plan_arn);
+        match (requested.enabled, plan_arn.as_deref()) {
+            (true, None) => {
+                return Err(validation(
+                    "MISSING_PRICING_PLAN_ARN",
+                    PREFERENCE_PLAN_FIELD,
+                    "a pricing plan ARN is required when the auto billing group creation \
+                     preference is enabled"
+                        .to_string(),
+                ))
+            }
+            (false, Some(named)) => {
+                return Err(validation(
+                    "FIELD_VALIDATION_FAILED",
+                    PREFERENCE_PLAN_FIELD,
+                    format!(
+                        "the pricing plan {named} must be omitted when the auto billing group \
+                         creation preference is disabled"
+                    ),
+                ))
+            }
+            _ => {}
+        }
+
+        // An enabled preference names the plan the billing groups it creates are to
+        // compute with, so that plan has to exist — the same requirement
+        // `CreateBillingGroup` holds a `ComputationPreference` to, answered with the same
+        // `MISSING_PRICINGPLAN` reason the model enumerates for it. (This operation's
+        // modelled 404 is about the billing transfer; a plan reference that resolves
+        // nowhere is a fault in the input.) The AWS-managed plans exist for every
+        // caller, which `pricing_plan_exists` already accounts for.
+        if let Some(plan) = plan_arn.as_deref() {
+            if !state.pricing_plan_exists(plan) {
+                return Err(validation(
+                    "MISSING_PRICINGPLAN",
+                    PREFERENCE_PLAN_FIELD,
+                    format!("the pricing plan {plan} does not exist"),
+                ));
+            }
+        }
+
+        // The preference REPLACES whatever the transfer held: the whole preference is one
+        // required member, so there is no member to carry over. Nothing is created here —
+        // "the preference applies only to billing groups that are created after you
+        // enable it", and the accounts that transfer their bill to the bill source
+        // account are Organizations state this service does not hold.
+        let stored = state.set_billing_transfer_preference(
+            &transfer_arn,
+            requested.enabled,
+            plan_arn,
+            crate::state::now_millis(),
+        );
+        state.record_idempotent_arn(Self::NAME, input.client_token.as_deref(), &transfer_arn);
+
+        // The audit record for a state-changing call: who asked, what changed and that it
+        // succeeded — only the access key id the caller presented and the resources it
+        // addressed.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            responsibility_transfer_arn = %stored.responsibility_transfer_arn,
+            enabled = stored.enabled,
+            outcome = "updated",
+            "billing transfer preference updated"
+        );
+        Ok(render(&stored))
     }
+}
+
+/// `ResourceNotFoundException.ResourceType` for a billing transfer: the resource-type
+/// segment of the ARN the request named (`…:transfer/o-…`), the same convention this
+/// service's other not-found answers follow (`pricingplan`, `billinggroup`).
+const TRANSFER_RESOURCE_TYPE: &str = "transfer";
+
+/// The input member a pricing-plan refusal names in `ValidationException.Fields`.
+const PREFERENCE_PLAN_FIELD: &str = "AutoBillingTransferBillingGroupCreation.PricingPlanArn";
+
+/// This operation's answer, rendered from the STORED record rather than from the
+/// request, so a response reports what a later `GetBillingTransferPreference` will.
+fn render(
+    stored: &crate::state::BillingTransferPreferenceRecord,
+) -> UpdateBillingTransferPreferenceOutput {
+    UpdateBillingTransferPreferenceOutput {
+        responsibility_transfer_arn: stored.responsibility_transfer_arn.clone(),
+        auto_billing_transfer_billing_group_creation: AutoTransferBillingGroupCreationPreference {
+            enabled: stored.enabled,
+            pricing_plan_arn: stored.pricing_plan_arn.clone(),
+        },
+        last_modified_time: stored.last_modified_time_millis,
+    }
+}
+
+/// Refuse the request with this operation's modelled 400 `ValidationException`.
+fn validation(reason: &str, field: &str, message: String) -> UpdateBillingTransferPreferenceError {
+    UpdateBillingTransferPreferenceErrorModeled::ValidationException(
+        crate::state::validation_exception(reason, field, message),
+    )
+    .into()
 }

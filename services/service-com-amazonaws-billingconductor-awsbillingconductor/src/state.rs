@@ -566,6 +566,41 @@ impl CustomLineItemRecord {
     }
 }
 
+/// The auto billing group creation preference recorded for ONE billing transfer, as
+/// `UpdateBillingTransferPreference` persisted it.
+///
+/// `AutoTransferBillingGroupCreationPreference` carries `Enabled` and — only while the
+/// preference is enabled — the `PricingPlanArn` the automatically created billing groups
+/// are to compute with. The record adds the instant the preference was last set, which
+/// is what `LastModifiedTime` reports; a transfer with NO record is how "the preference
+/// has never been set" is represented, so that case reports the documented default and
+/// an empty `LastModifiedTime` rather than a stored zero.
+#[derive(Debug, Clone, Default)]
+pub struct BillingTransferPreferenceRecord {
+    /// The `ResponsibilityTransferArn` of the billing transfer the preference applies
+    /// to — this record's identity. The modelled pattern admits the full ARN only (no
+    /// bare-id spelling), so it needs no normalisation.
+    pub responsibility_transfer_arn: String,
+    /// `AutoBillingTransferBillingGroupCreation.Enabled`.
+    pub enabled: bool,
+    /// The FULL pricing plan ARN the preference names, held only while `enabled`:
+    /// "This value is required when `Enabled` is `true`, and must be omitted when
+    /// `Enabled` is `false`."
+    pub pricing_plan_arn: Option<String>,
+    pub last_modified_time_millis: i64,
+}
+
+/// The account segment of a `ResponsibilityTransferArn`: the management account of the
+/// organization that owns the billing transfer.
+///
+/// The modelled pattern spells a billing transfer as an AWS Organizations resource ARN
+/// (`^arn:[a-z0-9][a-z0-9-.]{0,62}:organizations::\d{12}:transfer/o-…`), whose account
+/// segment is the organization's management account — the fifth colon-separated field,
+/// the same position [`parse_taggable_arn`] reads an account id from.
+pub fn responsibility_transfer_owner_account(arn: &str) -> Option<&str> {
+    arn.split(':').nth(4).filter(|account| !account.is_empty())
+}
+
 /// Per-service state for com-amazonaws-billingconductor-awsbillingconductor. A handler reaches it through [`service_state`].
 ///
 /// The maps are ordered (`BTreeMap`/`BTreeSet`) so that the list operations page
@@ -598,6 +633,10 @@ impl CustomLineItemRecord {
 ///   `ServiceLimitExceededException`, and an association past it fails THAT resource
 ///   with the modelled `SERVICE_LIMIT_EXCEEDED` reason; a deleted billing group takes
 ///   its items, and their associations, with it.
+/// * `billing_transfer_preferences` holds one entry per billing transfer whose
+///   preference was set, at most [`MAX_BILLING_TRANSFER_PREFERENCES`]; nothing in this
+///   API deletes a billing transfer, so that store evicts the oldest-set preference
+///   first, which reads back as the "never set" it was before.
 /// * `unassociated_accounts` keeps the released accounts a later
 ///   `ListAccountAssociations` has to report as `UNMONITORED`. Nothing deletes a
 ///   linked account, so this one is capped at [`MAX_UNASSOCIATED_ACCOUNTS`] and
@@ -638,6 +677,16 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     /// another billing group" decidable and the MONITORED filter computable. One
     /// entry per account of a live billing group; a delete reclaims them.
     pub account_associations: BTreeMap<String, String>,
+    /// The auto billing group creation preference of every billing transfer that has
+    /// one, keyed by its `ResponsibilityTransferArn`. At most
+    /// [`MAX_BILLING_TRANSFER_PREFERENCES`]. Private so the cap below cannot be
+    /// bypassed by a handler inserting directly: reach it through
+    /// [`Self::billing_transfer_preference`] and
+    /// [`Self::set_billing_transfer_preference`].
+    billing_transfer_preferences: BTreeMap<String, BillingTransferPreferenceRecord>,
+    /// The keys of `billing_transfer_preferences` in first-set order, so the cap evicts
+    /// the oldest-set preference rather than an arbitrary one.
+    billing_transfer_preference_order: VecDeque<String>,
     /// The bounded tail of linked accounts that belong to no billing group: the ones
     /// a delete released, and a primary account that is not a member of its own
     /// group. They are what `UNMONITORED` reports. Private so the cap below cannot
@@ -703,6 +752,98 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             if let Some(oldest) = self.idempotency_order.pop_front() {
                 self.idempotency_tokens.remove(&oldest);
             }
+        }
+    }
+
+    /// The preference recorded for the billing transfer `arn` names, or `None` when no
+    /// call ever set one — the case `GetBillingTransferPreference` reports the
+    /// documented default and an empty `LastModifiedTime` for.
+    pub fn billing_transfer_preference(
+        &self,
+        arn: &str,
+    ) -> Option<&BillingTransferPreferenceRecord> {
+        self.billing_transfer_preferences.get(arn)
+    }
+
+    /// Record one billing transfer's preference and hand back what was stored,
+    /// forgetting the oldest-set preference once [`MAX_BILLING_TRANSFER_PREFERENCES`]
+    /// are held.
+    pub fn set_billing_transfer_preference(
+        &mut self,
+        arn: &str,
+        enabled: bool,
+        pricing_plan_arn: Option<String>,
+        now: i64,
+    ) -> BillingTransferPreferenceRecord {
+        let record = BillingTransferPreferenceRecord {
+            responsibility_transfer_arn: arn.to_string(),
+            enabled,
+            pricing_plan_arn,
+            last_modified_time_millis: now,
+        };
+        if self
+            .billing_transfer_preferences
+            .insert(arn.to_string(), record.clone())
+            .is_none()
+        {
+            self.billing_transfer_preference_order.push_back(arn.to_string());
+        }
+        while self.billing_transfer_preference_order.len() > MAX_BILLING_TRANSFER_PREFERENCES {
+            if let Some(oldest) = self.billing_transfer_preference_order.pop_front() {
+                self.billing_transfer_preferences.remove(&oldest);
+                // The eviction is the ONE thing about this store a caller cannot see in
+                // a response (the forgotten transfer reads back as "never set"), so it
+                // is logged rather than silent. Only the transfer's ARN, which the
+                // caller itself supplied, never a secret.
+                ::tracing::warn!(
+                    responsibility_transfer_arn = %oldest,
+                    cap = MAX_BILLING_TRANSFER_PREFERENCES,
+                    "the oldest billing transfer preference was forgotten at the store's cap"
+                );
+            }
+        }
+        record
+    }
+
+    /// The billing transfers whose ENABLED preference names the pricing plan `plan_arn`:
+    /// "While a pricing plan is specified in an enabled preference, you can't delete
+    /// that pricing plan" (`UpdateBillingTransferPreference`'s own documentation), the
+    /// case `ConflictExceptionReason` names
+    /// `PRICING_PLAN_REFERENCED_BY_PREFERENCE_DELETE_CONFLICT`.
+    ///
+    /// A disabled preference names no plan at all, so only the enabled ones can hold a
+    /// plan back. Stored plan ARNs are normalised
+    /// ([`normalize_pricing_plan_arn`]), so one plan has exactly one spelling here.
+    pub fn billing_transfer_preferences_referencing_pricing_plan(
+        &self,
+        plan_arn: &str,
+    ) -> Vec<String> {
+        self.billing_transfer_preferences
+            .values()
+            .filter(|record| record.enabled && record.pricing_plan_arn.as_deref() == Some(plan_arn))
+            .map(|record| record.responsibility_transfer_arn.clone())
+            .collect()
+    }
+
+    /// Whether the billing transfer `arn` names is one of THIS organization's.
+    ///
+    /// A billing transfer is an AWS Organizations resource and its ARN carries the
+    /// management account of the organization that owns it
+    /// ([`responsibility_transfer_owner_account`]). Billing Conductor's control plane is
+    /// the payer (management) account's alone, so the one organization this store can
+    /// answer for is the one whose management account it records as the payer
+    /// ([`Self::payer_account_id`]): an ARN owned by any other account names a transfer
+    /// this organization does not have.
+    ///
+    /// Fails CLOSED, like the authorization gate: a store that records no payer account
+    /// records no organization, so it owns no transfer.
+    pub fn transfer_belongs_to_this_organization(&self, arn: &str) -> bool {
+        match (
+            self.payer_account_id.as_deref(),
+            responsibility_transfer_owner_account(arn),
+        ) {
+            (Some(management), Some(owner)) => management == owner,
+            _ => false,
         }
     }
 
@@ -1116,6 +1257,18 @@ fn idempotency_key(operation: &str, token: &str) -> String {
 /// a caller replaying a token it used long ago creates a new resource instead of
 /// growing this map without limit.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = 1024;
+
+/// How many billing transfer preferences this service remembers.
+///
+/// A CHOSEN bound, not an AWS limit: a billing transfer is an AWS Organizations
+/// resource this API never creates, so the set of transfer ARNs a caller may set a
+/// preference for is bounded by nothing this store can see. `UpdateBillingTransferPreference`
+/// models no `ServiceLimitExceededException`, so a set past the cap is not refused:
+/// the oldest-SET preference is forgotten, exactly as the idempotency index forgets its
+/// oldest token ([`MAX_IDEMPOTENCY_TOKENS`]). A forgotten preference reads back as
+/// "never set" — the same answer the store gave for that transfer before anybody set
+/// one — and only a write ever evicts, so no read changes what a later caller sees.
+pub const MAX_BILLING_TRANSFER_PREFERENCES: usize = 1000;
 
 /// How many released (`UNMONITORED`) linked accounts this service remembers.
 ///
