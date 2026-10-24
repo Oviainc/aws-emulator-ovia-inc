@@ -6,6 +6,11 @@
 //! its `LastUpdatedTime`. The notifications, subscribers and tags attached to the
 //! budget are untouched — they have their own operations.
 //!
+//! "You can change every part of a budget except for the `budgetName` and the
+//! `calculatedSpend`": the members whose values the service derives from the cost it
+//! tracks are NOT taken from the request, on this path exactly as on the create path —
+//! `crate::state::stamp_service_owned` discards whatever `NewBudget` carried for them.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
