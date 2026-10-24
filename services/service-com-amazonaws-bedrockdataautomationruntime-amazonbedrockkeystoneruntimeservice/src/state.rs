@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Blueprint, DataAutomationConfiguration, EncryptionConfiguration, NotificationConfiguration, Tag,
+    AssetProcessingConfiguration, Blueprint, DataAutomationConfiguration, EncryptionConfiguration,
+    NotificationConfiguration, Tag, TimestampSegment, VideoSegmentConfiguration,
 };
 
 /// The region every ARN this service mints falls back to when the request carries no
@@ -217,6 +218,52 @@ pub fn extraction_target_refusal(
     }
 }
 
+/// The timestamp segment a submission delimited, or `None` when it delimited no segment.
+///
+/// The member is four optional levels deep
+/// (`assetProcessingConfiguration.video.segmentConfiguration.timestampSegment`, with the
+/// third level a union), so the walk down to it lives here once rather than in every
+/// caller that wants the requested processing scope.
+pub fn requested_timestamp_segment(
+    asset_processing_configuration: Option<&AssetProcessingConfiguration>,
+) -> Option<&TimestampSegment> {
+    match asset_processing_configuration?
+        .video
+        .as_ref()?
+        .segment_configuration
+        .as_ref()?
+    {
+        VideoSegmentConfiguration::timestampSegment(segment) => Some(segment),
+    }
+}
+
+/// Why a submission that delimits a segment whose end does not follow its start is
+/// refused.
+///
+/// This service's own fixed string, on the same footing as
+/// [`MISSING_PROJECT_OR_BLUEPRINTS`]: it carries NOTHING from the request, and what a
+/// client branches on is the HTTP 400 and the `ValidationException` code.
+pub const INCONSISTENT_TIMESTAMP_SEGMENT: &str =
+    "endTimeMillis must be greater than startTimeMillis in the requested timestamp segment.";
+
+/// The refusal a submission's requested processing scope earns, or `None` when it is
+/// acceptable.
+///
+/// A timestamp segment delimits a half-open interval of the asset, so its end has to lie
+/// after its start; a segment whose `endTimeMillis` does not follow its `startTimeMillis`
+/// delimits nothing the service could process. The model bounds each member on its own
+/// (`startTimeMillis` `@range(min: 0)`, `endTimeMillis` `@range(min: 300000)`) and no
+/// Smithy trait relates one member to another, so this cross-member rule is the
+/// service's — stated here, beside the other one
+/// ([`extraction_target_refusal`]), and applied before anything is minted so a refused
+/// submission leaves no record behind.
+pub fn timestamp_segment_refusal(
+    asset_processing_configuration: Option<&AssetProcessingConfiguration>,
+) -> Option<&'static str> {
+    let segment = requested_timestamp_segment(asset_processing_configuration)?;
+    (segment.end_time_millis <= segment.start_time_millis).then_some(INCONSISTENT_TIMESTAMP_SEGMENT)
+}
+
 /// What this service answers when a caller-supplied ARN names no retained invocation —
 /// the one message behind `ResourceNotFoundException` for every operation here that
 /// resolves an ARN (`GetDataAutomationStatus`, `TagResource`, `ListTagsForResource`,
@@ -279,6 +326,12 @@ pub struct Invocation {
     pub invocation_id: String,
     /// `inputConfiguration.s3Uri` as submitted.
     pub input_s3_uri: String,
+    /// `inputConfiguration.assetProcessingConfiguration` as submitted: the processing
+    /// scope this job was asked to work on, and `None` when the submission asked for the
+    /// whole asset. Retained so the accepted job's scope is part of its record rather
+    /// than being dropped at the handler boundary — reach the segment it delimits through
+    /// [`Invocation::requested_timestamp_segment`].
+    pub asset_processing_configuration: Option<AssetProcessingConfiguration>,
     /// `outputConfiguration.s3Uri` as submitted; what `GetDataAutomationStatus`
     /// reports as its `outputConfiguration`.
     pub output_s3_uri: String,
@@ -328,6 +381,7 @@ impl Invocation {
             invocation_arn,
             invocation_id,
             input_s3_uri,
+            asset_processing_configuration: None,
             output_s3_uri,
             data_automation_project_arn: None,
             stage: None,
@@ -399,6 +453,12 @@ impl Invocation {
         let completion = self.job_completion_time?;
         let elapsed = completion.duration_since(self.job_submission_time).ok()?;
         i32::try_from(elapsed.as_secs()).ok()
+    }
+
+    /// The timestamp segment this job was submitted with, or `None` when it was
+    /// submitted without one (the whole asset).
+    pub fn requested_timestamp_segment(&self) -> Option<&TimestampSegment> {
+        requested_timestamp_segment(self.asset_processing_configuration.as_ref())
     }
 
     /// The tag map as the modelled `list<Tag>`, in tag-key order.
