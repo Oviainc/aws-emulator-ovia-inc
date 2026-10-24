@@ -216,6 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = deployment.name.clone();
         let workload_name = deployment.workload_name.clone();
         let pattern_name = deployment.pattern_name.clone();
+        // The versions this deployment deploys right now, read off its own record: a
+        // version member the request leaves out is a version the update does not
+        // change, so these are what it keeps.
+        let deployed_workload_version = deployment.workload_version_name.clone();
+        let deployed_pattern_version = deployment.pattern_version_name.clone();
 
         // The settings are judged against the specification schema of the pattern this
         // deployment deploys, which is also where its versions come from.
@@ -233,7 +238,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A version the caller names has to be one the catalogue holds for this
         // deployment's workload and pattern: naming one it does not is a resource that
-        // cannot be found rather than a setting that is merely odd. Both messages are
+        // cannot be found rather than a setting that is merely odd. A pattern publishes
+        // several versions, so ANY of them is a version this deployment can be moved
+        // onto — the same published list `GetDeploymentPatternVersion` reports from, so
+        // a version a caller can read is a version it can ask for. Both messages are
         // the fixed, identifier-free ones a catalogue lookup carries, so the version
         // asked about is not reflected back.
         if input
@@ -251,7 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input
             .deployment_pattern_version_name
             .as_ref()
-            .is_some_and(|requested| *requested != pattern.pattern_version_name)
+            .is_some_and(|requested| pattern.version(requested).is_none())
         {
             return Err(UpdateDeploymentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -262,16 +270,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let warnings = crate::state::specification_warnings(pattern, &specifications);
         // A version the caller did not name is the one the deployment already deploys,
-        // which is why the record carries it. Cloned out of the catalogue borrow so the
-        // store can be written to below.
+        // which is why the record carries it: an update applies SETTINGS, and leaves the
+        // version it was not asked to move alone.
         let workload_version_name = input
             .workload_version_name
             .clone()
-            .unwrap_or_else(|| pattern.workload_version_name.clone());
+            .unwrap_or(deployed_workload_version);
         let pattern_version_name = input
             .deployment_pattern_version_name
             .clone()
-            .unwrap_or_else(|| pattern.pattern_version_name.clone());
+            .unwrap_or(deployed_pattern_version);
 
         // `force` applies the update "even if validation warnings are present"; without
         // it, those warnings are what the request is refused with.
