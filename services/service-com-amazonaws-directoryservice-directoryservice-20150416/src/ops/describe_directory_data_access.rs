@@ -159,10 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
             DescribeDirectoryDataAccessErrorModeled::DirectoryDoesNotExistException(
-                DirectoryDoesNotExistException {
-                    message: Some(crate::state::no_such_directory(&input.directory_id)),
-                    request_id: None,
-                },
+                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
             )
         })?;
 

@@ -22,12 +22,19 @@
 //! * [`encode_cursor`] / [`decode_cursor`], the opaque `NextToken` the paginated
 //!   operations of this slice (`DescribeDirectories`, `DescribeSnapshots`,
 //!   `ListTagsForResource`) issue and resolve.
+//! * [`refusal`], the one place a modelled refusal of this service is built: every error
+//!   shape the model declares carries a `Message` and a UUID-shaped `RequestId`, and this
+//!   is what mints the call's id, reports it in that member and appends it to the message
+//!   — so no handler can answer a refusal without the correlation handle a client logs it
+//!   by. [`invalid_resource_id`] and [`invalid_next_token`] are the two diagnostics a
+//!   whole family of operations shares, worded once here beside [`no_such_directory`].
 //!
 //! The administrator `Password` `CreateDirectory` is called with is deliberately NOT a
 //! field here: the model marks it `@sensitive`, no operation reports it back, and state
 //! this emulator does not need is state it must not hold.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -143,13 +150,43 @@ const ACCESS_URL_SUFFIX: &str = ".awsapps.com";
 /// modelled `NetworkType` enum, `IPv6`, is therefore refused for this directory type.
 pub const SIMPLE_AD_NETWORK_TYPES: [&str; 2] = ["IPv4", "Dual-stack"];
 
-/// Directory Service's default quota of 10 directories per account per Region, the
-/// bound `DirectoryLimitExceededException` reports. Every create in this slice
-/// (`CreateDirectory`, `CreateMicrosoftAD`) counts against it, so the Region holds at
-/// most this many directories whatever their type — which is why it is also the limit
-/// `GetDirectoryLimits` reports for each counter of the modelled `DirectoryLimits`
-/// structure: there is ONE allowance here, and each counter is a view of it.
-pub const MAX_DIRECTORIES: usize = 10;
+/// Directory Service's default quota of Simple AD directories per account per Region,
+/// which `CreateDirectory` draws on.
+///
+/// From the Directory Service quotas the service publishes — "Simple AD directories:
+/// 10" per Region — which is also the limit `GetDirectoryLimits` reports as
+/// `CloudOnlyDirectoriesLimit` ("The maximum number of cloud directories allowed in the
+/// Region").
+pub const MAX_CLOUD_ONLY_DIRECTORIES: usize = 10;
+
+/// Directory Service's default quota of AWS Managed Microsoft AD directories per account
+/// per Region, which `CreateMicrosoftAD` draws on.
+///
+/// From the same published quotas — "AWS Managed Microsoft AD directories: 20" per
+/// Region — which is the limit `GetDirectoryLimits` reports as
+/// `CloudOnlyMicrosoftADLimit` ("The maximum number of Managed Microsoft AD directories
+/// allowed in the region"). It is DOUBLE the Simple AD allowance: each category of
+/// directory carries its own quota, so no counter of the modelled `DirectoryLimits` can
+/// be reported from another's.
+pub const MAX_CLOUD_ONLY_MICROSOFT_AD_DIRECTORIES: usize = 20;
+
+/// Directory Service's default quota of AD Connector directories per account per Region,
+/// which `ConnectDirectory` (still scaffolded) would draw on.
+///
+/// From the same published quotas — "AD Connector directories: 10" per Region — which is
+/// the limit `GetDirectoryLimits` reports as `ConnectedDirectoriesLimit` ("The maximum
+/// number of connected directories allowed in the Region").
+pub const MAX_CONNECTED_DIRECTORIES: usize = 10;
+
+/// The most directories one Region can hold at once, whatever their type: the three
+/// published per-category quotas together.
+///
+/// NOT a quota of its own — every create counts against ITS OWN category's quota
+/// ([`DirectoryLimitCategory::quota`]) — but the ceiling of the directory store, and so
+/// the figure the resource guards derived from that store's size are sized against.
+pub const MAX_DIRECTORIES: usize = MAX_CLOUD_ONLY_DIRECTORIES
+    + MAX_CLOUD_ONLY_MICROSOFT_AD_DIRECTORIES
+    + MAX_CONNECTED_DIRECTORIES;
 
 /// Which of the three counters the modelled `DirectoryLimits` structure carries a
 /// stored directory counts towards, decided by its `DirectoryType`.
@@ -179,6 +216,17 @@ impl DirectoryLimitCategory {
             TYPE_MICROSOFT_AD => Some(Self::CloudOnlyMicrosoftAd),
             TYPE_AD_CONNECTOR => Some(Self::Connected),
             _ => None,
+        }
+    }
+
+    /// This category's own published Region quota: the limit `GetDirectoryLimits`
+    /// reports for its counter, and the bound a create of that category is refused past
+    /// with `DirectoryLimitExceededException`.
+    pub fn quota(self) -> usize {
+        match self {
+            Self::CloudOnly => MAX_CLOUD_ONLY_DIRECTORIES,
+            Self::CloudOnlyMicrosoftAd => MAX_CLOUD_ONLY_MICROSOFT_AD_DIRECTORIES,
+            Self::Connected => MAX_CONNECTED_DIRECTORIES,
         }
     }
 }
@@ -303,9 +351,10 @@ pub const MAX_TOPIC_NAMES_PER_REQUEST: usize = 100;
 /// NOT an AWS quota: a resource guard. An alias "cannot be deleted or reused", so an
 /// entry outlives the directory it was created for and the index is the one store here
 /// that a caller can grow without deleting anything (create, alias, delete, repeat).
-/// Ten times [`MAX_DIRECTORIES`] is far more reservations than a Region's worth of
-/// directories can hold at once; past it `CreateAlias` is refused.
-pub const MAX_RESERVED_ALIASES: usize = 10 * MAX_DIRECTORIES;
+/// Stated as its own figure rather than derived from a quota, so it does not move when a
+/// published per-category quota does: it is well above the [`MAX_DIRECTORIES`]
+/// directories a Region can hold at once, and past it `CreateAlias` is refused.
+pub const MAX_RESERVED_ALIASES: usize = 100;
 
 /// The most `DirectoryIds` entries a single `DescribeDirectories` will resolve.
 ///
@@ -1051,35 +1100,62 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     ///
     /// Every member is derived rather than stored. Each of the three counters the
     /// structure carries — cloud-only, cloud-only Managed Microsoft AD, connected —
-    /// reports its own current count, [`Self::directories_in_category`] of that
-    /// [`DirectoryLimitCategory`]. The limit each reports is [`MAX_DIRECTORIES`], the
-    /// Region's one directory allowance that every create here draws on whatever the
-    /// directory's type, and the `...LimitReached` flags ("Indicates if the … limit has
-    /// been reached") are that allowance being used up — so the report says exactly when
-    /// a further create is refused with `DirectoryLimitExceededException`, which is what
-    /// that error's own documentation points at this operation for.
+    /// reports ITS OWN category's figures: [`Self::directories_in_category`] of that
+    /// [`DirectoryLimitCategory`] as the current count, that category's published
+    /// Region quota ([`DirectoryLimitCategory::quota`]) as the limit, and the
+    /// `...LimitReached` flag ("Indicates if the … limit has been reached") as the
+    /// comparison of the two — so the report says exactly when a further create of that
+    /// category is refused with `DirectoryLimitExceededException`, which is what that
+    /// error's own documentation points at this operation for.
     pub fn directory_limits(&self) -> DirectoryLimits {
-        let limit = clamp_to_i32(MAX_DIRECTORIES);
-        let limit_reached = self.directories.len() >= MAX_DIRECTORIES;
-        let count_in = |category| clamp_to_i32(self.directories_in_category(category));
+        let cloud_only = self.category_report(DirectoryLimitCategory::CloudOnly);
+        let microsoft_ad = self.category_report(DirectoryLimitCategory::CloudOnlyMicrosoftAd);
+        let connected = self.category_report(DirectoryLimitCategory::Connected);
         DirectoryLimits {
-            cloud_only_directories_limit: Some(limit),
-            cloud_only_directories_current_count: Some(count_in(
-                DirectoryLimitCategory::CloudOnly,
-            )),
-            cloud_only_directories_limit_reached: limit_reached,
-            cloud_only_microsoft_ad_limit: Some(limit),
-            cloud_only_microsoft_ad_current_count: Some(count_in(
-                DirectoryLimitCategory::CloudOnlyMicrosoftAd,
-            )),
-            cloud_only_microsoft_ad_limit_reached: limit_reached,
-            connected_directories_limit: Some(limit),
-            connected_directories_current_count: Some(count_in(
-                DirectoryLimitCategory::Connected,
-            )),
-            connected_directories_limit_reached: limit_reached,
+            cloud_only_directories_limit: Some(cloud_only.limit),
+            cloud_only_directories_current_count: Some(cloud_only.current_count),
+            cloud_only_directories_limit_reached: cloud_only.limit_reached,
+            cloud_only_microsoft_ad_limit: Some(microsoft_ad.limit),
+            cloud_only_microsoft_ad_current_count: Some(microsoft_ad.current_count),
+            cloud_only_microsoft_ad_limit_reached: microsoft_ad.limit_reached,
+            connected_directories_limit: Some(connected.limit),
+            connected_directories_current_count: Some(connected.current_count),
+            connected_directories_limit_reached: connected.limit_reached,
         }
     }
+
+    /// One counter of [`Self::directory_limits`]: the category's own quota, how many
+    /// stored directories fall in it, and whether the quota is used up.
+    fn category_report(&self, category: DirectoryLimitCategory) -> CategoryReport {
+        let count = self.directories_in_category(category);
+        let quota = category.quota();
+        CategoryReport {
+            limit: clamp_to_i32(quota),
+            current_count: clamp_to_i32(count),
+            limit_reached: count >= quota,
+        }
+    }
+
+    /// Whether a further directory of `category` can be created: that category's own
+    /// published quota against how many of it the store already holds. The one place a
+    /// create decides whether it is past the quota, so the bound a create is refused at
+    /// and the bound `GetDirectoryLimits` reports reached cannot drift apart.
+    pub fn category_limit_reached(&self, category: DirectoryLimitCategory) -> bool {
+        self.directories_in_category(category) >= category.quota()
+    }
+}
+
+/// One counter of the modelled `DirectoryLimits`, as
+/// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::category_report`]
+/// derives it.
+#[derive(Debug, Clone, Copy)]
+struct CategoryReport {
+    /// The category's published Region quota.
+    limit: i32,
+    /// How many stored directories fall in the category.
+    current_count: i32,
+    /// Whether the quota is used up.
+    limit_reached: bool,
 }
 
 /// A count as the modelled `Limit` integer, which is 32 bits wide: every count a
@@ -1134,17 +1210,181 @@ pub fn as_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
 }
 
+/// The source of every request id this service reports.
+///
+/// Process-wide rather than a field of the state struct on purpose: a REPORTING
+/// operation reports a request id too when it refuses a call, and a read must not write
+/// to the store it reports on.
+static MINTED_REQUEST_IDS: AtomicU64 = AtomicU64::new(1);
+
+/// A fresh id for the call being answered, shaped the way the modelled `RequestId`
+/// demands.
+///
+/// Every error structure in this service's model carries a `RequestId` whose `@pattern`
+/// is `^([A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12})$`
+/// (`smithy_query(query="shape",shape="EntityDoesNotExistException")`), so the value is
+/// rendered as an RFC 4122 version-4 UUID. Its low field is a monotonic counter rather
+/// than randomness, so the id is unique for the life of the process without being
+/// derived from the request: two identical calls are answered with two different ids,
+/// and no id is ever reused.
+pub fn next_request_id() -> String {
+    let minted = MINTED_REQUEST_IDS.fetch_add(1, Ordering::Relaxed);
+    format!("00000000-0000-4000-8000-{minted:012x}")
+}
+
+/// `message` with the request-id suffix Directory Service appends to the diagnostic of
+/// every refusal: `… : RequestId: <id>`.
+///
+/// A recorded ds refusal carries its request id TWICE — in the modelled `RequestId`
+/// member and at the end of `Message` — so the two are built together in [`refusal`] and
+/// no handler can report one without the other.
+fn with_request_id(message: &str, request_id: &str) -> String {
+    format!("{message} : RequestId: {request_id}")
+}
+
+/// One of this service's modelled error structures.
+///
+/// Every error shape Directory Service models carries the same two members — `Message`
+/// and the UUID-shaped `RequestId` — and the macro below implements this for each of
+/// them, so [`refusal`] is the single place either member is ever filled.
+pub trait ModeledFailure: Sized {
+    /// The structure carrying `message` and `request_id`.
+    fn from_parts(message: String, request_id: String) -> Self;
+}
+
+/// Implement [`ModeledFailure`] for each named error shape of this service's model.
+macro_rules! modeled_failures {
+    ($($error:ident),+ $(,)?) => {
+        $(
+            impl ModeledFailure for crate::ops::types::$error {
+                fn from_parts(message: String, request_id: String) -> Self {
+                    Self {
+                        message: Some(message),
+                        request_id: Some(request_id),
+                    }
+                }
+            }
+        )+
+    };
+}
+
+modeled_failures!(
+    ADAssessmentLimitExceededException,
+    AccessDeniedException,
+    AuthenticationFailedException,
+    CertificateDoesNotExistException,
+    ClientException,
+    DirectoryAlreadySharedException,
+    DirectoryDoesNotExistException,
+    DirectoryInDesiredStateException,
+    DirectoryLimitExceededException,
+    DirectoryUnavailableException,
+    EntityAlreadyExistsException,
+    EntityDoesNotExistException,
+    InsufficientPermissionsException,
+    InvalidClientAuthStatusException,
+    InvalidLDAPSStatusException,
+    InvalidNextTokenException,
+    InvalidParameterException,
+    InvalidTargetException,
+    IpRouteLimitExceededException,
+    NoAvailableCertificateException,
+    ServiceException,
+    SnapshotLimitExceededException,
+    TagLimitExceededException,
+    UnsupportedOperationException,
+);
+
+/// Refuse the call with one of this service's modelled errors, `message` as its
+/// diagnostic.
+///
+/// THE one place a ds refusal is built: it mints the call's request id
+/// ([`next_request_id`]), reports it in the modelled `RequestId` member and appends it
+/// to the message ([`with_request_id`]), so no refusal leaves this service without the
+/// correlation handle an AWS client, an SDK retry log or a support workflow reads a
+/// failed call by. WHICH error is refused is the error-enum variant the value is
+/// constructed into, so a handler names it exactly where it did before.
+pub fn refusal<E: ModeledFailure>(message: impl Into<String>) -> E {
+    let request_id = next_request_id();
+    E::from_parts(with_request_id(&message.into(), &request_id), request_id)
+}
+
+/// Refuse the call with one of this service's modelled errors, where the diagnostic
+/// ITSELF ends with the call's request-id suffix and the envelope's own suffix follows
+/// it.
+///
+/// Only the tag family's diagnostic ([`invalid_resource_id`]) is recorded that way,
+/// while every other family's carries the suffix once ([`refusal`]): the inner suffix
+/// belongs to the layer that produces that family's text, which has already appended the
+/// id by the time the envelope appends its own. Both occurrences are the id of THIS
+/// call, the one the modelled `RequestId` member reports, so the message still carries
+/// exactly one correlation handle.
+///
+/// The recorded body is where the doubling comes from, verbatim from the wire corpus's
+/// `AddTagsToResource` refusal of an absent resource id (fixture
+/// `ds-tags-error-paths-fake-directory#task#1`):
+///
+/// ```text
+/// HTTP 400; EntityDoesNotExistException: Invalid resource ID. : RequestId:
+/// f4a44547-8d53-4939-9c8a-7fc6f361d17a : RequestId: f4a44547-8d53-4939-9c8a-7fc6f361d17a
+/// ```
+///
+/// The issue report that filed this quotes the same message with ONE suffix, which is an
+/// abbreviation of that body: a single-suffix message replays as a divergence on
+/// `$.Message` for all three tag operations, and the doubled one replays clean. Should a
+/// later recording show the single form, this function and the test row that pins it go
+/// away in favour of plain [`refusal`] rather than growing a second exception.
+fn refusal_restating_its_request_id<E: ModeledFailure>(diagnostic: &str) -> E {
+    let request_id = next_request_id();
+    let stated = with_request_id(diagnostic, &request_id);
+    E::from_parts(with_request_id(&stated, &request_id), request_id)
+}
+
 /// The `EntityDoesNotExistException` message for an id that names no stored directory.
 /// Shared so every operation that resolves a directory says the same thing about the
 /// same failure.
 ///
 /// The wording follows Directory Service's own: the quoted id the request asked for,
 /// then "does not exist." — so the message is built from the request and names what the
-/// caller has to fix. The request id AWS appends to it is per-run and this emulator
-/// mints none, so none is invented here.
+/// caller has to fix, and nothing else. [`refusal`] appends the request id, once.
 pub fn no_such_directory(directory_id: &str) -> String {
     format!("Directory: '{directory_id}' does not exist.")
 }
+
+/// The `EntityDoesNotExistException` the tag API answers for a `ResourceId` that names
+/// no taggable resource.
+///
+/// `AddTagsToResource` / `ListTagsForResource` / `RemoveTagsFromResource` take a
+/// `ResourceId`, not a `DirectoryId`, and the recorded refusal of a well-formed but
+/// absent one is the tag family's own diagnostic: it says the id is not a resource this
+/// service can tag, and QUOTES NO ID — unlike the directory-lookup family
+/// ([`no_such_directory`]), which names the id it could not resolve. The two families
+/// are what a caller tells "the id you passed is not a taggable resource id" from "this
+/// directory is gone" by, so they must not be collapsed into one template.
+///
+/// Built through [`refusal_restating_its_request_id`]: the recorded refusal of all three
+/// operations carries the call's id in the message twice.
+pub fn invalid_resource_id<E: ModeledFailure>() -> E {
+    refusal_restating_its_request_id(INVALID_RESOURCE_ID)
+}
+
+/// The refusal of a `NextToken` this service did not issue, or issued for another
+/// listing.
+///
+/// The diagnostic is `InvalidNextTokenException`'s own documented sentence
+/// (`smithy_query(query="shape",shape="InvalidNextTokenException")`: "The `NextToken`
+/// value is not valid."), with the family-wide request-id suffix [`refusal`] appends.
+/// The recorded text of this particular refusal is withheld by the corpus, so the
+/// sentence stated here is the model's own rather than a recorded one. The error SHAPE
+/// is the variant the caller constructs this into, because not every paginated operation
+/// of this service models `InvalidNextTokenException` for it.
+pub fn invalid_next_token<E: ModeledFailure>() -> E {
+    refusal(INVALID_NEXT_TOKEN)
+}
+
+/// The tag family's diagnostic, without either request-id suffix: see
+/// [`invalid_resource_id`], which is what builds the refusal.
+const INVALID_RESOURCE_ID: &str = "Invalid resource ID.";
 
 /// The ARN of the Amazon SNS topic named `topic_name` in `region`.
 ///
@@ -1168,13 +1408,6 @@ pub fn region_from_request(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The `DirectoryDoesNotExistException` message for an id that names no directory in
-/// `region` — either because nothing was ever created under it, or because the
-/// directory it names lives in other Regions only.
-pub fn no_such_directory_in_region(directory_id: &str, region: &str) -> String {
-    format!("Directory: '{directory_id}' does not exist in {region}.")
-}
-
 /// The `EntityDoesNotExistException` message for an id that names no stored snapshot.
 /// Shared so every operation that resolves a snapshot says the same thing about the
 /// same failure.
@@ -1185,14 +1418,15 @@ pub fn no_such_snapshot(snapshot_id: &str) -> String {
 /// The `EntityDoesNotExistException` message for an id that names no stored assessment.
 ///
 /// It names the member and the id the request sent, the way Directory Service's own
-/// message for this failure does, so the caller can tell which id was rejected. The
-/// request id Directory Service appends to its messages is per-run and is not
-/// fabricated here; it has its own modelled member.
+/// message for this failure does, so the caller can tell which id was rejected.
+/// [`refusal`] appends the request id.
 pub fn no_such_assessment(assessment_id: &str) -> String {
     format!("Assessment Id {assessment_id} does not exist.")
 }
 
-/// The `InvalidNextTokenException` message for a token this service did not issue.
+/// The `InvalidNextTokenException` diagnostic for a token this service did not issue:
+/// the sentence the error shape's own documentation states, which [`invalid_next_token`]
+/// is what refuses the call with.
 pub const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid.";
 
 /// What a handler answers when [`service_state`] cannot reach this service's store.
