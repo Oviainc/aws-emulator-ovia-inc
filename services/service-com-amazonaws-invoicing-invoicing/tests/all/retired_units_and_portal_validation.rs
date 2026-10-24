@@ -1070,8 +1070,9 @@ async fn every_declared_procurement_portal_name_is_accepted_and_enumerated() {
 
 /// RULE: a create whose `Name` is already taken by an invoice unit that EXISTS is
 /// refused with the service's duplicate-name `ValidationException`, whose message
-/// states the service's template over the requested name — so the name is recoverable
-/// from the message by that same rule.
+/// states the service's template over the requested name — the name enclosed in angle
+/// brackets — so the name is recoverable from the message by those delimiters whatever
+/// characters it contains.
 #[tokio::test]
 async fn a_duplicate_name_is_refused_with_the_services_template() {
     let router = emulator();
@@ -1103,7 +1104,7 @@ async fn a_duplicate_name_is_refused_with_the_services_template() {
         );
         assert_eq!(
             error_message(&body),
-            format!("Invoice Unit already exists with name: {name}"),
+            format!("Invoice Unit already exists with name: <{name}>"),
             "case {name:?}: expected the service's duplicate-name template, got {body}"
         );
         assert_eq!(
@@ -1111,9 +1112,14 @@ async fn a_duplicate_name_is_refused_with_the_services_template() {
             Some("duplicateInvoiceUnit"),
             "case {name:?}: expected the modelled duplicateInvoiceUnit reason, got {body}"
         );
-        // The name is recoverable from the message by the same rule that built it.
+        // The name is recoverable from the message by the delimiters that built it.
+        let message = error_message(&body);
+        let delimited = message
+            .split_once('<')
+            .and_then(|(_, tail)| tail.rsplit_once('>'))
+            .map(|(name, _)| name.to_string());
         assert_eq!(
-            error_message(&body).split_once(": ").map(|(_, tail)| tail),
+            delimited.as_deref(),
             Some(name),
             "case {name:?}: the requested name must be readable out of the message, got {body}"
         );
