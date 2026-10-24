@@ -2,9 +2,10 @@
 
 //! @op UpdateCluster
 //!
-//! Applies the members a request supplies to a stored cluster, which a later
-//! `DescribeCluster` observes, while that cluster's `ClusterState` is still
-//! `AwaitingQuorum`. A member the request omits is left as it was.
+//! Applies the members a request supplies to a stored cluster and to the node jobs that
+//! cluster already holds, which a later `DescribeCluster` and `DescribeJob` observe, while
+//! that cluster's `ClusterState` is still `AwaitingQuorum`. A member the request omits is
+//! left as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -234,12 +235,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The cluster is the only record this operation writes. A node job created for the
-        // cluster inherits the cluster's attributes at the instant it is created
-        // (`CreateJobRequest$ClusterId`), so a node created after this update carries the
-        // updated values while one created before it keeps what it inherited, which is
-        // what `UpdateJob` is for.
+        // A cluster's node jobs carry the cluster's attributes rather than copies of their
+        // own: "you need to provide only this clusterId value. The other job attributes are
+        // inherited from the cluster" (`CreateJobRequest$ClusterId`), and `ClusterMetadata`
+        // models ONE address and ONE shipping speed for the whole cluster, so every device
+        // the cluster orders is delivered to that one address at that one speed. Updating
+        // the cluster therefore updates the whole order: the attributes reach the node jobs
+        // the cluster already holds too — each node that is itself still within its own
+        // update window — exactly as updating an export order's main job reaches its job
+        // parts. A node job created after this one reads the same values when it inherits
+        // them at creation time.
         apply_update(cluster, &input);
+        let node_job_ids = cluster.node_job_ids.clone();
+        for job_id in node_job_ids {
+            if let Some(job) = store.jobs.get_mut(&job_id) {
+                if job.job_state.is_updatable() {
+                    apply_update_to_node(job, &input);
+                }
+            }
+        }
 
         Ok(UpdateClusterOutput {})
     }
@@ -278,5 +292,41 @@ fn apply_update(cluster: &mut crate::state::StoredCluster, input: &UpdateCluster
     }
     if let Some(configuration) = &input.on_device_service_configuration {
         cluster.on_device_service_configuration = Some(configuration.clone());
+    }
+}
+
+/// Apply the members this request supplied to `job`, one of the updated cluster's node
+/// jobs, leaving every member it omitted as it was.
+///
+/// The members `UpdateClusterRequest` models are the cluster's own, and a node job holds the
+/// cluster's attributes, so each one the request names lands on the node as it lands on the
+/// cluster. The members only a job has — the device it is configured with, its impact level,
+/// its pickup details, the long-term pricing it is associated with, its capacity preference
+/// — are not the cluster's and are what `UpdateJob` takes, so they are left alone here, as
+/// are the node's own id, state, unlock code and creation instant.
+fn apply_update_to_node(job: &mut crate::state::StoredJob, input: &UpdateClusterInput) {
+    if let Some(address_id) = &input.address_id {
+        job.address_id = Some(address_id.clone());
+    }
+    if let Some(forwarding_address_id) = &input.forwarding_address_id {
+        job.forwarding_address_id = Some(forwarding_address_id.clone());
+    }
+    if let Some(description) = &input.description {
+        job.description = Some(description.clone());
+    }
+    if let Some(role_arn) = &input.role_arn {
+        job.role_arn = Some(role_arn.clone());
+    }
+    if let Some(shipping_option) = &input.shipping_option {
+        job.shipping_option = Some(shipping_option.clone());
+    }
+    if let Some(notification) = &input.notification {
+        job.notification = Some(notification.clone());
+    }
+    if let Some(resources) = &input.resources {
+        job.resources = Some(resources.clone());
+    }
+    if let Some(configuration) = &input.on_device_service_configuration {
+        job.on_device_service_configuration = Some(configuration.clone());
     }
 }

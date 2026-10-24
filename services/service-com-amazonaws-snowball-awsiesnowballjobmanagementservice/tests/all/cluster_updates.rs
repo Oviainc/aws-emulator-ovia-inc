@@ -9,7 +9,8 @@
 //! later `DescribeCluster` reports the merged cluster; a request naming a cluster in any
 //! other state is refused with `InvalidJobStateException`, and one naming a cluster or an
 //! address no record answers to with `InvalidResourceException`, in both cases changing
-//! nothing.
+//! nothing. That the same members also land on the cluster's node jobs is the rule
+//! `cluster_node_updates` asserts.
 //!
 //! The rows differ along what the rule generalises over: which members the request carries
 //! (none, one, several, all of them), the enum value from the modelled catalog
@@ -112,14 +113,14 @@ pub(crate) fn base_cluster(address_id: &str) -> Value {
 
 /// Merge `update` over `expected`, which is what applying the update to the stored cluster
 /// must do: a named member replaces what was stored, an omitted one leaves it alone.
-fn merge(expected: &mut Value, update: &Value) {
+pub(crate) fn merge(expected: &mut Value, update: &Value) {
     for (member, value) in update.as_object().expect("the update is a JSON object") {
         expected[member] = value.clone();
     }
 }
 
 /// The body of an `UpdateCluster` call: the update's members plus the cluster it names.
-fn update_body(cluster_id: &str, update: &Value) -> Value {
+pub(crate) fn update_body(cluster_id: &str, update: &Value) -> Value {
     let mut body = update.clone();
     body["ClusterId"] = json!(cluster_id);
     body
@@ -128,7 +129,7 @@ fn update_body(cluster_id: &str, update: &Value) -> Value {
 /// Every update row: one per member `UpdateClusterRequest` models, one per value the
 /// modelled `ShippingOption` catalog admits, one at each published bound of `Description`,
 /// one carrying every updatable member at once, and one carrying none.
-fn update_rows(address_id: &str, alternate_address_id: &str) -> Vec<(String, Value)> {
+pub(crate) fn update_rows(address_id: &str, alternate_address_id: &str) -> Vec<(String, Value)> {
     let mut rows: Vec<(String, Value)> = vec![
         (
             "the cluster id alone, naming no member to change".to_string(),
@@ -239,7 +240,7 @@ fn update_rows(address_id: &str, alternate_address_id: &str) -> Vec<(String, Val
 }
 
 /// Assert `metadata` reports exactly what `submitted` asked for, for a cluster in `state`.
-fn assert_cluster_metadata_matches(metadata: &Value, submitted: &Value, state: &str, case: &str) {
+pub(crate) fn assert_cluster_metadata_matches(metadata: &Value, submitted: &Value, state: &str, case: &str) {
     assert_eq!(
         metadata.get("ClusterState").and_then(Value::as_str),
         Some(state),
@@ -625,9 +626,11 @@ async fn create_job_joins_a_cluster_until_it_holds_its_quorum() {
          got {first_node}"
     );
 
-    // A node job inherits the cluster's attributes at the instant it is created, so an
-    // update to the cluster reaches the nodes created after it and leaves the ones created
-    // before it as they were.
+    // A node job holds the cluster's attributes, so an update to the cluster reaches every
+    // node of it — the ones created after the update, which inherit the updated values, and
+    // the ones created before it, which the update is written onto. The whole rule is
+    // asserted over a table in `cluster_node_updates`; this row is the one this suite's
+    // node-by-node walk passes through.
     let update_case = "the cluster updated between two of its nodes";
     let update = json!({
         "Description": "the re-planned cluster",
@@ -658,9 +661,19 @@ async fn create_job_joins_a_cluster_until_it_holds_its_quorum() {
         );
     }
     let first_again = job_metadata(&router, &first_node_id, update_case).await;
+    for member in ["Description", "AddressId"] {
+        assert_eq!(
+            first_again.get(member),
+            update.get(member),
+            "case {update_case:?}: expected the node created before the update to report \
+             the updated {member}, got {first_again}"
+        );
+    }
     assert_eq!(
-        first_again, first_node,
-        "case {update_case:?}: updating the cluster changed a node job created before it"
+        first_again.get("CreationDate"),
+        first_node.get("CreationDate"),
+        "case {update_case:?}: updating the cluster changed when a node job was created, \
+         got {first_again} after {first_node}"
     );
 
     // The cluster is still awaiting its quorum until every node job exists, and takes no
