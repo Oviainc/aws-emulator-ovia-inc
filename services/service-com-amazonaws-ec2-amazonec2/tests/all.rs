@@ -108,6 +108,9 @@ mod network_performance_data;
 mod placement_groups;
 #[path = "all/principal_id_format.rs"]
 mod principal_id_format;
+// What `DeleteQueuedReservedInstances` deletes and what it reports per id.
+#[path = "all/queued_reserved_instances.rs"]
+mod queued_reserved_instances;
 #[path = "all/regions.rs"]
 mod regions;
 #[path = "all/resource_specific_error_codes.rs"]

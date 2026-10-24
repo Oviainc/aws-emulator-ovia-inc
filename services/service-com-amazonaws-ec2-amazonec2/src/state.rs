@@ -1340,6 +1340,22 @@ pub struct ComAmazonawsEc2Amazonec2State {
         String,
         crate::ops::types::LocalGatewayRouteTableVirtualInterfaceGroupAssociation,
     >,
+    /// Every Reserved Instance the account holds, by `ReservedInstancesId`, as the modelled
+    /// [`crate::ops::types::ReservedInstances`] shape itself — for the same reason
+    /// [`Self::vpcs`] holds [`Vpc`]s: every member a writer sets round-trips through a
+    /// describe without a field-by-field copy, and the shape is named by its path the way
+    /// the field above names its own. Ordered by id, the order a describe reports in.
+    ///
+    /// A *queued* purchase is one of these records in the `queued` state, so
+    /// `DeleteQueuedReservedInstances` works on this one store rather than on a second map
+    /// of its own, and the delete moves the record to `queued-deleted` instead of dropping
+    /// it — `queued-deleted` is a member of the modelled `ReservedInstanceState` enum, so a
+    /// describe still reports the cancelled purchase and a repeat delete can say it is no
+    /// longer queued. The record's id, the ceiling that bounds this map (nothing here
+    /// reclaims a record) and the form of a Reserved Instances id all live in
+    /// `crate::ops::delete_queued_reserved_instances`, the one operation that reaches this
+    /// store today; a second one belongs beside it there or, once two share them, here.
+    pub reserved_instances: BTreeMap<String, crate::ops::types::ReservedInstances>,
     /// Every Network Access Scope the account holds, by `NetworkInsightsAccessScopeId`, as
     /// the modelled [`NetworkInsightsAccessScope`] shape itself — see the module docs.
     /// Ordered by id, the stable order every reader of it reports in.
@@ -1709,6 +1725,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             verified_access_trust_providers: BTreeMap::new(),
             verified_access_trust_provider_client_tokens: HashMap::new(),
             local_gateway_route_table_virtual_interface_group_associations: BTreeMap::new(),
+            // A fresh account has bought nothing, so it holds no Reserved Instances.
+            reserved_instances: BTreeMap::new(),
             network_insights_access_scopes: BTreeMap::new(),
             network_insights_access_scope_analyses: BTreeMap::new(),
             network_insights_access_scope_analysis_client_tokens: HashMap::new(),
