@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAnswer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAnswer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAnswer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the answer to ONE question of ONE lens review of a workload.
+//!
+//! The answer is held on the workload under the lens's alias and the `QuestionId`
+//! ([`crate::state::WorkloadRecord::answers`]), and every member a read reports about it
+//! that the service itself computes — the question's `Risk`, its `SelectedChoices` — is
+//! DERIVED from what is recorded rather than stored beside it, so the next read of the
+//! answer, of the lens review's roll-up or of the workload's risk counts moves with this
+//! write.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +177,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAnswer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAnswerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAnswer"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAnswerErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // The lens as the request named it resolves to ONE ARN
+        // (`crate::state::...::lens_arn_of`, the one place this service resolves a lens's
+        // ARN); read before the workload is borrowed for writing, so the answer and the
+        // ARN come from one view of the store.
+        let lens_arn =
+            store.lens_arn_of(&input.lens_alias, &crate::state::request_region(ctx.parts()));
+
+        // The resource is resolved BEFORE the request's values are judged, so a request
+        // that names a workload, a lens review or a question that does not exist is
+        // answered with that 404 whatever else it carries.
+        let workload = store
+            .workloads
+            .get_mut(&input.workload_id)
+            .ok_or_else(|| {
+                UpdateAnswerErrorModeled::ResourceNotFoundException(
+                    crate::state::workload_not_found(&input.workload_id),
+                )
+            })?;
+
+        // The answers of a lens review exist only while that lens is associated with the
+        // workload, so a lens the workload does not carry has no review to answer in.
+        if !workload.reviews_lens(&input.lens_alias) {
+            return Err(UpdateAnswerErrorModeled::ResourceNotFoundException(
+                crate::state::lens_review_not_found(&input.workload_id, &input.lens_alias),
+            )
+            .into());
+        }
+
+        // A question belongs to the LENS under review: the answer this operation writes is
+        // the answer to one of the questions that lens asks, so a `QuestionId` it does not
+        // ask names no answer of this lens review.
+        let question = crate::state::lens_question(&input.lens_alias, &input.question_id)
+            .ok_or_else(|| {
+                UpdateAnswerErrorModeled::ResourceNotFoundException(
+                    crate::state::question_not_found(
+                        &input.workload_id,
+                        &input.lens_alias,
+                        &input.question_id,
+                    ),
+                )
+            })?;
+
+        // `AnswerReason` and `ChoiceStatus` / `ChoiceReason` are modelled enums, whose
+        // value sets the boundary does not enforce inside a map's values, so a value
+        // outside one is refused here rather than stored — through the one place this
+        // service words that refusal, shared with `UpdateReviewTemplateAnswer`.
+        if let Some(exception) = crate::state::answer_enum_refusal(
+            input.reason.as_deref(),
+            input.choice_updates.as_ref(),
+        ) {
+            return Err(UpdateAnswerErrorModeled::ValidationException(exception).into());
+        }
+
+        // A `ChoiceId` is a choice of THIS question (`Answer$Choices` is the only place a
+        // client discovers them), so one that names no choice of it belongs to no answer
+        // of this question and is refused rather than stored.
+        if let Some(exception) = crate::state::undefined_choice_refusal(
+            question,
+            input.selected_choices.as_deref(),
+            input.choice_updates.as_ref(),
+        ) {
+            return Err(UpdateAnswerErrorModeled::ValidationException(exception).into());
+        }
+
+        let answer = workload.answer_mut(&input.lens_alias, question);
+
+        // "The values entered replace the previously selected choices"
+        // (`SelectedChoices` doc): the choices named are the ones in place, so every other
+        // choice of the question is not.
+        if let Some(selected) = input.selected_choices.as_deref() {
+            answer.select_only(question, selected);
+        }
+
+        // Each `ChoiceUpdate` carries one choice's answer in full — `Status` is
+        // `@required` on the shape — so it REPLACES what was stored for that choice, down
+        // to a reason or notes it leaves out.
+        if let Some(updates) = input.choice_updates {
+            for (choice_id, update) in updates {
+                answer.choice_answers.insert(
+                    choice_id,
+                    crate::state::ChoiceAnswerRecord {
+                        status: update.status,
+                        reason: update.reason,
+                        notes: update.notes,
+                    },
+                );
+            }
+        }
+
+        // Each remaining member of the answer is replaced by the value the request
+        // supplies and left as stored when it supplies none, so they are written
+        // independently of each other.
+        if let Some(is_applicable) = input.is_applicable {
+            answer.is_applicable = is_applicable;
+        }
+        if let Some(reason) = input.reason {
+            answer.reason = Some(reason);
+        }
+        if let Some(notes) = input.notes {
+            answer.notes = Some(notes);
+        }
+
+        // The selected choices of an answer ARE the choices it records `SELECTED` for, so
+        // the two members a client reads back agree whichever of them the request wrote
+        // through.
+        answer.resolve_selected_choices(question);
+
+        // Answering a question changes the workload's review, which is what a workload
+        // read and its lens reviews report as the instant they were last updated.
+        workload.updated_at = ::std::time::SystemTime::now();
+
+        Ok(UpdateAnswerOutput {
+            // The workload as STORED, which is the resource this answer belongs to, and
+            // the lens as the REQUEST named it, beside the ARN it resolves to.
+            workload_id: Some(workload.workload_id.clone()),
+            lens_alias: Some(input.lens_alias.clone()),
+            lens_arn: Some(lens_arn),
+            answer: Some(crate::state::answer_projection(
+                question,
+                workload.answer(&input.lens_alias, &input.question_id),
+            )),
+        })
     }
 }

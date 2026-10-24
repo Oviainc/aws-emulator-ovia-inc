@@ -194,7 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let current = campaign.state;
+        // The state the campaign is at NOW: a campaign whose scheduled run window
+        // has closed is `Completed`, a terminal state no lifecycle action moves out
+        // of, so the refusal names the state the clock left it at rather than the
+        // one the last call wrote.
+        let current = campaign.state_at(::std::time::SystemTime::now());
         let Some(next) = current.after(ACTION) else {
             return Err(ResumeCampaignErrorModeled::InvalidCampaignStateException(
                 InvalidCampaignStateException {
@@ -209,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        campaign.state = next;
+        campaign.lifecycle_state = next;
 
         Ok(ResumeCampaignOutput)
     }

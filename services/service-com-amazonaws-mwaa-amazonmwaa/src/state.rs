@@ -49,12 +49,13 @@ pub const UPDATE_PHASE_SPAN: Duration = Duration::from_millis(250);
 /// materialise a response that grows with the stored environment count.
 pub const MAX_RESULTS_LIMIT: i32 = 25;
 
-/// How many environments this emulator will hold.
+/// How many environments this emulator will hold, across every Region together.
 ///
 /// The real service caps environments per account per Region with a service quota. The
 /// number here is NOT a fidelity claim about the published quota: it is the emulator's
-/// own ceiling, set generously so no realistic workflow meets it, so that a caller
-/// looping on create cannot grow this process's memory without bound.
+/// own STORE-WIDE ceiling, set generously so no realistic workflow meets it, so that a
+/// caller looping on create — in one Region or in many — cannot grow this process's
+/// memory without bound.
 pub const MAX_ENVIRONMENTS: usize = 1_000;
 
 /// How many tags one environment can carry, from `TagMap`'s own `@length(1, 50)`.
@@ -589,8 +590,9 @@ pub struct LastUpdateRecord {
 pub struct EnvironmentRecord {
     pub name: String,
     pub arn: String,
-    /// The region the create was signed for; every ARN and host this record reports
-    /// carries it.
+    /// The region the create was signed for: the Region this environment LIVES in, so it
+    /// is half of the record's store key ([`EnvironmentKey`]) as well as the Region every
+    /// ARN and host this record reports carries.
     pub region: String,
     /// An `EnvironmentStatus` value.
     pub status: String,
@@ -747,16 +749,31 @@ fn map_of(source: &BTreeMap<String, String>) -> HashMap<String, String> {
         .collect()
 }
 
+/// How an environment is addressed in the store: the Region it lives in, then its name.
+///
+/// An environment belongs to the Region it was created in — that Region is in its own
+/// `EnvironmentArn` pattern (`arn:aws…:airflow:<region>:<account>:environment/<Name>`) —
+/// and a name identifies an environment only WITHIN a Region, so the same name may name a
+/// different environment in another Region. Ordering the key by Region first and name
+/// second keeps one Region's names contiguous and sorted, so a per-Region listing
+/// paginates deterministically.
+pub type EnvironmentKey = (String, String);
+
+/// The store key for `name` in `region`.
+fn environment_key(region: &str, name: &str) -> EnvironmentKey {
+    (region.to_string(), name.to_string())
+}
+
 /// Per-service state for com-amazonaws-mwaa-amazonmwaa. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMwaaAmazonmwaaState {
-    /// Every environment, keyed by its name — unique per account per Region — and ordered
-    /// by it, so `ListEnvironments` paginates deterministically.
-    pub environments: BTreeMap<String, EnvironmentRecord>,
-    /// Environment ARN -> environment name, so the `/tags/{ResourceArn}` operations
-    /// resolve an ARN back to the environment that owns the tags. Written and removed
-    /// alongside `environments`, so it never names an environment that is gone.
-    pub arn_index: HashMap<String, String>,
+    /// Every environment of every Region, keyed by [`EnvironmentKey`].
+    pub environments: BTreeMap<EnvironmentKey, EnvironmentRecord>,
+    /// Environment ARN -> the key of the environment it names, so the
+    /// `/tags/{ResourceArn}` operations resolve an ARN back to the environment that owns
+    /// the tags. Written and removed alongside `environments`, so it never names an
+    /// environment that is gone.
+    pub arn_index: HashMap<String, EnvironmentKey>,
 }
 
 impl ComAmazonawsMwaaAmazonmwaaState {
@@ -769,32 +786,75 @@ impl ComAmazonawsMwaaAmazonmwaaState {
         }
     }
 
-    /// The environment an `/tags/{ResourceArn}` request names, or `None` when the ARN
-    /// resolves to nothing stored.
-    pub fn environment_by_arn(&self, resource_arn: &str) -> Option<&EnvironmentRecord> {
-        let name = self.arn_index.get(resource_arn)?;
-        self.environments.get(name)
+    /// The environment `name` names in `region`, or `None` when that Region holds no
+    /// environment of that name — whatever another Region holds under it.
+    pub fn environment(&self, region: &str, name: &str) -> Option<&EnvironmentRecord> {
+        self.environments.get(&environment_key(region, name))
     }
 
-    /// The environment an `/tags/{ResourceArn}` request names, for writing its tags.
+    /// The environment `name` names in `region`, for writing it. See [`Self::environment`].
+    pub fn environment_mut(&mut self, region: &str, name: &str) -> Option<&mut EnvironmentRecord> {
+        self.environments.get_mut(&environment_key(region, name))
+    }
+
+    /// Whether `region` holds an environment called `name`.
+    pub fn contains(&self, region: &str, name: &str) -> bool {
+        self.environments.contains_key(&environment_key(region, name))
+    }
+
+    /// The names of every environment stored in `region`, sorted — the keys are ordered by
+    /// Region and then by name, so this order is the sorted one and a pagination cursor
+    /// naming a name always resumes at the right position.
+    pub fn names_in_region(&self, region: &str) -> Vec<String> {
+        self.environments
+            .keys()
+            .filter(|(stored_region, _)| stored_region == region)
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+
+    /// The environment an `/tags/{ResourceArn}` request names, or `None` when the ARN
+    /// resolves to nothing this Region holds.
+    ///
+    /// The lookup is scoped to the Region the request was signed for, like every
+    /// name-addressed one: an ARN carries its own Region, so an ARN minted in another
+    /// Region resolves to nothing here rather than reaching across Regions.
+    pub fn environment_by_arn(
+        &self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<&EnvironmentRecord> {
+        let key = self.arn_index.get(resource_arn)?;
+        self.environments
+            .get(key)
+            .filter(|record| record.region == region)
+    }
+
+    /// The environment an `/tags/{ResourceArn}` request names, for writing its tags. See
+    /// [`Self::environment_by_arn`].
     pub fn environment_by_arn_mut(
         &mut self,
+        region: &str,
         resource_arn: &str,
     ) -> Option<&mut EnvironmentRecord> {
-        let name = self.arn_index.get(resource_arn)?.clone();
-        self.environments.get_mut(&name)
+        let key = self.arn_index.get(resource_arn)?.clone();
+        self.environments
+            .get_mut(&key)
+            .filter(|record| record.region == region)
     }
 
-    /// Store a new environment and index its ARN.
+    /// Store a new environment under its own Region and name, and index its ARN.
     pub fn insert(&mut self, record: EnvironmentRecord) {
-        self.arn_index.insert(record.arn.clone(), record.name.clone());
-        self.environments.insert(record.name.clone(), record);
+        let key = environment_key(&record.region, &record.name);
+        self.arn_index.insert(record.arn.clone(), key.clone());
+        self.environments.insert(key, record);
     }
 
-    /// Remove an environment and its ARN index entry (and with it its tags, which live on
-    /// the record). `None` when no environment of that name is stored.
-    pub fn remove(&mut self, name: &str) -> Option<EnvironmentRecord> {
-        let record = self.environments.remove(name)?;
+    /// Remove the environment `name` names in `region`, and its ARN index entry (and with
+    /// it its tags, which live on the record). `None` when that Region holds no
+    /// environment of that name.
+    pub fn remove(&mut self, region: &str, name: &str) -> Option<EnvironmentRecord> {
+        let record = self.environments.remove(&environment_key(region, name))?;
         self.arn_index.remove(&record.arn);
         Some(record)
     }

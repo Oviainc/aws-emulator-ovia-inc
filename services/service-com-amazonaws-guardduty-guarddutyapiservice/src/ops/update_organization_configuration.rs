@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateOrganizationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateOrganizationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Writes the organization configuration of the delegated administrator's
+//! detector: whether GuardDuty itself is enabled automatically for the
+//! organization's accounts, and the auto-enablement of each `OrgFeature`. A switch
+//! the request does not name keeps the value it already had, and
+//! `DescribeOrganizationConfiguration` is what reads the whole configuration back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateOrganizationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each switch is stored ONCE, as the feature that governs it, so the deprecated
+//! `DataSources` input and the `Features` one write the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +161,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateOrganizationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateOrganizationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateOrganizationConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateOrganizationConfigurationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // The id is classified from the REQUEST before anything is looked up: a
+        // value that cannot be a detector id is a parameter failure whatever the
+        // store holds, which is the rule `crate::state::detector_id_rejection`
+        // carries for every read of a detector.
+        if !crate::state::is_detector_id(&input.detector_id) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::detector_id_rejection(&input.detector_id),
+            ));
+        }
+
+        // "You must provide a value for either autoEnableOrganizationMembers or
+        // autoEnable, but not both"
+        // (`smithy_query(query="doc",shape="UpdateOrganizationConfiguration")`):
+        // neither leaves the auto-enablement unsaid, and both say it twice in two
+        // vocabularies that can disagree.
+        let members = input.auto_enable_organization_members.as_deref();
+        if members.is_some() == input.auto_enable.is_some() {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::auto_enable_exclusive_message(),
+            ));
+        }
+        let mut state = state.lock();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // Well formed (checked above) but not this account's in this Region:
+            // the ownership failure the same classifier answers with.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::detector_id_rejection(&input.detector_id),
+            ));
+        };
+        let configuration = &mut detector.organization;
+
+        // `AutoEnableMembers` and the `Features` members are enums, so a value
+        // outside them is already refused at the boundary; what is left here is the
+        // rule the model cannot express, judged against the auto-enablement each
+        // feature ENDS UP with — which is why it is checked here, where the stored
+        // configuration is in hand, and still before anything is written, so a
+        // rejected update leaves the configuration exactly as it was.
+        if let Err(message) = crate::state::validate_org_feature_configurations(
+            configuration,
+            input.features.as_ref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
+        }
+
+        // Exactly one of the two views is present (checked above), so neither
+        // overwrites the other: the deprecated boolean becomes the
+        // `AutoEnableMembers` member it names.
+        if let Some(value) = members {
+            configuration.auto_enable_members = value.to_string();
+        } else if let Some(flag) = input.auto_enable {
+            configuration.auto_enable_members =
+                crate::state::org_status_for_flag(flag).to_string();
+        }
+        // The deprecated `DataSources` view is applied first so an explicit
+        // `Features` entry for the same switch wins.
+        crate::state::apply_org_data_sources(configuration, input.data_sources.as_ref());
+        crate::state::apply_org_feature_configurations(configuration, input.features.as_ref());
+
+        // `UpdateOrganizationConfigurationResponse` declares no members
+        // (`smithy_query(operation="UpdateOrganizationConfiguration")`): the
+        // configuration is read back with `DescribeOrganizationConfiguration`.
+        Ok(UpdateOrganizationConfigurationOutput {})
     }
 }

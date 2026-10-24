@@ -8,7 +8,8 @@
 //! * an unknown `(ServiceCode, QuotaCode)` pair is `NoSuchResourceException` (404);
 //! * `Status` keeps the requests that now carry that `RequestStatus`;
 //! * `QuotaRequestedAtLevel` keeps the requests made at that level — `ALL` keeps
-//!   every one;
+//!   every one, and a caller that names none gets the member's documented default
+//!   ([`crate::state::requested_at_level`]);
 //! * `MaxResults` / `NextToken` page the listing, and a token this service did not
 //!   issue is `InvalidPaginationTokenException` (400).
 //!
@@ -147,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .is_none_or(|status| request.status == status)
                 })
                 .filter(|request| {
-                    requested_at_level(
+                    crate::state::requested_at_level(
                         &request.quota_requested_at_level,
                         input.quota_requested_at_level.as_deref(),
                     )
@@ -176,17 +177,5 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             requested_quotas: Some(page.items),
             next_token: page.next_token,
         })
-    }
-}
-
-/// Whether a request belongs in a listing filtered to `requested` level.
-///
-/// `ALL` is the level that covers every other one, so it keeps the whole listing; any
-/// other value keeps the requests made at exactly that level.
-fn requested_at_level(level: &str, requested: Option<&str>) -> bool {
-    match requested {
-        None => true,
-        Some(filter) if filter == crate::state::LEVEL_ALL => true,
-        Some(filter) => level == filter,
     }
 }

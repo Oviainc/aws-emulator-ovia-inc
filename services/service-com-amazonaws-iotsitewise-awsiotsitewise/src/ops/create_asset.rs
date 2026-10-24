@@ -250,24 +250,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // inherits its id, so property writes and reads resolve against the asset. A
         // stored model property without an id would make an unaddressable asset
         // property, so it is skipped rather than materialised with an empty id.
-        let properties: Vec<AssetProperty> = model
-            .properties
-            .iter()
-            .filter_map(|property| {
-                let id = property.id.clone().filter(|id| !id.is_empty())?;
-                Some(AssetProperty {
-                    id,
-                    external_id: property.external_id.clone(),
-                    name: property.name.clone(),
-                    alias: None,
-                    notification: None,
-                    data_type: property.data_type.clone(),
-                    data_type_spec: property.data_type_spec.clone(),
-                    unit: property.unit.clone(),
-                    path: None,
-                })
-            })
-            .collect();
+        //
+        // The same pass collects the value each materialised property STARTS with,
+        // which for an attribute definition is the default value the model declares:
+        // that default is the property's value on every asset created from the model,
+        // so the series starts with it at this asset's creation instant rather than
+        // empty. One pass, so the id filter cannot say one thing here and another
+        // there — a definition that materialises no property seeds no value either.
+        let mut properties: Vec<AssetProperty> = Vec::with_capacity(model.properties.len());
+        let mut initial_values: Vec<(String, AssetPropertyValue)> = Vec::new();
+        for property in &model.properties {
+            let Some(id) = property.id.clone().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            if let Some(sample) = crate::state::initial_property_sample(property, now) {
+                initial_values.push((id.clone(), sample));
+            }
+            properties.push(AssetProperty {
+                id,
+                external_id: property.external_id.clone(),
+                name: property.name.clone(),
+                alias: None,
+                notification: None,
+                data_type: property.data_type.clone(),
+                data_type_spec: property.data_type_spec.clone(),
+                unit: property.unit.clone(),
+                path: None,
+            });
+        }
         // An asset starts with one (empty) hierarchy per model hierarchy definition.
         let hierarchies: Vec<AssetHierarchy> = model
             .hierarchies
@@ -332,6 +342,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.asset_external_ids.insert(external, record.id.clone());
         }
         store.assets.insert(record.id.clone(), record);
+        for (property_id, value) in initial_values {
+            store.record_property_value(&asset_id, &property_id, value);
+        }
 
         Ok(output)
     }

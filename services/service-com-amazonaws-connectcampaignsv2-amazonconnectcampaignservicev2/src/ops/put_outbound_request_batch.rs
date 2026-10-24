@@ -202,16 +202,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A campaign dials only while it is running: an Initialized, Paused,
         // Stopped, Completed or Failed campaign is not placing calls, so it takes no
-        // outbound requests and the refusal names the state it is in.
-        if campaign.state != crate::state::CampaignState::Running {
+        // outbound requests and the refusal names the state it is in. The state is
+        // the one the campaign is at NOW — a campaign whose scheduled run window has
+        // closed is past dialling even though the last call wrote `Running`.
+        let current = campaign.state_at(::std::time::SystemTime::now());
+        if current != crate::state::CampaignState::Running {
             return Err(
                 PutOutboundRequestBatchErrorModeled::InvalidCampaignStateException(
                     InvalidCampaignStateException {
-                        state: campaign.state.as_wire().to_string(),
+                        state: current.as_wire().to_string(),
                         message: format!(
                             "Campaign {} is {} and takes outbound requests only while Running",
                             input.id,
-                            campaign.state.as_wire()
+                            current.as_wire()
                         ),
                         x_amz_error_type: None,
                     },

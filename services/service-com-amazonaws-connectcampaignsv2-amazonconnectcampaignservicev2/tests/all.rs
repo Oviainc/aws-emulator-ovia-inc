@@ -29,6 +29,8 @@ mod campaign_name_uniqueness;
 mod campaign_not_found_message;
 #[path = "all/campaign_resume.rs"]
 mod campaign_resume;
+#[path = "all/campaign_schedule_completion.rs"]
+mod campaign_schedule_completion;
 #[path = "all/common.rs"]
 mod common;
 #[path = "all/connect_instance_integrations.rs"]

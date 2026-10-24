@@ -1993,6 +1993,15 @@ pub struct Detector {
     /// `DisassociateFromMasterAccount`; a detector a create just minted
     /// administers itself, so it starts with none.
     pub administrator: Option<AdministratorRecord>,
+    /// What this detector's account has configured for the OTHER accounts in its
+    /// organization — what `DescribeOrganizationConfiguration` reports and
+    /// `UpdateOrganizationConfiguration` writes.
+    ///
+    /// It hangs off the detector because that is what identifies it on the wire
+    /// (`/detector/{DetectorId}/admin`), so `DeleteDetector` drops it with the
+    /// detector. Bounded by construction: one record per `AutoEnableMembers` value
+    /// and one per [`ORG_FEATURES`] member, whatever a caller sends.
+    pub organization: OrganizationConfiguration,
 }
 
 /// An invitation this detector's account RECEIVED, as the store holds it.
@@ -4647,6 +4656,25 @@ pub fn paginate_window(
     Ok((start..end, next))
 }
 
+/// Refuse a feature list that asks for Runtime Monitoring and EKS Runtime
+/// Monitoring at once, with the message the refusal carries.
+///
+/// "You can add only one of these two features because Runtime Monitoring already
+/// includes the threat detection for Amazon EKS resources"
+/// (`smithy_query(query="doc",shape="UpdateOrganizationConfiguration")`, and the
+/// same sentence on `CreateDetector`), so the rule holds for a DETECTOR's feature
+/// list and for an ORGANIZATION's alike. The two carry different status
+/// vocabularies, so each caller supplies `asked_for` — whether its list asks for
+/// the feature it names — and the rule and its message live here once.
+pub fn refuse_runtime_monitoring_overlap(asked_for: impl Fn(&str) -> bool) -> Result<(), String> {
+    if asked_for(FEATURE_EKS_RUNTIME_MONITORING) && asked_for(FEATURE_RUNTIME_MONITORING) {
+        return Err(format!(
+            "Features: {FEATURE_EKS_RUNTIME_MONITORING} and {FEATURE_RUNTIME_MONITORING} cannot both be enabled because {FEATURE_RUNTIME_MONITORING} already includes threat detection for Amazon EKS resources."
+        ));
+    }
+    Ok(())
+}
+
 /// The feature set `CreateDetector` gives a detector when the request names no
 /// features.
 ///
@@ -4819,12 +4847,7 @@ fn validate_runtime_monitoring_pair<'a>(
             .clone()
             .any(|(name, status)| name == Some(wanted) && status != Some(DISABLED))
     };
-    if named(FEATURE_EKS_RUNTIME_MONITORING) && named(FEATURE_RUNTIME_MONITORING) {
-        return Err(format!(
-            "Features: {FEATURE_EKS_RUNTIME_MONITORING} and {FEATURE_RUNTIME_MONITORING} cannot both be enabled because {FEATURE_RUNTIME_MONITORING} already includes threat detection for Amazon EKS resources."
-        ));
-    }
-    Ok(())
+    refuse_runtime_monitoring_overlap(named)
 }
 
 /// Refuse a `DestinationType` this service does not support, returning the AWS
@@ -5307,6 +5330,325 @@ pub fn member_data_source_configuration_view(
                 })
                 .collect(),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The organization configuration
+//
+// A delegated administrator configures, once per account per Region, what
+// GuardDuty does for the OTHER accounts in its organization: whether the service
+// itself is turned on for them and, per feature, whether that feature is. The
+// configuration is a property of the administrator's detector — every operation
+// on it is bound under `/detector/{DetectorId}/admin`
+// (`smithy_query(operation="DescribeOrganizationConfiguration")`) — so it hangs
+// off [`Detector`] and `DeleteDetector` drops it with the detector.
+//
+// Each switch is stored ONCE, as the feature that governs it, and read back
+// through either the `Features` view or the deprecated `DataSources` one, exactly
+// as the detector's own switches are ([`apply_data_sources`] above).
+// ---------------------------------------------------------------------------
+
+/// `AutoEnableMembers` / `OrgFeatureStatus`: nothing is enabled automatically.
+///
+/// Both enums carry the same three members
+/// (`smithy_query(shape="AutoEnableMembers,OrgFeatureStatus")`) — one says whether
+/// GuardDuty itself is auto-enabled for the organization's accounts, the other
+/// whether one feature is — so one constant serves both.
+pub const AUTO_ENABLE_NONE: &str = "NONE";
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::AUTO_ENABLE_MEMBERS_VALUES,
+    AUTO_ENABLE_NONE
+));
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::ORG_FEATURE_STATUS_VALUES,
+    AUTO_ENABLE_NONE
+));
+
+/// `AutoEnableMembers` / `OrgFeatureStatus`: auto-enabled for the accounts that
+/// JOIN the organization from now on. See [`AUTO_ENABLE_NONE`] for the enums.
+pub const AUTO_ENABLE_NEW: &str = "NEW";
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::AUTO_ENABLE_MEMBERS_VALUES,
+    AUTO_ENABLE_NEW
+));
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::ORG_FEATURE_STATUS_VALUES,
+    AUTO_ENABLE_NEW
+));
+
+/// Every `OrgFeature` member, in the order a read reports them: the crate's
+/// MODEL-DERIVED list, so a feature the model gains cannot be missed here.
+pub const ORG_FEATURES: &[&str] = crate::ops::types::shared_types::ORG_FEATURE_VALUES;
+
+/// The wire name of the `AutoEnableOrganizationMembers` member
+/// (`smithy_query(operation="UpdateOrganizationConfiguration")`).
+pub const AUTO_ENABLE_ORGANIZATION_MEMBERS_MEMBER: &str = "autoEnableOrganizationMembers";
+
+/// The wire name of the deprecated organization-level `AutoEnable` member.
+pub const AUTO_ENABLE_MEMBER: &str = "autoEnable";
+
+/// The message a request that names both auto-enable views, or neither, is refused
+/// with: "You must provide a value for either `autoEnableOrganizationMembers` or
+/// `autoEnable`, but not both"
+/// (`smithy_query(query="doc",shape="UpdateOrganizationConfiguration")`).
+pub fn auto_enable_exclusive_message() -> String {
+    format!(
+        "The request is rejected because exactly one of {AUTO_ENABLE_ORGANIZATION_MEMBERS_MEMBER} and {AUTO_ENABLE_MEMBER} must be specified."
+    )
+}
+
+/// The `OrgFeatureStatus` the deprecated BOOLEAN auto-enable view names.
+///
+/// A view that can only say yes or no cannot distinguish the two "yes" members, so
+/// yes is [`AUTO_ENABLE_NEW`]: the deprecated flag is about the accounts that join
+/// ("whether GuardDuty is automatically enabled for accounts added to the
+/// organization" — `smithy_query(query="doc",shape="DescribeOrganizationConfigurationResponse",member="AutoEnable")`),
+/// which is exactly what `NEW` means.
+pub fn org_status_for_flag(auto_enable: bool) -> &'static str {
+    if auto_enable {
+        AUTO_ENABLE_NEW
+    } else {
+        AUTO_ENABLE_NONE
+    }
+}
+
+/// How a stored `OrgFeatureStatus` reads back through the deprecated BOOLEAN view:
+/// anything other than [`AUTO_ENABLE_NONE`] is an auto-enablement, so it reads
+/// back as true.
+pub fn org_status_flag(status: &str) -> bool {
+    status != AUTO_ENABLE_NONE
+}
+
+/// One `OrgFeature`'s auto-enablement, as the store holds it.
+#[derive(Debug, Clone)]
+pub struct OrgFeatureRecord {
+    /// An `OrgFeature` member — one of [`ORG_FEATURES`].
+    pub name: String,
+    /// `OrgFeatureStatus`: whether this feature is enabled automatically for the
+    /// organization's accounts, and for which of them.
+    pub auto_enable: String,
+    /// The feature's additional configurations, as a request set them. Empty until
+    /// one does: GuardDuty documents no additional configuration a feature carries
+    /// by default, so nothing is invented here.
+    pub additional_configuration: Vec<OrgAdditionalConfigRecord>,
+}
+
+/// One `OrgFeatureAdditionalConfiguration`'s auto-enablement, as the store holds
+/// it.
+#[derive(Debug, Clone)]
+pub struct OrgAdditionalConfigRecord {
+    /// An `OrgFeatureAdditionalConfiguration` member
+    /// (`smithy_query(shape="OrgFeatureAdditionalConfiguration")`), which the
+    /// boundary refuses a request outside of before a handler sees it.
+    pub name: String,
+    /// `OrgFeatureStatus`, as on the feature that carries it.
+    pub auto_enable: String,
+}
+
+/// The organization configuration of one delegated administrator's detector.
+#[derive(Debug, Clone)]
+pub struct OrganizationConfiguration {
+    /// `AutoEnableMembers`: whether GuardDuty itself is enabled automatically for
+    /// the organization's accounts.
+    pub auto_enable_members: String,
+    /// One record per [`ORG_FEATURES`] member, in that order, so a read reports the
+    /// whole set once each and a page token means the same thing on the next call.
+    pub features: Vec<OrgFeatureRecord>,
+}
+
+impl Default for OrganizationConfiguration {
+    /// What an administrator's detector reports before any
+    /// `UpdateOrganizationConfiguration`: nothing is enabled automatically, which
+    /// is what [`AUTO_ENABLE_NONE`] says for GuardDuty itself and for every
+    /// feature. The administrator "must manage GuardDuty for each account in the
+    /// organization individually"
+    /// (`smithy_query(query="doc",shape="UpdateOrganizationConfigurationRequest",member="AutoEnableOrganizationMembers")`)
+    /// until a request says otherwise.
+    fn default() -> Self {
+        Self {
+            auto_enable_members: AUTO_ENABLE_NONE.to_string(),
+            features: ORG_FEATURES
+                .iter()
+                .map(|name| OrgFeatureRecord {
+                    name: (*name).to_string(),
+                    auto_enable: AUTO_ENABLE_NONE.to_string(),
+                    additional_configuration: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl OrganizationConfiguration {
+    /// One feature's `OrgFeatureStatus`, or [`AUTO_ENABLE_NONE`] when the
+    /// configuration does not carry that feature.
+    pub fn feature_auto_enable(&self, name: &str) -> &str {
+        self.features
+            .iter()
+            .find(|feature| feature.name == name)
+            .map_or(AUTO_ENABLE_NONE, |feature| feature.auto_enable.as_str())
+    }
+
+    /// Set one feature's `OrgFeatureStatus` and hand back the record, so a caller
+    /// can write its additional configurations too.
+    ///
+    /// `None` for a name that is not an [`ORG_FEATURES`] member: the stored set is
+    /// exactly that set and stays in its order, which is the invariant
+    /// [`Self::features`] states and the page token a read issues depends on, so a
+    /// name outside it is IGNORED rather than appended. Nothing can reach here with
+    /// one anyway — `OrgFeature` is an enum, so the boundary refuses a value outside
+    /// it before a handler runs — and the record for a member the stored list somehow
+    /// lacks is inserted at its place in that order.
+    pub fn set_feature(&mut self, name: &str, auto_enable: &str) -> Option<&mut OrgFeatureRecord> {
+        let rank = |feature: &str| ORG_FEATURES.iter().position(|member| *member == feature);
+        let wanted = rank(name)?;
+        let position = match self
+            .features
+            .iter()
+            .position(|feature| feature.name == name)
+        {
+            Some(position) => position,
+            None => {
+                let position = self
+                    .features
+                    .iter()
+                    .position(|feature| rank(&feature.name).is_none_or(|held| held > wanted))
+                    .unwrap_or(self.features.len());
+                self.features.insert(
+                    position,
+                    OrgFeatureRecord {
+                        name: name.to_string(),
+                        auto_enable: auto_enable.to_string(),
+                        additional_configuration: Vec::new(),
+                    },
+                );
+                position
+            }
+        };
+        let feature = &mut self.features[position];
+        feature.auto_enable = auto_enable.to_string();
+        Some(feature)
+    }
+}
+
+/// Refuse an organization `Features` list the operation documents as
+/// contradictory, with the message the refusal carries.
+///
+/// Every value in the list is an enum member the boundary already checked, so what
+/// is left is the rule that spans two entries, which
+/// [`refuse_runtime_monitoring_overlap`] holds for a detector's list and an
+/// organization's alike.
+///
+/// The rule is judged on the auto-enablement each feature ENDS UP with, not on what
+/// the request mentions: the request's value where it states one, and `configuration`'s
+/// stored value otherwise (a list that omits a feature, or names it without an
+/// `AutoEnable`, leaves that switch alone — see
+/// [`apply_org_feature_configurations`]). So enabling one of the two while the other
+/// is already stored enabled is refused, and naming one of them without a status
+/// while enabling the other is not.
+pub fn validate_org_feature_configurations(
+    configuration: &OrganizationConfiguration,
+    features: Option<&Vec<crate::ops::types::OrganizationFeatureConfiguration>>,
+) -> Result<(), String> {
+    let Some(features) = features else {
+        return Ok(());
+    };
+    let enabled = |wanted: &str| {
+        // The LAST entry for a name is the one that lands, as applying the list
+        // writes them in order.
+        let requested = features
+            .iter()
+            .rfind(|feature| feature.name.as_deref() == Some(wanted))
+            .and_then(|feature| feature.auto_enable.as_deref());
+        requested.unwrap_or_else(|| configuration.feature_auto_enable(wanted)) != AUTO_ENABLE_NONE
+    };
+    refuse_runtime_monitoring_overlap(enabled)
+}
+
+/// Write a `Features` list onto an organization configuration. A feature the list
+/// does not name keeps the auto-enablement it already had, the way
+/// [`apply_feature_configurations`] leaves the detector's own switches — and so
+/// does a feature the list names WITHOUT an `AutoEnable`, which is an optional
+/// member (`smithy_query(shape="OrganizationFeatureConfiguration")`): an entry that
+/// states no auto-enablement states nothing to change about it, and may still carry
+/// the additional configurations below.
+pub fn apply_org_feature_configurations(
+    configuration: &mut OrganizationConfiguration,
+    features: Option<&Vec<crate::ops::types::OrganizationFeatureConfiguration>>,
+) {
+    let Some(features) = features else { return };
+    for feature in features {
+        let Some(name) = feature.name.as_deref() else {
+            continue;
+        };
+        let auto_enable = feature
+            .auto_enable
+            .as_deref()
+            .unwrap_or_else(|| configuration.feature_auto_enable(name))
+            .to_string();
+        // `None` for a name no `OrgFeature` carries, which the boundary refuses
+        // before this runs: such an entry writes nothing at all.
+        let Some(record) = configuration.set_feature(name, &auto_enable) else {
+            continue;
+        };
+        if let Some(additional) = feature.additional_configuration.as_ref() {
+            record.additional_configuration = additional
+                .iter()
+                .filter_map(|configuration| {
+                    configuration
+                        .name
+                        .as_deref()
+                        .map(|name| OrgAdditionalConfigRecord {
+                            name: name.to_string(),
+                            auto_enable: configuration
+                                .auto_enable
+                                .as_deref()
+                                .unwrap_or(AUTO_ENABLE_NONE)
+                                .to_string(),
+                        })
+                })
+                .collect();
+        }
+    }
+}
+
+/// Write the deprecated organization `DataSources` view onto an organization
+/// configuration.
+///
+/// `DataSources` is "deprecated, use Features instead"
+/// (`smithy_query(operation="UpdateOrganizationConfiguration")`), so each node is
+/// stored as the `OrgFeature` that governs it — one source of truth, read back
+/// through either view, exactly as [`apply_data_sources`] stores the detector's own
+/// data sources. The boolean becomes an `OrgFeatureStatus` through
+/// [`org_status_for_flag`].
+pub fn apply_org_data_sources(
+    configuration: &mut OrganizationConfiguration,
+    data_sources: Option<&crate::ops::types::OrganizationDataSourceConfigurations>,
+) {
+    let Some(data_sources) = data_sources else {
+        return;
+    };
+    if let Some(s3) = data_sources.s3_logs.as_ref() {
+        configuration.set_feature(FEATURE_S3_DATA_EVENTS, org_status_for_flag(s3.auto_enable));
+    }
+    if let Some(kubernetes) = data_sources.kubernetes.as_ref() {
+        configuration.set_feature(
+            FEATURE_EKS_AUDIT_LOGS,
+            org_status_for_flag(kubernetes.audit_logs.auto_enable),
+        );
+    }
+    if let Some(auto_enable) = data_sources
+        .malware_protection
+        .as_ref()
+        .and_then(|malware| malware.scan_ec2_instance_with_findings.as_ref())
+        .and_then(|scan| scan.ebs_volumes.as_ref())
+        .and_then(|volumes| volumes.auto_enable)
+    {
+        configuration.set_feature(
+            FEATURE_EBS_MALWARE_PROTECTION,
+            org_status_for_flag(auto_enable),
+        );
     }
 }
 

@@ -8,7 +8,8 @@
 //! (`CreateReviewTemplate`, `GetReviewTemplate`, `ListReviewTemplates`,
 //! `DeleteReviewTemplate`), the lens reviews of a workload (`GetLensReview`,
 //! `ListLensReviews`), the answers of
-//! a workload's lens reviews (`ListAnswers`), the improvement plan of one of those lens
+//! a workload's lens reviews (`GetAnswer`, `ListAnswers`, `UpdateAnswer`), the
+//! improvement plan of one of those lens
 //! reviews (`ListLensReviewImprovements`) and the answers of a review template's lens
 //! reviews (`ListReviewTemplateAnswers`, `GetReviewTemplateAnswer`,
 //! `UpdateReviewTemplateAnswer`) are backed entirely by the maps below, so a
@@ -1214,6 +1215,69 @@ impl AnswerRecord {
     }
 }
 
+/// The `Answer` projection of one question of a lens review: the question as the LENS
+/// defines it, plus the answer the reviewed resource records for it.
+///
+/// Lives here rather than in a handler because both the read of a single answer and the
+/// write that records one report it, so the two cannot disagree about what an answer
+/// looks like. A question with NO stored answer is `UNANSWERED` and applicable, with
+/// nothing selected and no choice answered — the same reading of an unanswered question
+/// the risk roll-up counts ([`WorkloadRecord::risk_counts`]).
+///
+/// `QuestionDescription`, `ImprovementPlanUrl`, `HelpfulResourceUrl` and
+/// `HelpfulResourceDisplayText` are omitted: each is per-question or per-choice prose
+/// this emulator's lens content does not carry, and the members are optional, so they
+/// are left off rather than filled with something else.
+pub fn answer_projection(
+    question: &FrameworkQuestion,
+    answer: Option<&AnswerRecord>,
+) -> crate::ops::types::Answer {
+    crate::ops::types::Answer {
+        question_id: Some(question.question_id.to_string()),
+        pillar_id: Some(question.pillar_id.to_string()),
+        question_title: Some(question.title.to_string()),
+        question_description: None,
+        improvement_plan_url: None,
+        helpful_resource_url: None,
+        helpful_resource_display_text: None,
+        // The question's CHOICE CATALOG: the best practices it asks about, reported
+        // whether or not the question has been answered, because it describes the
+        // QUESTION. It is also the only place a client can discover the `ChoiceId`s an
+        // update names.
+        choices: Some(question.choices()),
+        selected_choices: Some(
+            answer
+                .map(|answer| answer.selected_choices.clone())
+                .unwrap_or_default(),
+        ),
+        choice_answers: Some(
+            answer
+                .map(|answer| {
+                    answer
+                        .choice_answers
+                        .iter()
+                        .map(|(choice_id, choice)| crate::ops::types::ChoiceAnswer {
+                            choice_id: Some(choice_id.clone()),
+                            status: Some(choice.status.clone()),
+                            reason: choice.reason.clone(),
+                            notes: choice.notes.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        // A question applies unless an answer says it does not.
+        is_applicable: Some(answer.is_none_or(|answer| answer.is_applicable)),
+        risk: Some(answer.map_or(RISK_UNANSWERED, AnswerRecord::risk).to_string()),
+        // `Notes` and `Reason` exist only once an answer records them.
+        notes: answer.and_then(|answer| answer.notes.clone()),
+        reason: answer.and_then(|answer| answer.reason.clone()),
+        // A question's Jira issue exists once the workload's Jira integration has synced
+        // one; `UpdateIntegration` is still a stub, so nothing is synced here.
+        jira_configuration: None,
+    }
+}
+
 /// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
 /// lens — the resource type `ShareResourceType` names a lens by
 /// (`smithy_query(query="shape", shape="ShareResourceType")` publishes `LENS`).
@@ -1549,6 +1613,23 @@ impl WorkloadRecord {
     /// through [`lens_alias`], so the same answer is found by either name.
     pub fn answer(&self, lens: &str, question_id: &str) -> Option<&AnswerRecord> {
         self.answers.get(lens_alias(lens))?.get(question_id)
+    }
+
+    /// [`Self::answer`] for a caller about to WRITE it, created from the question's own
+    /// choice set on the first write ([`AnswerRecord::for_question`]).
+    ///
+    /// Recording an answer is what moves the question out of `UNANSWERED`
+    /// ([`Self::risk_counts`]), so this is the one place a workload's answer comes into
+    /// existence. `lens` is a lens as a request names it, so an answer written by either
+    /// spelling is the same answer ([`lens_alias`]) — the mirror of
+    /// [`ReviewTemplateRecord::answer_mut`], because a workload's lens review and a review
+    /// template's record an answer the same way.
+    pub fn answer_mut(&mut self, lens: &str, question: &FrameworkQuestion) -> &mut AnswerRecord {
+        self.answers
+            .entry(lens_alias(lens).to_string())
+            .or_default()
+            .entry(question.question_id.to_string())
+            .or_insert_with(|| AnswerRecord::for_question(question))
     }
 
     /// Whether this workload has a lens review of the named lens.
@@ -5244,6 +5325,126 @@ pub fn member_constraint_exception(
     )])
 }
 
+/// The member a refused `SelectedChoices` value is reported under, in either operation
+/// that records an answer (`UpdateAnswerInput$SelectedChoices`,
+/// `UpdateReviewTemplateAnswerInput$SelectedChoices`).
+pub const SELECTED_CHOICES_MEMBER: &str = "SelectedChoices";
+
+/// The member a refused `ChoiceUpdates` key is reported under, in either operation that
+/// records an answer. A finding about ONE entry names the path that reaches it
+/// (`ChoiceUpdates.<ChoiceId>.<Member>`), so a caller is told WHICH choice's update to fix.
+pub const CHOICE_UPDATES_MEMBER: &str = "ChoiceUpdates";
+
+/// The member a refused answer `Reason` is reported under, in either operation that
+/// records an answer.
+pub const ANSWER_REASON_MEMBER: &str = "Reason";
+
+/// The refusal for the first enum member of an answer-recording request carrying a value
+/// outside its modelled value set, if any does: the answer's own `Reason` (an
+/// `AnswerReason`) and each `ChoiceUpdate`'s `Status` (a `ChoiceStatus`) and `Reason` (a
+/// `ChoiceReason`).
+///
+/// The boundary's constraint walk does not reach inside a map's values, so these are
+/// enforced by the handler — and both operations that record an answer (a workload's and
+/// a review template's) take the same two members, so the rule and its wording live here
+/// once rather than in each of them.
+///
+/// The `ChoiceUpdates` entries are judged in `ChoiceId` order, so the member a refusal
+/// names does not depend on the request map's iteration order.
+pub fn answer_enum_refusal(
+    reason: Option<&str>,
+    choice_updates: Option<&HashMap<String, crate::ops::types::ChoiceUpdate>>,
+) -> Option<crate::ops::types::ValidationException> {
+    let mut members: Vec<(String, &str, &[&str])> = Vec::new();
+    if let Some(reason) = reason {
+        members.push((
+            ANSWER_REASON_MEMBER.to_string(),
+            reason,
+            crate::ops::types::ANSWER_REASON_VALUES,
+        ));
+    }
+    let mut updates: Vec<(&String, &crate::ops::types::ChoiceUpdate)> =
+        choice_updates.into_iter().flatten().collect();
+    updates.sort_by_key(|(choice_id, _)| *choice_id);
+    for (choice_id, update) in updates {
+        members.push((
+            format!("{CHOICE_UPDATES_MEMBER}.{choice_id}.Status"),
+            update.status.as_str(),
+            crate::ops::types::CHOICE_STATUS_VALUES,
+        ));
+        if let Some(reason) = update.reason.as_deref() {
+            members.push((
+                format!("{CHOICE_UPDATES_MEMBER}.{choice_id}.Reason"),
+                reason,
+                crate::ops::types::CHOICE_REASON_VALUES,
+            ));
+        }
+    }
+    members
+        .into_iter()
+        .find(|(_, value, allowed)| !allowed.contains(value))
+        .map(|(member, _, allowed)| {
+            member_constraint_exception(
+                &member,
+                &format!(
+                    "Member must satisfy enum value set: [{}]",
+                    allowed.join(", ")
+                ),
+            )
+        })
+}
+
+/// The refusal for a `ChoiceId` an answer-recording request names that is not a choice of
+/// the question being answered, if either member that carries one does.
+///
+/// A choice is answered BY ID and the ids are the question's own catalog (`Answer$Choices`
+/// / `ReviewTemplateAnswer$Choices`, the only place a client discovers them), so an id
+/// naming a choice of another question — or of none — belongs to no answer of this
+/// question. Shared by both operations that record an answer, so they cannot word it
+/// differently; the offending ids are sorted and deduplicated, so the refusal does not
+/// depend on the order the request listed them in.
+pub fn undefined_choice_refusal(
+    question: &FrameworkQuestion,
+    selected_choices: Option<&[String]>,
+    choice_updates: Option<&HashMap<String, crate::ops::types::ChoiceUpdate>>,
+) -> Option<crate::ops::types::ValidationException> {
+    // Each member's ids are BORROWED from the request: only the ones the question does
+    // not define are collected, so a request whose choices are all valid allocates
+    // nothing.
+    let named: [(&str, Box<dyn Iterator<Item = &str>>); 2] = [
+        (
+            SELECTED_CHOICES_MEMBER,
+            Box::new(selected_choices.unwrap_or_default().iter().map(String::as_str)),
+        ),
+        (
+            CHOICE_UPDATES_MEMBER,
+            Box::new(
+                choice_updates
+                    .into_iter()
+                    .flat_map(|updates| updates.keys().map(String::as_str)),
+            ),
+        ),
+    ];
+    for (member, choice_ids) in named {
+        let mut undefined: Vec<&str> = choice_ids
+            .filter(|choice_id| !question.defines_choice(choice_id))
+            .collect();
+        if !undefined.is_empty() {
+            undefined.sort_unstable();
+            undefined.dedup();
+            return Some(member_constraint_exception(
+                member,
+                &format!(
+                    "every choice must be a choice of question {}, which {} is not",
+                    question.question_id,
+                    undefined.join(", ")
+                ),
+            ));
+        }
+    }
+    None
+}
+
 /// The tag this service opens an exception message with: the failure class in square
 /// brackets, then the sentence — `[ResourceNotFound] …`, `[Conflict] …`,
 /// `[Validation] …`. Every failure this service words goes through here, so one form
@@ -5572,6 +5773,30 @@ pub fn lens_review_not_found(workload_id: &str, lens: &str) -> ResourceNotFoundE
 /// to — a workload's id or a review template's ARN — and the lens it reviews.
 pub fn lens_review_resource_id(owner: &str, lens: &str) -> String {
     format!("{owner}.{lens}")
+}
+
+/// [`resource_not_found`] for a `QuestionId` the lens under review does not ask, so the
+/// review has no answer to that question to read or to record.
+///
+/// A question of a review is identified by the `(WorkloadId, LensAlias, QuestionId)`
+/// triple — the lens decides which questions exist, and the workload decides which lens
+/// is reviewed — so the `ResourceId` is the composite and the message names all three.
+/// `lens` is the lens AS SENT, which is how the caller named it. Worded like
+/// [`review_template_answer_not_found`], the same failure about a review template's lens
+/// review.
+pub fn question_not_found(
+    workload_id: &str,
+    lens: &str,
+    question_id: &str,
+) -> ResourceNotFoundException {
+    resource_not_found(
+        QUESTION_RESOURCE_TYPE,
+        format!("{}.{question_id}", lens_review_resource_id(workload_id, lens)),
+        &format!(
+            "question with ID {question_id} in a review of lens {lens} in a workload with \
+             ID {workload_id}"
+        ),
+    )
 }
 
 /// [`resource_not_found`] for a lens that is not applied to the review template, so the

@@ -310,26 +310,27 @@ pub const MAX_DETAILS_VALUE_LEN: usize = 1000;
 pub const MAX_AMENDMENT_REASON_LEN: usize = 1000;
 
 /// The longest `ClientToken` this service stores, which is the modelled
-/// `AmendBenefitApplicationInput$ClientToken` `@length(min: 1, max: 64)` (its
-/// `@pattern` `^[a-zA-Z0-9-]{1,64}$` says the same). The amendment record keeps the
-/// token, so this bounds the bytes one record holds for it.
+/// `@length(min: 1, max: 64)` every operation's `ClientToken` carries (the patterns
+/// `^[a-zA-Z0-9-]{1,64}$` and `^[!-~]{1,64}$` say the same). The applied-write record
+/// keeps the token, so this bounds the bytes one record holds for it.
 pub const MAX_CLIENT_TOKEN_LEN: usize = 64;
 
-/// The most amendments one benefit application keeps a record of.
+/// The most writes one benefit application keeps a record of.
 ///
-/// `AmendBenefitApplication` is idempotent on its `ClientToken`, which it recognises by
-/// looking the token up in this record, so the record is what bounds how far back a
-/// retry is recognised. AWS publishes no retention for the token, so the number is
-/// CHOSEN: more amendments than a retry window needs, while keeping the record of one
-/// application finite however many times it is amended. Beyond it the oldest amendment
-/// is dropped, and a retry of a token that old applies its amendments again.
+/// Every operation that changes an application and carries a `ClientToken` is idempotent
+/// in that token, which it recognises by looking the token up in this record, so the
+/// record is what bounds how far back a retry is recognised. AWS publishes no retention
+/// for the token, so the number is CHOSEN: more writes than a retry window needs, while
+/// keeping the record of one application finite however many times it is written. Beyond
+/// it the oldest entry is dropped, and a retry of a token that old applies its write
+/// again.
 ///
 /// With [`MAX_AMENDMENTS_PER_REQUEST`], [`MAX_FIELD_PATH_LEN`],
-/// [`MAX_AMENDMENT_REASON_LEN`] and [`MAX_CLIENT_TOKEN_LEN`] — each enforced by
-/// `AmendBenefitApplication` before the record is written — one application's amendment
-/// record holds at most 20 x (64-byte token + 1000-byte reason + 20 x 256-byte path) of
-/// caller text: bounded, like every other part of this store.
-pub const MAX_AMENDMENT_HISTORY: usize = 20;
+/// [`MAX_AMENDMENT_REASON_LEN`] and [`MAX_CLIENT_TOKEN_LEN`] — each enforced before the
+/// record is written — one application's write record holds at most 20 x (64-byte token
+/// + 1000-byte reason + 20 x 256-byte path) of caller text: bounded, like every other
+/// part of this store.
+pub const MAX_APPLIED_WRITE_HISTORY: usize = 20;
 
 /// The most members a stored `BenefitApplicationDetails` document may hold, counted over
 /// the whole tree.
@@ -857,26 +858,32 @@ impl BenefitAllocation {
     }
 }
 
-/// One amendment request `AmendBenefitApplication` applied to a benefit application.
+/// One write a `ClientToken`-carrying operation applied to a benefit application.
 ///
-/// Kept so a replayed `ClientToken` applies nothing a second time, and as the record of
-/// WHICH fields each amendment changed and why. No modelled output reports it: the model
-/// binds no amendment member on any output shape, so it is state this service holds
-/// rather than something it reports. The new values are not copied here — the fields
-/// themselves hold them — which is also what keeps the record small.
+/// Kept so a replayed `ClientToken` applies nothing a second time and answers with what
+/// the first call reported, and as the record of WHICH fields each write changed and
+/// why. No modelled output reports it: the model binds no member for it on any output
+/// shape, so it is state this service holds rather than something it reports. The new
+/// values are not copied here — the fields themselves hold them — which is also what
+/// keeps the record small.
 #[derive(Debug, Clone)]
-pub struct AppliedAmendment {
+pub struct AppliedWrite {
+    /// The operation that applied the write, as the model names it. A `ClientToken` is
+    /// the identity of ONE request, so a token is a replay only of the same operation.
+    pub operation: &'static str,
     /// The request's `ClientToken`.
     pub client_token: String,
-    /// The request's `AmendmentReason`.
-    pub reason: String,
-    /// The `FieldPath` of each amendment applied, in the order they were applied; at
-    /// most [`MAX_AMENDMENTS_PER_REQUEST`] of them, each at most
-    /// [`MAX_FIELD_PATH_LEN`] bytes.
-    pub field_paths: Vec<String>,
-    /// When the amendment was applied, as epoch milliseconds.
+    /// Why the write was made, where the request carried a reason of its own (an
+    /// `AmendmentReason`) that the record does not already hold elsewhere.
+    pub reason: Option<String>,
+    /// The fields the write changed: an amendment's `FieldPath`s, or the input members
+    /// an update applied, in the order they were applied. At most
+    /// [`MAX_AMENDMENTS_PER_REQUEST`] of them, each at most [`MAX_FIELD_PATH_LEN`]
+    /// bytes.
+    pub fields: Vec<String>,
+    /// When the write was applied, as epoch milliseconds.
     pub applied_at_millis: i64,
-    /// The revision the amendment produced.
+    /// The revision the write produced — the `Revision` a replay of the token reports.
     pub revision: u64,
 }
 
@@ -927,9 +934,10 @@ pub struct BenefitApplication {
     pub partner_contacts: Vec<Contact>,
     pub file_details: Vec<FileDetail>,
     pub tags: BTreeMap<String, String>,
-    /// The amendments applied to this application, oldest first, at most
-    /// [`MAX_AMENDMENT_HISTORY`] of them.
-    pub amendments: Vec<AppliedAmendment>,
+    /// The writes a `ClientToken`-carrying operation applied to this application, oldest
+    /// first, at most [`MAX_APPLIED_WRITE_HISTORY`] of them. It is what makes those
+    /// operations idempotent in their token — see [`BenefitApplication::applied_write`].
+    pub applied_writes: Vec<AppliedWrite>,
 }
 
 impl BenefitApplication {
@@ -993,19 +1001,25 @@ impl BenefitApplication {
         self.touch(now_millis);
     }
 
-    /// The amendment `client_token` already applied to this application, if this
-    /// application still holds a record of it.
-    pub fn applied_amendment(&self, client_token: &str) -> Option<&AppliedAmendment> {
-        self.amendments
+    /// The write `operation` already applied to this application under `client_token`,
+    /// if this application still holds a record of it — the request a retry carrying
+    /// that token is a replay of, which must change nothing and answer with what the
+    /// first call reported.
+    ///
+    /// The operation is part of the key: a `ClientToken` identifies ONE request, so the
+    /// same token spent on a different operation is a different request rather than a
+    /// retry of this one.
+    pub fn applied_write(&self, operation: &str, client_token: &str) -> Option<&AppliedWrite> {
+        self.applied_writes
             .iter()
-            .find(|applied| applied.client_token == client_token)
+            .find(|applied| applied.operation == operation && applied.client_token == client_token)
     }
 
-    /// Record one applied amendment, dropping the oldest once the record is full.
-    pub fn record_amendment(&mut self, applied: AppliedAmendment) {
-        self.amendments.push(applied);
-        if self.amendments.len() > MAX_AMENDMENT_HISTORY {
-            self.amendments.remove(0);
+    /// Record one applied write, dropping the oldest once the record is full.
+    pub fn record_write(&mut self, applied: AppliedWrite) {
+        self.applied_writes.push(applied);
+        if self.applied_writes.len() > MAX_APPLIED_WRITE_HISTORY {
+            self.applied_writes.remove(0);
         }
     }
 
@@ -1219,7 +1233,7 @@ pub const ALLOCATION_RESOURCE: &str = "benefit-allocation";
 /// BOUNDED: `CreateBenefitApplication` refuses a create that would take a catalog past
 /// [`MAX_APPLICATIONS_PER_CATALOG`], the catalog set is fixed by [`SEEDED_CATALOGS`],
 /// `arns` and `client_tokens` carry at most one entry per stored application, one
-/// application records at most [`MAX_AMENDMENT_HISTORY`] amendments, and a catalog holds
+/// application records at most [`MAX_APPLIED_WRITE_HISTORY`] applied writes, and a catalog holds
 /// at most [`MAX_ALLOCATIONS_PER_CATALOG`] allocations — so no caller can grow this store
 /// without limit.
 #[derive(Debug)]

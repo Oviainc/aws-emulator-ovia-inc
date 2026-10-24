@@ -1168,7 +1168,11 @@ async fn submit_transitions_only_from_pending_submission() {
     }
 }
 
-/// Cancelling records the reason as `StatusReason`, bumps the revision, and is terminal.
+/// Cancelling records the reason as `StatusReason`, bumps the revision, and is terminal:
+/// a cancellation under a token of its own is refused, while a replay of the first
+/// cancellation's own `ClientToken` answers success and changes nothing (the
+/// token-idempotency rule is pinned over every write in
+/// `tests/all/client_token_idempotency.rs`).
 ///
 /// The rows are the statuses an application can be cancelled from, each with and without
 /// a `Reason`.
@@ -1246,6 +1250,19 @@ async fn cancel_records_the_reason_and_is_terminal() {
         );
 
         let (status, out) = harness.call("CancelBenefitApplication", &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: replaying the cancellation's ClientToken must answer success, got {status} {out:?}"
+        );
+        let replayed = harness.get(case, &id).await;
+        assert_eq!(
+            replayed, after,
+            "case {case:?}: a replayed cancellation must change nothing, got {replayed:?}"
+        );
+
+        let mut fresh = body.clone();
+        fresh["ClientToken"] = json!(format!("tok-cancel-again-{index}"));
+        let (status, out) = harness.call("CancelBenefitApplication", &fresh).await;
         assert_eq!(
             status, 409,
             "case {case:?}: a second cancel must be refused, got {status} {out:?}"

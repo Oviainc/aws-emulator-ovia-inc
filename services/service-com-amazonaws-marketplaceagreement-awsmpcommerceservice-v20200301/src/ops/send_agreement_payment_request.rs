@@ -309,6 +309,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The payment request is created in `PENDING_APPROVAL` status, at
             // which point the buyer can accept or reject it."
             status: crate::state::PAYMENT_REQUEST_STATUS_PENDING_APPROVAL.to_string(),
+            // Nothing has decided the request yet, so there is no additional
+            // context about its status to report.
+            status_message: None,
             // The charge is created when the buyer approves the request.
             charge_id: None,
             // This call is the seller's, so the account that made it is the

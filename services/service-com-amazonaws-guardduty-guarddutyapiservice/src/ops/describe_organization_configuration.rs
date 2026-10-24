@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOrganizationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOrganizationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the organization configuration the delegated administrator's detector
+//! holds: whether GuardDuty itself is enabled automatically for the organization's
+//! accounts (`AutoEnableOrganizationMembers`, and the deprecated boolean view of
+//! it), the auto-enablement of each `OrgFeature`, the deprecated `DataSources`
+//! projection of the three features that view can name, and whether the
+//! administrator's member quota is already full.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOrganizationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure report: every value is read off the stored configuration
+//! ([`crate::state::OrganizationConfiguration`]), which
+//! `UpdateOrganizationConfiguration` is what writes. The `Features` list is
+//! paginated, so a caller walking it with any `maxResults` sees each feature
+//! exactly once.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +172,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOrganizationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOrganizationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOrganizationConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeOrganizationConfigurationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            // Classified from the REQUEST — a malformed id is a parameter failure,
+            // a well-formed one this account does not hold an ownership failure.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::detector_id_rejection(&input.detector_id),
+            ));
+        };
+        let configuration = &detector.organization;
+
+        // `Features` is the paginated member (`inputToken` `NextToken`,
+        // `outputToken` `NextToken`, `pageSize` `MaxResults` —
+        // `smithy_query(operation="DescribeOrganizationConfiguration")`), and the
+        // stored records are in a total order, which is what makes a page token
+        // mean the same thing on the next call.
+        let (window, next_token) = crate::state::paginate_window(
+            configuration.features.len(),
+            input.max_results,
+            input.next_token.as_deref(),
+            FEATURES_PAGE_MAX,
+        )
+        .map_err(|_rejected_token| {
+            // `paginate_window` fails on ONE thing — the token it hands back, which
+            // is not one this service issued — so the refusal names that member and
+            // nothing else; `maxResults` is a modelled `range 1..50`, refused at the
+            // boundary before this handler runs. Under the error CLASS, naming the
+            // parameter at fault and not quoting the token back.
+            crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::NEXT_TOKEN_MEMBER),
+            )
+        })?;
+
+        Ok(DescribeOrganizationConfigurationOutput {
+            // The deprecated boolean view of the same stored value: one switch,
+            // read back under either name.
+            auto_enable: Some(crate::state::org_status_flag(
+                &configuration.auto_enable_members,
+            )),
+            auto_enable_organization_members: Some(configuration.auto_enable_members.clone()),
+            // "Whether the maximum number of allowed member accounts are already
+            // associated with the delegated administrator account": the members
+            // this detector administers, against the quota `CreateMembers`
+            // enforces.
+            member_account_limit_reached: detector.members.len()
+                >= crate::state::MAX_MEMBERS_PER_DETECTOR,
+            data_sources: Some(data_sources_result(configuration)),
+            features: Some(
+                configuration.features[window]
+                    .iter()
+                    .map(feature_result)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
+
+/// How many features one page can carry at most: `MaxResults` is `range 1..50`
+/// (`smithy_query(operation="DescribeOrganizationConfiguration")`), so a request
+/// can never ask for more, and one that asks for nothing gets the whole set.
+const FEATURES_PAGE_MAX: usize = 50;
+
+/// One stored feature, as the `Features` list reports it.
+fn feature_result(
+    feature: &crate::state::OrgFeatureRecord,
+) -> OrganizationFeatureConfigurationResult {
+    OrganizationFeatureConfigurationResult {
+        name: Some(feature.name.clone()),
+        auto_enable: Some(feature.auto_enable.clone()),
+        // Absent rather than an empty list until a request configures one: nothing
+        // is invented for a feature no additional configuration was set on.
+        additional_configuration: if feature.additional_configuration.is_empty() {
+            None
+        } else {
+            Some(
+                feature
+                    .additional_configuration
+                    .iter()
+                    .map(|additional| OrganizationAdditionalConfigurationResult {
+                        name: Some(additional.name.clone()),
+                        auto_enable: Some(additional.auto_enable.clone()),
+                    })
+                    .collect(),
+            )
+        },
+    }
+}
+
+/// The deprecated `DataSources` view of the organization configuration.
+///
+/// `DataSources` is "deprecated, use Features instead"
+/// (`smithy_query(operation="DescribeOrganizationConfiguration")`), so every node
+/// here is read back off the `OrgFeature` that governs it: the same stored switch,
+/// projected under its other name and narrowed to the boolean that view can carry
+/// ([`crate::state::org_status_flag`]).
+fn data_sources_result(
+    configuration: &crate::state::OrganizationConfiguration,
+) -> OrganizationDataSourceConfigurationsResult {
+    let auto_enabled =
+        |feature: &str| crate::state::org_status_flag(configuration.feature_auto_enable(feature));
+    OrganizationDataSourceConfigurationsResult {
+        s3_logs: OrganizationS3LogsConfigurationResult {
+            auto_enable: auto_enabled(crate::state::FEATURE_S3_DATA_EVENTS),
+        },
+        kubernetes: Some(OrganizationKubernetesConfigurationResult {
+            audit_logs: OrganizationKubernetesAuditLogsConfigurationResult {
+                auto_enable: auto_enabled(crate::state::FEATURE_EKS_AUDIT_LOGS),
+            },
+        }),
+        malware_protection: Some(OrganizationMalwareProtectionConfigurationResult {
+            scan_ec2_instance_with_findings: Some(OrganizationScanEc2InstanceWithFindingsResult {
+                ebs_volumes: Some(OrganizationEbsVolumesResult {
+                    auto_enable: Some(auto_enabled(crate::state::FEATURE_EBS_MALWARE_PROTECTION)),
+                }),
+            }),
+        }),
+    }
+}
+

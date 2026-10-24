@@ -404,6 +404,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_time: now,
             last_modified_time: now,
             etag: etag.clone(),
+            // Nothing but a `CreateInvalidationForDistributionTenant` puts an invalidation
+            // here, so a tenant is created holding none.
+            invalidations: std::collections::BTreeMap::new(),
         };
         let distribution_tenant = stored.to_distribution_tenant();
         store.distribution_tenants.insert(id, stored);

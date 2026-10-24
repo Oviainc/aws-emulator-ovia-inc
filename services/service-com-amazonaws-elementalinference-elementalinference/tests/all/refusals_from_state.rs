@@ -211,8 +211,8 @@ async fn a_release_with_nothing_to_release_reports_the_feeds_own_status() {
     );
 }
 
-/// The same release request, answered differently as the feed moves through the store:
-/// the message follows the state, not the request.
+/// A release of a resource the feed does not hold, answered differently as the feed moves
+/// through the store: the message follows the state, not the request.
 #[tokio::test]
 async fn the_release_refusal_follows_the_feed_through_the_store() {
     let router = router();
@@ -232,13 +232,16 @@ async fn the_release_refusal_follows_the_feed_through_the_store() {
     let (code, _) = disassociate(&router, &id, "walked-media").await;
     assert_eq!(code, 200, "case \"the release\": DisassociateFeed answers 200");
 
-    // ARCHIVED: the very same request, now reporting the status the release left.
-    let (code, error) = disassociate(&router, &id, "walked-media").await;
+    // ARCHIVED: a release of ANOTHER resource, now reporting the status the release
+    // left. The name has to differ from the released one, because repeating THAT name is
+    // the same release once more under its idempotency token — a replay that answers the
+    // first call's success rather than any refusal (`feed_release_retry.rs`).
+    let (code, error) = disassociate(&router, &id, "another-walked-media").await;
     assert_eq!(
         (code, message_of(&error)),
         (400, feed_not_associated_message(FeedStatus::Archived)),
-        "case \"after the release\": the same request now reports ARCHIVED, got {code} with \
-         {error}"
+        "case \"after the release\": a release of another resource now reports ARCHIVED, got \
+         {code} with {error}"
     );
 }
 

@@ -63,9 +63,14 @@ const NO_REPLICATION: &str = "Specified engine does not support replication.";
 /// The service's sentence for an `UpdateUser` naming no field to change.
 const EMPTY_USER_UPDATE: &str = "Update user needs to have at least one field specified.";
 
-/// The service's sentence for an ARN whose region or account this endpoint does not
-/// serve.
-const FOREIGN_SCOPE: &str = "Please check the region or customer ID specified in the request.";
+/// The service's sentence for an ARN whose REGION this endpoint does not serve. It
+/// names the account too, because the service does not say which of the two it read the
+/// region against.
+const FOREIGN_REGION: &str = "Please check the region or customer ID specified in the request.";
+
+/// The service's sentence for an ARN whose ACCOUNT is not the caller's — a different
+/// sentence from [`FOREIGN_REGION`], because the service words the two differently.
+const FOREIGN_ACCOUNT: &str = "The resource ARN does not belong to the caller's account.";
 
 /// One `arn:aws:memorydb:<region>:<account>:<type>/<name>`.
 fn arn(region: &str, account: &str, resource_type: &str, name: &str) -> String {
@@ -133,41 +138,50 @@ async fn an_arn_naming_another_scope_is_an_invalid_parameter_value() {
 
     // The rows differ along what the rule generalises over: which part of the scope is
     // foreign (region, account, both), the kind of resource the ARN names, and whether
-    // the resource it names EXISTS in this store.
-    let rows: Vec<(String, String)> = vec![
+    // the resource it names EXISTS in this store. Each carries the sentence the service
+    // words THAT part of the scope with; a row that is foreign in both is told about the
+    // region, the part the service reads first.
+    let rows: Vec<(String, String, &str)> = vec![
         (
             "another region, a stored cluster".to_string(),
             arn(OTHER_REGION, ACCOUNT, "cluster", &cluster),
+            FOREIGN_REGION,
         ),
         (
             "another region, no such cluster".to_string(),
             arn(OTHER_REGION, ACCOUNT, "cluster", ABSENT),
+            FOREIGN_REGION,
         ),
         (
             "another account".to_string(),
             arn(REGION, OTHER_ACCOUNT, "cluster", &cluster),
+            FOREIGN_ACCOUNT,
         ),
         (
             "another region and account".to_string(),
             arn(OTHER_REGION, OTHER_ACCOUNT, "acl", OPEN_ACCESS_ACL),
+            FOREIGN_REGION,
         ),
         (
             "another account, a user ARN".to_string(),
             arn(REGION, OTHER_ACCOUNT, "user", "default"),
+            FOREIGN_ACCOUNT,
         ),
         (
             "another account, a parameter group ARN".to_string(),
             arn(REGION, OTHER_ACCOUNT, "parametergroup", ABSENT),
+            FOREIGN_ACCOUNT,
         ),
         (
             // A global resource has no region to compare, but it still belongs to an
             // account.
             "another account, a multi-Region cluster ARN".to_string(),
             format!("arn:aws:memorydb::{OTHER_ACCOUNT}:multiregioncluster/{ABSENT}"),
+            FOREIGN_ACCOUNT,
         ),
     ];
 
-    for (label, candidate) in rows {
+    for (label, candidate, sentence) in rows {
         for (operation, payload) in [
             ("ListTags", json!({})),
             ("TagResource", json!({ "Tags": [{ "Key": "k", "Value": "v" }] })),
@@ -181,7 +195,7 @@ async fn an_arn_naming_another_scope_is_an_invalid_parameter_value() {
                 operation,
                 &body,
                 "InvalidParameterValueException",
-                Some(FOREIGN_SCOPE),
+                Some(sentence),
                 &case,
             )
             .await;

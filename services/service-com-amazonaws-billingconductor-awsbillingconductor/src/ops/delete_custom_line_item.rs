@@ -271,10 +271,10 @@ enum Remaining {
 /// the request's end on, or neither.
 ///
 /// A request whose range ends inside the item's span would leave both parts, which one
-/// stored span cannot hold — AWS keeps each generation of an item as a version, which
-/// this service does not persist yet (`ListCustomLineItemVersions` is still a scaffold,
-/// with its own issue) — so the part before the request's start is what remains and the
-/// item ends where the delete begins.
+/// stored span cannot hold — AWS keeps each generation of an item as a version
+/// ([`crate::state::CustomLineItemVersion`]), and a generation holds ONE span — so the
+/// part before the request's start is what remains and the item ends where the delete
+/// begins.
 fn remaining_span(
     item: &crate::state::CustomLineItemRecord,
     range: &CustomLineItemBillingPeriodRange,

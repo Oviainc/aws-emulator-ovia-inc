@@ -19,6 +19,8 @@ mod env_endpoint_payload;
 mod environment_business_rules;
 #[path = "all/environment_lifecycle.rs"]
 mod environment_lifecycle;
+#[path = "all/environment_region_scoping.rs"]
+mod environment_region_scoping;
 #[path = "all/environment_service_defaults.rs"]
 mod environment_service_defaults;
 #[path = "all/environment_unit_count_ranges.rs"]

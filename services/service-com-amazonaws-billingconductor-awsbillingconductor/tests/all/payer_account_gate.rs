@@ -772,7 +772,11 @@ async fn the_gate_precedes_semantic_validation_resource_lookup_and_the_scaffold(
             method: "POST",
             uri: "/list-custom-line-item-versions",
             body: json!({ "Arn": "ABCDEFGHIJ", "MaxResults": 5 }),
-            payer_status: 501,
+            // The payer account reaches this operation's own resource lookup. It models
+            // no 404, so its answer for an item that does not exist is the modelled
+            // `ValidationException` (`MISSING_CUSTOMLINEITEM`); the gate's concern is
+            // that a caller that is not the payer never gets there.
+            payer_status: 400,
         },
         Row {
             case: "a ListResourcesAssociatedToCustomLineItem naming a bare custom line item",

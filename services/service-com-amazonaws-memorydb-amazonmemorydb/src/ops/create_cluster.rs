@@ -476,7 +476,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource, so an unknown one is resolved against state, not accepted.
         if !state.acls.contains_key(&acl_name) {
             return Err(CreateClusterErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
-                message: Some(format!("ACL {acl_name} not found.")),
+                message: Some(crate::state::not_found_message(
+                    crate::state::ResourceKind::Acl,
+                    &acl_name,
+                )),
             })
             .into());
         }

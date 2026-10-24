@@ -478,13 +478,24 @@ async fn update_keyspace_caps_the_replication_region_count() {
     seed(&emulator, PAST_CAP, None, None).await;
     tokio::time::sleep(settle_wait()).await;
 
-    // `RegionList`'s member is `length 2..25` with no pattern, so these synthetic Region
-    // names are inside the modelled member shape; the current Region leads the list.
+    // A `regionList` entry names an Amazon Web Services Region, so a list of any length is
+    // built out of the Region catalog (`emulator_telemetry::policy::KNOWN_REGIONS`, the
+    // source `keyspaces::is_aws_region` checks against); the current Region leads the list.
     let region_list = |count: usize| -> Vec<String> {
         let mut regions = vec![REGION.to_string()];
-        while regions.len() < count {
-            regions.push(format!("region-{:04}", regions.len()));
+        for region in ::emulator_telemetry::policy::KNOWN_REGIONS {
+            if regions.len() >= count {
+                break;
+            }
+            if *region != REGION {
+                regions.push((*region).to_string());
+            }
         }
+        assert_eq!(
+            regions.len(),
+            count,
+            "case {count:?}: the Region catalog must hold enough Regions for this list, got {regions:?}"
+        );
         regions
     };
     let at_cap = region_list(keyspaces::MAX_REPLICATION_REGIONS);

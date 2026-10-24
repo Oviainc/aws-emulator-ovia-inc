@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInvalidationForDistributionTenant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInvalidationForDistributionTenant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInvalidationForDistributionTenant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Submits one invalidation batch against ONE distribution tenant: the batch is persisted
+//! under that tenant with a minted id, the transient status a just-accepted batch has and
+//! the submitted batch kept whole, so a later read or list of that tenant's invalidations
+//! answers from this record. Repeating a `CallerReference` with the same batch returns the
+//! invalidation it already created rather than creating a second one.
+//!
+//! A batch the invalidation quota cannot admit — one naming more invalidation objects than
+//! a request may — is refused with `TooManyInvalidationsInProgress` ("You have exceeded
+//! the maximum number of allowable InProgress invalidation batch requests, or invalidation
+//! objects"), and nothing is stored for it.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +79,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::StoredInvalidation;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +158,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInvalidationForDistributionTenant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInvalidationForDistributionTenantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInvalidationForDistributionTenant"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "The ID of the distribution tenant": an invalidation is created under a tenant
+        // this store holds, and the record it is stored on is the one every later read of
+        // that tenant's invalidations answers from.
+        let Some(tenant) = store.distribution_tenant(&input.id) else {
+            return Err(
+                CreateInvalidationForDistributionTenantErrorModeled::EntityNotFound(
+                    crate::state::distribution_tenant_not_found(&input.id),
+                )
+                .into(),
+            );
+        };
+        let tenant_id = tenant.id.clone();
+
+        // "The value of Quantity and the size of Items don't match."
+        if let Some(message) = crate::state::batch_quantity_mismatch(&input.invalidation_batch) {
+            return Err(
+                CreateInvalidationForDistributionTenantErrorModeled::InconsistentQuantities(
+                    InconsistentQuantities {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You have exceeded the maximum number of allowable InProgress invalidation batch
+        // requests, or invalidation objects": the objects ONE batch names count against
+        // that quota, so a batch naming more paths than the service admits is refused
+        // under it. The batch is stored whole, so the bound is checked before anything is
+        // stored.
+        let path_count = crate::state::batch_path_count(&input.invalidation_batch);
+        if path_count > crate::state::MAX_INVALIDATION_PATHS {
+            return Err(
+                CreateInvalidationForDistributionTenantErrorModeled::TooManyInvalidationsInProgress(
+                    crate::state::too_many_invalidations_in_progress(),
+                )
+                .into(),
+            );
+        }
+
+        // "If you make a second invalidation request with the same value for
+        // CallerReference, and if the rest of the request is the same, CloudFront doesn't
+        // create a new invalidation request. Instead, CloudFront returns information about
+        // the invalidation request that you previously created with the same
+        // CallerReference" — the reference identifies one invalidation of this tenant.
+        let repeated = tenant
+            .invalidations
+            .values()
+            .find(|existing| {
+                existing.batch.caller_reference == input.invalidation_batch.caller_reference
+            })
+            .cloned();
+        if let Some(existing) = repeated {
+            if crate::state::same_batch(&existing.batch, &input.invalidation_batch) {
+                return Ok(CreateInvalidationForDistributionTenantOutput {
+                    location: Some(crate::state::location_uri(
+                        &crate::state::distribution_tenant_invalidation_path(
+                            &tenant_id,
+                            &existing.id,
+                        ),
+                    )),
+                    invalidation: Some(existing.to_invalidation()),
+                });
+            }
+            // The same reference naming a DIFFERENT set of paths is not the same request
+            // again, and a caller reference identifies one invalidation for its whole
+            // life, so the second batch is refused rather than stored under a reference
+            // that is already taken.
+            return Err(
+                CreateInvalidationForDistributionTenantErrorModeled::InvalidArgument(
+                    InvalidArgument {
+                        message: Some(format!(
+                            "The CallerReference {} was already used for invalidation {} of \
+                             this distribution tenant with different paths",
+                            input.invalidation_batch.caller_reference, existing.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You have exceeded the maximum number of allowable InProgress invalidation batch
+        // requests, or invalidation objects." The invalidations of one tenant grow only
+        // here and a record cannot be evicted (a later read has to answer with what this
+        // create returned), so the bound is an entry count refused BEFORE anything is
+        // stored.
+        if tenant.invalidations.len() >= crate::state::MAX_INVALIDATIONS_PER_DISTRIBUTION {
+            return Err(
+                CreateInvalidationForDistributionTenantErrorModeled::TooManyInvalidationsInProgress(
+                    crate::state::too_many_invalidations_in_progress(),
+                )
+                .into(),
+            );
+        }
+
+        let id = store.allocate_tenant_invalidation_id(&tenant_id);
+        let invalidation = StoredInvalidation {
+            id: id.clone(),
+            // An invalidation batch CloudFront has just accepted has not finished yet, so
+            // it reports the transient status until the clock owes it the terminal one.
+            status: crate::state::STATUS_IN_PROGRESS.to_string(),
+            create_time: now,
+            completed_due: now + crate::state::PROPAGATION_DELAY,
+            // Stored whole: a later read of this invalidation answers from the batch as
+            // submitted.
+            batch: input.invalidation_batch,
+        };
+        let reported = invalidation.to_invalidation();
+        let Some(owner) = store.distribution_tenants.get_mut(&tenant_id) else {
+            return Err(
+                CreateInvalidationForDistributionTenantErrorModeled::EntityNotFound(
+                    crate::state::distribution_tenant_not_found(&input.id),
+                )
+                .into(),
+            );
+        };
+        owner.invalidations.insert(id.clone(), invalidation);
+
+        Ok(CreateInvalidationForDistributionTenantOutput {
+            // "The location for the invalidation": the URI the tenant's invalidation is
+            // addressed by, including its id.
+            location: Some(crate::state::location_uri(
+                &crate::state::distribution_tenant_invalidation_path(&tenant_id, &id),
+            )),
+            invalidation: Some(reported),
+        })
     }
 }

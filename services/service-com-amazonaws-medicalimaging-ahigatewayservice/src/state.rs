@@ -167,7 +167,9 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 // 1. A missing resource is stated by its KIND, as a constant: the text carries no
 //    identifier from the request, so one caller probing ids cannot read them back
 //    out of the 404 body ([`DATASTORE_NOT_FOUND_MESSAGE`],
-//    [`IMPORT_JOB_NOT_FOUND_MESSAGE`]).
+//    [`IMPORT_JOB_NOT_FOUND_MESSAGE`]) — including on the ARN-keyed tagging routes,
+//    whose lookup reports the absent kind rather than the ARN it was named by
+//    ([`MissingResource`]).
 // 2. A continuation token this service did not issue is refused with ONE fixed
 //    sentence that does not vary with the token supplied
 //    ([`INVALID_NEXT_TOKEN_MESSAGE`]).
@@ -1345,26 +1347,34 @@ impl ComAmazonawsMedicalimagingAhigatewayserviceState {
     }
 
     /// The tag map of the resource `arn` names — a data store, or one image set it
-    /// owns — as seen from `region`, or `None` when this emulator holds no such
-    /// resource there.
+    /// owns — as seen from `region`, or which resource KIND is missing when this
+    /// emulator holds no such resource there.
     ///
     /// One lookup for both resource kinds, so the three tagging operations agree on
     /// what exists: tags live ON the resource record rather than in a map beside it.
     /// The ARN must be the resource's OWN: a data store is reached by its id in the
     /// region the request addressed, and then only when the ARN it was named by is the
     /// one the data store reports.
+    ///
+    /// The failure says WHICH kind is absent — the data store, or the image set inside
+    /// one that is present — because that is what a refusal has to state
+    /// ([`MissingResource::message`]).
     pub fn resource_tags(
         &self,
         region: &str,
         arn: &ResourceArn,
-    ) -> Option<&HashMap<String, String>> {
-        let datastore = self.datastore_in(region, &arn.datastore_id)?;
-        if datastore.datastore_arn != arn.datastore_arn {
-            return None;
-        }
+    ) -> Result<&HashMap<String, String>, MissingResource> {
+        let datastore = self
+            .datastore_in(region, &arn.datastore_id)
+            .filter(|datastore| datastore.datastore_arn == arn.datastore_arn)
+            .ok_or(MissingResource::Datastore)?;
         match &arn.image_set_id {
-            None => Some(&datastore.tags),
-            Some(image_set_id) => Some(&datastore.image_sets.get(image_set_id)?.tags),
+            None => Ok(&datastore.tags),
+            Some(image_set_id) => datastore
+                .image_sets
+                .get(image_set_id)
+                .map(|image_set| &image_set.tags)
+                .ok_or(MissingResource::ImageSet),
         }
     }
 
@@ -1373,14 +1383,18 @@ impl ComAmazonawsMedicalimagingAhigatewayserviceState {
         &mut self,
         region: &str,
         arn: &ResourceArn,
-    ) -> Option<&mut HashMap<String, String>> {
-        let datastore = self.datastore_in_mut(region, &arn.datastore_id)?;
-        if datastore.datastore_arn != arn.datastore_arn {
-            return None;
-        }
+    ) -> Result<&mut HashMap<String, String>, MissingResource> {
+        let datastore = self
+            .datastore_in_mut(region, &arn.datastore_id)
+            .filter(|datastore| datastore.datastore_arn == arn.datastore_arn)
+            .ok_or(MissingResource::Datastore)?;
         match &arn.image_set_id {
-            None => Some(&mut datastore.tags),
-            Some(image_set_id) => Some(&mut datastore.image_sets.get_mut(image_set_id)?.tags),
+            None => Ok(&mut datastore.tags),
+            Some(image_set_id) => datastore
+                .image_sets
+                .get_mut(image_set_id)
+                .map(|image_set| &mut image_set.tags)
+                .ok_or(MissingResource::ImageSet),
         }
     }
 
@@ -1465,6 +1479,29 @@ pub struct ResourceArn {
     pub datastore_id: String,
     /// `Some` only when the ARN carries the optional `/imageset/<id>` suffix.
     pub image_set_id: Option<String>,
+}
+
+/// Which resource a [`ResourceArn`] lookup failed to find: the data store the ARN
+/// names, or the image set inside a data store that IS held.
+///
+/// It exists so a refusal can state the KIND that is absent — rule 1 of the wording
+/// rules above — rather than anything the caller supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingResource {
+    Datastore,
+    ImageSet,
+}
+
+impl MissingResource {
+    /// The sentence this service answers a request naming this absent resource with —
+    /// the same constant every other operation that resolves the kind uses, so one
+    /// resource has one refusal text whichever route reached it.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Datastore => DATASTORE_NOT_FOUND_MESSAGE,
+            Self::ImageSet => IMAGE_SET_NOT_FOUND_MESSAGE,
+        }
+    }
 }
 
 /// Parse a medical-imaging resource ARN, or `None` when the string is not one.

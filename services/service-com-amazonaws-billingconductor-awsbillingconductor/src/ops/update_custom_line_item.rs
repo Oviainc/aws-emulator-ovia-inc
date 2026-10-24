@@ -201,7 +201,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let updated = merge(stored, &input)?;
         let output = render(&updated);
-        state.custom_line_items.insert(item_arn.clone(), updated);
+        // One state method writes the item and keeps the generations
+        // `ListCustomLineItemVersions` reports: an update that takes effect in a new
+        // billing period opens a new version of the item and freezes the one it
+        // replaces, and an update inside the current version's billing period replaces
+        // that version.
+        let now = updated.last_modified_time_millis;
+        state.put_custom_line_item(updated, now);
 
         // The audit record for a state-changing call: who asked, what it addressed and
         // that it succeeded. Never a `@sensitive` member — the item's name and its
@@ -296,10 +302,11 @@ fn merge(
     // and the end exclusive, so an end at or before the start would cover no billing
     // period at all.
     //
-    // AWS keeps one VERSION of the item per billing period range, readable through
-    // `ListCustomLineItemVersions` (still a scaffold, with its own issue); this store
-    // holds the item's current generation, so the range the request names becomes the
-    // range the item — with the values this update leaves on it — applies in.
+    // AWS keeps one VERSION of the item per billing period it is in effect in, readable
+    // through `ListCustomLineItemVersions`: the range the request names becomes the
+    // range the item — with the values this update leaves on it — applies in, and the
+    // generation it replaces is kept as a version (see
+    // [`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_custom_line_item`]).
     if let Some(range) = input.billing_period_range.as_ref() {
         if !crate::state::billing_period_range_is_ordered(range) {
             return Err(validation(

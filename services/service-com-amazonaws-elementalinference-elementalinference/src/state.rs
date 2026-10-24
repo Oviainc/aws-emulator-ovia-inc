@@ -561,6 +561,21 @@ pub struct Feed {
     pub status: FeedStatus,
     /// The resource associated with the feed; `None` until `AssociateFeed` runs.
     pub association: Option<FeedAssociation>,
+    /// The name of the resource whose RELEASE this feed has already served, and `None`
+    /// while no release of it has been served.
+    ///
+    /// `DisassociateFeed` is `@idempotent` and its `associatedResourceName` is the
+    /// operation's `@idempotencyToken`, so a retry of the same release — what an SDK
+    /// sends when it never saw the first response — has to answer the first call's
+    /// success again instead of being judged against the state that first call left
+    /// behind. This member is what tells a retry from a new request: it records the name
+    /// the served release carried, so a request naming it is that same release once more
+    /// and any other name is a request of its own.
+    ///
+    /// It lives on the feed record rather than in a store of its own, so it is bounded by
+    /// the feeds that exist and leaves the store with the feed it belongs to — a released
+    /// feed that is then deleted is simply not found, as any absent feed is.
+    pub released_resource_name: Option<String>,
     /// The resource-based policy document attached to the feed, or `None` while the
     /// feed carries no policy.
     ///
@@ -617,6 +632,13 @@ impl Feed {
         self.association
             .as_ref()
             .map(|association| association.associated_resource_name.as_str())
+    }
+
+    /// Whether a release naming `resource_name` has ALREADY been served for this feed,
+    /// i.e. whether a `DisassociateFeed` carrying that name is the same release once more
+    /// rather than a new request ([`Self::released_resource_name`]).
+    pub fn has_served_release_of(&self, resource_name: &str) -> bool {
+        self.released_resource_name.as_deref() == Some(resource_name)
     }
 
     /// The tags of this feed as the `TagMap` every feed response carries.

@@ -235,12 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if stored.invalidations.len() >= crate::state::MAX_INVALIDATIONS_PER_DISTRIBUTION {
             return Err(
                 CreateInvalidationErrorModeled::TooManyInvalidationsInProgress(
-                    TooManyInvalidationsInProgress {
-                        message: Some(format!(
-                            "This emulator holds at most {} invalidations per distribution",
-                            crate::state::MAX_INVALIDATIONS_PER_DISTRIBUTION
-                        )),
-                    },
+                    crate::state::too_many_invalidations_in_progress(),
                 )
                 .into(),
             );

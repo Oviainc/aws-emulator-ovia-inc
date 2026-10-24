@@ -186,7 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(cluster) = state.clusters.get(name) else {
                     return Err(DescribeClustersErrorModeled::ClusterNotFoundFault(
                         ClusterNotFoundFault {
-                            message: Some(format!("Cluster {name} not found.")),
+                            message: Some(crate::state::not_found_message(
+                                crate::state::ResourceKind::Cluster,
+                                name,
+                            )),
                         },
                     )
                     .into());

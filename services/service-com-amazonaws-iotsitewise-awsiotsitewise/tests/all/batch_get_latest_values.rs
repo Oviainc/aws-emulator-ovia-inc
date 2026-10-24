@@ -6,7 +6,8 @@
 //! The rule these suites pin: one batch-get request answers EVERY entry it carries
 //! from the one shared engine store — each entry that names a stored property is a
 //! success entry carrying that property's latest stored value (and no value at all
-//! when nothing has been written to it), each entry that names no stored property
+//! when its definition declares none and nothing has been written to it), each
+//! entry that names no stored property
 //! is an error entry carrying the `BatchGetAssetPropertyValueErrorCode` for why,
 //! and the operation reports without changing anything a later caller sees.
 //!
@@ -62,7 +63,8 @@ fn count(list: &Value) -> usize {
 }
 
 /// A model whose properties cover one measurement per `PropertyDataType` a
-/// `Variant` member exists for, plus an attribute nothing is ever written to.
+/// `Variant` member exists for, plus an attribute carrying a model default value
+/// and one carrying none — the second is the property nothing ever gives a value.
 /// Source: `smithy_query(query="shape", shape="PropertyDataType,Variant")`.
 fn mixed_type_model() -> Value {
     json!([
@@ -71,6 +73,7 @@ fn mixed_type_model() -> Value {
         {"name": "Status", "dataType": "STRING", "type": {"measurement": {}}},
         {"name": "Running", "dataType": "BOOLEAN", "type": {"measurement": {}}},
         {"name": "Serial", "dataType": "STRING", "type": {"attribute": {"defaultValue": "unset"}}},
+        {"name": "Site", "dataType": "STRING", "type": {"attribute": {}}},
     ])
 }
 
@@ -184,8 +187,10 @@ async fn batch_get_reports_the_latest_stored_value_of_every_entry_it_carries() {
         );
     }
 
-    // One request carrying every row plus the attribute nothing was written to.
-    let unwritten = property_id(&asset["assetProperties"], "Serial");
+    // One request carrying every row, plus the attribute whose current value is
+    // the default its model declares and the attribute that declares none.
+    let defaulted = property_id(&asset["assetProperties"], "Serial");
+    let unwritten = property_id(&asset["assetProperties"], "Site");
     let mut entries: Vec<Value> = rows
         .iter()
         .enumerate()
@@ -193,6 +198,11 @@ async fn batch_get_reports_the_latest_stored_value_of_every_entry_it_carries() {
             json!({"entryId": format!("row{at}"), "assetId": asset_id, "propertyId": property})
         })
         .collect();
+    entries.push(json!({
+        "entryId": "defaulted",
+        "assetId": asset_id,
+        "propertyId": defaulted,
+    }));
     entries.push(json!({
         "entryId": "unwritten",
         "assetId": asset_id,
@@ -223,7 +233,7 @@ async fn batch_get_reports_the_latest_stored_value_of_every_entry_it_carries() {
     );
     assert_eq!(
         count(&body["successEntries"]),
-        rows.len() + 1,
+        rows.len() + 2,
         "expected one success entry per requested entry, got {body}"
     );
 
@@ -258,11 +268,27 @@ async fn batch_get_reports_the_latest_stored_value_of_every_entry_it_carries() {
         );
     }
 
+    // An attribute's model default value IS its current value, so the entry for a
+    // property nothing was written to carries it; a property whose definition
+    // declares no value at all carries none. (The rule across data types is pinned
+    // by the `attribute_default_values` suite.)
+    let default = find_entry(&body["successEntries"], "defaulted")
+        .unwrap_or_else(|| panic!("no success entry for the defaulted property in {body}"));
+    assert_eq!(
+        default["assetPropertyValue"]["value"]["stringValue"].as_str(),
+        Some("unset"),
+        "an attribute reports the default value its model declares, got {default}"
+    );
+    assert_eq!(
+        default["assetPropertyValue"]["quality"].as_str(),
+        Some("GOOD"),
+        "the materialised default carries the quality of an ordinary reading, got {default}"
+    );
     let empty = find_entry(&body["successEntries"], "unwritten")
         .unwrap_or_else(|| panic!("no success entry for the unwritten property in {body}"));
     assert!(
         empty.get("assetPropertyValue").is_none(),
-        "a property nothing was written to has no current value, got {empty}"
+        "a property whose definition declares no value has no current value, got {empty}"
     );
 
     // Reporting changes nothing a later caller sees: the same request answers the

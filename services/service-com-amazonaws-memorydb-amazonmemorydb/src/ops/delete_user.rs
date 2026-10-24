@@ -180,7 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(user) = state.users.get(&user_name) else {
             return Err(DeleteUserErrorModeled::UserNotFoundFault(UserNotFoundFault {
-                message: Some(format!("User {user_name} not found.")),
+                message: Some(crate::state::not_found_message(
+                    crate::state::ResourceKind::User,
+                    &user_name,
+                )),
             })
             .into());
         };
@@ -208,7 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(mut user) = state.users.remove(&user_name) else {
             // Unreachable: the entry was read under this same lock just above.
             return Err(DeleteUserErrorModeled::UserNotFoundFault(UserNotFoundFault {
-                message: Some(format!("User {user_name} not found.")),
+                message: Some(crate::state::not_found_message(
+                    crate::state::ResourceKind::User,
+                    &user_name,
+                )),
             })
             .into());
         };

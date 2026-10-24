@@ -109,10 +109,11 @@ pub const STATUS_FAILED: &str = "FAILED";
 /// the non-terminal ones a delete is refused for, per `BadRequestException`'s own
 /// documentation ("if it's in a non-terminal state (such as IN PROGRESS)").
 ///
-/// `MedicalScribeJobStatus` is modelled with the same four values
-/// (`smithy_query(query="shape", shape="MedicalScribeJobStatus")`) and its deletes
-/// carry the same `BadRequestException`, so this one predicate answers for both job
-/// families rather than each handler spelling its own list.
+/// `MedicalScribeJobStatus` and `CallAnalyticsJobStatus` are modelled with the same
+/// four values (`smithy_query(query="shape", shape="MedicalScribeJobStatus")`,
+/// `smithy_query(query="shape", shape="CallAnalyticsJobStatus")`) and their deletes
+/// carry the same `BadRequestException`, so this one predicate answers for every job
+/// family rather than each handler spelling its own list.
 pub fn is_terminal_job_status(status: &str) -> bool {
     status == STATUS_COMPLETED || status == STATUS_FAILED
 }
@@ -221,8 +222,7 @@ pub const MAX_MEDICAL_TRANSCRIPTION_JOBS: usize = MAX_TRANSCRIPTION_JOBS;
 /// Call Analytics jobs. Applying the same figure the other job families use keeps the
 /// store bounded — a caller that never deletes cannot grow it without end — and a
 /// start beyond it answers the `LimitExceededException` the operation models for an
-/// exceeded quota. `DeleteCallAnalyticsJob` is what makes room again, once it is
-/// implemented (it is still a scaffold stub, with an issue of its own).
+/// exceeded quota. `DeleteCallAnalyticsJob` is what makes room again.
 pub const MAX_CALL_ANALYTICS_JOBS: usize = MAX_TRANSCRIPTION_JOBS;
 
 /// `VocabularyState` values, from the model's enum

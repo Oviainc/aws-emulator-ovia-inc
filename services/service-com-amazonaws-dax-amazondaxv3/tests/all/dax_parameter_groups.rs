@@ -228,6 +228,109 @@ async fn the_default_parameter_group_is_reported_before_anything_is_created() {
 }
 
 // ---------------------------------------------------------------------------
+// Rule: the parameter group AWS provides is identified by the parameter group FAMILY
+// whose defaults it carries — `default.<family>`, described as "Default parameter group
+// for <family>" — and that name is the identifier a client passes back wherever a
+// `ParameterGroupName` is taken, so no other spelling of it resolves.
+// Source: `state::DEFAULT_PARAMETER_GROUP_FAMILY` (the family the catalog's defaults
+// belong to) and the members that take the name back on the wire —
+// `DescribeParameterGroups$ParameterGroupNames` and `CreateCluster$ParameterGroupName`
+// (`smithy_query(query="operation",operation="CreateCluster,DescribeParameterGroups")`).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_default_parameter_group_is_identified_by_its_family() {
+    // The identity is the family's, not an unrelated spelling: both members are the
+    // family-qualified forms.
+    assert_eq!(
+        state::DEFAULT_PARAMETER_GROUP,
+        format!("default.{}", state::DEFAULT_PARAMETER_GROUP_FAMILY),
+        "case name: expected default.<family>, got {:?}",
+        state::DEFAULT_PARAMETER_GROUP
+    );
+    assert_eq!(
+        state::DEFAULT_PARAMETER_GROUP_DESCRIPTION,
+        format!(
+            "Default parameter group for {}",
+            state::DEFAULT_PARAMETER_GROUP_FAMILY
+        ),
+        "case description: expected it to name the family, got {:?}",
+        state::DEFAULT_PARAMETER_GROUP_DESCRIPTION
+    );
+
+    let router = emulator();
+    let (status, all) = call(&router, "DescribeParameterGroups", json!({})).await;
+    assert_eq!(status, 200, "describe all: got {all:?}");
+    assert_eq!(
+        all["ParameterGroups"][0]["ParameterGroupName"].as_str(),
+        Some(state::DEFAULT_PARAMETER_GROUP),
+        "case unfiltered: expected the family-qualified name, got {all:?}"
+    );
+    assert_eq!(
+        all["ParameterGroups"][0]["Description"].as_str(),
+        Some(state::DEFAULT_PARAMETER_GROUP_DESCRIPTION),
+        "case unfiltered: expected the family's description, got {all:?}"
+    );
+
+    // Rows: spellings that drop part of the identifier — the family, its version, the
+    // separator — plus the family on its own. None of them names a group, so a client
+    // that guessed one is refused rather than served the default group by accident.
+    for absent in [
+        "default.dax",
+        "default",
+        "default.dax1",
+        "default-dax1.0",
+        state::DEFAULT_PARAMETER_GROUP_FAMILY,
+    ] {
+        let (status, body) = call(
+            &router,
+            "DescribeParameterGroups",
+            json!({ "ParameterGroupNames": [absent] }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (404, "ParameterGroupNotFoundFault"),
+            "case {absent:?}: only the family-qualified name resolves, got {status} {body:?}"
+        );
+    }
+
+    // The name reads back as an identifier: a describe naming it resolves, and a cluster
+    // created with it reports it unchanged.
+    let (status, named) = call(
+        &router,
+        "DescribeParameterGroups",
+        json!({ "ParameterGroupNames": [state::DEFAULT_PARAMETER_GROUP] }),
+    )
+    .await;
+    assert_eq!(status, 200, "case describe by name: got {named:?}");
+    assert_eq!(
+        reported_names(&named),
+        vec![state::DEFAULT_PARAMETER_GROUP.to_string()],
+        "case describe by name: expected only the default group, got {named:?}"
+    );
+
+    let (status, created) = call(
+        &router,
+        "CreateCluster",
+        json!({
+            "ClusterName": "default-params",
+            "NodeType": NODE_TYPE,
+            "ReplicationFactor": 1,
+            "IamRoleArn": ROLE_ARN,
+            "ParameterGroupName": state::DEFAULT_PARAMETER_GROUP,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "case CreateCluster: got {created:?}");
+    assert_eq!(
+        created["Cluster"]["ParameterGroup"]["ParameterGroupName"].as_str(),
+        Some(state::DEFAULT_PARAMETER_GROUP),
+        "case CreateCluster: expected the group it was created with, got {created:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Refusals: an unknown name, a name already taken.
 // ---------------------------------------------------------------------------
 
@@ -331,6 +434,17 @@ async fn creating_a_parameter_group_under_a_taken_name_is_refused() {
             (status, error_code(&body).as_str()),
             (400, "ParameterGroupAlreadyExistsFault"),
             "case {name:?}: expected 400 ParameterGroupAlreadyExistsFault, got {status} {body:?}"
+        );
+        // Like this service's other parameter-group fault, the template is one fixed
+        // sentence that echoes nothing of the request.
+        assert_eq!(
+            body["message"].as_str(),
+            state::parameter_group_already_exists().message.as_deref(),
+            "case {name:?}: expected the fault's own template, got {body:?}"
+        );
+        assert!(
+            !body["message"].as_str().unwrap_or_default().contains(name),
+            "case {name:?}: the refusal must not echo the requested name, got {body:?}"
         );
 
         // Nothing was written: the stored description is still the first one.

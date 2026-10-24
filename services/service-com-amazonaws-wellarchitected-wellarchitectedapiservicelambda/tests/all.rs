@@ -36,6 +36,9 @@ mod agent_profile_listing;
 #[path = "all/agent_recommendation_generations.rs"]
 mod agent_recommendation_generations;
 
+#[path = "all/answer_updates.rs"]
+mod answer_updates;
+
 #[path = "all/custom_lens_import.rs"]
 mod custom_lens_import;
 

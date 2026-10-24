@@ -29,7 +29,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::api_lifecycle::{as_str, assert_minted_id, call, emulator, error_code};
+use crate::api_lifecycle::{as_str, assert_minted_id, call, carries_nothing, emulator, error_code};
 
 /// The most route responses one route holds, after which a create is refused: the
 /// crate's own bound, so the test tracks it rather than restating a number.
@@ -174,16 +174,6 @@ async fn create_route(
         "case {case:?}: expected 201 from CreateRoute, got {status} {created}"
     );
     as_str(&created, "routeId")
-}
-
-/// Whether `member` carries nothing: absent, null, or an empty collection.
-fn carries_nothing(body: &Value, member: &str) -> bool {
-    body.get(member).is_none_or(|value| match value {
-        Value::Null => true,
-        Value::Object(map) => map.is_empty(),
-        Value::Array(items) => items.is_empty(),
-        _ => false,
-    })
 }
 
 #[tokio::test]

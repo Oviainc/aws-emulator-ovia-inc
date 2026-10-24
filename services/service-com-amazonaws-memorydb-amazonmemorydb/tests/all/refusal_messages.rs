@@ -1044,8 +1044,9 @@ async fn delete_acl_removes_the_acl_and_a_later_read_answers_not_found() {
             );
             assert_eq!(
                 message,
-                format!("ACL {folded} not found."),
-                "case {probe:?}: the not-found refusal must name the folded name"
+                format!("ACL {folded} not found"),
+                "case {probe:?}: the not-found refusal must name the folded name in the \
+                 one sentence this service states a missing ACL with"
             );
         }
         // Membership is held ONCE, on the ACL, so the user no longer reports it.

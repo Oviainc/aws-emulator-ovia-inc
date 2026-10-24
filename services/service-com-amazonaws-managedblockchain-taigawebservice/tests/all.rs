@@ -47,6 +47,8 @@ mod reserved_tag_keys;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_a_resource_not_ready.rs"]
+mod tagging_a_resource_not_ready;
 #[path = "all/update_member_log_publishing.rs"]
 mod update_member_log_publishing;
 #[path = "all/update_node_log_publishing.rs"]

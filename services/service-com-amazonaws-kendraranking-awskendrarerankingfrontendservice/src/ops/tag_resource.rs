@@ -159,6 +159,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // "A tag key and value can consist of Unicode letters, digits, white space,
+        // and any of the following symbols: _ . : / = + - @." (`Tag`) — and the `aws:`
+        // key prefix is AWS's own. Neither is expressible in the model, so a tag
+        // outside the set, or under the reserved prefix, is refused here with the
+        // modelled `ValidationException` before anything is written: the request is
+        // about its own values, so it is judged before the resource it names is
+        // resolved.
+        if let Some(rejection) = crate::state::tag_set_rejection(TAGS_MEMBER, &input.tags) {
+            return Err(TagResourceErrorModeled::ValidationException(rejection).into());
+        }
+
         // An ARN this emulator holds no rescore execution plan under names no taggable
         // resource: that is the modelled `ResourceUnavailableException` (HTTP 404), the
         // only not-found error this operation declares.
@@ -203,3 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(TagResourceOutput {})
     }
 }
+
+/// The request member holding the tags this operation writes, as the dotted path of a
+/// validation clause spells it.
+const TAGS_MEMBER: &str = "tags";
