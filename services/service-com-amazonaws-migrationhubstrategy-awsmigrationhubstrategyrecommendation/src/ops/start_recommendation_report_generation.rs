@@ -180,20 +180,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every refusal is decided from the request alone, before the store is touched,
         // so a refused call leaves no task behind.
-        let output_format = match input.output_format.as_deref() {
+        let output_format = match input.output_format {
             // "The default format is Microsoft Excel" when the request names none.
             None => crate::state::DEFAULT_OUTPUT_FORMAT.to_string(),
-            Some(named) if OUTPUT_FORMAT_VALUES.contains(&named) => named.to_string(),
-            // A value `OutputFormat` does not declare: the boundary validator does not
-            // enforce enum membership, so the request is refused here rather than
-            // generating a report in a format that does not exist.
-            Some(_) => {
-                return Err(
-                    StartRecommendationReportGenerationErrorModeled::ValidationException(
-                        crate::state::invalid_request_body(),
-                    )
-                    .into(),
-                );
+            // A value `OutputFormat` does not declare is refused here — the boundary
+            // validator does not enforce enum membership — rather than generating a
+            // report in a format that does not exist.
+            Some(named) => {
+                crate::state::check_enum(Some(named.as_str()), OUTPUT_FORMAT_VALUES).map_err(
+                    StartRecommendationReportGenerationErrorModeled::ValidationException,
+                )?;
+                named
             }
         };
         let group_id_filter = input.group_id_filter.unwrap_or_default();
