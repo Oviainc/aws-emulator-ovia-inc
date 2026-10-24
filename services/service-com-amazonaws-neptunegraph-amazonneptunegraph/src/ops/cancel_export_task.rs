@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelExportTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelExportTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Cancels an export task: the one operation that stops an export this service
+//! accepted. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelExportTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## The rule this handler implements
+//!
+//! A cancellation is accepted only for a task whose export is still in flight; it is
+//! accepted rather than completed, so the task reports the modelled `CANCELLING` status
+//! ("The status is CANCELLING when the export task is cancelled") and the clock owes it
+//! the move to `CANCELLED`. A task that has already stopped, or is already winding down,
+//! has no work left to cancel and is refused `ConflictException` (409); a task
+//! identifier this Region holds no task under is refused `ResourceNotFoundException`
+//! (404).
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +165,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelExportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelExportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CancelExportTaskErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // An export task lives in exactly one Region, so the Region this request was
+        // signed for is part of the lookup: a task of another Region is not found here.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // The lookup settles the transition the clock already made due first, so a task
+        // whose export has already stopped is judged on the status it stopped in rather
+        // than on the status it was accepted with.
+        let Some(task) = store.settled_export_task_mut(&input.task_identifier, &region, now)
+        else {
+            return Err(CancelExportTaskErrorModeled::ResourceNotFoundException(
+                crate::state::export_task_not_found(&input.task_identifier),
+            )
+            .into());
+        };
+
+        // Only a task whose export is still in flight has work to stop: one that has
+        // already stopped, and one that is already winding down, is a conflict rather
+        // than a second cancellation.
+        let status = task.status;
+        if !status.is_cancellable() {
+            let task_id = task.id.clone();
+            return Err(CancelExportTaskErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "export task {task_id} is in status {} and cannot be cancelled",
+                        status.as_wire()
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // Cancellation is ACCEPTED, not completed: the task reports `CANCELLING` now and
+        // the clock owes the move to `CANCELLED` a fixed span later
+        // (`crate::state::CANCELLATION_SPAN`), so a caller that reads the task straight
+        // after this call still sees it winding down.
+        task.begin_cancellation(now);
+
+        // Exporting READS a graph, so the source graph's own status is untouched here,
+        // for the same reason `StartExportTask` leaves it alone: the model puts no
+        // export status on `GraphStatus`, and the task carries the state of the export.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelExportTask"))
+        // Report the record that was stored, so this response cannot drift from what a
+        // later GetExportTask answers.
+        Ok(Self::Output::from(&*task))
     }
 }

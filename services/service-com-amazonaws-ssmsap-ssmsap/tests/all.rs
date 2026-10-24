@@ -19,6 +19,8 @@ mod application_reference_refusals;
 mod configuration_check_reads;
 #[path = "all/configuration_checks.rs"]
 mod configuration_checks;
+#[path = "all/deregistration_window.rs"]
+mod deregistration_window;
 #[path = "all/list_configuration_check_operations.rs"]
 mod list_configuration_check_operations;
 #[path = "all/list_databases.rs"]

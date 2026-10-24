@@ -39,6 +39,8 @@ mod fixture_data_source;
 mod fixture_search;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/output_config_defaults.rs"]
+mod output_config_defaults;
 #[path = "all/output_provenance.rs"]
 mod output_provenance;
 #[path = "all/put_feed_policy_scope.rs"]

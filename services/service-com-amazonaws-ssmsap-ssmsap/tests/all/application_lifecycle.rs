@@ -74,24 +74,27 @@ impl Reply {
     }
 
     /// A member of the response body's `Application`.
-    fn app(&self, name: &str) -> Option<&Value> {
+    ///
+    /// `pub(crate)` so every suite of this target reads an `Application` member the same
+    /// way.
+    pub(crate) fn app(&self, name: &str) -> Option<&Value> {
         self.member("Application")
             .and_then(|application| application.get(name))
             .filter(|value| !value.is_null())
     }
 
     /// A member of the response body's `Operation`.
-    fn op(&self, name: &str) -> Option<&Value> {
+    pub(crate) fn op(&self, name: &str) -> Option<&Value> {
         self.member("Operation")
             .and_then(|operation| operation.get(name))
             .filter(|value| !value.is_null())
     }
 
-    fn app_str(&self, name: &str) -> &str {
+    pub(crate) fn app_str(&self, name: &str) -> &str {
         self.app(name).and_then(Value::as_str).unwrap_or("")
     }
 
-    fn op_str(&self, name: &str) -> &str {
+    pub(crate) fn op_str(&self, name: &str) -> &str {
         self.op(name).and_then(Value::as_str).unwrap_or("")
     }
 }
@@ -259,8 +262,11 @@ impl Emulator {
     }
 }
 
-/// Wait out a status change the clock owes.
-async fn settle() {
+/// Wait out a change the clock owes an application — the next status an asynchronous
+/// call moves it to, or the removal a deregistration ends it with.
+///
+/// `pub(crate)` so every suite of this target waits out the clock the same way.
+pub(crate) async fn settle() {
     tokio::time::sleep(settle_wait()).await;
 }
 
@@ -1660,6 +1666,10 @@ async fn deregistering_removes_the_application_from_every_reader() {
             removed.status, 200,
             "case {id:?}: expected 200 from DeregisterApplication, got {removed:?}"
         );
+        // The deregistration is asynchronous: the application reports DELETING until the
+        // removal the clock owes it falls due (`tests/all/deregistration_window.rs` pins
+        // that window), so this waits the clock out before reading it back.
+        settle().await;
 
         let fetched = emulator.get_application(json!({"ApplicationId": id})).await;
         assert_eq!(
@@ -1679,11 +1689,18 @@ async fn deregistering_removes_the_application_from_every_reader() {
             "case {id:?}: only the other application remains listed, got {listed:?}"
         );
 
-        // Its operation bookkeeping went with it.
+        // The record of the call that handed out that `OperationId` is the history of a
+        // call already made, so the removal does not destroy it.
         let operation = emulator.get_operation(&operation_id).await;
         assert_eq!(
-            operation.status, 400,
-            "case {id:?}: the removed application's operations are gone, got {operation:?}"
+            operation.status, 200,
+            "case {id:?}: an OperationId handed out earlier still resolves, got {operation:?}"
+        );
+        assert_eq!(
+            operation.op_str("ResourceId"),
+            id,
+            "case {id:?}: the surviving record still names the application it was filed \
+             against, got {operation:?}"
         );
 
         // Starting and stopping it is now a not-found, and deregistering it again is
