@@ -25,6 +25,8 @@ mod harness;
 mod modeled_validation_exception;
 #[path = "all/multi_region_witness.rs"]
 mod multi_region_witness;
+#[path = "all/pagination_token_refusal.rs"]
+mod pagination_token_refusal;
 #[path = "all/policy_document_class.rs"]
 mod policy_document_class;
 #[path = "all/policy_version_conflict_and_lockout.rs"]

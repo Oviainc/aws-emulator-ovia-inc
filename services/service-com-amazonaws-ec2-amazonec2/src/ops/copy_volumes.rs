@@ -317,15 +317,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // regardless of this value. Set to true to encrypt a copy of an unencrypted source
         // volume" (`CopyVolumesRequest$Encrypted`): the copy is encrypted when the request
         // asks for it OR the source already is.
-        let encrypted = input.encrypted == Some(true) || source.view.encrypted == Some(true);
+        let requested_encrypted =
+            input.encrypted == Some(true) || source.view.encrypted == Some(true);
         // "If KmsKeyId is specified, the encrypted state must be true"
         // (`CreateVolumeRequest$KmsKeyId`) — a key only names how the copy is encrypted, so
         // naming one for a copy that is not encrypted at all cannot be honoured.
-        if input.kms_key_id.is_some() && !encrypted {
+        if input.kms_key_id.is_some() && !requested_encrypted {
             return Err(Scaffolded::invalid_parameter_value(
                 "kmsKeyId may be specified only when the volume copy is encrypted",
             ));
         }
+        // The copy is a NEW EBS volume in this Region, so the account's encryption-by-default
+        // setting raises its encryption state the same way it raises a created volume's:
+        // once the setting is on, "you cannot disable it for individual volumes" (Amazon EBS
+        // User Guide, "Encryption by default"). Read under the guard this copy is written
+        // under, so no enable or disable can land in between.
+        let encrypted = requested_encrypted || store.ebs_encryption_by_default(&region);
         // "If you set Encrypted to true but do not specify KmsKeyId, the service uses the
         // default KMS key for EBS encryption in your account" — this emulator models no KMS
         // keys, so an unnamed default key is reported as no key, the way `CreateVolume`

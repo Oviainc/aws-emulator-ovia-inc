@@ -24,6 +24,8 @@ mod connectors;
 mod connectors_and_hosts;
 #[path = "all/create_environment_validation.rs"]
 mod create_environment_validation;
+#[path = "all/eip_ec2_propagation.rs"]
+mod eip_ec2_propagation;
 #[path = "all/entitlement_connector.rs"]
 mod entitlement_connector;
 #[path = "all/entitlements.rs"]

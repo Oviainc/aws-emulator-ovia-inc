@@ -264,7 +264,11 @@ fn expected_arn(id: &str) -> String {
 
 /// Whether `value` is the UUID form the model's `OperationId` pattern describes:
 /// `^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$`.
-fn is_operation_id(value: &str) -> bool {
+///
+/// `pub(crate)` so every suite of this target reads one definition of the id form:
+/// `tests/all/configuration_checks.rs` pins it on the ids a configuration check
+/// operation is minted with.
+pub(crate) fn is_operation_id(value: &str) -> bool {
     let core = value.strip_prefix('{').unwrap_or(value);
     let core = core.strip_suffix('}').unwrap_or(core);
     let groups: Vec<&str> = core.split('-').collect();

@@ -202,11 +202,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let mut state = state.lock();
-
         // The id is moved out of the input first, so every other member can be MOVED into
         // the record below rather than cloned into it.
         let id = std::mem::take(&mut input.id);
+
+        // Whether MediaPackage could act as the roles this request names is decided against
+        // the IAM store — a different store in the same engine — so that store's guard is
+        // taken and released BEFORE this service's, exactly as `CreateHarvestJob` reads it:
+        // no two orders of the same two locks exist. The ANSWER is held and reported below,
+        // after the endpoint has been resolved, so an update naming an id this service does
+        // not hold is still answered 404 rather than with a refusal about a role.
+        let assumed_roles = crate::state::origin_endpoint_assumed_roles(
+            input.authorization.as_ref(),
+            input.hls_package.as_ref(),
+            input.dash_package.as_ref(),
+            input.cmaf_package.as_ref(),
+            input.mss_package.as_ref(),
+        );
+        let role_refusal = if assumed_roles.is_empty() {
+            None
+        } else {
+            let iam = crate::state::iam_state(&*self.engine).ok_or_else(|| {
+                UpdateOriginEndpointErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some("the IAM store is unavailable".into()),
+                    },
+                )
+            })?;
+            let iam = iam.lock();
+            assumed_roles.iter().find_map(|(member, role_arn)| {
+                crate::state::assume_role_refusal(member, role_arn, &iam)
+            })
+        };
+
+        let mut state = state.lock();
 
         // An update changes an endpoint this service holds; there is nothing to update
         // for an id it does not, so the target is resolved before the request is judged.
@@ -235,6 +264,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.cmaf_package.as_ref(),
             input.mss_package.as_ref(),
         )?;
+        // And the CONTENT rules the create applies to the same members, by the same
+        // function: a whitelist entry that is not an address range, an ARN that names no
+        // resource of the documented service, and a CMAF package that publishes no child
+        // manifest are refused here too, leaving the stored record exactly as it was.
+        crate::state::check_origin_endpoint_members(
+            input.whitelist.as_deref(),
+            input.authorization.as_ref(),
+            input.hls_package.as_ref(),
+            input.dash_package.as_ref(),
+            input.cmaf_package.as_ref(),
+            input.mss_package.as_ref(),
+        )?;
+        if let Some(refusal) = role_refusal {
+            return Err(refusal.into());
+        }
 
         // An endpoint packages its channel in exactly ONE format, so a request naming
         // several cannot be stored — the same rule, decided by the same function, as on

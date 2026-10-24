@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores an `IndexRecord` on the `CollectionRecord` the requested
+//! collection id names, so `GetIndex` reports the schema back. Refuses an id that names
+//! no collection (`ResourceNotFoundException`), a collection that is not `ACTIVE`
+//! (`ConflictException`), an index name the service's own documented rule rejects
+//! (`ValidationException`), a name already taken by an index with a different schema
+//! (`ConflictException`), and a create past
+//! [`crate::state::MAX_INDEXES_PER_COLLECTION`] (`ValidationException`).
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +147,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIndex"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateIndexErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `IndexName` carries no `@pattern`, so the boundary validator does not narrow it;
+        // the rule is in the member's own documentation: "Index names must be lowercase
+        // and can't begin with underscores (_) or hyphens (-)".
+        if let Err(reason) = crate::state::validate_index_name(&input.index_name) {
+            return Err(
+                CreateIndexErrorModeled::ValidationException(ValidationException {
+                    message: Some(reason),
+                })
+                .into(),
+            );
+        }
+
+        // The schema is STORED, so its size is part of what this collection's index store
+        // grows by: one past the emulator's own document bounds is refused rather than
+        // kept. See `crate::state::MAX_INDEX_SCHEMA_NODES`.
+        if let Some(schema) = &input.index_schema {
+            if !crate::state::document_within_bounds(schema, crate::state::MAX_INDEX_SCHEMA_NODES) {
+                return Err(
+                    CreateIndexErrorModeled::ValidationException(ValidationException {
+                        message: Some(format!(
+                            "indexSchema must not nest deeper than {} levels or carry more than \
+                             {} values",
+                            crate::state::MAX_DOCUMENT_DEPTH,
+                            crate::state::MAX_INDEX_SCHEMA_NODES
+                        )),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        let Some(collection) = store.collections.get_mut(&input.id) else {
+            return Err(CreateIndexErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::index_collection_not_found_message(&input.id)),
+                },
+            )
+            .into());
+        };
+        // An index lives in the collection's data plane, which exists once the collection
+        // is "ready to use" (`CollectionStatus$ACTIVE`'s own documentation) — so a
+        // collection still being created, updated or deleted cannot take one yet. That is
+        // the state conflict `ConflictException` describes.
+        if collection.status != crate::state::COLLECTION_ACTIVE {
+            return Err(CreateIndexErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Collection with ID {} is in status {} and cannot take an index; it must be {}",
+                    input.id,
+                    collection.status,
+                    crate::state::COLLECTION_ACTIVE
+                )),
+            })
+            .into());
+        }
+
+        if let Some(existing) = collection.indexes.get(&input.index_name) {
+            // `CreateIndex` is `@idempotent`, so a repeat of the SAME create answers the
+            // index it already made rather than conflicting with it; a different schema
+            // under a name already taken is a genuinely different request, which is the
+            // conflict `ConflictException` describes.
+            if existing.index_schema == input.index_schema {
+                return Ok(CreateIndexOutput {});
+            }
+            return Err(CreateIndexErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "An index with name '{}' already exists in the collection with ID {}.",
+                    input.index_name, input.id
+                )),
+            })
+            .into());
+        }
+
+        // The per-collection index store is BOUNDED: `CreateIndex` adds one caller-named
+        // entry per request to a collection that may live indefinitely, and nothing
+        // reclaims an index until its collection is purged, so the cap is what keeps that
+        // store finite. Checked AFTER the idempotent short-circuit above, so a retry of an
+        // accepted create is never refused by it.
+        if collection.indexes.len() >= crate::state::MAX_INDEXES_PER_COLLECTION {
+            return Err(
+                CreateIndexErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "Maximum number of indexes exceeded for the collection with ID {}: no \
+                         more than {} indexes can exist in one collection",
+                        input.id,
+                        crate::state::MAX_INDEXES_PER_COLLECTION
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        collection.indexes.insert(
+            input.index_name.clone(),
+            crate::state::IndexRecord {
+                index_schema: input.index_schema,
+            },
+        );
+        // `CreateIndexResponse` models no members: the index is what the call produced,
+        // and `GetIndex` is where it is read back.
+        Ok(CreateIndexOutput {})
     }
 }

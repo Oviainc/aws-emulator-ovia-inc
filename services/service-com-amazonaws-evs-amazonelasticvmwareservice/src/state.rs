@@ -1773,6 +1773,43 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
         })
     }
 
+    /// The VLAN of some LIVE environment this service holds that already carries the
+    /// Elastic IP allocation `allocation_id`, as `(environmentId, associationId)`.
+    ///
+    /// An Elastic IP address carries ONE association at a time, whoever made it, so an
+    /// allocation some VLAN already uses cannot be associated with another: this is what
+    /// `AssociateEipToVlan` asks before recording one, so a second environment cannot
+    /// mint a second association for a single Elastic IP address.
+    ///
+    /// The scope is every environment rather than one Region's, because the account's
+    /// Elastic IP allocations are one store: an id that names an allocation names the
+    /// same allocation wherever it is read. An environment on its way out
+    /// (`DELETING`/`DELETED`) holds nothing: its VLAN subnets are released with it, and
+    /// so are the addresses they were using.
+    pub fn eip_allocation_holder(&self, allocation_id: &str) -> Option<(String, String)> {
+        self.environments
+            .values()
+            .filter(|environment| {
+                environment.state != STATE_DELETED && environment.state != STATE_DELETING
+            })
+            .flat_map(|environment| {
+                environment.vlans.iter().flat_map(move |vlan| {
+                    vlan.eip_associations
+                        .iter()
+                        .map(move |association| (environment, association))
+                })
+            })
+            .find(|(_, association)| {
+                association.allocation_id.as_deref() == Some(allocation_id)
+            })
+            .map(|(environment, association)| {
+                (
+                    environment.environment_id.clone(),
+                    association.association_id.clone().unwrap_or_default(),
+                )
+            })
+    }
+
     /// Whether some host of some environment this service holds already carries
     /// `host_name`: "DNS hostnames for hosts must be unique across Amazon EVS
     /// environments and within VCF" (`HostInfoForCreate$hostName` doc), so the scope is

@@ -91,6 +91,17 @@ pub const STATUS_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
 /// AccessDeniedException after the delete operation completes."
 pub const STATUS_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
 
+/// `RegionStatus::ADDING` (the enum is `ACTIVE | ADDING | REMOVING`) — the status a
+/// Region carries while, as `RegionMetadata$Status` documents it, the "Region extension
+/// workflow is in progress".
+pub const STATUS_ADDING: &str = "ADDING";
+
+/// `RegionStatus::REMOVING` — the status a Region carries while the "Region removal
+/// workflow is in progress" (`RegionMetadata$Status`), which is what `RemoveRegion` puts
+/// the Region it names into: "The Region status is set to REMOVING and the Region record
+/// is deleted when the workflow completes."
+pub const STATUS_REMOVING: &str = "REMOVING";
+
 /// How long after `DeleteInstance` the instance stops existing.
 ///
 /// AWS publishes no duration for it, so this span is the emulator's own CHOSEN one, on
@@ -111,6 +122,20 @@ pub const INSTANCE_DELETION_SPAN: Duration = Duration::from_millis(500);
 /// instance is usable within one test. It is stored as a due instant and materialised by
 /// [`ComAmazonawsSsoadminSwbexternalserviceState::materialize_due`] — nothing sleeps.
 pub const INSTANCE_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after `RemoveRegion` the Region record it names stops existing — the end of
+/// the `REMOVING` the remove put it into ("This operation initiates an asynchronous
+/// workflow to clean up IAM Identity Center resources in the specified additional Region.
+/// The Region status is set to REMOVING and the Region record is deleted when the workflow
+/// completes").
+///
+/// AWS publishes no duration for that workflow, so this span is the emulator's own CHOSEN
+/// one, on the same footing as [`INSTANCE_DELETION_SPAN`]: it is never zero, so a caller
+/// that reads the instance straight after the remove still observes the `REMOVING` status
+/// the model declares, and it is short enough to be waited out inside one test. It is held
+/// as the instant the removal falls due and applied by [`Instance::materialize_due`] —
+/// nothing sleeps for it.
+pub const REGION_REMOVAL_SPAN: Duration = Duration::from_millis(500);
 
 /// Which KIND of IAM Identity Center instance a record is.
 ///
@@ -519,9 +544,63 @@ pub struct Region {
     pub status: String,
     pub added_date: DateTime,
     pub is_primary_region: bool,
+    /// When the clock owes this Region record its REMOVAL — the end of the `REMOVING` a
+    /// `RemoveRegion` put it into — or `None` for a Region nothing is removing. Stored as
+    /// a due INSTANT and applied by [`Instance::materialize_due`], which drops the record;
+    /// nothing sleeps for it.
+    pub removed_due: Option<SystemTime>,
 }
 
 impl Region {
+    /// The PRIMARY Region of an instance: the Region it was enabled in, in its terminal
+    /// `ACTIVE` status. It is the one Region of `Regions` that carries `IsPrimaryRegion`,
+    /// and `RemoveRegion` refuses to remove it ("The primary Region cannot be removed.").
+    pub fn primary(region_name: &str, added_date: DateTime) -> Self {
+        Self {
+            is_primary_region: true,
+            ..Self::active(region_name, added_date)
+        }
+    }
+
+    /// An additional Region of an instance, in its terminal `ACTIVE` status: a Region
+    /// whose extension workflow has finished. NOT the primary one — the primary Region is
+    /// the one the instance was enabled in, which [`Instance::active`] holds.
+    pub fn active(region_name: &str, added_date: DateTime) -> Self {
+        Self {
+            region_name: region_name.to_string(),
+            status: STATUS_ACTIVE.to_string(),
+            added_date,
+            is_primary_region: false,
+            removed_due: None,
+        }
+    }
+
+    /// Whether an add or remove Region workflow is in progress on this Region: the two
+    /// non-terminal values of the model's `RegionStatus` enum (`ADDING` — "Region extension
+    /// workflow is in progress" — and `REMOVING` — "Region removal workflow is in
+    /// progress").
+    pub fn workflow_in_progress(&self) -> bool {
+        self.status == STATUS_ADDING || self.status == STATUS_REMOVING
+    }
+
+    /// Start this Region's removal at `now`: `REMOVING` until the record's deletion falls
+    /// due, [`REGION_REMOVAL_SPAN`] later.
+    ///
+    /// Idempotent on a Region already being removed — the due instant the first
+    /// `RemoveRegion` fixed is kept, so a repeated remove cannot push the deletion out.
+    pub fn start_removal(&mut self, now: SystemTime) {
+        if self.removed_due.is_some() {
+            return;
+        }
+        self.status = STATUS_REMOVING.to_string();
+        self.removed_due = Some(now + REGION_REMOVAL_SPAN);
+    }
+
+    /// Whether the clock already owes this Region record its DELETION.
+    pub fn removal_due(&self, now: SystemTime) -> bool {
+        self.removed_due.is_some_and(|due| due <= now)
+    }
+
     /// This Region as the modeled `RegionMetadata` shape.
     pub fn to_shape(&self) -> RegionMetadata {
         RegionMetadata {
@@ -617,12 +696,7 @@ impl Instance {
             created_date,
             status: STATUS_ACTIVE.to_string(),
             primary_region: region.to_string(),
-            regions: vec![Region {
-                region_name: region.to_string(),
-                status: STATUS_ACTIVE.to_string(),
-                added_date: created_date,
-                is_primary_region: true,
-            }],
+            regions: vec![Region::primary(region, created_date)],
             instance_type,
             // What this KIND of instance starts with; `UpdateInstance` can enable
             // permission sets on an instance that starts without them.
@@ -691,14 +765,20 @@ impl Instance {
     }
 
     /// Apply what the CLOCK already owes this instance: an instance whose activation
-    /// instant has passed is `ACTIVE`, in every Region it holds. Idempotent, and it
-    /// changes nothing before the instant falls due, so a read that calls it answers
-    /// exactly what a read at the same instant would have answered without it.
+    /// instant has passed is `ACTIVE`, in every Region it holds, and a Region whose own
+    /// removal instant has passed ([`Region::start_removal`]) is no longer one of its
+    /// Regions. Idempotent, and it changes nothing before an instant falls due, so a read
+    /// that calls it answers exactly what a read at the same instant would have answered
+    /// without it.
     ///
-    /// The REMOVAL a delete owes is applied by the store rather than here, since it drops
-    /// the record: see
+    /// The REMOVAL a delete owes the INSTANCE is applied by the store rather than here,
+    /// since it drops the whole record: see
     /// [`ComAmazonawsSsoadminSwbexternalserviceState::materialize_due`].
     pub fn materialize_due(&mut self, now: SystemTime) {
+        // A Region whose removal workflow has run out no longer exists, whether or not
+        // anybody called: `RemoveRegion` is documented as deleting the Region record "when
+        // the workflow completes".
+        self.regions.retain(|region| !region.removal_due(now));
         if self.deleted_due.is_some() {
             return;
         }
@@ -706,9 +786,28 @@ impl Instance {
             self.active_due = None;
             self.status = STATUS_ACTIVE.to_string();
             for region in &mut self.regions {
-                region.status = STATUS_ACTIVE.to_string();
+                // A Region on its way OUT keeps its `REMOVING`: the instance's activation
+                // says nothing about a removal workflow another call started.
+                if region.removed_due.is_none() {
+                    region.status = STATUS_ACTIVE.to_string();
+                }
             }
         }
+    }
+
+    /// The Region of this instance whose name is `region_name`, or `None` when the
+    /// instance is not enabled in it.
+    pub fn region(&self, region_name: &str) -> Option<&Region> {
+        self.regions
+            .iter()
+            .find(|region| region.region_name == region_name)
+    }
+
+    /// The same Region, for a handler that updates it.
+    pub fn region_mut(&mut self, region_name: &str) -> Option<&mut Region> {
+        self.regions
+            .iter_mut()
+            .find(|region| region.region_name == region_name)
     }
 
     /// This instance as the modeled `InstanceMetadata` shape.

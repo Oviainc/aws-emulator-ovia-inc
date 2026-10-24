@@ -483,11 +483,22 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The `InputDeviceSummary` projection of one claimed device, or `None` when
     /// this account has claimed no device with that id.
     ///
-    /// The one projection of a device, so every operation that reports one
-    /// (`DescribeInputDevice` through [`input_device_output`], and the listing
-    /// when its own issue lands) reads the same record the same way.
+    /// Resolution only: the projection itself is
+    /// [`ComAmazonawsMedialiveMedialiveState::input_device_summary_of`], so a
+    /// reader that already holds the record (the listing, walking the store) and
+    /// one that only holds an id (`DescribeInputDevice`) cannot report a device
+    /// differently.
     pub fn input_device_summary(&self, id: &str) -> Option<InputDeviceSummary> {
-        let device = self.input_devices.get(id)?;
+        Some(self.input_device_summary_of(self.input_devices.get(id)?))
+    }
+
+    /// The `InputDeviceSummary` projection of one claimed device record.
+    ///
+    /// The ONE projection of a device, so every operation that reports one
+    /// (`DescribeInputDevice` through [`input_device_output`], and
+    /// `ListInputDevices`) reads the same record the same way.
+    pub fn input_device_summary_of(&self, device: &InputDeviceRecord) -> InputDeviceSummary {
+        let id = device.id.as_str();
         let medialive_input_arns = self.inputs_using_input_device(id);
         // "The output attachment type of the input device": a device some input
         // ingests from is that input's source, and one nothing ingests from is
@@ -497,7 +508,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         } else {
             input_device_output_type::MEDIALIVE_INPUT
         };
-        Some(InputDeviceSummary {
+        InputDeviceSummary {
             arn: Some(device.arn.clone()),
             connection_state: Some(device.connection_state.clone()),
             device_settings_sync_state: Some(device.device_settings_sync_state.clone()),
@@ -519,7 +530,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             medialive_input_arns: (!medialive_input_arns.is_empty())
                 .then_some(medialive_input_arns),
             output_type: Some(output_type.to_string()),
-        })
+        }
     }
 }
 

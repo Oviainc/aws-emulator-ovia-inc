@@ -149,22 +149,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = state.lock();
+        let now = std::time::Instant::now();
 
-        // "Usage of this API will result in deletion of the resource in question": the
-        // record goes, so a later Get answers not-found and a later List no longer
-        // carries it.
-        let Some(removed) = state.instances.remove(&input.workspace_instance_id) else {
+        // Deleting a WorkSpace Instance is ASYNCHRONOUS teardown: "Usage of this API
+        // will result in deletion of the resource in question", not in the resource
+        // being gone by the time this call answers. The call is accepted, the instance
+        // moves to the transient `DEALLOCATING`, and it keeps being reported — by
+        // `GetWorkspaceInstance` and by `ListWorkspaceInstances`, including under a
+        // `ProvisionStates` filter naming that state — until the teardown has finished
+        // and the record's retention has elapsed. Removing it inside the request would
+        // make a state the model declares unobservable.
+        let Some(record) = state.settled_mut(&input.workspace_instance_id, now) else {
             return Err(crate::state::instance_not_found_error(
                 &input.workspace_instance_id,
                 DeleteWorkspaceInstanceErrorModeled::ResourceNotFoundException,
             ));
         };
 
-        // Retire the creating `ClientToken` with the record: the token identifies that
-        // create call, and replaying it must not hand back an id that no longer exists.
-        if let Some(token) = removed.client_token {
-            state.client_tokens.remove(&token);
-        }
+        // A record already tearing down is left exactly as it is: this call asks for
+        // the end state that teardown is already heading to, so it is accepted and
+        // changes nothing — it neither restarts the teardown clock nor conflicts.
+        record.begin_deallocation(now);
 
         Ok(DeleteWorkspaceInstanceOutput {})
     }

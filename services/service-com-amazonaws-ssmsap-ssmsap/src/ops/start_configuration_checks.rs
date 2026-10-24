@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartConfigurationChecks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartConfigurationChecks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartConfigurationChecks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts one configuration check operation per requested check against the stored
+//! application, and returns the records it filed: each is `INPROGRESS` now and reaches
+//! its terminal status one [`crate::state::TRANSITION_SPAN`] later, and each `Id` names
+//! a persisted record `GetConfigurationCheckOperation` reads back. A request naming no
+//! check runs the service's whole catalogue (see
+//! [`crate::state::configuration_checks_to_run`]), and the terminal status is the
+//! model's failure status for the reason
+//! [`crate::state::CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE`] states.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +145,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartConfigurationChecks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartConfigurationChecksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartConfigurationChecks"))
+        // The Region this request was signed for: a configuration check runs against an
+        // application registered at THIS regional endpoint and no others.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartConfigurationChecksErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.settle(now);
+
+        let Some(application_id) = state
+            .region(&region)
+            .applications
+            .get(&input.application_id)
+            .map(|application| application.id.clone())
+        else {
+            return Err(
+                StartConfigurationChecksErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::application_not_found_message(
+                        &input.application_id,
+                    )),
+                )
+                .into(),
+            );
+        };
+
+        let checks =
+            crate::state::configuration_checks_to_run(input.configuration_check_ids.as_deref());
+
+        // A check already running against this application cannot be started again
+        // while it runs, which is what `ConflictException` reports. The whole request is
+        // refused before anything is written, so a refused call leaves no half-started
+        // set of checks behind.
+        for check in &checks {
+            if let Some(running) = state
+                .region(&region)
+                .configuration_check_in_progress(&application_id, check)
+            {
+                return Err(StartConfigurationChecksErrorModeled::ConflictException(
+                    crate::state::conflict(format!(
+                        "Configuration check {check} is already in progress for application \
+                         {application_id} under operation {}",
+                        running.id
+                    )),
+                )
+                .into());
+            }
+        }
+
+        // The application was just found in this Region, so reaching for the partition
+        // to write mints nothing.
+        let region_state = state.region_entry(&region);
+        let mut started = Vec::with_capacity(checks.len());
+        for check in &checks {
+            started.push(
+                region_state
+                    .record_configuration_check(&application_id, check, now)
+                    .view(),
+            );
+        }
+
+        Ok(StartConfigurationChecksOutput {
+            configuration_check_operations: Some(started),
+        })
     }
 }

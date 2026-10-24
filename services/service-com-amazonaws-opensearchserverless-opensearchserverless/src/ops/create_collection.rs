@@ -4,7 +4,11 @@
 //! IMPLEMENTED: mints a `CollectionId`, derives the collection's ARN and its index and
 //! Dashboards endpoints from that id, stores a `CollectionRecord` in [`crate::state`]
 //! under the id (indexed by name) in the non-terminal `CREATING` status, and answers from
-//! the stored record. A second create for a name already taken is a `ConflictException`.
+//! the stored record. The collection's encryption setting must come from somewhere — the
+//! request's `encryptionConfig` or a stored `encryption` security policy covering
+//! `collection/<name>` — and a request with neither is refused with
+//! `ValidationException`. A second create for a name already taken is a
+//! `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -239,6 +243,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A collection is encrypted at rest, and the setting that says HOW comes either
+        // from this request's `encryptionConfig` or from an `encryption` security policy
+        // whose rules already cover `collection/<name>`. With neither, there is no
+        // encryption setting for the collection at all, which is the missing input
+        // `ValidationException` describes ("the HTTP request contains invalid input or is
+        // missing required input").
+        let requested_key = input
+            .encryption_config
+            .as_ref()
+            .and_then(|config| config.kms_key_arn.clone());
+        let requested_aws_owned_key = input
+            .encryption_config
+            .as_ref()
+            .and_then(|config| config.a_ws_owned_key)
+            .unwrap_or_default();
+        let policy_encryption = store.policy_encryption_for(&input.name);
+        if requested_key.is_none() && !requested_aws_owned_key && policy_encryption.is_none() {
+            return Err(CreateCollectionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "No encryption policy or encryption configuration exists for the \
+                         collection {}: specify encryptionConfig in the request, or create an \
+                         encryption security policy whose rules cover collection/{}",
+                        input.name, input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
         // A collection name identifies one collection in the account, so a name already
         // taken is the conflict `ConflictException` describes: "thrown when a resource
         // with the same name already exists or is being created".
@@ -278,14 +312,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = store.mint_collection_id();
         let created_date = crate::state::now_epoch_millis();
-        // `EncryptionConfig` either names a customer managed key or selects the
-        // AWS-owned one; a collection encrypted with the AWS-owned key has no customer
-        // key ARN to report, so it reports the service's own marker for it.
-        let kms_key_arn = input
-            .encryption_config
-            .as_ref()
-            .and_then(|config| config.kms_key_arn.clone())
-            .unwrap_or_else(|| crate::state::AWS_OWNED_KEY.to_string());
+        // The key the collection reports. The REQUEST's own choice wins over the covering
+        // policy's — a request that names a customer managed key, or that selects the
+        // AWS-owned key, has said what this collection is encrypted with — and only a
+        // request that says nothing takes the key the covering policy assigns. Either way
+        // a collection encrypted with the AWS-owned key has no customer key ARN to report,
+        // so it reports the service's own marker for it.
+        let kms_key_arn = match requested_key {
+            Some(key) => key,
+            None if requested_aws_owned_key => crate::state::AWS_OWNED_KEY.to_string(),
+            None => policy_encryption
+                .and_then(|encryption| encryption.kms_key_arn)
+                .unwrap_or_else(|| crate::state::AWS_OWNED_KEY.to_string()),
+        };
         let mut record = CollectionRecord {
             id: id.clone(),
             name: input.name,
@@ -313,7 +352,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_date,
             last_modified_date: created_date,
             tags: input.tags.unwrap_or_default(),
+            // A collection is created empty: `CreateIndex` is what puts an index in it.
+            indexes: ::std::collections::BTreeMap::new(),
             pending_status: None,
+            purge_at: None,
         };
         // The collection is returned in the non-terminal `CREATING` status and reaches
         // `ACTIVE` on its own a moment later, with nobody calling.

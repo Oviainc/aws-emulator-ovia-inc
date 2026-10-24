@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInputDevices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInputDevices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInputDevices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +140,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInputDevices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInputDevicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInputDevices"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing and
+        // is a bad request. It is clamped to a finite ceiling, and an absent one
+        // uses that ceiling, so no single request can ask the service to project
+        // an unbounded number of devices in one response.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(ListInputDevicesErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!("maxResults must be at least 1, got {max_results}")),
+                    },
+                )
+                .into());
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        let mut state = state.lock();
+        // Reporting only. `settle` materialises what the clock had already made
+        // due at this instant — a maintenance window whose span has passed, a
+        // delete that has come due on an input a device feeds — so the devices
+        // are reported as they stand, and a later caller sees exactly the same
+        // thing whether or not this listing happened.
+        state.settle(::std::time::SystemTime::now());
+        let state = &*state;
+
+        // `NextToken` is the id the next page starts at. A device's id is the
+        // Link unit's own rather than one this service mints, so the store's
+        // `BTreeMap` orders devices by that id and resuming is a range scan from
+        // the token. A token naming a device the store no longer holds simply
+        // resumes at the next id instead of failing.
+        let first = match input.next_token.as_deref() {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = state
+            .input_devices
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded));
+
+        let input_devices: Vec<InputDeviceSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, device)| state.input_device_summary_of(device))
+            .collect();
+        // Absent on the last page: a token is handed out only when a device is
+        // left over after this one.
+        let next_token = remaining.next().map(|(id, _)| id.clone());
+
+        Ok(ListInputDevicesOutput {
+            input_devices: Some(input_devices),
+            next_token,
+        })
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to list the devices from. A modelled server error, never
+/// a fresh engine (which would answer from an empty private store).
+fn unavailable() -> ListInputDevicesError {
+    ListInputDevicesErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

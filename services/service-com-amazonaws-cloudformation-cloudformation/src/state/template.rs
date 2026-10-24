@@ -3036,24 +3036,33 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// ([`super::StoredStack::deploy_template`]). Every other type's physical id is a function
 /// of its declared or generated name, which any deployment recomputes identically.
 ///
-/// Four types this emulator provisions are in that position: an experiment template's id
+/// Five types this emulator provisions are in that position: an experiment template's id
 /// is minted by FIS (`Ref` returns it, and the type has no name property at all), an AWS
 /// WAF Classic regional IPSet's id is minted by `CreateIPSet` ("Ref returns the IPSet ID"),
 /// where that type's `Name` is only what the create asks for, an Amazon EMR cluster's is
 /// the `j-` job-flow id `RunJobFlow` mints ("Ref returns the cluster ID"), where the type's
-/// `Name` is only the name the flow runs under, and a GuardDuty detector's is minted by
-/// `CreateDetector`, which takes no identifier at all.
+/// `Name` is only the name the flow runs under, a GuardDuty detector's is minted by
+/// `CreateDetector`, which takes no identifier at all, and an OpenSearch Serverless
+/// collection's `Ref` is the `CollectionId` its create mints — a template declares the
+/// collection's NAME, never that id.
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == FIS_EXPERIMENT_TEMPLATE
         || resource_type == WAF_REGIONAL_IP_SET
         || resource_type == EMR_CLUSTER
         || resource_type == GUARDDUTY_DETECTOR
+        || resource_type == AOSS_COLLECTION
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
 /// The middle segment is the Firehose model's own `awsService.cloudFormationName`
 /// (`smithy_query(query="service_info")` on that service's model).
 pub const FIREHOSE_DELIVERY_STREAM: &str = "AWS::KinesisFirehose::DeliveryStream";
+
+/// The `AWS::<cloudFormationName>::<Resource>` types of the two OpenSearch Serverless
+/// resources a stack creates. The middle segment is that service's own
+/// `awsService.cloudFormationName` (`OpenSearchServerless`).
+pub const AOSS_COLLECTION: &str = "AWS::OpenSearchServerless::Collection";
+pub const AOSS_SECURITY_POLICY: &str = "AWS::OpenSearchServerless::SecurityPolicy";
 
 /// The type of an Amazon S3 bucket, whose middle segment is that model's own
 /// `cloudFormationName` the same way. "Ref returns the bucket name" for this type, so a

@@ -160,7 +160,7 @@ async fn stored_tags(router: &MultiServiceRouter, id: &str) -> BTreeMap<String, 
 }
 
 /// Every `WorkspaceInstanceId` `ListWorkspaceInstances` reports, paging to the end.
-async fn list_all_ids(router: &MultiServiceRouter, mut request: Value) -> Vec<String> {
+pub(crate) async fn list_all_ids(router: &MultiServiceRouter, mut request: Value) -> Vec<String> {
     let mut ids = Vec::new();
     loop {
         let page = ok(router, "ListWorkspaceInstances", request.clone()).await;
@@ -471,7 +471,7 @@ async fn max_results_outside_the_modelled_range_is_refused() {
 }
 
 /// The `ProvisionState` `GetWorkspaceInstance` reports for one id.
-async fn provision_state(router: &MultiServiceRouter, id: &str) -> String {
+pub(crate) async fn provision_state(router: &MultiServiceRouter, id: &str) -> String {
     let got = ok(
         router,
         "GetWorkspaceInstance",
@@ -646,7 +646,9 @@ async fn the_instance_quota_is_bounded_and_released_by_delete() {
         "case one past the quota: expected the service's own code, got {payload}"
     );
 
-    // Deleting releases capacity, exactly as it does on the real service.
+    // Deleting releases capacity: the quota is on RUNNING instances, and the delete
+    // moves this one into teardown, so the slot is free even though the record is
+    // still reported for a while.
     ok(
         &router,
         "DeleteWorkspaceInstance",
@@ -776,7 +778,7 @@ async fn the_stored_tag_set_cannot_grow_past_what_the_model_can_report() {
 }
 
 #[tokio::test]
-async fn delete_removes_the_instance_from_every_view() {
+async fn delete_removes_the_instance_from_every_view_once_the_teardown_completes() {
     let router = router();
     let doomed = create(&router, json!({ "ClientToken": "tok-doomed", "ManagedInstance": {} })).await;
     let survivor = create(&router, minimal_create()).await;
@@ -785,6 +787,16 @@ async fn delete_removes_the_instance_from_every_view() {
         &router,
         "DeleteWorkspaceInstance",
         json!({ "WorkspaceInstanceId": doomed }),
+    )
+    .await;
+
+    // Deletion is ASYNCHRONOUS teardown, so the record is still reported right after
+    // the call (the `instance_deletion_lifecycle` suite spans that window). It stops
+    // being reported once the teardown and its retention have both fallen due.
+    tokio::time::sleep(
+        wsinst::state::DEALLOCATION_SPAN
+            + wsinst::state::DEALLOCATED_RETENTION
+            + std::time::Duration::from_millis(250),
     )
     .await;
 
@@ -820,7 +832,7 @@ async fn delete_removes_the_instance_from_every_view() {
         "case list-after-delete: expected only {survivor:?}, got {listed:?}"
     );
 
-    // The deleted record's `ClientToken` was retired with it, so replaying that
+    // The torn-down record's `ClientToken` was retired with it, so replaying that
     // create does not hand back an id that no longer exists.
     let replayed = create(
         &router,

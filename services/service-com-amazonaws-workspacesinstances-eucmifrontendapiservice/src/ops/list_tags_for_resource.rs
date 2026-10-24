@@ -147,9 +147,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let state = state.lock();
+        let mut state = state.lock();
 
-        let Some(record) = state.instances.get(&input.workspace_instance_id) else {
+        // Read through the same clock-due settle every other instance lookup uses, so
+        // a record whose teardown retention has elapsed is not reported here either.
+        let Some(record) = state.settled(&input.workspace_instance_id, std::time::Instant::now())
+        else {
             return Err(crate::state::instance_not_found_error(
                 &input.workspace_instance_id,
                 ListTagsForResourceErrorModeled::ResourceNotFoundException,
