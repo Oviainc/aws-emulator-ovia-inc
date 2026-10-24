@@ -21,6 +21,8 @@ mod error_message_members;
 mod member_accounts;
 #[path = "all/policy_lifecycle.rs"]
 mod policy_lifecycle;
+#[path = "all/protocols_list_lifecycle.rs"]
+mod protocols_list_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging_and_managing_admins.rs"]
