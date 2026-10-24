@@ -42,6 +42,11 @@
 //!   `RepositoryCatalogData.RepositoryDescription` against the API's `repositoryName` and
 //!   `catalogData.description`), so its arm maps the members AWS's resource reference
 //!   publishes one by one, and sends nothing for a property the template leaves out;
+//! * the `AWS::OpenSearchServerless::*` types are the same case (`Name`/`Type`/`Policy`
+//!   against `name`/`type`/`policy`), and a collection's identifier is one the OWNING
+//!   service mints rather than a name the template asked for, so its arm answers that
+//!   identifier and [`super::template::identity_is_service_assigned`] names the type it
+//!   belongs to;
 //! * `AWS::S3::Bucket`'s and `AWS::IAM::Role`'s reach services whose wire is not JSON at
 //!   all, so those arms go through the official `aws-sdk-s3` / `aws-sdk-iam` clients over
 //!   the same in-process callback ([`s3_client`], [`iam_client`]) and name the members
@@ -143,9 +148,10 @@ use super::provisioning::{
     Created, Refusal, AWS_JSON_1_0, AWS_JSON_1_1,
 };
 use super::template::{
-    CLOUDWATCH_METRIC_STREAM, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EMR_CLUSTER,
-    FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE, GUARDDUTY_DETECTOR,
-    SAGEMAKER_MODEL_PACKAGE_GROUP, SNS_TOPIC, SQS_QUEUE, WAF_REGIONAL_IP_SET,
+    AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM, ECR_PUBLIC_REPOSITORY,
+    ECS_CLUSTER, EMR_CLUSTER, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
+    GUARDDUTY_DETECTOR, SAGEMAKER_MODEL_PACKAGE_GROUP, SNS_TOPIC, SQS_QUEUE,
+    WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -180,6 +186,8 @@ pub(super) enum Provisioner {
     FirehoseDeliveryStream,
     CloudWatchMetricStream,
     EcrPublicRepository,
+    OpenSearchServerlessCollection,
+    OpenSearchServerlessSecurityPolicy,
     S3Bucket,
     EmrCluster,
     IamRole,
@@ -202,6 +210,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         FIREHOSE_DELIVERY_STREAM => Some(Provisioner::FirehoseDeliveryStream),
         CLOUDWATCH_METRIC_STREAM => Some(Provisioner::CloudWatchMetricStream),
         ECR_PUBLIC_REPOSITORY => Some(Provisioner::EcrPublicRepository),
+        AOSS_COLLECTION => Some(Provisioner::OpenSearchServerlessCollection),
+        AOSS_SECURITY_POLICY => Some(Provisioner::OpenSearchServerlessSecurityPolicy),
         S3_BUCKET => Some(Provisioner::S3Bucket),
         EMR_CLUSTER => Some(Provisioner::EmrCluster),
         IAM_ROLE => Some(Provisioner::IamRole),
@@ -271,6 +281,14 @@ impl Provisioner {
             // `AWS::WAFRegional::IPSet` publishes `Name` and `IPSetDescriptors` and no
             // `Tags`: the type is not taggable, so no tags are propagated to it.
             Self::WafRegionalIpSet => create_ip_set(ctx, region, resource).await,
+            // `AWS::OpenSearchServerless::SecurityPolicy` publishes no `Tags` property and
+            // `CreateSecurityPolicy` takes none, so a policy carries no propagated tag.
+            Self::OpenSearchServerlessSecurityPolicy => {
+                create_security_policy(ctx, region, resource).await
+            }
+            Self::OpenSearchServerlessCollection => {
+                create_collection(ctx, region, resource, propagated).await
+            }
             Self::GuardDutyDetector => {
                 create_detector(ctx, region, resource, propagated).await
             }
@@ -355,6 +373,10 @@ impl Provisioner {
     /// on the answer's own terms: on its not-found CODE where the service models one —
     /// never on a message, which carries the request's own name — and, where it models
     /// none (SageMaker's model group), by READING the resource back.
+    ///
+    /// The whole record is passed, not just its physical id: a type whose identity is a
+    /// PAIR (a security policy's `(type, name)`) needs the property that carries the other
+    /// half.
     pub(super) async fn delete(
         self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -371,6 +393,12 @@ impl Provisioner {
             }
             Self::EcrPublicRepository => {
                 delete_public_repository(ctx, region, physical_resource_id).await
+            }
+            Self::OpenSearchServerlessSecurityPolicy => {
+                delete_security_policy(ctx, region, resource).await
+            }
+            Self::OpenSearchServerlessCollection => {
+                delete_collection(ctx, region, physical_resource_id).await
             }
             Self::S3Bucket => delete_bucket(ctx, region, physical_resource_id).await,
             Self::EmrCluster => terminate_job_flow(ctx, region, physical_resource_id).await,
@@ -435,6 +463,12 @@ impl Provisioner {
             }
             Self::EcsCluster => describe_cluster(ctx, region, physical_resource_id).await,
             Self::SqsQueue => describe_queue(ctx, region, physical_resource_id).await,
+            Self::OpenSearchServerlessCollection => {
+                describe_collection(ctx, region, physical_resource_id).await
+            }
+            Self::OpenSearchServerlessSecurityPolicy => {
+                describe_security_policy(ctx, region, resource).await
+            }
             Self::SageMakerModelPackageGroup => {
                 describe_model_package_group(ctx, region, physical_resource_id).await
             }
@@ -839,6 +873,202 @@ async fn describe_public_repository(
 }
 
 // ---------------------------------------------------------------------------
+// OpenSearch Serverless: AWS::OpenSearchServerless::Collection / ::SecurityPolicy
+// ---------------------------------------------------------------------------
+
+/// OpenSearch Serverless's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: aoss`, service shape `OpenSearchServerless`).
+const AOSS_SIGNING_NAME: &str = "aoss";
+const AOSS_TARGET_PREFIX: &str = "OpenSearchServerless";
+
+/// Create the policy an `AWS::OpenSearchServerless::SecurityPolicy` declares.
+///
+/// The resource declares `Name`, `Type`, `Policy` and `Description` against an API that
+/// takes `name`, `type`, `policy` and `description`, so those four are mapped here. `Ref`
+/// on the resource returns the policy's NAME, which is the physical id the deployment
+/// already computed from the `Name` property, so the service assigns nothing this record
+/// has to take over.
+async fn create_security_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    request.insert(
+        "name".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    request.insert("type".to_string(), Value::String(declared_type(resource)?));
+    request.insert(
+        "policy".to_string(),
+        Value::String(policy_document(resource)?),
+    );
+    if let Some(description) = property(resource, "Description") {
+        request.insert("description".to_string(), Value::String(description));
+    }
+    call_json_rpc(
+        ctx,
+        AOSS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{AOSS_TARGET_PREFIX}.CreateSecurityPolicy"),
+        &Value::Object(request),
+    )
+    .await?;
+    // `AWS::OpenSearchServerless::SecurityPolicy` publishes no `Fn::GetAtt` attributes, so
+    // an attribute read against it yields no value rather than a guessed one.
+    Ok(Created::default())
+}
+
+/// Delete the policy a stack created, by the `(type, name)` pair that identifies one. A
+/// policy the service no longer has is already in the state the delete asks for.
+async fn delete_security_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let kind = declared_type(resource)?;
+    let request = serde_json::json!({
+        "type": kind,
+        "name": resource.physical_resource_id,
+    });
+    match call_json_rpc(
+        ctx,
+        AOSS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{AOSS_TARGET_PREFIX}.DeleteSecurityPolicy"),
+        &request,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Create the collection an `AWS::OpenSearchServerless::Collection` declares.
+///
+/// `Ref` on this resource returns the collection's **Id** — the server-minted
+/// `CollectionId`, which is what `BatchGetCollection` and `CreateIndex` address a
+/// collection by — so the create's own answer replaces the computed physical id, and
+/// `Fn::GetAtt` reads `Id`, `Arn`, `CollectionEndpoint` and `DashboardEndpoint` off what
+/// the owning service reports rather than off anything rebuilt here. The resource's
+/// `Name`, `Type`, `Description`, `StandbyReplicas` and `Tags` are mapped onto the API's
+/// own members, and its `tags` carry the stack's propagated tags beside the declared ones
+/// ([`tags_of`]).
+async fn create_collection(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    request.insert(
+        "name".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    for (declared, member) in [
+        ("Type", "type"),
+        ("Description", "description"),
+        ("StandbyReplicas", "standbyReplicas"),
+    ] {
+        if let Some(value) = property(resource, declared) {
+            request.insert(member.to_string(), Value::String(value));
+        }
+    }
+    let tags: Vec<Value> = tags_of(&resource.properties, propagated)
+        .into_iter()
+        .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+        .collect();
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Array(tags));
+    }
+    let reported = call_json_rpc(
+        ctx,
+        AOSS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{AOSS_TARGET_PREFIX}.CreateCollection"),
+        &Value::Object(request),
+    )
+    .await?;
+    let detail = reported
+        .get("createCollectionDetail")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let id = detail
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "the created collection carries no id".to_string(),
+        })?
+        .to_string();
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Id".to_string(), id.clone());
+    if let Some(arn) = detail.get("arn").and_then(Value::as_str) {
+        attributes.insert("Arn".to_string(), arn.to_string());
+    }
+    // The endpoints are derived from the collection's id BY THE OWNING SERVICE, so they
+    // are read back from it rather than rebuilt here. A read that does not answer them
+    // leaves those attributes unset rather than guessed.
+    let read = call_json_rpc(
+        ctx,
+        AOSS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{AOSS_TARGET_PREFIX}.BatchGetCollection"),
+        &serde_json::json!({ "ids": [id] }),
+    )
+    .await
+    .ok();
+    let detail = read
+        .as_ref()
+        .and_then(|answer| answer.get("collectionDetails"))
+        .and_then(Value::as_array)
+        .and_then(|details| details.first());
+    if let Some(detail) = detail {
+        for (member, attribute) in [
+            ("collectionEndpoint", "CollectionEndpoint"),
+            ("dashboardEndpoint", "DashboardEndpoint"),
+        ] {
+            if let Some(endpoint) = detail.get(member).and_then(Value::as_str) {
+                attributes.insert(attribute.to_string(), endpoint.to_string());
+            }
+        }
+    }
+    Ok(Created {
+        physical_resource_id: Some(id),
+        attributes,
+    })
+}
+
+/// Delete the collection a stack created, by the id the create reported. A collection the
+/// service no longer has is already in the state the delete asks for.
+async fn delete_collection(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "id": physical_resource_id });
+    match call_json_rpc(
+        ctx,
+        AOSS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{AOSS_TARGET_PREFIX}.DeleteCollection"),
+        &request,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Amazon S3: AWS::S3::Bucket
 // ---------------------------------------------------------------------------
@@ -1628,7 +1858,7 @@ async fn create_pipeline(
     resource: &StoredResource,
     propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
-    let mut declaration = match camel_cased(&resource.properties) {
+    let mut declaration = match camel_cased(&resource.properties, 0)? {
         Value::Object(object) => object,
         _ => Map::new(),
     };
@@ -1735,6 +1965,21 @@ async fn describe_pipeline(
 // Reading an evaluated property document
 // ---------------------------------------------------------------------------
 
+/// The deepest a re-casing walk descends into an evaluated property document.
+///
+/// The same rule, for the same reason, as [`MAX_CONFIGURATION_NESTING`]: the properties
+/// come from a caller-supplied template body, so their nesting is the REQUESTER's choice
+/// and a recursive walk over them has to be bounded by a constant rather than by the
+/// input — exhausting the native stack ABORTS the process instead of unwinding, which
+/// would take the emulator down for every caller rather than failing one stack. A document
+/// nested deeper than this is REFUSED, never quietly truncated: a resource created from
+/// part of the document its template declared is not the resource the template described.
+///
+/// Set to the template reader's own [`super::template::MAX_TEMPLATE_DEPTH`], the deepest
+/// body that reader admits at all, so this bound refuses nothing a template could carry
+/// and still holds when a property document reaches a walk from somewhere else.
+const MAX_PROPERTY_NESTING: usize = super::template::MAX_TEMPLATE_DEPTH;
+
 /// The same document with every object KEY's initial letter lower-cased, which is the one
 /// difference between a CloudFormation resource type's property names and the API members
 /// they are (`RoleArn` -> `roleArn`).
@@ -1743,10 +1988,16 @@ async fn describe_pipeline(
 /// keys are the action PROVIDER's own, case-sensitive settings (`S3Bucket`,
 /// `PollForSourceChanges`), not modelled member names, so the entries of that one map are
 /// carried through verbatim.
-fn camel_cased(value: &Value) -> Value {
+///
+/// `depth` is how many levels are already above this one, so the outermost call passes
+/// `0`; a document deeper than [`MAX_PROPERTY_NESTING`] is refused rather than walked.
+fn camel_cased(value: &Value, depth: usize) -> Result<Value, Refusal> {
     /// The one map whose KEYS are data rather than member names.
     const CONFIGURATION: &str = "configuration";
 
+    if depth >= MAX_PROPERTY_NESTING {
+        return Err(too_deeply_nested());
+    }
     match value {
         Value::Object(members) => {
             let mut converted = Map::new();
@@ -1755,14 +2006,32 @@ fn camel_cased(value: &Value) -> Value {
                 let member = if name == CONFIGURATION {
                     member.clone()
                 } else {
-                    camel_cased(member)
+                    camel_cased(member, depth + 1)?
                 };
                 converted.insert(name, member);
             }
-            Value::Object(converted)
+            Ok(Value::Object(converted))
         }
-        Value::Array(items) => Value::Array(items.iter().map(camel_cased).collect()),
-        scalar => scalar.clone(),
+        Value::Array(items) => {
+            let mut converted = Vec::with_capacity(items.len());
+            for item in items {
+                converted.push(camel_cased(item, depth + 1)?);
+            }
+            Ok(Value::Array(converted))
+        }
+        scalar => Ok(scalar.clone()),
+    }
+}
+
+/// The refusal a property document nested past [`MAX_PROPERTY_NESTING`] answers: the
+/// resource is not created, which is what [`configurations`] answers for the same case.
+fn too_deeply_nested() -> Refusal {
+    Refusal {
+        code: "ValidationException".to_string(),
+        message: format!(
+            "Resource properties are nested deeper than the {MAX_PROPERTY_NESTING} levels \
+             this emulator carries, so the resource was not created"
+        ),
     }
 }
 
@@ -1973,7 +2242,7 @@ async fn create_cluster(
     if let Value::Object(properties) = &resource.properties {
         for (property, member) in ECS_CLUSTER_MEMBERS {
             if let Some(value) = properties.get(*property) {
-                request.insert((*member).to_string(), lower_camel_members(value));
+                request.insert((*member).to_string(), lower_camel_members(value, 0)?);
             }
         }
     }
@@ -2032,6 +2301,46 @@ async fn delete_cluster(
     }
 }
 
+/// One evaluated scalar property of a resource as the text an API member takes.
+///
+/// Read through [`scalar_text`], this module's single spelling rule, so a property a
+/// template writes as a number or a boolean reaches the owning service the same way here
+/// as in every other arm, and an empty string is treated as a property the template did
+/// not really declare.
+fn property(resource: &StoredResource, name: &str) -> Option<String> {
+    scalar_text(resource.properties.get(name)?).filter(|text| !text.is_empty())
+}
+
+/// The `Type` property both OpenSearch Serverless resource types require (a policy's
+/// `encryption`/`network`, a collection's `SEARCH`/`TIMESERIES`/`VECTORSEARCH`).
+///
+/// A resource that declares none is refused HERE rather than with a request the owning
+/// service would have to reject: the property is required by the resource type.
+fn declared_type(resource: &StoredResource) -> Result<String, Refusal> {
+    property(resource, "Type").ok_or_else(|| Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!("{} declares no Type", resource.resource_type),
+    })
+}
+
+/// The `Policy` property as the policy document text the owning service takes.
+///
+/// A template may spell it as the JSON text or as the document itself (an inline mapping
+/// in a YAML template), which is exactly [`document_text`]'s rule, shared with the IAM
+/// arm. A declaration carrying none describes no policy that could be created, so it is
+/// refused here.
+fn policy_document(resource: &StoredResource) -> Result<String, Refusal> {
+    resource
+        .properties
+        .get("Policy")
+        .and_then(document_text)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!("{} declares no Policy", resource.resource_type),
+        })
+}
+
 /// The cluster's configuration as Amazon ECS reports it, for drift detection.
 ///
 /// A cluster Amazon ECS no longer holds (`ClusterNotFoundException`, an answer listing no
@@ -2064,27 +2373,131 @@ async fn describe_cluster(
     }
 }
 
+/// The collection's configuration as OpenSearch Serverless reports it, for drift
+/// detection, in the TYPE's own property vocabulary — the same correspondence the create
+/// maps the other way, so an actual configuration is comparable with the template's.
+///
+/// `BatchGetCollection` reports a collection it no longer holds as a
+/// `collectionErrorDetails` entry rather than with a refusal, so "no `collectionDetails`
+/// entry" is what says the collection was deleted. A property the read does not answer is
+/// absent from the document rather than guessed.
+async fn describe_collection(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let answer = call_json_rpc(
+        ctx,
+        AOSS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{AOSS_TARGET_PREFIX}.BatchGetCollection"),
+        &serde_json::json!({ "ids": [physical_resource_id] }),
+    )
+    .await?;
+    let Some(detail) = first_listed(&answer, "collectionDetails") else {
+        return Ok(None);
+    };
+    Ok(Some(reported_as_properties(
+        &detail,
+        &[
+            ("Name", "name"),
+            ("Type", "type"),
+            ("Description", "description"),
+            ("StandbyReplicas", "standbyReplicas"),
+        ],
+    )))
+}
+
+/// The policy's configuration as OpenSearch Serverless reports it, for drift detection, in
+/// the type's own property vocabulary. A policy the service no longer holds is its own
+/// `ResourceNotFoundException`.
+///
+/// `Policy` is deliberately NOT reported: the service answers the policy as the parsed
+/// document, while a template may spell it as that document or as its JSON text, so
+/// comparing the two spellings would report drift where there is none.
+async fn describe_security_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({
+        "type": declared_type(resource)?,
+        "name": resource.physical_resource_id,
+    });
+    match call_json_rpc(
+        ctx,
+        AOSS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{AOSS_TARGET_PREFIX}.GetSecurityPolicy"),
+        &request,
+    )
+    .await
+    {
+        Ok(answer) => {
+            let Some(detail) = answer.get("securityPolicyDetail") else {
+                return Ok(None);
+            };
+            Ok(Some(reported_as_properties(
+                detail,
+                &[
+                    ("Name", "name"),
+                    ("Type", "type"),
+                    ("Description", "description"),
+                ],
+            )))
+        }
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// One answered detail document under the resource type's own property names, as
+/// `(property, member)` pairs. A member the answer does not carry contributes nothing, so
+/// the result reports only what the owning service really said.
+fn reported_as_properties(detail: &Value, members: &[(&str, &str)]) -> Value {
+    let mut reported = Map::new();
+    for (property, member) in members {
+        if let Some(value) = detail.get(*member) {
+            reported.insert((*property).to_string(), value.clone());
+        }
+    }
+    Value::Object(reported)
+}
+
 /// One property value with every member name inside it in LOWER CAMEL case, which is how
 /// a service whose model spells its members that way names the very same members a
 /// CloudFormation property names in upper camel case (`ClusterSettings: [{Name, Value}]`
 /// is `settings: [{name, value}]`).
 ///
-/// The walk recurses over a tree the template reader already bounded in depth and node
-/// count (`super::template`'s `MAX_TEMPLATE_DEPTH` / `MAX_TEMPLATE_NODES`), so a
-/// caller-supplied body cannot drive it deeper than that constant. It is applied only
-/// where every member inside the property is a modelled name: a property carrying a MAP of
-/// caller data (a container definition's `DockerLabels`) would have its keys re-cased too,
-/// and no property of the type above carries one.
-fn lower_camel_members(value: &Value) -> Value {
+/// The walk is bounded by [`MAX_PROPERTY_NESTING`] for the reason that constant records:
+/// the document is caller-supplied, so a deeper one is refused rather than walked. It is
+/// applied only where every member inside the property is a modelled name: a property
+/// carrying a MAP of caller data (a container definition's `DockerLabels`) would have its
+/// keys re-cased too, and no property of the type above carries one.
+///
+/// `depth` is how many levels are already above this one, as in [`camel_cased`].
+fn lower_camel_members(value: &Value, depth: usize) -> Result<Value, Refusal> {
+    if depth >= MAX_PROPERTY_NESTING {
+        return Err(too_deeply_nested());
+    }
     match value {
-        Value::Object(members) => Value::Object(
-            members
-                .iter()
-                .map(|(name, member)| (lower_initial(name), lower_camel_members(member)))
-                .collect(),
-        ),
-        Value::Array(items) => Value::Array(items.iter().map(lower_camel_members).collect()),
-        scalar => scalar.clone(),
+        Value::Object(members) => {
+            let mut converted = Map::new();
+            for (name, member) in members {
+                converted.insert(lower_initial(name), lower_camel_members(member, depth + 1)?);
+            }
+            Ok(Value::Object(converted))
+        }
+        Value::Array(items) => {
+            let mut converted = Vec::with_capacity(items.len());
+            for item in items {
+                converted.push(lower_camel_members(item, depth + 1)?);
+            }
+            Ok(Value::Array(converted))
+        }
+        scalar => Ok(scalar.clone()),
     }
 }
 
@@ -3642,7 +4055,7 @@ async fn create_detector(
             if property == "Tags" {
                 continue;
             }
-            request.insert(lower_initial(property), lower_camel_members(value));
+            request.insert(lower_initial(property), lower_camel_members(value, 0)?);
         }
     }
     let tags = tags_as_map(&tags_of(&resource.properties, propagated));
@@ -4363,7 +4776,7 @@ mod tests {
                 }]
             }]
         });
-        let converted = camel_cased(&declared);
+        let converted = camel_cased(&declared, 0).expect("a shallow document is carried");
         let action = &converted["stages"][0]["actions"][0];
         assert_eq!(
             action["name"].as_str(),
@@ -4379,6 +4792,66 @@ mod tests {
             action["configuration"].get("s3Bucket").is_none(),
             "a configuration key must not be converted, got {converted}"
         );
+    }
+
+    /// A property document deeper than [`MAX_PROPERTY_NESTING`] is REFUSED by both
+    /// re-casing walks, and one at the bound is carried.
+    ///
+    /// The nesting of an evaluated property document is the REQUESTER's choice, and a
+    /// recursive walk over it that is bounded by the input exhausts the native stack —
+    /// which aborts the process rather than failing the one stack. The rows differ along
+    /// the shape the nesting is built from (objects, arrays, and the two alternating) and
+    /// cover the deepest document each walk carries, one level past it, and far past it.
+    #[test]
+    fn a_property_document_nested_past_the_bound_is_refused() {
+        /// A document `levels` deep, built from `shape`.
+        fn nested(shape: &str, levels: usize) -> Value {
+            let mut value = Value::String("leaf".to_string());
+            for level in 0..levels {
+                value = match shape {
+                    "objects" => serde_json::json!({ "Member": value }),
+                    "arrays" => Value::Array(vec![value]),
+                    // Alternating, so neither arm of the walk is the only one exercised.
+                    _ if level % 2 == 0 => serde_json::json!({ "Member": value }),
+                    _ => Value::Array(vec![value]),
+                };
+            }
+            value
+        }
+
+        for shape in ["objects", "arrays", "alternating"] {
+            // The deepest document the walk carries: the leaf sits at depth
+            // MAX_PROPERTY_NESTING - 1, so the walk never reaches the bound.
+            let carried = nested(shape, MAX_PROPERTY_NESTING - 1);
+            for (walk, converted) in [
+                ("camel_cased", camel_cased(&carried, 0)),
+                ("lower_camel_members", lower_camel_members(&carried, 0)),
+            ] {
+                assert!(
+                    converted.is_ok(),
+                    "case {walk}({shape} at the bound): expected the document to be carried, \
+                     got {:?}",
+                    converted.err()
+                );
+            }
+
+            for levels in [MAX_PROPERTY_NESTING + 1, MAX_PROPERTY_NESTING * 4] {
+                let too_deep = nested(shape, levels);
+                for (walk, refused) in [
+                    ("camel_cased", camel_cased(&too_deep, 0)),
+                    ("lower_camel_members", lower_camel_members(&too_deep, 0)),
+                ] {
+                    let refusal = refused.err().unwrap_or_else(|| {
+                        panic!("case {walk}({shape}, {levels} levels): expected a refusal")
+                    });
+                    assert_eq!(
+                        refusal.code, "ValidationException",
+                        "case {walk}({shape}, {levels} levels): expected ValidationException, got \
+                         {refusal:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// A policy document reaches IAM as text whichever way the template spells it.

@@ -68,6 +68,9 @@ mod event_bridge_rule_templates;
 #[path = "all/input_deletion.rs"]
 mod input_deletion;
 
+#[path = "all/input_device_listing.rs"]
+mod input_device_listing;
+
 #[path = "all/input_device_maintenance_window.rs"]
 mod input_device_maintenance_window;
 

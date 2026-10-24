@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExportIdleRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExportIdleRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Export optimization recommendations for the account's idle resources.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExportIdleRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A CALL CREATES a job: the operation queues one asynchronous export against the
+//! destination bucket the request names and answers the job's id and the object keys the
+//! export file and its metadata file are written under. The job record, the keys it
+//! derives, the status lifecycle the clock drives and the one-job-in-progress-per-Region
+//! limit all live in [`crate::state`], shared with every other export operation and with
+//! `DescribeRecommendationExportJobs`, which reports the job back.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +194,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExportIdleRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExportIdleRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ExportIdleRecommendationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer recommendation store is unavailable."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A malformed request is refused BEFORE the store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as it
+        // does in every other operation of this service.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExportIdleRecommendations"))
+        // `accountIds`: "You can specify multiple account IDs per request", each an Amazon
+        // Web Services account ID. "This parameter can't be specified together with the
+        // include member accounts parameter. The parameters are mutually exclusive."
+        let account_ids = input.account_ids.unwrap_or_default();
+        if !account_ids.is_empty() && input.include_member_accounts {
+            return Err(invalid_parameter(
+                "The value supplied for parameter accountIds is not valid: accountIds and \
+                 includeMemberAccounts are mutually exclusive."
+                    .to_string(),
+            ));
+        }
+        if let Some(value) = account_ids
+            .iter()
+            .find(|value| !crate::state::is_account_id(value))
+        {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter accountIds is not valid: {value} is not a \
+                 12-digit Amazon Web Services account ID."
+            )));
+        }
+
+        // The filter vocabulary is the one `GetIdleRecommendations` selects with — the
+        // request carries the same `IdleRecommendationFilters` — so a name or value outside
+        // it is refused here too rather than silently exporting a different set.
+        let filters = input.filters.unwrap_or_default();
+        if let Some(reason) = crate::state::idle_filter_rejection(&filters) {
+            return Err(invalid_parameter(reason));
+        }
+
+        // "You must create the destination Amazon S3 bucket for your recommendations export
+        // before you create the export job. Compute Optimizer does not create the S3 bucket
+        // for you." There is no export without a bucket to write it to, so a request that
+        // names none is refused.
+        let bucket = input
+            .s3_destination_config
+            .bucket
+            .as_deref()
+            .map(str::trim)
+            .filter(|bucket| !bucket.is_empty());
+        let Some(bucket) = bucket else {
+            return Err(invalid_parameter(
+                "The value supplied for parameter s3DestinationConfig is not valid: a \
+                 destination bucket must be supplied."
+                    .to_string(),
+            ));
+        };
+
+        // Compute Optimizer is regional: the export job belongs to the Region whose
+        // endpoint created it, and so does the one-job-in-progress limit below.
+        let region = crate::state::request_region(ctx);
+        let now = crate::state::now_secs();
+
+        let mut guard = state.lock();
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                ExportIdleRecommendationsErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Creating a job is a write, so this is where the jobs the seven-day reporting
+        // window has dropped are let go of — a reader never writes.
+        guard.export_jobs.prune_expired(now);
+
+        // "You can have only one idle resource export job in progress per Amazon Web
+        // Services Region." A job that has reached its terminal status is not in progress,
+        // so the next export is admitted once the previous one completes.
+        if let Some(running) =
+            guard
+                .export_jobs
+                .in_progress_in(&region, crate::state::RESOURCE_TYPE_IDLE, now)
+        {
+            let running = running.job_id.clone();
+            return Err(limit_exceeded(format!(
+                "You can have only one idle resource export job in progress per Amazon Web \
+                 Services Region. Export job {running} is still in progress."
+            )));
+        }
+        if !guard.export_jobs.can_hold() {
+            return Err(limit_exceeded(format!(
+                "The request exceeds a limit of the service: this emulator holds at most {} \
+                 recommendation export jobs.",
+                crate::state::MAX_EXPORT_JOBS
+            )));
+        }
+
+        // The export is for the account the request is signed for, which is the one account
+        // this emulator presents; `accountIds` and `includeMemberAccounts` select WHOSE
+        // recommendations go into the file, not where it is written.
+        let job_id = guard.export_jobs.mint_job_id();
+        let (key, metadata_key) = crate::state::export_destination_keys(
+            input.s3_destination_config.key_prefix.as_deref(),
+            ::engine::emulator_account_id(),
+            crate::state::RESOURCE_TYPE_IDLE,
+            &job_id,
+        );
+        let job = crate::state::ExportJob {
+            job_id: job_id.clone(),
+            region,
+            resource_type: crate::state::RESOURCE_TYPE_IDLE.to_string(),
+            bucket: bucket.to_string(),
+            key,
+            metadata_key,
+            created_at: now,
+        };
+        // The destination this call answers is the job's own, so it names exactly the
+        // objects `DescribeRecommendationExportJobs` reports for the job.
+        let s3_destination = job.s3_destination();
+        guard.export_jobs.insert(job);
+        drop(guard);
+
+        Ok(ExportIdleRecommendationsOutput {
+            job_id: Some(job_id),
+            s3_destination: Some(s3_destination),
+        })
     }
+}
+
+/// The 400 `InvalidParameterValueException` this operation refuses a bad request with:
+/// "The value supplied for the input parameter is out of range or not valid."
+fn invalid_parameter(message: String) -> ExportIdleRecommendationsError {
+    ExportIdleRecommendationsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The 400 `LimitExceededException` this operation refuses a request with when it cannot
+/// create another job: "The request exceeds a limit of the service."
+fn limit_exceeded(message: String) -> ExportIdleRecommendationsError {
+    ExportIdleRecommendationsErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
 }

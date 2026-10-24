@@ -49,15 +49,18 @@ const ENDPOINT_ID: &str = "harvest-endpoint";
 const BUCKET: &str = "harvest-destination";
 
 /// The service principal a harvest job's destination role must admit
-/// (`crate::state::HARVEST_SERVICE_PRINCIPAL`).
-const PRINCIPAL: &str = "mediapackage.amazonaws.com";
+/// (`crate::state::SERVICE_PRINCIPAL`).
+///
+/// Shared with `tests/all/origin_endpoint_contents.rs`, which asserts the same rule for the
+/// roles an origin-endpoint write names.
+pub(crate) const PRINCIPAL: &str = "mediapackage.amazonaws.com";
 
 /// An emulator carrying BOTH services over one engine, with request authentication off.
 ///
 /// The crate's own builder (`tests/all/channel_lifecycle.rs`) serves MediaPackage alone;
 /// this suite needs IAM in the same engine, because the rule under test is about records
-/// IAM holds.
-fn emulator() -> MultiServiceRouter {
+/// IAM holds. Shared with `tests/all/origin_endpoint_contents.rs` for the same reason.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -83,7 +86,7 @@ async fn mp(
 /// Create an IAM role carrying `document` as its trust policy, and answer the ARN IAM
 /// minted for it — read off the response rather than constructed, so the ARN the harvest
 /// job names is the one IAM actually holds.
-async fn create_role(router: &MultiServiceRouter, name: &str, document: &str) -> String {
+pub(crate) async fn create_role(router: &MultiServiceRouter, name: &str, document: &str) -> String {
     let body = format!(
         "Action=CreateRole&Version=2010-05-08&RoleName={}&AssumeRolePolicyDocument={}",
         urlencode(name),
@@ -114,7 +117,7 @@ async fn create_role(router: &MultiServiceRouter, name: &str, document: &str) ->
 }
 
 /// A trust policy with one statement, written as a client would send it.
-fn policy(effect: &str, action: &str, service: &str) -> String {
+pub(crate) fn policy(effect: &str, action: &str, service: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"{effect}\",\
          \"Principal\":{{\"Service\":{service}}},\"Action\":{action}}}]}}"

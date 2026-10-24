@@ -41,7 +41,7 @@ use crate::ops::types::{
     RouterNetworkInterface, RouterNetworkInterfaceConfiguration,
     RouterOutput, RouterOutputConfiguration, RouterOutputMessage,
     RouterOutputProtocolConfiguration, RouterOutputStreamDetails, SetSourceRequest, Source,
-    StandardRouterInputStreamDetails,
+    StandardRouterInputStreamDetails, StandardRouterOutputConfiguration,
     StandardRouterOutputStreamDetails, Transport, UpdateEncryption,
     UpdateFailoverConfig, VpcInterface,
     VpcInterfaceAttachment,
@@ -2116,12 +2116,19 @@ pub const ROUTER_INPUT_TYPE_MEDIALIVE_CHANNEL: &str = "MEDIALIVE_CHANNEL";
 /// The `RouterOutputState` enum the model declares for a router output
 /// (`smithy_query(query="shape",shape="RouterOutputState")`: CREATING | STANDBY | STARTING
 /// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
-/// three a router output's creation and deletion reach are named here; the rest belong to
-/// operations that are still scaffolded.
+/// two a router output's creation reaches, the one its reconfiguration passes through and
+/// the one its deletion reaches are named here; the rest belong to operations that are
+/// still scaffolded.
 pub const ROUTER_OUTPUT_STATE_CREATING: &str = "CREATING";
 /// See [`ROUTER_OUTPUT_STATE_CREATING`]. A router output that finished being created is
 /// not carrying content yet: it waits in `STANDBY` until StartRouterOutput.
 pub const ROUTER_OUTPUT_STATE_STANDBY: &str = "STANDBY";
+/// See [`ROUTER_OUTPUT_STATE_CREATING`]. The transient state an output is RECONFIGURED in:
+/// UpdateRouterOutput answers `202 Accepted`, so the settings it accepted are not in effect
+/// the instant it answers, and the clock settles the output back into the state it was
+/// heading for one [`TRANSITION_SPAN`] later
+/// ([`StoredRouterOutput::begin_transition`]).
+pub const ROUTER_OUTPUT_STATE_UPDATING: &str = "UPDATING";
 /// See [`ROUTER_OUTPUT_STATE_CREATING`]. The state a router output is in while its delete
 /// is in progress — `DeleteRouterOutputResponse$State` is "the current state of the deleted
 /// router output, indicating where it is in the deletion process".
@@ -2593,6 +2600,38 @@ pub fn router_output_tier_bitrate_ceiling(tier: &str) -> Option<i64> {
     Some(megabits_per_second * BITS_PER_MEGABIT)
 }
 
+/// Why a router output of tier `tier` may not carry a `MaximumBitrate` of
+/// `maximum_bitrate`, or `None` when that pair is acceptable.
+///
+/// "The tier sets the maximum bitrate, in Mbps, for the router output"
+/// (`smithy_query(query="doc",shape="CreateRouterOutputRequest",member="Tier")`), so the
+/// tier an output ENDS UP with bounds the bitrate it may be asked for, through the one
+/// catalog [`router_output_tier_bitrate_ceiling`]; and a bitrate is a count of bits per
+/// second, so it is positive. Every operation that sets either member
+/// (CreateRouterOutput, UpdateRouterOutput) judges the pair HERE, so the bound cannot
+/// drift between them. The detail is the sentence the refusal's envelope carries
+/// ([`validation_failed_message`]).
+pub fn router_output_bitrate_rejection(tier: &str, maximum_bitrate: i64) -> Option<String> {
+    let Some(ceiling) = router_output_tier_bitrate_ceiling(tier) else {
+        return Some(format!(
+            "Tier {tier:?} is not a router output tier this service offers."
+        ));
+    };
+    if maximum_bitrate <= 0 {
+        return Some(format!(
+            "MaximumBitrate is a number of bits per second and must be positive; this \
+             request asks for {maximum_bitrate}."
+        ));
+    }
+    if maximum_bitrate > ceiling {
+        return Some(format!(
+            "MaximumBitrate {maximum_bitrate} bps exceeds the {ceiling} bps the {tier} tier \
+             allows."
+        ));
+    }
+    None
+}
+
 /// The ceiling on how many router outputs this store holds.
 ///
 /// The same bound, for the same reason, as [`MAX_GATEWAYS`]: nothing evicts a router
@@ -2618,6 +2657,61 @@ pub fn router_output_protocol(configuration: &RouterOutputProtocolConfiguration)
         RouterOutputProtocolConfiguration::SrtCaller(_) => "SRT_CALLER",
         RouterOutputProtocolConfiguration::SrtListener(_) => "SRT_LISTENER",
         RouterOutputProtocolConfiguration::RtmpPush(_) => "RTMP_PUSH",
+    }
+}
+
+/// The `RouterOutputConfiguration` a request's configuration is STORED as, or the detail of
+/// why it cannot be stored as one.
+///
+/// A STANDARD output's `Protocol` is implied by the variant of its `ProtocolConfiguration`
+/// ([`router_output_protocol`]), so the stored configuration reports the protocol that
+/// configuration configures, and a request whose `Protocol` names a different one is
+/// refused rather than stored self-contradicting. The two configurations that deliver into
+/// another AWS resource carry no protocol member to reconcile, so each is stored as it
+/// arrived. Every operation that takes a configuration (CreateRouterOutput,
+/// UpdateRouterOutput) normalises it HERE, so no second spelling can drift from this one.
+pub fn normalized_router_output_configuration(
+    configuration: RouterOutputConfiguration,
+) -> Result<RouterOutputConfiguration, String> {
+    match configuration {
+        RouterOutputConfiguration::Standard(standard) => {
+            let configured = router_output_protocol(&standard.protocol_configuration);
+            if let Some(named) = standard
+                .protocol
+                .as_deref()
+                .filter(|protocol| !protocol.is_empty())
+            {
+                if named != configured {
+                    return Err(format!(
+                        "Configuration sets a {configured} protocol configuration, but \
+                         Protocol names {named}."
+                    ));
+                }
+            }
+            Ok(RouterOutputConfiguration::Standard(
+                StandardRouterOutputConfiguration {
+                    protocol: Some(configured.to_string()),
+                    ..standard
+                },
+            ))
+        }
+        other => Ok(other),
+    }
+}
+
+/// The `RouterOutputType` of an output configured by `configuration`.
+///
+/// `RouterOutputConfiguration` is a union with one member per output kind and
+/// `RouterOutputType` names exactly those kinds, so the type an output reports is a
+/// function of the configuration it holds — never a separate request member. The router
+/// output counterpart of [`router_input_type`], and the one mapping every projection
+/// ([`StoredRouterOutput::output_type`]) and every check on the configuration's KIND
+/// resolves through.
+pub fn router_output_type(configuration: &RouterOutputConfiguration) -> &'static str {
+    match configuration {
+        RouterOutputConfiguration::Standard(_) => ROUTER_OUTPUT_TYPE_STANDARD,
+        RouterOutputConfiguration::MediaConnectFlow(_) => ROUTER_OUTPUT_TYPE_MEDIACONNECT_FLOW,
+        RouterOutputConfiguration::MediaLiveInput(_) => ROUTER_OUTPUT_TYPE_MEDIALIVE_INPUT,
     }
 }
 
@@ -2815,6 +2909,29 @@ impl StoredRouterOutput {
         }
     }
 
+    /// Enter `transient` now and owe `settled` once [`TRANSITION_SPAN`] has passed — the
+    /// router output counterpart of [`StoredFlow::begin_transition`], so every state a
+    /// router output is answered in while the clock still owes a change is started one way.
+    pub fn begin_transition(&mut self, transient: &str, settled: &str, now: SystemTime) {
+        self.state = transient.to_string();
+        self.pending = Some(PendingStatus {
+            status: settled.to_string(),
+            due_at: now + TRANSITION_SPAN,
+        });
+    }
+
+    /// The state this output is heading for: the one the clock already owes it, or the one
+    /// it is settled in when the clock owes none.
+    ///
+    /// What a call that puts the output through a TRANSIENT state of its own hands
+    /// [`Self::begin_transition`] as the settled state, so an output reconfigured while it
+    /// was still being created still reaches the state its creation owed it.
+    pub fn settling_state(&self) -> String {
+        self.pending
+            .as_ref()
+            .map_or_else(|| self.state.clone(), |pending| pending.status.clone())
+    }
+
     /// Whether this router output's delete has been accepted, so it is on its way out of
     /// the store rather than live. See [`Self::removal_due_at`].
     pub fn is_deleting(&self) -> bool {
@@ -2829,19 +2946,24 @@ impl StoredRouterOutput {
         self.removal_due_at.is_some_and(|due_at| now >= due_at)
     }
 
-    /// `RouterOutput$OutputType`, the variant of the output's configuration union.
+    /// `RouterOutput$OutputType`, the variant of the output's configuration union —
+    /// resolved through the crate's one mapping, [`router_output_type`].
     pub fn output_type(&self) -> &'static str {
-        match &self.configuration {
-            RouterOutputConfiguration::Standard(_) => ROUTER_OUTPUT_TYPE_STANDARD,
-            RouterOutputConfiguration::MediaConnectFlow(_) => ROUTER_OUTPUT_TYPE_MEDIACONNECT_FLOW,
-            RouterOutputConfiguration::MediaLiveInput(_) => ROUTER_OUTPUT_TYPE_MEDIALIVE_INPUT,
-        }
+        router_output_type(&self.configuration)
+    }
+
+    /// Whether a router input is currently routed to this output — the ACTIVE ROUTE that
+    /// `UpdateRouterOutput$FabricConfiguration` names as its precondition ("you cannot
+    /// update the fabric configuration while the output has an active route"), which is the
+    /// same condition [`Self::routed_state`] reports as `ROUTED`.
+    pub fn is_routed(&self) -> bool {
+        self.routed_input_arn.is_some()
     }
 
     /// `RouterOutput$RoutedState`: ROUTED exactly while a router input is routed to this
     /// output, UNROUTED otherwise.
     pub fn routed_state(&self) -> &'static str {
-        if self.routed_input_arn.is_some() {
+        if self.is_routed() {
             ROUTED_STATE_ROUTED
         } else {
             ROUTED_STATE_UNROUTED
@@ -3175,6 +3297,21 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     ) -> Option<&mut StoredRouterInput> {
         self.settle_due_transitions(now);
         self.router_inputs.get_mut(arn)
+    }
+
+    /// The router output `arn` addresses, with every state change the clock already made
+    /// due materialised first.
+    ///
+    /// The router output counterpart of [`Self::router_input_mut`]: the one lookup a router
+    /// output operation resolves an `@httpLabel` ARN through, so one request can never see
+    /// a state another request would not.
+    pub fn router_output_mut(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<&mut StoredRouterOutput> {
+        self.settle_due_transitions(now);
+        self.router_outputs.get_mut(arn)
     }
 
     /// How many router outputs are currently ROUTED to the router input `input_arn` —

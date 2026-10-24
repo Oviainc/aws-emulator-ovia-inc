@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableEbsEncryptionByDefault
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableEbsEncryptionByDefault`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableEbsEncryptionByDefault::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! MUTATING, as the spec says: this operation "enables EBS encryption by default for your
+//! account in the current Region", so it records the Region through
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::set_ebs_encryption_by_default`] and
+//! answers "the updated status of encryption by default"
+//! (`EnableEbsEncryptionByDefaultResult$EbsEncryptionByDefault`) read back out of the
+//! store. Idempotent: enabling a Region it is already on in changes nothing.
+//! `GetEbsEncryptionByDefault` reports the setting and `DisableEbsEncryptionByDefault`
+//! turns it off again.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +139,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableEbsEncryptionByDefault` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableEbsEncryptionByDefaultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        // "for your account in the current Region": the Region is the one the request was
+        // signed for, so enabling the setting in one Region leaves every other Region's
+        // setting where it was.
+        let region = state::request_region(ctx.parts());
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+
+        // The store holds the setting for a bounded number of Regions, and the Region
+        // comes from the caller, so a request that would push it past that ceiling is
+        // refused rather than stored. A Region already enabled costs nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableEbsEncryptionByDefault"))
+        // This sits BEFORE the DryRun check on purpose, the way `CreateVolume`'s own store
+        // ceilings do: DryRun asks whether the request WOULD have worked, so a request this
+        // emulator could not have carried out is answered with that reason instead of 412.
+        if store.would_exceed_encryption_by_default_regions(&region) {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds the EBS encryption-by-default setting for \
+                 {} Regions, which is as many as it stores",
+                state::MAX_ENCRYPTION_BY_DEFAULT_REGIONS
+            )));
+        }
+
+        // DryRun sits AFTER validation and BEFORE the write: the flag asks whether the
+        // request WOULD have worked, so one that would have succeeded leaves the setting
+        // untouched. "If you have the required permissions, the error response is
+        // DryRunOperation" (`EnableEbsEncryptionByDefaultRequest$DryRun`).
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Answer the status read back OUT of the store, so the caller sees what a later
+        // `GetEbsEncryptionByDefault` will see rather than what the request asked for.
+        let enabled = store.set_ebs_encryption_by_default(&region, true);
+        Ok(EnableEbsEncryptionByDefaultOutput {
+            ebs_encryption_by_default: Some(enabled),
+        })
     }
 }

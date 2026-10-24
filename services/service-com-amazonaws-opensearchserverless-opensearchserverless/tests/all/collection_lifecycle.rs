@@ -180,14 +180,44 @@ pub(crate) fn is_policy_version(version: &str) -> bool {
 
 /// Create the collection `body` describes in `region`, asserting it was accepted, and
 /// answer its `createCollectionDetail`.
+///
+/// A collection's encryption setting has to come from somewhere — the request's
+/// `encryptionConfig` or an `encryption` security policy covering its name — so a row that
+/// is not about encryption gets `aWSOwnedKey` here rather than repeating it everywhere.
 async fn create_collection(router: &MultiServiceRouter, region: &str, body: Value) -> Value {
     let case = body.to_string();
+    let mut body = body;
+    if body.get("encryptionConfig").is_none() {
+        body["encryptionConfig"] = json!({ "aWSOwnedKey": true });
+    }
     let (status, code, answer) = call_in(router, region, "CreateCollection", body).await;
     assert_eq!(
         status, 200,
         "case CreateCollection({case}): expected 200, got {status} {code} with {answer}"
     );
     at(&answer, "createCollectionDetail").clone()
+}
+
+/// Poll `BatchGetCollection` until `id` is no longer reported at all: the purge of a
+/// `DELETING` collection is owed by the clock, so this waits for the wall clock rather
+/// than for a call.
+async fn await_purged(router: &MultiServiceRouter, region: &str, id: &str) {
+    for _ in 0..10 {
+        let (status, code, answer) =
+            call_in(router, region, "BatchGetCollection", json!({ "ids": [id] })).await;
+        assert_eq!(
+            status, 200,
+            "case BatchGetCollection({id}): expected 200, got {status} {code} with {answer}"
+        );
+        if at(&answer, "collectionDetails")
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        {
+            return;
+        }
+        tokio::time::sleep(SETTLE_WAIT / 5).await;
+    }
+    panic!("case await_purged({id}): the collection was never purged");
 }
 
 /// Poll `BatchGetCollection` until `id` reports `ACTIVE`, answering its `CollectionDetail`.
@@ -210,7 +240,7 @@ async fn await_active(router: &MultiServiceRouter, region: &str, id: &str) -> Va
         if text(&detail, "status") == "ACTIVE" {
             return detail;
         }
-        std::thread::sleep(SETTLE_WAIT / 5);
+        tokio::time::sleep(SETTLE_WAIT / 5).await;
     }
     panic!("case await_active({id}): the collection never reached ACTIVE");
 }
@@ -677,8 +707,8 @@ async fn deleting_a_collection_removes_it_and_refuses_what_it_must() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (CLIENT_ERROR, "ConflictException"),
-        "case DeleteCollection(deletionProtection ENABLED): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ValidationException"),
+        "case DeleteCollection(deletionProtection ENABLED): expected {CLIENT_ERROR} ValidationException, got {status} {code} with {answer}"
     );
 
     for (case, name, request_protection) in [
@@ -716,18 +746,53 @@ async fn deleting_a_collection_removes_it_and_refuses_what_it_must() {
             "case DeleteCollection({case}): the detail reports the stored deletionProtection, got {deleted}"
         );
 
-        // The record is gone: a read reports it as missing, the listing no longer carries
-        // it, and a second delete is the `ResourceNotFoundException`.
+        // The delete is ACCEPTED, not completed: the collection stays readable in
+        // `DELETING` until the clock makes its purge due, so a caller polling the deletion
+        // sees that state instead of the resource vanishing in one step.
+        let (_, _, deleting) =
+            call(&router, "BatchGetCollection", json!({ "ids": [id.clone()] })).await;
+        let visible = at(&deleting, "collectionDetails")
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            visible.len(),
+            1,
+            "case DeleteCollection({case}): the collection is still visible right after the delete, got {deleting}"
+        );
+        assert_eq!(
+            text(&visible[0], "status"),
+            "DELETING",
+            "case DeleteCollection({case}): it is visible in DELETING, got {deleting}"
+        );
+        assert_eq!(
+            at(&deleting, "collectionErrorDetails"),
+            &json!([]),
+            "case DeleteCollection({case}): a DELETING collection is not an error detail, got {deleting}"
+        );
+        // A second delete while it is DELETING is the state conflict, not a not-found: the
+        // collection is still there.
+        let (status, code, answer) =
+            call(&router, "DeleteCollection", json!({ "id": id.clone() })).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (CLIENT_ERROR, "ConflictException"),
+            "case DeleteCollection({case}, while DELETING): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
+        );
+
+        // And after the purge the record is gone: a read reports it as missing, the
+        // listing no longer carries it, and a later delete is the not-found refusal.
+        await_purged(&router, "us-east-1", &id).await;
         let (_, _, read) = call(&router, "BatchGetCollection", json!({ "ids": [id.clone()] })).await;
         assert_eq!(
             at(&read, "collectionDetails"),
             &json!([]),
-            "case DeleteCollection({case}): a deleted collection has no details, got {read}"
+            "case DeleteCollection({case}): a purged collection has no details, got {read}"
         );
         assert_eq!(
             text(at(&read, "collectionErrorDetails").get(0).unwrap_or(&Value::Null), "errorCode"),
             "NOT_FOUND",
-            "case DeleteCollection({case}): a deleted collection is reported NOT_FOUND, got {read}"
+            "case DeleteCollection({case}): a purged collection is reported NOT_FOUND, got {read}"
         );
 
         let (_, _, listed) = call(
@@ -739,14 +804,14 @@ async fn deleting_a_collection_removes_it_and_refuses_what_it_must() {
         assert_eq!(
             at(&listed, "collectionSummaries"),
             &json!([]),
-            "case DeleteCollection({case}): a deleted collection is no longer listed, got {listed}"
+            "case DeleteCollection({case}): a purged collection is no longer listed, got {listed}"
         );
 
         let (status, code, answer) = call(&router, "DeleteCollection", json!({ "id": id })).await;
         assert_eq!(
             (status, code.as_str()),
             (CLIENT_ERROR, "ResourceNotFoundException"),
-            "case DeleteCollection({case}, second time): expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
+            "case DeleteCollection({case}, after the purge): expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
         );
 
         // And the name is free again, which is what proves the name index was dropped
@@ -780,10 +845,18 @@ async fn create_collection_refuses_a_duplicate_name_and_an_invalid_input() {
 
     create_collection(&router, "us-east-1", json!({ "name": "taken-collection" })).await;
     for (case, request) in [
-        ("same members", json!({ "name": "taken-collection" })),
+        (
+            "same members",
+            json!({ "name": "taken-collection", "encryptionConfig": { "aWSOwnedKey": true } }),
+        ),
         (
             "different members",
-            json!({ "name": "taken-collection", "type": "SEARCH", "description": "another" }),
+            json!({
+                "name": "taken-collection",
+                "type": "SEARCH",
+                "description": "another",
+                "encryptionConfig": { "aWSOwnedKey": true },
+            }),
         ),
     ] {
         let (status, code, answer) = call(&router, "CreateCollection", request).await;
@@ -791,6 +864,11 @@ async fn create_collection_refuses_a_duplicate_name_and_an_invalid_input() {
             (status, code.as_str()),
             (CLIENT_ERROR, "ConflictException"),
             "case CreateCollection(duplicate name, {case}): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
+        );
+        assert_eq!(
+            text(&answer, "message"),
+            "A collection with name 'taken-collection' already exists.",
+            "case CreateCollection(duplicate name, {case}): the message is built from the request's own name, got {answer}"
         );
     }
 
@@ -859,7 +937,11 @@ async fn a_replayed_client_token_answers_the_record_it_first_created() {
     let (status, code, answer) = call(
         &router,
         "CreateCollection",
-        json!({ "name": "idempotent-collection", "clientToken": "token-two" }),
+        json!({
+            "name": "idempotent-collection",
+            "clientToken": "token-two",
+            "encryptionConfig": { "aWSOwnedKey": true },
+        }),
     )
     .await;
     assert_eq!(
@@ -969,15 +1051,18 @@ async fn the_client_token_index_stays_bounded() {
         "case collection live: the create remembered its token"
     );
     await_active(&router, "us-east-1", &id).await;
-    let (status, code, answer) = call(&router, "DeleteCollection", json!({ "id": id })).await;
+    let (status, code, answer) = call(&router, "DeleteCollection", json!({ "id": id.clone() })).await;
     assert_eq!(
         status, 200,
         "case collection delete: expected 200, got {status} {code} with {answer}"
     );
+    // The token is forgotten with the RECORD, which the delete only schedules: it goes
+    // when the purge the clock owes removes the collection.
+    await_purged(&router, "us-east-1", &id).await;
     assert_eq!(
-        tokens("collection deleted"),
+        tokens("collection purged"),
         0,
-        "case collection deleted: deleting the collection must forget the token that created it"
+        "case collection purged: purging the collection must forget the token that created it"
     );
 
     // And the cap itself, over twice its own size: the index is held at exactly the cap by

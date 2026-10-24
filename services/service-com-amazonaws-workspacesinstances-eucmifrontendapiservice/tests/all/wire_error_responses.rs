@@ -519,7 +519,7 @@ async fn an_unknown_instance_is_not_found_with_this_services_status_and_resource
 }
 
 #[tokio::test]
-async fn a_deleted_instance_is_answered_the_same_way_as_one_that_never_existed() {
+async fn a_torn_down_instance_is_answered_the_same_way_as_one_that_never_existed() {
     let router = router();
 
     let created = call(
@@ -569,12 +569,23 @@ async fn a_deleted_instance_is_answered_the_same_way_as_one_that_never_existed()
         "case \"delete\": expected HTTP 200, got {status} with {payload}"
     );
 
+    // The delete starts an asynchronous teardown, so the instance is still reported
+    // for a while (the `instance_deletion_lifecycle` suite spans that window). Only
+    // once the teardown and its retention have both fallen due does the id name no
+    // stored record, and then it is answered exactly like one that never existed.
+    tokio::time::sleep(
+        wsinst::state::DEALLOCATION_SPAN
+            + wsinst::state::DEALLOCATED_RETENTION
+            + std::time::Duration::from_millis(250),
+    )
+    .await;
+
     for operation in [
         "GetWorkspaceInstance",
         "DeleteWorkspaceInstance",
         "ListTagsForResource",
     ] {
-        let case = format!("{operation} after delete");
+        let case = format!("{operation} after the teardown completed");
         assert_not_found(
             &router,
             &case,
