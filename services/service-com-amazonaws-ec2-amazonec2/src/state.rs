@@ -2110,17 +2110,21 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// request answers with that AFI instead of creating a second one. Cleared for an AFI a
     /// delete removes, so a token cannot name an image that is gone.
     pub fpga_image_client_tokens: HashMap<String, String>,
-    /// Every volume in the account's Recycle Bin, by `VolumeId`, as the modelled
-    /// [`VolumeRecycleBinInfo`] shape `ListVolumesInRecycleBin` reports — so a member a
-    /// writer sets round-trips without a field-by-field copy. Ordered by id, which is the
-    /// order that report pages over.
+    /// Every volume in the account's Recycle Bin, by `VolumeId`, as a
+    /// [`RecycledVolumeRecord`]: the modelled [`VolumeRecycleBinInfo`] entry
+    /// `ListVolumesInRecycleBin` reports, beside the [`VolumeRecord`] the volume store held,
+    /// so a restore gives the SAME volume back rather than a copy rebuilt from a projection.
+    /// Ordered by id, which is the order that report pages over.
     ///
     /// A volume reaches the bin when it is deleted while a Recycle Bin retention rule
-    /// covers it, and leaves it when it is restored or when its retention period runs out;
-    /// `DeleteVolume` and `RestoreVolumeFromRecycleBin` are the operations that move it,
-    /// and both are still scaffolds, so a fresh account's bin is empty — which is exactly
-    /// what the report answers with.
-    pub volumes_in_recycle_bin: BTreeMap<String, VolumeRecycleBinInfo>,
+    /// covers it ([`Self::move_volume_to_recycle_bin`]), and leaves it when it is restored
+    /// (`RestoreVolumeFromRecycleBin`, through [`Self::restore_recycled_volume`]) or when
+    /// its retention period runs out — a permanent deletion the CLOCK owes, applied by
+    /// [`Self::materialize_due_transitions`]. Nothing in this service's implemented surface
+    /// puts a volume IN the bin: a deleted resource is retained only when a Recycle Bin
+    /// retention rule covers it, retention rules are the `rbin` service's resources, and
+    /// `DeleteVolume` — still a scaffold — is the operation that will consult one.
+    pub volumes_in_recycle_bin: BTreeMap<String, RecycledVolumeRecord>,
     /// Every AMI usage report the account holds, by `ReportId`, as the modelled
     /// [`ImageUsageReport`] shape the describe reports. `CreateImageUsageReport` is the
     /// operation that adds one and `DeleteImageUsageReport` the one that removes it.
@@ -4058,6 +4062,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// analysis reaching its terminal `AnalysisStatus`.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
+        // A volume whose Recycle Bin retention period has run out was permanently deleted
+        // at its exit instant whether or not anybody called, so that deletion is applied
+        // before anything reads the bin.
+        self.delete_due_recycled_volumes(now);
         for instance in self.instances.values_mut() {
             let due = instance
                 .pending_transition
@@ -8739,6 +8747,27 @@ pub fn invalid_volume_id_malformed<E>(volume_id: &str) -> crate::scaffolded::Sca
         INVALID_VOLUME_ID_MALFORMED,
         400,
         format!("Invalid id: '{volume_id}'"),
+    )
+}
+
+/// Refuse a `VolumeId` the Recycle Bin holds no entry for: HTTP 400
+/// `InvalidVolumeID.Malformed`, the one code the service answers for every id
+/// `RestoreVolumeFromRecycleBin` cannot resolve in the bin — an id that is not shaped like
+/// one, a well-formed id the bin never held, one whose retention period has run out, and one
+/// the account still has a live volume for.
+///
+/// The CODE is [`INVALID_VOLUME_ID_MALFORMED`], the same code
+/// [`invalid_volume_id_malformed`] answers, but the WORDING is this operation's: the
+/// recorded traffic behind
+/// `issues/things-that-now-work/20261022T235108Z-ec2-restorevolumefromrecyclebin-stub.md`
+/// has the service answering "The volume ID 'vol-…' is malformed" for the restore, where a
+/// describe of the account's volumes answers "Invalid id: 'vol-…'". The message is built
+/// from the request — the id the caller sent is the only part of it that varies.
+pub fn volume_id_not_in_recycle_bin<E>(volume_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VOLUME_ID_MALFORMED,
+        400,
+        format!("The volume ID '{volume_id}' is malformed"),
     )
 }
 
@@ -19032,6 +19061,13 @@ impl ComAmazonawsEc2Amazonec2State {
     /// taken before the first mutation — so a refused move leaves the volume where it was
     /// instead of losing it between the two stores.
     ///
+    /// `now` is the instant of THIS call — the wall-clock reading of the moment the volume is
+    /// being moved, which every caller takes as `SystemTime::now()`. It is a parameter rather
+    /// than read here so the reported `RecycleBinEnterTime`/`RecycleBinExitTime` and the rest
+    /// of the calling operation's timestamps are one reading of one moment; the monotonic
+    /// deadline the permanent deletion is enforced against is the SAME moment read off the
+    /// clock that cannot jump, so the two never disagree by more than the two reads.
+    ///
     /// The byte accounting is symmetric, the way [`Self::remove_fpga_image`] is: the bytes
     /// the create charged for the volume are given back as it leaves the store, and the
     /// entry that takes its place is charged for itself
@@ -19053,6 +19089,11 @@ impl ComAmazonawsEc2Amazonec2State {
         // caller, so the sum is asked for with `checked_add` and the move is refused rather
         // than unwinding — and it is asked BEFORE the volume is removed.
         let exit_at = now.checked_add(retention)?;
+        // The same instant on the MONOTONIC clock, which is what the permanent deletion the
+        // clock owes is compared against ([`Self::materialize_due_transitions`]), so a
+        // wall-clock adjustment can neither keep an expired entry nor expire a fresh one.
+        // Fallible, and asked BEFORE the volume is removed, for the same reason as above.
+        let exit_due_at = Instant::now().checked_add(retention)?;
         let record = self.volumes.remove(volume_id)?;
         let client_token = self
             .volume_client_tokens
@@ -19062,7 +19103,9 @@ impl ComAmazonawsEc2Amazonec2State {
         if let Some(token) = &client_token {
             self.volume_client_tokens.remove(token);
         }
-        let view = record.view;
+        // The volume is kept whole, so the restore gives back the SAME record: the entry
+        // below is DERIVED from this view rather than taking it over.
+        let view = &record.view;
         // Give back exactly what `CreateVolume` charged for this volume, the way
         // [`Self::remove_fpga_image`] does for an FPGA image: the byte budget stays the sum of
         // what the store actually holds, and the entry stored below is charged for itself.
@@ -19095,9 +19138,112 @@ impl ComAmazonawsEc2Amazonec2State {
             recycle_bin_exit_time: Some(system_time_to_date_time(exit_at)),
         };
         self.add_stored_bytes(volume_recycle_bin_entry_payload_bytes(&entry));
-        self.volumes_in_recycle_bin
-            .insert(volume_id.to_string(), entry.clone());
+        self.volumes_in_recycle_bin.insert(
+            volume_id.to_string(),
+            RecycledVolumeRecord {
+                entry: entry.clone(),
+                volume: record,
+                client_token,
+                exit_due_at,
+            },
+        );
         Some(entry)
+    }
+
+    /// Take the volume the Recycle Bin holds for `volume_id` back into the account's
+    /// volumes, and answer whether the bin held one.
+    ///
+    /// The MOVE back: the record the bin kept is the record the volume store gets, so the
+    /// volume comes back with the id, ARN, create time, provisioning, tags and attachment
+    /// state it had, and the `ClientToken` that minted it names it again — a repeat of that
+    /// create answers with this volume rather than minting a second one. The byte accounting
+    /// is the mirror of [`Self::move_volume_to_recycle_bin`]: the entry gives its bytes back
+    /// and the volume is charged what the create charged for it, so a volume that goes into
+    /// the bin and comes back leaves the budget where it started.
+    ///
+    /// `false` when the bin holds no entry for `volume_id`, and then NOTHING was written.
+    pub fn restore_recycled_volume(&mut self, volume_id: &str) -> bool {
+        let Some(record) = self.volumes_in_recycle_bin.remove(volume_id) else {
+            return false;
+        };
+        self.release_stored_bytes(volume_recycle_bin_entry_payload_bytes(&record.entry));
+        self.charge_and_store_restored_volume(volume_id, record);
+        true
+    }
+
+    /// Put one restored volume back in the volume store, charged exactly what
+    /// `CreateVolume` charged for it — the one writer of that charge on the restore path,
+    /// so the move out of the bin and the move back cannot disagree about it.
+    fn charge_and_store_restored_volume(&mut self, volume_id: &str, record: RecycledVolumeRecord) {
+        let RecycledVolumeRecord {
+            volume,
+            client_token,
+            ..
+        } = record;
+        self.add_stored_bytes(volume_payload_bytes(
+            volume.view.tags.as_deref().unwrap_or_default(),
+            volume.view.kms_key_id.as_deref(),
+            client_token.as_deref(),
+        ));
+        if let Some(token) = client_token {
+            self.volume_client_tokens
+                .insert(token, volume_id.to_string());
+        }
+        self.volumes.insert(volume_id.to_string(), volume);
+    }
+
+    /// Apply the permanent deletions the clock owes the Recycle Bin: an entry whose
+    /// retention period has run out is deleted for good — "the date and time when the volume
+    /// is to be permanently deleted from the Recycle Bin"
+    /// (`VolumeRecycleBinInfo$RecycleBinExitTime`) — whether or not anybody called, so
+    /// neither a report of the bin nor a restore can see it afterwards, and the bytes the
+    /// entry was charged go back to the budget.
+    ///
+    /// Reached only through [`Self::materialize_due_transitions`], so a reporting operation
+    /// materialises nothing but what the clock already made due.
+    fn delete_due_recycled_volumes(&mut self, now: Instant) {
+        let expired: Vec<String> = self
+            .volumes_in_recycle_bin
+            .iter()
+            .filter(|(_, record)| now >= record.exit_due_at)
+            .map(|(volume_id, _)| volume_id.clone())
+            .collect();
+        for volume_id in expired {
+            if let Some(record) = self.volumes_in_recycle_bin.remove(&volume_id) {
+                self.release_stored_bytes(volume_recycle_bin_entry_payload_bytes(&record.entry));
+            }
+        }
+    }
+}
+
+/// One volume the Recycle Bin holds: the modelled entry a report of the bin answers with,
+/// beside the stored volume itself, so a restore gives back the SAME resource rather than
+/// one rebuilt from the entry's members — the entry carries neither the volume's tags nor
+/// its encryption, and a restored volume keeps both.
+#[derive(Debug, Clone)]
+pub struct RecycledVolumeRecord {
+    /// What `ListVolumesInRecycleBin` reports for this volume, derived from the volume when
+    /// it entered the bin ([`ComAmazonawsEc2Amazonec2State::move_volume_to_recycle_bin`] is
+    /// the one writer).
+    pub entry: VolumeRecycleBinInfo,
+    /// The volume exactly as the volume store held it, so
+    /// [`ComAmazonawsEc2Amazonec2State::restore_recycled_volume`] gives back the same
+    /// resource.
+    pub volume: VolumeRecord,
+    /// The `ClientToken` that minted the volume, if one did, so a restore makes that token
+    /// name this volume again instead of leaving it able to mint a second one.
+    pub client_token: Option<String>,
+    /// The instant from which this entry's permanent deletion is due — the monotonic
+    /// reading of its `RecycleBinExitTime`, never reported, so it is the clock's and not a
+    /// member of the entry two writers could disagree about.
+    pub exit_due_at: Instant,
+}
+
+impl RecycledVolumeRecord {
+    /// How much of this entry's retention period is left at `now`, which is zero once the
+    /// permanent deletion is due.
+    pub fn retention_left(&self, now: Instant) -> Duration {
+        self.exit_due_at.saturating_duration_since(now)
     }
 }
 

@@ -229,6 +229,9 @@ mod volume_modifications;
 // volumes, and how `VolumeIds`, the filters and the page size narrow it.
 #[path = "all/volume_status.rs"]
 mod volume_status;
+// `RestoreVolumeFromRecycleBin`: what the bin gives back, and what it refuses.
+#[path = "all/volumes_in_recycle_bin.rs"]
+mod volumes_in_recycle_bin;
 #[path = "all/vpc_attributes.rs"]
 mod vpc_attributes;
 #[path = "all/vpc_block_public_access_exclusions.rs"]

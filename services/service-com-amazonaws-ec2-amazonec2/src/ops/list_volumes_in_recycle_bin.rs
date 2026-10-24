@@ -8,7 +8,11 @@
 //! A volume reaches the Recycle Bin when it is deleted while a retention rule covers it
 //! ([`crate::state::ComAmazonawsEc2Amazonec2State::move_volume_to_recycle_bin`]) and leaves
 //! it when it is restored or when its retention period runs out, so a fresh account's bin is
-//! empty — which is what this reports. "Omit this parameter to list all of the volumes that
+//! empty — which is what this reports. The end of a retention period is the CLOCK's, so this
+//! report materialises the permanent deletions already due before it reads the bin: each was
+//! owed at its exit instant whether or not anybody called, and reporting an entry past it
+//! would disagree with `RestoreVolumeFromRecycleBin`, which refuses that same id.
+//! "Omit this parameter to list all of the volumes that
 //! are in the Recycle Bin" (`VolumeIds`): an id the request DOES name has to be a volume in
 //! the bin, so one that is not is an error rather than an absent row — a malformed id
 //! (`InvalidVolumeID.Malformed`) before an unknown one (`InvalidVolume.NotFound`), the order
@@ -194,7 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state = require_service_state(&*self.engine)?;
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // WHICH volumes the bin holds is a question about NOW: a volume whose
+        // `RecycleBinExitTime` has passed was permanently deleted at that instant whether
+        // or not anybody called, so the deletions the clock already owed are applied before
+        // the bin is read. Reporting one of them would also disagree with
+        // `RestoreVolumeFromRecycleBin`, which refuses that same id.
+        store.materialize_due_transitions();
 
         // An id the request named has to be a volume the bin holds: a malformed one is
         // answered as malformed, and a well-formed one the bin does not hold as not found.
@@ -208,14 +219,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The store is an ordered map, so its iteration order is the `VolumeId` order the
-        // cursor below names a position in.
+        // cursor below names a position in. Each record's `entry` is what the report
+        // answers with; the volume itself is kept beside it so a restore can give it back.
         let selected: Vec<&VolumeRecycleBinInfo> = store
             .volumes_in_recycle_bin
             .iter()
             .filter(|(volume_id, _)| {
                 requested_ids.is_empty() || requested_ids.contains(volume_id)
             })
-            .map(|(_, entry)| entry)
+            .map(|(_, record)| &record.entry)
             .collect();
 
         let from = match start_at.as_deref() {
