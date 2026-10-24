@@ -87,8 +87,12 @@ mod region_catalog;
 mod relational_database_blueprints;
 #[path = "all/relational_database_bundles.rs"]
 mod relational_database_bundles;
+#[path = "all/relational_database_delete.rs"]
+mod relational_database_delete;
 #[path = "all/relational_database_lifecycle.rs"]
 mod relational_database_lifecycle;
+#[path = "all/relational_database_listing.rs"]
+mod relational_database_listing;
 #[path = "all/relational_database_parameter_updates.rs"]
 mod relational_database_parameter_updates;
 #[path = "all/relational_database_parameters.rs"]

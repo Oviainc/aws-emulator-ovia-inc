@@ -2,9 +2,9 @@
 
 //! @op CreateSubnet
 //! IMPLEMENTED: creates a subnet inside a stored VPC from the request's IPv4 CIDR block
-//! and Availability Zone, stores it as the modelled [`Subnet`] shape, and answers it in
-//! `pending` with the instant the clock owes it `available` recorded beside it (see
-//! [`crate::state::ComAmazonawsEc2Amazonec2State::subnet_available_at`]).
+//! and Availability Zone, stores it as the modelled [`Subnet`] shape, and answers it
+//! `available` — subnet creation is synchronous, so the subnet the response reports is
+//! already the terminal state every later read reports.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -167,7 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state;
-        use std::time::Instant;
 
         // Request shapes this emulator holds no state for at all, so a 501 ("nobody has
         // written this yet") is the honest answer rather than a refusal that blames the
@@ -351,22 +350,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // auto-assign public IPv4 address attribute set to `true`" is a property of a
         // DEFAULT subnet — Amazon VPC User Guide, "Default VPCs"), so both are false here
         // until something modifies the subnet.
+        //
+        // The subnet is stored `available`, which is the state this call ANSWERS with:
+        // creating a subnet is synchronous, so there is no non-terminal state for the
+        // clock to owe a move out of and no instant to record beside the record — unlike
+        // the `pending` VPC this subnet is created into. `SubnetState` declares `pending`
+        // too, for the window AWS can report one in, but a caller that creates a subnet
+        // and launches into it never has to wait for it.
         let subnet_id = store.insert_subnet(state::SubnetSpec {
             vpc_id: input.vpc_id.clone(),
             cidr_block,
             availability_zone: zone.zone_name,
             availability_zone_id: zone.zone_id,
             region,
-            state: state::SUBNET_STATE_PENDING.to_string(),
+            state: state::SUBNET_STATE_AVAILABLE.to_string(),
             default_for_az: false,
             map_public_ip_on_launch: false,
             tags,
         });
-        // What the clock now owes this subnet: `available`, one TRANSITION_DELAY from now —
-        // the same span, off the same monotonic clock, as a `pending` VPC's own move.
-        store
-            .subnet_available_at
-            .insert(subnet_id.clone(), Instant::now() + state::TRANSITION_DELAY);
 
         // The answer is the record as it was stored, so `CreateSubnet` and
         // `DescribeSubnets` cannot drift apart.

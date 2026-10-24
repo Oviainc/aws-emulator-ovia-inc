@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAgreementPaymentRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAgreementPaymentRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAgreementPaymentRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored payment request, selected by the agreement it belongs to
+//! and its own id. A report: every member is computed from the stored record and
+//! nothing is written. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -178,20 +172,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAgreementPaymentRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAgreementPaymentRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAgreementPaymentRequest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetAgreementPaymentRequestErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // A pure report: it reads the stored payment request and writes nothing,
+        // so two reads of the same request answer the same thing and a later
+        // caller sees what this one saw.
+        let store = state.lock();
+
+        // A payment request is a child of the agreement it was sent under, and
+        // this call names both. Resolution goes PARENT-FIRST, so
+        // `ResourceNotFoundException`'s `resourceType` and `resourceId` name the
+        // OUTERMOST resource that failed to resolve, the way the sibling
+        // `GetBillingAdjustmentRequest` and `GetAgreementCancellationRequest`
+        // resolve their own parent/child pairs.
+        if !store.agreements.contains_key(&input.agreement_id) {
+            // The lookup found nothing: the modelled not-found body, at the
+            // status this service answers it with (`state::NOT_FOUND_STATUS`).
+            return Err(crate::state::not_found(
+                GetAgreementPaymentRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                ),
+            ));
+        }
+
+        // The agreement resolved, so the child is what this call looks for.
+        // Both ids are required and both select: a payment request of another
+        // agreement is not the one this call names. "A
+        // `ResourceNotFoundException` is returned if the payment request does
+        // not exist."
+        let found = store
+            .payment_requests
+            .get(&input.payment_request_id)
+            .filter(|request| request.agreement_id == input.agreement_id);
+        let Some(stored) = found else {
+            return Err(crate::state::not_found(
+                GetAgreementPaymentRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_request_not_found(&input.payment_request_id),
+                ),
+            ));
+        };
+
+        // "The calling identity must be either the acceptor or proposer of the
+        // payment request": the proposer is the account the send recorded on the
+        // request and the acceptor is the one the agreement records, which
+        // `crate::state::payment_request_party_matches` decides. This emulator
+        // serves a single account, which is both for every request it stores, so
+        // no stored request is readable by a non-party and the modelled
+        // `AccessDeniedException` has no case to answer here.
+        Ok(stored.to_detail())
     }
 }

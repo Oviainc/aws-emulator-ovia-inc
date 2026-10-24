@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptPrimaryEmailUpdate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptPrimaryEmailUpdate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptPrimaryEmailUpdate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts the primary email update a `StartPrimaryEmailUpdate` recorded against
+//! the MEMBER account the request names: the presented address has to be the one
+//! the update was started for, and only an update still waiting for its one-time
+//! passcode can be accepted. An accepted update is `ACCEPTED`, and its
+//! `COMPLETED` status — at which point the address IS the account's primary
+//! email — is owed by the clock
+//! ([`crate::state::PRIMARY_EMAIL_UPDATE_COMPLETION`]).
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +165,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptPrimaryEmailUpdate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptPrimaryEmailUpdateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptPrimaryEmailUpdate"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AcceptPrimaryEmailUpdateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // The authorization rule comes FIRST, as it does on
+        // `StartPrimaryEmailUpdate`: this operation acts on a member account
+        // from the management or delegated administrator account, and the
+        // model's own `AccountId` documentation states that the management
+        // account can't specify its own `AccountId`. `AccountId` is required
+        // here, so there is no caller's-own default to resolve.
+        if input.account_id == crate::state::default_account_id() {
+            return Err(AcceptPrimaryEmailUpdateErrorModeled::AccessDeniedException(
+                crate::state::cannot_target_own_account(),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise every completion the clock already owes before deciding,
+        // so the update this call acts on and the addresses that count as in
+        // use are the settled ones.
+        store.settle_primary_email_updates(now);
+        // Whether the presented address is already in use is read BEFORE the
+        // target record is borrowed mutably, and it is a question about the
+        // whole store: an address another account holds, or has an accepted
+        // update for, cannot become this one's. The target's own update is
+        // still PENDING at this point, so it never conflicts with itself.
+        let address_in_use = store.primary_email_in_use(&input.primary_email);
+
+        // This operation acts on an update that already exists, so it creates
+        // no account record: an account this emulator has never been told about
+        // is outside the caller's organization, which is the same refusal
+        // `GetPrimaryEmailUpdateStatus` applies.
+        let Some(account) = store.existing_account_mut(&input.account_id) else {
+            return Err(AcceptPrimaryEmailUpdateErrorModeled::AccessDeniedException(
+                crate::state::account_not_accessible(&input.account_id),
+            )
+            .into());
+        };
+
+        let Some(update) = account.primary_email_update.as_mut() else {
+            // Nothing originated from `StartPrimaryEmailUpdate` for this
+            // account, so there is no request to accept.
+            return Err(AcceptPrimaryEmailUpdateErrorModeled::ValidationException(
+                crate::state::no_primary_email_update(),
+            )
+            .into());
+        };
+
+        if !update.is_pending() {
+            // The update is ACCEPTED, COMPLETED or FAILED: accepting it again
+            // conflicts with "the current status of the resource".
+            return Err(AcceptPrimaryEmailUpdateErrorModeled::ConflictException(
+                crate::state::primary_email_update_not_pending(update.settled_status(now)),
+            )
+            .into());
+        }
+
+        // The model's `PrimaryEmail` documentation is the rule: the address
+        // presented here "must match the PrimaryEmail from the
+        // StartPrimaryEmailUpdate API call". `@length(min: 5, max: 64)` on the
+        // address and `^[a-zA-Z0-9]{6}$` on `Otp` were already enforced at the
+        // boundary, so reaching here means both are well formed.
+        if input.primary_email != update.requested_email {
+            return Err(AcceptPrimaryEmailUpdateErrorModeled::ValidationException(
+                crate::state::primary_email_does_not_match_request(),
+            )
+            .into());
+        }
+
+        if address_in_use {
+            // The conflict this service's `ConflictException` documents by
+            // example: a root user email cannot be changed to an address that
+            // is already in use.
+            return Err(AcceptPrimaryEmailUpdateErrorModeled::ConflictException(
+                crate::state::primary_email_already_in_use(),
+            )
+            .into());
+        }
+
+        // The passcode itself: Account Management mails it to the proposed
+        // address, and this emulator has no mailbox a caller could read it
+        // from, so it cannot hold a particular passcode a caller would have to
+        // present — and it invents none to compare against. What the model DOES
+        // state about `Otp` is its form (`^[a-zA-Z0-9]{6}$`), which the
+        // boundary refuses anything outside of; a passcode of that form
+        // confirms the update.
+        update.accept(now);
+        let status = update.settled_status(now).to_string();
+
+        Ok(AcceptPrimaryEmailUpdateOutput {
+            status: Some(status),
+        })
     }
 }

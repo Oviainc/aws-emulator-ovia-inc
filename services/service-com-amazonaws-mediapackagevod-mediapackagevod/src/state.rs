@@ -421,6 +421,22 @@ impl ComAmazonawsMediapackagevodMediapackagevodState {
         self.tags_by_arn.remove(arn);
     }
 
+    /// Remove from the map stored for `arn` exactly the tags `keys` names, leaving
+    /// every other tag of that resource in place.
+    ///
+    /// A key the resource does not carry removes nothing, so the request is
+    /// idempotent: repeating it leaves the same tag map, and the resource itself is
+    /// untouched either way. Keys are compared verbatim — a tag key differing in
+    /// case or in surrounding whitespace is a different key.
+    pub fn remove_tag_keys(&mut self, arn: &str, keys: &[String]) {
+        let Some(stored) = self.tags_by_arn.get_mut(arn) else {
+            return;
+        };
+        for key in keys {
+            stored.remove(key);
+        }
+    }
+
     /// The tags stored for `arn`, in the modelled `Tags` map shape. A resource with
     /// no tags reports an empty map, which is what it was created with.
     pub fn tags_of(&self, arn: &str) -> HashMap<String, String> {

@@ -351,7 +351,9 @@ async fn create_outpost_refuses_an_availability_zone_of_another_region() {
     let site = outposts.create_site(&json!({ "Name": "zone site" })).await;
     let site_id = text(&site, "SiteId");
 
-    // (case, region, AvailabilityZone, AvailabilityZoneId)
+    // (case, region, AvailabilityZone, AvailabilityZoneId). A row naming BOTH names
+    // one zone with them, since the two identities of one zone is what a pair means
+    // (see `crate::availability_zone_identity`).
     let accepted: [(&str, &str, Option<&str>, Option<&str>); 7] = [
         ("zone name only", "us-east-1", Some("us-east-1a"), None),
         ("zone id only", "us-east-1", None, Some("use1-az1")),
@@ -359,19 +361,19 @@ async fn create_outpost_refuses_an_availability_zone_of_another_region() {
             "both, another region",
             "us-west-2",
             Some("us-west-2b"),
-            Some("usw2-az3"),
+            Some("usw2-az2"),
         ),
         (
             "compound direction",
             "ap-southeast-2",
             Some("ap-southeast-2c"),
-            Some("apse2-az1"),
+            Some("apse2-az3"),
         ),
         (
             "non-direction word",
             "eu-central-1",
             Some("eu-central-1a"),
-            Some("euc1-az2"),
+            Some("euc1-az1"),
         ),
         (
             "partition word",

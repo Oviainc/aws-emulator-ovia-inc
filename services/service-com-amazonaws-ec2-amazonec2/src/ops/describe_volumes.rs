@@ -161,11 +161,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            decode_page_token, encode_page_token, invalid_id_parameter_value,
-            invalid_pagination_token_for, invalid_volume_id_not_found, require_service_state,
-            volume_id_is_well_formed, CompiledFilter, MatchBudget, MAX_FILTERS,
-            MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE,
-            MAX_RESOURCE_IDS, VOLUME_ID_PREFIX, VOLUME_IDS_PARAMETER,
+            decode_page_token, invalid_id_parameter_value, invalid_pagination_token_for,
+            invalid_volume_id_not_found, require_service_state, volume_id_is_well_formed,
+            CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
+            MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, VOLUME_ID_PREFIX,
+            VOLUME_IDS_PARAMETER,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it. The store
@@ -344,13 +344,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // here establishes the invariant the cursor depends on at the point of use.
         selected.sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
 
-        let from = match start_at.as_deref() {
-            None => 0,
-            Some(cursor) => selected
-                .partition_point(|volume| volume.volume_id.as_deref().unwrap_or_default() < cursor),
-        };
-        let page = selected.get(from..).unwrap_or_default();
-
         // A request that names no page size gets the largest page this service serves, so
         // the `NextToken` path behaves the same whether or not a page size was asked for.
         let limit = input
@@ -359,15 +352,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(MAX_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
 
-        // A token only when a volume follows this page: "To get the next page of items,
-        // make another request with the token returned in the output".
-        let next_token = page
-            .get(limit)
-            .and_then(|volume| volume.volume_id.as_deref())
-            .map(encode_page_token);
+        // The page and the token that follows it, through the one definition of EC2 paging
+        // ([`crate::state::page_from_cursor`]): the cursor names the volume this page ends
+        // at, and this operation was recorded answering a token only while a further
+        // volume follows the page.
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            crate::state::PageTokenRule::WhenAnotherItemFollows,
+            |volume| volume.volume_id.as_deref().unwrap_or_default(),
+        );
 
         Ok(DescribeVolumesOutput {
-            volumes: Some(page.iter().take(limit).cloned().collect()),
+            volumes: Some(page.to_vec()),
             next_token,
         })
     }

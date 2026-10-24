@@ -177,9 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            decode_page_token, encode_page_token, filter_name_supported, require_known_instance,
-            require_service_state, CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS,
-            MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
+            decode_page_token, filter_name_supported, page_from_cursor, require_known_instance,
+            require_service_state, CompiledFilter, MatchBudget, PageTokenRule, MAX_FILTERS,
+            MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE,
+            MAX_RESOURCE_IDS,
         };
 
         let _ = ctx;
@@ -324,38 +325,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `@paginated` names `Reservations` as the paged items, so a page is a whole
-        // number of reservations and the token carries the id of the one to resume
-        // at, opaquely (`state::encode_page_token`), so a caller cannot assemble one.
-        // A request that names no page size gets the documented maximum rather than
-        // the whole store.
+        // number of reservations and the token carries, opaquely
+        // (`state::encode_page_token`), the id of the one it ENDS at, so a caller cannot
+        // assemble one. A request that names no page size gets the documented maximum
+        // rather than the whole store.
         let page_size = input
             .max_results
             .and_then(|max_results| usize::try_from(max_results).ok())
             .unwrap_or(MAX_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
-        let start = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                let resume_at = decode_page_token(token).ok_or_else(|| {
-                    Scaffolded::invalid_parameter_value(
-                        "The NextToken value is not a token this service issued",
-                    )
-                })?;
-                matched
-                    .iter()
-                    .position(|(reservation_id, _)| *reservation_id == resume_at)
-                    .ok_or_else(|| {
-                        Scaffolded::invalid_parameter_value(
-                            "The NextToken value does not resume this result set",
-                        )
-                    })?
-            }
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(
+                    "The NextToken value is not a token this service issued",
+                )
+            })?),
         };
-        let end = start.saturating_add(page_size).min(matched.len());
-        let next_token = matched
-            .get(end)
-            .map(|(reservation_id, _)| encode_page_token(reservation_id));
-        let reservations = matched[start..end]
+        // Launch order IS `ReservationId` order — an id is 17 hex digits of a counter that
+        // only grows — so the set `reservation_order` built is already in the order the
+        // cursor names a position in. Paging it through the one definition of EC2 paging
+        // ([`state::page_from_cursor`]): the cursor names the reservation the page ends at,
+        // and this operation was recorded answering a token only while a further
+        // reservation follows the page.
+        let (page, next_token) = page_from_cursor(
+            &matched,
+            start_at.as_deref(),
+            Some(page_size),
+            PageTokenRule::WhenAnotherItemFollows,
+            |(reservation_id, _)| reservation_id.as_str(),
+        );
+        let reservations = page
             .iter()
             .filter_map(|(reservation_id, instance_ids)| {
                 store.reservation_view(reservation_id, instance_ids)

@@ -26,7 +26,9 @@
 //! [`InputDeviceRecord`] per claimed device, keyed by the device id the claim
 //! named rather than by an id this service mints, because a Link unit's id is
 //! its own. A device's `DeviceUpdateStatus` comes out of the maintenance window
-//! `StartInputDeviceMaintenanceWindow` opens on it, and its `OutputType` and
+//! `StartInputDeviceMaintenanceWindow` opens on it, its `InputDeviceState` out
+//! of the `StartInputDevice` / `StopInputDevice` commands it has accepted, and
+//! its `OutputType` and
 //! `MedialiveInputArns` out of the inputs this store holds — see
 //! [`input_devices`]. A device also carries the TRANSFER pending on it, which
 //! `TransferInputDevice` records and `ListInputDeviceTransfers` reports in the
@@ -83,6 +85,13 @@
 //! each carrying the id of the group its `GroupIdentifier` resolved to, so a
 //! template reports the group it belongs to out of state rather than out of the
 //! request.
+//!
+//! The ACCOUNT's own MediaLive settings live here too, beside the resources:
+//! one [`AccountConfigurationRecord`] per region an `UpdateAccountConfiguration`
+//! has written one in. That is not a resource a caller creates — the account
+//! always has a configuration — so a region nothing has configured yet reads as
+//! the unset configuration rather than as missing. See the
+//! [`account_configuration`] slice.
 //!
 //! Every value a channel-, input-, input-security-group-, SdiSource-,
 //! signal-map- or template-group-shaped response carries is either stored
@@ -155,6 +164,19 @@ pub mod schedules;
 pub use alarm_template_groups::{
     AlarmTemplateGroupRefusal, CloudWatchAlarmTemplateGroupRecord,
     MAX_ALARM_TEMPLATE_GROUPS, MAX_ALARM_TEMPLATE_GROUP_TOKENS,
+};
+
+/// The ACCOUNT CONFIGURATION slice: the per-region record this account's
+/// `UpdateAccountConfiguration` writes and `DescribeAccountConfiguration` reads,
+/// the shape of KMS key ARN it accepts and the bound on the store, in one module
+/// of its own for the same reason as [`alarm_template_groups`]. What stays in
+/// this file is the part the rest of the state needs: the
+/// `account_configurations` store member on
+/// [`ComAmazonawsMedialiveMedialiveState`].
+pub mod account_configuration;
+
+pub use account_configuration::{
+    is_kms_key_arn, AccountConfigurationRecord, MAX_ACCOUNT_CONFIGURATION_REGIONS,
 };
 
 pub use schedules::{
@@ -1595,6 +1617,21 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// per cluster by the slice's `channel_placement_group_token_key` -> the
     /// group it created. PRIVATE for the same reason as [`Self::channel_tokens`].
     channel_placement_group_tokens: IdempotencyTokens,
+    /// The account's MediaLive configuration in each region an
+    /// `UpdateAccountConfiguration` has written one in, keyed by the region the
+    /// writing request was signed for. A `BTreeMap` so a debug dump of the store
+    /// is in region order rather than in write order.
+    ///
+    /// There is no mint counter and no token map beside it: the configuration is
+    /// not a resource a caller creates, it is the account's own settings, so a
+    /// region nothing has configured yet reads as the unset configuration rather
+    /// than as missing (see the [`account_configuration`] slice).
+    ///
+    /// PRIVATE, so the partial-update rule, the blank-clears-the-key rule and
+    /// the store's bound stay invariants of
+    /// [`Self::update_account_configuration`] and
+    /// [`Self::account_configuration`] rather than of each handler.
+    account_configurations: BTreeMap<String, AccountConfigurationRecord>,
     /// Every node that exists, in every cluster, keyed by its minted `Id`, in id
     /// order for the same reason as [`Self::channels`]. The cluster a node
     /// belongs to is on the record, and every node lookup matches it

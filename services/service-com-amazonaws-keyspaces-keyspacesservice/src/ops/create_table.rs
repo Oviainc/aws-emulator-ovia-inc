@@ -415,8 +415,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         keyspace.tables.insert(
             input.table_name.clone(),
             crate::state::Table {
-                keyspace_name: input.keyspace_name,
-                table_name: input.table_name,
+                keyspace_name: input.keyspace_name.clone(),
+                table_name: input.table_name.clone(),
                 resource_arn: resource_arn.clone(),
                 creation_timestamp: Some(now),
                 // "CreateTable is an asynchronous operation. When the request is received,
@@ -427,7 +427,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status_due_at: Some(settles_at),
                 schema_definition: Some(input.schema_definition),
                 capacity_specification: Some(capacity_specification),
-                auto_scaling_specification,
+                auto_scaling_specification: auto_scaling_specification.clone(),
                 // Only an `UpdateTable` that moves the table to PAY_PER_REQUEST sets
                 // this; a table created in a mode was never updated into it.
                 last_update_to_pay_per_request: None,
@@ -453,6 +453,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The clock now owes this table its ACTIVE transition; tell the store the earliest
         // instant at which `settle` has to look at the tables again.
         store.note_transition_due(settles_at);
+        drop(store);
+
+        // Auto scaling settings are Application Auto Scaling resources, so configuring
+        // them on a table registers, per configured capacity, that capacity's scalable
+        // target and the target-tracking policy that steers it — which is what makes them
+        // visible to `DescribeScalableTargets` and `DescribeScalingPolicies`. Done with
+        // this service's store lock released, so no request holds two service stores at
+        // once.
+        if let Some(specification) = auto_scaling_specification.as_ref() {
+            crate::state::publish_auto_scaling(
+                &*self.engine,
+                &region,
+                &input.keyspace_name,
+                &input.table_name,
+                specification,
+            );
+        }
 
         Ok(CreateTableOutput { resource_arn })
     }

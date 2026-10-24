@@ -2237,6 +2237,220 @@ fn apply_alarms<Eng: Send + Sync + 'static>(
 }
 
 // ---------------------------------------------------------------------------
+// The targets another service manages on its own resources' behalf
+// ---------------------------------------------------------------------------
+
+/// The one policy type whose configuration IS a tracked metric and a target value, and
+/// whose alarms this service owns.
+pub const TARGET_TRACKING_POLICY_TYPE: &str = "TargetTrackingScaling";
+
+/// What the service that OWNS a scalable resource wants this service to hold for one of
+/// that resource's capacity dimensions: the capacity window, and the target-tracking
+/// policy that steers it.
+#[derive(Debug, Clone)]
+pub struct ManagedTarget {
+    /// The scalable target's `MinCapacity`.
+    pub min_capacity: i32,
+    /// Its `MaxCapacity`.
+    pub max_capacity: i32,
+    /// The `PolicyName` the owning service gives the policy it manages, which is what
+    /// makes that policy addressable — and re-settable — through this service's own API.
+    pub policy_name: String,
+    /// The policy's `TargetTrackingScalingPolicyConfiguration`.
+    pub target_tracking: TargetTrackingScalingPolicyConfiguration,
+}
+
+/// Materialise, for the service that owns the resource, the scalable target and the
+/// target-tracking policy one of its capacity dimensions is scaled by — or retire both
+/// when that dimension is no longer scaled (`wanted` is `None`).
+///
+/// Several services implement their own auto scaling settings ON TOP of Application Auto
+/// Scaling: the settings a caller configures through the owning service's API are
+/// scalable targets and scaling policies of THIS service, which is why that API documents
+/// `application-autoscaling:DescribeScalableTargets` /
+/// `application-autoscaling:DescribeScalingPolicies` as the permissions needed to read
+/// them back. So the owning service writes them here instead of keeping a second,
+/// disconnected copy, and a caller sees them through `DescribeScalableTargets` and
+/// `DescribeScalingPolicies` exactly as it sees one it registered itself.
+///
+/// Everything this service's own `RegisterScalableTarget`/`PutScalingPolicy` guarantee
+/// holds for a target written this way: the ARNs and creation times are minted once per
+/// identity and survive a re-write, a capacity window that moves the resource's capacity
+/// records a scaling activity, the target-tracking policy's CloudWatch alarms are
+/// materialised, and retiring the target cascades into its policies, its scheduled
+/// actions and those alarms. Call it with NO store lock of either service held; it does
+/// nothing when this service's store is not reachable from `engine`.
+pub fn apply_managed_target<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    key: &TargetKey,
+    wanted: Option<&ManagedTarget>,
+) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    let now = SystemTime::now();
+    // What the CloudWatch side owes once this service's lock is released: the alarm plan
+    // of the target that was written, and the policies whose alarms are to be retired.
+    let mut plan: Option<AlarmPlan> = None;
+    let mut retired: Vec<(PolicyKey, String)> = Vec::new();
+    {
+        let mut guard = state.lock();
+        let store = &mut *guard;
+        match wanted {
+            // "Deregistering a scalable target deletes the scaling policies and the
+            // scheduled actions that are associated with it" — the same cascade, because
+            // this is the same resource going away.
+            None => {
+                if let Some(removed) = store.targets.remove(key) {
+                    store.arn_index.remove(&removed.arn);
+                    retired = store
+                        .policies
+                        .iter()
+                        .filter(|(policy_key, _)| &policy_key.target == key)
+                        .map(|(policy_key, record)| {
+                            (policy_key.clone(), record.policy_type.clone())
+                        })
+                        .collect();
+                    store.policies.retain(|policy_key, _| &policy_key.target != key);
+                    store
+                        .scheduled_actions
+                        .retain(|action_key, _| &action_key.target != key);
+                }
+            }
+            Some(wanted) => {
+                // The window as a window: the owning service validates its own settings,
+                // and this service "will not scale capacity to values that are outside of
+                // the minimum and maximum range", which inverted bounds are not.
+                let min_capacity = wanted.min_capacity.min(wanted.max_capacity);
+                let max_capacity = wanted.max_capacity.max(wanted.min_capacity);
+                // The emulator's own store bound is what a first registration is held to,
+                // exactly as `RegisterScalableTarget` is; past it the owning service's
+                // resource simply carries no scalable target.
+                let room = store.targets.len() < MAX_SCALABLE_TARGETS;
+                let moved = match store.targets.get_mut(key) {
+                    // An existing target keeps its ARN, its creation time, its tags and
+                    // its suspended state: this is an update of that resource, not a new
+                    // one. Its capacity is placed back inside the new window.
+                    Some(existing) => {
+                        existing.min_capacity = min_capacity;
+                        existing.max_capacity = max_capacity;
+                        let moved = existing.current_capacity.clamp(min_capacity, max_capacity);
+                        let cause = (moved != existing.current_capacity).then(|| {
+                            if moved > existing.current_capacity {
+                                format!("minimum capacity was set to {min_capacity}")
+                            } else {
+                                format!("maximum capacity was set to {max_capacity}")
+                            }
+                        });
+                        existing.current_capacity = moved;
+                        cause.map(|cause| (moved, cause))
+                    }
+                    // Past the store bound the owning service's resource simply carries no
+                    // scalable target.
+                    None if !room => None,
+                    None => {
+                        let arn = scalable_target_arn(region, key, now);
+                        store.arn_index.insert(arn.clone(), key.clone());
+                        store.targets.insert(
+                            key.clone(),
+                            ScalableTargetRecord {
+                                arn,
+                                min_capacity,
+                                max_capacity,
+                                // A first registration adopts the window's floor rather
+                                // than moving anything, so it records no activity.
+                                current_capacity: min_capacity,
+                                role_arn: service_linked_role_arn(&key.service_namespace),
+                                creation_time: now,
+                                suspended_state: None,
+                                tags: BTreeMap::new(),
+                            },
+                        );
+                        None
+                    }
+                };
+                if let Some((capacity, cause)) = moved {
+                    store.record_capacity_change(key, capacity, cause, now);
+                }
+                // The policy exists only against a registered target, so it is written
+                // only where one is.
+                if store.targets.contains_key(key) {
+                    let policy_key = PolicyKey {
+                        target: key.clone(),
+                        policy_name: wanted.policy_name.clone(),
+                    };
+                    // The ARN and the creation time are minted once per policy identity
+                    // and survive every later write of it; the store bound is checked on
+                    // the create path only, so an update still lands at the ceiling.
+                    let identity = match store.policies.get(&policy_key) {
+                        Some(existing) => {
+                            Some((existing.policy_arn.clone(), existing.creation_time))
+                        }
+                        None if store.policies.len() >= MAX_SCALING_POLICIES => None,
+                        None => Some((scaling_policy_arn(region, &policy_key), now)),
+                    };
+                    if let Some((policy_arn, creation_time)) = identity {
+                        store.policies.insert(
+                            policy_key,
+                            ScalingPolicyRecord {
+                                policy_arn,
+                                policy_type: TARGET_TRACKING_POLICY_TYPE.to_string(),
+                                step_config: None,
+                                target_tracking_config: Some(wanted.target_tracking.clone()),
+                                predictive_config: None,
+                                // Filled in by the alarm sync below, which is what creates
+                                // them in CloudWatch.
+                                alarms: Vec::new(),
+                                creation_time,
+                            },
+                        );
+                    }
+                    plan = Some(plan_target_alarms(store, region, key, None));
+                }
+            }
+        }
+    }
+    // With this service's lock released: the CloudWatch writes, exactly as
+    // `PutScalingPolicy` and `DeregisterScalableTarget` sequence them.
+    if let Some(plan) = plan {
+        let minted = apply_target_alarms(engine, &plan);
+        let orphaned = record_minted_alarms(&mut state.lock(), minted);
+        for policy_key in &orphaned {
+            retire_policy_alarms(engine, policy_key, TARGET_TRACKING_POLICY_TYPE);
+        }
+    }
+    for (policy_key, policy_type) in &retired {
+        retire_policy_alarms(engine, policy_key, policy_type);
+    }
+}
+
+/// The capacity window and the target-tracking configuration this service holds for
+/// `key`, for the service that OWNS the resource to report back: `None` when no scalable
+/// target is registered for that dimension, so there are no settings to report.
+///
+/// The configuration is the one of the target's target-tracking policies that
+/// [`apply_managed_target`] writes under `policy_name`, falling back to any other
+/// target-tracking policy of the same target — a caller may steer the same dimension with
+/// a policy it put there itself, and that policy is then what the dimension is scaled by.
+pub fn managed_target_settings(
+    state: &ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    key: &TargetKey,
+    policy_name: &str,
+) -> Option<(i32, i32, Option<TargetTrackingScalingPolicyConfiguration>)> {
+    let target = state.targets.get(key)?;
+    let tracking = state
+        .policies
+        .iter()
+        .filter(|(policy_key, record)| {
+            &policy_key.target == key && record.policy_type == TARGET_TRACKING_POLICY_TYPE
+        })
+        .min_by_key(|(policy_key, _)| policy_key.policy_name != policy_name)
+        .and_then(|(_, record)| record.target_tracking_config.clone());
+    Some((target.min_capacity, target.max_capacity, tracking))
+}
+
+// ---------------------------------------------------------------------------
 // Scheduled actions
 // ---------------------------------------------------------------------------
 

@@ -324,41 +324,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // inheriting it from the container `crate::state` happens to hold.
         selected.sort_by(|left, right| left.group_id.cmp(&right.group_id));
 
-        // That order is both the stable paging order and the cursor, so a token naming the
-        // id the next page starts at always advances.
-        let from = match start_at.as_deref() {
-            None => 0,
-            Some(cursor) => selected
-                .partition_point(|group| group.group_id.as_deref().unwrap_or_default() < cursor),
-        };
-        let page = selected.get(from..).unwrap_or_default();
-
         // "The maximum number of items to return for this request. … If this parameter is
         // not specified, then all items are returned"
         // (`DescribeSecurityGroupsRequest$MaxResults`) — so a request that names none is
-        // not paged at all. The model's `range 5..1000` has already refused anything
-        // outside it, so the only value that cannot convert is one the boundary validator
-        // would have rejected.
+        // not paged at all and carries no token. The model's `range 5..1000` has already
+        // refused anything outside it, so the only value that cannot convert is one the
+        // boundary validator would have rejected.
         let limit = input
             .max_results
-            .and_then(|max_results| usize::try_from(max_results).ok())
-            .unwrap_or(page.len());
+            .and_then(|max_results| usize::try_from(max_results).ok());
 
-        // "This value is null when there are no more items to return"
-        // (`DescribeSecurityGroupsResult$NextToken`): a token only when a group follows
-        // this page.
-        let next_token = page
-            .get(limit)
-            .and_then(|group| group.group_id.as_deref())
-            .map(crate::state::encode_page_token);
+        // The page and the token that follows it, through the one definition of EC2 paging
+        // ([`crate::state::page_from_cursor`]). This operation is the one recorded minting
+        // a token for a page `MaxResults` did NOT fill: a paged, vpc-scoped read answers a
+        // token on every page that held groups and ends the walk on the empty page that
+        // token leads to, so a caller must follow it instead of stopping at a short page.
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            limit,
+            crate::state::PageTokenRule::WhenThePageHeldItems,
+            |group| group.group_id.as_deref().unwrap_or_default(),
+        );
 
         Ok(DescribeSecurityGroupsOutput {
-            security_groups: Some(
-                page.iter()
-                    .take(limit)
-                    .map(|group| (*group).clone())
-                    .collect(),
-            ),
+            security_groups: Some(page.iter().map(|group| (*group).clone()).collect()),
             next_token,
         })
     }

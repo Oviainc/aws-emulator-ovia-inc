@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAllowedRepositoriesForGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAllowedRepositoriesForGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAllowedRepositoriesForGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: this operation reads the allowed-repository list of one package-group
+//! restriction and reports one page of it. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,23 +160,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_ALLOWED_REPOSITORIES_FOR_GROUP_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report one page of the allowed-repository list of ONE restriction of one package
+    /// group.
+    ///
+    /// A reporting operation: it reads the list the group's restriction holds and writes
+    /// nothing. That list belongs to a restriction whose `mode` is
+    /// `ALLOW_SPECIFIC_REPOSITORIES` — this lists "the repositories in the added
+    /// repositories list of the specified restriction type" — so a restriction in any
+    /// OTHER mode, `INHERIT` included, has no list of its own and the call is refused as
+    /// an invalid parameter rather than answered with an empty list. The mode that decides
+    /// it is the group's OWN `mode`, never the `effectiveMode` it resolves to: an
+    /// inheriting group holds no list, and the list its ancestor holds is reported by
+    /// listing THAT group.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAllowedRepositoriesForGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAllowedRepositoriesForGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAllowedRepositoriesForGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListAllowedRepositoriesForGroupErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the CodeArtifact store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A `packageGroup` that is not a path from the domain root is not an identifier
+        // any package group can have, so it is refused on the INPUT — as every other
+        // package-group operation refuses it — rather than resolved to a lookup that is
+        // bound to miss.
+        if let Some(refusal) = crate::state::package_group_pattern_refusal(&input.package_group) {
+            return Err(
+                ListAllowedRepositoriesForGroupErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
+        // A `nextToken` this service did not mint for THIS group's restriction of THIS
+        // type cannot name a place in that list's order.
+        let scope = crate::state::allowed_repository_cursor_scope(
+            &input.domain,
+            &input.package_group,
+            &input.origin_restriction_type,
+        );
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_token(&scope, token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(
+                        ListAllowedRepositoriesForGroupErrorModeled::ValidationException(
+                            ValidationException {
+                                message: "nextToken is not a pagination token this service \
+                                          issued for this listing"
+                                    .to_string(),
+                                reason: Some(
+                                    crate::state::VALIDATION_REASON_FIELD_FAILED.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let store = state.lock();
+        let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(
+                ListAllowedRepositoriesForGroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::domain_not_found_message(
+                            &input.domain,
+                            input.domain_owner.as_deref(),
+                        ),
+                        resource_id: Some(input.domain.clone()),
+                        resource_type: Some(crate::state::DOMAIN_RESOURCE_TYPE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `resourceType` is unset: `ResourceType` models only `domain`, `repository`,
+        // `package`, `package-version` and `asset`, so there is no enum value for a
+        // package group to report.
+        let Some(group) = domain.package_groups.get(&input.package_group) else {
+            return Err(
+                ListAllowedRepositoriesForGroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::package_group_not_found_message(
+                            &domain.name,
+                            Some(&domain.owner),
+                            &input.package_group,
+                        ),
+                        resource_id: Some(input.package_group.clone()),
+                        resource_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        if group.restriction_mode(&input.origin_restriction_type)
+            != crate::state::ORIGIN_MODE_ALLOW_SPECIFIC_REPOSITORIES
+        {
+            return Err(
+                ListAllowedRepositoriesForGroupErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "OriginRestrictionMode is not {} for the given OriginControlType",
+                            crate::state::ORIGIN_MODE_ALLOW_SPECIFIC_REPOSITORIES
+                        ),
+                        reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let (allowed_repositories, next_token) = crate::state::page_of_names(
+            group.allowed_repositories(&input.origin_restriction_type),
+            &scope,
+            cursor.as_deref(),
+            input.max_results,
+        );
+
+        Ok(ListAllowedRepositoriesForGroupOutput {
+            allowed_repositories: Some(allowed_repositories),
+            next_token,
+        })
     }
 }

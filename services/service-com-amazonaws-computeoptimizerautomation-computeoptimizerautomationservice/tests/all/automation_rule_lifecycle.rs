@@ -406,7 +406,13 @@ async fn created_rules_round_trip_through_get() {
                 "ruleType": "AccountRule",
                 "priority": "0.000000000000000000000000000001",
                 "recommendedActionTypes": ["UpgradeEbsVolumeType"],
-                "schedule": {"executionWindowInMinutes": 60},
+                // A schedule carries the expression that says when the rule
+                // runs, so this case names one; what it is about is the
+                // priority bound above.
+                "schedule": {
+                    "scheduleExpression": "59 23 * * ? *",
+                    "executionWindowInMinutes": 60
+                },
                 "status": "Active"
             }),
         ),

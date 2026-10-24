@@ -2285,12 +2285,21 @@ fn gateway_label_char(c: char) -> bool {
 /// (`AWS::CodePipeline::Pipeline`, whose `Ref` is the pipeline name, which is the default
 /// this module already gives every type).
 pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
+    APIGATEWAY_DEPLOYMENT,
+    APIGATEWAY_RESOURCE,
+    APIGATEWAY_REST_API,
     "AWS::BedrockAgentCore::Browser",
     "AWS::BedrockAgentCore::CodeInterpreter",
     "AWS::BedrockAgentCore::Gateway",
     "AWS::BedrockAgentCore::Memory",
     "AWS::BedrockAgentCore::Runtime",
     "AWS::BedrockAgentCore::WorkloadIdentity",
+    CLOUDFRONT_CACHE_POLICY,
+    CLOUDFRONT_DISTRIBUTION,
+    CLOUDFRONT_ORIGIN_ACCESS_CONTROL,
+    CLOUDFRONT_ORIGIN_ACCESS_IDENTITY,
+    CLOUDFRONT_ORIGIN_REQUEST_POLICY,
+    CLOUDFRONT_RESPONSE_HEADERS_POLICY,
     "AWS::CloudWatch::Alarm",
     CLOUDWATCH_METRIC_STREAM,
     "AWS::DynamoDB::Table",
@@ -2380,12 +2389,112 @@ fn return_values(
             attributes.insert("QueueUrl".to_string(), url.clone());
             (url, attributes)
         }
-        // "Ref returns the bucket name"; Fn::GetAtt: Arn, DomainName. An Amazon S3 bucket
-        // ARN carries neither a region nor an account id (`arn:aws:s3:::<bucket>`).
+        // "Ref returns the bucket name"; Fn::GetAtt: Arn, DomainName,
+        // DualStackDomainName, RegionalDomainName, WebsiteURL — each one a DNS name S3
+        // serves the bucket under, in the form that type's "Return values" section
+        // publishes an example of: `DomainName`
+        // "mystack-mybucket-kdwwxmddtr2g.s3.amazonaws.com" (the IPv4 DNS name),
+        // `DualStackDomainName`
+        // "mystack-mybucket-kdwwxmddtr2g.s3.dualstack.us-east-2.amazonaws.com" (the IPv6
+        // one), `RegionalDomainName`
+        // "mystack-mybucket-kdwwxmddtr2g.s3.us-east-2.amazonaws.com" and `WebsiteURL`
+        // "http://mystack-mybucket-kdwwxmddtr2g.s3-website-us-east-2.amazonaws.com" (the
+        // bucket's website endpoint). An Amazon S3 bucket ARN carries neither a region nor
+        // an account id (`arn:aws:s3:::<bucket>`).
         S3_BUCKET => {
             attributes.insert("Arn".to_string(), format!("arn:{PARTITION}:s3:::{name}"));
             attributes.insert("DomainName".to_string(), format!("{name}.s3.{URL_SUFFIX}"));
+            attributes.insert(
+                "DualStackDomainName".to_string(),
+                format!("{name}.s3.dualstack.{region}.{URL_SUFFIX}"),
+            );
+            attributes.insert(
+                "RegionalDomainName".to_string(),
+                format!("{name}.s3.{region}.{URL_SUFFIX}"),
+            );
+            attributes.insert(
+                "WebsiteURL".to_string(),
+                format!("http://{name}.s3-website-{region}.{URL_SUFFIX}"),
+            );
             (name.to_string(), attributes)
+        }
+        // "Ref returns the distribution ID"; Fn::GetAtt: DomainName, Id. CloudFront
+        // ASSIGNS both — the type has no name property for a template to set — so a
+        // declaration reports identifiers of CLOUDFRONT's forms rather than
+        // CloudFormation's `<stack>-<logical id>-<unique id>` name (the case
+        // AWS::Transfer::Server and AWS::RUM::AppMonitor are in): an id is
+        // [`cloudfront_assigned_id`] and the domain name
+        // [`cloudfront_distribution_domain_name`].
+        CLOUDFRONT_DISTRIBUTION => {
+            let id = cloudfront_assigned_id(CLOUDFRONT_DISTRIBUTION_ID_SALT, name);
+            attributes.insert("Id".to_string(), id.clone());
+            attributes.insert(
+                "DomainName".to_string(),
+                cloudfront_distribution_domain_name(name),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the origin access control's unique identifier"; Fn::GetAtt: Id.
+        // Service-assigned in the same form a distribution id takes.
+        CLOUDFRONT_ORIGIN_ACCESS_CONTROL => {
+            let id = cloudfront_assigned_id(CLOUDFRONT_ORIGIN_ACCESS_CONTROL_ID_SALT, name);
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the CloudFront origin access identity"; Fn::GetAtt: Id,
+        // S3CanonicalUserId. The id is service-assigned in the form
+        // `CloudFrontOriginAccessIdentity$Id` documents ("for example, E74FTE3AJFJ256A"),
+        // and the canonical user id is the one S3 knows the identity by, in the
+        // [`S3_CANONICAL_USER_ID_HEX_CHARS`] lowercase hex characters S3 writes one in.
+        CLOUDFRONT_ORIGIN_ACCESS_IDENTITY => {
+            let id = cloudfront_assigned_id(CLOUDFRONT_ORIGIN_ACCESS_IDENTITY_ID_SALT, name);
+            attributes.insert("Id".to_string(), id.clone());
+            attributes.insert(
+                "S3CanonicalUserId".to_string(),
+                derived_digits(
+                    CLOUDFRONT_S3_CANONICAL_USER_ID_SALT,
+                    name,
+                    S3_CANONICAL_USER_ID_HEX_CHARS,
+                    Alphabet::Lower,
+                ),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the cache policy's unique identifier"; Fn::GetAtt: Id,
+        // LastModifiedTime. CloudFront identifies each of its three policy kinds by a
+        // UUID it mints, so that is what `Ref` and `Id` report. `LastModifiedTime` is NOT
+        // carried: it is the instant the policy was last changed, which this module has no
+        // value for, and an invented timestamp would be worse than no value.
+        CLOUDFRONT_CACHE_POLICY | CLOUDFRONT_ORIGIN_REQUEST_POLICY
+        | CLOUDFRONT_RESPONSE_HEADERS_POLICY => {
+            let id = generated_uuid(resource_type, name);
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the RestApi ID"; Fn::GetAtt: RestApiId, RootResourceId. API Gateway
+        // ASSIGNS both ids — a template names the API but not its identifier — in the form
+        // [`api_gateway_assigned_id`] describes, and the root resource is a resource of the
+        // API, so it carries an id of its own rather than the API's.
+        APIGATEWAY_REST_API => {
+            let id = api_gateway_assigned_id(APIGATEWAY_REST_API_ID_SALT, name);
+            attributes.insert("RestApiId".to_string(), id.clone());
+            attributes.insert(
+                "RootResourceId".to_string(),
+                api_gateway_assigned_id(APIGATEWAY_ROOT_RESOURCE_ID_SALT, name),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the resource ID"; Fn::GetAtt: ResourceId.
+        APIGATEWAY_RESOURCE => {
+            let id = api_gateway_assigned_id(APIGATEWAY_RESOURCE_ID_SALT, name);
+            attributes.insert("ResourceId".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the deployment ID"; Fn::GetAtt: DeploymentId.
+        APIGATEWAY_DEPLOYMENT => {
+            let id = api_gateway_assigned_id(APIGATEWAY_DEPLOYMENT_ID_SALT, name);
+            attributes.insert("DeploymentId".to_string(), id.clone());
+            (id, attributes)
         }
         // "Ref returns the table name"; Fn::GetAtt: Arn.
         "AWS::DynamoDB::Table" => {
@@ -2978,7 +3087,13 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
     match resource_type {
         "AWS::SNS::Topic" => &["TopicArn", "TopicName"],
         SQS_QUEUE => &["Arn", "QueueName", "QueueUrl"],
-        "AWS::S3::Bucket" => &["Arn", "DomainName"],
+        "AWS::S3::Bucket" => &[
+            "Arn",
+            "DomainName",
+            "DualStackDomainName",
+            "RegionalDomainName",
+            "WebsiteURL",
+        ],
         "AWS::DynamoDB::Table" => &["Arn"],
         "AWS::Lambda::Function" => &["Arn"],
         "AWS::Logs::LogGroup" => &["Arn"],
@@ -3022,6 +3137,14 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         "AWS::CloudWatch::Alarm" => &["Arn"],
         CLOUDWATCH_METRIC_STREAM => &["Arn"],
         FIS_EXPERIMENT_TEMPLATE => &["Id"],
+        CLOUDFRONT_DISTRIBUTION => &["DomainName", "Id"],
+        CLOUDFRONT_ORIGIN_ACCESS_CONTROL => &["Id"],
+        CLOUDFRONT_ORIGIN_ACCESS_IDENTITY => &["Id", "S3CanonicalUserId"],
+        CLOUDFRONT_CACHE_POLICY | CLOUDFRONT_ORIGIN_REQUEST_POLICY
+        | CLOUDFRONT_RESPONSE_HEADERS_POLICY => &["Id"],
+        APIGATEWAY_REST_API => &["RestApiId", "RootResourceId"],
+        APIGATEWAY_RESOURCE => &["ResourceId"],
+        APIGATEWAY_DEPLOYMENT => &["DeploymentId"],
         GUARDDUTY_DETECTOR => &["Id"],
         _ => &[],
     }
@@ -3164,6 +3287,101 @@ const FIS_TEMPLATE_ID_PREFIX: &str = "EXT";
 /// How many characters follow [`FIS_TEMPLATE_ID_PREFIX`] in an experiment-template id:
 /// FIS's own `ID_SUFFIX_LEN`, the width of the base-36 suffix every id it mints carries.
 const FIS_TEMPLATE_ID_DIGITS: usize = 12;
+
+/// The `AWS::CloudFront::Distribution` resource type: one CloudFront distribution.
+pub const CLOUDFRONT_DISTRIBUTION: &str = "AWS::CloudFront::Distribution";
+
+/// The `AWS::CloudFront::OriginAccessControl` resource type: the origin access control an
+/// origin is read through.
+pub const CLOUDFRONT_ORIGIN_ACCESS_CONTROL: &str = "AWS::CloudFront::OriginAccessControl";
+
+/// The `AWS::CloudFront::CloudFrontOriginAccessIdentity` resource type: the legacy origin
+/// access identity an Amazon S3 bucket policy names by canonical user id.
+pub const CLOUDFRONT_ORIGIN_ACCESS_IDENTITY: &str =
+    "AWS::CloudFront::CloudFrontOriginAccessIdentity";
+
+/// CloudFront's three policy resource types, each identified by a UUID CloudFront mints.
+pub const CLOUDFRONT_CACHE_POLICY: &str = "AWS::CloudFront::CachePolicy";
+pub const CLOUDFRONT_ORIGIN_REQUEST_POLICY: &str = "AWS::CloudFront::OriginRequestPolicy";
+pub const CLOUDFRONT_RESPONSE_HEADERS_POLICY: &str = "AWS::CloudFront::ResponseHeadersPolicy";
+
+/// The Amazon API Gateway resource types whose published `Ref` is a SERVICE-ASSIGNED id
+/// rather than a name a template states: a REST API, a resource of one, and a deployment
+/// of one.
+pub const APIGATEWAY_REST_API: &str = "AWS::ApiGateway::RestApi";
+pub const APIGATEWAY_RESOURCE: &str = "AWS::ApiGateway::Resource";
+pub const APIGATEWAY_DEPLOYMENT: &str = "AWS::ApiGateway::Deployment";
+
+/// How many characters follow the `E` of a CloudFront-assigned identifier.
+///
+/// CloudFront mints a distribution id, an origin access control id and an origin access
+/// identity id in one shape: `E` and 13 more characters — the form
+/// `CloudFrontOriginAccessIdentity$Id` documents by example ("for example,
+/// E74FTE3AJFJ256A") and the one this emulator's own CloudFront service mints an id in.
+const CLOUDFRONT_ID_BODY_LEN: usize = 13;
+
+/// How many characters an API-Gateway-assigned identifier carries: ten, the width of the
+/// `RestApi`, `Resource` and `Deployment` ids API Gateway mints (and the width this
+/// emulator's own API Gateway service mints one in).
+const APIGATEWAY_ID_LEN: usize = 10;
+
+/// How many lowercase hexadecimal characters an Amazon S3 canonical user id carries: 64,
+/// the width S3 writes one in (and the width this emulator's CloudFront service mints the
+/// canonical user id of an origin access identity in).
+const S3_CANONICAL_USER_ID_HEX_CHARS: usize = 64;
+
+/// The salts the identifiers above are derived under — one per identifier, so two ids of
+/// ONE resource are never the same digits (see [`derived_digits`]).
+const CLOUDFRONT_DISTRIBUTION_ID_SALT: &str = "cloudfront/distribution-id";
+const CLOUDFRONT_DISTRIBUTION_DOMAIN_SALT: &str = "cloudfront/distribution-domain-label";
+const CLOUDFRONT_ORIGIN_ACCESS_CONTROL_ID_SALT: &str = "cloudfront/origin-access-control-id";
+const CLOUDFRONT_ORIGIN_ACCESS_IDENTITY_ID_SALT: &str = "cloudfront/origin-access-identity-id";
+const CLOUDFRONT_S3_CANONICAL_USER_ID_SALT: &str = "cloudfront/s3-canonical-user-id";
+const APIGATEWAY_REST_API_ID_SALT: &str = "apigateway/rest-api-id";
+const APIGATEWAY_ROOT_RESOURCE_ID_SALT: &str = "apigateway/root-resource-id";
+const APIGATEWAY_RESOURCE_ID_SALT: &str = "apigateway/resource-id";
+const APIGATEWAY_DEPLOYMENT_ID_SALT: &str = "apigateway/deployment-id";
+
+/// An identifier of the shape CloudFront ASSIGNS one in: `E` followed by
+/// [`CLOUDFRONT_ID_BODY_LEN`] uppercase characters.
+///
+/// The characters are uppercase hexadecimal, a subset of the base-36 alphabet CloudFront
+/// mints from — a stand-in of the right shape, stable across reads for the reason
+/// [`derived_digits`] gives.
+fn cloudfront_assigned_id(salt: &str, name: &str) -> String {
+    format!(
+        "E{}",
+        derived_digits(salt, name, CLOUDFRONT_ID_BODY_LEN, Alphabet::Upper)
+    )
+}
+
+/// The domain name CloudFront serves a distribution on: `d<label>.cloudfront.net`.
+///
+/// `Distribution$DomainName` is "The domain name that corresponds to the distribution …
+/// such as d111111abcdef8.cloudfront.net" — a generated label under CloudFront's own
+/// `cloudfront.net` zone, in the lowercase a DNS label takes. It is a DIFFERENT value from
+/// the distribution's id, so it is derived under its own salt.
+fn cloudfront_distribution_domain_name(name: &str) -> String {
+    format!(
+        "d{}.{CLOUDFRONT_DOMAIN_SUFFIX}",
+        derived_digits(
+            CLOUDFRONT_DISTRIBUTION_DOMAIN_SALT,
+            name,
+            CLOUDFRONT_ID_BODY_LEN,
+            Alphabet::Lower,
+        )
+    )
+}
+
+/// The DNS zone CloudFront serves a distribution's own domain name under — not
+/// [`URL_SUFFIX`], which is where the AWS service endpoints live.
+const CLOUDFRONT_DOMAIN_SUFFIX: &str = "cloudfront.net";
+
+/// An identifier of the shape API Gateway ASSIGNS one in: [`APIGATEWAY_ID_LEN`] lowercase
+/// characters, drawn from the same derivation as every other identifier here.
+fn api_gateway_assigned_id(salt: &str, name: &str) -> String {
+    derived_digits(salt, name, APIGATEWAY_ID_LEN, Alphabet::Lower)
+}
 
 /// The revision a task definition registered for a family the account does not hold yet
 /// carries: "the first task definition that you registered to a family is given a revision

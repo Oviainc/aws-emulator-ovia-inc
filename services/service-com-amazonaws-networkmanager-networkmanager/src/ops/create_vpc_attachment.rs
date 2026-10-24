@@ -277,7 +277,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     input.options.as_ref(),
                                 )
                         }
-                        crate::state::AttachmentDetail::Connect { .. } => false,
+                        crate::state::AttachmentDetail::Connect { .. }
+                        | crate::state::AttachmentDetail::SiteToSiteVpn => false,
                     }
                     && crate::state::same_tags(
                         &existing.tags,

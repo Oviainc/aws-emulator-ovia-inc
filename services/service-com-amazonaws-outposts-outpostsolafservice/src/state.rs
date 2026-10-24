@@ -1250,44 +1250,77 @@ pub fn resource_arn_parts(arn: &str) -> Option<(String, String)> {
 /// Which Availability Zone identifiers a request addressed to a region may name.
 ///
 /// AWS names an Availability Zone in two ways, and both pin it to ONE region: the
-/// zone NAME is the region code plus a zone suffix (`us-east-1a`), while the zone
+/// zone NAME is the region code plus a zone letter (`us-east-1a`), while the zone
 /// ID is the region's abbreviation plus `-az<n>` (`us-east-1` -> `use1-az1`), which
-/// [`region_abbreviation`] derives from the region code itself. So a request
-/// addressed to one region cannot name a zone of another.
+/// [`region_abbreviation`] derives from the region code itself. So an identifier
+/// names a zone of a region only when it has one of those two forms FOR that
+/// region: a request addressed to one region cannot name a zone of another, and a
+/// value whose zone part names no zone at all — a name with no zone letter, an
+/// `az<n>` outside the indices this API numbers zones by — names no zone of any
+/// region.
 ///
-/// Whether `zone` is an Availability Zone NAME of `region`: the region code plus a
-/// suffix that is not itself more digits of a longer region code (so `us-east-1`
-/// does not claim `us-east-12a`).
+/// Whether `zone` is an Availability Zone NAME of `region`: exactly the region
+/// code, followed by a zone letter that names one of this region's zones (see
+/// [`zone_name_parts`], which also keeps `us-east-1` from claiming `us-east-12a`).
 pub fn zone_name_in_region(zone: &str, region: &str) -> bool {
-    zone.to_ascii_lowercase()
-        .strip_prefix(region)
-        .is_some_and(|suffix| {
-            !suffix.is_empty() && !suffix.starts_with(|character: char| character.is_ascii_digit())
-        })
+    zone_name_parts(zone).is_some_and(|(named, _)| named == region.to_ascii_lowercase())
 }
 
 /// Whether `zone_id` is an Availability Zone ID of `region`: the region's
-/// abbreviation followed by the zone's own part. A region
-/// [`region_abbreviation`] cannot abbreviate is a region no zone id can be judged
-/// against, so every id passes rather than being refused on a guess.
+/// abbreviation followed by an `az<n>` that names one of its zones. A region
+/// [`region_abbreviation`] cannot abbreviate is a region no zone id's REGION part
+/// can be judged against, so that part is taken on trust there rather than refused
+/// on a guess — the zone part is judged either way.
 pub fn zone_id_in_region(zone_id: &str, region: &str) -> bool {
-    match region_abbreviation(region) {
-        Some(abbreviation) => zone_id
-            .to_ascii_lowercase()
-            .strip_prefix(&abbreviation)
-            .is_some_and(|rest| rest.starts_with('-')),
-        None => true,
+    zone_id_parts(zone_id).is_some_and(|(abbreviation, _)| {
+        region_abbreviation(region).is_none_or(|expected| expected == abbreviation)
+    })
+}
+
+/// The `(region code, zone index)` an Availability Zone NAME names, or `None` when
+/// the value names no zone.
+///
+/// A zone name is a region code plus ONE zone letter, and the letters that name a
+/// zone are the ones [`zone_index`] pairs with an index this API can number a zone
+/// by — so a region code with no letter, or a letter past the last index, names no
+/// zone.
+fn zone_name_parts(zone: &str) -> Option<(String, u32)> {
+    if !zone.is_ascii() || zone.is_empty() {
+        return None;
     }
+    let zone = zone.to_ascii_lowercase();
+    let (region, letter) = zone.split_at(zone.len() - 1);
+    let index = zone_index(*letter.as_bytes().first()?)?;
+    Some((region.to_string(), index))
+}
+
+/// The `(region abbreviation, zone index)` an Availability Zone ID names, or `None`
+/// when the value names no zone.
+///
+/// A zone id is `<region abbreviation>-az<n>` with the zones of a region numbered
+/// from `az1`, so an index outside `1..=`[`MAX_ZONE_INDEX`] — `az0` above all —
+/// names no zone of any region.
+fn zone_id_parts(zone_id: &str) -> Option<(String, u32)> {
+    if !zone_id.is_ascii() {
+        return None;
+    }
+    let zone_id = zone_id.to_ascii_lowercase();
+    let (abbreviation, index) = zone_id.split_once("-az")?;
+    let index: u32 = index.parse().ok()?;
+    (1..=MAX_ZONE_INDEX)
+        .contains(&index)
+        .then(|| (abbreviation.to_string(), index))
 }
 
 /// Why the Availability Zone identifiers a request named are not usable in
-/// `region`, or `None` when every one of them belongs to it.
+/// `region`, or `None` when they name one zone of it.
 ///
-/// An Availability Zone belongs to exactly one region (see
-/// [`zone_name_in_region`]), so a request addressed to one region naming another
-/// region's zone describes a resource that cannot exist — a bad parameter, which
-/// this API answers as its `ValidationException` (400). AWS states that as
-/// `<the value as supplied> does not match your region.`
+/// An Availability Zone belongs to exactly one region and is one of the zones that
+/// region has (see [`zone_name_in_region`]), so a request naming a zone of another
+/// region, or an identifier that names no zone at all, describes a resource that
+/// cannot exist — a bad parameter, which this API answers as its
+/// `ValidationException` (400). AWS states a cross-region zone as `<the value as
+/// supplied> does not match your region.`
 ///
 /// A value that names THIS region and no zone within it is refused too, but it is
 /// not a cross-region mismatch, so it is not worded as one.
@@ -1295,7 +1328,11 @@ pub fn zone_id_in_region(zone_id: &str, region: &str) -> bool {
 /// The zone ID is reported first: it is the region-stable identifier of a zone (a
 /// zone NAME is per-account), so when a request names both and neither belongs to
 /// the region, the ID is the identifier the refusal names.
-pub fn availability_zone_region_refusal(
+///
+/// Both identities name ONE zone ("You can specify either an Availability one or an
+/// AZ ID"), so a request naming BOTH must name the same zone twice: see
+/// [`zone_pair_refusal`].
+pub fn availability_zone_refusal(
     region: &str,
     zone: Option<&str>,
     zone_id: Option<&str>,
@@ -1303,32 +1340,55 @@ pub fn availability_zone_region_refusal(
     zone_id
         .and_then(|zone_id| zone_id_refusal(zone_id, region))
         .or_else(|| zone.and_then(|zone| zone_name_refusal(zone, region)))
+        .or_else(|| zone_pair_refusal(zone, zone_id))
 }
 
 /// Why `zone` is not an Availability Zone name `region` can place a resource in,
 /// or `None` when it is one of its zones.
 fn zone_name_refusal(zone: &str, region: &str) -> Option<String> {
-    if zone_name_in_region(zone, region) {
-        return None;
+    match zone_name_parts(zone) {
+        // It names a zone, so the only thing left to refuse is the region it is in.
+        Some((named, _)) => (named != region.to_ascii_lowercase()).then(|| wrong_region(zone)),
+        // It names no zone at all, so there is no region for it to mismatch.
+        None => Some(names_no_zone(zone, region)),
     }
-    Some(match zone.eq_ignore_ascii_case(region) {
-        true => names_no_zone(zone, region),
-        false => wrong_region(zone),
-    })
 }
 
 /// Why `zone_id` is not an Availability Zone ID `region` can place a resource in,
 /// or `None` when it is one of its zones.
 fn zone_id_refusal(zone_id: &str, region: &str) -> Option<String> {
-    if zone_id_in_region(zone_id, region) {
-        return None;
+    match zone_id_parts(zone_id) {
+        Some((abbreviation, _)) => region_abbreviation(region)
+            .filter(|expected| *expected != abbreviation)
+            .map(|_| wrong_region(zone_id)),
+        None => Some(names_no_zone(zone_id, region)),
     }
-    let names_region = region_abbreviation(region)
-        .is_some_and(|abbreviation| zone_id.eq_ignore_ascii_case(&abbreviation));
-    Some(match names_region {
-        true => names_no_zone(zone_id, region),
-        false => wrong_region(zone_id),
-    })
+}
+
+/// Why the two Availability Zone identities a request named do not name the same
+/// zone, or `None` when they do — or when the request named at most one of them,
+/// which names one zone by itself.
+///
+/// A zone's name and its id are one zone's two identities (a 1:1 mapping, which
+/// this service fixes as the [`zone_index`] bijection and resolves the missing
+/// identity with), so a pair the mapping does not pair describes a zone that cannot
+/// exist. Either direction is enough to pair them, so a pair one direction cannot
+/// map is still confirmed by the other. A pair NEITHER direction can map — both
+/// identities in a region whose code carries no zone-ID abbreviation — is a pair
+/// this service cannot read as two zones either, so it is taken on trust exactly as
+/// the region part of such an id is ([`zone_id_in_region`]).
+fn zone_pair_refusal(zone: Option<&str>, zone_id: Option<&str>) -> Option<String> {
+    let (zone, zone_id) = (zone?, zone_id?);
+    let named_id = availability_zone_id(zone);
+    let identified_zone = availability_zone(zone_id);
+    let same_zone = named_id
+        .as_deref()
+        .is_some_and(|resolved| resolved.eq_ignore_ascii_case(zone_id))
+        || identified_zone
+            .as_deref()
+            .is_some_and(|resolved| resolved.eq_ignore_ascii_case(zone));
+    let mapped = named_id.is_some() || identified_zone.is_some();
+    (mapped && !same_zone).then(|| two_zones(zone, zone_id))
 }
 
 /// How this API words a zone of another region, as the recorded response does:
@@ -1342,6 +1402,12 @@ fn wrong_region(value: &str) -> String {
 /// stated separately, because calling it a region mismatch would be wrong.
 fn names_no_zone(value: &str, region: &str) -> String {
     format!("{value} is not an Availability Zone of {region}.")
+}
+
+/// How this service words a pair of identities that name two zones: both values as
+/// supplied, since either of them could be the one the caller meant.
+fn two_zones(zone: &str, zone_id: &str) -> String {
+    format!("{zone} and {zone_id} do not name the same Availability Zone.")
 }
 
 /// The `Site` projection of an operating address: the three members `Site`
@@ -1489,23 +1555,19 @@ fn zone_letter(index: u32) -> Option<char> {
 /// (`us-west-2b` -> `usw2-az2`), or `None` when the name carries no region and zone
 /// letter to resolve one from.
 pub fn availability_zone_id(zone: &str) -> Option<String> {
-    if !zone.is_ascii() || zone.is_empty() {
-        return None;
-    }
-    let (region, letter) = zone.split_at(zone.len() - 1);
-    let index = zone_index(*letter.as_bytes().first()?)?;
-    Some(format!("{}-az{index}", region_abbreviation(region)?))
+    let (region, index) = zone_name_parts(zone)?;
+    Some(format!("{}-az{index}", region_abbreviation(&region)?))
 }
 
 /// The `AvailabilityZone` name of the zone an `AvailabilityZoneId` names
 /// (`usw2-az2` -> `us-west-2b`): the inverse of [`availability_zone_id`].
 pub fn availability_zone(zone_id: &str) -> Option<String> {
-    if !zone_id.is_ascii() {
-        return None;
-    }
-    let (abbreviation, index) = zone_id.split_once("-az")?;
-    let letter = zone_letter(index.parse().ok()?)?;
-    Some(format!("{}{letter}", region_from_abbreviation(abbreviation)?))
+    let (abbreviation, index) = zone_id_parts(zone_id)?;
+    let letter = zone_letter(index)?;
+    Some(format!(
+        "{}{letter}",
+        region_from_abbreviation(&abbreviation)?
+    ))
 }
 
 /// A string member the caller may have sent as the empty string, which carries no

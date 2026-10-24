@@ -1234,6 +1234,7 @@ async fn max_results_pages_over_reservations() {
                  reservations, got {}",
                 ids.len()
             );
+            let held = ids.len();
             seen.extend(ids);
             pages += 1;
             assert!(
@@ -1241,6 +1242,19 @@ async fn max_results_pages_over_reservations() {
                 "case page size {page_size}: paging did not terminate after {pages} pages"
             );
             token = answer.next_token();
+            // The token means "resume AFTER what I just gave you", and this operation
+            // answers one while a further reservation follows the page.
+            let due = seen.len() < launched.len();
+            assert_eq!(
+                token.is_some(),
+                due,
+                "case page size {page_size}: page {pages} reported {held} of at most \
+                 {page_size} reservations, {seen} of {all} in all, so a token \
+                 {expectation}; got {token:?}",
+                seen = seen.len(),
+                all = launched.len(),
+                expectation = if due { "is due" } else { "is not due" }
+            );
             if token.is_none() {
                 break;
             }

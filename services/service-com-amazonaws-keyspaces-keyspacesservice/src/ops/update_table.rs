@@ -517,6 +517,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             schema.all_columns.extend(added);
         }
+        // Whether this update leaves the table with no provisioned capacity to scale, so
+        // the scalable targets its capacities were scaled on are retired below.
+        let mut leaves_provisioned_mode = false;
         if let Some(capacity) = capacity_specification {
             // "The timestamp of the last operation that changed the provisioned
             // throughput capacity of a table": the summary member is named for a move TO
@@ -533,6 +536,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 && capacity.throughput_mode == crate::state::PAY_PER_REQUEST_THROUGHPUT_MODE
             {
                 table.last_update_to_pay_per_request = Some(now);
+            }
+            // Auto scaling is "the optional auto scaling settings for a table in
+            // provisioned capacity mode", so a table moved OUT of that mode has no
+            // provisioned throughput for a policy to move and therefore no auto scaling
+            // settings at all: the settings go, here and in Application Auto Scaling.
+            leaves_provisioned_mode =
+                capacity.throughput_mode != crate::state::PROVISIONED_THROUGHPUT_MODE;
+            if leaves_provisioned_mode {
+                table.auto_scaling_specification = None;
             }
             table.capacity_specification = Some(capacity);
         }
@@ -557,7 +569,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(client_side_timestamps) = input.client_side_timestamps {
             table.client_side_timestamps = Some(client_side_timestamps);
         }
-        if let Some(supplied) = auto_scaling_specification {
+        if let Some(supplied) = auto_scaling_specification.as_ref() {
             // "If auto scaling is already enabled for the table, you can use UpdateTable to
             // update the minimum and maximum values or the auto scaling policy settings
             // independently": the two capacities are configured independently of each
@@ -566,10 +578,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let stored = table
                 .auto_scaling_specification
                 .get_or_insert_with(AutoScalingSpecification::default);
-            if let Some(read) = supplied.read_capacity_auto_scaling {
+            if let Some(read) = supplied.read_capacity_auto_scaling.clone() {
                 stored.read_capacity_auto_scaling = Some(read);
             }
-            if let Some(write) = supplied.write_capacity_auto_scaling {
+            if let Some(write) = supplied.write_capacity_auto_scaling.clone() {
                 stored.write_capacity_auto_scaling = Some(write);
             }
         }
@@ -586,6 +598,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         table.status_due_at = Some(settles_at);
         let resource_arn = table.resource_arn.clone();
         store.note_transition_due(settles_at);
+        drop(store);
+
+        // An update that changes a capacity's auto scaling settings re-registers — or,
+        // when it turns auto scaling off for that capacity, deregisters — that capacity's
+        // scalable target and its target-tracking policy in Application Auto Scaling,
+        // where a table's auto scaling settings live. Done with this service's store lock
+        // released, so no request holds two service stores at once.
+        if let Some(specification) = auto_scaling_specification.as_ref() {
+            crate::state::publish_auto_scaling(
+                &*self.engine,
+                &region,
+                &input.keyspace_name,
+                &input.table_name,
+                specification,
+            );
+        }
+        if leaves_provisioned_mode {
+            crate::state::retire_auto_scaling(
+                &*self.engine,
+                &region,
+                &input.keyspace_name,
+                &input.table_name,
+            );
+        }
 
         Ok(UpdateTableOutput { resource_arn })
     }

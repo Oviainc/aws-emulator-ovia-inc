@@ -198,6 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // Materialise the completion the clock already owes this account before
+        // its update record is replaced: an accepted update whose completion
+        // came due has already made its address the account's primary email,
+        // and starting another update must not lose that.
+        account.settle_primary_email_update(now);
         // The account carries its MOST RECENT update, so starting another one
         // replaces the record rather than adding a second: a restarted update is
         // the one a status read reports, with its own `UpdatedAt`.

@@ -176,11 +176,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The DeleteKeyspace operation deletes a keyspace and all of its tables." The
         // tables are held INSIDE the keyspace record, so removing it removes them with
         // it and no table can outlive its keyspace in state.
-        if store.keyspaces.remove(&input.keyspace_name).is_none() {
+        let Some(removed) = store.keyspaces.remove(&input.keyspace_name) else {
             return Err(DeleteKeyspaceErrorModeled::ResourceNotFoundException(
                 crate::state::keyspace_not_found(&region, &input.keyspace_name),
             )
             .into());
+        };
+        let deleted_tables: Vec<String> = removed.tables.keys().cloned().collect();
+        drop(store);
+
+        // Every table deleted with the keyspace takes its capacities with it, so the
+        // scalable targets they were scaled on are retired in Application Auto Scaling,
+        // exactly as deleting each table on its own would. Done with this service's store
+        // lock released, so no request holds two service stores at once.
+        for table_name in &deleted_tables {
+            crate::state::retire_auto_scaling(
+                &*self.engine,
+                &region,
+                &input.keyspace_name,
+                table_name,
+            );
         }
 
         Ok(DeleteKeyspaceOutput {})

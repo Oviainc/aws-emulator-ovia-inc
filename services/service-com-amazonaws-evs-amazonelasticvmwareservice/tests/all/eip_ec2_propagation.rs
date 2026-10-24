@@ -40,7 +40,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::environment_lifecycle::{call_in_region, error_type};
+use crate::environment_lifecycle::{call_in_region, error_type, PAST_THE_TRANSITION};
 use crate::vlan_subnet_propagation::{call_ec2, element, elements, emulator};
 
 /// The ten `InitialVlans` members, in the order the model declares them.
@@ -146,6 +146,11 @@ async fn create_environment(
         .as_str()
         .unwrap_or_else(|| panic!("case {name:?}: no environmentId in {body}"))
         .to_string();
+    // Wait out the transition the clock owes the new environment: it is CREATING — still
+    // initializing — until then, and a list addressed to an environment in that state is
+    // refused (`tests/all/list_while_initializing.rs`), while every row below reads the
+    // HCX VLAN back through `ListEnvironmentVlans`.
+    std::thread::sleep(PAST_THE_TRANSITION);
     Environment {
         network,
         environment_id,

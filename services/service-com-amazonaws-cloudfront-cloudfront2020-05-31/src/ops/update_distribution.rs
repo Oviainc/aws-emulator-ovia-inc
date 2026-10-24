@@ -432,6 +432,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The same rule the create path applies: an alternate domain name is served only
+        // under a certificate that validates it, so an update cannot leave a distribution
+        // carrying an alias its viewer certificate does not cover either.
+        if let Some(message) = crate::state::alias_certificate_mismatch(&input.distribution_config)
+        {
+            return Err(UpdateDistributionErrorModeled::InvalidViewerCertificate(
+                InvalidViewerCertificate {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // A distribution's caller reference identifies it for its whole life, so an
         // update that renames it is not a modification CloudFront allows.
         if input.distribution_config.caller_reference != current_caller_reference {

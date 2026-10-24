@@ -3,11 +3,11 @@
 //! Engine state for the com-amazonaws-route53resolver-route53resolver service.
 //!
 //! Besides the state struct this module owns the small pieces the Resolver
-//! endpoint and Resolver rule operations share, so no two handlers grow their
-//! own copy: id minting, the RFC 3339 clock read, the clock-owed status
-//! transition, the opaque pagination cursor the two `@paginated` list
-//! operations mint and verify, the record -> modelled-shape projections, and
-//! the exception bodies the operations report a missing resource with.
+//! endpoint, Resolver rule and Resolver-on-Outpost operations share, so no two
+//! handlers grow their own copy: id minting, the RFC 3339 clock read, the
+//! clock-owed status transition, the opaque pagination cursor the `@paginated`
+//! list operations mint and verify, the record -> modelled-shape projections,
+//! and the exception bodies the operations report a missing resource with.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    IpAddressResponse, ResolverEndpoint, ResolverRule, ResolverRuleAssociation,
+    IpAddressResponse, OutpostResolver, ResolverEndpoint, ResolverRule, ResolverRuleAssociation,
     ResourceNotFoundException, Tag, TargetAddress,
 };
 
@@ -34,6 +34,26 @@ pub const ENDPOINT_STATUS_CREATING: &str = "CREATING";
 pub const ENDPOINT_STATUS_OPERATIONAL: &str = "OPERATIONAL";
 pub const ENDPOINT_STATUS_UPDATING: &str = "UPDATING";
 pub const ENDPOINT_STATUS_DELETING: &str = "DELETING";
+
+/// `OutpostResolverStatus` values the Resolver-on-Outpost slice reports. The
+/// model's enum (`smithy_query(query="shape",shape="OutpostResolverStatus")`,
+/// re-exported as [`crate::ops::types::OUTPOST_RESOLVER_STATUS_VALUES`]) also
+/// carries `ACTION_NEEDED`, `FAILED_CREATION` and `FAILED_DELETION`, which
+/// describe provisioning failures the emulator never produces.
+pub const OUTPOST_RESOLVER_STATUS_CREATING: &str = "CREATING";
+pub const OUTPOST_RESOLVER_STATUS_OPERATIONAL: &str = "OPERATIONAL";
+pub const OUTPOST_RESOLVER_STATUS_UPDATING: &str = "UPDATING";
+pub const OUTPOST_RESOLVER_STATUS_DELETING: &str = "DELETING";
+
+/// The `InstanceCount` a Resolver on an Outpost is created with when the
+/// request names none, and the smallest one it may be created or updated with.
+///
+/// `CreateOutpostResolver`'s `InstanceCount` doc: "Number of Amazon EC2
+/// instances for the Resolver on Outpost. The default and minimal value is 4."
+/// The model puts no `range` on `InstanceCount`, so the minimum is enforced by
+/// the handlers, which refuse a smaller count with the `ValidationException`
+/// both operations model.
+pub const OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT: i32 = 4;
 
 /// `IpAddressStatus` values this slice reports, out of the model's enum
 /// (`smithy_query(query="shape",shape="IpAddressStatus")`); the rest describe
@@ -110,6 +130,17 @@ pub const MAX_FILTERS: usize = 10;
 /// See [`MAX_FILTERS`].
 pub const MAX_FILTER_VALUES: usize = 100;
 
+/// The most Resolvers on Outposts this store holds, for the same reason as
+/// [`MAX_STORED_ENDPOINTS`]: `CreateOutpostResolver` admits any new
+/// `CreatorRequestId`, so without a bound a caller looping creates grows one
+/// emulator process without limit. A create past this count is REFUSED by
+/// [`ComAmazonawsRoute53resolverRoute53resolverState::can_store_another_outpost_resolver`]
+/// with the `ServiceQuotaExceededException` that operation models ("Fulfilling
+/// the request would cause one or more quotas to be exceeded"); a retry of a
+/// `CreatorRequestId` already stored stays allowed, because it allocates no new
+/// record, and a delete frees a slot.
+pub const MAX_STORED_OUTPOST_RESOLVERS: usize = 1_000;
+
 /// The most `SecurityGroupIds` one endpoint may be created with.
 ///
 /// The model constrains the list's length no more than it does `Filters`, and a
@@ -142,6 +173,11 @@ pub const RSLVR_CODE_ENDPOINT_NOT_FOUND: &str = "RSLVR-00501";
 /// `ResourceNotFoundException$ResourceType`, "the type of resource that doesn't
 /// exist": the modelled shape name of a Resolver endpoint.
 pub const RESOURCE_TYPE_RESOLVER_ENDPOINT: &str = "ResolverEndpoint";
+
+/// `ResourceNotFoundException$ResourceType` for a Resolver on an Outpost: the
+/// modelled shape name of the resource, as for
+/// [`RESOURCE_TYPE_RESOLVER_ENDPOINT`].
+pub const RESOURCE_TYPE_OUTPOST_RESOLVER: &str = "OutpostResolver";
 
 /// The same, for a Resolver rule and for one rule-to-VPC association.
 pub const RESOURCE_TYPE_RESOLVER_RULE: &str = "ResolverRule";
@@ -216,6 +252,25 @@ pub fn resolver_endpoint_not_found(resolver_endpoint_id: &str) -> ResourceNotFou
             &format!(r#"Resolver endpoint with ID "{resolver_endpoint_id}" does not exist"#),
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_ENDPOINT.to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` every Resolver-on-Outpost operation answers
+/// for an id it holds no Resolver under, built here so `GetOutpostResolver`,
+/// `UpdateOutpostResolver` and `DeleteOutpostResolver` cannot drift apart.
+///
+/// Unlike [`resolver_endpoint_not_found`] the sentence carries no `RSLVR-nnnnn`
+/// code: that code comes from the recorded responses of the endpoint
+/// operations, and no recording supplies one for a missing Resolver on an
+/// Outpost, so none is invented here. The wire error code clients match on is
+/// the shape name, `ResourceNotFoundException`, and the modelled
+/// `ResourceType` says which resource was missing.
+pub fn outpost_resolver_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            r#"Resolver on Outpost with ID "{id}" does not exist."#
+        )),
+        resource_type: Some(RESOURCE_TYPE_OUTPOST_RESOLVER.to_string()),
     }
 }
 
@@ -460,6 +515,64 @@ impl FilterKey {
     }
 }
 
+/// A Resolver on an Outpost, as stored.
+#[derive(Debug, Clone)]
+pub struct OutpostResolverRecord {
+    /// Position in the store's creation order, from
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::id_seq`]. It is the
+    /// list order and the source of the minted id.
+    pub seq: u64,
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub creator_request_id: String,
+    pub instance_count: i32,
+    pub preferred_instance_type: String,
+    pub outpost_arn: String,
+    /// The transient `OutpostResolverStatus` reported until [`Self::ready_at`]
+    /// falls due (`CREATING` after a create, `UPDATING` after an update).
+    pub status: String,
+    pub status_message: Option<String>,
+    /// `CreateOutpostResolver$Tags`, kept with the record so it is not silently
+    /// discarded. `OutpostResolver` models no `Tags` member, so no response
+    /// reports them yet: `ListTagsForResource` is still a scaffold stub.
+    pub tags: Vec<Tag>,
+    pub creation_time: String,
+    pub modification_time: String,
+    /// The instant at which the move to `OPERATIONAL` is owed.
+    pub ready_at: Instant,
+}
+
+impl OutpostResolverRecord {
+    /// This Resolver's `OutpostResolverStatus` as of `now`: the transient
+    /// status until the transition the clock owes falls due, `OPERATIONAL`
+    /// after it.
+    pub fn status_at(&self, now: Instant) -> &str {
+        if now < self.ready_at {
+            &self.status
+        } else {
+            OUTPOST_RESOLVER_STATUS_OPERATIONAL
+        }
+    }
+
+    /// Project the record onto the modelled `OutpostResolver`.
+    pub fn to_outpost_resolver(&self, now: Instant) -> OutpostResolver {
+        OutpostResolver {
+            arn: Some(self.arn.clone()),
+            creation_time: Some(self.creation_time.clone()),
+            modification_time: Some(self.modification_time.clone()),
+            creator_request_id: Some(self.creator_request_id.clone()),
+            id: Some(self.id.clone()),
+            instance_count: Some(self.instance_count),
+            preferred_instance_type: Some(self.preferred_instance_type.clone()),
+            name: Some(self.name.clone()),
+            status: Some(self.status_at(now).to_string()),
+            status_message: self.status_message.clone(),
+            outpost_arn: Some(self.outpost_arn.clone()),
+        }
+    }
+}
+
 /// A Resolver rule, as stored.
 #[derive(Debug, Clone)]
 pub struct ResolverRuleRecord {
@@ -567,6 +680,14 @@ pub struct ComAmazonawsRoute53resolverRoute53resolverState {
     /// `CreatorRequestId` resolves to the endpoint it already made instead of a
     /// duplicate.
     pub creator_request_id_index: HashMap<String, String>,
+    /// Every stored Resolver on an Outpost, keyed by its `Id`.
+    pub outpost_resolvers: HashMap<String, OutpostResolverRecord>,
+    /// `CreatorRequestId` -> Resolver-on-Outpost id, the same retry index as
+    /// [`Self::creator_request_id_index`] for the other resource. Kept separate
+    /// because a `CreatorRequestId` identifies a request to ONE operation: the
+    /// same string used for an endpoint and for a Resolver on an Outpost names
+    /// two different resources.
+    pub outpost_resolver_creator_request_ids: HashMap<String, String>,
     /// Every stored Resolver rule, keyed by its `Id`.
     pub resolver_rules: HashMap<String, ResolverRuleRecord>,
     /// `CreatorRequestId` -> rule id, so a retried create with the same
@@ -575,8 +696,9 @@ pub struct ComAmazonawsRoute53resolverRoute53resolverState {
     pub rule_creator_request_id_index: HashMap<String, String>,
     /// Every stored rule-to-VPC association, keyed by its `Id`.
     pub resolver_rule_associations: HashMap<String, ResolverRuleAssociationRecord>,
-    /// Monotonic counter behind every minted id (endpoint, IP, rule,
-    /// association), so ids are reproducible within a run and never collide.
+    /// Monotonic counter behind every minted id (endpoint, IP, Resolver on an
+    /// Outpost, rule, association), so ids are reproducible within a run and
+    /// never collide — across resources as well as within one.
     pub id_seq: u64,
 }
 
@@ -627,6 +749,21 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
     /// operation's pages and its cursor are defined over.
     pub fn endpoints_in_creation_order(&self) -> Vec<&ResolverEndpointRecord> {
         let mut all: Vec<&ResolverEndpointRecord> = self.resolver_endpoints.values().collect();
+        all.sort_by_key(|record| record.seq);
+        all
+    }
+
+    /// Whether one more Resolver on an Outpost may be stored, i.e. the store is
+    /// still below [`MAX_STORED_OUTPOST_RESOLVERS`]. A create that this refuses
+    /// answers `ServiceQuotaExceededException` and writes nothing.
+    pub fn can_store_another_outpost_resolver(&self) -> bool {
+        self.outpost_resolvers.len() < MAX_STORED_OUTPOST_RESOLVERS
+    }
+
+    /// Every stored Resolver on an Outpost in creation order — the order
+    /// `ListOutpostResolvers`' pages and its cursor are defined over.
+    pub fn outpost_resolvers_in_creation_order(&self) -> Vec<&OutpostResolverRecord> {
+        let mut all: Vec<&OutpostResolverRecord> = self.outpost_resolvers.values().collect();
         all.sort_by_key(|record| record.seq);
         all
     }
@@ -688,6 +825,16 @@ pub fn mint_endpoint_id(direction: &str, seq: u64) -> String {
 /// Resolver network interface `rni-<hex>`.
 pub fn mint_ip_id(seq: u64) -> String {
     format!("rni-{:016x}", scramble(seq))
+}
+
+/// Mint the `Id` of a Resolver on an Outpost from the id sequence.
+///
+/// The model constrains `ResourceId` only to length 1..64, so the shape is
+/// taken from [`mint_endpoint_id`]'s `rslvr-<infix>-<hex>` with the Outpost
+/// infix: an id is therefore recognisable as this resource's and fits
+/// `ResourceId`.
+pub fn mint_outpost_resolver_id(seq: u64) -> String {
+    format!("rslvr-op-{:016x}", scramble(seq))
 }
 
 /// Mint the `Id` of a Resolver rule from the id sequence. AWS names a Resolver
@@ -759,6 +906,25 @@ pub fn endpoint_list_scope(filters: &[(FilterKey, HashSet<String>)]) -> String {
     }
     format!(
         "ListResolverEndpoints/{}",
+        hex::encode(&hasher.finalize()[..8])
+    )
+}
+
+/// The cursor scope of one `ListOutpostResolvers` query.
+///
+/// The offset a cursor carries is an index into the collection the query
+/// selects, which `OutpostArn` narrows, so — exactly as for
+/// [`endpoint_list_scope`] — resuming with a different `OutpostArn` (or with
+/// none) is answered as an unknown cursor rather than with a page cut at the
+/// wrong position.
+pub fn outpost_resolver_list_scope(outpost_arn: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ListOutpostResolvers/outpost-arn/v1");
+    if let Some(outpost_arn) = outpost_arn {
+        feed_field(&mut hasher, outpost_arn.as_bytes());
+    }
+    format!(
+        "ListOutpostResolvers/{}",
         hex::encode(&hasher.finalize()[..8])
     )
 }

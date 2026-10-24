@@ -1687,6 +1687,20 @@ pub struct ComAmazonawsEc2Amazonec2State {
         String,
         crate::ops::types::LocalGatewayRouteTableVirtualInterfaceGroupAssociation,
     >,
+    /// Every local gateway route table the account holds, by `LocalGatewayRoutetableId`,
+    /// with the routes IN that table held on the record beside the modelled
+    /// [`crate::ops::types::LocalGatewayRouteTable`] shape
+    /// ([`LocalGatewayRouteTableRecord`]) — a route is reached only THROUGH the table it
+    /// belongs to, so one map holds both and no second store can disagree about which
+    /// table a route is in. Ordered by id, the stable order a report of the tables pages
+    /// over.
+    ///
+    /// Starts EMPTY, for the reason the association store above it does: a local gateway
+    /// and its route tables exist only on an Outpost, which no EC2 call creates, so an
+    /// account without one holds no route table and therefore no local gateway route.
+    /// [`Self::insert_local_gateway_route_table`] is the one way a table is stored and
+    /// [`Self::insert_local_gateway_route`] the one way a route is.
+    pub local_gateway_route_tables: BTreeMap<String, LocalGatewayRouteTableRecord>,
     /// Every local gateway virtual interface group the account holds, by
     /// `LocalGatewayVirtualInterfaceGroupId`, as the modelled
     /// [`crate::ops::types::LocalGatewayVirtualInterfaceGroup`] shape itself — so a member
@@ -1744,10 +1758,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// that have one.
     ///
     /// The subnet counterpart of [`Self::vpc_available_at`], for the same reason and on the
-    /// same clock: `CreateSubnet` answers a subnet in the non-terminal `pending` state, so
-    /// the clock owes it `available` [`TRANSITION_DELAY`] later whether or not anybody
-    /// calls again. A subnet AWS hands over ready — a default VPC's default subnets — never
-    /// has an entry here.
+    /// same clock, for a WRITER that hands a subnet over in the non-terminal `pending`
+    /// state: the clock then owes it `available` [`TRANSITION_DELAY`] later whether or not
+    /// anybody calls again. A subnet AWS hands over ready has no entry here, which is every
+    /// subnet EC2 itself mints — `CreateSubnet` is synchronous and answers `available`, and
+    /// a default VPC's default subnets are ready too; the entries are the VLAN subnets
+    /// Amazon EVS provisions into this account as part of an environment it is still
+    /// building.
     pub subnet_available_at: BTreeMap<String, Instant>,
     /// Every Verified Access trust provider the account holds, by
     /// `VerifiedAccessTrustProviderId`, as the modelled
@@ -2236,6 +2253,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             verified_access_trust_providers: BTreeMap::new(),
             verified_access_trust_provider_client_tokens: HashMap::new(),
             local_gateway_route_table_virtual_interface_group_associations: BTreeMap::new(),
+            // A local gateway route table lives on an Outpost, which no EC2 call creates.
+            local_gateway_route_tables: BTreeMap::new(),
             local_gateway_virtual_interface_groups: BTreeMap::new(),
             // A fresh account has bought nothing, so it holds no Reserved Instances.
             reserved_instances: BTreeMap::new(),
@@ -3897,8 +3916,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// instant whether or not anybody asked, so materialising it changes nothing
     /// a later caller would otherwise have seen. It covers every resource kind that
     /// has one — an instance's next state, a `pending` VPC becoming `available` with
-    /// its IPv6 association moving `associating` -> `associated`, a `pending` subnet
-    /// becoming `available`, a `pending` transit gateway with the route tables that come up
+    /// its IPv6 association moving `associating` -> `associated`, a subnet another service
+    /// handed over `pending` becoming `available`, a `pending` transit
+    /// gateway with the route tables that come up
     /// with it, a `pending` route server endpoint or route server peer becoming
     /// `available` (a route server's own two states are derived on read by
     /// [`RouteServerRecord::view_at`] instead), a VPC BPA exclusion reaching
@@ -7439,6 +7459,525 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 // =============================================================================
+// Local gateway route tables and the routes in them
+// =============================================================================
+
+/// The `ResourceType` enum member a local gateway route table is tagged and named under:
+/// `local-gateway-route-table` (`smithy_query(query="shape",shape="ResourceType")`), which
+/// is also the resource path [`local_gateway_route_table_arn`] builds its ARNs under. The
+/// resource's one spelling, so the refusals that name it cannot drift from it.
+pub const RESOURCE_TYPE_LOCAL_GATEWAY_ROUTE_TABLE: &str = "local-gateway-route-table";
+
+/// The id prefix EC2 mints a local gateway route table with: `lgw-rtb-`, as the AWS
+/// Outposts and EC2 documentation's own ids read (for example
+/// `lgw-rtb-059615ef7dEXAMPLE`) and as the recorded wire corpus behind
+/// `issues/…-ec2-createlocalgatewayroute-stub.md` shows — `lgw-rtb-0123456789abcdef0` is
+/// answered with the route table's `.NotFound`, where `lgwrtb-00000000000000000` (the same
+/// digits under a prefix that is not this one) is answered with its `.Malformed` before any
+/// lookup. The model puts no pattern on `LocalGatewayRoutetableId`, so the prefix is the
+/// one thing that says which resource an id names.
+pub const LOCAL_GATEWAY_ROUTE_TABLE_ID_PREFIX: &str = "lgw-rtb";
+
+/// The id prefix a managed or Amazon-published prefix list carries: `pl-`, the form
+/// `PrefixListResourceId` values take (`service_prefix_list_id` in
+/// `crate::ops::describe_prefix_lists` mints exactly it). The model puts no pattern on
+/// that shape, so the prefix is what says a value names a prefix list at all.
+pub const PREFIX_LIST_ID_PREFIX: &str = "pl";
+
+/// How many local gateway route tables this emulator stores before a write must refuse.
+///
+/// CHOSEN, like [`MAX_LOCAL_GATEWAY_VIF_GROUPS`] and for the same reason: nothing in this
+/// emulator reclaims a stored route table, so the store needs a ceiling that is not the
+/// process's memory.
+pub const MAX_LOCAL_GATEWAY_ROUTE_TABLES: usize = 4096;
+
+/// How many routes this emulator stores in ONE local gateway route table before a write
+/// must refuse.
+///
+/// CHOSEN, for the reason [`MAX_LOCAL_GATEWAY_ROUTE_TABLES`] is: AWS publishes a quota for
+/// the routes a local gateway route table holds, but not in anything the model or a
+/// request carries, so this is a ceiling of this emulator's own rather than that quota.
+pub const MAX_LOCAL_GATEWAY_ROUTES_PER_TABLE: usize = 1000;
+
+/// A route "pending" insertion into the local gateway route table: the
+/// `LocalGatewayRouteState` enum's `pending` member.
+pub const LOCAL_GATEWAY_ROUTE_STATE_PENDING: &str = "pending";
+
+/// A route that is carrying traffic: the `LocalGatewayRouteState` enum's `active` member.
+pub const LOCAL_GATEWAY_ROUTE_STATE_ACTIVE: &str = "active";
+
+/// A route whose target is gone, so traffic matching it is dropped: the
+/// `LocalGatewayRouteState` enum's `blackhole` member.
+pub const LOCAL_GATEWAY_ROUTE_STATE_BLACKHOLE: &str = "blackhole";
+
+/// A route that has been deleted: the `LocalGatewayRouteState` enum's `deleted` member,
+/// the TERMINAL state `DeleteLocalGatewayRoute` answers the route it removed in. The
+/// catalog's `deleting` has no constant here because nothing writes it: this emulator owes
+/// the clock no move after a delete, since the state AWS hands back from that call is
+/// already terminal — the operation that needs `deleting` is the one that introduces a
+/// deletion this service reports as under way.
+pub const LOCAL_GATEWAY_ROUTE_STATE_DELETED: &str = "deleted";
+
+/// A route a caller created: the `LocalGatewayRouteType` enum's `static` member, the type
+/// "Creates a static route for the specified local gateway route table"
+/// (`CreateLocalGatewayRoute`) writes.
+pub const LOCAL_GATEWAY_ROUTE_TYPE_STATIC: &str = "static";
+
+/// A route the local gateway learned rather than a caller created: the
+/// `LocalGatewayRouteType` enum's `propagated` member.
+pub const LOCAL_GATEWAY_ROUTE_TYPE_PROPAGATED: &str = "propagated";
+
+/// `InvalidLocalGatewayRouteTableID.Malformed` (HTTP 400): the request named something
+/// that is not a local gateway route table id at all, so there is nothing to look up. The
+/// code AWS answers, as the recorded wire corpus behind
+/// `issues/…-ec2-deletelocalgatewayroute-stub.md` shows.
+pub const INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_MALFORMED: &str =
+    "InvalidLocalGatewayRouteTableID.Malformed";
+
+/// `InvalidLocalGatewayRouteTableID.NotFound` (HTTP 400): the request named a well-formed
+/// local gateway route table id this account holds no route table for. The code AWS
+/// answers, as the recorded wire corpus behind
+/// `issues/…-ec2-createlocalgatewayroute-stub.md` shows.
+pub const INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_NOT_FOUND: &str =
+    "InvalidLocalGatewayRouteTableID.NotFound";
+
+/// `InvalidRoute.NotFound` (HTTP 400): the route table exists, but it holds no route for
+/// the destination the request named. EC2's own code for a route it cannot resolve in a
+/// route table ("InvalidRoute.NotFound — The specified route does not exist", EC2 API
+/// error codes), which is a different answer from the route TABLE's `.NotFound` above, so
+/// a client can tell "no such route table" from "no such route in it".
+pub const INVALID_ROUTE_NOT_FOUND: &str = "InvalidRoute.NotFound";
+
+/// Whether `id` is a well-formed local gateway route table id — one EC2 could have issued.
+///
+/// `<prefix>-<8 or 17 lowercase hex digits>`, read by the one generic id reader
+/// ([`prefixed_id_is_well_formed`]) under this resource's own prefix
+/// ([`LOCAL_GATEWAY_ROUTE_TABLE_ID_PREFIX`], whose doc carries the recorded evidence for
+/// it). Anything else is `.Malformed` BEFORE any lookup, so a caller can tell "not an id of
+/// this kind" from "no such route table".
+pub fn local_gateway_route_table_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(LOCAL_GATEWAY_ROUTE_TABLE_ID_PREFIX, id)
+}
+
+/// Whether `id` is a well-formed prefix list id, the other form a local gateway route's
+/// destination takes ("Use a prefix list in place of DestinationCidrBlock",
+/// `DeleteLocalGatewayRouteRequest$DestinationPrefixListId`).
+pub fn prefix_list_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(PREFIX_LIST_ID_PREFIX, id)
+}
+
+/// Whether `value` is an address prefix in CIDR notation, of either address family.
+///
+/// Reads the value with the two canonicalisers this crate already keeps one rule for
+/// ([`canonical_ipv4_cidr`], [`canonical_ipv6_cidr`]) and keeps only the yes/no, for the
+/// members that are matched EXACTLY rather than canonicalised — a local gateway route's
+/// destination is one ("This must match the CIDR for the route exactly",
+/// `DeleteLocalGatewayRouteRequest$DestinationCidrBlock`), so the block a request names is
+/// read for its FORM and then compared as the caller wrote it.
+pub fn cidr_block_is_well_formed(value: &str) -> bool {
+    if value.contains(':') {
+        canonical_ipv6_cidr(value).is_ok()
+    } else {
+        canonical_ipv4_cidr(value).is_ok()
+    }
+}
+
+/// Refuse something that is not a local gateway route table id at all: HTTP 400
+/// `InvalidLocalGatewayRouteTableID.Malformed`, worded the way AWS words a malformed id of
+/// this resource and built from the request's own value.
+pub fn invalid_local_gateway_route_table_id_malformed<E>(id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_MALFORMED,
+        400,
+        format!("The {RESOURCE_TYPE_LOCAL_GATEWAY_ROUTE_TABLE} ID '{id}' is malformed"),
+    )
+}
+
+/// Refuse a well-formed local gateway route table id this account holds no route table
+/// for: HTTP 400 `InvalidLocalGatewayRouteTableID.NotFound`, worded the way AWS words it
+/// ("The LocalGateway Route Table ID '…' does not exist").
+pub fn invalid_local_gateway_route_table_id_not_found<E>(id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_NOT_FOUND,
+        400,
+        format!("The LocalGateway Route Table ID '{id}' does not exist"),
+    )
+}
+
+/// Refuse a `LocalGatewayRouteTableId` this service cannot resolve: a malformed one before
+/// an unknown one, the order [`require_well_formed_id`] documents.
+///
+/// The ONE place a local gateway route table id is resolved, so every operation that takes
+/// one refuses the same id the same way; the contract [`require_known_instance`] writes out
+/// for instances.
+pub fn require_known_local_gateway_route_table<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    id: &str,
+) -> Result<(), Scaffolded<E>> {
+    if !local_gateway_route_table_id_is_well_formed(id) {
+        return Err(invalid_local_gateway_route_table_id_malformed(id));
+    }
+    if !store.local_gateway_route_tables.contains_key(id) {
+        return Err(invalid_local_gateway_route_table_id_not_found(id));
+    }
+    Ok(())
+}
+
+/// Refuse a destination the named local gateway route table holds no route for: HTTP 400
+/// [`INVALID_ROUTE_NOT_FOUND`].
+pub fn local_gateway_route_not_found<E>(route_table_id: &str, destination: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ROUTE_NOT_FOUND,
+        400,
+        format!(
+            "The route '{destination}' does not exist in the local gateway route table \
+             '{route_table_id}'"
+        ),
+    )
+}
+
+/// What a local gateway route MATCHES, and therefore what it is named by inside its route
+/// table: one address prefix, given either literally or as a prefix list.
+///
+/// "You cannot use DestinationPrefixListId and DestinationCidrBlock in the same request"
+/// (`DeleteLocalGatewayRouteRequest$DestinationPrefixListId`), so exactly one of the two
+/// names a route and this enum is that choice. The two forms share one key space
+/// ([`Self::key`]): a prefix list id can never read as a CIDR block, so no route can be
+/// reached by the wrong one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalGatewayRouteDestination {
+    /// "The CIDR range used for destination matches"
+    /// (`CreateLocalGatewayRouteRequest$DestinationCidrBlock`), as the caller wrote it:
+    /// "This must match the CIDR for the route exactly"
+    /// (`DeleteLocalGatewayRouteRequest$DestinationCidrBlock`) makes the comparison exact,
+    /// so the value is NOT canonicalised on the way in.
+    CidrBlock(String),
+    /// "The ID of the prefix list. Use a prefix list in place of DestinationCidrBlock"
+    /// (`CreateLocalGatewayRouteRequest$DestinationPrefixListId`).
+    PrefixListId(String),
+}
+
+impl LocalGatewayRouteDestination {
+    /// The key this destination names its route by inside
+    /// [`LocalGatewayRouteTableRecord::routes`].
+    pub fn key(&self) -> &str {
+        match self {
+            Self::CidrBlock(block) => block.as_str(),
+            Self::PrefixListId(id) => id.as_str(),
+        }
+    }
+}
+
+/// The destination a request names, or the refusal EC2 answers when it names none or both.
+///
+/// The ONE reading of that pair of members, so every operation that takes a local gateway
+/// route's destination (`CreateLocalGatewayRoute`, `ModifyLocalGatewayRoute`,
+/// `DeleteLocalGatewayRoute`) refuses the same request the same way:
+///
+/// * both given — `InvalidParameterCombination`: "You cannot use DestinationPrefixListId
+///   and DestinationCidrBlock in the same request" (`$DestinationPrefixListId`);
+/// * neither given — `MissingParameter`, since a route is named by its destination and the
+///   model marks neither member required (so the boundary validator passes the request);
+/// * a `DestinationCidrBlock` that is not an address prefix, or a
+///   `DestinationPrefixListId` that is not a prefix list id — `InvalidParameterValue`,
+///   naming the member and what it accepts.
+pub fn require_local_gateway_route_destination<E>(
+    destination_cidr_block: Option<&str>,
+    destination_prefix_list_id: Option<&str>,
+) -> Result<LocalGatewayRouteDestination, Scaffolded<E>> {
+    match (destination_cidr_block, destination_prefix_list_id) {
+        (Some(_), Some(_)) => Err(invalid_parameter_combination(
+            "You cannot use destinationPrefixListId and destinationCidrBlock in the same \
+             request",
+        )),
+        (Some(cidr_block), None) => {
+            if !cidr_block_is_well_formed(cidr_block) {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value '{cidr_block}' for destinationCidrBlock. \
+                     It must be an address range in CIDR notation"
+                )));
+            }
+            Ok(LocalGatewayRouteDestination::CidrBlock(
+                cidr_block.to_string(),
+            ))
+        }
+        (None, Some(prefix_list_id)) => {
+            if !prefix_list_id_is_well_formed(prefix_list_id) {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value '{prefix_list_id}' for destinationPrefixListId. \
+                     It must be a prefix list ID of the form \
+                     '{PREFIX_LIST_ID_PREFIX}-xxxxxxxx'"
+                )));
+            }
+            Ok(LocalGatewayRouteDestination::PrefixListId(
+                prefix_list_id.to_string(),
+            ))
+        }
+        (None, None) => Err(missing_parameter(
+            "Either destinationCidrBlock or destinationPrefixListId must be specified",
+        )),
+    }
+}
+
+/// One stored local gateway route table: the modelled shape a report of the tables answers
+/// with, and the routes that table holds.
+///
+/// The routes live HERE rather than in a map of their own because a route has no id: it is
+/// named by its destination inside one route table ("Deletes the specified route from the
+/// specified local gateway route table", `DeleteLocalGatewayRoute`), so the table is the
+/// only thing that can key them.
+#[derive(Debug, Clone)]
+pub struct LocalGatewayRouteTableRecord {
+    /// The table as every reader of it reports it.
+    pub view: crate::ops::types::LocalGatewayRouteTable,
+    /// The routes in the table, by the destination that names each one
+    /// ([`LocalGatewayRouteDestination::key`]). Ordered by destination, the stable order a
+    /// search of the routes reports and pages over.
+    pub routes: BTreeMap<String, crate::ops::types::LocalGatewayRoute>,
+}
+
+/// What one local gateway route table is written with: the local gateway and Outpost it
+/// belongs to, the Region whose ARN namespace its ARN names, its mode and state, and its
+/// tags.
+///
+/// Every member the service itself owns — the table id, the ARN built from the Region and
+/// that id, and the owning account — is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_route_table`] rather than taken
+/// from the caller, so two writers cannot report one table differently.
+#[derive(Debug, Clone)]
+pub struct LocalGatewayRouteTableSpec {
+    /// "The ID of the local gateway" the table belongs to.
+    pub local_gateway_id: String,
+    /// "The Amazon Resource Name (ARN) of the Outpost"
+    /// (`LocalGatewayRouteTable$OutpostArn`).
+    pub outpost_arn: String,
+    /// The Region the table's ARN names.
+    pub region: String,
+    /// "The mode of the local gateway route table" (`LocalGatewayRouteTable$Mode`), one of
+    /// [`crate::ops::types::LOCAL_GATEWAY_ROUTE_TABLE_MODE_VALUES`].
+    pub mode: String,
+    /// "The state of the local gateway route table" (`LocalGatewayRouteTable$State`),
+    /// which the model leaves an unconstrained string.
+    pub state: String,
+    /// "The tags assigned to the local gateway route table".
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored route table holds: its tags, the state and mode a
+/// writer pinned on it and the ids and ARNs it names. Everything else on the record — the
+/// table id, its own ARN, the owning account — is derived by this module, so it is
+/// fixed-size.
+///
+/// The ONE definition of that charge, the way
+/// [`local_gateway_vif_group_association_payload_bytes`] is for the store beside it.
+pub fn local_gateway_route_table_payload_bytes(spec: &LocalGatewayRouteTableSpec) -> usize {
+    tag_list_bytes(&spec.tags)
+        .saturating_add(spec.local_gateway_id.len())
+        .saturating_add(spec.outpost_arn.len())
+        .saturating_add(spec.mode.len())
+        .saturating_add(spec.state.len())
+}
+
+/// The caller-chosen bytes one stored route holds: its destination, its target and the
+/// type and state it carries. The ONE definition of that charge, so
+/// [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_route`] charges exactly what
+/// [`ComAmazonawsEc2Amazonec2State::remove_local_gateway_route`] gives back.
+pub fn local_gateway_route_payload_bytes(route: &crate::ops::types::LocalGatewayRoute) -> usize {
+    [
+        route.destination_cidr_block.as_deref(),
+        route.destination_prefix_list_id.as_deref(),
+        route.local_gateway_virtual_interface_group_id.as_deref(),
+        route.network_interface_id.as_deref(),
+        route.subnet_id.as_deref(),
+        route.coip_pool_id.as_deref(),
+        route.r#type.as_deref(),
+        route.state.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(0usize, |bytes, value| bytes.saturating_add(value.len()))
+}
+
+/// What one local gateway route is written with: the table it goes in, the destination it
+/// matches, the target traffic to that destination is sent to, and the type and state the
+/// route carries.
+///
+/// Every member the service itself owns — the route table's ARN and the owning account —
+/// is taken from the STORED route table by
+/// [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_route`] rather than from the
+/// caller, so a route can never name a table it is not in.
+#[derive(Debug, Clone)]
+pub struct LocalGatewayRouteSpec {
+    /// "The ID of the local gateway route table" the route goes in.
+    pub local_gateway_route_table_id: String,
+    /// What the route matches, and what names it inside that table.
+    pub destination: LocalGatewayRouteDestination,
+    /// "The ID of the virtual interface group" the route sends traffic to, for a route
+    /// whose target is one.
+    pub local_gateway_virtual_interface_group_id: Option<String>,
+    /// "The ID of the network interface" the route sends traffic to, for a route whose
+    /// target is one.
+    pub network_interface_id: Option<String>,
+    /// "The ID of the subnet" (`LocalGatewayRoute$SubnetId`), for a route AWS reports one
+    /// for.
+    pub subnet_id: Option<String>,
+    /// "The ID of the customer-owned address pool" (`LocalGatewayRoute$CoipPoolId`), for a
+    /// route AWS reports one for.
+    pub coip_pool_id: Option<String>,
+    /// "The route type" (`LocalGatewayRoute$Type`), one of
+    /// [`crate::ops::types::LOCAL_GATEWAY_ROUTE_TYPE_VALUES`].
+    pub route_type: String,
+    /// "The state of the route" (`LocalGatewayRoute$State`), one of
+    /// [`crate::ops::types::LOCAL_GATEWAY_ROUTE_STATE_VALUES`].
+    pub state: String,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another local gateway route table fits inside the store's ceiling
+    /// ([`MAX_LOCAL_GATEWAY_ROUTE_TABLES`]).
+    pub fn has_local_gateway_route_table_capacity(&self) -> bool {
+        self.local_gateway_route_tables.len() < MAX_LOCAL_GATEWAY_ROUTE_TABLES
+    }
+
+    /// Store one local gateway route table and answer the id it was given — or `None` when
+    /// the store cannot take it.
+    ///
+    /// Both of the store's bounds are enforced HERE, before an id is minted or a byte
+    /// charged: the count ceiling ([`Self::has_local_gateway_route_table_capacity`]) and
+    /// the byte budget ([`Self::would_exceed_stored_bytes`] over
+    /// [`local_gateway_route_table_payload_bytes`]) — the same contract as
+    /// [`Self::insert_local_gateway_route_table_virtual_interface_group_association`]. A
+    /// caller that gets `None` must refuse the request rather than report a table it did
+    /// not store.
+    pub fn insert_local_gateway_route_table(
+        &mut self,
+        spec: LocalGatewayRouteTableSpec,
+    ) -> Option<String> {
+        let payload_bytes = local_gateway_route_table_payload_bytes(&spec);
+        if !self.has_local_gateway_route_table_capacity()
+            || self.would_exceed_stored_bytes(payload_bytes)
+        {
+            return None;
+        }
+        let route_table_id = self.next_id(LOCAL_GATEWAY_ROUTE_TABLE_ID_PREFIX);
+        let view = crate::ops::types::LocalGatewayRouteTable {
+            local_gateway_route_table_id: Some(route_table_id.clone()),
+            local_gateway_route_table_arn: Some(local_gateway_route_table_arn(
+                &spec.region,
+                &route_table_id,
+            )),
+            local_gateway_id: Some(spec.local_gateway_id),
+            outpost_arn: Some(spec.outpost_arn),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            state: Some(spec.state),
+            tags: Some(spec.tags),
+            mode: Some(spec.mode),
+            state_reason: None,
+        };
+        self.add_stored_bytes(payload_bytes);
+        self.local_gateway_route_tables.insert(
+            route_table_id.clone(),
+            LocalGatewayRouteTableRecord {
+                view,
+                routes: BTreeMap::new(),
+            },
+        );
+        Some(route_table_id)
+    }
+
+    /// The route the local gateway route table `route_table_id` holds for `destination`, if
+    /// it holds one.
+    ///
+    /// The ONE lookup of a route, so every reader of one asks the same question of the same
+    /// map: a destination is matched EXACTLY ("This must match the CIDR for the route
+    /// exactly", `DeleteLocalGatewayRouteRequest$DestinationCidrBlock`).
+    pub fn local_gateway_route(
+        &self,
+        route_table_id: &str,
+        destination: &str,
+    ) -> Option<&crate::ops::types::LocalGatewayRoute> {
+        self.local_gateway_route_tables
+            .get(route_table_id)?
+            .routes
+            .get(destination)
+    }
+
+    /// Store one route in the local gateway route table its spec names, and answer it as
+    /// the store now holds it — or `None` when there is no such table, it already holds a
+    /// route for that destination, or the store cannot take another.
+    ///
+    /// The route's `LocalGatewayRouteTableArn` and `OwnerId` come from the STORED table, so
+    /// a route and the table it is in can never disagree about which Region and account
+    /// they belong to.
+    pub fn insert_local_gateway_route(
+        &mut self,
+        spec: LocalGatewayRouteSpec,
+    ) -> Option<crate::ops::types::LocalGatewayRoute> {
+        let (cidr_block, prefix_list_id) = match &spec.destination {
+            LocalGatewayRouteDestination::CidrBlock(block) => (Some(block.clone()), None),
+            LocalGatewayRouteDestination::PrefixListId(id) => (None, Some(id.clone())),
+        };
+        let table = self
+            .local_gateway_route_tables
+            .get(&spec.local_gateway_route_table_id)?;
+        if table.routes.len() >= MAX_LOCAL_GATEWAY_ROUTES_PER_TABLE
+            || table.routes.contains_key(spec.destination.key())
+        {
+            return None;
+        }
+        let route = crate::ops::types::LocalGatewayRoute {
+            destination_cidr_block: cidr_block,
+            local_gateway_virtual_interface_group_id: spec
+                .local_gateway_virtual_interface_group_id,
+            r#type: Some(spec.route_type),
+            state: Some(spec.state),
+            local_gateway_route_table_id: Some(spec.local_gateway_route_table_id.clone()),
+            local_gateway_route_table_arn: table.view.local_gateway_route_table_arn.clone(),
+            owner_id: table.view.owner_id.clone(),
+            subnet_id: spec.subnet_id,
+            coip_pool_id: spec.coip_pool_id,
+            network_interface_id: spec.network_interface_id,
+            destination_prefix_list_id: prefix_list_id,
+        };
+        let payload_bytes = local_gateway_route_payload_bytes(&route);
+        if self.would_exceed_stored_bytes(payload_bytes) {
+            return None;
+        }
+        // The write FIRST and the charge after it, so the budget can never be charged for
+        // a route that was not stored.
+        self.local_gateway_route_tables
+            .get_mut(&spec.local_gateway_route_table_id)?
+            .routes
+            .insert(spec.destination.key().to_string(), route.clone());
+        self.add_stored_bytes(payload_bytes);
+        Some(route)
+    }
+
+    /// Take the route `route_table_id` holds for `destination` out of that table, and
+    /// answer it in the terminal `deleted` state EC2 reports a deleted local gateway route
+    /// in — or `None` when there is no such table or route.
+    ///
+    /// The record LEAVES the store rather than lingering: a deleted route is not in the
+    /// route table any more, so a later search of that table must not report it, and the
+    /// caller-chosen bytes it held go back to the budget — exactly what
+    /// [`Self::insert_local_gateway_route`] charged for it.
+    pub fn remove_local_gateway_route(
+        &mut self,
+        route_table_id: &str,
+        destination: &str,
+    ) -> Option<crate::ops::types::LocalGatewayRoute> {
+        let mut route = self
+            .local_gateway_route_tables
+            .get_mut(route_table_id)?
+            .routes
+            .remove(destination)?;
+        self.release_stored_bytes(local_gateway_route_payload_bytes(&route));
+        route.state = Some(LOCAL_GATEWAY_ROUTE_STATE_DELETED.to_string());
+        Some(route)
+    }
+}
+
+// =============================================================================
 // Local gateway virtual interface groups
 // =============================================================================
 
@@ -10495,9 +11034,15 @@ impl ComAmazonawsEc2Amazonec2State {
 /// than read as a cursor.
 const PAGE_TOKEN_VERSION: &str = "ec2-1";
 
-/// Encode a pagination cursor — the resource id the NEXT page starts at — as an opaque
-/// token.
+/// Encode a pagination cursor — a resource id — as an opaque token.
 ///
+/// WHICH id is the CALLER's reading, and the two in this crate differ: a describe paged by
+/// [`page_from_cursor`] encodes the LAST item of the page it answered and resumes strictly
+/// after it, while a describe that still hand-rolls its page encodes the FIRST item of the
+/// next page and resumes at it. Nothing here depends on which: the cursor is opaque and
+/// only ever presented back to the operation that minted it, so each operation reads its
+/// own tokens. A NEW call site should take the exclusive reading, which is the one that can
+/// also name a page nothing follows.
 /// The token is the hex of `<version>:<checksum>:<id>`, so it is opaque to the caller and
 /// a token this service did not mint fails verification in [`decode_page_token`] instead
 /// of being treated as an id. Hex alone would not do that: any even-length hex string
@@ -10534,6 +11079,95 @@ fn page_token_checksum(start_at: &str) -> u64 {
     PAGE_TOKEN_VERSION.hash(&mut hasher);
     start_at.hash(&mut hasher);
     hasher.finish()
+}
+
+/// When a paged EC2 describe mints the `NextToken` that tells a caller to ask again.
+///
+/// The two readings differ only on a page the caller's `MaxResults` did NOT fill, and EC2
+/// does not answer them the same way for every operation — which is a fact of each
+/// operation's own backend, so the operation names the one it was recorded answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageTokenRule {
+    /// A token only when the selected set holds a further item AFTER this page: the
+    /// answer looks ahead, so the last page of a walk carries none. This is what every
+    /// describe of this service answered before one of them was recorded doing otherwise,
+    /// and it is what "this value is null when there are no more items to return" reads
+    /// as on its own.
+    WhenAnotherItemFollows,
+    /// A token whenever the page reported an item at all, whether or not the limit filled
+    /// it and without looking ahead: the token means "resume AFTER what I just gave you",
+    /// so a walk ends on the TRAILING EMPTY page that token leads to rather than on the
+    /// last page that carried items.
+    ///
+    /// Recorded behaviour, not something the model states: a vpc-scoped, paged
+    /// `DescribeSecurityGroups` read answers a `NextToken` on a page that did not reach
+    /// `MaxResults`, and the page after it is empty and carries none. A caller must
+    /// therefore follow the token rather than stop at a short page — which is the whole
+    /// reason this is modelled instead of assumed away.
+    WhenThePageHeldItems,
+}
+
+/// One page of `ordered`, and the `NextToken` that page carries.
+///
+/// `ordered` is the whole selected set in the stable order the cursor names a position
+/// in — the id order each describe sorts into — `cursor` is the cursor
+/// [`decode_page_token`] read out of the request's `NextToken`, and `limit` is the page
+/// size: `None` for an operation whose `MaxResults` doc says a request naming none is not
+/// paged at all, which is then reported in one answer with no token whichever `rule` is
+/// named.
+///
+/// A cursor names the LAST item of the page it was issued with and the next page resumes
+/// AFTER it, so a token can be minted without there being a known item to name — which is
+/// what [`PageTokenRule::WhenThePageHeldItems`] needs — and a cursor whose resource has
+/// been deleted since still resumes at the right place.
+///
+/// Paging on the cursor rather than on an index is what keeps a walk correct when the
+/// store changes under it: a token names an id, so a resource inserted or deleted ahead
+/// of the cursor cannot shift the page's contents, and the cursor always advances because
+/// the order is total.
+///
+/// MIGRATION, so the two readings in the crate are not mistaken for a bug: the describes
+/// that have not moved onto this helper yet still hand-roll the page with an INCLUSIVE
+/// cursor — their token names the FIRST item of the NEXT page — which cannot express a
+/// token for a page nothing follows. Nothing breaks while both exist, because a token is
+/// opaque and only ever presented back to the operation that minted it; each describe
+/// moves over as the issue that owns its behaviour reaches it.
+pub fn page_from_cursor<'a, T>(
+    ordered: &'a [T],
+    cursor: Option<&str>,
+    limit: Option<usize>,
+    rule: PageTokenRule,
+    id_of: impl Fn(&T) -> &str,
+) -> (&'a [T], Option<String>) {
+    // The cursor is a POSITION in `ordered`, found by binary search, so an unsorted set
+    // would silently skip items rather than fail: a caller that has not sorted by the id
+    // `id_of` reads is the bug, and it fails loudly here in a debug or test build.
+    debug_assert!(
+        ordered
+            .windows(2)
+            .all(|pair| id_of(&pair[0]) <= id_of(&pair[1])),
+        "page_from_cursor needs its set in ascending id order"
+    );
+    let from = match cursor {
+        None => 0,
+        Some(cursor) => ordered.partition_point(|item| id_of(item) <= cursor),
+    };
+    let rest = ordered.get(from..).unwrap_or_default();
+    let Some(limit) = limit else {
+        return (rest, None);
+    };
+    let page = rest.get(..limit.min(rest.len())).unwrap_or_default();
+    let due = match rule {
+        PageTokenRule::WhenAnotherItemFollows => rest.len() > page.len(),
+        PageTokenRule::WhenThePageHeldItems => !page.is_empty(),
+    };
+    // `page.last()` is `None` only for an empty page, which no rule above mints a token
+    // for: there is no item for the cursor to name.
+    let token = page
+        .last()
+        .filter(|_| due)
+        .map(|item| encode_page_token(id_of(item)));
+    (page, token)
 }
 
 // ---------------------------------------------------------------------------

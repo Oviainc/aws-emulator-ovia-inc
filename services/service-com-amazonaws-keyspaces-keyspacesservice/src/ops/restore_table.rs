@@ -527,7 +527,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status_due_at: Some(settles_at),
                 schema_definition: restored.schema_definition,
                 capacity_specification,
-                auto_scaling_specification,
+                auto_scaling_specification: auto_scaling_specification.clone(),
                 // The restored table is a new table in whatever mode it was restored into;
                 // no update has moved it to `PAY_PER_REQUEST`.
                 last_update_to_pay_per_request: None,
@@ -558,6 +558,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The clock now owes the restored table its ACTIVE transition; tell the store the
         // earliest instant at which `settle` has to look at the tables again.
         store.note_transition_due(settles_at);
+        drop(store);
+
+        // The restored table's auto scaling settings are Application Auto Scaling
+        // resources of the RESTORED table, so they are registered for it the way a create
+        // registers them — whether they came with this request or from the source table.
+        // Done with this service's store lock released, so no request holds two service
+        // stores at once.
+        if let Some(specification) = auto_scaling_specification.as_ref() {
+            crate::state::publish_auto_scaling(
+                &*self.engine,
+                &region,
+                &input.target_keyspace_name,
+                &input.target_table_name,
+                specification,
+            );
+        }
 
         Ok(RestoreTableOutput { restored_table_arn })
     }

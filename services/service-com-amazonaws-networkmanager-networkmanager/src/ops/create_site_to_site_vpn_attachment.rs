@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSiteToSiteVpnAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSiteToSiteVpnAttachment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a site-to-site VPN attachment on an edge location of a core network: the
+//! attachment is MINTED here, its id, ARN, edge location (the Region of the VPN connection
+//! being attached) and timestamps computed and stored, and every later read of the
+//! attachment answers from that record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSiteToSiteVpnAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This file is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,212 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSiteToSiteVpnAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSiteToSiteVpnAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSiteToSiteVpnAttachment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSiteToSiteVpnAttachmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The same tag rules `TagResource` applies hold for the tags a create carries.
+        // This operation models no `ServiceQuotaExceededException`, so the per-resource tag
+        // quota is refused through the `ValidationException` it does model.
+        if let Err(problem) = crate::state::check_requested_tags(input.tags.as_ref()) {
+            return Err(CreateSiteToSiteVpnAttachmentErrorModeled::ValidationException(
+                crate::state::tag_problem_rejection(problem),
+            )
+            .into());
+        }
+
+        // "Creates an Amazon Web Services site-to-site VPN attachment on an edge location
+        // of a core network" (`smithy_query query="doc"
+        // shape="CreateSiteToSiteVpnAttachment"`), so the attachment hangs off the core
+        // network the request names: one that names nothing would leave the record with a
+        // dangling back-reference. Like every create of this service, an unresolvable
+        // reference is a FIELD failure on the member that carried it.
+        let core_network = store
+            .core_networks
+            .get(&input.core_network_id)
+            .ok_or_else(|| {
+                CreateSiteToSiteVpnAttachmentErrorModeled::ValidationException(
+                    crate::state::unknown_reference(
+                        crate::state::FIELD_CORE_NETWORK_ID,
+                        crate::state::CORE_NETWORK_KIND,
+                    ),
+                )
+            })?;
+
+        // The attachment's edge location is the Region the VPN connection is in — no
+        // request member carries it — and it has to be one the core network's policy
+        // configures an edge for, since an attachment attaches to an EDGE of the core
+        // network.
+        let edge_location = crate::state::ec2_arn_region(&input.vpn_connection_arn)
+            .ok_or_else(|| {
+                CreateSiteToSiteVpnAttachmentErrorModeled::ValidationException(
+                    crate::state::field_rejection(
+                        crate::state::FIELD_VPN_CONNECTION_ARN,
+                        crate::state::REASON_FIELD_VALIDATION_FAILED,
+                        "the VPN connection ARN must name the Region the connection is in"
+                            .to_string(),
+                    ),
+                )
+            })?
+            .to_string();
+        if !core_network.topology.has_edge_location(&edge_location) {
+            return Err(CreateSiteToSiteVpnAttachmentErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_VPN_CONNECTION_ARN,
+                    crate::state::VALIDATION_REASON_OTHER,
+                    format!(
+                        "core network {} configures no edge location in {edge_location}",
+                        input.core_network_id
+                    ),
+                ),
+            )
+            .into());
+        }
+        let core_network_arn = core_network.arn.clone();
+
+        // What the policy in force on that core network decides about this attachment: the
+        // `attachment-policies` rule that claims it, the segment or network function group
+        // that rule puts it in, and whether the attachment request has to be ACCEPTED before
+        // the attachment is created. The decision is taken here, once, and stored on the
+        // record, so a later read reports what the policy in force at create time decided.
+        let claim = core_network
+            .topology
+            .attachment_claim(&crate::state::AttachmentCandidate {
+                attachment_type: crate::state::ATTACHMENT_TYPE_SITE_TO_SITE_VPN,
+                edge_location: &edge_location,
+                resource_arn: &input.vpn_connection_arn,
+                account_id: ::engine::emulator_account_id(),
+                tags: input.tags.as_deref().unwrap_or_default(),
+            });
+
+        // `ClientToken` is the operation's modelled `@idempotencyToken`, so a retry of the
+        // same request answers the record the first call minted instead of minting a second
+        // attachment; the same token asking for something else is a conflict. This is
+        // resolved BEFORE the one-attachment-per-VPN-connection rule below, so a retry
+        // answers the attachment it created rather than colliding with it.
+        if let Some(token) = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+        {
+            if let Some(existing) = store
+                .attachments
+                .values()
+                .find(|record| record.client_token.as_deref() == Some(token))
+            {
+                let same_request = existing.core_network_id == input.core_network_id
+                    && existing.resource_arn == input.vpn_connection_arn
+                    && existing.routing_policy_label == input.routing_policy_label
+                    && matches!(
+                        existing.detail,
+                        crate::state::AttachmentDetail::SiteToSiteVpn
+                    )
+                    && crate::state::same_tags(
+                        &existing.tags,
+                        input.tags.as_deref().unwrap_or_default(),
+                    );
+                if same_request {
+                    return Ok(CreateSiteToSiteVpnAttachmentOutput {
+                        site_to_site_vpn_attachment: existing.to_site_to_site_vpn_attachment(now),
+                    });
+                }
+                return Err(CreateSiteToSiteVpnAttachmentErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "client token {token:?} already created attachment {}, with a different request",
+                            existing.id
+                        ),
+                        resource_id: existing.id.clone(),
+                        resource_type: crate::state::ATTACHMENT_KIND.to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A VPN connection is attached to one core network at a time, so a second
+        // attachment of the same connection is the service's concurrent-state conflict and
+        // stores nothing.
+        if let Some(existing) = store
+            .attachments
+            .values()
+            .find(|record| record.resource_arn == input.vpn_connection_arn)
+        {
+            return Err(CreateSiteToSiteVpnAttachmentErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "VPN connection {} is already attached by attachment {}",
+                        input.vpn_connection_arn, existing.id
+                    ),
+                    resource_id: existing.id.clone(),
+                    resource_type: crate::state::ATTACHMENT_KIND.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // A quota bounds how many attachments one core network can be made to hold: at the
+        // cap the create is refused and nothing is stored, so a repeated call cannot grow
+        // the store without end.
+        let held = store.attachment_count_of_core_network(&input.core_network_id);
+        if held >= crate::state::MAX_ATTACHMENTS_PER_CORE_NETWORK {
+            return Err(CreateSiteToSiteVpnAttachmentErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_CORE_NETWORK_ID,
+                    crate::state::VALIDATION_REASON_OTHER,
+                    format!(
+                        "core network {} already holds the maximum of {} attachments",
+                        input.core_network_id,
+                        crate::state::MAX_ATTACHMENTS_PER_CORE_NETWORK
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let id = store.next_id(crate::state::ATTACHMENT_KIND);
+        let record = crate::state::AttachmentRecord {
+            arn: crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn(
+                crate::state::ATTACHMENT_KIND,
+                &id,
+            ),
+            id: id.clone(),
+            core_network_id: input.core_network_id,
+            core_network_arn,
+            attachment_type: crate::state::ATTACHMENT_TYPE_SITE_TO_SITE_VPN,
+            edge_location,
+            // The resource this attachment attaches is the VPN connection itself, which is
+            // also the `VpnConnectionArn` the shape reports.
+            resource_arn: input.vpn_connection_arn,
+            routing_policy_label: input.routing_policy_label,
+            created_at: now,
+            // An attachment the policy asked acceptance for is not being created yet, so no
+            // transition is owed on it: `AcceptAttachment` is what starts the settle span.
+            available_at: (!claim.require_acceptance).then(|| now + crate::state::SETTLE_DELAY),
+            accepted_at: None,
+            attachment_policy_rule_number: claim.rule_number,
+            segment_name: claim.segment_name,
+            network_function_group_name: claim.network_function_group_name,
+            client_token: input.client_token.filter(|token| !token.is_empty()),
+            tags: input.tags.unwrap_or_default(),
+            detail: crate::state::AttachmentDetail::SiteToSiteVpn,
+        };
+        // The attachment waits for its acceptance where the policy asked for one, and is
+        // otherwise `CREATING` until the settle span the clock owes elapses, so the response
+        // reports the state the stored record is in now.
+        let site_to_site_vpn_attachment = record.to_site_to_site_vpn_attachment(now);
+        store.attachments.insert(id, record);
+
+        Ok(CreateSiteToSiteVpnAttachmentOutput {
+            site_to_site_vpn_attachment,
+        })
     }
 }

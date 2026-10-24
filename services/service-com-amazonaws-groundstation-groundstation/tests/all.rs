@@ -15,6 +15,8 @@
 mod agent_configuration_reads;
 #[path = "all/agent_lifecycle.rs"]
 mod agent_lifecycle;
+#[path = "all/antenna_inventory.rs"]
+mod antenna_inventory;
 #[path = "all/config_defaults_and_references.rs"]
 mod config_defaults_and_references;
 #[path = "all/config_listing.rs"]
@@ -31,6 +33,8 @@ mod dataflow_endpoint_group_listing;
 mod dataflow_endpoint_groups;
 #[path = "all/ephemeris_catalog.rs"]
 mod ephemeris_catalog;
+#[path = "all/ephemeris_description.rs"]
+mod ephemeris_description;
 #[path = "all/lifecycle_writes.rs"]
 mod lifecycle_writes;
 #[path = "all/minute_usage.rs"]

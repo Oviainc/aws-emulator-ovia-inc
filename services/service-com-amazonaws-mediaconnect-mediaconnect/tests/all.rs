@@ -35,6 +35,8 @@ mod flow_projection;
 mod flow_source_failover_bound;
 #[path = "all/flow_source_metadata.rs"]
 mod flow_source_metadata;
+#[path = "all/flow_source_thumbnail.rs"]
+mod flow_source_thumbnail;
 #[path = "all/flow_sources.rs"]
 mod flow_sources;
 #[path = "all/gateway_instances.rs"]
@@ -63,6 +65,8 @@ mod router_input_restart;
 mod router_network_interfaces;
 #[path = "all/router_output_lifecycle.rs"]
 mod router_output_lifecycle;
+#[path = "all/router_output_stop.rs"]
+mod router_output_stop;
 #[path = "all/router_outputs.rs"]
 mod router_outputs;
 #[path = "all/state_roundtrip.rs"]

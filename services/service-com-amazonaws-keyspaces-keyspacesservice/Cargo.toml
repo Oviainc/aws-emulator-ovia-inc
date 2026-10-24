@@ -25,6 +25,11 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Hex codec for the opaque `nextToken` ListTables issues (encode/decode only).
 hex = { workspace = true }
+# A table's auto scaling settings ARE Application Auto Scaling resources — a scalable
+# target per capacity dimension, plus the target-tracking policy that steers it — so they
+# are written into, and read back out of, that emulator's own store through the shared
+# engine, which needs its state TYPE.
+service-com-amazonaws-applicationautoscaling-anyscalefrontendservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

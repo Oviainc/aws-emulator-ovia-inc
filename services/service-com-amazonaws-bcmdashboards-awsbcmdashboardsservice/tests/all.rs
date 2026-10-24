@@ -29,6 +29,8 @@ mod response_media_type;
 mod resource_tags;
 #[path = "all/scheduled_report_execution.rs"]
 mod scheduled_report_execution;
+#[path = "all/scheduled_report_health_views.rs"]
+mod scheduled_report_health_views;
 #[path = "all/scheduled_report_lifecycle.rs"]
 mod scheduled_report_lifecycle;
 #[path = "all/scheduled_report_listing.rs"]
