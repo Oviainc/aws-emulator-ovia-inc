@@ -111,6 +111,92 @@ pub const MAX_RESOURCES_PER_KIND: usize = 1_000;
 /// repeated `TagResource` cannot grow one resource's tag map without limit.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The most characters a tag KEY holds.
+///
+/// `Tags` is `map<String, String>` and carries `@length(min: 0, max: 50)` on the MAP only
+/// (`smithy_query(query="shape", shape="Tags")`), so nothing in the model constrains an
+/// individual key and the boundary validator checks none. The rule is the
+/// service-independent one from the AWS tagging reference ("Tag key length: Maximum 128
+/// Unicode characters in UTF-8"), which every AWS tagging API enforces, counted in
+/// CHARACTERS and not bytes for exactly that reason.
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+
+/// The most characters a tag VALUE holds: the same tagging reference's "Tag value length:
+/// Maximum 256 Unicode characters in UTF-8". A value may be EMPTY (unlike a key), which
+/// is why only a maximum is stated here.
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// The fewest characters a tag KEY holds: a key is required, so the empty string is not
+/// one ("Tag key length: Minimum 1" in the same reference).
+pub const MIN_TAG_KEY_CHARS: usize = 1;
+
+/// The tag-key namespace AWS keeps for itself: "Do not use the `aws:` prefix in your tag
+/// names or values because it is reserved for AWS use", so a caller can neither set nor
+/// remove a tag in it. Compared case-INSENSITIVELY, because AWS reserves the namespace
+/// rather than one spelling of it.
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
+/// Check the tag set a request asks this service to WRITE — `TagResource`'s `Tags`, and
+/// the `Tags` map of every operation that creates a resource with tags.
+///
+/// Refuses, with [`StateError::Validation`] (every such operation models
+/// `ValidationException`, HTTP 400), a key outside
+/// [`MIN_TAG_KEY_CHARS`]..=[`MAX_TAG_KEY_CHARS`], a value longer than
+/// [`MAX_TAG_VALUE_CHARS`], and any key in the [`RESERVED_TAG_PREFIX`] namespace. The
+/// whole request is refused so a payload carrying one illegal tag writes NONE of its
+/// tags. Keys are examined in sorted order, so a payload breaking several rules names the
+/// same tag every time rather than whichever one the map happened to yield first.
+pub fn validate_tags(tags: &HashMap<String, String>) -> Result<(), StateError> {
+    let mut keys: Vec<&String> = tags.keys().collect();
+    keys.sort_unstable();
+    for key in keys {
+        validate_tag_key("Tags", key)?;
+        let value = &tags[key];
+        let length = value.chars().count();
+        if length > MAX_TAG_VALUE_CHARS {
+            return Err(StateError::Validation(format!(
+                "Tags: the value of tag key {key:?} must hold at most \
+                 {MAX_TAG_VALUE_CHARS} characters, but holds {length}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Check the tag keys a request asks this service to REMOVE (`UntagResource`'s `TagKeys`).
+///
+/// The same key rule as [`validate_tags`], because it is a rule about what a tag key IS:
+/// a key AWS reserves cannot be removed any more than it can be set, and a key outside
+/// the length bounds names no tag any resource could carry. A legal key the resource does
+/// not carry is NOT an error — removal stays idempotent.
+pub fn validate_tag_keys(keys: &[String]) -> Result<(), StateError> {
+    for key in keys {
+        validate_tag_key("TagKeys", key)?;
+    }
+    Ok(())
+}
+
+/// The rules every tag key obeys, whichever member carries it. `member` is named in the
+/// refusal so a caller sees which part of the request to fix.
+fn validate_tag_key(member: &str, key: &str) -> Result<(), StateError> {
+    let length = key.chars().count();
+    if !(MIN_TAG_KEY_CHARS..=MAX_TAG_KEY_CHARS).contains(&length) {
+        return Err(StateError::Validation(format!(
+            "{member}: a tag key must hold between {MIN_TAG_KEY_CHARS} and \
+             {MAX_TAG_KEY_CHARS} characters, but {key:?} holds {length}"
+        )));
+    }
+    // `RESERVED_TAG_PREFIX` is spelled in lowercase, so lowercasing the key is what makes
+    // the comparison case-insensitive.
+    if key.to_lowercase().starts_with(RESERVED_TAG_PREFIX) {
+        return Err(StateError::Validation(format!(
+            "{member}: tag key {key:?} uses the {RESERVED_TAG_PREFIX} prefix, which is \
+             reserved for AWS use"
+        )));
+    }
+    Ok(())
+}
+
 /// What the operations that RESOLVE an identity-provider reference say about one that
 /// resolves to no registration: the provider named is not a valid parameter value.
 ///
@@ -711,16 +797,20 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
 
     /// Merge `tags` into the tags held against `arn`.
     ///
-    /// The merged set is bounded by [`MAX_TAGS_PER_RESOURCE`]: a request that would carry
-    /// a resource past it is refused WHOLE, leaving the stored map exactly as it was, so
-    /// repeated tagging of one resource cannot grow the store without limit. A key the
-    /// resource already carries is overwritten and does not count as growth, which is
-    /// also what the operation's `@idempotent` trait asks for.
+    /// Every tag the request carries has to be a legal tag ([`validate_tags`]) and the
+    /// merged set is bounded by [`MAX_TAGS_PER_RESOURCE`]: a request that breaks either
+    /// rule is refused WHOLE, leaving the stored map exactly as it was, so neither an
+    /// illegal tag nor unbounded growth can reach the store. A key the resource already
+    /// carries is overwritten and does not count as growth, which is also what the
+    /// operation's `@idempotent` trait asks for.
     pub fn merge_tags(
         &mut self,
         arn: &str,
         tags: &HashMap<String, String>,
     ) -> Result<(), StateError> {
+        // Whether a tag is legal is a fact about the request alone, so it is settled
+        // before the stored set is even read.
+        validate_tags(tags)?;
         let merged = match self.tags.get(arn) {
             Some(held) => {
                 held.len() + tags.keys().filter(|key| !held.contains_key(*key)).count()

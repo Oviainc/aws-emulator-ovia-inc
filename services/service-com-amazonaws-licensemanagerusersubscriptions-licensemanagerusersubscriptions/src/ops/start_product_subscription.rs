@@ -175,6 +175,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let provider_arn = provider.arn.clone();
         let provider_union = provider.identity_provider.clone();
 
+        // Whether a tag is a legal AWS tag is a fact about the request, asked once the
+        // registration it is subscribed through has been resolved — so an unresolvable
+        // reference keeps its own fail-closed refusal — and before anything is minted or
+        // stored. The write below goes through `merge_tags`, the one validated tag writer.
+        if let Some(tags) = input.tags.as_ref() {
+            crate::state::validate_tags(tags).map_err(into_error)?;
+        }
+
         let index_key = (
             provider_arn.clone(),
             input.product.clone(),
@@ -209,8 +217,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             license_expiration_date: None,
         };
 
-        if let Some(tags) = input.tags.clone() {
-            state.tags.insert(arn.clone(), tags);
+        if let Some(tags) = input.tags.as_ref() {
+            state.merge_tags(&arn, tags).map_err(into_error)?;
         }
         state.product_users.insert(arn.clone(), record.clone());
         state.product_user_order.push(arn);

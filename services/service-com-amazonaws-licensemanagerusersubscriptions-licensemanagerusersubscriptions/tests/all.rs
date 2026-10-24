@@ -23,3 +23,5 @@ mod refusals;
 mod resource_resolution_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_validation.rs"]
+mod tag_validation;

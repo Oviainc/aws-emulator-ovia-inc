@@ -205,6 +205,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Whether a tag is a legal AWS tag is a fact about the request, asked once the
+        // identifiers it names have been resolved: a payload carrying an illegal key or
+        // value is refused before anything is minted or stored, and the write below goes
+        // through `merge_tags`, the one validated tag writer.
+        if let Some(tags) = input.tags.as_ref() {
+            crate::state::validate_tags(tags).map_err(into_error)?;
+        }
+
         // `@idempotent`: the same user on the same instance through the same directory is
         // the association already in state, answered as it stands.
         let index_key = (
@@ -254,8 +262,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             associated_due_at: crate::state::association_due_at(now),
         };
 
-        if let Some(tags) = input.tags.clone() {
-            state.tags.insert(arn.clone(), tags);
+        if let Some(tags) = input.tags.as_ref() {
+            state.merge_tags(&arn, tags).map_err(into_error)?;
         }
         state.instance_users.insert(arn.clone(), record.clone());
         state.instance_user_order.push(arn);

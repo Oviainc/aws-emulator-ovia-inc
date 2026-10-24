@@ -175,6 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(identity_provider_not_valid());
         }
 
+        // Whether a tag is a legal AWS tag is a fact about the request (the model bounds
+        // the `Tags` MAP and nothing inside it), asked once the identity provider has been
+        // resolved and before anything is minted or stored. The write below goes through
+        // `merge_tags`, the one validated tag writer, so no path into the tag store skips
+        // the rule.
+        if let Some(tags) = input.tags.as_ref() {
+            crate::state::validate_tags(tags).map_err(invalid_tags)?;
+        }
+
         // `@idempotent`: a repeat create for the same (identity provider, server type)
         // answers with the endpoint already in state instead of minting a second one.
         // The endpoint's tags are therefore whatever the create that MINTED the record
@@ -223,8 +232,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             provisioned_due_at: crate::state::endpoint_provisioned_due_at(now),
         };
 
-        if let Some(tags) = input.tags.clone() {
-            state.tags.insert(arn.clone(), tags);
+        if let Some(tags) = input.tags.as_ref() {
+            state.merge_tags(&arn, tags).map_err(invalid_tags)?;
         }
         state
             .license_server_endpoints
@@ -248,6 +257,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn identity_provider_not_valid() -> CreateLicenseServerEndpointError {
     CreateLicenseServerEndpointErrorModeled::ValidationException(ValidationException {
         message: Some(crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()),
+    })
+    .into()
+}
+
+/// Map the tag-rule refusal the state layer raises onto this operation's modelled
+/// `ValidationException` (HTTP 400): a `Tags` map carrying an illegal key or value is a
+/// parameter that is not valid.
+fn invalid_tags(error: crate::state::StateError) -> CreateLicenseServerEndpointError {
+    let message = match error {
+        crate::state::StateError::NotFound(message)
+        | crate::state::StateError::Conflict(message)
+        | crate::state::StateError::Validation(message) => message,
+        // The tag rules address no identity provider, so the merge cannot report this; the
+        // arm keeps the wording this handler already uses for an unresolvable reference.
+        crate::state::StateError::ProviderNotRegistered => {
+            crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()
+        }
+    };
+    CreateLicenseServerEndpointErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
     })
     .into()
 }

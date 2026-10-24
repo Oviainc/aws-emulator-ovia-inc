@@ -180,6 +180,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolving a directory is a question for another service.
         crate::state::validate_product(&input.product).map_err(into_error)?;
 
+        // Whether a tag is a legal AWS tag is a fact about the request too (the model
+        // bounds the `Tags` MAP and nothing inside it), so a payload carrying an illegal
+        // key or value is refused here, before anything is minted or stored. The write
+        // itself goes through `merge_tags`, the one validated tag writer, so no path into
+        // the tag store skips the rule.
+        if let Some(tags) = input.tags.as_ref() {
+            crate::state::validate_tags(tags).map_err(into_error)?;
+        }
+
         let now = std::time::SystemTime::now();
 
         let region = crate::state::request_region(&ctx.parts().headers);
@@ -243,8 +252,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             registered_due_at: crate::state::registration_due_at(now),
         };
 
-        if let Some(tags) = input.tags.clone() {
-            state.tags.insert(arn.clone(), tags);
+        if let Some(tags) = input.tags.as_ref() {
+            state.merge_tags(&arn, tags).map_err(into_error)?;
         }
         state.identity_providers.insert(arn.clone(), record.clone());
         state.identity_provider_order.push(arn.clone());
