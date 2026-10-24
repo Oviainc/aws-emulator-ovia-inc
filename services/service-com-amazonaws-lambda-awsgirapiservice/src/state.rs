@@ -859,6 +859,16 @@ pub fn function_url_qualifier_message(qualifier: &str) -> String {
     )
 }
 
+/// The message a function-URL operation refuses with when the qualifier it resolved
+/// holds no function URL: `ResourceNotFoundException`'s own wording, naming no resource.
+///
+/// Lambda's function-URL operations answer this one fixed sentence for a function URL
+/// that does not exist — the request already names which one it asked about — rather than
+/// the `Function not found: <arn>` form the function-lifecycle operations build when it
+/// is the FUNCTION that is missing. [`resolve_function`] still produces the latter, so a
+/// caller can tell "no such function" from "that function has no URL".
+pub const FUNCTION_URL_NOT_FOUND_MESSAGE: &str = "The resource you requested does not exist.";
+
 /// The qualifier a `FunctionName`/`Qualifier` pair NAMES, as opposed to the
 /// [`VERSION_LATEST`] an unqualified request resolves to. It may come from either, and
 /// [`resolve_function`] refuses a pair that names two different ones.

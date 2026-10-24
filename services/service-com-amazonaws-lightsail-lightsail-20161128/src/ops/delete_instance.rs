@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInstance
-//! Removes the stored instance so no later read reports it, and appends the
-//! operation that records the removal.
+//! Removes the stored instance so no later read reports it, releases every
+//! attachment another stored resource held to it, and appends the operations
+//! that record the removal and each release.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -172,6 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_ms();
 
         crate::state::with_state(&*self.engine, |store| {
+            // Removing the instance also releases every attachment another
+            // stored resource holds to it — a block storage disk, a static IP,
+            // a load balancer's registration — because an attachment names "the
+            // resources to which" a resource "is attached" (the modelled
+            // `Disk$attachedTo`) and this instance is about to be none of them.
+            // The release is part of the same step, so no read can observe a
+            // resource attached to an instance this account no longer holds.
             let Some(deleted) = store.remove_instance(&name) else {
                 return Err(not_found(&name));
             };
@@ -182,11 +190,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::OPERATION_TYPE_DELETE_INSTANCE,
                 crate::state::RESOURCE_TYPE_INSTANCE,
                 &name,
-                &deleted.location,
+                &deleted.instance.location,
                 None,
             );
+            // `operations` is a list because a Lightsail call can act on
+            // several resources at once, and this one did: each attachment the
+            // removal released is a mutation of the record that held it, so it
+            // is logged as that record's own detachment — already done when
+            // this call returns, and so terminal too.
+            let mut operations = vec![operation.view()];
+            for released in &deleted.released_attachments {
+                let entry = store.start_operation(
+                    now,
+                    released.operation_type,
+                    released.resource_type,
+                    &released.resource_name,
+                    &released.location,
+                    None,
+                );
+                operations.push(entry.view());
+            }
             Ok(DeleteInstanceOutput {
-                operations: Some(vec![operation.view()]),
+                operations: Some(operations),
             })
         })
         .ok_or_else(unavailable)?

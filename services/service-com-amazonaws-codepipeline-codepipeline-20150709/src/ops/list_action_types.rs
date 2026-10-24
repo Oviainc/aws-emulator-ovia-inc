@@ -173,9 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ListActionTypesError::from(
                         ListActionTypesErrorModeled::InvalidNextTokenException(
                             InvalidNextTokenException {
-                                message: Some(
-                                    "nextToken was not issued by ListActionTypes".to_string(),
-                                ),
+                                message: Some(crate::state::invalid_next_token_message(
+                                    token,
+                                )),
                             },
                         ),
                     )

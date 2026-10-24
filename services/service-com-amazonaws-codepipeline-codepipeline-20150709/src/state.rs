@@ -2468,14 +2468,16 @@ impl TagProblem {
 /// * no key in AWS's reserved [`RESERVED_TAG_KEY_PREFIX`] namespace, which a caller
 ///   may not set, matched in any letter case.
 ///
+/// `resource` is the identity of the resource being tagged, as the request names it
+/// (one of the `…_resource` helpers beside [`too_many_tags_message`]): the tag-limit
+/// refusal names the resource it was exceeded for, so every operation that sets tags
+/// passes the resource its own request identifies.
+///
 /// Every operation that sets tags on a resource of this service applies it, so one
 /// request is refused the same way whichever resource it addresses.
-pub fn validate_tags(tags: &[Tag]) -> Result<(), TagProblem> {
+pub fn validate_tags(tags: &[Tag], resource: &str) -> Result<(), TagProblem> {
     if tags.len() > MAX_TAGS_PER_RESOURCE {
-        return Err(TagProblem::TooMany(format!(
-            "tags must hold at most {MAX_TAGS_PER_RESOURCE} entries, but this request carries {}",
-            tags.len()
-        )));
+        return Err(TagProblem::TooMany(too_many_tags_message(resource)));
     }
     let mut seen = BTreeSet::new();
     for tag in tags {
@@ -3669,6 +3671,19 @@ pub fn pipeline_not_found_message(name: &str) -> String {
     )
 }
 
+/// The message a pipeline-VERSION lookup that found no such version carries.
+///
+/// The same rule as [`pipeline_not_found_message`] with the version the request asked
+/// for appended, so a caller reading version history can tell an absent version from an
+/// absent pipeline from the text alone: the lookup is scoped to one account AND one
+/// version, and the refusal names both.
+pub fn pipeline_version_not_found_message(name: &str, version: i32) -> String {
+    format!(
+        "Account '{}' does not have a pipeline with name '{name}' and version '{version}'.",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// The message `PipelineNameInUseException` carries.
 ///
 /// Built the same way: the name the request asked for, and the account the collision
@@ -3678,6 +3693,102 @@ pub fn pipeline_name_in_use_message(name: &str) -> String {
         "A pipeline with the name '{name}' already exists in account '{}'",
         ::engine::emulator_account_id()
     )
+}
+
+/// The message an execution lookup that found no such execution carries, for every
+/// operation that raises it.
+///
+/// Built from the two request members that name the execution — the id, and the
+/// pipeline the id was looked up IN — because an execution id is only ever resolved
+/// within one pipeline (`PipelineExecutionNotFoundException` is documented for an
+/// execution that "cannot be found, or an execution ID does not belong to the specified
+/// pipeline", so the refusal names both halves of that lookup).
+pub fn pipeline_execution_not_found_message(pipeline_name: &str, execution_id: &str) -> String {
+    format!(
+        "Pipeline Execution with id '{execution_id}' does not exist in pipeline with name \
+         '{pipeline_name}'"
+    )
+}
+
+/// The message `StageNotFoundException` carries, for every operation that raises it.
+///
+/// Built from the two request members that name the stage: a stage name is only ever
+/// resolved within one pipeline's declaration, so the refusal names the pipeline it was
+/// resolved against and the stage name it did not find there.
+pub fn stage_not_found_message(pipeline_name: &str, stage_name: &str) -> String {
+    format!("Pipeline '{pipeline_name}' does not have a stage with name '{stage_name}'")
+}
+
+/// The message `ActionNotFoundException` carries, for every operation that raises it.
+///
+/// The same rule one level in: an action name is only ever resolved within one stage of
+/// one pipeline, so the refusal names the stage, the pipeline it belongs to and the
+/// action name it did not find there.
+pub fn action_not_found_message(
+    pipeline_name: &str,
+    stage_name: &str,
+    action_name: &str,
+) -> String {
+    format!(
+        "Stage '{stage_name}' of pipeline '{pipeline_name}' does not have an action with name \
+         '{action_name}'"
+    )
+}
+
+/// The message `InvalidNextTokenException` carries, for every paginated operation of
+/// this service.
+///
+/// Built from the request: the rejected cursor is quoted back so a paginating client can
+/// log WHICH cursor it lost, and the sentence states what the caller has to do about it.
+/// One formatter for every listing, so two paginated operations cannot disagree about
+/// the wording of one rule — the token is the only part that varies, and the operation
+/// that refused it is already named by the request it answers.
+pub fn invalid_next_token_message(token: &str) -> String {
+    format!(
+        "The nextToken value '{token}' is not valid. Specify a valid nextToken value, and then \
+         try again."
+    )
+}
+
+/// The message `TooManyTagsException` carries: which RESOURCE the tag limit was
+/// exceeded for.
+///
+/// `resource` is that resource's identity as the request names it (see
+/// [`custom_action_type_resource`] and the `…_resource` helpers beside it). The limit
+/// itself is deliberately absent: a batch caller tagging many resources needs to know
+/// which request was refused, which the count does not say, and the bound is published
+/// rather than request-derived.
+pub fn too_many_tags_message(resource: &str) -> String {
+    format!("Tag limit exceeded for {resource}.")
+}
+
+/// How a tagging refusal names a custom action type: the three request members that
+/// identify it (`CreateCustomActionType$category`, `$provider` and `$version` — the
+/// action type's identity, since `owner` is always `Custom` for one this account
+/// created).
+pub fn custom_action_type_resource(category: &str, provider: &str, version: &str) -> String {
+    format!(
+        "custom action type with category=[{category}], provider=[{provider}] and \
+         version=[{version}]"
+    )
+}
+
+/// How a tagging refusal names a pipeline: the name the request carries, which is a
+/// pipeline's identity in an account.
+pub fn pipeline_resource(name: &str) -> String {
+    format!("pipeline with name=[{name}]")
+}
+
+/// How a tagging refusal names a webhook: the name the request carries, which is a
+/// webhook's identity in an account.
+pub fn webhook_resource(name: &str) -> String {
+    format!("webhook with name=[{name}]")
+}
+
+/// How a tagging refusal names the resource an ARN addresses, for the operations whose
+/// request identifies the resource by `resourceArn` rather than by its members.
+pub fn arn_resource(resource_arn: &str) -> String {
+    format!("resource with arn=[{resource_arn}]")
 }
 
 /// Refuse a `PipelineDeclaration` whose structure cannot describe a pipeline.

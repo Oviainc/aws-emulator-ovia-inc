@@ -12,12 +12,13 @@
 //!
 //! The same holds for every other resource kind this store carries — a key value store, a
 //! response headers policy, an origin request policy, a cache policy, an origin access
-//! control, a CloudFront function, a public key: each record is put there by the call that
-//! creates it and is what every later read of that resource answers from. None of a
-//! response headers policy, an origin request policy, a cache policy, an origin access
-//! control or a public key has a status member or a propagation deadline, so nothing about
-//! one is owed by the clock; neither is anything about a function, which reaches its `LIVE`
-//! stage through a `PublishFunction` CALL rather than by waiting.
+//! control, a CloudFront function, a connection function, a public key: each record is put
+//! there by the call that creates it and is what every later read of that resource answers
+//! from. None of a response headers policy, an origin request policy, a cache policy, an
+//! origin access control or a public key has a status member or a propagation deadline, so
+//! nothing about one is owed by the clock; neither is anything about a function or a
+//! connection function, each of which reaches its `LIVE` stage through a publish CALL
+//! rather than by waiting.
 //!
 //! Several things in here are owed by the CLOCK rather than by a call:
 //!
@@ -78,6 +79,13 @@ use crate::ops::types::{
 /// name reachable as `crate::state::<name>`, which is where each handler names it.
 pub mod functions;
 pub use functions::*;
+
+/// The CONNECTION FUNCTION slice of this store: the connection function record, its two
+/// stages, their quotas, the id, ARN and path one is addressed by, and the modelled errors
+/// the connection function operations answer with. A SUBMODULE for the same reason
+/// [`functions`] is one; `pub use` keeps every name reachable as `crate::state::<name>`.
+pub mod connection_functions;
+pub use connection_functions::*;
 
 /// `Distribution$Status` while a configuration is still propagating to the edge
 /// locations. The model documents the terminal value — "When the status is `Deployed`,
@@ -1782,6 +1790,12 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// every cache policy operation addresses one by. A `BTreeMap` for the same reason as
     /// `distributions`: one stable total order for a listing to page through.
     pub cache_policies: BTreeMap<String, StoredCachePolicy>,
+    /// Every connection function this emulator holds, keyed by its minted id — the
+    /// identifier every mutating connection function operation addresses one by (its name
+    /// and its ARN resolve to the same record). A `BTreeMap` for the same reason as
+    /// `distributions`: one stable total order for a listing to page through. Everything
+    /// that reads or writes it lives in [`connection_functions`].
+    pub connection_functions: BTreeMap<String, StoredConnectionFunction>,
     /// Every public key this emulator holds, keyed by its minted id — the identifier every
     /// public key operation addresses one by. A `BTreeMap` for the same reason as
     /// `distributions`: one stable total order for `ListPublicKeys`'s `Marker` to index
@@ -2107,6 +2121,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         if let Some(function) = self.function_by_arn(arn) {
             return Some(&function.tags);
         }
+        if let Some(function) = self.connection_function_by_arn(arn) {
+            return Some(&function.tags);
+        }
         self.distribution_tenants
             .values()
             .find(|tenant| tenant.arn == arn)
@@ -2145,7 +2162,16 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         // The FIELD rather than the [`Self::function_by_arn`] lookup the tag READ goes
         // through: a method taking `&mut self` would borrow the whole store, which the
         // arms above already borrow a field of. The comparison is the same one.
-        self.functions
+        if let Some(function) = self
+            .functions
+            .values_mut()
+            .find(|function| function.arn == arn)
+        {
+            return Some(&mut function.tags);
+        }
+        // The connection function arm, resolved against the STORED ARN exactly as the tag
+        // read resolves it, and against the field for the same borrow reason as above.
+        self.connection_functions
             .values_mut()
             .find(|function| function.arn == arn)
             .map(|function| &mut function.tags)

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNetworks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNetworks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNetworks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +141,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNetworks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNetworksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNetworks"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing and
+        // is a bad request. It is clamped to a finite ceiling, and an absent one
+        // uses that ceiling, so no single request can ask the service to project
+        // an unbounded number of networks in one response.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(ListNetworksErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "maxResults must be at least 1, got {max_results}"
+                        )),
+                    },
+                )
+                .into());
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises the transitions the clock had
+        // already made due — a network's `CREATING` -> `ACTIVE` step among them —
+        // which were owed whether or not this listing ran, so a listed network
+        // reports the same `State` a describe of it does.
+        state.settle(::std::time::SystemTime::now());
+        let state = &*state;
+
+        // `NextToken` is the id the next page starts at, and ids sort in mint
+        // order in the `BTreeMap`, so resuming is a range scan from that id. A
+        // token naming a network gone since the previous page simply resumes at
+        // the next surviving id instead of failing.
+        let first = match input.next_token.as_deref() {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = state
+            .networks
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded));
+
+        // Every network is reported through the ONE projection `DescribeNetwork`
+        // answers from, so a summary cannot drift from the described network.
+        let networks: Vec<DescribeNetworkSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .filter_map(|(id, _)| state.network_description(id))
+            .collect();
+        // Absent on the last page: a token is handed out only when a network is
+        // left over after this one.
+        let next_token = remaining.next().map(|(id, _)| id.clone());
+
+        Ok(ListNetworksOutput {
+            networks: Some(networks),
+            next_token,
+        })
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to list the networks from. A modelled server error,
+/// never a fresh engine (which would answer from an empty private store).
+fn unavailable() -> ListNetworksError {
+    ListNetworksErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

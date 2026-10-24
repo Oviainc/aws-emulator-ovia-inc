@@ -247,7 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.pipelines.contains_key(&input.pipeline_name) {
             return Err(ListActionExecutionsErrorModeled::PipelineNotFoundException(
                 PipelineNotFoundException {
-                    message: Some(format!("pipeline {} does not exist", input.pipeline_name)),
+                    message: Some(crate::state::pipeline_not_found_message(
+                        &input.pipeline_name,
+                    )),
                 },
             )
             .into());
@@ -265,10 +267,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     ListActionExecutionsErrorModeled::PipelineExecutionNotFoundException(
                         PipelineExecutionNotFoundException {
-                            message: Some(format!(
-                                "pipeline {} has no execution {execution_id}",
-                                input.pipeline_name
-                            )),
+                            message: Some(
+                                crate::state::pipeline_execution_not_found_message(
+                                    &input.pipeline_name,
+                                    execution_id,
+                                ),
+                            ),
                         },
                     )
                     .into(),
@@ -308,9 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             ListActionExecutionsErrorModeled::InvalidNextTokenException(
                                 InvalidNextTokenException {
                                     message: Some(
-                                        "nextToken was not issued by ListActionExecutions for \
-                                         this pipeline"
-                                            .to_string(),
+                                        crate::state::invalid_next_token_message(token),
                                     ),
                                 },
                             ),

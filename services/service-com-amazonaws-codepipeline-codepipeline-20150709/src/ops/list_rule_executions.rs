@@ -139,14 +139,6 @@ impl From<ListRuleExecutionsErrorModeled> for ListRuleExecutionsError {
     }
 }
 
-/// The message a refused `nextToken` carries: the sentence this service's model
-/// documents for `InvalidNextTokenException`, which states the rule the caller has to
-/// act on ("Make sure that the next token you provide is the token returned by a
-/// previous call") rather than a wording invented here.
-const INVALID_NEXT_TOKEN_MESSAGE: &str = "The next token was specified in an invalid format. \
-                                          Make sure that the next token you provide is the token \
-                                          returned by a previous call.";
-
 /// Whether `declaration` configures any stage condition with rules.
 ///
 /// `ListRuleExecutions` reports "the rule executions that have occurred in a pipeline
@@ -255,7 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ListRuleExecutionsError::from(
                 ListRuleExecutionsErrorModeled::PipelineNotFoundException(
                     PipelineNotFoundException {
-                        message: Some(format!("pipeline {} does not exist", input.pipeline_name)),
+                        message: Some(crate::state::pipeline_not_found_message(
+                            &input.pipeline_name,
+                        )),
                     },
                 ),
             )
@@ -276,10 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no condition rules the listing never truncates a page (see the module docs),
         // so it has issued no cursor and any token presented to it is one it did not
         // issue — exactly the condition the model's `InvalidNextTokenException` states.
-        if input.next_token.is_some() {
+        if let Some(token) = input.next_token.as_deref() {
             return Err(ListRuleExecutionsErrorModeled::InvalidNextTokenException(
                 InvalidNextTokenException {
-                    message: Some(INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                    message: Some(crate::state::invalid_next_token_message(token)),
                 },
             )
             .into());
@@ -297,10 +291,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     ListRuleExecutionsErrorModeled::PipelineExecutionNotFoundException(
                         PipelineExecutionNotFoundException {
-                            message: Some(format!(
-                                "pipeline {} has no execution {execution_id}",
-                                input.pipeline_name
-                            )),
+                            message: Some(
+                                crate::state::pipeline_execution_not_found_message(
+                                    &input.pipeline_name,
+                                    execution_id,
+                                ),
+                            ),
                         },
                     )
                     .into(),

@@ -182,7 +182,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(pipeline) = state.pipelines.get(&input.pipeline_name) else {
             return Err(PutActionRevisionErrorModeled::PipelineNotFoundException(
                 PipelineNotFoundException {
-                    message: Some(format!("pipeline {} does not exist", input.pipeline_name)),
+                    message: Some(crate::state::pipeline_not_found_message(
+                        &input.pipeline_name,
+                    )),
                 },
             )
             .into());
@@ -195,9 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(PutActionRevisionErrorModeled::StageNotFoundException(
                 StageNotFoundException {
-                    message: Some(format!(
-                        "pipeline {} has no stage named {}",
-                        input.pipeline_name, input.stage_name
+                    message: Some(crate::state::stage_not_found_message(
+                        &input.pipeline_name,
+                        &input.stage_name,
                     )),
                 },
             )
@@ -210,9 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(PutActionRevisionErrorModeled::ActionNotFoundException(
                 ActionNotFoundException {
-                    message: Some(format!(
-                        "stage {} of pipeline {} has no action named {}",
-                        input.stage_name, input.pipeline_name, input.action_name
+                    message: Some(crate::state::action_not_found_message(
+                        &input.pipeline_name,
+                        &input.stage_name,
+                        &input.action_name,
                     )),
                 },
             )
