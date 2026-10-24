@@ -8,6 +8,10 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The shared wording of a boundary constraint refusal
+# (`service_common::aws_validation_refusal`), so this service does not carry its
+# own copy of how AWS states one.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
