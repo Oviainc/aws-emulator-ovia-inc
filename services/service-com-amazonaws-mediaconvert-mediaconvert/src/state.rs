@@ -2777,6 +2777,51 @@ pub enum DeleteQueueOutcome {
     HasActiveJobs { submitted: i32, progressing: i32 },
 }
 
+/// What the store did when asked to delete a resource whose `Name` is its identity — a
+/// job template or a preset.
+///
+/// The queue delete has one refusal of its own beyond these ([`DeleteQueueOutcome`], for
+/// a queue that still owes work), so it reports its own outcome; the two branches both
+/// kinds share are the ones below.
+#[derive(Debug)]
+pub enum DeleteNamedOutcome {
+    /// The record is gone from the store.
+    Deleted,
+    /// Nothing was stored under that name, so the store is ALREADY in the state the
+    /// request asked for and nothing was removed: the delete is a no-op success. The READ
+    /// paths are unaffected — a `Get*` of that name is still the modelled 404.
+    AlreadyAbsent,
+    /// A BUILT-IN ([`TYPE_SYSTEM`]) resource holds that name, which is not one the caller
+    /// created and so not one they may delete.
+    SystemResource,
+}
+
+/// Remove the record stored under `name`, idempotently.
+///
+/// ONE rule for every named resource this service deletes, so no two delete paths can
+/// disagree about it:
+///
+/// * a name a caller-created record holds removes it — [`DeleteNamedOutcome::Deleted`];
+/// * a name nothing holds removes NOTHING and is reported as already in the asked-for
+///   state — [`DeleteNamedOutcome::AlreadyAbsent`], the idempotent repeat;
+/// * a name a built-in record holds is [`DeleteNamedOutcome::SystemResource`].
+///
+/// The probe and the removal happen under the one `&mut` borrow the caller holds the state
+/// lock for, so the decision and the state it was read from cannot disagree.
+fn delete_named<R: NamedRecord>(
+    store: &mut BTreeMap<String, R>,
+    name: &str,
+) -> DeleteNamedOutcome {
+    match store.get(name) {
+        None => DeleteNamedOutcome::AlreadyAbsent,
+        Some(existing) if existing.is_system() => DeleteNamedOutcome::SystemResource,
+        Some(_) => {
+            store.remove(name);
+            DeleteNamedOutcome::Deleted
+        }
+    }
+}
+
 /// What the store did when asked to create a resource whose `Name` is its identity — a
 /// queue, a job template or a preset.
 ///
@@ -3652,6 +3697,18 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         create_named(&mut self.presets, MAX_PRESETS, record, |preset| {
             preset.view(region)
         })
+    }
+
+    /// Delete a job template: "Permanently delete a job template you have created."
+    /// See [`delete_named`] for the one rule every named delete here follows.
+    pub fn delete_job_template(&mut self, name: &str) -> DeleteNamedOutcome {
+        delete_named(&mut self.job_templates, name)
+    }
+
+    /// Delete a preset: "Permanently delete a preset you have created."
+    /// See [`delete_named`] for the one rule every named delete here follows.
+    pub fn delete_preset(&mut self, name: &str) -> DeleteNamedOutcome {
+        delete_named(&mut self.presets, name)
     }
 
     /// The tag set of the resource an ARN named, or `None` when this store holds no such

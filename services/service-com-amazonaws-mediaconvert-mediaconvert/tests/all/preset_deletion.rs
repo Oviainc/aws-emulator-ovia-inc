@@ -4,9 +4,11 @@
 //!
 //! `DeletePreset` is documented as "Permanently delete a preset you have created", so the
 //! rule under test is: the removal is IMMEDIATE and the store is what every later call
-//! reads — the deleted name answers `NotFoundException` (404) from `GetPreset` and from a
-//! second `DeletePreset`, the name is free to create again, and no other preset moves.
-//! A name the store never held is the same 404.
+//! reads — the deleted name answers `NotFoundException` (404) from `GetPreset`, the name
+//! is free to create again, and no other preset moves. The DELETE itself is idempotent on
+//! the name, as the sibling deletes in this crate are: a name the store does not hold is
+//! already in the state the request asks for, so it answers the operation's empty 202 and
+//! removes nothing.
 //!
 //! Each case drives the real restJson1 wire path through the router (the harness is the
 //! one `job_lifecycle` builds), so what is asserted is the bytes a client would see.
@@ -223,20 +225,17 @@ async fn a_deleted_preset_is_not_readable_and_its_name_is_free_again() {
             );
         }
 
-        // A second delete has nothing to remove, so it is the same 404 rather than a
-        // second success.
+        // A second delete has nothing to remove, so it is the same empty 202: the store is
+        // already in the state the request asks for.
         let again = delete_preset(&emulator, name).await;
         assert_eq!(
-            again.status, 404,
-            "case {label:?}: expected HTTP 404 from a second DeletePreset, got {} with body {}",
+            again.status, 202,
+            "case {label:?}: expected HTTP 202 from a second DeletePreset, got {} with body {}",
             again.status, again.body
         );
-        assert_eq!(
-            again.error_type.as_deref(),
-            Some("NotFoundException"),
-            "case {label:?}: expected NotFoundException from a second delete, got {:?} with body \
-             {}",
-            again.error_type,
+        assert!(
+            again.body.is_null() || again.body == json!({}),
+            "case {label:?}: a repeated DeletePreset models an empty output, got body {}",
             again.body
         );
 
@@ -268,13 +267,15 @@ async fn a_deleted_preset_is_not_readable_and_its_name_is_free_again() {
     }
 }
 
-/// A preset nobody created cannot be deleted: `DeletePreset` answers the modelled
-/// `NotFoundException` (404) and removes nothing.
+/// Deleting a preset nobody created is the operation's empty success and removes nothing:
+/// the store already holds no preset under that name, which is what the request asks for,
+/// so the answer is HTTP 202 with an empty body while `GetPreset` on that name stays the
+/// modelled `NotFoundException` (404).
 ///
 /// The rows differ in how they miss: never created, a prefix of a stored name, a
 /// different case, and a name that looks like a built-in resource.
 #[tokio::test]
-async fn deleting_a_preset_that_was_never_created_is_not_found() {
+async fn deleting_a_preset_that_was_never_created_is_a_no_op_success() {
     let emulator = Emulator::new();
     let created = create_preset(
         &emulator,
@@ -293,22 +294,35 @@ async fn deleting_a_preset_that_was_never_created_is_not_found() {
     for name in ["absent", "presen", "PRESENT", "System-Generic-Hd-Mp4-Avc-Aac-16x9"] {
         let reply = delete_preset(&emulator, name).await;
         assert_eq!(
-            reply.status, 404,
-            "case {name:?}: expected HTTP 404, got {} with body {}",
+            reply.status, 202,
+            "case {name:?}: expected HTTP 202, got {} with body {}",
             reply.status, reply.body
         );
-        assert_eq!(
-            reply.error_type.as_deref(),
-            Some("NotFoundException"),
-            "case {name:?}: expected NotFoundException, got {:?} with body {}",
-            reply.error_type,
+        assert!(
+            reply.body.is_null() || reply.body == json!({}),
+            "case {name:?}: DeletePreset models an empty output, got body {}",
             reply.body
         );
+
+        // The delete is idempotent; the READ of that name is not.
+        let gone = get_preset(&emulator, name).await;
         assert_eq!(
-            reply.string("/message"),
+            gone.status, 404,
+            "case {name:?}: expected HTTP 404 from GetPreset, got {} with body {}",
+            gone.status, gone.body
+        );
+        assert_eq!(
+            gone.error_type.as_deref(),
+            Some("NotFoundException"),
+            "case {name:?}: expected NotFoundException, got {:?} with body {}",
+            gone.error_type,
+            gone.body
+        );
+        assert_eq!(
+            gone.string("/message"),
             not_found_message("name"),
             "case {name:?}: the refusal must name the member the lookup read, got {}",
-            reply.body
+            gone.body
         );
 
         // The preset that IS there is untouched by every miss.
@@ -316,7 +330,7 @@ async fn deleting_a_preset_that_was_never_created_is_not_found() {
         assert_eq!(
             still_there.at("/preset"),
             created.at("/preset"),
-            "case {name:?}: a refused delete must remove nothing, got {}",
+            "case {name:?}: a delete of another name must remove nothing, got {}",
             still_there.body
         );
     }
