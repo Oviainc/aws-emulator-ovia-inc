@@ -34,8 +34,8 @@ use crate::ops::types::{
 };
 // The dynamic instrumentation shapes, on their own `use` for the same reason.
 use crate::ops::types::{
-    InstrumentationConfiguration, InstrumentationConfigurationWithoutServiceEnv, Location,
-    LocationIdentifier,
+    InstrumentationConfiguration, InstrumentationConfigurationWithoutServiceEnv,
+    InstrumentationStatusEvent, Location, LocationIdentifier,
 };
 
 /// This service's SigV4 signing name, which is also its ARN namespace
@@ -1829,6 +1829,50 @@ pub const INSTRUMENTATION_CONFIGURATIONS_TOKEN_TAG: &str = "instrumentation-conf
 /// operation models `ServiceQuotaExceededException` for precisely that refusal.
 pub const MAX_INSTRUMENTATION_CONFIGURATIONS: usize = 1_000;
 
+/// The page `GetInstrumentationConfigurationStatus` returns when the caller names no
+/// `MaxResults`: the member's modelled `@default` of 60 ("The maximum number of status events
+/// to return in one call. The default is 60").
+pub const DEFAULT_STATUS_EVENT_PAGE: i32 = 60;
+
+/// The window a status read covers when the request names neither `StartTime` nor `EndTime`.
+/// `GetInstrumentationConfigurationStatus`'s doc: "If no status or time window is provided,
+/// the operation defaults to ACTIVE events from the last hour", and the members' own: "When
+/// both are omitted, the time range defaults to the last hour".
+pub const STATUS_EVENT_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// The `InstrumentationConfigurationStatus` a status read reports when the request names
+/// none. `GetInstrumentationConfigurationStatus.Status`'s doc: "If omitted, only ACTIVE
+/// status events are returned", and the response member's: "If not specified in the request,
+/// this is ACTIVE" (`smithy_query(query="shape",shape="InstrumentationConfigurationStatus")`
+/// -> `["READY", "ERROR", "ACTIVE", "DISABLED"]`).
+pub const DEFAULT_STATUS_EVENT_STATUS: &str = "ACTIVE";
+
+/// The `UnprocessedStatusEventFailureReason` a reported status event earns when it names an
+/// identity this service holds no configuration for
+/// (`smithy_query(query="shape",shape="UnprocessedStatusEventFailureReason")` ->
+/// `["THROTTLED", "INTERNAL_ERROR", "VALIDATION_ERROR"]`): the report is about a
+/// configuration that does not exist, which is a property of the request.
+pub const STATUS_EVENT_FAILED_VALIDATION: &str = "VALIDATION_ERROR";
+
+/// The [`NEXT_TOKEN_TAG`] of `GetInstrumentationConfigurationStatus`, which every token it
+/// issues carries together with a fingerprint of the query that issued it (see
+/// [`instrumentation_status_token_tag`]).
+pub const INSTRUMENTATION_STATUS_EVENTS_TOKEN_TAG: &str = "instrumentation-status-events/1/";
+
+/// The most status events this service keeps for one instrumentation configuration, past
+/// which the OLDEST event it holds is dropped.
+///
+/// AWS publishes no retention for reported status events, so the bound is this emulator's
+/// own; what is not chosen is that there IS one.
+/// `ReportInstrumentationConfigurationStatus` is the only writer and the caller chooses how
+/// often it writes ("Report ACTIVE periodically (for example, every minute) while
+/// instrumentation is running"), so without a cap the store's size would be a property of
+/// the caller rather than of the service. Dropping the oldest event keeps the recent history
+/// a read asks for: the cap holds more than ten pages at the modelled `MaxResults` maximum of
+/// 100, and far more than the hour a read covers by default at the cadence the operation
+/// suggests.
+pub const MAX_STATUS_EVENTS_PER_CONFIGURATION: usize = 1_000;
+
 /// How long a scope whose set has EMPTIED keeps its last-change instant before the record
 /// itself is dropped.
 ///
@@ -1888,6 +1932,11 @@ pub struct InstrumentationConfigurationSet {
     /// than deduce it from the records it still holds \u2014 a deletion leaves no record to read
     /// a timestamp off.
     pub last_changed_at: Option<DateTime>,
+    /// The status events reported for each configuration of this scope, keyed by the same
+    /// [`instrumentation_key`] `configurations` is keyed by — so a configuration and the
+    /// history reported against it are one record's two halves, and the history goes when
+    /// the configuration goes.
+    pub status_history: BTreeMap<String, InstrumentationStatusHistory>,
 }
 
 impl InstrumentationConfigurationSet {
@@ -1901,6 +1950,266 @@ impl InstrumentationConfigurationSet {
         if keep {
             self.last_changed_at = Some(at);
         }
+    }
+}
+
+/// A status event's key within one configuration's history: the instant it was reported for,
+/// then the status reported at that instant.
+///
+/// Time first, so the ordered map is a chronology a read walks backwards ("sorted with the
+/// most recent first") and the oldest event is the one the cap drops. The status is part of
+/// the key because one instant can carry one event per status, and because a repeated report
+/// of the SAME status at the SAME instant is the same event: the operation is `@idempotent`,
+/// so re-reporting one must not add a second event.
+type StatusEventKey = (i64, u32, String);
+
+/// The status events reported against ONE instrumentation configuration.
+///
+/// Bounded at [`MAX_STATUS_EVENTS_PER_CONFIGURATION`] events by [`Self::record`], the only
+/// writer, so a caller reporting for ever does not grow the store for ever.
+#[derive(Debug, Default)]
+pub struct InstrumentationStatusHistory {
+    /// Each event's optional `ErrorCause`, keyed by [`StatusEventKey`].
+    events: BTreeMap<StatusEventKey, Option<String>>,
+}
+
+impl InstrumentationStatusHistory {
+    /// Record that this configuration was in `status` at `at`, with the `error_cause` the
+    /// report carried.
+    ///
+    /// Recording the same status at the same instant again REPLACES the event rather than
+    /// adding one, which is what makes a repeated report of one event a no-op. Once the
+    /// history is at its cap the oldest event it holds is dropped.
+    fn record(&mut self, status: &str, at: &DateTime, error_cause: Option<&str>) {
+        self.events.insert(
+            status_event_key(status, at),
+            error_cause.map(ToString::to_string),
+        );
+        while self.events.len() > MAX_STATUS_EVENTS_PER_CONFIGURATION {
+            self.events.pop_first();
+        }
+    }
+
+    /// How many events this history holds, over every status.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Whether this history holds no event at all.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// One page of the events [`StatusEventQuery`] asks for, most recent first, together with
+    /// the instant of the last event it reported when a further page remains (`None` once the
+    /// page is the last one).
+    ///
+    /// The window is inclusive at both ends: an event is reported for an instant, and an
+    /// instant the caller names as a bound is part of the range it asks about. At most
+    /// `page_size + 1` matching events are collected, and the walk itself is over a history
+    /// bounded by [`MAX_STATUS_EVENTS_PER_CONFIGURATION`].
+    fn page(
+        &self,
+        query: &StatusEventQuery,
+    ) -> (Vec<InstrumentationStatusEvent>, Option<StatusEventInstant>) {
+        // A page of nothing could not advance its own cursor, so a caller following
+        // `NextToken` would loop for ever. `MaxResults` is modelled `range 1..100`, so this
+        // only ever clamps a bound no request can state.
+        let page_size = query.page_size.max(1);
+        let lower = status_event_instant(&query.start);
+        let upper = status_event_instant(&query.end);
+        let mut window: Vec<(&StatusEventKey, &Option<String>)> = self
+            .events
+            .iter()
+            .rev()
+            .filter(|(key, _)| {
+                let at = (key.0, key.1);
+                key.2 == query.status
+                    && at >= lower
+                    && at <= upper
+                    && query.older_than.is_none_or(|bound| at < bound)
+            })
+            .take(page_size.saturating_add(1))
+            .collect();
+
+        let next = if window.len() > page_size {
+            window.truncate(page_size);
+            window.last().map(|(key, _)| (key.0, key.1))
+        } else {
+            None
+        };
+
+        let events = window
+            .into_iter()
+            .map(|(key, error_cause)| InstrumentationStatusEvent {
+                time: DateTime::from_secs_and_nanos(key.0, key.1),
+                error_cause: error_cause.clone(),
+            })
+            .collect();
+        (events, next)
+    }
+}
+
+/// What one status read asks of a configuration's history: the status whose chronology it
+/// walks, the window it covers, where the previous page of the sequence stopped and how many
+/// events a page holds.
+#[derive(Debug, Clone)]
+pub struct StatusEventQuery {
+    pub status: String,
+    pub start: DateTime,
+    pub end: DateTime,
+    pub older_than: Option<StatusEventInstant>,
+    pub page_size: usize,
+}
+
+/// The [`StatusEventKey`] of `status` at `at`.
+fn status_event_key(status: &str, at: &DateTime) -> StatusEventKey {
+    (at.secs(), at.subsec_nanos(), status.to_string())
+}
+
+/// One instant of a status chronology, to the precision a `Timestamp` carries: whole seconds
+/// and the nanoseconds within them.
+pub type StatusEventInstant = (i64, u32);
+
+/// How many nanoseconds make a second, which is the exclusive bound on the subsecond part of
+/// an instant: a value at or above it belongs to the next second and is no subsecond part at
+/// all.
+const NANOS_PER_SECOND: u32 = 1_000_000_000;
+
+/// The [`StatusEventInstant`] of `at`.
+fn status_event_instant(at: &DateTime) -> StatusEventInstant {
+    (at.secs(), at.subsec_nanos())
+}
+
+/// The boundary a status-event `NextToken` carries: the WINDOW the page sequence is being
+/// taken over, and the instant of the last event the previous page reported, which the next
+/// call resolves as an exclusive bound on a chronology read backwards.
+///
+/// The window travels in the token because the default window is RELATIVE ("the last hour"):
+/// recomputing it on the next call would move both its bounds, so a page sequence that named
+/// no window would drift across its own pages. Carrying it keeps every page of one sequence
+/// over one window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusEventCursor {
+    pub start: StatusEventInstant,
+    pub end: StatusEventInstant,
+    pub older_than: StatusEventInstant,
+}
+
+impl StatusEventCursor {
+    /// The cursor for the page after one taken over `[start, end]` whose last event was at
+    /// `older_than`.
+    pub fn new(start: &DateTime, end: &DateTime, older_than: StatusEventInstant) -> Self {
+        Self {
+            start: status_event_instant(start),
+            end: status_event_instant(end),
+            older_than,
+        }
+    }
+
+    /// This cursor as the opaque payload of a `NextToken`.
+    pub fn encode(&self) -> String {
+        let parts = [self.start, self.end, self.older_than]
+            .map(|(secs, nanos)| format!("{secs}.{nanos}"));
+        parts.join("/")
+    }
+
+    /// The cursor a `NextToken` payload carries, or `None` when it is not one [`Self::encode`]
+    /// produced.
+    ///
+    /// A `NextToken` is opaque but not authenticated, so every field it carries is a value a
+    /// caller may have written: an instant is accepted only when its subsecond part is a real
+    /// one (strictly under a second, [`NANOS_PER_SECOND`]), which is the range
+    /// [`Self::window`]'s timestamps are defined over. A payload carrying anything else is not
+    /// a cursor this service issued, and is refused exactly like a token that is not hex.
+    pub fn decode(payload: &str) -> Option<Self> {
+        let mut parts = payload.split('/');
+        let mut instant = || -> Option<StatusEventInstant> {
+            let (secs, nanos) = parts.next()?.split_once('.')?;
+            let secs = secs.parse::<i64>().ok()?;
+            let nanos = nanos.parse::<u32>().ok().filter(|nanos| *nanos < NANOS_PER_SECOND)?;
+            Some((secs, nanos))
+        };
+        let start = instant()?;
+        let end = instant()?;
+        let older_than = instant()?;
+        Some(Self {
+            start,
+            end,
+            older_than,
+        })
+    }
+
+    /// The window this cursor's page sequence is taken over.
+    pub fn window(&self) -> (DateTime, DateTime) {
+        (
+            DateTime::from_secs_and_nanos(self.start.0, self.start.1),
+            DateTime::from_secs_and_nanos(self.end.0, self.end.1),
+        )
+    }
+
+    /// Whether this cursor's window is the one `[start, end]` names.
+    pub fn covers(&self, start: &DateTime, end: &DateTime) -> bool {
+        self.start == status_event_instant(start) && self.end == status_event_instant(end)
+    }
+}
+
+/// The `NextToken` tag one status read issues its page tokens under: the operation's
+/// [`INSTRUMENTATION_STATUS_EVENTS_TOKEN_TAG`] plus a fingerprint of the configuration and
+/// the status whose chronology the page was taken over.
+///
+/// A cursor is a boundary within ONE chronology, so a token issued for another configuration
+/// or another status would silently skip or repeat events if it were honoured. Binding the
+/// chronology's identity into the tag makes such a token fail to decode, and it is refused
+/// like any other token this service did not issue. The window is not part of the identity:
+/// it travels inside the cursor (see [`StatusEventCursor`]).
+pub fn instrumentation_status_token_tag(
+    scope: &InstrumentationScope,
+    key: &str,
+    status: &str,
+) -> String {
+    let fingerprint = stable_hash(&[
+        Some(scope.instrumentation_type.as_str()),
+        Some(scope.service.as_str()),
+        Some(scope.environment.as_str()),
+        Some(key),
+        Some(status),
+    ]);
+    format!("{INSTRUMENTATION_STATUS_EVENTS_TOKEN_TAG}{fingerprint}/")
+}
+
+/// The window a status read covers: the one the request names, or the documented default.
+///
+/// `StartTime` and `EndTime` "must both be provided together or both be omitted", and "when
+/// both are omitted, the time range defaults to the last hour" — so a request naming exactly
+/// one of them names no window, and neither does one whose window ends before it begins.
+/// `Err` carries the refusal such a request earns.
+pub fn status_event_window(
+    start: Option<&DateTime>,
+    end: Option<&DateTime>,
+    now: &DateTime,
+) -> Result<(DateTime, DateTime), String> {
+    // Compared and derived on the exact instants a `Timestamp` carries — seconds and the
+    // nanoseconds within them, the same pair the history is keyed by — so one precision model
+    // governs the window and the events it selects.
+    match (start, end) {
+        (None, None) => Ok((
+            DateTime::from_secs_and_nanos(
+                now.secs()
+                    .saturating_sub(STATUS_EVENT_DEFAULT_WINDOW.as_secs() as i64),
+                now.subsec_nanos(),
+            ),
+            *now,
+        )),
+        (Some(start), Some(end))
+            if status_event_instant(end) >= status_event_instant(start) =>
+        {
+            Ok((*start, *end))
+        }
+        (Some(_), Some(_)) => Err("EndTime must not be earlier than StartTime".to_string()),
+        _ => Err(
+            "StartTime and EndTime must both be provided together or both be omitted".to_string(),
+        ),
     }
 }
 
@@ -2040,6 +2349,10 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         for (scope, key, expires_at, arn) in lapsed {
             if let Some(set) = self.instrumentation_configurations.get_mut(&scope) {
                 set.configurations.remove(&key);
+                // The status history belongs to the configuration, so it goes with it: a
+                // later configuration created at the same location is a NEW resource and
+                // has reported nothing yet.
+                set.status_history.remove(&key);
                 set.record_change(expires_at);
             }
             // Tags are addressed by resource ARN, so a record that is gone takes its tags
@@ -2059,6 +2372,72 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         });
 
         self.instrumentation_due_at = self.next_instrumentation_pass();
+    }
+
+    /// Record that the configuration stored in `scope` under `key` ([`instrumentation_key`])
+    /// was in `status` at `at`, with the `error_cause` the report carried, and answer whether
+    /// the event was recorded.
+    ///
+    /// `false` — and nothing recorded — when the scope holds no configuration at that
+    /// location: a status event is reported AGAINST a configuration, so there is nothing for
+    /// one naming no configuration to be recorded against. Recording the same status at the
+    /// same instant again replaces the event rather than adding one, so repeating a report
+    /// changes nothing further.
+    pub fn record_instrumentation_status(
+        &mut self,
+        scope: &InstrumentationScope,
+        key: &str,
+        status: &str,
+        at: &DateTime,
+        error_cause: Option<&str>,
+    ) -> bool {
+        let Some(set) = self.instrumentation_configurations.get_mut(scope) else {
+            return false;
+        };
+        if !set.configurations.contains_key(key) {
+            return false;
+        }
+        set.status_history
+            .entry(key.to_string())
+            .or_default()
+            .record(status, at, error_cause);
+        true
+    }
+
+    /// The status history of the configuration stored in `scope` under `key`
+    /// ([`instrumentation_key`]), or `None` when the scope holds no history for that
+    /// location — which is the state of a configuration nothing has reported for.
+    pub fn instrumentation_status_history(
+        &self,
+        scope: &InstrumentationScope,
+        key: &str,
+    ) -> Option<&InstrumentationStatusHistory> {
+        self.instrumentation_configurations
+            .get(scope)
+            .and_then(|set| set.status_history.get(key))
+    }
+
+    /// One page of the events [`StatusEventQuery`] asks for, of the configuration stored in
+    /// `scope` under `key`, together with the cursor for the page after it.
+    ///
+    /// A configuration nothing has reported for has an empty history, which is not an error:
+    /// the resource exists and its status events are the empty list.
+    pub fn page_instrumentation_status_events(
+        &self,
+        scope: &InstrumentationScope,
+        key: &str,
+        query: &StatusEventQuery,
+    ) -> (Vec<InstrumentationStatusEvent>, Option<StatusEventCursor>) {
+        let (events, next) = match self.instrumentation_status_history(scope, key) {
+            Some(history) => history.page(query),
+            None => (Vec::new(), None),
+        };
+        (
+            events,
+            next.map(|older_than| {
+                StatusEventCursor::new(&query.start, &query.end, older_than)
+            }),
+        )
     }
 
     /// Whether `scope`'s set has changed since `since`.
@@ -2373,6 +2752,10 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         let (removed, emptied) = {
             let set = self.instrumentation_configurations.get_mut(scope)?;
             let removed = set.configurations.remove(key)?;
+            // The status history belongs to the configuration, so it goes with it: a later
+            // configuration created at the same location is a NEW resource and has reported
+            // nothing yet.
+            set.status_history.remove(key);
             set.record_change(at);
             (removed, set.configurations.is_empty())
         };

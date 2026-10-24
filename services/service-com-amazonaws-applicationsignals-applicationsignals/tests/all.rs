@@ -27,6 +27,8 @@ mod get_service;
 mod grouping_configuration;
 #[path = "all/instrumentation_configuration_deletion.rs"]
 mod instrumentation_configuration_deletion;
+#[path = "all/instrumentation_configuration_status.rs"]
+mod instrumentation_configuration_status;
 #[path = "all/instrumentation_configuration_tags.rs"]
 mod instrumentation_configuration_tags;
 #[path = "all/instrumentation_configurations.rs"]
