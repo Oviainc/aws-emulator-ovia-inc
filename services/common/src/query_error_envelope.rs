@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The `<RequestId>` element an `awsQuery` `<ErrorResponse>` carries beside its `<Error>`,
-//! for every emulated service whose model speaks that protocol.
+//! The request id a response reports, for every emulated service: the `<RequestId>`
+//! element an `awsQuery` `<ErrorResponse>` carries beside its `<Error>`, and the response
+//! HEADER AWS reports the same id in whatever the protocol.
 //!
 //! AWS answers an `awsQuery` error with
 //!
@@ -32,11 +33,32 @@
 //! * a response a service renders ITSELF (an API-version refusal on a shared endpoint,
 //!   say) is passed through [`with_request_id`] directly.
 //!
-//! Only the envelope is this module's business: the HTTP status, the `<Type>`, the
-//! `<Code>`, the `<Message>` and the entire success path stay with the framework renderer
-//! that owns them, so each has exactly one home. Nothing here is protocol-specific beyond
-//! the one element: a document that is not an `awsQuery` `<ErrorResponse>` is returned
-//! untouched, so a service of any other protocol can hold the wrapper harmlessly.
+//! # The two reports
+//!
+//! WHERE a response states the id is the one protocol-dependent part, so it is the one
+//! thing a service chooses here. The two seams above take that choice as a REPORT — a
+//! function from the rendered response to the response as it is sent — and the plumbing
+//! around it (resolving the modelled operation, delegating to it, wrapping the three
+//! framework-level renderers) is stated once and shared by both:
+//!
+//! * [`with_request_id`], the `awsQuery` report: the `<RequestId>` element in the error
+//!   envelope AND the header, carrying one id so a client correlating on either sees the
+//!   same value. Reached through [`RequestIdEnvelopeOperation`] and
+//!   [`RequestIdEnvelopeDefinition::new`].
+//! * [`with_request_id_header`], the protocol-independent report: the header ALONE, on
+//!   every response — success or failure — which is what a service whose protocol has no
+//!   envelope element for the id (`restJson1`, `restXml`, `awsJson`, `rpcv2Cbor`) answers
+//!   with. Reached through [`RequestIdHeaderOperation`] and
+//!   [`RequestIdEnvelopeDefinition::header_only`].
+//!
+//! Only the request id is this module's business: the HTTP status, the `<Type>`, the
+//! `<Code>`, the `<Message>`, the body of a success and every other header stay with the
+//! framework renderer that owns them, so each has exactly one home. The only
+//! protocol-specific part is the `awsQuery` element: a document that is not an `awsQuery`
+//! `<ErrorResponse>` is returned untouched by [`with_request_id`], so a service of any
+//! other protocol can hold that wrapper harmlessly — and reaches for
+//! [`with_request_id_header`] instead, which reports the id on its every response without
+//! reading the body at all.
 //!
 //! This is the shared home the service-local copies of this rule record as their migration
 //! target — `services/service-com-amazonaws-rds-amazonrdsv19`,
@@ -210,6 +232,30 @@ pub fn with_request_id(mut resp: RtResponse) -> RtResponse {
     resp
 }
 
+/// The response with the request it answers named in the header AWS reports that id in,
+/// and nothing else changed — the protocol-independent report.
+///
+/// Every response gets one, a success as much as a failure: the header is a property of
+/// the RESPONSE, which is why no model declares it and no handler can set it, and it is
+/// what SDK logging and `ServiceError::request_id()` read. The body, the status and every
+/// other header are left exactly as the renderer wrote them, so this is the whole report
+/// for a protocol with no envelope element for the id (`restJson1`, `restXml`, `awsJson`,
+/// `rpcv2Cbor`).
+///
+/// A response that already names its request keeps the id it has, so this is idempotent
+/// and two layers of one service cannot report two ids for one call. A header the HTTP
+/// layer will not carry is dropped rather than turned into a transport failure, which on
+/// an error path would replace a modelled 4xx with a 500 an SDK retries.
+pub fn with_request_id_header(mut resp: RtResponse) -> RtResponse {
+    if resp.headers().get(REQUEST_ID_HEADER).is_some() {
+        return resp;
+    }
+    let _ = resp
+        .headers_mut()
+        .try_insert(REQUEST_ID_HEADER, new_request_id());
+    resp
+}
+
 /// The modelled operation the service's routing table names for this request, or `None`
 /// when the request names none.
 fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dyn ErasedOperation> {
@@ -218,8 +264,39 @@ fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dy
     definition.routing_table().get(key)
 }
 
+/// How one response of a service reports the request it answers: [`with_request_id`] for
+/// `awsQuery`, [`with_request_id_header`] for every other protocol.
+///
+/// A function rather than a type parameter, so one service's operation wrapper and
+/// definition wrapper can be handed the SAME report and cannot report differently.
+type Report = fn(RtResponse) -> RtResponse;
+
+/// Serve the modelled operation the service's own routing table names for `req`, exactly
+/// as that table would, and `report` the request id on the response.
+///
+/// The ONE statement of the operation-wrapper plumbing: the two wrappers below differ only
+/// in the report they pass in. No operation of its own is stored and no routing decision is
+/// made here — the operation run is the one the service's table names for the request, so
+/// the framework still owns the whole deserialize -> validate -> handle -> serialize
+/// sequence and every status, code and message it answers with.
+async fn serve_reporting<'r>(
+    svc: &'r dyn Service,
+    req: &'r RtRequest,
+    ctx: &'r OperationContext<'r>,
+    report: Report,
+) -> RtResponse {
+    match modeled_operation(svc, req) {
+        Some(op) => report(op.run(svc, req, ctx).await),
+        // Unreachable through a `Service::override_operation` that claims a request only
+        // when the routing table holds its key ([`RequestIdEnvelopeDefinition::routes`]);
+        // answered as the framework answers an unroutable request rather than guessed at
+        // (and a service holding the definition wrapper reports the id on it there).
+        None => svc.definition().routing_error_response(req),
+    }
+}
+
 /// Serves a modelled operation through the framework exactly as the routing table would,
-/// then adds the envelope's `<RequestId>` to the response.
+/// then adds the envelope's `<RequestId>` to the response — the `awsQuery` report.
 ///
 /// It stores no operation of its own: the one it delegates to is the one the service's
 /// routing table names for the request, resolved from the `svc` the framework passes into
@@ -235,22 +312,40 @@ impl ErasedOperation for RequestIdEnvelopeOperation {
         req: &'r RtRequest,
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
-        Box::pin(async move {
-            match modeled_operation(svc, req) {
-                Some(op) => with_request_id(op.run(svc, req, ctx).await),
-                // Unreachable through a `Service::override_operation` that claims a
-                // request only when the routing table holds its key
-                // ([`RequestIdEnvelopeDefinition::routes`]); answered as the framework
-                // answers an unroutable request rather than guessed at.
-                None => svc.definition().routing_error_response(req),
-            }
-        })
+        Box::pin(serve_reporting(svc, req, ctx, with_request_id))
     }
 
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
         // `None` is "defer to the modelled operation the routing key names" — which is
         // the operation this wrapper delegates to, so its model-declared schemes decide
         // and this wrapper cannot weaken them.
+        None
+    }
+}
+
+/// Serves a modelled operation exactly as the routing table would, then names the request
+/// in the response's header — the protocol-independent report, for a service whose protocol
+/// carries the id in the header alone.
+///
+/// The same wrapper serves every operation of such a service, and it is the one place each
+/// of their responses passes through, so no operation can answer — with a success, a
+/// modelled error, or a constraint refusal raised while it was being served — without
+/// naming the request it answered.
+pub struct RequestIdHeaderOperation;
+
+impl ErasedOperation for RequestIdHeaderOperation {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(serve_reporting(svc, req, ctx, with_request_id_header))
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // See [`RequestIdEnvelopeOperation::auth_schemes`]: the modelled operation this
+        // wrapper delegates to is what decides, so wrapping cannot weaken its schemes.
         None
     }
 }
@@ -262,19 +357,39 @@ impl ErasedOperation for RequestIdEnvelopeOperation {
 /// Identity, the routing table and the protocol come from the wrapped definition
 /// untouched — nothing model-derived is restated here. Generic over that definition rather
 /// than over an engine, so this crate names no service's generated type.
+///
+/// The report is chosen by the constructor: [`new`](Self::new) for an `awsQuery` service
+/// (the envelope element and the header) and [`header_only`](Self::header_only) for every
+/// other protocol (the header alone, on every response).
 pub struct RequestIdEnvelopeDefinition<D> {
     inner: D,
+    report: Report,
 }
 
 impl<D: ErasedServiceDefinition> RequestIdEnvelopeDefinition<D> {
-    /// Wrap a service's generated definition.
+    /// Wrap a service's generated definition, reporting the id the way `awsQuery` does:
+    /// the `<RequestId>` element in the error envelope, and the header beside it.
     pub fn new(inner: D) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            report: with_request_id,
+        }
+    }
+
+    /// Wrap a service's generated definition, reporting the id in the header alone — the
+    /// whole report for a protocol with no envelope element for it.
+    pub fn header_only(inner: D) -> Self {
+        Self {
+            inner,
+            report: with_request_id_header,
+        }
     }
 
     /// Whether the generated routing table can serve this request — the condition under
-    /// which a service claims it for [`RequestIdEnvelopeOperation`], so an `Action` naming
-    /// no modelled operation stays the framework's (or the service's own) routing failure.
+    /// which a service claims it for [`RequestIdEnvelopeOperation`] or
+    /// [`RequestIdHeaderOperation`], so a request naming no modelled operation (an
+    /// `Action` the model does not declare, a method and path the model does not bind)
+    /// stays the framework's (or the service's own) routing failure.
     pub fn routes(&self, req: &RtRequest) -> bool {
         self.inner
             .protocol()
@@ -299,14 +414,14 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for RequestIdEnvelopeDe
     }
 
     fn routing_error_response(&self, req: &RtRequest) -> RtResponse {
-        with_request_id(self.inner.routing_error_response(req))
+        (self.report)(self.inner.routing_error_response(req))
     }
 
     fn framework_error_response(
         &self,
         error: aws_smithy_schema_server::ProtocolError,
     ) -> RtResponse {
-        with_request_id(self.inner.framework_error_response(error))
+        (self.report)(self.inner.framework_error_response(error))
     }
 
     fn refusal_response(
@@ -314,7 +429,7 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for RequestIdEnvelopeDe
         error: aws_smithy_schema_server::ProtocolError,
         chosen: Option<smithy_server_runtime::Refused>,
     ) -> RtResponse {
-        with_request_id(self.inner.refusal_response(error, chosen))
+        (self.report)(self.inner.refusal_response(error, chosen))
     }
 }
 
@@ -470,5 +585,75 @@ mod tests {
                 "case {case:?}: expected is_request_id({id:?}) == {expected}"
             );
         }
+    }
+
+    /// One response, as the header-only report hands it on.
+    fn reported(status: u16, body: &'static str) -> RtResponse {
+        with_request_id_header(RtResponse::new(
+            aws_smithy_runtime_api::http::StatusCode::try_from(status)
+                .expect("the test status is valid"),
+            SdkBody::from(body),
+        ))
+    }
+
+    /// The protocol-independent report names the request on EVERY response — a success as
+    /// much as a failure, with a body or without one — and changes nothing else about it.
+    #[test]
+    fn the_header_report_names_the_request_on_every_response() {
+        for (case, status, body) in [
+            ("a restJson1 success", 200u16, "{\"tags\":{}}"),
+            ("an empty-bodied success", 204, ""),
+            ("a restJson1 error document", 404, "{\"message\":\"no\"}"),
+            ("a body that is no document at all", 501, "not a document"),
+        ] {
+            let reported = reported(status, body);
+            let stated = reported
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .expect("the report names the request");
+            assert!(
+                is_request_id(stated),
+                "case {case:?}: expected the form of a request id, got {stated:?}"
+            );
+            assert_eq!(
+                reported.status().as_u16(),
+                status,
+                "case {case:?}: the status must not change"
+            );
+            assert_eq!(
+                reported.body().bytes(),
+                Some(body.as_bytes()),
+                "case {case:?}: the body must not change"
+            );
+        }
+    }
+
+    /// The report is per CALL and idempotent: two responses never name the same request,
+    /// and a response that already names one keeps the id it has.
+    #[test]
+    fn the_header_report_is_fresh_per_call_and_idempotent() {
+        let first = reported(200, "{}");
+        let second = reported(200, "{}");
+        let (first, second) = (
+            first.headers().get(REQUEST_ID_HEADER).map(str::to_string),
+            second.headers().get(REQUEST_ID_HEADER).map(str::to_string),
+        );
+        assert_ne!(
+            first, second,
+            "expected a fresh id per call, got {first:?} twice"
+        );
+
+        let mut already = RtResponse::new(
+            aws_smithy_runtime_api::http::StatusCode::try_from(200u16).expect("200"),
+            SdkBody::from("{}"),
+        );
+        let stated = "11112222-3333-4444-5555-666677778888";
+        let _ = already.headers_mut().try_insert(REQUEST_ID_HEADER, stated);
+        let kept = with_request_id_header(already);
+        assert_eq!(
+            kept.headers().get(REQUEST_ID_HEADER),
+            Some(stated),
+            "a response that already names its request keeps that id"
+        );
     }
 }

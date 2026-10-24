@@ -243,7 +243,8 @@ async fn the_created_instance_is_stored_and_read_back() {
         );
 
         // Before that instant the instance is in the transient status the model's
-        // `InstanceStatus` enum declares, in the API and in every Region it holds.
+        // `InstanceStatus` enum declares, and its Regions in the one the model's
+        // `RegionStatus` enum declares for an enablement still in flight.
         hold_activation(&engine, closed_at + Duration::from_secs(3_600));
         let pending = describe(&router, &instance_arn).await;
         assert_eq!(
@@ -252,10 +253,14 @@ async fn the_created_instance_is_stored_and_read_back() {
             "case {label:?}: a just-created instance is CREATE_IN_PROGRESS, got {:?}",
             pending["Status"]
         );
+        // Its Region carries a `RegionStatus` value, a different enum from the instance's
+        // own `InstanceStatus`: the enablement is in flight, which `RegionStatus` spells
+        // ADDING. `instance_region_status.rs` asserts that over the whole lifecycle.
         assert_eq!(
             pending["Regions"][0]["Status"].as_str(),
-            Some("CREATE_IN_PROGRESS"),
-            "case {label:?}: its Region carries the same status, got {:?}",
+            Some("ADDING"),
+            "case {label:?}: its Region's enablement is in flight, so it is ADDING, got \
+             {:?}",
             pending["Regions"]
         );
         // What the request set is echoed from the STORED record, and an absent `Name`

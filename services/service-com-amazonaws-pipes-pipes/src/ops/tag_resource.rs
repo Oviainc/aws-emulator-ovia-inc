@@ -2,14 +2,15 @@
 
 //! @op TagResource
 //! IMPLEMENTED: merges the request's tags into the ones persisted on the pipe the
-//! `resourceArn` names — a new key is added, a key already present has its value replaced.
-//! An ARN no stored pipe carries is `NotFoundException` (404); a merge that would push the
-//! pipe past 50 tags is `ValidationException` (400). This is the ONLY file to touch for this
-//! operation.
+//! `resourceArn` names — a new key is added, a key already present has its value replaced,
+//! and every tag the request does not name (like every other member of the record) is left
+//! exactly as it was. An ARN no stored pipe carries is `NotFoundException` (404); a tag
+//! whose key or value breaks `TagKey`/`TagValue`'s published length bounds, a key using the
+//! prefix AWS reserves for its own tags, and a merge that would push the pipe past 50 tags
+//! are each `ValidationException` (400). This is the ONLY file to touch for this operation.
 //!
-//! STILL MISSING, tracked by `issues/.../pipes-tagresource-stub.md`: the refusals AWS makes
-//! on a tag key's CONTENT (the reserved `aws:` prefix, and the character rules the modelled
-//! `TagKey`/`TagValue` length constraints do not express). Those keys are accepted here.
+//! The key-content rules live in [`crate::state::tag_violation`], so the create path that
+//! also installs tags refuses exactly what this one refuses.
 //!
 //! ## Shape of an operation
 //!
@@ -160,6 +161,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle_due_transitions();
 
+        // Every tag in a deterministic order, so a request carrying several illegal ones
+        // is always refused with the same message.
+        let requested: ::std::collections::BTreeMap<&String, &String> =
+            input.tags.iter().collect();
+
+        // `TagKey`'s and `TagValue`'s `@length` bounds, plus the tag-key prefix AWS
+        // reserves for itself. The boundary validator walks a map's own entry count and
+        // its values' shapes but not its KEYS, so the rule is enforced here — with the
+        // `ValidationException` the model declares, never a 501.
+        for (&key, &value) in &requested {
+            if let Some(violation) = crate::state::tag_violation(key, value) {
+                return Err(TagResourceErrorModeled::ValidationException(
+                    crate::state::tag_violation_error("tags", violation),
+                )
+                .into());
+            }
+        }
+
         let pipe = state.pipe_by_arn_mut(&input.resource_arn).ok_or_else(|| {
             TagResourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(format!("Pipe not found: {}", input.resource_arn)),
@@ -193,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A new key is appended, a key already on the pipe has its value replaced — and a
         // key the request does not name is left alone, which is what makes a repeated
         // `TagResource` idempotent.
-        for (key, value) in &input.tags {
+        for (key, value) in requested {
             pipe.tags.insert(key.clone(), value.clone());
         }
 
