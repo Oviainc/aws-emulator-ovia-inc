@@ -7,6 +7,11 @@
 //! `GetAppBundle` and `ListAppBundles` answer from the same bytes this call
 //! wrote.
 //!
+//! An app bundle is a per-Region resource of the account, and AppFabric's quota
+//! allows one per account per Region ([`crate::state::MAX_APP_BUNDLES_PER_REGION`]),
+//! so a create while that Region's bundle still exists is refused with the
+//! modelled `ServiceQuotaExceededException`.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request.
@@ -176,9 +181,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = crate::state::new_uuid();
-        // A RESOURCE GUARD on the store, answered with the quota error this
-        // operation models. Checked AFTER the idempotent replay above, so a retry
-        // of a bundle that already exists is never refused by it.
+        // An app bundle is a PER-REGION resource of the account: the published
+        // quota allows one per account per Region, so a create while that
+        // Region's bundle still exists is the quota error this operation models,
+        // and it succeeds again once `DeleteAppBundle` has removed it. Checked
+        // AFTER the idempotent replay above, so a retry of a bundle that already
+        // exists is never refused by it.
+        if store.bundles_in_region(&region) >= crate::state::MAX_APP_BUNDLES_PER_REGION {
+            return Err(CreateAppBundleErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    ::engine::emulator_account_id(),
+                    "AppBundle",
+                    "AppBundlesPerRegion",
+                    crate::state::MAX_APP_BUNDLES_PER_REGION,
+                ),
+            )
+            .into());
+        }
+        // A RESOURCE GUARD on the store, which serves every Region a caller may
+        // sign for and so is not bounded by the per-Region quota alone.
         if store.app_bundles.len() >= crate::state::MAX_APP_BUNDLES {
             return Err(CreateAppBundleErrorModeled::ServiceQuotaExceededException(
                 crate::state::quota_exceeded(
@@ -195,6 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::AppBundleRecord {
             id: id.clone(),
             arn: arn.clone(),
+            region: region.clone(),
             customer_managed_key_arn,
             tags: input.tags.unwrap_or_default(),
             created_at: ::std::time::SystemTime::now(),

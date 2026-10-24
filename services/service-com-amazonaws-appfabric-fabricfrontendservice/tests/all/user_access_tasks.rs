@@ -561,8 +561,10 @@ async fn an_unknown_app_bundle_is_refused_by_both_operations() {
 #[tokio::test]
 async fn a_task_id_resolves_only_within_its_own_bundle() {
     let emulator = Emulator::new();
-    let first = app_bundle(&emulator).await;
-    let second = app_bundle(&emulator).await;
+    // Two bundles at once, so each is created in its own Region: an account
+    // holds one app bundle per Region.
+    let first = emulator.fixture_bundle(0).await;
+    let second = emulator.fixture_bundle(1).await;
     authorization(&emulator, &first, "SLACK", "tenant-first", true).await;
     authorization(&emulator, &first, "ZOOM", "tenant-first-2", true).await;
     authorization(&emulator, &second, "JIRA", "tenant-second", true).await;

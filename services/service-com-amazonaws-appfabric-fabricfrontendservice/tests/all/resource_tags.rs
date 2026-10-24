@@ -356,10 +356,8 @@ async fn a_tag_set_belongs_to_one_resource() {
     let emulator = Emulator::new();
     let resources = taggable_resources(&emulator, json!([])).await;
     // A second bundle, so the table also spans two resources of the SAME kind.
-    let other_bundle = arn_of(
-        &emulator.create_app_bundle(json!({})).await.body,
-        "appBundle",
-    );
+    // It lives in its own Region, because a Region holds one app bundle.
+    let other_bundle = emulator.fixture_bundle(1).await;
 
     let mut arns: Vec<(String, String)> = resources
         .iter()
@@ -436,14 +434,9 @@ async fn listing_tags_changes_nothing() {
 #[tokio::test]
 async fn an_unknown_resource_arn_is_not_found() {
     let emulator = Emulator::new();
-    let live_bundle = arn_of(
-        &emulator.create_app_bundle(json!({})).await.body,
-        "appBundle",
-    );
-    let deleted_bundle = arn_of(
-        &emulator.create_app_bundle(json!({})).await.body,
-        "appBundle",
-    );
+    let live_bundle = emulator.fixture_bundle(0).await;
+    // In its own Region, so both bundles can exist at once.
+    let deleted_bundle = emulator.fixture_bundle(1).await;
     let deleted_ingestion = arn_of(
         &emulator
             .create_ingestion(
