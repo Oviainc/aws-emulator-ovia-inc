@@ -423,9 +423,9 @@ fn quote(overrides: Value) -> Value {
 
 /// Rule B over every constraint class the model puts on this service's members,
 /// across a route whose member is a URI label, one whose member is in the body,
-/// and one whose member is a query parameter — and across an operation that is
-/// implemented and two that are still 501 stubs, because the report is produced
-/// at the boundary, before any handler runs.
+/// and one whose member is a query parameter — and across implemented operations
+/// and one that is still a 501 stub (`GetConnection`), because the report is
+/// produced at the boundary, before any handler runs.
 #[tokio::test]
 async fn validation_reports_name_the_member_and_constraint_and_omit_the_value() {
     let outposts = Outposts::new();
