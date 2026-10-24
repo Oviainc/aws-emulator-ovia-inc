@@ -1,37 +1,48 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `BatchGetTaxExemptions`: the tax exemptions this service reports for the
-//! accounts a caller names, end to end over the restJson1 wire.
+//! Tax exemptions end to end over the restJson1 wire: what `PutTaxExemption`
+//! records, and what `BatchGetTaxExemptions` and `ListTaxExemptions` report.
 //!
 //! The rules under test:
 //!
-//! * the call reports, for each account it names, the exemptions this service
-//!   holds for that account — every stored record, member for member — and an
-//!   account it holds none for simply has no entry in the reported map;
+//! * the reads report, for each account, the exemptions this service holds for
+//!   it — every stored record, member for member — and an account it holds none
+//!   for simply has no entry in the reported map;
 //! * an account this service holds no tax settings for and that is not the
 //!   caller's own is outside the caller's consolidated billing family, so the
 //!   CALL is refused with `ResourceNotFoundException` (404) rather than reported
-//!   on;
+//!   on or written for;
 //! * an exemption whose expiration date has passed is reported `Expired`,
 //!   because lapsing is a transition the clock owes; every other recorded status
 //!   is reported as recorded;
+//! * a submission records the exemption its `exemptionType` and `authority`
+//!   identify for EVERY account it names, under one support case id, and that
+//!   pair is the exemption's identity — submitting it again replaces the
+//!   account's record rather than adding one beside it;
+//! * `ListTaxExemptions` pages over the accounts holding an exemption in
+//!   account-id order, the page size being the server's decision, and a cursor it
+//!   did not issue is refused;
 //! * reading is a report: it changes neither the exemptions nor anything beside
-//!   them.
+//!   them;
+//! * a request naming an exemption type the service does not publish, or a
+//!   jurisdiction that type does not apply in, is refused and stores nothing.
 //!
 //! The tables below span the classes those rules generalise over — the kinds of
 //! evidence an account is in the family (the caller's own, a stored TRN, stored
 //! exemptions), the number of accounts named (one, the model's `@length` bound of
 //! five, one past it, and duplicates), the catalog entry an exemption was granted
-//! under, the authority's shape (a country, a country and a state), which dates a
-//! record carries, and every value of `EntityExemptionAccountStatus` crossed with
-//! an expiration in the past, in the future and absent.
+//! under and whether it is named by its description or its display name, the
+//! authority's shape (a country, a country and a state, either re-cased or
+//! padded), which dates a record carries, every value of
+//! `EntityExemptionAccountStatus` crossed with an expiration in the past, in the
+//! future and absent, several page sizes against several store sizes, and each
+//! published bound of `maxResults` plus one past it.
 //!
-//! `PutTaxExemption` — the writer AWS models for these records — is still a
-//! scaffold stub with its own issue, so the tables seed the store the way
-//! `tax_registration_lifecycle.rs` moves a clock-owed transition: through the
-//! shared engine's state, the same store the handler reads.
+//! Where a table needs a store rather than a wire write it seeds the shared
+//! engine's state the way `tax_registration_lifecycle.rs` moves a clock-owed
+//! transition: through the same store the handlers read.
 //!
-//! The harness (`emulator_with_engine`, `call`) lives in
+//! The harness (`emulator`, `emulator_with_engine`, `call`) lives in
 //! `tax_registration_lifecycle.rs`; nothing here builds a second one.
 
 use std::sync::Arc;
@@ -41,16 +52,17 @@ use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::ops::types::{Authority, TaxExemptionType};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
     tax_exemption_type_catalog, ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxExemption,
-    EXEMPTION_STATUS_EXPIRED, EXEMPTION_STATUS_NONE, EXEMPTION_STATUS_PENDING,
-    EXEMPTION_STATUS_VALID,
+    DEFAULT_PAGE_SIZE, EXEMPTION_STATUS_EXPIRED, EXEMPTION_STATUS_NONE, EXEMPTION_STATUS_PENDING,
+    EXEMPTION_STATUS_VALID, MAX_STORED_EXEMPTIONS,
 };
+use smithy_server_runtime::MultiServiceRouter;
 
 use crate::tax_exemption_types::wire_form;
-use crate::tax_registration_lifecycle::{call, emulator_with_engine, Answer};
+use crate::tax_registration_lifecycle::{call, emulator, emulator_with_engine, Answer};
 
 /// Record `exemptions` as `account_id`'s tax exemptions in the shared engine's
-/// store — the store the handler reads — standing in for the write
-/// `PutTaxExemption` will perform once it is implemented.
+/// store — the store the handlers read — for a table that is about what a read
+/// reports rather than about the write that recorded it.
 fn seed_exemptions(
     engine: &Arc<engine::InMemoryEngine>,
     account_id: &str,
@@ -617,29 +629,35 @@ async fn an_exemption_is_reported_expired_once_its_expiration_has_passed() {
             )],
         );
 
-        let answer = call(
-            &router,
-            "BatchGetTaxExemptions",
-            &json!({ "accountIds": [account_id] }),
-        )
-        .await;
-        assert_eq!(
-            (answer.status, answer.error_code.as_str()),
-            (200, ""),
-            "case {case:?}: expected 200, got {answer:?}"
-        );
-        let reported = reported_exemptions(&answer, account_id);
-        assert_eq!(
-            reported.len(),
-            1,
-            "case {case:?}: expected the one recorded exemption, got {reported:?}"
-        );
-        assert_eq!(
-            reported[0].get("status").and_then(Value::as_str),
-            Some(expected),
-            "case {case:?}: expected status {expected:?}, got {:?}",
-            reported[0]
-        );
+        // Both readers project one record the same way, so each is asserted on
+        // the same row rather than one of them being trusted to agree.
+        for (reader, request) in [
+            (
+                "BatchGetTaxExemptions",
+                json!({ "accountIds": [account_id] }),
+            ),
+            ("ListTaxExemptions", json!({})),
+        ] {
+            let case = format!("{case} through {reader}");
+            let answer = call(&router, reader, &request).await;
+            assert_eq!(
+                (answer.status, answer.error_code.as_str()),
+                (200, ""),
+                "case {case:?}: expected 200, got {answer:?}"
+            );
+            let reported = reported_exemptions(&answer, account_id);
+            assert_eq!(
+                reported.len(),
+                1,
+                "case {case:?}: expected the one recorded exemption, got {reported:?}"
+            );
+            assert_eq!(
+                reported[0].get("status").and_then(Value::as_str),
+                Some(expected),
+                "case {case:?}: expected status {expected:?}, got {:?}",
+                reported[0]
+            );
+        }
 
         // The derivation is a projection of the record and the clock: the stored
         // status is left exactly as it was, so a later caller sees the same.
@@ -738,24 +756,945 @@ async fn reading_exemptions_changes_nothing() {
         "case \"an inheritance read after an exemption read\": expected the unchanged default, \
          got {inheritance:?}"
     );
+}
 
-    // A read of an account that holds no exemption must not create one, so the
-    // same account still reports nothing on the next call.
-    let empty = call(
+// ---------------------------------------------------------------------------
+// `PutTaxExemption` and `ListTaxExemptions`: the write, and the listing that
+// pages over what it recorded.
+// ---------------------------------------------------------------------------
+
+/// A certificate file to submit: `documentFile` is a blob, which restJson1
+/// carries base64-encoded.
+fn certificate(document_name: &str) -> Value {
+    json!({
+        "documentName": document_name,
+        "documentFile": ::aws_smithy_types::base64::encode("%PDF-1.4 exemption certificate"),
+    })
+}
+
+/// Make each of `accounts` an account this service holds tax settings for, so a
+/// submission naming it is inside the caller's consolidated billing family.
+async fn hold_tax_settings_for(router: &MultiServiceRouter, accounts: &[&str]) {
+    for account in accounts {
+        let stored = call(
+            router,
+            "PutTaxRegistration",
+            &json!({ "accountId": account, "taxRegistrationEntry": a_registration() }),
+        )
+        .await;
+        assert_eq!(
+            stored.status, 200,
+            "case \"setup for {account}\": the registration must store, got {stored:?}"
+        );
+    }
+}
+
+/// One `PutTaxExemption` submission and what the listing must then report for it.
+struct Submission {
+    case: &'static str,
+    accounts: &'static [&'static str],
+    /// The `exemptionType` the request names: the `description` or the
+    /// `displayName` of an entry the catalog publishes
+    /// (`smithy_query(query="doc", shape="PutTaxExemptionRequest",
+    /// member="exemptionType")`: "Use the supported tax exemption type
+    /// description").
+    exemption_type: &'static str,
+    country: &'static str,
+    state: Option<&'static str>,
+    /// `ExemptionCertificate$documentName`, whose modelled pattern admits a
+    /// `.pdf`, `.jpg` or `.png` suffix in either case
+    /// (`smithy_query(query="shape", shape="ExemptionCertificate")`).
+    document_name: &'static str,
+    expected_display_name: &'static str,
+    expected_description: &'static str,
+    expected_country: &'static str,
+    expected_state: Option<&'static str>,
+}
+
+impl Submission {
+    /// The request body this submission sends.
+    fn body(&self) -> Value {
+        let mut authority = json!({ "country": self.country });
+        if let Some(state) = self.state {
+            authority["state"] = json!(state);
+        }
+        json!({
+            "accountIds": self.accounts,
+            "authority": authority,
+            "exemptionType": self.exemption_type,
+            "exemptionCertificate": certificate(self.document_name),
+        })
+    }
+
+    /// The `taxExemptionType` the listing must report for it: the catalog's
+    /// entry, pinned literally here rather than read back from the service.
+    fn expected_type(&self) -> Value {
+        json!({
+            "displayName": self.expected_display_name,
+            "description": self.expected_description,
+            "applicableJurisdictions": [{ "country": "US" }],
+        })
+    }
+
+    /// The `authority` the listing must report for it.
+    fn expected_authority(&self) -> Value {
+        let mut authority = json!({ "country": self.expected_country });
+        if let Some(state) = self.expected_state {
+            authority["state"] = json!(state);
+        }
+        authority
+    }
+}
+
+/// The submissions the round-trip table makes.
+///
+/// The rows differ along what the rule generalises over: how many accounts one
+/// submission names, which published entry the type is (four of the seven, none
+/// of them cited by any issue), whether it is named by its `description` or its
+/// `displayName` and in which case, whether the jurisdiction carries a state, and
+/// which of the three file extensions the certificate uses.
+const SUBMISSIONS: &[Submission] = &[
+    Submission {
+        case: "one account, the type named by its description, no state",
+        accounts: &["000000000001"],
+        exemption_type: "Purchases for resale, held under a resale certificate",
+        country: "US",
+        state: None,
+        document_name: "resale-certificate.pdf",
+        expected_display_name: "Reseller",
+        expected_description: "Purchases for resale, held under a resale certificate",
+        expected_country: "US",
+        expected_state: None,
+    },
+    Submission {
+        case: "three accounts, the type named by its display name, with a state",
+        accounts: &["000000000002", "000000000003", "000000000004"],
+        exemption_type: "501(c)(3)",
+        country: "US",
+        state: Some("New York"),
+        document_name: "charity.JPG",
+        expected_display_name: "501(c)(3)",
+        expected_description: "Charitable organization exempt under section 501(c)(3) of the US \
+                               Internal Revenue Code",
+        expected_country: "US",
+        expected_state: Some("New York"),
+    },
+    Submission {
+        case: "a lower-cased country code and a padded state",
+        accounts: &["000000000005"],
+        exemption_type: "educational institution",
+        country: "us",
+        state: Some("  Texas  "),
+        document_name: "school.png",
+        expected_display_name: "Educational Institution",
+        expected_description: "Accredited school, college or university exempt from sales and use \
+                               tax",
+        expected_country: "US",
+        expected_state: Some("Texas"),
+    },
+    Submission {
+        case: "a tribal government exemption for two accounts",
+        accounts: &["000000000006", "000000000007"],
+        exemption_type: "Federally recognized tribal government body exempt from sales and use \
+                         tax",
+        country: "US",
+        state: Some("Arizona"),
+        document_name: "tribal.pdf",
+        expected_display_name: "Tribal Government",
+        expected_description: "Federally recognized tribal government body exempt from sales and \
+                               use tax",
+        expected_country: "US",
+        expected_state: Some("Arizona"),
+    },
+];
+
+/// RULE: a submission records the exemption it identifies for every account it
+/// names, and the listing reports each of those accounts with that exemption:
+/// the published type, the submitted jurisdiction, the status a submitted
+/// exemption carries while its certificate is under review, and the instant this
+/// service recorded it.
+#[tokio::test]
+async fn every_submitted_exemption_is_reported_for_every_account_it_names() {
+    for submission in SUBMISSIONS {
+        let case = submission.case;
+        let router = emulator();
+        hold_tax_settings_for(&router, submission.accounts).await;
+
+        let before = epoch_secs(SystemTime::now());
+        let stored = call(&router, "PutTaxExemption", &submission.body()).await;
+        assert_eq!(
+            (stored.status, stored.error_code.as_str()),
+            (200, ""),
+            "case {case:?}: expected 200, got {stored:?}"
+        );
+        let case_id = stored
+            .get("caseId")
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a caseId, got {stored:?}"))
+            .to_string();
+        assert!(
+            (1..=200).contains(&case_id.chars().count()),
+            "case {case:?}: caseId is a 1..200 string, got {case_id:?}"
+        );
+        let after = epoch_secs(SystemTime::now());
+
+        let listed = call(&router, "ListTaxExemptions", &json!({})).await;
+        assert_eq!(
+            (listed.status, listed.error_code.as_str()),
+            (200, ""),
+            "case {case:?}: expected 200, got {listed:?}"
+        );
+        let expected_accounts: Vec<String> = submission
+            .accounts
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect();
+        assert_eq!(
+            reported_accounts(&listed),
+            expected_accounts,
+            "case {case:?}: expected exactly the accounts the submission named, got {:?}",
+            details_map(&listed)
+        );
+
+        for account in submission.accounts {
+            let case = format!("{case} ({account})");
+            let details = details_map(&listed)
+                .get(*account)
+                .cloned()
+                .unwrap_or_else(|| panic!("case {case:?}: expected {account}, got {listed:?}"));
+            // Nothing this service records is inherited from a consolidated
+            // billing family's management account, so no `heritageObtained*`
+            // member is reported.
+            for member in [
+                "heritageObtainedDetails",
+                "heritageObtainedParentEntity",
+                "heritageObtainedReason",
+            ] {
+                assert!(
+                    details.get(member).is_none(),
+                    "case {case:?}: nothing was inherited, so {member} is not reported, got \
+                     {details}"
+                );
+            }
+
+            let held = reported_exemptions(&listed, account);
+            assert_eq!(
+                held.len(),
+                1,
+                "case {case:?}: the account holds the one submitted exemption, got {held:?}"
+            );
+            let exemption = &held[0];
+            assert_eq!(
+                exemption.get("authority"),
+                Some(&submission.expected_authority()),
+                "case {case:?}: expected {}, got {exemption}",
+                submission.expected_authority()
+            );
+            assert_eq!(
+                exemption.get("taxExemptionType"),
+                Some(&submission.expected_type()),
+                "case {case:?}: expected {}, got {exemption}",
+                submission.expected_type()
+            );
+            assert_eq!(
+                exemption.get("status").and_then(Value::as_str),
+                Some(EXEMPTION_STATUS_PENDING),
+                "case {case:?}: a submitted certificate is under review, got {exemption}"
+            );
+            let recorded = exemption
+                .get("systemEffectiveDate")
+                .and_then(Value::as_f64)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: expected a systemEffectiveDate, got {exemption}")
+                });
+            assert!(
+                (before - 1.0..=after + 1.0).contains(&recorded),
+                "case {case:?}: the recording time is when the submission was stored \
+                 ({before}..{after}), got {recorded}"
+            );
+            // Both dates are facts about the certificate this emulator does not
+            // read, so neither reaches the wire.
+            for member in ["effectiveDate", "expirationDate"] {
+                assert!(
+                    exemption.get(member).is_none(),
+                    "case {case:?}: no certificate date is reported, got {exemption}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: the exemption's identity is its type and its jurisdiction, so one
+/// account can hold several exemptions, and a second submission of the same pair
+/// REPLACES its record instead of adding one beside it — case and padding in
+/// either making no second exemption.
+#[tokio::test]
+async fn an_exemption_is_identified_by_its_type_and_its_jurisdiction() {
+    let account = "000000000011";
+    // The rows differ along the member that makes a submission a different
+    // exemption: the type, the state of the jurisdiction, and neither (a repeat,
+    // spelled several ways).
+    let submissions: &[(&str, Value, usize)] = &[
+        (
+            "the first exemption",
+            json!({ "exemptionType": "Reseller", "authority": { "country": "US" } }),
+            1,
+        ),
+        (
+            "a second type in the same jurisdiction",
+            json!({ "exemptionType": "Direct Pay Permit", "authority": { "country": "US" } }),
+            2,
+        ),
+        (
+            "the first type in another state",
+            json!({
+                "exemptionType": "Reseller",
+                "authority": { "country": "US", "state": "Ohio" },
+            }),
+            3,
+        ),
+        (
+            "the same type in the same state again",
+            json!({
+                "exemptionType": "Reseller",
+                "authority": { "country": "US", "state": "Ohio" },
+            }),
+            3,
+        ),
+        (
+            "the same state spelled in another case",
+            json!({
+                "exemptionType": "Reseller",
+                "authority": { "country": "us", "state": "OHIO" },
+            }),
+            3,
+        ),
+        (
+            "the same type named by its description instead",
+            json!({
+                "exemptionType": "Purchases for resale, held under a resale certificate",
+                "authority": { "country": "US", "state": " Ohio " },
+            }),
+            3,
+        ),
+    ];
+
+    let router = emulator();
+    hold_tax_settings_for(&router, &[account]).await;
+    let mut case_ids: Vec<String> = Vec::new();
+    for (case, submission, expected_held) in submissions {
+        let body = json!({
+            "accountIds": [account],
+            "authority": submission["authority"],
+            "exemptionType": submission["exemptionType"],
+            "exemptionCertificate": certificate("certificate.pdf"),
+        });
+        let stored = call(&router, "PutTaxExemption", &body).await;
+        assert_eq!(
+            (stored.status, stored.error_code.as_str()),
+            (200, ""),
+            "case {case:?}: expected 200, got {stored:?}"
+        );
+        let case_id = stored
+            .get("caseId")
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a caseId, got {stored:?}"))
+            .to_string();
+        assert!(
+            !case_ids.contains(&case_id),
+            "case {case:?}: every submission opens its own case, got {case_id:?} twice"
+        );
+        case_ids.push(case_id);
+
+        let listed = call(&router, "ListTaxExemptions", &json!({})).await;
+        let held = reported_exemptions(&listed, account);
+        assert_eq!(
+            held.len(),
+            *expected_held,
+            "case {case:?}: expected {expected_held} exemption(s), got {held:?}"
+        );
+    }
+}
+
+/// RULE: a submission addresses accounts in the caller's consolidated billing
+/// family, so one naming an account this service holds no tax settings for is
+/// refused whole with `ResourceNotFoundException` (404) and stores nothing.
+#[tokio::test]
+async fn a_submission_for_an_account_outside_the_billing_family_is_refused() {
+    let in_family = "000000000012";
+    // The rows differ along which account is outside the family and where it sits
+    // in the list — alone, first, or beside accounts that would have been
+    // written.
+    let cases: &[(&str, Vec<&str>, u16)] = &[
+        ("the caller's own account", vec![own_account()], 200),
+        ("an account with a stored TRN", vec![in_family], 200),
+        ("an account this service knows nothing about", vec!["999999999999"], 404),
+        ("a foreign account named first", vec!["999999999999", in_family], 404),
+        ("a foreign account named last", vec![in_family, "999999999998"], 404),
+    ];
+
+    for (case, accounts, expected_status) in cases {
+        let router = emulator();
+        hold_tax_settings_for(&router, &[in_family]).await;
+        let answer = call(
+            &router,
+            "PutTaxExemption",
+            &json!({
+                "accountIds": accounts,
+                "authority": { "country": "US" },
+                "exemptionType": "Reseller",
+                "exemptionCertificate": certificate("resale.pdf"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, *expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {answer:?}"
+        );
+
+        let listed = call(&router, "ListTaxExemptions", &json!({})).await;
+        if *expected_status == 200 {
+            let expected: Vec<String> =
+                accounts.iter().map(|account| (*account).to_string()).collect();
+            assert_eq!(
+                reported_accounts(&listed),
+                expected,
+                "case {case:?}: expected the exemption to be recorded, got {listed:?}"
+            );
+        } else {
+            assert!(
+                answer.error_code.contains("ResourceNotFoundException"),
+                "case {case:?}: expected a ResourceNotFoundException, got {answer:?}"
+            );
+            assert!(
+                reported_accounts(&listed).is_empty(),
+                "case {case:?}: a refused submission stores nothing, got {listed:?}"
+            );
+        }
+    }
+}
+
+/// Seed one exemption for each of `count` accounts, answering the account ids in
+/// store order.
+fn seed_many(engine: &Arc<engine::InMemoryEngine>, count: usize) -> Vec<String> {
+    let accounts: Vec<String> = (1..=count).map(|index| format!("{index:012}")).collect();
+    for account in &accounts {
+        seed_exemptions(engine, account, vec![a_valid_exemption()]);
+    }
+    accounts
+}
+
+/// RULE: the listing pages over the accounts holding an exemption in account-id
+/// order, every account appearing exactly once across the pages, and only the
+/// last page carries no cursor.
+#[tokio::test]
+async fn the_listing_pages_over_every_account() {
+    // The rows differ along the page size against the store size: one at a time,
+    // a size that does not divide the store, exactly the store, and more than it.
+    let page_sizes: &[Option<i64>] = &[Some(1), Some(2), Some(3), Some(7), Some(1_000), None];
+    let store_size = 7;
+
+    for page_size in page_sizes {
+        let case = format!("maxResults {page_size:?} over {store_size} accounts");
+        let (router, engine) = emulator_with_engine();
+        let expected = seed_many(&engine, store_size);
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut body = json!({});
+            if let Some(size) = page_size {
+                body["maxResults"] = json!(size);
+            }
+            if let Some(cursor) = &token {
+                body["nextToken"] = json!(cursor);
+            }
+            let answer = call(&router, "ListTaxExemptions", &body).await;
+            assert_eq!(
+                (answer.status, answer.error_code.as_str()),
+                (200, ""),
+                "case {case:?}: expected 200, got {answer:?}"
+            );
+            let page = reported_accounts(&answer);
+            let limit = page_size.map_or(DEFAULT_PAGE_SIZE, |size| size.unsigned_abs() as usize);
+            assert!(
+                page.len() <= limit,
+                "case {case:?}: a page holds at most {limit} accounts, got {page:?}"
+            );
+            seen.extend(page);
+            pages += 1;
+            assert!(
+                pages <= store_size + 1,
+                "case {case:?}: paging must terminate, got {pages} pages for {seen:?}"
+            );
+            token = answer
+                .get("nextToken")
+                .as_str()
+                .map(std::string::ToString::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+
+        seen.sort();
+        assert_eq!(
+            seen, expected,
+            "case {case:?}: expected every account exactly once, got {seen:?}"
+        );
+    }
+}
+
+/// RULE: the page size is the SERVER's decision — a request that names none
+/// still gets a bounded page and a cursor to continue from.
+#[tokio::test]
+async fn a_request_naming_no_page_size_gets_the_servers_default() {
+    let (router, engine) = emulator_with_engine();
+    let store_size = DEFAULT_PAGE_SIZE + 5;
+    let expected = seed_many(&engine, store_size);
+
+    let first = call(&router, "ListTaxExemptions", &json!({})).await;
+    let page = reported_accounts(&first);
+    assert_eq!(
+        page.len(),
+        DEFAULT_PAGE_SIZE,
+        "case \"no maxResults\": expected the server's default page, got {} accounts",
+        page.len()
+    );
+    let token = first
+        .get("nextToken")
+        .as_str()
+        .unwrap_or_else(|| panic!("case \"no maxResults\": expected a cursor, got {first:?}"))
+        .to_string();
+
+    let second = call(&router, "ListTaxExemptions", &json!({ "nextToken": token })).await;
+    let rest = reported_accounts(&second);
+    assert_eq!(
+        rest.len(),
+        store_size - DEFAULT_PAGE_SIZE,
+        "case \"the cursor's page\": expected the remainder, got {rest:?}"
+    );
+    assert!(
+        second.get("nextToken").is_null(),
+        "case \"the cursor's page\": the last page carries no cursor, got {second:?}"
+    );
+    let mut seen = page;
+    seen.extend(rest);
+    seen.sort();
+    assert_eq!(
+        seen, expected,
+        "case \"the two pages\": expected every account exactly once, got {seen:?}"
+    );
+}
+
+/// RULE: `maxResults` is accepted on each published bound of its 1..=1000 range
+/// (`smithy_query(query="operation", operation="ListTaxExemptions")`) and refused
+/// one past either.
+#[tokio::test]
+async fn max_results_is_accepted_inside_its_published_range() {
+    let cases: &[(&str, i64, u16)] = &[
+        ("one below the floor", 0, 400),
+        ("the floor", 1, 200),
+        ("the ceiling", 1_000, 200),
+        ("one past the ceiling", 1_001, 400),
+    ];
+    let (router, engine) = emulator_with_engine();
+    seed_many(&engine, 3);
+
+    for (case, max_results, expected_status) in cases {
+        let answer = call(
+            &router,
+            "ListTaxExemptions",
+            &json!({ "maxResults": max_results }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, *expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {answer:?}"
+        );
+        if *expected_status == 400 {
+            assert!(
+                answer.error_code.contains("ValidationException"),
+                "case {case:?}: expected a ValidationException, got {answer:?}"
+            );
+        }
+    }
+}
+
+/// RULE: a cursor this service did not issue names nothing to resume from, so it
+/// is refused with a `ValidationException` carrying the token error code.
+#[tokio::test]
+async fn a_cursor_this_service_did_not_issue_is_refused() {
+    // The rows differ along how the token fails: it does not decode at all, it
+    // decodes to something that is no account id, or it decodes to an account id
+    // of the wrong length.
+    let cases: &[(&str, String, &str)] = &[
+        ("not base64 at all", "A".to_string(), "MalformedToken"),
+        (
+            "base64 of a word",
+            ::aws_smithy_types::base64::encode("hello"),
+            "InvalidToken",
+        ),
+        (
+            "base64 of eleven digits",
+            ::aws_smithy_types::base64::encode("00000000001"),
+            "InvalidToken",
+        ),
+        (
+            "base64 of thirteen digits",
+            ::aws_smithy_types::base64::encode("0000000000001"),
+            "InvalidToken",
+        ),
+    ];
+
+    let (router, engine) = emulator_with_engine();
+    seed_many(&engine, 2);
+
+    for (case, token, expected_code) in cases {
+        let answer = call(
+            &router,
+            "ListTaxExemptions",
+            &json!({ "nextToken": token }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {answer:?}"
+        );
+        assert!(
+            answer.error_code.contains("ValidationException"),
+            "case {case:?}: expected a ValidationException, got {answer:?}"
+        );
+        assert_eq!(
+            answer.get("errorCode").as_str(),
+            Some(*expected_code),
+            "case {case:?}: expected errorCode {expected_code:?}, got {answer:?}"
+        );
+    }
+
+    // And a cursor this service DID issue resumes the listing.
+    let first = call(&router, "ListTaxExemptions", &json!({ "maxResults": 1 })).await;
+    let token = first
+        .get("nextToken")
+        .as_str()
+        .unwrap_or_else(|| panic!("case \"an issued cursor\": expected a cursor, got {first:?}"))
+        .to_string();
+    let second = call(&router, "ListTaxExemptions", &json!({ "nextToken": token })).await;
+    assert_eq!(
+        (second.status, reported_accounts(&second)),
+        (200, vec!["000000000002".to_string()]),
+        "case \"an issued cursor\": expected the next account, got {second:?}"
+    );
+}
+
+/// RULE: the listing is a report — it changes nothing a later caller sees,
+/// neither the records it reports nor anything beside them.
+#[tokio::test]
+async fn listing_the_exemptions_changes_nothing() {
+    let (router, engine) = emulator_with_engine();
+    hold_tax_settings_for(&router, &["000000000021"]).await;
+    let submitted = call(
         &router,
-        "BatchGetTaxExemptions",
-        &json!({ "accountIds": [own_account()] }),
+        "PutTaxExemption",
+        &json!({
+            "accountIds": ["000000000021", own_account()],
+            "authority": { "country": "US" },
+            "exemptionType": "Reseller",
+            "exemptionCertificate": certificate("resale.pdf"),
+        }),
     )
     .await;
     assert_eq!(
-        (empty.status, reported_accounts(&empty)),
-        (200, Vec::new()),
-        "case \"the caller's own account, which holds no exemption\": expected an empty map, got \
-         {empty:?}"
+        (submitted.status, submitted.error_code.as_str()),
+        (200, ""),
+        "case \"setup\": the submission must store, got {submitted:?}"
+    );
+    seed_exemptions(&engine, "000000000022", vec![a_valid_exemption()]);
+
+    let first = call(&router, "ListTaxExemptions", &json!({})).await;
+    let second = call(&router, "ListTaxExemptions", &json!({})).await;
+    assert_eq!(
+        second.body, first.body,
+        "case \"a second read\": expected {:?}, got {:?}",
+        first.body, second.body
+    );
+
+    // Paging through the store is a read too: the accounts and their exemptions
+    // are the same afterwards.
+    let mut token = call(&router, "ListTaxExemptions", &json!({ "maxResults": 1 }))
+        .await
+        .get("nextToken")
+        .as_str()
+        .map(std::string::ToString::to_string);
+    assert!(
+        token.is_some(),
+        "case \"setup\": a store of three accounts pages"
+    );
+    while let Some(cursor) = token {
+        let page = call(
+            &router,
+            "ListTaxExemptions",
+            &json!({ "maxResults": 1, "nextToken": cursor }),
+        )
+        .await;
+        token = page
+            .get("nextToken")
+            .as_str()
+            .map(std::string::ToString::to_string);
+    }
+    let after_paging = call(&router, "ListTaxExemptions", &json!({})).await;
+    assert_eq!(
+        after_paging.body, first.body,
+        "case \"after paging through the store\": expected {:?}, got {:?}",
+        first.body, after_paging.body
+    );
+
+    // Nothing beside the exemptions moved either: the inheritance election is
+    // still the default, and no further support case was opened — a read mints
+    // none.
+    let inheritance = call(&router, "GetTaxInheritance", &json!({})).await;
+    assert_eq!(
+        (inheritance.status, inheritance.get("heritageStatus").clone()),
+        (200, json!("OptOut")),
+        "case \"an inheritance read across a listing\": expected the unchanged default, got \
+         {inheritance:?}"
+    );
+    let minted = engine
+        .state::<ComAmazonawsTaxsettingsTaxsettingsState>()
+        .lock()
+        .minted_exemption_cases;
+    assert_eq!(
+        minted, 1,
+        "case \"the cases a listing opens\": expected the one submission's case, got {minted}"
+    );
+}
+
+/// RULE: an `exemptionType` the service's published catalog does not name is
+/// refused, and nothing is stored for it; a type named by either of the members
+/// that identify a published entry is accepted, whatever its case or padding.
+#[tokio::test]
+async fn an_unpublished_exemption_type_is_refused() {
+    // The rows differ along how the value relates to the catalog: a display name,
+    // a description, either re-cased or padded, and values that name no entry.
+    let cases: &[(&str, &str, u16)] = &[
+        ("a display name", "Reseller", 200),
+        (
+            "a description",
+            "Purchases for resale, held under a resale certificate",
+            200,
+        ),
+        ("a padded, re-cased display name", "  dIRECT pAY pERMIT  ", 200),
+        ("a type the catalog does not publish", "Diplomatic Mission", 400),
+        ("a prefix of a published description", "Purchases for resale", 400),
+        ("a shape name rather than a type", "TaxExemptionType", 400),
+    ];
+
+    for (case, exemption_type, expected_status) in cases {
+        let router = emulator();
+        let answer = call(
+            &router,
+            "PutTaxExemption",
+            &json!({
+                "accountIds": [own_account()],
+                "authority": { "country": "US" },
+                "exemptionType": exemption_type,
+                "exemptionCertificate": certificate("certificate.pdf"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, *expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {answer:?}"
+        );
+
+        let listed = call(&router, "ListTaxExemptions", &json!({})).await;
+        if *expected_status == 200 {
+            assert_eq!(
+                reported_accounts(&listed),
+                vec![own_account().to_string()],
+                "case {case:?}: expected the account to hold the exemption, got {listed:?}"
+            );
+        } else {
+            assert!(
+                answer.error_code.contains("ValidationException"),
+                "case {case:?}: expected a ValidationException, got {answer:?}"
+            );
+            assert_eq!(
+                answer.get("errorCode").as_str(),
+                Some("FieldValidationFailed"),
+                "case {case:?}: expected a field violation, got {answer:?}"
+            );
+            assert_eq!(
+                answer.get("fieldList").clone(),
+                json!([{ "name": "EXEMPTION_TYPE" }]),
+                "case {case:?}: expected the refused parameter to be named, got {answer:?}"
+            );
+            assert!(
+                reported_accounts(&listed).is_empty(),
+                "case {case:?}: a refused submission stores nothing, got {listed:?}"
+            );
+        }
+    }
+}
+
+/// RULE: an `authority` outside the jurisdictions the published type applies in
+/// is refused, and nothing is stored for it; a jurisdiction a country-wide type
+/// covers is accepted with or without a state.
+#[tokio::test]
+async fn an_authority_outside_the_published_jurisdictions_is_refused() {
+    // The rows differ along the jurisdiction: the published country with and
+    // without a state, the same country in another case, another country, and a
+    // state that is all whitespace (the model's non-blank pattern).
+    let cases: &[(&str, Value, u16, &str)] = &[
+        ("the published country", json!({ "country": "US" }), 200, ""),
+        (
+            "the published country with a state",
+            json!({ "country": "US", "state": "California" }),
+            200,
+            "",
+        ),
+        (
+            "the published country, lower-cased",
+            json!({ "country": "us" }),
+            200,
+            "",
+        ),
+        (
+            // A country-only jurisdiction applies throughout that country, and
+            // the state a certificate is held in is a fact about the
+            // certificate rather than about the type, so a state the catalog
+            // does not enumerate is accepted and reported as submitted.
+            "a state the published jurisdiction does not enumerate",
+            json!({ "country": "US", "state": "Guam" }),
+            200,
+            "",
+        ),
+        (
+            "a country the type does not apply in",
+            json!({ "country": "DE" }),
+            400,
+            "AUTHORITY",
+        ),
+        (
+            "another country with a state",
+            json!({ "country": "CA", "state": "Ontario" }),
+            400,
+            "AUTHORITY",
+        ),
+        (
+            "a blank state",
+            json!({ "country": "US", "state": "   " }),
+            400,
+            "STATE",
+        ),
+    ];
+
+    for (case, authority, expected_status, expected_field) in cases {
+        let router = emulator();
+        let answer = call(
+            &router,
+            "PutTaxExemption",
+            &json!({
+                "accountIds": [own_account()],
+                "authority": authority,
+                "exemptionType": "Reseller",
+                "exemptionCertificate": certificate("resale.pdf"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, *expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {answer:?}"
+        );
+        let listed = call(&router, "ListTaxExemptions", &json!({})).await;
+        if *expected_status == 200 {
+            assert_eq!(
+                reported_accounts(&listed),
+                vec![own_account().to_string()],
+                "case {case:?}: expected the account to hold the exemption, got {listed:?}"
+            );
+        } else {
+            assert!(
+                answer.error_code.contains("ValidationException"),
+                "case {case:?}: expected a ValidationException, got {answer:?}"
+            );
+            assert_eq!(
+                answer.get("fieldList").clone(),
+                json!([{ "name": expected_field }]),
+                "case {case:?}: expected the refused parameter to be named, got {answer:?}"
+            );
+            assert!(
+                reported_accounts(&listed).is_empty(),
+                "case {case:?}: a refused submission stores nothing, got {listed:?}"
+            );
+        }
+    }
+}
+
+/// RULE: a submission that would take the store past the exemptions this
+/// emulator keeps resident is refused whole with the modelled
+/// `CaseCreationLimitExceededException`, opening no case, while replacing an
+/// exemption an account already holds is always allowed, because it adds nothing.
+#[tokio::test]
+async fn a_submission_past_the_resident_bound_is_refused() {
+    let (router, engine) = emulator_with_engine();
+    // Fill the store to its bound directly, so the bound is reached without
+    // sending a thousand requests. Each seeded account holds an exemption, which
+    // is also what puts it in the caller's billing family.
+    let seeded = seed_many(&engine, MAX_STORED_EXEMPTIONS);
+
+    let body = |account: &str, exemption_type: &str| {
+        json!({
+            "accountIds": [account],
+            "authority": { "country": "US" },
+            "exemptionType": exemption_type,
+            "exemptionCertificate": certificate("resale.pdf"),
+        })
+    };
+
+    // The caller's own account is inside the family and holds nothing, so this
+    // submission would ADD the thousand-and-first record.
+    let refused = call(&router, "PutTaxExemption", &body(own_account(), "Reseller")).await;
+    assert_eq!(
+        refused.status, 413,
+        "case \"one account past the bound\": expected HTTP 413, got {refused:?}"
     );
     assert!(
-        stored_exemptions(&engine, own_account()).is_empty(),
-        "case \"the caller's own account\": a read must record nothing, got {:?}",
-        stored_exemptions(&engine, own_account())
+        refused
+            .error_code
+            .contains("CaseCreationLimitExceededException"),
+        "case \"one account past the bound\": expected the case-limit refusal, got {refused:?}"
+    );
+
+    // A refused submission opens no support case either.
+    let minted = engine
+        .state::<ComAmazonawsTaxsettingsTaxsettingsState>()
+        .lock()
+        .minted_exemption_cases;
+    assert_eq!(
+        minted, 0,
+        "case \"the cases a refused submission opens\": expected none, got {minted}"
+    );
+
+    // The seeded records were granted under the catalog's first entry in the US,
+    // so submitting that same exemption for a seeded account replaces its record
+    // instead of adding one.
+    let first_type = catalog_entry(0)
+        .description
+        .expect("every published entry carries a description");
+    let replaced = call(&router, "PutTaxExemption", &body(&seeded[0], &first_type)).await;
+    assert_eq!(
+        (replaced.status, replaced.error_code.as_str()),
+        (200, ""),
+        "case \"replacing an exemption the account holds\": expected 200, got {replaced:?}"
+    );
+
+    let held = engine
+        .state::<ComAmazonawsTaxsettingsTaxsettingsState>()
+        .lock()
+        .stored_exemption_count();
+    assert_eq!(
+        held, MAX_STORED_EXEMPTIONS,
+        "case \"the store at its bound\": expected {MAX_STORED_EXEMPTIONS} records, got {held}"
     );
 }

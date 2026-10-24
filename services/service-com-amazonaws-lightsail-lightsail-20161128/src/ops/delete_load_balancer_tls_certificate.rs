@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLoadBalancerTlsCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLoadBalancerTlsCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the ONE SSL/TLS certificate the request names from the load balancer that
+//! holds it, in the Region the request is made in, and answers the operation-log entry
+//! the removal appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLoadBalancerTlsCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A certificate still ATTACHED to the load balancer is in use, so removing it needs
+//! `force`; everything else about the load balancer is left exactly as it was.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +169,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLoadBalancerTlsCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLoadBalancerTlsCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLoadBalancerTlsCertificate"))
+        // A load balancer is a REGIONAL resource, so the certificate it holds is
+        // addressed in the Region the request is signed for — the same Region
+        // `CreateLoadBalancer` stored the record in.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `loadBalancerName` and `certificateName` are modelled `@required`
+        // members carrying the modelled `ResourceName` pattern, so the
+        // centralized walk refused anything outside them before this body ran.
+        // `force` is an optional boolean whose documented effect attaches to the
+        // TRUE value alone ("When `true`, forces the deletion"), so an absent
+        // `force` is the same request as `false`.
+        let load_balancer_name = input.load_balancer_name;
+        let certificate_name = input.certificate_name;
+        let force = input.force.unwrap_or(false);
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The load balancer first: it is the resource this operation acts
+            // through, and the one tag-based access control is evaluated against
+            // ("supports tag-based access control via resource tags applied to
+            // the resource identified by load balancer name"). It is resolved
+            // ONCE, mutably, and nothing is written until every refusal below
+            // has been cleared.
+            let balancer = store
+                .load_balancer_mut(&region, &load_balancer_name)
+                .ok_or_else(|| {
+                    not_found(
+                        crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+                        &load_balancer_name,
+                    )
+                })?;
+            let location = balancer.location.clone();
+            // A certificate is addressed by its own name among the ones THIS
+            // load balancer holds, so a name none of them carries names nothing
+            // to delete — on a load balancer holding no certificate at all, and
+            // on one whose certificate a previous call already deleted.
+            let is_attached = balancer
+                .certificate
+                .as_ref()
+                .filter(|certificate| certificate.name == certificate_name)
+                .ok_or_else(|| {
+                    not_found(
+                        crate::state::RESOURCE_TYPE_LOAD_BALANCER_TLS_CERTIFICATE,
+                        &certificate_name,
+                    )
+                })?
+                .is_attached;
+            // "The `force` parameter is required when the primary SSL/TLS
+            // certificate is in use by an instance attached to the load
+            // balancer": the ATTACHED certificate is the one the load balancer
+            // terminates HTTPS with, so deleting it takes that listener away
+            // from traffic already flowing through it and the request has to say
+            // it means to. An unattached certificate serves nothing, so `force`
+            // changes nothing for it.
+            if is_attached && !force {
+                return Err(operation_failure(format!(
+                    "The SSL/TLS certificate {certificate_name} is attached to the load \
+                     balancer {load_balancer_name} and is in use: set force to true to \
+                     delete a certificate that is in use."
+                )));
+            }
+
+            // The certificate is gone from the load balancer's record, so the
+            // load balancer stops reporting a summary for it — and, where the
+            // deleted certificate was the attached one, drops back to the plain
+            // `HTTP` listener on port 80, which is what the modelled `protocol`
+            // and `publicPorts` are computed from. Nothing else about the load
+            // balancer changes: this call deletes a certificate, not a load
+            // balancer.
+            balancer.certificate = None;
+
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once; this one removes exactly one certificate, so it
+            // answers exactly one entry, logged against the certificate it
+            // deleted and located where the load balancer that held it is. The
+            // certificate is gone as this call returns, so the work the entry
+            // describes is already done and the entry is terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_LOAD_BALANCER_TLS_CERTIFICATE,
+                crate::state::RESOURCE_TYPE_LOAD_BALANCER_TLS_CERTIFICATE,
+                &certificate_name,
+                &location,
+                None,
+            );
+            Ok(DeleteLoadBalancerTlsCertificateOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// certificate that is in the way and what would let the call through.
+fn operation_failure(message: String) -> DeleteLoadBalancerTlsCertificateError {
+    DeleteLoadBalancerTlsCertificateErrorModeled::OperationFailureException(
+        OperationFailureException {
+            message: Some(message),
+            ..Default::default()
+        },
+    )
+    .into()
+}
+
+/// The request names a resource this account does not hold: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name. Deleting the same certificate twice therefore fails the
+/// second time rather than reporting a deletion that did not happen.
+fn not_found(resource_type: &str, name: &str) -> DeleteLoadBalancerTlsCertificateError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DeleteLoadBalancerTlsCertificateError {
+    DeleteLoadBalancerTlsCertificateErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail load balancer store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

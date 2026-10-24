@@ -110,6 +110,18 @@
 //!   member from the resource's physical id, and the DB instance's published endpoint,
 //!   ARN and resource id are replaced by the ones Amazon RDS answered with, since those
 //!   are the values a client reaches the database through.
+//! * `AWS::Events::Rule`'s are `PutRule`'s own members, spelled identically, with two
+//!   exceptions: `EventPattern` is a template DOCUMENT where the request takes the JSON
+//!   TEXT of one, and `Targets` is no `PutRule` member at all — a rule's targets are
+//!   installed by the `PutTargets` a client makes next, so the arm makes that second call
+//!   ([`install_targets`]), maps each declared target against `Target`'s own members and
+//!   fails the resource on a target EventBridge reports as a failed entry. `PutRule` is
+//!   documented "Creates or updates the specified rule", so it is also this type's UPDATE,
+//!   with the declared target list reconciled against the installed one.
+//! * `AWS::SSM::Parameter`'s are `PutParameter`'s own members the same way, with the name
+//!   CloudFormation decides set on the way out and the declared tag MAP sent as the
+//!   `[{Key, Value}]` list that request takes. That one call is "Create or update a
+//!   parameter in Parameter Store", so `Overwrite` makes it this type's update too.
 //!
 //! ## The tags every created resource carries
 //!
@@ -149,8 +161,8 @@ use super::provisioning::{
 };
 use super::template::{
     AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM, ECR_PUBLIC_REPOSITORY,
-    ECS_CLUSTER, EMR_CLUSTER, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
-    GUARDDUTY_DETECTOR, SAGEMAKER_MODEL_PACKAGE_GROUP, SNS_TOPIC, SQS_QUEUE,
+    ECS_CLUSTER, EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
+    GUARDDUTY_DETECTOR, SAGEMAKER_MODEL_PACKAGE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER,
     WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
@@ -201,6 +213,8 @@ pub(super) enum Provisioner {
     GuardDutyDetector,
     RdsDbInstance,
     RdsDbSubnetGroup,
+    EventsRule,
+    SsmParameter,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -225,6 +239,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
         RDS_DB_INSTANCE => Some(Provisioner::RdsDbInstance),
         RDS_DB_SUBNET_GROUP => Some(Provisioner::RdsDbSubnetGroup),
+        EVENTS_RULE => Some(Provisioner::EventsRule),
+        SSM_PARAMETER => Some(Provisioner::SsmParameter),
         _ => None,
     }
 }
@@ -298,6 +314,11 @@ impl Provisioner {
             Self::RdsDbSubnetGroup => {
                 create_db_subnet_group(ctx, region, resource, propagated).await
             }
+            // `AWS::Events::Rule` publishes `Description`, `EventBusName`, `EventPattern`,
+            // `Name`, `RoleArn`, `ScheduleExpression`, `State` and `Targets` and no
+            // `Tags`: the type is not taggable, so no tags are propagated to it.
+            Self::EventsRule => put_rule(ctx, region, resource).await,
+            Self::SsmParameter => put_parameter(ctx, region, resource, propagated).await,
         }
     }
 
@@ -361,6 +382,16 @@ impl Provisioner {
                 .await
                 .map(Some)
             }
+            // `PutRule` is documented "Creates or updates the specified rule", so the call
+            // that created the rule is the call that applies a changed declaration to it,
+            // with the declared target list reconciled against the one it carries.
+            Self::EventsRule => update_rule(ctx, region, resource, declared).await,
+            // `PutParameter` is documented "Create or update a parameter in Parameter
+            // Store", and `Overwrite` is what makes the second of the two: the changed
+            // declaration reaches Systems Manager as a new version of the same parameter.
+            Self::SsmParameter => update_parameter(ctx, region, resource, declared)
+                .await
+                .map(Some),
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -425,6 +456,10 @@ impl Provisioner {
             Self::RdsDbSubnetGroup => {
                 delete_db_subnet_group(ctx, region, physical_resource_id).await
             }
+            // A rule still carrying targets cannot be deleted, and only the rule's own
+            // record says which bus it is on, so the delete takes the record.
+            Self::EventsRule => delete_rule(ctx, region, resource).await,
+            Self::SsmParameter => delete_parameter(ctx, region, physical_resource_id).await,
         }
     }
 
@@ -484,6 +519,10 @@ impl Provisioner {
             Self::RdsDbSubnetGroup => {
                 describe_db_subnet_group(ctx, region, physical_resource_id).await
             }
+            // The read is addressed by the rule's name AND the bus it is bound to, which
+            // only the resource's own record carries.
+            Self::EventsRule => describe_rule(ctx, region, resource).await,
+            Self::SsmParameter => describe_parameter(ctx, region, physical_resource_id).await,
         }
     }
 }
@@ -4739,6 +4778,622 @@ fn push_tag_list(
             value.clone(),
         ));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Amazon EventBridge: AWS::Events::Rule
+// ---------------------------------------------------------------------------
+
+/// Amazon EventBridge's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: events`, service shape `AWSEvents`), which speaks `awsJson1_1`.
+const EVENTS_SIGNING_NAME: &str = "events";
+const EVENTS_TARGET_PREFIX: &str = "AWSEvents";
+
+/// The error code CloudFormation's own resource handlers answer for a create whose
+/// identifier is already in use (`AlreadyExists`), for a type whose owning API takes the
+/// create as an UPSERT and so refuses nothing itself.
+const ALREADY_EXISTS: &str = "AlreadyExists";
+
+/// The `AWS::Events::Rule` properties `PutRule` takes under the SAME member name.
+///
+/// Source: AWS's CloudFormation resource reference for the type against
+/// `smithy_query(operation="PutRule")` — `Description`, `EventBusName`, `RoleArn`,
+/// `ScheduleExpression` and `State` are spelled identically on both sides. The three
+/// properties NOT here are the three that are not passed straight through: `Name`, which
+/// CloudFormation decides and which is this resource's physical id, `EventPattern`, which
+/// the type declares as a template DOCUMENT while `PutRule` takes the JSON TEXT of one,
+/// and `Targets`, which is not a `PutRule` member at all — a rule's targets are installed
+/// by `PutTargets`, the same second call a client makes.
+const EVENTS_RULE_MEMBERS: &[&str] = &[
+    "Description",
+    "EventBusName",
+    "RoleArn",
+    "ScheduleExpression",
+    "State",
+];
+
+/// The `Target` property type's members, named identically to `Target`'s own
+/// (`smithy_query(shape="Target")`): a target's id, the ARN it invokes, the role it
+/// assumes, the input it carries and the per-service parameter structures. The one member
+/// absent here is `EcsParameters`, whose two renamed members [`ecs_parameters`] maps.
+const EVENTS_TARGET_MEMBERS: &[&str] = &[
+    "AppSyncParameters",
+    "Arn",
+    "BatchParameters",
+    "DeadLetterConfig",
+    "HttpParameters",
+    "Id",
+    "Input",
+    "InputPath",
+    "InputTransformer",
+    "KinesisParameters",
+    "RedshiftDataParameters",
+    "RetryPolicy",
+    "RoleArn",
+    "RunCommandParameters",
+    "SageMakerPipelineParameters",
+    "SqsParameters",
+];
+
+/// The `EcsParameters` members named identically on both sides
+/// (`smithy_query(shape="EcsParameters")`). The two that are NOT are mapped by
+/// [`ecs_parameters`].
+const EVENTS_ECS_PARAMETER_MEMBERS: &[&str] = &[
+    "CapacityProviderStrategy",
+    "EnableECSManagedTags",
+    "EnableExecuteCommand",
+    "Group",
+    "LaunchType",
+    "PlacementConstraints",
+    "PlacementStrategy",
+    "PlatformVersion",
+    "PropagateTags",
+    "ReferenceId",
+    "TaskCount",
+    "TaskDefinitionArn",
+];
+
+/// Create — or update — the rule an `AWS::Events::Rule` declares, so a client reading the
+/// stack's outputs and then calling `events DescribeRule` with that name finds the rule
+/// there rather than a `ResourceNotFoundException`.
+///
+/// `Ref` of this type returns the rule NAME, which is this resource's physical id, so the
+/// rule is created under exactly the name the stack reports for it; the ARN `PutRule`
+/// answers with is the resource's real identity and replaces the computed one.
+///
+/// The declared `Targets` are installed by a `PutTargets` on the created rule — the same
+/// pair of calls a client makes, since `PutRule` takes no targets.
+///
+/// `PutRule` is an UPSERT ("creates or updates the specified rule"), so the name is probed
+/// first: a rule the bus ALREADY holds is not this stack's to reconfigure, and a create
+/// that put the declaration over it would report a resource the stack took over rather than
+/// created. That is the refusal CloudFormation itself answers for a resource whose
+/// identifier is already in use, and it is the same thing the Systems Manager arm gets for
+/// free from `PutParameter` refusing a put without `Overwrite`.
+///
+/// A rule whose TARGETS could not be installed is not a created resource either, so the
+/// rule this call just made is removed before that refusal is reported: nothing is left
+/// behind under a name the stack does not record.
+async fn put_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    if describe_rule(ctx, region, resource).await?.is_some() {
+        return Err(Refusal {
+            code: ALREADY_EXISTS.to_string(),
+            message: format!(
+                "Resource of type '{}' with identifier '{}' already exists.",
+                resource.resource_type, resource.physical_resource_id
+            ),
+        });
+    }
+    let reported = put_rule_configuration(
+        ctx,
+        region,
+        &resource.physical_resource_id,
+        &resource.properties,
+    )
+    .await?;
+    if let Err(refusal) = install_targets(
+        ctx,
+        region,
+        &resource.physical_resource_id,
+        &resource.properties,
+    )
+    .await
+    {
+        // Best effort: the refusal that stopped the create is what the stack reports, so a
+        // failure to undo it must not displace that reason.
+        let _ = delete_rule(ctx, region, resource).await;
+        return Err(refusal);
+    }
+    Ok(reported)
+}
+
+/// Apply a CHANGED `AWS::Events::Rule` declaration to the rule the stack already has.
+///
+/// `PutRule` is "Creates or updates the specified rule", so the declared configuration is
+/// put under the same name, and the declared target list is reconciled against the one the
+/// rule carries: a target the declaration no longer names is removed, and the ones it
+/// names are put (`PutTargets` "adds the specified targets to the specified rule, or
+/// updates the targets if they are already associated with the rule").
+///
+/// A declaration that moves the rule to a DIFFERENT event bus is not an in-place change:
+/// a rule belongs to one bus, so nothing here can carry it across and the deployment
+/// reports the change as not applied (`Ok(None)`) rather than creating a second rule and
+/// leaving the first behind.
+async fn update_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    if declared_bus(declared) != declared_bus(&resource.properties) {
+        return Ok(None);
+    }
+    let name = &resource.physical_resource_id;
+    let reported = put_rule_configuration(ctx, region, name, declared).await?;
+    let installed = installed_target_ids(ctx, region, name, declared).await?;
+    let retained: Vec<String> = declared_targets(declared)
+        .iter()
+        .filter_map(|target| target.get("Id").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect();
+    let removed: Vec<String> = installed
+        .into_iter()
+        .filter(|id| !retained.contains(id))
+        .collect();
+    remove_targets(ctx, region, name, declared, &removed).await?;
+    install_targets(ctx, region, name, declared).await?;
+    Ok(Some(reported))
+}
+
+/// `PutRule` with `properties` as the rule's configuration and `name` as the one member
+/// CloudFormation decides — the call behind both this type's create and its update, so the
+/// two cannot send a different request for the same declaration.
+///
+/// No tag is sent: the type publishes no `Tags` property, so CloudFormation propagates
+/// none to a rule, exactly as it propagates none to an `AWS::WAFRegional::IPSet`.
+async fn put_rule_configuration(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    properties: &Value,
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    if let Some(declared) = properties.as_object() {
+        for member in EVENTS_RULE_MEMBERS {
+            if let Some(value) = declared.get(*member) {
+                request.insert((*member).to_string(), value.clone());
+            }
+        }
+    }
+    // The type declares `EventPattern` as a document ("Json"), while `PutRule` takes the
+    // JSON text of one — the same spelling rule a policy document reaches IAM under.
+    if let Some(pattern) = properties.get("EventPattern").and_then(document_text) {
+        request.insert("EventPattern".to_string(), Value::String(pattern));
+    }
+    request.insert("Name".to_string(), Value::String(name.to_string()));
+    let reported = call_events(ctx, region, "PutRule", &Value::Object(request)).await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = reported.get("RuleArn").and_then(Value::as_str) {
+        attributes.insert("Arn".to_string(), arn.to_string());
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Install the targets a declaration names on the rule `name`, through EventBridge's own
+/// `PutTargets`. A declaration naming none asks for no call at all, since `Targets` is a
+/// `@length(min: 1)` list of that request.
+///
+/// `PutTargets` reports per-target failures in its answer rather than refusing the call,
+/// so a reported failed entry is read as the refusal it is: the resource failed, and the
+/// stack carries the code and message EventBridge gave for that target.
+async fn install_targets(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    properties: &Value,
+) -> Result<(), Refusal> {
+    let declared = declared_targets(properties);
+    if declared.is_empty() {
+        return Ok(());
+    }
+    let targets: Vec<Value> = declared.iter().map(event_target).collect();
+    let mut request = Map::new();
+    request.insert("Rule".to_string(), Value::String(name.to_string()));
+    request.insert("Targets".to_string(), Value::Array(targets));
+    if let Some(bus) = declared_bus(properties) {
+        request.insert("EventBusName".to_string(), Value::String(bus));
+    }
+    let reported = call_events(ctx, region, "PutTargets", &Value::Object(request)).await?;
+    match first_listed(&reported, "FailedEntries") {
+        Some(failed) => Err(Refusal {
+            code: failed
+                .get("ErrorCode")
+                .and_then(Value::as_str)
+                .unwrap_or(UNIDENTIFIED_FAILURE)
+                .to_string(),
+            message: failed
+                .get("ErrorMessage")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Remove the targets `ids` names from the rule `name`. An empty set asks for no call:
+/// `RemoveTargets$Ids` is a `@length(min: 1)` list.
+async fn remove_targets(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    properties: &Value,
+    ids: &[String],
+) -> Result<(), Refusal> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut request = Map::new();
+    request.insert("Rule".to_string(), Value::String(name.to_string()));
+    request.insert(
+        "Ids".to_string(),
+        Value::Array(ids.iter().map(|id| Value::String(id.clone())).collect()),
+    );
+    if let Some(bus) = declared_bus(properties) {
+        request.insert("EventBusName".to_string(), Value::String(bus));
+    }
+    let reported = call_events(ctx, region, "RemoveTargets", &Value::Object(request)).await?;
+    match first_listed(&reported, "FailedEntries") {
+        Some(failed) => Err(Refusal {
+            code: failed
+                .get("ErrorCode")
+                .and_then(Value::as_str)
+                .unwrap_or(UNIDENTIFIED_FAILURE)
+                .to_string(),
+            message: failed
+                .get("ErrorMessage")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The ids of the targets the rule `name` CARRIES, as EventBridge reports them.
+///
+/// One page is the whole set: a rule holds at most as many targets as `Target`'s own list
+/// bound admits, which is inside `ListTargetsByRule`'s maximum page.
+async fn installed_target_ids(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    properties: &Value,
+) -> Result<Vec<String>, Refusal> {
+    let mut request = Map::new();
+    request.insert("Rule".to_string(), Value::String(name.to_string()));
+    if let Some(bus) = declared_bus(properties) {
+        request.insert("EventBusName".to_string(), Value::String(bus));
+    }
+    let reported = call_events(ctx, region, "ListTargetsByRule", &Value::Object(request)).await?;
+    Ok(reported
+        .get("Targets")
+        .and_then(Value::as_array)
+        .map(|targets| {
+            targets
+                .iter()
+                .filter_map(|target| target.get("Id").and_then(Value::as_str))
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Delete the rule a stack created: its targets first, because "before you can delete the
+/// rule, you must remove all associated targets" (`DeleteRule`), then the rule itself.
+///
+/// A rule EventBridge no longer holds is already in the state the delete asks for: the
+/// read that lists its targets answers `ResourceNotFoundException` for it, which is the
+/// one code that says the rule is gone, and `DeleteRule` is itself idempotent ("if you
+/// call delete rule multiple times for the same rule, all calls will succeed").
+async fn delete_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let name = &resource.physical_resource_id;
+    let installed = match installed_target_ids(ctx, region, name, &resource.properties).await {
+        Ok(installed) => installed,
+        // Judged on the error CODE, never on the message, which carries the rule's name.
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(()),
+        Err(refusal) => return Err(refusal),
+    };
+    remove_targets(ctx, region, name, &resource.properties, &installed).await?;
+    let mut request = Map::new();
+    request.insert("Name".to_string(), Value::String(name.to_string()));
+    if let Some(bus) = declared_bus(&resource.properties) {
+        request.insert("EventBusName".to_string(), Value::String(bus));
+    }
+    match call_events(ctx, region, "DeleteRule", &Value::Object(request)).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The rule's configuration as EventBridge reports it, for drift detection. A rule it no
+/// longer holds (`ResourceNotFoundException`) was deleted.
+///
+/// `DescribeRule` answers the rule's members under the very names the type declares them
+/// with (`Description`, `EventBusName`, `EventPattern`, `ScheduleExpression`, `State`,
+/// `RoleArn`), so its answer IS the actual configuration document; the declared
+/// `EventPattern` document is compared against the text EventBridge holds by
+/// [`super::drift`]'s own rule for a composite a service reports as a string.
+async fn describe_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let mut request = Map::new();
+    request.insert(
+        "Name".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    if let Some(bus) = declared_bus(&resource.properties) {
+        request.insert("EventBusName".to_string(), Value::String(bus));
+    }
+    match call_events(ctx, region, "DescribeRule", &Value::Object(request)).await {
+        Ok(answer) => Ok(Some(answer)),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The bus a declaration binds its rule to, or `None` for one that names none — which is
+/// the account's `default` bus, the member's own documented default, so nothing is sent
+/// for it.
+fn declared_bus(properties: &Value) -> Option<String> {
+    properties
+        .get("EventBusName")
+        .and_then(scalar_text)
+        .filter(|bus| !bus.is_empty())
+}
+
+/// The `Targets` a declaration names, in the order it writes them.
+fn declared_targets(properties: &Value) -> Vec<Value> {
+    properties
+        .get("Targets")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// One declared `Target` as `PutTargets` takes it: the members named identically on both
+/// sides ([`EVENTS_TARGET_MEMBERS`]) passed through as the template wrote them, plus
+/// `EcsParameters` with its two renamed members mapped ([`ecs_parameters`]).
+fn event_target(declared: &Value) -> Value {
+    let mut target = Map::new();
+    if let Some(members) = declared.as_object() {
+        for member in EVENTS_TARGET_MEMBERS {
+            if let Some(value) = members.get(*member) {
+                target.insert((*member).to_string(), value.clone());
+            }
+        }
+        if let Some(ecs) = members.get("EcsParameters") {
+            target.insert("EcsParameters".to_string(), ecs_parameters(ecs));
+        }
+    }
+    Value::Object(target)
+}
+
+/// A declared `EcsParameters` as `Target$EcsParameters` takes it.
+///
+/// Its members are named identically on both sides ([`EVENTS_ECS_PARAMETER_MEMBERS`])
+/// except two: the task's tag list, which the property type publishes as `TagList` while
+/// the shape's member is `Tags`, and the awsvpc configuration, which the property type
+/// publishes as `NetworkConfiguration.AwsVpcConfiguration` while the
+/// `NetworkConfiguration` shape's one member is `awsvpcConfiguration`
+/// (`smithy_query(shape="EcsParameters,NetworkConfiguration")`).
+fn ecs_parameters(declared: &Value) -> Value {
+    let mut mapped = Map::new();
+    if let Some(members) = declared.as_object() {
+        for member in EVENTS_ECS_PARAMETER_MEMBERS {
+            if let Some(value) = members.get(*member) {
+                mapped.insert((*member).to_string(), value.clone());
+            }
+        }
+        if let Some(tags) = members.get("TagList") {
+            mapped.insert("Tags".to_string(), tags.clone());
+        }
+        if let Some(awsvpc) = members
+            .get("NetworkConfiguration")
+            .and_then(|network| network.get("AwsVpcConfiguration"))
+        {
+            let mut network = Map::new();
+            network.insert("awsvpcConfiguration".to_string(), awsvpc.clone());
+            mapped.insert("NetworkConfiguration".to_string(), Value::Object(network));
+        }
+    }
+    Value::Object(mapped)
+}
+
+/// Call one Amazon EventBridge operation on the awsJson1_1 wire its model declares.
+async fn call_events(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        EVENTS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{EVENTS_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// AWS Systems Manager: AWS::SSM::Parameter
+// ---------------------------------------------------------------------------
+
+/// AWS Systems Manager's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: ssm`, service shape `AmazonSSM`), which speaks `awsJson1_1`.
+const SSM_SIGNING_NAME: &str = "ssm";
+const SSM_TARGET_PREFIX: &str = "AmazonSSM";
+
+/// The error code Systems Manager answers for a parameter it does not hold
+/// (`ParameterNotFound`: "The parameter couldn't be found. Verify the name and try
+/// again").
+const PARAMETER_NOT_FOUND: &str = "ParameterNotFound";
+
+/// The `AWS::SSM::Parameter` properties `PutParameter` takes under the SAME member name.
+///
+/// Source: AWS's CloudFormation resource reference for the type against
+/// `smithy_query(operation="PutParameter")` — every property of the type is a member of
+/// that request, spelled identically. The two not here are the two that are not passed
+/// straight through: `Name`, which CloudFormation decides and which is this resource's
+/// physical id, and `Tags`, which the type publishes as a MAP while the request takes the
+/// `[{Key, Value}]` list its own `Tag` shape spells.
+const SSM_PARAMETER_MEMBERS: &[&str] = &[
+    "AllowedPattern",
+    "DataType",
+    "Description",
+    "Policies",
+    "Tier",
+    "Type",
+    "Value",
+];
+
+/// Create the parameter an `AWS::SSM::Parameter` declares, so a client that deployed the
+/// stack and then calls `ssm GetParameter` with that name reads the value back rather than
+/// a `ParameterNotFound`.
+///
+/// `Ref` of this type returns the parameter NAME, which is this resource's physical id, so
+/// the parameter is created under exactly the name the stack reports for it. Nothing
+/// `PutParameter` answers (the version it created, the tier it resolved) is a published
+/// return value of the type, so no attribute is re-reported off it: the type's `Type` and
+/// `Value` are the declaration's own.
+///
+/// The parameter carries the tags the declaration asks for plus the ones CloudFormation
+/// gives the resource ([`tags_of`]), as the list Systems Manager's own `Tag` shape spells.
+async fn put_parameter(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = parameter_request(&resource.properties, &resource.physical_resource_id);
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    call_ssm(ctx, region, "PutParameter", &Value::Object(request)).await?;
+    Ok(Created::default())
+}
+
+/// Apply a CHANGED `AWS::SSM::Parameter` declaration to the parameter the stack already
+/// has, through the `Overwrite` half of the one call that "create[s] or update[s] a
+/// parameter in Parameter Store".
+///
+/// No tag is sent with the overwrite: "to add tags to an existing Systems Manager
+/// parameter, use the AddTagsToResource operation" (`PutParameter$Tags`), so the set the
+/// parameter carries is left exactly as the create left it rather than replaced.
+async fn update_parameter(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let mut request = parameter_request(declared, &resource.physical_resource_id);
+    request.insert("Overwrite".to_string(), Value::Bool(true));
+    call_ssm(ctx, region, "PutParameter", &Value::Object(request)).await?;
+    Ok(Created::default())
+}
+
+/// Delete the parameter a stack created, addressed by its name — this resource's physical
+/// id, which is what `Ref` returns for the type. A parameter Systems Manager no longer
+/// holds (`ParameterNotFound`) is already in the state the delete asks for.
+async fn delete_parameter(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "Name": physical_resource_id });
+    match call_ssm(ctx, region, "DeleteParameter", &request).await {
+        Ok(_) => Ok(()),
+        // Judged on the error CODE, never on the message, which carries the request's own
+        // parameter name.
+        Err(refusal) if refusal.code == PARAMETER_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The parameter's configuration as Systems Manager reports it, for drift detection: the
+/// `Parameter` its own read answers with, whose `Type`, `Value` and `DataType` are the
+/// properties the type declares under those very names. One it no longer holds
+/// (`ParameterNotFound`) was deleted.
+async fn describe_parameter(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "Name": physical_resource_id });
+    match call_ssm(ctx, region, "GetParameter", &request).await {
+        Ok(answer) => Ok(Some(reported_member(&answer, "Parameter"))),
+        Err(refusal) if refusal.code == PARAMETER_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The `PutParameter` request one declaration describes, under the name CloudFormation
+/// decided: the members named identically on both sides ([`SSM_PARAMETER_MEMBERS`]), each
+/// as the text its API member takes.
+fn parameter_request(properties: &Value, name: &str) -> Map<String, Value> {
+    let mut request = Map::new();
+    if let Some(declared) = properties.as_object() {
+        for member in SSM_PARAMETER_MEMBERS {
+            if let Some(value) = declared.get(*member) {
+                request.insert((*member).to_string(), parameter_text(value));
+            }
+        }
+    }
+    request.insert("Name".to_string(), Value::String(name.to_string()));
+    request
+}
+
+/// One declared parameter property as the TEXT its `PutParameter` member takes: every one
+/// of them is a string member, and a template may write a value as a number, a boolean, or
+/// — for the `Policies` array — as an inline document.
+fn parameter_text(value: &Value) -> Value {
+    match document_text(value).or_else(|| scalar_text(value)) {
+        Some(text) => Value::String(text),
+        None => value.clone(),
+    }
+}
+
+/// Call one AWS Systems Manager operation on the awsJson1_1 wire its model declares.
+async fn call_ssm(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        SSM_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{SSM_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
 }
 
 #[cfg(test)]

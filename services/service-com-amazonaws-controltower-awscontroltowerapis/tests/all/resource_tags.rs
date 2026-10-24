@@ -32,7 +32,9 @@ use std::collections::BTreeMap;
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::landing_zone_lifecycle::{call, dispatch, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{
+    call, dispatch, emulator, past_the_settle_span, simple_manifest, Answer,
+};
 
 /// The request path both tagging operations bind: `/tags/{resourceArn}`.
 ///
@@ -112,7 +114,7 @@ async fn resources(router: &MultiServiceRouter) -> Vec<Resource> {
         "/create-landingzone",
         serde_json::json!({
             "version": "3.3",
-            "manifest": { "governedRegions": ["us-west-2"] },
+            "manifest": simple_manifest(),
             "tags": { "Owner": "platform" },
         }),
     )

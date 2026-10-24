@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutTaxExemption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutTaxExemption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutTaxExemption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records one tax exemption for each account the request names: the published
+//! exemption type it asks for, in the jurisdiction its `authority` names. One
+//! applied submission opens one support case and answers its `caseId`, because
+//! it submits one certificate.
+//!
+//! The exemption's identity is its type and its jurisdiction — the request
+//! carries no exemption id — so submitting the same exemption for an account
+//! again REPLACES that account's record, which is what makes this a `Put`. The
+//! submission is applied whole or not at all: a bound it would take the store
+//! past is refused before any record is written, and no case is opened for a
+//! submission that was not applied.
+//!
+//! Three refusals of the request. Two are `ValidationException`s about the
+//! collection `GetTaxExemptionTypes` publishes: an `exemptionType` that catalog
+//! does not name, and an `authority` outside the jurisdictions that type applies
+//! in ([`crate::state::check_exemption_type`] and
+//! [`crate::state::check_exemption_authority`] decide both against the catalog).
+//! The third is the `ResourceNotFoundException` an account outside the caller's
+//! consolidated billing family gets, judged by the same
+//! [`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::reports_exemptions_for`]
+//! predicate `BatchGetTaxExemptions` reads an account through.
+//!
+//! The exemption a submission stores is `Pending`, the status the model gives
+//! one whose certificate has not been reviewed: the certificate is attached to a
+//! support case for review, and granting the exemption is that reviewer's
+//! decision rather than a transition the clock makes due — see
+//! [`crate::state::StoredTaxExemption::reported_status`], where lapsing is the
+//! transition the clock owes a stored exemption. It carries no effective or
+//! expiration date, because both are facts about the submitted certificate and
+//! nothing here reads that document.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +178,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutTaxExemption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutTaxExemptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutTaxExemption"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutTaxExemptionErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+
+        // The exemption types are the collection this service publishes, and the
+        // model documents that a request names one of them ("Use the supported
+        // tax exemption type description"), so an unknown type is refused before
+        // anything is stored.
+        let exemption_type = crate::state::check_exemption_type(&input.exemption_type)
+            .map_err(PutTaxExemptionErrorModeled::ValidationException)?;
+
+        // `Authority$state` carries the model's non-blank pattern
+        // `^(?!\s*$)[\s\S]+$`, a negative lookahead the boundary validator's
+        // regex engine cannot compile, so a blank state reaches this handler
+        // having satisfied every constraint the boundary could check. The
+        // two-letter country code, the 1..=200 `exemptionType`, the 1..=550
+        // `accountIds` of 12 digits each and the certificate's file-name pattern
+        // and 1..=4 MiB file it already refused outside.
+        if let Some(submitted_state) = input.authority.state.as_deref() {
+            crate::state::check_not_blank("authority.state", submitted_state)
+                .map_err(PutTaxExemptionErrorModeled::ValidationException)?;
+        }
+        crate::state::check_exemption_authority(exemption_type, &input.authority)
+            .map_err(PutTaxExemptionErrorModeled::ValidationException)?;
+
+        let mut store = state.lock();
+        // The submission addresses "accounts listed in a consolidated billing
+        // family", so an account this service holds no tax-settings resource for
+        // and that is not the caller's own is outside that family: the CALL is
+        // refused rather than an exemption recorded for an account AWS would not
+        // have accepted — the same judgement, through the same predicate, that
+        // `BatchGetTaxExemptions` makes before reporting on an account.
+        for account_id in &input.account_ids {
+            if !store.reports_exemptions_for(account_id) {
+                return Err(PutTaxExemptionErrorModeled::ResourceNotFoundException(
+                    crate::state::no_exemptions_for_account(account_id),
+                )
+                .into());
+            }
+        }
+
+        // The records are written first and the case id minted only once they
+        // are: a submission refused for want of room opens no support case, so
+        // the ids this service hands out count the submissions it applied. One
+        // applied submission opens exactly one case, whatever number of accounts
+        // it wrote for, because it submits one certificate.
+        store
+            .store_exemptions(
+                &input.account_ids,
+                exemption_type,
+                &input.authority,
+                ::std::time::SystemTime::now(),
+            )
+            .map_err(PutTaxExemptionErrorModeled::CaseCreationLimitExceededException)?;
+        let case_id = store.mint_exemption_case_id();
+        let accounts = input.account_ids.len();
+        drop(store);
+
+        // The access record for a state-changing call: which operation ran, what
+        // it changed and how it ended. The certificate's bytes are never logged,
+        // and neither is any credential.
+        ::tracing::info!(
+            operation = "PutTaxExemption",
+            outcome = "recorded",
+            accounts,
+            exemption_type = %input.exemption_type,
+            case_id = %case_id,
+            "recorded a tax exemption for the accounts a submission named"
+        );
+
+        Ok(PutTaxExemptionOutput {
+            case_id: Some(case_id),
+        })
     }
 }

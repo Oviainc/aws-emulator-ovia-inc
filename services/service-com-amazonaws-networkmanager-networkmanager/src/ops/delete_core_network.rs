@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Deletes a core network along with all core network policies. This can only be
         // done if there are no attachments on a core network." The policies live on the
-        // record itself (`state::CoreNetworkRecord::policy_document`), so removing the
+        // record itself (`state::CoreNetworkRecord::policy_versions`), so removing the
         // record removes them with it; the attachments it holds block the delete until the
         // caller removes them, reported like every other dependency refusal of this service
         // through `state::dependents_block_delete`.

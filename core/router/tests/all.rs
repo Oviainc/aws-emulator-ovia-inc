@@ -237,3 +237,5 @@ mod mediapackagev2_published_data_plane_urls;
 mod pi_resource_features;
 #[path = "all/cloudformation_provisions_cloudwatch_metric_streams.rs"]
 mod cloudformation_provisions_cloudwatch_metric_streams;
+#[path = "all/cloudformation_provisions_event_rules_and_ssm_parameters.rs"]
+mod cloudformation_provisions_event_rules_and_ssm_parameters;
