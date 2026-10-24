@@ -17,7 +17,14 @@ pub struct GetEvaluationJobInput {
     pub job_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GetEvaluationJobResponse")]
+/// `GetEvaluationJobResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `creationTime` and `lastModifiedTime` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation",operation="GetEvaluationJob")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetEvaluationJobOutput {
     pub job_name: String,
@@ -35,4 +42,89 @@ pub struct GetEvaluationJobOutput {
     pub last_modified_time: Option<::aws_smithy_types::DateTime>,
     pub failure_messages: Option<Vec<String>>,
 }
+
+bedrock_schema_and_codec!(
+    GetEvaluationJobOutput,
+    GET_EVALUATION_JOB_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#GetEvaluationJobResponse",
+    "com.amazonaws.bedrock",
+    "GetEvaluationJobResponse",
+    (M_JOB_NAME, job_name, "jobName", 0, req, string),
+    (M_STATUS, status, "status", 1, req, string),
+    (M_JOB_ARN, job_arn, "jobArn", 2, req, string),
+    (
+        M_JOB_DESCRIPTION,
+        job_description,
+        "jobDescription",
+        3,
+        opt,
+        string
+    ),
+    (M_ROLE_ARN, role_arn, "roleArn", 4, req, string),
+    (
+        M_CUSTOMER_ENCRYPTION_KEY_ID,
+        customer_encryption_key_id,
+        "customerEncryptionKeyId",
+        5,
+        opt,
+        string
+    ),
+    (M_JOB_TYPE, job_type, "jobType", 6, req, string),
+    (
+        M_APPLICATION_TYPE,
+        application_type,
+        "applicationType",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_EVALUATION_CONFIG,
+        evaluation_config,
+        "evaluationConfig",
+        8,
+        req,
+        union_of(EvaluationConfig)
+    ),
+    (
+        M_INFERENCE_CONFIG,
+        inference_config,
+        "inferenceConfig",
+        9,
+        req,
+        union_of(EvaluationInferenceConfig)
+    ),
+    (
+        M_OUTPUT_DATA_CONFIG,
+        output_data_config,
+        "outputDataConfig",
+        10,
+        req,
+        struct_of(EvaluationOutputDataConfig)
+    ),
+    (
+        M_CREATION_TIME,
+        creation_time,
+        "creationTime",
+        11,
+        req,
+        date_time
+    ),
+    (
+        M_LAST_MODIFIED_TIME,
+        last_modified_time,
+        "lastModifiedTime",
+        12,
+        opt,
+        date_time
+    ),
+    (
+        M_FAILURE_MESSAGES,
+        failure_messages,
+        "failureMessages",
+        13,
+        opt,
+        list_of_string
+    ),
+);
 

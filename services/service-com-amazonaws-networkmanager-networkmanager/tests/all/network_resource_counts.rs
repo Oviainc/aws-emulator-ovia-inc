@@ -27,8 +27,9 @@ use crate::resource_tagging::escape;
 /// `transit-gateway-connect-peer`, `transit-gateway-route-table`, `vpn-connection`).
 ///
 /// Written here in lexicographic order, which is the order a request that names no
-/// `ResourceType` pages them in.
-const SUPPORTED_TYPES: [&str; 17] = [
+/// `ResourceType` pages them in. Shared with the `network_resources` suite, which reports
+/// resources of these same types.
+pub(crate) const SUPPORTED_TYPES: [&str; 17] = [
     "attachment",
     "connect-peer",
     "connection",

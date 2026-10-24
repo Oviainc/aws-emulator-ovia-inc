@@ -19,6 +19,8 @@ mod application_reference_refusals;
 mod configuration_check_reads;
 #[path = "all/configuration_checks.rs"]
 mod configuration_checks;
+#[path = "all/list_databases.rs"]
+mod list_databases;
 #[path = "all/pattern_violation_messages.rs"]
 mod pattern_violation_messages;
 #[path = "all/register_application_conditional_requirements.rs"]

@@ -168,10 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports removing nothing, and a built-in preset is not the caller's to delete —
         // `Preset$Type` says a preset "can be of two types: system or custom" and a
         // system one is not one "you have created" — so it is the modelled 403. That
-        // second branch is reachable only once the store seeds built-in presets (today it
-        // seeds built-in job templates and the `Default` queue only, and `CreatePreset`
-        // always stores `CUSTOM`); it is kept so the refusal lives with the removal, as
-        // `DeleteQueue` and `DeleteJobTemplate` keep theirs.
+        // second branch answers for the built-in presets the store is seeded with, which
+        // no `CreatePreset` minted, exactly as `DeleteQueue` and `DeleteJobTemplate`
+        // answer for the built-in queue and the built-in job templates.
         use ::std::collections::btree_map::Entry;
         match state.presets.entry(name.to_string()) {
             Entry::Vacant(_) => Err(DeletePresetErrorModeled::NotFoundException(NotFoundException {

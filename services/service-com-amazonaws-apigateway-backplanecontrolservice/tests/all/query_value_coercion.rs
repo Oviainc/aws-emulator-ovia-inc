@@ -38,12 +38,21 @@ use serde_json::{json, Value};
 use crate::rest_api_lifecycle::{create_api, string_member, Answer, Gateway};
 
 /// The error code a protocol-level conversion failure is answered with, and the code
-/// that must NOT appear: `ValidationException` is what the framework answers for a value
-/// that was read and then broke a modelled constraint.
+/// that must NOT appear for one: a conversion failure is not a constraint refusal (see
+/// [`CONSTRAINT_REFUSAL`]).
 const SERIALIZATION_EXCEPTION: &str = "SerializationException";
 
-/// The code a constraint refusal carries, which a conversion failure is not.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
+/// The code a constraint refusal carries for this service (`BadRequestException`, see
+/// `src/service/validation.rs`). A conversion failure is not one — but that code is also
+/// a legitimate per-operation modelled error, so what a converted value must not earn is
+/// the constraint ENVELOPE, recognised by [`CONSTRAINT_ENVELOPE`] rather than by the code
+/// alone.
+const CONSTRAINT_REFUSAL: &str = "BadRequestException";
+
+/// The envelope a constraint refusal states its clauses in (`1 validation error
+/// detected: …`), which is what says the request was refused for breaking a modelled
+/// rule whatever error code carries it.
+const CONSTRAINT_ENVELOPE: &str = "validation error";
 
 /// What a row expects of the answer.
 #[derive(Debug, Clone, Copy)]
@@ -102,9 +111,17 @@ fn assert_converted(answer: &Answer, case: &str) {
     );
     assert_ne!(
         answer.error.as_deref(),
-        Some(VALIDATION_EXCEPTION),
+        Some(CONSTRAINT_REFUSAL),
         "case {case}: a value that converts must reach the operation, \
          got {} with {:?}",
+        answer.status,
+        answer.body
+    );
+    let message = answer.body["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains(CONSTRAINT_ENVELOPE),
+        "case {case}: a value that converts must not be refused as a constraint \
+         violation, got {} with {:?}",
         answer.status,
         answer.body
     );

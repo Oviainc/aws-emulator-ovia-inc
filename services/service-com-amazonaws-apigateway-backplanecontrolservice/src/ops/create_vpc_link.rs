@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpcLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpcLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +87,87 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+
+use crate::state::VpcLinkEntry;
+
+/// The `VpcLink` body for a stored link — the one place this crate renders that shape, so
+/// `CreateVpcLink` and `GetVpcLink` cannot report a record differently.
+///
+/// `status` is computed from the stored record (see [`VpcLinkEntry::status`]).
+/// `statusMessage` is "a description about the VPC link status" (`VpcLink$statusMessage`)
+/// and AWS publishes no sentence it carries for a link that is provisioning or
+/// provisioned, so nothing is reported for it rather than a message this emulator made
+/// up.
+pub fn vpc_link_body(entry: &VpcLinkEntry) -> CreateVpcLinkOutput {
+    CreateVpcLinkOutput {
+        id: Some(entry.id.clone()),
+        name: Some(entry.name.clone()),
+        description: entry.description.clone(),
+        target_arns: Some(entry.target_arns.clone()),
+        status: Some(entry.status().to_string()),
+        status_message: None,
+        tags: (!entry.tags.is_empty()).then(|| {
+            entry
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        }),
+    }
+}
+
+/// Refuse a request this service will not store.
+///
+/// Called BEFORE the store lock is taken, so a request the service refuses never reaches
+/// the records at all. Every caller-sized member is bounded by the rule the sibling
+/// creates apply, and `targetArns` by what the member itself documents: "The ARN of the
+/// network load balancer of the VPC targeted by the VPC link" — a link targets at least
+/// one load balancer, and each entry is an ARN. WHICH resource that ARN names is not
+/// checked: a load balancer belongs to another service, which this emulator cannot
+/// resolve, so requiring the ARN FORM is the part of the rule it can hold the caller to.
+fn bound_input(input: &CreateVpcLinkInput) -> Result<(), String> {
+    use crate::state::{
+        bound_chars, bound_entries, bound_tag, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS, MAX_TAGS,
+    };
+
+    bound_chars("name", &input.name, MAX_STRING_CHARS)?;
+    // `name` is "the name used to label and identify the VPC link" (`VpcLink$name`) and
+    // is `@required`, so a link is identified by it; the model declares no `@length` on
+    // it, so this one bound is the emulator's own reading of "a name identifies" — an
+    // empty string names nothing, and a stored link whose name is empty could not be told
+    // from one that never had a name.
+    if input.name.is_empty() {
+        return Err("name may not be empty".to_string());
+    }
+    if let Some(description) = &input.description {
+        bound_chars("description", description, MAX_STRING_CHARS)?;
+    }
+    bound_entries(
+        "targetArns",
+        input.target_arns.len(),
+        MAX_COLLECTION_ENTRIES,
+    )?;
+    if input.target_arns.is_empty() {
+        return Err("targetArns must name at least one target".to_string());
+    }
+    for target in &input.target_arns {
+        bound_chars("a targetArns entry", target, MAX_STRING_CHARS)?;
+        if ::service_common::arn::parse(target).is_none() {
+            return Err(crate::state::invalid_arn(target));
+        }
+    }
+    // The tags a create carries are checked by the SAME rule `TagResource` applies, so
+    // a tag this service refuses on one path cannot be stored through the other.
+    if let Some(tags) = &input.tags {
+        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        for (key, value) in tags {
+            bound_tag(key, value)?;
+        }
+    }
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,18 +240,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpcLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpcLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpcLink"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store unchecked, and the checks run before the
+        // store lock is taken.
+        bound_input(&input).map_err(|message| {
+            CreateVpcLinkErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // Bound the growth a caller drives, at API Gateway's published quota.
+        if store.vpc_links.len() >= crate::state::MAX_VPC_LINKS {
+            return Err(CreateVpcLinkErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(format!(
+                        "Maximum number of VPC links exceeded for this account: {}",
+                        crate::state::MAX_VPC_LINKS
+                    )),
+                },
+            )
+            .into());
+        }
+        let id = store.mint_id();
+        let sequence = store.next_sequence();
+        let entry = VpcLinkEntry {
+            id: id.clone(),
+            name: input.name,
+            description: input.description,
+            target_arns: input.target_arns,
+            // Creating a VPC link is "an asynchronous operation": the link is still being
+            // provisioned when this answer is written, so it is reported `PENDING` until
+            // the stored due instant has passed. The span is stored, never slept through.
+            available_at: Some(
+                ::std::time::Instant::now() + crate::state::VPC_LINK_PROVISION_SPAN,
+            ),
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<String, String>>(),
+            sequence,
+        };
+        // The answer is rendered from the record that is about to be stored, by the one
+        // renderer a read uses, so what the caller is told is what the store holds.
+        let body = vpc_link_body(&entry);
+        store.vpc_links.insert(id.clone(), entry);
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — never a request body, a tag value or a target ARN.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            vpc_link_id = ?id,
+            outcome = "created",
+            "vpc link created",
+        );
+        Ok(body)
     }
 }
