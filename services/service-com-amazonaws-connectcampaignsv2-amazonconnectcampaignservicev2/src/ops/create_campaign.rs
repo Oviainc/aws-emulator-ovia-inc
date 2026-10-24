@@ -264,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             communication_time_config: input.communication_time_config,
             communication_limits_override: input.communication_limits_override,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
-            state: crate::state::CampaignState::Initialized,
+            lifecycle_state: crate::state::CampaignState::Initialized,
             created_at: std::time::SystemTime::now(),
             outbound_requests: std::collections::BTreeMap::new(),
         });
