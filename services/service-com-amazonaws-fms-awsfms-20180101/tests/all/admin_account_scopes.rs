@@ -47,13 +47,15 @@ const OTHER_REGION: &str = "eu-central-1";
 const DELEGATED_ACCOUNTS: &[&str] = &["222233334444", "7", "000000000001", "99999999999999999999"];
 
 /// How long a new administrator stays `ONBOARDING`, from the service's own
-/// constant, plus a margin so a waiting test is not racing it.
+/// constant, plus a margin so a waiting test is not racing it. `pub(crate)` so
+/// the sibling suite that enumerates the organization's administrators waits out
+/// the SAME span rather than keeping a second copy of the wait rule.
 ///
 /// A blocking `std::thread::sleep` on purpose: this workspace's `tokio` is
 /// built without the `time` feature, so `tokio::time::sleep` is not available
 /// here, and a test that waits out one chosen span has nothing else to do
 /// meanwhile.
-fn wait_out_the_onboarding() {
+pub(crate) fn wait_out_the_onboarding() {
     sleep(
         service_com_amazonaws_fms_awsfms_20180101::state::ADMIN_ONBOARDING_SPAN
             + Duration::from_millis(250),
@@ -62,8 +64,9 @@ fn wait_out_the_onboarding() {
 
 /// `name` as the model's own `OrganizationStatus` catalog spells it, so an
 /// expectation below names a value the enum actually carries instead of a
-/// free-standing string.
-fn organization_status(name: &str) -> &'static str {
+/// free-standing string. `pub(crate)` so a sibling suite asserting the same
+/// statuses reads them out of the same catalog.
+pub(crate) fn organization_status(name: &str) -> &'static str {
     ORGANIZATION_STATUS_VALUES
         .iter()
         .copied()
@@ -294,8 +297,9 @@ fn scope_cases() -> Vec<ScopeCase> {
 }
 
 /// Onboard `account` with `scope`, asserting the 200 and the empty body
-/// `PutAdminAccount` models.
-async fn put_admin_account(
+/// `PutAdminAccount` models. `pub(crate)` so a sibling suite onboards an
+/// administrator through the same helper.
+pub(crate) async fn put_admin_account(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     account: &str,

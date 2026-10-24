@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAdminAccountsForOrganization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAdminAccountsForOrganization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAdminAccountsForOrganization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +121,14 @@ impl From<ListAdminAccountsForOrganizationErrorModeled> for ListAdminAccountsFor
     }
 }
 
+/// The largest page this operation serves, whether or not the caller bounds it.
+///
+/// The model's `com.amazonaws.fms#PaginationMaxResults` range is 1..100, so 100
+/// is the largest `MaxResults` a caller can ask for and therefore the largest
+/// page: a caller who sends none gets that bounded page plus a `NextToken`
+/// rather than every administrator in one response.
+const MAX_PAGE_SIZE: usize = 100;
+
 /// The `ListAdminAccountsForOrganization` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,18 +165,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAdminAccountsForOrganization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAdminAccountsForOrganizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAdminAccountsForOrganization"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListAdminAccountsForOrganizationErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the Firewall Manager store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // ONE reading of the clock for the whole request: this handler decides
+        // every administrator's status from it and then writes the transitions
+        // that reading made due, and `SystemTime` is not monotonic, so a second
+        // reading could straddle a settle boundary.
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The authorization gate, BEFORE the pagination token is examined: this
+        // call is organisation-scoped, so a caller that is not entitled to it
+        // cannot learn anything about what the organization holds.
+        crate::state::require_administrator(&store, &region)?;
+
+        // A token this service did not mint names no page boundary. The model
+        // declares no client-input error for this operation, so refuse it as a
+        // bad request rather than inventing a page for it.
+        let start = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_account_page_token(token) {
+                Some(start) => Some(start),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "NextToken is not a pagination token issued by \
+                         ListAdminAccountsForOrganization",
+                    ));
+                }
+            },
+            None => None,
+        };
+
+        // Materialise the transitions the CLOCK has already made due — the
+        // administrator-role tear-down and the onboardings — so the statuses
+        // reported here are persisted rather than re-derived by every reader.
+        // That is the only write this reporting operation makes, and it was owed
+        // at this instant whether or not anybody called.
+        store.settle_admin_account_at(now);
+        store.settle_organization_admins_at(now);
+
+        // The organization's administrators, keyed by account id, so a page
+        // boundary is a key in a total order: an administrator onboarded or
+        // removed between two pages cannot reshuffle what was already reported.
+        let summaries = store.admin_account_summaries(now);
+        // With no token the lower bound is the empty id, which sorts before
+        // every `AWSAccountId`.
+        let lower = start.unwrap_or_default();
+        let mut remaining = summaries.range(lower..);
+
+        // Clamped into 1..=MAX_PAGE_SIZE rather than only capped: the modelled
+        // range already refuses a page size outside it, and this keeps a page
+        // from ever being empty-with-a-token (which a client would follow
+        // forever) if that validation ever changes.
+        let page_size = input
+            .max_results
+            .map_or(MAX_PAGE_SIZE, |max| usize::try_from(max).unwrap_or(0))
+            .clamp(1, MAX_PAGE_SIZE);
+        let admin_accounts: Vec<AdminAccountSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, summary)| summary.clone())
+            .collect();
+        // A token only when an administrator is left AFTER this page, so the
+        // last page carries none.
+        let next_token = remaining
+            .next()
+            .map(|(account, _)| crate::state::encode_page_token(account));
+
+        Ok(ListAdminAccountsForOrganizationOutput {
+            admin_accounts: Some(admin_accounts),
+            next_token,
+        })
     }
 }

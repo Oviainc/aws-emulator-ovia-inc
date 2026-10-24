@@ -13,10 +13,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccountScope, AdminScope, AppsListData, ComplianceViolator, DiscoveredResource, EvaluationResult,
-    OrganizationalUnitScope, Policy, PolicyComplianceStatus, PolicySummary, PolicyTypeScope,
-    ProtocolsListData, ProtocolsListDataSummary, RegionScope, ResourceNotFoundException,
-    ResourceSet, ResourceSetSummary, Tag,
+    AccountScope, AdminAccountSummary, AdminScope, AppsListData, ComplianceViolator,
+    DiscoveredResource, EvaluationResult, OrganizationalUnitScope, Policy, PolicyComplianceStatus,
+    PolicySummary, PolicyTypeScope, ProtocolsListData, ProtocolsListDataSummary, RegionScope,
+    ResourceNotFoundException, ResourceSet, ResourceSetSummary, Tag,
 };
 
 /// The Region an emulated service reports when the request carries no SigV4
@@ -33,9 +33,10 @@ const ARN_NAMESPACE: &str = "fms";
 /// [`crate::ops::types::ACCOUNT_ROLE_STATUS_VALUES`]); the association is
 /// returned ready, so it is `READY` from the moment it is written.
 ///
-/// `associated_at` is recorded here but not yet reported by any implemented
-/// operation: it is what the later `ListAdminAccountsForOrganization` slice
-/// reads, so it is stored now rather than being a derivation a reader computes.
+/// `associated_at` is recorded here but reported by no operation: no modelled
+/// member of `GetAdminAccountResponse` or `AdminAccountSummary` carries when the
+/// association was made, so it is held for the operations that come to need it
+/// rather than being a derivation a reader would have to compute.
 ///
 /// `removal_due` is the instant a requested disassociation completes — see
 /// [`ComAmazonawsFmsAwsfms20180101State::settle_admin_account`]. It is `None`
@@ -170,9 +171,9 @@ pub const ADMIN_ONBOARDING_SPAN: Duration = Duration::from_millis(500);
 /// `ONBOARDING_COMPLETE` [`ADMIN_ONBOARDING_SPAN`] after the call that started
 /// it, whether or not anybody asks. Readers materialise it with [`Self::settle`].
 ///
-/// `onboarded_at` / `updated_at` are recorded but not yet reported: no modelled
-/// member of `AdminAccountSummary` or `GetAdminScopeResponse` carries them, and
-/// they are what a later slice (the administrator enumeration) reads.
+/// `onboarded_at` / `updated_at` are recorded but reported by no operation: no
+/// modelled member of `AdminAccountSummary` or `GetAdminScopeResponse` carries
+/// them, so they are held for the operations that come to need them.
 #[derive(Debug, Clone)]
 pub struct OrganizationAdminRecord {
     pub account_id: String,
@@ -1172,6 +1173,63 @@ impl ComAmazonawsFmsAwsfms20180101State {
             }
             None => false,
         }
+    }
+
+    /// Every Firewall Manager administrator account this organisation holds,
+    /// keyed by account id, as the `AdminAccountSummary` an enumeration reports.
+    ///
+    /// The organisation's administrators are the two kinds of record this store
+    /// keeps: the ONE default administrator `AssociateAdminAccount` associated
+    /// ([`AdminAccountRecord`], which "has full administrative scope", so
+    /// `DefaultAdmin` is set on it and on no other), and every account
+    /// `PutAdminAccount` onboarded ([`OrganizationAdminRecord`]). An account
+    /// recorded as both is ONE administrator, and the default-administrator role
+    /// is the one reported for it.
+    ///
+    /// Each summary's `Status` is the `OrganizationStatus` that holds AT `now`,
+    /// derived from the CLOCK rather than from whether a writer has
+    /// materialised it ([`OrganizationAdminRecord::status_at`] for an onboarded
+    /// administrator, and for the default administrator the role status that
+    /// holds at `now` read through [`default_admin_organization_status`]), so no
+    /// reader of this store can disagree with another about an administrator's
+    /// status.
+    ///
+    /// A `BTreeMap` so the order is total and a page boundary is a KEY rather
+    /// than a cursor: an administrator onboarded or removed between two pages
+    /// cannot reshuffle the accounts already reported.
+    pub fn admin_account_summaries(&self, now: SystemTime) -> BTreeMap<String, AdminAccountSummary> {
+        let mut summaries: BTreeMap<String, AdminAccountSummary> = self
+            .organization_admins
+            .values()
+            .map(|admin| {
+                (
+                    admin.account_id.clone(),
+                    AdminAccountSummary {
+                        admin_account: Some(admin.account_id.clone()),
+                        default_admin: false,
+                        status: Some(admin.status_at(now).to_string()),
+                    },
+                )
+            })
+            .collect();
+        if let Some(admin) = self.admin_account.as_ref() {
+            // A tear-down the clock has already completed IS a deleted role,
+            // whether or not it has been written yet.
+            let role_status = if admin.is_active_at(now) {
+                admin.role_status.as_str()
+            } else {
+                ROLE_STATUS_DELETED
+            };
+            summaries.insert(
+                admin.account_id.clone(),
+                AdminAccountSummary {
+                    admin_account: Some(admin.account_id.clone()),
+                    default_admin: true,
+                    status: Some(default_admin_organization_status(role_status).to_string()),
+                },
+            );
+        }
+        summaries
     }
 
     /// The Firewall Manager administrator accounts that manage the calling

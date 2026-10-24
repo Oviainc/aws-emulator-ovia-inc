@@ -25,6 +25,8 @@ mod third_party_firewall_firewall_policies;
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]
 mod admin_account_scopes;
+#[path = "all/admin_accounts_for_organization.rs"]
+mod admin_accounts_for_organization;
 #[path = "all/administrator_gated_operations.rs"]
 mod administrator_gated_operations;
 #[path = "all/apps_list_lifecycle.rs"]
