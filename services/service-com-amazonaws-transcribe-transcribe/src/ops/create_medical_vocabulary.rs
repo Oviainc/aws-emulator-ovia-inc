@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMedicalVocabulary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMedicalVocabulary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMedicalVocabulary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a custom medical vocabulary built from the table file a request names
+//! (see [`CreateMedicalVocabulary::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -183,23 +176,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_MEDICAL_VOCABULARY_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Record the custom medical vocabulary this request describes.
+    ///
+    /// A medical vocabulary's terms can only come from the table file at
+    /// `VocabularyFileUri`, which this operation models `@required` and for which it
+    /// publishes no inline alternative ("CreateMedicalVocabulary does not support the
+    /// Phrases flag and only accepts vocabularies in table format"). Reading that
+    /// file is work this emulator cannot perform, so the resource is recorded — the
+    /// control plane is real — and the build it cannot run ends in the service's own
+    /// modelled failure state: `PENDING` here, then `FAILED` with a `FailureReason`
+    /// once the clock makes the transition due (see
+    /// [`crate::state::MedicalVocabularyRecord`]).
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMedicalVocabulary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMedicalVocabularyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMedicalVocabulary"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateMedicalVocabularyErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "US English (en-US) is the only language supported with Amazon Transcribe
+        // Medical" (model doc for `CreateMedicalVocabularyRequest$LanguageCode`). The
+        // member targets the service-wide `LanguageCode` enum, so no constraint trait
+        // expresses that narrowing and the handler is where it is refused.
+        if input.language_code != crate::state::MEDICAL_LANGUAGE_CODE {
+            return Err(bad_request(&format!(
+                "The LanguageCode {language} is not supported by Amazon Transcribe \
+                 Medical. Use {only} and try your request again.",
+                language = input.language_code,
+                only = crate::state::MEDICAL_LANGUAGE_CODE,
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // "must be unique within an Amazon Web Services account. If you try to create
+        // a new custom medical vocabulary with the same name as an existing custom
+        // medical vocabulary, you get a ConflictException error." Checked and
+        // inserted under one lock, so N concurrent creates of one name have exactly
+        // one winner. The name is unique within THIS family: a medical vocabulary and
+        // a custom vocabulary are two resource types, each with its own ARN.
+        if store.medical_vocabularies.contains_key(&input.vocabulary_name) {
+            return Err(CreateMedicalVocabularyErrorModeled::ConflictException(
+                ConflictException {
+                    // As `CreateVocabulary`: the kind, not the caller's name.
+                    message: Some(crate::state::name_already_exists_message(
+                        crate::state::KIND_MEDICAL_VOCABULARY,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if store.medical_vocabularies.len() >= crate::state::MAX_VOCABULARIES {
+            return Err(CreateMedicalVocabularyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} custom medical vocabularies \
+                         for this account. Delete a custom medical vocabulary you no \
+                         longer need and try your request again.",
+                        crate::state::MAX_VOCABULARIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.next_sequence();
+        let record = crate::state::MedicalVocabularyRecord::pending(
+            input.vocabulary_name.clone(),
+            sequence,
+            input.language_code,
+            input.vocabulary_file_uri,
+            region,
+            input.tags.unwrap_or_default(),
+            now,
+        );
+
+        // The response is the record just stored, never the request echoed back.
+        let output = CreateMedicalVocabularyOutput {
+            vocabulary_name: Some(record.name.clone()),
+            language_code: Some(record.language_code.clone()),
+            vocabulary_state: Some(record.state.clone()),
+            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+            failure_reason: record.failure_reason.clone(),
+        };
+        ::tracing::info!(
+            operation = "CreateMedicalVocabulary",
+            vocabulary = %record.name,
+            state = %record.state,
+            "custom medical vocabulary recorded; its file is not read"
+        );
+        store.medical_vocabularies.insert(record.name.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express.
+fn bad_request(message: &str) -> CreateMedicalVocabularyError {
+    CreateMedicalVocabularyErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
