@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members a request supplies to a stored job, which a later `DescribeJob` or
+//! `ListJobs` observes, while that job's `JobState` is still `New`. A member the request
+//! omits is left as it was. Updating the main job of an export order updates its job parts
+//! with it, since a part is the device-bearing half of the same order and carries the
+//! order's attributes.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +181,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        let mut store = state.lock();
+        let Some(job) = store.jobs.get(&input.job_id) else {
+            return Err(UpdateJobErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The job ID {} can't be found. Check the information you provided in \
+                         your last request, and try again.",
+                        input.job_id
+                    )),
+                    resource_type: Some("job".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "While a job's JobState value is New, you can update some of the information
+        // associated with a job. Once the job changes to a different job state … this
+        // action is no longer available": from any other state — `Cancelled`, which a
+        // cancelled job is in, included — the job's current state does not allow the
+        // action.
+        if !job.job_state.is_updatable() {
+            return Err(UpdateJobErrorModeled::InvalidJobStateException(
+                InvalidJobStateException {
+                    message: Some(format!(
+                        "The job {} is in state {} and can't be updated. A job's information \
+                         can only be updated while its JobState value is New.",
+                        job.job_id,
+                        job.job_state.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Updating the main job of an export order updates the order: its job parts carry
+        // the order's attributes — the address the device ships to, the resources covered,
+        // the role, the notification — so a change to the order reaches them too, each one
+        // that is itself still within the update window. A job part named on its own, like
+        // every job that holds no parts, is the only record its update touches.
+        let order: Vec<String> = ::std::iter::once(input.job_id.clone())
+            .chain(job.job_part_ids.iter().cloned())
+            .collect();
+
+        // An update that names a resource is built from that resource, exactly as the
+        // create is: an id no stored address answers to names none. A forwarding address
+        // is an address too, so the same rule holds for it.
+        for address_id in [
+            input.address_id.as_deref(),
+            input.forwarding_address_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !store.addresses.contains_key(address_id) {
+                return Err(UpdateJobErrorModeled::InvalidResourceException(
+                    InvalidResourceException {
+                        message: Some(format!(
+                            "The address ID {address_id} can't be found. Check the information \
+                             you provided in your last request, and try again."
+                        )),
+                        resource_type: Some("address".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        for job_id in order {
+            if let Some(job) = store.jobs.get_mut(&job_id) {
+                if job.job_state.is_updatable() {
+                    apply_update(job, &input);
+                }
+            }
+        }
+
+        Ok(UpdateJobOutput {})
+    }
+}
+
+/// Apply the members this request supplied to `job`, leaving every member it omitted as
+/// it was.
+///
+/// `UpdateJobRequest` models no member that clears a stored value — `Description` is
+/// modelled `length 1..1024`, so not even an empty string reaches a handler — so an absent
+/// member means "leave this as it is", which is what makes an update partial. Every member
+/// the request models is applied; nothing else about the job (its id, its type, its device
+/// type, its state, the instant it was created, the parts it holds) is something this
+/// operation takes.
+fn apply_update(job: &mut crate::state::StoredJob, input: &UpdateJobInput) {
+    if let Some(address_id) = &input.address_id {
+        job.address_id = Some(address_id.clone());
+    }
+    if let Some(forwarding_address_id) = &input.forwarding_address_id {
+        job.forwarding_address_id = Some(forwarding_address_id.clone());
+    }
+    if let Some(description) = &input.description {
+        job.description = Some(description.clone());
+    }
+    if let Some(role_arn) = &input.role_arn {
+        job.role_arn = Some(role_arn.clone());
+    }
+    if let Some(shipping_option) = &input.shipping_option {
+        job.shipping_option = Some(shipping_option.clone());
+    }
+    if let Some(capacity_preference) = &input.snowball_capacity_preference {
+        job.snowball_capacity_preference = Some(capacity_preference.clone());
+    }
+    if let Some(notification) = &input.notification {
+        job.notification = Some(notification.clone());
+    }
+    if let Some(resources) = &input.resources {
+        job.resources = Some(resources.clone());
+    }
+    if let Some(configuration) = &input.on_device_service_configuration {
+        job.on_device_service_configuration = Some(configuration.clone());
+    }
+    if let Some(pickup_details) = &input.pickup_details {
+        job.pickup_details = Some(pickup_details.clone());
     }
 }

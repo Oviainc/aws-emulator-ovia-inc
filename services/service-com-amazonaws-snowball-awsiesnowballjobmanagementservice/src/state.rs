@@ -100,6 +100,17 @@ impl JobState {
     pub fn is_cancellable(self) -> bool {
         matches!(self, Self::New)
     }
+
+    /// Whether `UpdateJob` is permitted in this state.
+    ///
+    /// The model documents the window on `UpdateJob`: "While a job's `JobState` value is
+    /// `New`, you can update some of the information associated with a job. Once the job
+    /// changes to a different job state … this action is no longer available." So `New`
+    /// is the only state a job's information can still be updated from — including
+    /// `Cancelled`, which a cancelled job is in and from which no update is available.
+    pub fn is_updatable(self) -> bool {
+        matches!(self, Self::New)
+    }
 }
 
 /// One stored shipping address: every `Address` member this service keeps, so

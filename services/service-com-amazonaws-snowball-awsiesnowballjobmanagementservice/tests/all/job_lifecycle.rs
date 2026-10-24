@@ -127,7 +127,7 @@ pub(crate) async fn ok(
 }
 
 /// A call that must be refused with HTTP 400 and the modelled error `error_code`.
-async fn refused(
+pub(crate) async fn refused(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
@@ -366,7 +366,7 @@ pub(crate) fn assert_address_matches(
 
 /// Every state the lifecycle enum spells, so the set below is checked against the model
 /// rather than against itself.
-const ALL_JOB_STATES: &[JobState] = &[
+pub(crate) const ALL_JOB_STATES: &[JobState] = &[
     JobState::New,
     JobState::PreparingAppliance,
     JobState::PreparingShipment,
@@ -584,7 +584,7 @@ fn job_rows() -> Vec<(&'static str, Value)> {
 }
 
 /// Assert `metadata` reports exactly what `submitted` asked for, for a job in `state`.
-fn assert_job_metadata_matches(metadata: &Value, submitted: &Value, state: &str, case: &str) {
+pub(crate) fn assert_job_metadata_matches(metadata: &Value, submitted: &Value, state: &str, case: &str) {
     assert_eq!(
         metadata.get("JobState").and_then(Value::as_str),
         Some(state),

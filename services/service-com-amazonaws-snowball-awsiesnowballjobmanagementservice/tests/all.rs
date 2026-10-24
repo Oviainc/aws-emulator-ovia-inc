@@ -17,5 +17,7 @@ mod address_validation;
 mod export_job_parts;
 #[path = "all/job_lifecycle.rs"]
 mod job_lifecycle;
+#[path = "all/job_updates.rs"]
+mod job_updates;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
