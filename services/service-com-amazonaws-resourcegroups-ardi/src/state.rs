@@ -228,6 +228,22 @@ pub fn check_tags<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> Res
 /// effect, with no update in flight to report.
 pub const CONFIGURATION_IN_EFFECT: &str = "UPDATE_COMPLETE";
 
+/// The service-configuration parameter that decides whether a group may be
+/// deleted.
+///
+/// A parameter is named in the AWS "Service configurations for resource groups"
+/// reference, which is the vocabulary `GroupConfigurationParameter$Name` is
+/// documented in; the modelled name pattern `^[a-z-]+$` admits exactly one
+/// spelling, so the comparison in [`GroupRecord::configuration_parameter_has_value`]
+/// is exact.
+pub const DELETION_PROTECTION_PARAMETER: &str = "deletion-protection";
+
+/// The [`DELETION_PROTECTION_PARAMETER`] value that keeps a group which still
+/// holds resources from being deleted. Its documented alternative (`DISABLED`),
+/// any other value, and the parameter being absent all leave deletion
+/// unprotected.
+pub const DELETION_PROTECTION_UNLESS_EMPTY: &str = "UNLESS_EMPTY";
+
 /// One persisted resource group: its identity, its describable attributes, the
 /// query or the service configuration it was created with, its tags, and its
 /// static members.
@@ -306,6 +322,42 @@ impl GroupRecord {
             status: Some(CONFIGURATION_IN_EFFECT.to_string()),
             failure_reason: None,
         })
+    }
+
+    /// Whether this record's stored service configuration sets `parameter` to
+    /// `value`.
+    ///
+    /// Read across every configuration item the group holds and every value the
+    /// parameter carries: a parameter is set when any item sets it, because the
+    /// configuration is one document whatever item type declares the parameter.
+    /// A group with no configuration, an item with no parameters and a parameter
+    /// with no values all set nothing.
+    pub fn configuration_parameter_has_value(&self, parameter: &str, value: &str) -> bool {
+        self.configuration
+            .iter()
+            .flatten()
+            .filter_map(|item| item.parameters.as_ref())
+            .flatten()
+            .filter(|p| p.name == parameter)
+            .filter_map(|p| p.values.as_ref())
+            .flatten()
+            .any(|v| v == value)
+    }
+
+    /// Whether this group's own stored service configuration forbids deleting it
+    /// as it stands.
+    ///
+    /// [`DELETION_PROTECTION_PARAMETER`] set to
+    /// [`DELETION_PROTECTION_UNLESS_EMPTY`] protects a group that still contains
+    /// resources, so protection is decided from the configuration AND the
+    /// membership the record holds at the moment of the call: emptying the group
+    /// lifts it, and filling it again restores it.
+    pub fn deletion_is_protected(&self) -> bool {
+        !self.members.is_empty()
+            && self.configuration_parameter_has_value(
+                DELETION_PROTECTION_PARAMETER,
+                DELETION_PROTECTION_UNLESS_EMPTY,
+            )
     }
 
     /// The modelled `ResourceQuery` for this record, if it was created with one.

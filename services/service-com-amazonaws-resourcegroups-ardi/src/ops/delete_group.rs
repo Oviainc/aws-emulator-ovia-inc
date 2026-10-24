@@ -4,7 +4,9 @@
 //!
 //! Removes the group that `Group` (a name or a group ARN) or the deprecated `GroupName`
 //! names — with its static memberships and its tags, which are held on the same record —
-//! and reports the group as it was at the moment it was deleted.
+//! and reports the group as it was at the moment it was deleted. A group whose own stored
+//! service configuration protects it from deletion while it still contains resources is
+//! refused instead, and keeps its memberships and its tags.
 //!
 //! ## Shape of an operation
 //!
@@ -187,6 +189,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
         let name = store.lookup(identifier).ok_or_else(not_found)?;
+        // A group's own stored service configuration can forbid deleting it: the
+        // `deletion-protection` parameter set to `UNLESS_EMPTY` protects a group
+        // that still contains resources. The record is read before anything is
+        // removed, so the answer is for the configuration and the membership the
+        // store holds NOW, and a refusal leaves the group exactly as it was.
+        // `lookup` already resolved the name to a stored record, so the 404 arm
+        // here is defensive only.
+        let record = store.groups.get(&name).ok_or_else(not_found)?;
+        if record.deletion_is_protected() {
+            let resources = record.members.len();
+            drop(store);
+            // The access record for a destructive operation that was REFUSED: an
+            // attempt on a protected group is as auditable as one that succeeded.
+            tracing::info!(
+                target: crate::state::AUDIT_TARGET,
+                operation = Self::NAME,
+                caller = ?crate::state::request_caller(ctx.parts()),
+                region = ?crate::state::request_region(ctx.parts()),
+                group = ?name,
+                resources,
+                outcome = "refused",
+                "resource group deletion refused",
+            );
+            return Err(DeleteGroupErrorModeled::BadRequestException(BadRequestException {
+                message: Some(
+                    "Cannot delete group: its service configuration protects it from \
+                     deletion while it contains resources"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
         // Removing the record removes the group's memberships and tags with it:
         // both are held on the record itself.
         let removed = store.groups.remove(&name).ok_or_else(not_found)?;
