@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkspaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkspaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the workspaces of the account — "Retrieves information about
+//! workspaces in the current account" — in `workspaceId` order, a page at a
+//! time, each row built from the STORED workspace record the create persisted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkspaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `maxResults` caps the page: its documented default is 25 and its documented
+//! minimum 1, so an omitted value serves 25 rows and an explicit zero is
+//! refused. (The modelled `range` on the member admits 0, so that refusal is
+//! this handler's, applied on the strength of the member's own documentation:
+//! "The default is 25. Valid Range: Minimum value of 1.") The service never
+//! serves more than [`crate::state::MAX_PAGE_SIZE`] rows whatever is asked for.
+//! The opaque `nextToken` resumes the listing at the next `workspaceId` rather
+//! than at an offset, so a page boundary survives a workspace being created or
+//! deleted between two pages; a token this listing did not mint is refused with
+//! the `ValidationException` (HTTP 400) the operation models, since it declares
+//! no other client error for a malformed input.
+//!
+//! This is a REPORTING operation: it writes nothing — not even a lifecycle
+//! transition, because a workspace is stored in no non-terminal state.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +155,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkspaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkspacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkspaces"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and a page served is a read of tenant state.
+        ::tracing::info!(operation = "ListWorkspaces", "serving a request");
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWorkspacesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        let invalid = |message: String| {
+            ListWorkspacesErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        };
+
+        // A `nextToken` carries the `workspaceId` the page resumes AT
+        // (inclusive), not an offset, so a page boundary survives a workspace
+        // being created or deleted between two pages.
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(decode_next_token(token).ok_or_else(|| {
+                // The token itself is NOT echoed back: it is opaque to the
+                // caller and modelled up to 17880 characters, so the refusal
+                // names the member and what is wrong with it rather than
+                // copying an arbitrary request string into the response.
+                invalid("nextToken is not a token this listing minted".to_string())
+            })?),
+        };
+
+        // The page size served. `maxResults` documents a minimum of 1 and a
+        // default of 25, so an explicit zero is refused and a request that names
+        // none is served the documented default — never every workspace.
+        // Whatever is asked for, the service serves at most
+        // `crate::state::MAX_PAGE_SIZE`.
+        let page_size = match input.max_results {
+            None => crate::state::DEFAULT_PAGE_SIZE,
+            Some(requested) if requested < 1 => {
+                return Err(invalid(
+                    "maxResults must be at least 1; omit it for the default of 25".to_string(),
+                )
+                .into())
+            }
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(crate::state::MAX_PAGE_SIZE)
+                .min(crate::state::MAX_PAGE_SIZE),
+        };
+
+        // `workspaces` is keyed by `workspaceId`, so iterating the map IS id
+        // order and resuming is a `range` from the token's key: the page starts
+        // at the first id at or past it without walking what came before.
+        let mut remaining = match &resume_at {
+            Some(from) => state.workspaces.range(from.clone()..),
+            None => state.workspaces.range::<String, _>(..),
+        }
+        .map(|(_, workspace)| workspace);
+
+        let mut workspace_summaries = Vec::new();
+        for workspace in remaining.by_ref().take(page_size) {
+            workspace_summaries.push(WorkspaceSummary {
+                workspace_id: workspace.workspace_id.clone(),
+                arn: workspace.arn.clone(),
+                // Present, not omitted: a workspace carries a description (the
+                // empty string when its create named none), exactly as
+                // `GetWorkspace` reports it.
+                description: Some(workspace.description.clone()),
+                // Omitted rather than reported as an empty list while nothing
+                // has linked a service into the workspace: the member is
+                // optional and the sync-job slice is what populates it. Again
+                // the choice `GetWorkspace` makes, so one workspace reads the
+                // same whichever operation reports it.
+                linked_services: (!workspace.linked_services.is_empty())
+                    .then(|| workspace.linked_services.clone()),
+                creation_date_time: crate::state::timestamp(workspace.creation_date_time),
+                update_date_time: crate::state::timestamp(workspace.update_date_time),
+            });
+        }
+        // The token the next call resumes at: the first workspace this page left
+        // over. Absent on the last page, which is how a caller knows to stop.
+        let next_token = remaining
+            .next()
+            .map(|workspace| encode_next_token(&workspace.workspace_id));
+
+        Ok(ListWorkspacesOutput {
+            // Present, not omitted, for an account holding no workspaces: the
+            // member is how a caller reads the set, and an empty list says there
+            // is none where an absent member cannot be told from an unanswered
+            // read.
+            workspace_summaries: Some(workspace_summaries),
+            next_token,
+        })
     }
+}
+
+/// The envelope a `nextToken` of this listing carries, so a token minted
+/// elsewhere — by another listing of this service, or by hand — is recognisably
+/// not one of ours. The token itself is the shape every paginated operation of
+/// this service mints ([`crate::state::encode_page_token`]); this listing is
+/// account-wide, so unlike `ListEntities`' it is scoped to no parent resource.
+const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:workspaces:1:";
+
+/// The opaque `nextToken` for the page of workspaces starting at `workspace_id`.
+fn encode_next_token(workspace_id: &str) -> String {
+    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, &[], workspace_id)
+}
+
+/// The workspace id inside a `nextToken`, or `None` when the token is not one
+/// this listing minted.
+fn decode_next_token(token: &str) -> Option<String> {
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[], token)
 }

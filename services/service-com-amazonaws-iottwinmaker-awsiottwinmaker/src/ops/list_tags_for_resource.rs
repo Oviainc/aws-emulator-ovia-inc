@@ -245,28 +245,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The envelope a `nextToken` of this listing carries, so a token minted
 /// elsewhere — for another resource, by another listing, or by hand — is
-/// recognisably not one of ours.
+/// recognisably not one of ours. The token itself is the shape every paginated
+/// operation of this service mints ([`crate::state::encode_page_token`]), scoped
+/// to the resource whose tags it pages.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:tags:1:";
 
 /// The opaque `nextToken` for a page of `resource_arn`'s tags starting at
 /// `tag_key`.
-///
-/// Hex so the token is opaque to a caller and safe in a JSON body, over an
-/// envelope that names the listing it belongs to and the resume KEY rather than
-/// an offset.
 fn encode_next_token(resource_arn: &str, tag_key: &str) -> String {
-    ::hex::encode(format!("{NEXT_TOKEN_PREFIX}{resource_arn}\n{tag_key}"))
+    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, &[resource_arn], tag_key)
 }
 
 /// The tag key inside a `nextToken` minted for `resource_arn`, or `None` when
 /// the token is not one this listing minted for that resource.
-///
-/// The ARN and the key are separated by a newline, which the modelled
-/// `TwinMakerArn` and `TagKey` patterns both exclude, so the split cannot be
-/// confused by a value carrying the separator.
 fn decode_next_token(token: &str, resource_arn: &str) -> Option<String> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    let body = decoded.strip_prefix(NEXT_TOKEN_PREFIX)?;
-    let (token_arn, tag_key) = body.split_once('\n')?;
-    (token_arn == resource_arn && !tag_key.is_empty()).then(|| tag_key.to_string())
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[resource_arn], token)
 }
