@@ -27,6 +27,15 @@
 //! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::idempotent_replay`]) every
 //! create in this service uses.
 //!
+//! Starting the engagement also engages the contact's plan, and engaging a plan PAGES the
+//! contact channels it targets: the model has no call that creates a page, so this is the
+//! operation that mints them — one page per channel the plan's stages name, plus the channels
+//! of the contacts an escalation plan's stages name, each carrying this request's message and
+//! sent at its own stage's offset into the engagement
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::page_targets_of`]). A plan with
+//! no channel target pages nothing, which is the common case for an engagement of a contact
+//! whose channels were never added to its plan.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -187,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{engagement_arn, EngagementRecord};
+        use crate::state::{engagement_arn, EngagementRecord, PageRecord};
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartEngagementErrorModeled::InternalServerException(
@@ -266,13 +275,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stop_time: None,
             stop_reason: None,
         };
+        let start_time = record.start_time;
         state.engagements.insert(arn.clone(), record);
         state.remember_idempotency_token(Self::NAME, input.idempotency_token.as_deref(), &arn);
+
+        // Starting the engagement engages the contact's plan, and engaging a plan pages the
+        // contact channels it targets: the model has no call that creates a page, so this is
+        // where a page comes into existence. Each page carries the message this request
+        // carried and the code Incident Manager sends with it, which `AcceptPage` checks the
+        // caller's `AcceptCode` against.
+        let region = crate::state::request_region(ctx.parts());
+        for target in state.page_targets_of(&input.contact_id) {
+            let sequence = state.pages_sent;
+            state.pages_sent = state.pages_sent.saturating_add(1);
+            let page_arn = crate::state::page_arn(&region, &target.contact_alias, sequence);
+            let page = PageRecord {
+                accept_code: crate::state::page_accept_code(&page_arn),
+                arn: page_arn.clone(),
+                engagement_arn: arn.clone(),
+                contact_arn: target.contact_arn,
+                contact_channel_arn: target.contact_channel_arn,
+                sender: input.sender.clone(),
+                subject: input.subject.clone(),
+                content: input.content.clone(),
+                public_subject: input.public_subject.clone(),
+                public_content: input.public_content.clone(),
+                incident_id: input.incident_id.clone(),
+                // The plan's own schedule: a stage is engaged once the stages ahead of it
+                // have had their `DurationInMinutes`. The addition is CHECKED — the offset
+                // comes from a stored plan, and `SystemTime`'s own `Add` panics on overflow
+                // rather than answering an error — so a plan whose stages sum past the
+                // representable range pages at the start instant instead of failing the call
+                // partway through.
+                sent_time: stage_offset(target.stage_offset_minutes)
+                    .and_then(|offset| start_time.checked_add(offset))
+                    .unwrap_or(start_time),
+                // Nothing has acknowledged the page yet: only `AcceptPage` stamps these.
+                delivery_time: None,
+                read_time: None,
+                receipts: Vec::new(),
+                sequence,
+            };
+            state.pages.insert(page_arn, page);
+        }
 
         Ok(StartEngagementOutput {
             engagement_arn: arn,
         })
     }
+}
+
+/// Seconds in the minute a plan stage's `DurationInMinutes` counts.
+const SECONDS_PER_MINUTE: u64 = 60;
+
+/// `minutes` into the engagement as a duration, or `None` when that many minutes is not
+/// representable.
+fn stage_offset(minutes: u32) -> Option<::std::time::Duration> {
+    u64::from(minutes)
+        .checked_mul(SECONDS_PER_MINUTE)
+        .map(::std::time::Duration::from_secs)
 }
 
 /// The `resourceType` this operation's not-found error names: what the request named is a

@@ -27,6 +27,8 @@ mod data_plane_precondition;
 mod engagement_lifecycle;
 #[path = "all/onboarding.rs"]
 mod onboarding;
+#[path = "all/page_acknowledgement.rs"]
+mod page_acknowledgement;
 #[path = "all/replication_set_precondition.rs"]
 mod replication_set_precondition;
 #[path = "all/rotation_deletes.rs"]
