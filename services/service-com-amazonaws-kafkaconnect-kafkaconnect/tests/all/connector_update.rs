@@ -12,6 +12,9 @@
 //! for the setting that changes, which reports the settings on each side of the update
 //! and walks the model's update states and steps until it completes. A request that
 //! names neither setting or both, a capacity that names neither of its forms or both, a
+//! capacity whose counts are not ones the service allocates (an `mcuCount` outside the
+//! value set its member documents, or auto-scaling worker and task counts that do not
+//! bound each other), a
 //! version that is not the connector's, and a connector that is not running are each
 //! refused with nothing stored.
 //!
@@ -32,7 +35,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_kafkaconnect_kafkaconnect::state::TRANSITION_SPAN;
+use service_com_amazonaws_kafkaconnect_kafkaconnect::state::{MCU_COUNT_VALUES, TRANSITION_SPAN};
 use service_com_amazonaws_kafkaconnect_kafkaconnect::EmulatedService;
 
 /// A SigV4 credential scope naming this service and the region every minted ARN must
@@ -390,7 +393,9 @@ fn update_cases() -> Vec<UpdateCase> {
                 "minWorkerCount": 2,
                 "scaleInPolicy": {"cpuUtilizationPercentage": 1},
                 "scaleOutPolicy": {"cpuUtilizationPercentage": 100},
-                "maxAutoscalingTaskCount": 6,
+                // "Must be at least equal to maxWorkerCount"
+                // (`AutoScalingUpdate$maxAutoscalingTaskCount`).
+                "maxAutoscalingTaskCount": 8,
             }})),
         },
         UpdateCase {
@@ -740,7 +745,7 @@ async fn successive_updates_each_move_the_connector_one_version_on() {
     let updates = [
         Settings::Capacity(json!({"provisionedCapacity": {"mcuCount": 2, "workerCount": 3}})),
         Settings::Configuration(json!({"tasks.max": "4"})),
-        Settings::Capacity(json!({"provisionedCapacity": {"mcuCount": 3, "workerCount": 4}})),
+        Settings::Capacity(json!({"provisionedCapacity": {"mcuCount": 4, "workerCount": 4}})),
     ];
 
     for (index, settings) in updates.iter().enumerate() {
@@ -1030,4 +1035,208 @@ async fn an_update_that_names_no_single_valid_setting_is_refused_with_nothing_st
             .is_some_and(Vec::is_empty),
         "a refused update records no operation, got {listed}"
     );
+}
+
+/// What the service must answer one capacity's counts with.
+#[derive(Clone, Copy)]
+enum CountVerdict {
+    /// Accepted: every count is one the service allocates.
+    Accepted,
+    /// Refused by the service, on the member it blames.
+    RefusedNaming(&'static str),
+    /// Refused by the modelled range the member targets, before the handler runs, so the
+    /// message is the framework's rather than the service's member-naming one.
+    RefusedByTheModel,
+}
+
+/// One row of the capacity-count table.
+struct CountCase {
+    why: String,
+    capacity: Value,
+    verdict: CountVerdict,
+}
+
+/// An auto-scaled capacity with these counts. Both scaling policies are required on
+/// `AutoScalingUpdate`, so every row carries them at a legal percentage.
+fn auto_scaling(mcu: i32, minimum: i32, maximum: i32, tasks: Option<i32>) -> Value {
+    let mut scaling = json!({
+        "mcuCount": mcu,
+        "minWorkerCount": minimum,
+        "maxWorkerCount": maximum,
+        "scaleInPolicy": {"cpuUtilizationPercentage": 20},
+        "scaleOutPolicy": {"cpuUtilizationPercentage": 80},
+    });
+    if let Some(tasks) = tasks {
+        scaling["maxAutoscalingTaskCount"] = json!(tasks);
+    }
+    json!({"autoScaling": scaling})
+}
+
+/// The capacity-count table, spanning what the rule generalises over.
+///
+/// `AutoScalingUpdate$mcuCount` and `ProvisionedCapacityUpdate$mcuCount` document "The
+/// valid values are 1,2,4,8" inside a modelled `__integerMin1Max8` range that also admits
+/// 3, 5, 6 and 7, so every integer from one below that range to one above it is a row, in
+/// each of the two capacity forms. The auto-scaled rows then span the relations the other
+/// members document: a worker window with its minimum below, equal to and above its
+/// maximum, and a `maxAutoscalingTaskCount` absent, equal to `maxWorkerCount`, above it
+/// and below it ("Must be at least equal to maxWorkerCount").
+fn count_cases() -> Vec<CountCase> {
+    let mut rows = Vec::new();
+    for mcu in 0..=9 {
+        let verdict = if MCU_COUNT_VALUES.contains(&mcu) {
+            CountVerdict::Accepted
+        } else if (1..=8).contains(&mcu) {
+            CountVerdict::RefusedNaming("mcuCount")
+        } else {
+            CountVerdict::RefusedByTheModel
+        };
+        rows.push(CountCase {
+            why: format!("the provisioned form at mcuCount {mcu}"),
+            capacity: json!({"provisionedCapacity": {"mcuCount": mcu, "workerCount": 2}}),
+            verdict,
+        });
+        rows.push(CountCase {
+            why: format!("the auto-scaled form at mcuCount {mcu}"),
+            capacity: auto_scaling(mcu, 1, 4, None),
+            verdict,
+        });
+    }
+
+    for (minimum, maximum, tasks, verdict) in [
+        (1, 4, None, CountVerdict::Accepted),
+        (2, 2, None, CountVerdict::Accepted),
+        (1, 4, Some(4), CountVerdict::Accepted),
+        (1, 4, Some(40), CountVerdict::Accepted),
+        (8, 2, None, CountVerdict::RefusedNaming("minWorkerCount")),
+        (5, 4, Some(10), CountVerdict::RefusedNaming("minWorkerCount")),
+        (
+            1,
+            4,
+            Some(3),
+            CountVerdict::RefusedNaming("maxAutoscalingTaskCount"),
+        ),
+        (
+            2,
+            2,
+            Some(1),
+            CountVerdict::RefusedNaming("maxAutoscalingTaskCount"),
+        ),
+    ] {
+        rows.push(CountCase {
+            why: format!("minWorkerCount {minimum}, maxWorkerCount {maximum}, tasks {tasks:?}"),
+            capacity: auto_scaling(2, minimum, maximum, tasks),
+            verdict,
+        });
+    }
+    rows
+}
+
+#[tokio::test]
+async fn an_update_s_capacity_counts_must_be_ones_the_service_allocates() {
+    let emulator = emulator();
+    let plugin_arn = active_plugin(&emulator, "capacity-count-plugin").await;
+    let rows = count_cases();
+
+    // Every refused row is tried against ONE connector: a refusal stores nothing, so the
+    // connector is still at its created capacity and version for the next row.
+    let refusing = running_connectors(
+        &emulator,
+        &plugin_arn,
+        &["count-refusals".to_string()],
+    )
+    .await
+    .remove(0);
+    let version = text(&describe(&emulator, &refusing).await, "currentVersion");
+
+    for row in &rows {
+        let member = match row.verdict {
+            CountVerdict::Accepted => continue,
+            CountVerdict::RefusedNaming(member) => Some(member),
+            CountVerdict::RefusedByTheModel => None,
+        };
+        let (status, refused) = update(
+            &emulator,
+            &refusing,
+            &version,
+            json!({"capacity": row.capacity}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: counts the service does not allocate must be refused, got {status} \
+             {refused}",
+            row.why
+        );
+        assert!(
+            error_code(&refused).contains("BadRequestException"),
+            "case {:?}: expected BadRequestException, got {refused}",
+            row.why
+        );
+        if let Some(member) = member {
+            let expected = format!("Invalid parameter {member}: ");
+            let actual = text(&refused, "message");
+            assert!(
+                actual.starts_with(&expected),
+                "case {:?}: expected a message starting {expected:?}, got {actual:?}",
+                row.why
+            );
+        }
+        let unchanged = describe(&emulator, &refusing).await;
+        assert_eq!(
+            text(&unchanged, "currentVersion"),
+            version,
+            "case {:?}: a refused update stores nothing, got {unchanged}",
+            row.why
+        );
+        assert_eq!(
+            numbers(&unchanged["capacity"]),
+            numbers(&created_capacity()),
+            "case {:?}: a refused update changes no capacity, got {unchanged}",
+            row.why
+        );
+    }
+
+    // Each accepted row gets its own connector, so one wait covers every update the clock
+    // then has to land.
+    let accepted: Vec<&CountCase> = rows
+        .iter()
+        .filter(|row| matches!(row.verdict, CountVerdict::Accepted))
+        .collect();
+    let names: Vec<String> = (0..accepted.len())
+        .map(|index| format!("count-accepted-{index}"))
+        .collect();
+    let connectors = running_connectors(&emulator, &plugin_arn, &names).await;
+    for (row, connector) in accepted.iter().zip(&connectors) {
+        let version = text(&describe(&emulator, connector).await, "currentVersion");
+        let (status, updated) = update(
+            &emulator,
+            connector,
+            &version,
+            json!({"capacity": row.capacity}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: counts the service allocates must be accepted, got {status} {updated}",
+            row.why
+        );
+    }
+    past_the_whole_update().await;
+
+    for (row, connector) in accepted.iter().zip(&connectors) {
+        let after = describe(&emulator, connector).await;
+        let reported = numbers(&after["capacity"]);
+        // Every number the request named must read back from state. A member the request
+        // left out takes the modelled default, which the description reports as zero, so
+        // the requested numbers are a subset rather than the whole map.
+        for (member, value) in numbers(&row.capacity) {
+            assert_eq!(
+                reported.get(&member),
+                Some(&value),
+                "case {:?}: the accepted {member} must read back as {value}, got {after}",
+                row.why
+            );
+        }
+    }
 }
