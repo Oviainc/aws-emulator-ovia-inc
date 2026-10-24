@@ -1442,32 +1442,12 @@ async fn the_deployment_status_settles_once_the_clock_owes_it() {
     );
 }
 
-/// The operations this slice leaves for their own issues still answer the scaffold's
-/// 501 — never an empty 200, which a client cannot tell from a real implementation.
-#[tokio::test]
-async fn the_operations_this_slice_does_not_cover_still_answer_501() {
-    let router = emulator();
-    // `GET /serviceSettings` and `GET /listQuickSetupTypes` are no longer here: both
-    // are implemented, and `tests/all/service_settings_and_types.rs` covers them.
-    // `GET /getConfiguration/{ConfigurationId}` is no longer here either — it is
-    // implemented, and the `GetConfiguration` section below covers it. Nor is
-    // `GET /tags/{ResourceArn}` (`ListTagsForResource`): it is implemented, and
-    // `tests/all/list_tags_for_resource.rs` covers it.
-    let cases: [(&str, &str, Option<Value>); 1] = [
-        (
-            "PUT",
-            "/tags/arn%3Aaws%3Assm-quicksetup%3Aus-west-2%3A000000000000%3Aconfiguration-manager%2F00000000-0000-4000-8000-000000000000",
-            Some(json!({ "Tags": { "Env": "prod" } })),
-        ),
-    ];
-    for (method, uri, body) in cases {
-        let (status, answer) = call(&router, method, uri, body.as_ref()).await;
-        assert_eq!(
-            status, 501,
-            "case {method} {uri}: a stub must answer 501, got {status} / {answer:?}"
-        );
-    }
-}
+// This file used to carry a stub census — a test asserting that the operations this
+// slice left for their own issues still answered the scaffold's 501. Every operation of
+// this service is now implemented (no `//! SCAFFOLDED, NOT IMPLEMENTED:` marker is left
+// under `src/ops/`), so the census has nothing to assert and is gone: the last entry it
+// held, `PUT /tags/{ResourceArn}` (`TagResource`), is implemented and covered end to end
+// by `tests/all/resource_tags.rs`, including the 404 an ARN naming no resource earns.
 
 // ---------------------------------------------------------------------------
 // GetConfiguration
