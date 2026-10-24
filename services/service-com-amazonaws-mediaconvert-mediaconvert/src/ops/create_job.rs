@@ -454,8 +454,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .billing_tags_source
                 .unwrap_or_else(|| crate::state::BILLING_TAGS_SOURCE_JOB.to_string()),
             acceleration_settings,
-            // Nothing has shared this job: a resource share is what moves the status.
-            share_status: crate::state::SHARE_STATUS_NOT_SHARED.to_string(),
+            // Nothing has shared this job: a resource share is what records an attempt,
+            // and a job with no attempt reports `NOT_SHARED` and no share details.
+            share: None,
             hop_destinations,
             job_engine_version_requested: input.job_engine_version,
             simulate_reserved_queue: input.simulate_reserved_queue,

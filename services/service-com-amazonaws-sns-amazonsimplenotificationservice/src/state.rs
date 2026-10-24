@@ -1042,6 +1042,230 @@ pub fn malformed_subscription_arn(arn: &str) -> Option<String> {
     })
 }
 
+// =============================================================================
+// The per-message rules every publishing operation shares
+// =============================================================================
+
+/// The only value `MessageStructure` accepts ("Valid value: json" —
+/// `PublishInput$MessageStructure` doc).
+pub const JSON_MESSAGE_STRUCTURE: &str = "json";
+
+/// The key a JSON-structured message must carry: "contain at least a top-level JSON
+/// key of \"default\" with a value that is a string" (`PublishInput$MessageStructure`
+/// doc).
+pub const DEFAULT_JSON_KEY: &str = "default";
+
+/// "By default, a message can be at most 256 KiB in size (262,144 bytes)"
+/// (`PublishInput$Message` doc); a topic's [`MAXIMUM_MESSAGE_SIZE_ATTRIBUTE`]
+/// attribute overrides it.
+pub const DEFAULT_MAXIMUM_MESSAGE_SIZE: usize = 262_144;
+
+/// The FIFO attribute that makes SNS derive the `MessageDeduplicationId` from the
+/// message body instead of requiring the caller to supply one
+/// (`GetTopicAttributesResponse$Attributes` doc).
+pub const CONTENT_BASED_DEDUPLICATION_ATTRIBUTE: &str = "ContentBasedDeduplication";
+
+/// "Subjects must be UTF-8 text with no line breaks or control characters, and less
+/// than 100 characters long" (`PublishInput$Subject` doc).
+pub const MAX_SUBJECT_CHARS: usize = 100;
+
+/// "The MessageGroupId can contain up to 128 alphanumeric characters (a-z, A-Z, 0-9)
+/// and punctuation" — the same rule the doc states for `MessageDeduplicationId`
+/// ("When provided, the same validation rules apply").
+pub const MAX_ORDERING_ID_CHARS: usize = 128;
+
+/// Whether an ordering id (`MessageGroupId`, `MessageDeduplicationId`) satisfies the
+/// rule above: 1 to 128 characters of ASCII alphanumerics and ASCII punctuation,
+/// which is exactly the set the doc lists.
+fn ordering_id_is_valid(value: &str) -> bool {
+    let length = value.chars().count();
+    length > 0
+        && length <= MAX_ORDERING_ID_CHARS
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c.is_ascii_punctuation())
+}
+
+/// Whether `subject` satisfies the rule SNS documents for it.
+fn subject_is_valid(subject: &str) -> bool {
+    subject.chars().count() < MAX_SUBJECT_CHARS && !subject.chars().any(char::is_control)
+}
+
+/// Check a `MessageStructure: json` body: a JSON object with a string `default`
+/// member, every other member a string too. Returns the reason it is not.
+fn json_message_error(message: &str) -> Option<&'static str> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(message) else {
+        return Some("message must be a syntactically valid JSON object");
+    };
+    let Some(members) = parsed.as_object() else {
+        return Some("message must be a syntactically valid JSON object");
+    };
+    if !members.get(DEFAULT_JSON_KEY).is_some_and(|v| v.is_string()) {
+        return Some("message must carry a top-level \"default\" key whose value is a string");
+    }
+    if members.values().any(|value| !value.is_string()) {
+        return Some("every top-level value of the message must be a string");
+    }
+    None
+}
+
+/// One message as a caller supplied it: the members `PublishInput` and
+/// `PublishBatchRequestEntry` have in common, which is every member either shape
+/// carries a documented per-message rule for. Borrowed, so judging a message costs no
+/// clone.
+#[derive(Debug, Clone, Copy)]
+pub struct MessageRequest<'a> {
+    pub message: &'a str,
+    pub subject: Option<&'a str>,
+    pub message_structure: Option<&'a str>,
+    pub message_group_id: Option<&'a str>,
+    pub message_deduplication_id: Option<&'a str>,
+}
+
+/// Why SNS refuses this message on its own members alone, or `None` when every
+/// documented per-member rule holds.
+///
+/// This is ARGUMENT validation — it judges the message without looking at any record —
+/// so it runs before the topic is read, and it is SHARED by every operation that
+/// publishes a message: a message `Publish` accepts cannot be one `PublishBatch`
+/// refuses. The reason names the member and the constraint it failed, built from the
+/// request.
+pub fn message_refusal(request: MessageRequest<'_>) -> Option<String> {
+    if let Some(structure) = request.message_structure {
+        if structure != JSON_MESSAGE_STRUCTURE {
+            return Some(format!(
+                "Invalid parameter: MessageStructure Reason: the only valid value is \
+                 {JSON_MESSAGE_STRUCTURE}"
+            ));
+        }
+        if let Some(reason) = json_message_error(request.message) {
+            return Some(format!("Invalid parameter: Message - {reason}"));
+        }
+    }
+
+    if request.message.is_empty() {
+        return Some("Invalid parameter: Message - must not be empty".to_string());
+    }
+
+    if request.subject.is_some_and(|subject| !subject_is_valid(subject)) {
+        return Some(format!(
+            "Invalid parameter: Subject - must be text with no control characters and \
+             fewer than {MAX_SUBJECT_CHARS} characters long"
+        ));
+    }
+
+    // The ordering ids follow one rule, whatever the topic type, and it is also what
+    // keeps a retained delivery's own size bounded.
+    for (member, value) in [
+        ("MessageGroupId", request.message_group_id),
+        ("MessageDeduplicationId", request.message_deduplication_id),
+    ] {
+        if value.is_some_and(|value| !ordering_id_is_valid(value)) {
+            return Some(format!(
+                "Invalid parameter: {member} - must be 1 to {MAX_ORDERING_ID_CHARS} \
+                 alphanumeric or punctuation characters"
+            ));
+        }
+    }
+
+    None
+}
+
+/// The ceiling, in bytes, on what `topic` accepts: [`DEFAULT_MAXIMUM_MESSAGE_SIZE`],
+/// which the topic's [`MAXIMUM_MESSAGE_SIZE_ATTRIBUTE`] may only LOWER.
+///
+/// The attribute reaches 1 MiB at AWS, but a caller-raised ceiling would let one
+/// request buy more memory per subscription than the documented default, so the
+/// emulator keeps the default as its hard limit.
+pub fn max_message_size(topic: &TopicRecord) -> usize {
+    topic
+        .attributes
+        .get(MAXIMUM_MESSAGE_SIZE_ATTRIBUTE)
+        .and_then(|value| value.parse::<usize>().ok())
+        .map_or(DEFAULT_MAXIMUM_MESSAGE_SIZE, |configured| {
+            configured.min(DEFAULT_MAXIMUM_MESSAGE_SIZE)
+        })
+}
+
+/// What `topic` makes of this message: the `MessageDeduplicationId` the stored
+/// delivery carries (`None` for a standard topic, which SNS does not sequence or
+/// deduplicate), or why this topic refuses the message.
+///
+/// These are the rules that need the TOPIC as well as the message — its size ceiling
+/// and the FIFO ordering parameters — so they run after the topic record is read, and
+/// they too are shared by every publishing operation.
+pub fn topic_message_refusal(
+    topic: &TopicRecord,
+    request: MessageRequest<'_>,
+) -> Result<Option<String>, String> {
+    let ceiling = max_message_size(topic);
+    if request.message.len() > ceiling {
+        return Err(format!(
+            "Invalid parameter: Message - too long: {} bytes exceeds the topic's limit of \
+             {ceiling} bytes",
+            request.message.len()
+        ));
+    }
+
+    if !topic.is_fifo {
+        if request.message_deduplication_id.is_some() {
+            return Err(
+                "Invalid parameter: MessageDeduplicationId - applies only to FIFO topics"
+                    .to_string(),
+            );
+        }
+        // A MessageGroupId is NOT refused here: for a standard topic "the
+        // MessageGroupId is optional and is forwarded only to Amazon SQS standard
+        // subscriptions to activate fair queues" (`PublishInput$MessageGroupId` doc),
+        // so it is stored with the delivery rather than rejected.
+        return Ok(None);
+    }
+
+    if request.message_group_id.is_none() {
+        // The sentence SNS states for the ordering parameter a FIFO publish must
+        // carry.
+        return Err(
+            "Invalid parameter: The MessageGroupId parameter is required for FIFO topics"
+                .to_string(),
+        );
+    }
+
+    let content_based = topic
+        .attributes
+        .get(CONTENT_BASED_DEDUPLICATION_ATTRIBUTE)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    match request.message_deduplication_id {
+        Some(id) => Ok(Some(id.to_string())),
+        // "Amazon SNS uses a SHA-256 hash to generate the MessageDeduplicationId using
+        // the body of the message (but not the attributes of the message)"
+        // (`GetTopicAttributesResponse$Attributes` doc).
+        None if content_based => Ok(Some(hex::encode(Sha256::digest(
+            request.message.as_bytes(),
+        )))),
+        None => Err(
+            "Invalid parameter: MessageDeduplicationId - required for a FIFO topic whose \
+             ContentBasedDeduplication is not enabled"
+                .to_string(),
+        ),
+    }
+}
+
+/// The bytes one message's attribute map holds: every name, type and value, which is
+/// what SNS counts beside the body when it measures a message against a topic's
+/// `MaximumMessageSize` ("including each message's body and attributes" — the
+/// `PublishBatch` doc).
+pub fn message_attribute_bytes(attributes: &HashMap<String, MessageAttributeValue>) -> usize {
+    attributes
+        .iter()
+        .map(|(name, value)| {
+            name.len()
+                + value.data_type.len()
+                + value.string_value.as_ref().map_or(0, String::len)
+                + value.binary_value.as_ref().map_or(0, Vec::len)
+        })
+        .sum()
+}
+
 /// One message `Publish` delivered to one subscription.
 #[derive(Debug, Clone)]
 pub struct PublishedMessage {
@@ -1069,16 +1293,7 @@ impl PublishedMessage {
         /// headers, the map's own allocation) that no caller varies.
         const FIXED_OVERHEAD: usize = 256;
 
-        let attributes: usize = self
-            .message_attributes
-            .iter()
-            .map(|(name, value)| {
-                name.len()
-                    + value.data_type.len()
-                    + value.string_value.as_ref().map_or(0, String::len)
-                    + value.binary_value.as_ref().map_or(0, Vec::len)
-            })
-            .sum();
+        let attributes = message_attribute_bytes(&self.message_attributes);
         FIXED_OVERHEAD
             + self.message_id.len()
             + self.topic_arn.len()
