@@ -12,13 +12,19 @@
 //! generalises over: each patch op the member takes (`replace`, `add`, `remove`), a
 //! sequence of them, the members no patch may name, the values that are not an IAM role
 //! ARN, and the read before anything was ever written.
+//!
+//! `GetAccount` is also a REPORTING operation, so the invariant
+//! [`a_read_of_the_account_reports_the_stored_record_and_changes_nothing`] pins holds
+//! over every one of those states: however often the record is read, and whatever else
+//! the caller does to the service in between, each read answers the same body — the one
+//! the last `UpdateAccount` reported.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
     API_KEY_VERSION, DEFAULT_ACCOUNT_THROTTLE, USAGE_PLANS_FEATURE,
 };
 
-use crate::rest_api_lifecycle::Gateway;
+use crate::rest_api_lifecycle::{create_api, Gateway};
 
 /// `GetAccount`.
 async fn get_account(gateway: &Gateway) -> Value {
@@ -148,6 +154,132 @@ async fn the_account_settings_a_patch_writes_are_what_a_read_reports() {
             json!(API_KEY_VERSION),
             "case {case:?}: expected the API key version to be unchanged, got {read:?}"
         );
+    }
+}
+
+/// One patch of the account's CloudWatch role: the `op` and the value it carries
+/// (absent for `remove`, which takes none).
+type RolePatch<'a> = (&'a str, Option<&'a str>);
+
+/// One state of the account record: the case name, the patch sequence that puts the
+/// record in it, and the CloudWatch role the record then carries.
+type AccountState<'a> = (&'a str, &'a [RolePatch<'a>], Option<&'a str>);
+
+#[tokio::test]
+async fn a_read_of_the_account_reports_the_stored_record_and_changes_nothing() {
+    // The states a caller can put the one account record in. `GetAccount` takes no
+    // input, so this IS the whole input space of the read: the stored record.
+    let states: &[AccountState<'_>] = &[
+        ("an account nobody has configured", &[], None),
+        (
+            "an account configured once",
+            &[("replace", Some("logging"))],
+            Some("logging"),
+        ),
+        (
+            "an account pointed at another role",
+            &[("replace", Some("first")), ("replace", Some("second"))],
+            Some("second"),
+        ),
+        (
+            "an account whose role was added",
+            &[("add", Some("added"))],
+            Some("added"),
+        ),
+        (
+            "an account whose role was removed",
+            &[("replace", Some("first")), ("remove", None)],
+            None,
+        ),
+        (
+            "an account reconfigured after a remove",
+            &[
+                ("replace", Some("first")),
+                ("remove", None),
+                ("replace", Some("again")),
+            ],
+            Some("again"),
+        ),
+    ];
+    // How many times in a row the record is read. A reporting operation answers the same
+    // body however often it is called, so the count is what the rule generalises over.
+    let read_counts = [1_usize, 2, 3, 5];
+
+    for (case, patches, expected_role) in states {
+        let expected_role = *expected_role;
+        for reads in read_counts {
+            let gateway = Gateway::new();
+            // The body the LAST patch reported, so the read can be held against it: the
+            // update and the read render one record, and must not drift.
+            let mut reported: Option<Value> = None;
+            for (op, value) in *patches {
+                reported = Some(
+                    patch_account(
+                        &gateway,
+                        op,
+                        "/cloudwatchRoleArn",
+                        value.map(role_arn).as_deref(),
+                    )
+                    .await,
+                );
+            }
+
+            let expected = expected_role
+                .map(role_arn)
+                .map_or(Value::Null, Value::String);
+            let first = get_account(&gateway).await;
+            assert_eq!(
+                first["cloudwatchRoleArn"], expected,
+                "case {case:?} with {reads} read(s): expected cloudwatchRoleArn {expected:?}, \
+                 got {first:?}"
+            );
+            // Every other member of `Account` is API Gateway's own, so it is reported on
+            // every state of the record, configured or not.
+            assert_eq!(
+                first["throttleSettings"]["burstLimit"],
+                json!(DEFAULT_ACCOUNT_THROTTLE.0),
+                "case {case:?} with {reads} read(s): expected the account burst limit, \
+                 got {first:?}"
+            );
+            assert_eq!(
+                first["throttleSettings"]["rateLimit"],
+                json!(DEFAULT_ACCOUNT_THROTTLE.1),
+                "case {case:?} with {reads} read(s): expected the account rate limit, \
+                 got {first:?}"
+            );
+            assert_eq!(
+                first["features"],
+                json!([USAGE_PLANS_FEATURE]),
+                "case {case:?} with {reads} read(s): expected the usage-plan feature entry, \
+                 got {first:?}"
+            );
+            assert_eq!(
+                first["apiKeyVersion"],
+                json!(API_KEY_VERSION),
+                "case {case:?} with {reads} read(s): expected the account's API key version, \
+                 got {first:?}"
+            );
+
+            for read in 1..reads {
+                // A mutation of an UNRELATED record between two reads: the account's own
+                // settings are no part of it, so the next read answers what the first did.
+                create_api(&gateway, &format!("account-read-{reads}-{read}")).await;
+                let again = get_account(&gateway).await;
+                assert_eq!(
+                    again, first,
+                    "case {case:?} read {read} of {reads}: expected the same body as the \
+                     first read {first:?}, got {again:?}"
+                );
+            }
+
+            if let Some(reported) = reported {
+                assert_eq!(
+                    reported, first,
+                    "case {case:?} with {reads} read(s): expected a read to report the body \
+                     UpdateAccount reported {reported:?}, got {first:?}"
+                );
+            }
+        }
     }
 }
 
