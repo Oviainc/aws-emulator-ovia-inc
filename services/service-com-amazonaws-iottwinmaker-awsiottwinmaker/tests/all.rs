@@ -32,6 +32,9 @@ mod harness;
 #[path = "all/metadata_transfer_job.rs"]
 mod metadata_transfer_job;
 
+#[path = "all/metadata_transfer_job_read.rs"]
+mod metadata_transfer_job_read;
+
 #[path = "all/pricing_plan.rs"]
 mod pricing_plan;
 

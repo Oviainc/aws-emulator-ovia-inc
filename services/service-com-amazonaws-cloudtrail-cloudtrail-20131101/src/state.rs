@@ -680,6 +680,19 @@ pub fn iso8601(at: SystemTime) -> Option<String> {
         .ok()
 }
 
+/// How many result rows one `GetQueryResults` page carries when the caller names no
+/// `MaxQueryResults`. The model bounds `MaxQueryResults` at
+/// `range 1..1000`, so the whole page a caller may ask for is the largest one the
+/// service will serve; a caller that wants smaller pages says so.
+pub const GET_QUERY_RESULTS_MAX_PAGE_SIZE: usize = 1_000;
+
+/// One row of a query result: its columns in order, each a (name, value) pair.
+///
+/// The modelled `QueryResultRow` is a LIST of single-entry maps rather than one map,
+/// which is what keeps a row's columns ordered on the wire — so a row is stored
+/// ordered here too.
+pub type QueryResultRowRecord = Vec<(String, String)>;
+
 /// How many import failures one `ListImportFailures` page carries when the request
 /// names no `MaxResults`.
 ///
@@ -991,6 +1004,33 @@ pub fn event_data_store_not_found_message(arn: &str) -> String {
 /// value <id> does not exist or is not in the same region."
 pub fn query_not_found_message(member: &str, value: &str) -> String {
     format!("The {member} value {value} does not exist or is not in the same region.")
+}
+
+/// Mint the page token that resumes a paged read of `resource_id` at `offset`.
+///
+/// Every paged operation of this service hands out the same shape of token — the
+/// resource the page belongs to, then the row the next page resumes at — so the
+/// encoding lives here once rather than beside each handler. The `separator` is the
+/// operation's own, because a token form it has already handed out is part of that
+/// operation's wire contract; a resource id is a `UUID` (`^[a-f0-9\-]+$`) and so holds
+/// neither separator, which is what keeps the two halves apart.
+pub fn encode_page_token(resource_id: &str, offset: usize, separator: char) -> String {
+    format!("{resource_id}{separator}{offset}")
+}
+
+/// Read a caller-supplied page token back as the offset it resumes at, or `None` when
+/// it is not a token minted for `resource_id`: no separator, another resource's token,
+/// or an offset that is not a row number. The model documents
+/// `InvalidNextTokenException` as "a token that is not valid, or a token that was
+/// previously used in a request with different parameters", which is the refusal a
+/// `None` answers with; whether an offset is still within the rows that remain is the
+/// calling operation's own check, since only it knows how many there are.
+pub fn decode_page_token(token: &str, resource_id: &str, separator: char) -> Option<usize> {
+    let (minted_for, offset) = token.rsplit_once(separator)?;
+    if minted_for != resource_id {
+        return None;
+    }
+    offset.parse::<usize>().ok()
 }
 
 /// The resource prefix of an event data store ARN:
@@ -1526,6 +1566,9 @@ pub struct QueryRecord {
     pub status: QueryState,
     pub statistics: QueryStatisticsRecord,
     pub delivery: Option<QueryDelivery>,
+    /// Every result row the run produced, in result order — the rows
+    /// `GetQueryResults` pages through.
+    pub result_rows: Vec<QueryResultRowRecord>,
     /// Why the run failed; set only by a run that ended in failure.
     pub error_message: Option<String>,
     /// The account owning the event data store, for a cross-account query.
@@ -1539,11 +1582,42 @@ pub struct QueryRecord {
 }
 
 impl QueryRecord {
+    /// The account that owns the event data store this query ran on: the one the
+    /// run recorded, defaulting to the emulator's own account.
+    pub fn owner(&self) -> &str {
+        match self.event_data_store_owner_account_id.as_deref() {
+            Some(account_id) => account_id,
+            None => ::engine::emulator_account_id(),
+        }
+    }
+
     /// Whether a call made in `region` naming `event_data_store_id` (when it names
     /// one) addresses this query.
     pub fn addressed_by(&self, region: &str, event_data_store_id: Option<&str>) -> bool {
         self.region == region
             && event_data_store_id.is_none_or(|store| self.event_data_store_id == store)
+    }
+
+    /// The `page_size` result rows that follow `offset`, projected onto the
+    /// modelled `QueryResultRows` shape: a list of rows, each a list of one-entry
+    /// column maps, which is how a row keeps its column order on the wire.
+    pub fn result_rows_page(
+        &self,
+        offset: usize,
+        page_size: usize,
+    ) -> Vec<Vec<::std::collections::HashMap<String, String>>> {
+        self.result_rows
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|row| {
+                row.iter()
+                    .map(|(column, value)| {
+                        ::std::collections::HashMap::from([(column.clone(), value.clone())])
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Materialise the transition the clock already owes this run: a run that is

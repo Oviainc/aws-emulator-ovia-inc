@@ -137,9 +137,11 @@ impl<Eng> ListImportFailures<Eng> {
 /// always told apart.
 const PAGE_TOKEN_SEPARATOR: char = '/';
 
-/// The token that resumes the listing of `import_id` at `offset`.
+/// The token that resumes the listing of `import_id` at `offset`, in the shared
+/// encoding every paged read of this service uses
+/// ([`crate::state::encode_page_token`]).
 fn encode_page_token(import_id: &str, offset: usize) -> String {
-    format!("{import_id}{PAGE_TOKEN_SEPARATOR}{offset}")
+    crate::state::encode_page_token(import_id, offset, PAGE_TOKEN_SEPARATOR)
 }
 
 /// Read a caller-supplied `NextToken` as the offset the next page starts at.
@@ -147,9 +149,10 @@ fn encode_page_token(import_id: &str, offset: usize) -> String {
 /// A token carries the import it was minted for, so one presented with a different
 /// `ImportId` is refused: the model documents `InvalidNextTokenException` as "a token
 /// that is not valid, or a token that was previously used in a request with different
-/// parameters".
+/// parameters". The reading itself is the shared
+/// [`crate::state::decode_page_token`]; the refusal wording is this operation's.
 fn decode_page_token(token: &str, import_id: &str) -> Result<usize, ListImportFailuresError> {
-    let reject = || {
+    crate::state::decode_page_token(token, import_id, PAGE_TOKEN_SEPARATOR).ok_or_else(|| {
         ListImportFailuresErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
             message: Some(format!(
                 "The pagination token '{token}' is not valid for a ListImportFailures \
@@ -157,15 +160,8 @@ fn decode_page_token(token: &str, import_id: &str) -> Result<usize, ListImportFa
                  carrying the same ImportId it was returned for"
             )),
         })
-    };
-
-    let Some((token_import_id, offset)) = token.rsplit_once(PAGE_TOKEN_SEPARATOR) else {
-        return Err(reject().into());
-    };
-    if token_import_id != import_id {
-        return Err(reject().into());
-    }
-    offset.parse::<usize>().map_err(|_| reject().into())
+        .into()
+    })
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation

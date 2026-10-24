@@ -450,6 +450,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status: crate::state::DELIVERY_STATUS_PENDING.to_string(),
                 }),
             error_message: None,
+            // Nothing has run yet, so the run has produced no rows; and this
+            // emulator ingests no CloudTrail events, so the store the statement
+            // reads holds none for it to produce. `GetQueryResults` pages through
+            // whatever this list holds.
+            result_rows: Vec::new(),
             event_data_store_owner_account_id: input.event_data_store_owner_account_id,
             created_at: Some(now),
             settles_at: Some(now + crate::state::QUERY_SETTLE_AFTER),

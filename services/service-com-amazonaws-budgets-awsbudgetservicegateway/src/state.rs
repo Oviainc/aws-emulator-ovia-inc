@@ -8,7 +8,10 @@
 //! keyed by that pair. A budget OWNS the notifications, their subscribers and the
 //! resource tags created with it ("After the end date, Amazon Web Services deletes
 //! the budget and all the associated notifications and subscribers"), so they are
-//! held inside the stored budget and go away with it.
+//! held inside the stored budget and go away with it. The budget ACTIONS created on
+//! it are held the same way: an action carries the name of its budget
+//! (`Action$BudgetName`) and every action operation names that budget beside the
+//! `ActionId`, so an action cannot outlive the budget it acts on.
 //!
 //! The helpers below (ARN rendering, the opaque pagination token, the cross-member
 //! rules `CreateBudget`/`UpdateBudget` document) are shared by several operation
@@ -16,8 +19,8 @@
 //! a new file under `src/ops/` would be picked up by `build.rs` as an operation.
 
 use crate::ops::types::{
-    Action, Budget, CostTypes, Definition, HealthStatus, Notification, ResourceTag, Spend,
-    Subscriber, TimePeriod,
+    Action, ActionHistory, ActionHistoryDetails, Budget, CostTypes, Definition, HealthStatus,
+    Notification, ResourceTag, Spend, Subscriber, TimePeriod,
 };
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -73,6 +76,11 @@ pub struct StoredAction {
     pub action: Action,
     /// `ResourceTags` supplied at creation.
     pub tags: Vec<ResourceTag>,
+    /// Every event recorded against this action, OLDEST FIRST — the order
+    /// `DescribeBudgetActionHistories` reports and its pagination token indexes into.
+    /// Append-only ([`record_action_event`]) and bounded by
+    /// [`MAX_ACTION_HISTORY_RECORDS`].
+    pub history: Vec<ActionHistory>,
     /// The settle owed while `action.status` is one of the `*_IN_PROGRESS` statuses,
     /// or `None` for an action whose status is settled.
     pub pending: Option<PendingSettle>,
@@ -88,11 +96,13 @@ pub struct PendingSettle {
 }
 
 impl StoredAction {
-    /// A newly created action: [`ACTION_STATUS_STANDBY`], with nothing owed.
+    /// A newly created action: [`ACTION_STATUS_STANDBY`], with nothing owed and an
+    /// empty history — the call that creates it records its own `CREATE_ACTION` event.
     pub fn new(action: Action, tags: Vec<ResourceTag>) -> Self {
         Self {
             action,
             tags,
+            history: Vec::new(),
             pending: None,
         }
     }
@@ -962,17 +972,14 @@ pub fn validate_budget(budget: &Budget) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if let Some(period) = &budget.time_period {
-        if let (Some(start), Some(end)) = (&period.start, &period.end) {
-            let start_before_end = (start.secs(), start.subsec_nanos())
-                < (end.secs(), end.subsec_nanos());
-            if !start_before_end {
-                return Err(
-                    "Unable to create/update budget: TimePeriod Start must come before End."
-                        .to_string(),
-                );
-            }
-        }
+    if budget
+        .time_period
+        .as_ref()
+        .is_some_and(|period| !time_period_ordered(period))
+    {
+        return Err(
+            "Unable to create/update budget: TimePeriod Start must come before End.".to_string(),
+        );
     }
     validate_time_period_end(budget)?;
     validate_budget_limit_present(budget)?;
@@ -980,6 +987,56 @@ pub fn validate_budget(budget: &Budget) -> Result<(), String> {
     validate_auto_adjust_data(budget)?;
     Ok(())
 }
+
+/// A `DateTime` as the totally ordered instant it names, so two timestamps are compared
+/// without any calendar arithmetic written here.
+fn instant(at: &::aws_smithy_types::DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
+}
+
+/// Whether `period` satisfies the rule every `TimePeriod` carries: "The start date must
+/// come before the end date" (`TimePeriod`). A period that names only one of the two
+/// bounds, or neither, satisfies it — "There are no restrictions on the end date".
+///
+/// The comparison is STRICT, so a period whose `Start` equals its `End` does not satisfy
+/// the rule — on a write and on a read filter alike, since the rule is the shape's, not
+/// one operation's. That is deliberate, and it is not in tension with
+/// [`within_time_period`] treating the bounds as covered: a window is refused before it
+/// ever filters anything, so the two never judge the same period.
+pub fn time_period_ordered(period: &TimePeriod) -> bool {
+    match (&period.start, &period.end) {
+        (Some(start), Some(end)) => instant(start) < instant(end),
+        _ => true,
+    }
+}
+
+/// Whether `at` falls inside `period`, which is the window a read filters its records
+/// by: "The period of time that's covered ... has a start date and an end date"
+/// (`TimePeriod`). A bound the caller left out does not restrict that side, and the
+/// bounds themselves are covered by the period they delimit.
+pub fn within_time_period(at: &::aws_smithy_types::DateTime, period: &TimePeriod) -> bool {
+    let at = instant(at);
+    period
+        .start
+        .as_ref()
+        .is_none_or(|start| instant(start) <= at)
+        && period.end.as_ref().is_none_or(|end| at <= instant(end))
+}
+
+/// `EventType$CREATE_ACTION` — the event a `CreateBudgetAction` call records.
+pub const EVENT_TYPE_CREATE_ACTION: &str = "CREATE_ACTION";
+
+/// `EventType$UPDATE_ACTION` — the event an `UpdateBudgetAction` call records.
+pub const EVENT_TYPE_UPDATE_ACTION: &str = "UPDATE_ACTION";
+
+/// `EventType$EXECUTE_ACTION` — the event an `ExecuteBudgetAction` call records.
+pub const EVENT_TYPE_EXECUTE_ACTION: &str = "EXECUTE_ACTION";
+
+/// How many history records one action keeps. NOT an AWS rule: every write against an
+/// action appends a record, so without a ceiling a caller could grow this process
+/// without limit. The oldest records are dropped first, so a read always reports the
+/// most recent history.
+pub const MAX_ACTION_HISTORY_RECORDS: usize = 1_000;
 
 /// "The end date must come before `06/15/87 00:00 UTC`" (`Budget$TimePeriod`), which is
 /// also the end date a budget written without one is given
@@ -990,7 +1047,7 @@ fn validate_time_period_end(budget: &Budget) -> Result<(), String> {
         return Ok(());
     };
     let last = default_time_period_end();
-    if (end.secs(), end.subsec_nanos()) > (last.secs(), last.subsec_nanos()) {
+    if instant(end) > instant(&last) {
         return Err(
             "Unable to create/update budget: TimePeriod End must not come after \
              06/15/87 00:00 UTC."
@@ -1106,6 +1163,79 @@ fn validate_auto_adjust_data(budget: &Budget) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The action `action_id` names on `stored`, with no settle materialised, or `None` when
+/// the budget holds no such action — which every action operation answers with the
+/// modelled `NotFoundException`.
+///
+/// For the read that reports the action itself, use [`find_action_mut`]: it materialises
+/// the settle the clock had already made due. This one is for a read of something the
+/// settle does not change — the action's HISTORY, whose records are the snapshots the
+/// write paths took.
+pub fn find_action<'a>(stored: &'a StoredBudget, action_id: &str) -> Option<&'a StoredAction> {
+    stored
+        .actions
+        .iter()
+        .find(|held| held.action.action_id == action_id)
+}
+
+/// Record one event against `stored`'s history, as of `at`.
+///
+/// `ActionHistory$Status` is "the status of action at the time of the event", and
+/// `ActionHistoryDetails$Action` is the action as that event left it — so both are taken
+/// from the stored action AFTER the caller applied the event to it. The record is
+/// appended, never edited: a history is append-only, bounded by
+/// [`MAX_ACTION_HISTORY_RECORDS`].
+pub fn record_action_event(
+    stored: &mut StoredAction,
+    event_type: &str,
+    message: &str,
+    at: SystemTime,
+) {
+    stored.history.push(ActionHistory {
+        timestamp: ::aws_smithy_types::DateTime::from(at),
+        status: stored.action.status.clone(),
+        event_type: event_type.to_string(),
+        action_history_details: ActionHistoryDetails {
+            message: message.to_string(),
+            action: stored.action.clone(),
+        },
+    });
+    let excess = stored
+        .history
+        .len()
+        .saturating_sub(MAX_ACTION_HISTORY_RECORDS);
+    if excess > 0 {
+        stored.history.drain(..excess);
+    }
+}
+
+/// The history records of `stored` that `period` covers, oldest first.
+///
+/// `None` for a `period` whose bounds are the wrong way round, which the caller refuses
+/// with the modelled `InvalidParameterException`; a caller that named no period gets the
+/// whole history.
+pub fn action_history_in_period(
+    stored: &StoredAction,
+    period: Option<&TimePeriod>,
+) -> Option<Vec<ActionHistory>> {
+    match period {
+        None => Some(stored.history.clone()),
+        Some(period) => {
+            if !time_period_ordered(period) {
+                return None;
+            }
+            Some(
+                stored
+                    .history
+                    .iter()
+                    .filter(|record| within_time_period(&record.timestamp, period))
+                    .cloned()
+                    .collect(),
+            )
+        }
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

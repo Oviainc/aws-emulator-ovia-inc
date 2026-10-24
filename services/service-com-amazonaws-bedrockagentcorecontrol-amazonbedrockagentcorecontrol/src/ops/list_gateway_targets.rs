@@ -198,32 +198,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `maxResults` has the modeled range 1..1000; absent, a page holds that
-        // same documented maximum. The floor of 1 keeps the handler correct on
-        // its own terms rather than relying on the boundary check: a page size of
-        // zero would be a silent dead end.
-        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
-            .unwrap_or(MAX_PAGE_SIZE as usize)
-            .max(1);
-
-        let mut items = Vec::new();
-        let mut next_token = None;
-        let mut last_included: Option<&str> = None;
-        for (target_id, target) in &gateway.targets {
-            if resume_after
-                .as_deref()
-                .is_some_and(|last| target_id.as_str() <= last)
-            {
-                continue;
-            }
-            if items.len() >= page_size {
-                // At least one target is left over, so hand back a token that
-                // resumes exactly where this page ended.
-                next_token = last_included.map(crate::state::encode_page_token);
-                break;
-            }
-            items.push(target.summary(now));
-            last_included = Some(target_id.as_str());
-        }
+        // same documented maximum. The page walk is `crate::state`'s, so every
+        // listing of this service pages by one rule.
+        let page_size = crate::state::page_size(input.max_results, MAX_PAGE_SIZE);
+        let (items, next_token) = crate::state::page_over(
+            &gateway.targets,
+            resume_after.as_deref(),
+            page_size,
+            |target| Some(target.summary(now)),
+        );
 
         Ok(ListGatewayTargetsOutput { items, next_token })
     }
