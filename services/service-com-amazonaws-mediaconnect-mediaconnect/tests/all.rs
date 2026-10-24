@@ -67,6 +67,8 @@ mod state_roundtrip;
 mod update_bridge;
 #[path = "all/update_bridge_source.rs"]
 mod update_bridge_source;
+#[path = "all/update_bridge_state.rs"]
+mod update_bridge_state;
 #[path = "all/update_flow.rs"]
 mod update_flow;
 #[path = "all/update_flow_entitlement.rs"]

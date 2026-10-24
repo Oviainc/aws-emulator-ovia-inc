@@ -986,6 +986,14 @@ pub struct SavingsPlanRecord {
     pub recurring_payment_units: i128,
     pub term_duration_in_seconds: i64,
     pub tags: BTreeMap<String, String>,
+    /// When this plan's return was accepted, epoch millis, or `None` for a plan
+    /// that was never returned.
+    ///
+    /// It is what the per-calendar-month return allowance
+    /// ([`MAX_RETURNS_PER_CALENDAR_MONTH`]) is counted from, so the allowance is
+    /// DERIVED from the plans the store already holds rather than tallied in a
+    /// second place that could drift from them.
+    pub returned_at_millis: Option<i64>,
 }
 
 impl SavingsPlanRecord {
@@ -1036,6 +1044,14 @@ impl SavingsPlanRecord {
         } else {
             self.start_millis
         }
+    }
+
+    /// Record that this plan's return was accepted at `now_millis`: it leaves the
+    /// states a return is accepted from, and the return counts against the
+    /// calendar month `now_millis` falls in.
+    pub fn mark_returned(&mut self, now_millis: i64) {
+        self.state = STATE_RETURNED.to_string();
+        self.returned_at_millis = Some(now_millis);
     }
 
     /// Merge `tags` into this plan's tags, refusing the WHOLE write when the
@@ -1142,6 +1158,37 @@ enum FilterKind {
 /// so without a ceiling one caller could grow it for the life of the process.
 pub const MAX_PLANS_PER_ACCOUNT: usize = 1000;
 
+/// The most Savings Plans this account may RETURN in one calendar month.
+///
+/// A return is bounded by more than the 168-hour window: AWS documents
+/// per-calendar-month limits on returns per payer account ("Returning a Savings
+/// Plan", AWS Savings Plans User Guide — besides the 7-day window, there are
+/// caps on how many Savings Plans and how much cumulative commitment may be
+/// returned in a calendar month), and `ReturnSavingsPlan` models
+/// `ServiceQuotaExceededException` (HTTP 402) for exhausting them.
+///
+/// The FIGURE is this emulator's, the way [`MAX_PLANS_PER_ACCOUNT`] is: what the
+/// service owes a caller is that the allowance exists, that it is counted per
+/// payer account per calendar month, and that the return past it is refused with
+/// the modelled 402 — not a particular number.
+pub const MAX_RETURNS_PER_CALENDAR_MONTH: usize = 10;
+
+/// The largest cumulative hourly commitment, in [`AMOUNT_SCALE`] units, this
+/// account may return in one calendar month. See
+/// [`MAX_RETURNS_PER_CALENDAR_MONTH`] for where the allowance comes from; this
+/// is the same allowance counted in commitment rather than in plans, so a
+/// handful of very large returns is bounded as well as a crowd of small ones.
+pub const MAX_RETURNED_COMMITMENT_UNITS_PER_CALENDAR_MONTH: i128 = 1000 * AMOUNT_SCALE;
+
+/// The calendar month `millis` falls in, as `YYYY-MM`.
+///
+/// Taken from [`format_millis`], so a month is the UTC calendar month — the same
+/// zone every instant this service renders is in — and the boundary between two
+/// months is one instant, not a range.
+pub fn calendar_month(millis: i64) -> String {
+    format_millis(millis).chars().take("YYYY-MM".len()).collect()
+}
+
 /// Per-service state for com-amazonaws-savingsplans-awssavingsplan. A handler
 /// reaches it through [`service_state`].
 #[derive(Debug)]
@@ -1231,6 +1278,62 @@ impl ComAmazonawsSavingsplansAwssavingsplanState {
     /// Whether another purchase would exceed [`MAX_PLANS_PER_ACCOUNT`].
     pub fn at_plan_quota(&self) -> bool {
         self.plans.len() >= MAX_PLANS_PER_ACCOUNT
+    }
+
+    /// What this account has already returned in the calendar month `now_millis`
+    /// falls in: how many plans, and their cumulative hourly commitment in
+    /// [`AMOUNT_SCALE`] units.
+    ///
+    /// Counted from the stored plans' [`SavingsPlanRecord::returned_at_millis`],
+    /// so a return recorded in an earlier month does not consume this month's
+    /// allowance and nothing has to be reset when the month turns over.
+    pub fn returns_in_calendar_month(&self, now_millis: i64) -> (usize, i128) {
+        let month = calendar_month(now_millis);
+        let mut returned = 0_usize;
+        let mut commitment = 0_i128;
+        for plan in &self.plans {
+            if plan
+                .returned_at_millis
+                .is_some_and(|at| calendar_month(at) == month)
+            {
+                returned = returned.saturating_add(1);
+                commitment = commitment.saturating_add(plan.commitment_units);
+            }
+        }
+        (returned, commitment)
+    }
+
+    /// Whether returning a plan of `commitment_units` at `now_millis` would take
+    /// this account past its return allowance for that calendar month, and if so
+    /// which cap it breaks and how much of the allowance is left.
+    ///
+    /// `Some(message)` is a quota refusal: the caller answers it with the
+    /// operation's modelled `ServiceQuotaExceededException` and changes nothing.
+    pub fn return_allowance_exceeded(
+        &self,
+        commitment_units: i128,
+        now_millis: i64,
+    ) -> Option<String> {
+        let month = calendar_month(now_millis);
+        let (returned, committed) = self.returns_in_calendar_month(now_millis);
+        if returned >= MAX_RETURNS_PER_CALENDAR_MONTH {
+            return Some(format!(
+                "this account has already returned its allowance of {MAX_RETURNS_PER_CALENDAR_MONTH} \
+                 Savings Plans in {month}"
+            ));
+        }
+        let total = committed.saturating_add(commitment_units);
+        if total > MAX_RETURNED_COMMITMENT_UNITS_PER_CALENDAR_MONTH {
+            return Some(format!(
+                "returning a Savings Plan committed at {} an hour would take this account past its \
+                 allowance of {} an hour of returned commitment in {month}: {} an hour has already \
+                 been returned",
+                format_amount(commitment_units),
+                format_amount(MAX_RETURNED_COMMITMENT_UNITS_PER_CALENDAR_MONTH),
+                format_amount(committed)
+            ));
+        }
+        None
     }
 
     /// Record a newly purchased plan, keeping both indexes in step.
@@ -1341,6 +1444,7 @@ pub fn purchase(
         recurring_payment_units,
         term_duration_in_seconds: offering.duration_seconds,
         tags,
+        returned_at_millis: None,
     }
 }
 
