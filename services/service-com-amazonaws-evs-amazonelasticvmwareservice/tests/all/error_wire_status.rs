@@ -222,8 +222,16 @@ async fn two_different_client_errors_share_the_400_and_differ_by_type() {
     }
 
     // And the scaffold channel is untouched by the status rule: an operation nobody
-    // has implemented yet is still a 501, not a client error.
-    let (status, body) = call(&router, "GetVersions", &json!({})).await;
+    // has implemented yet is still a 501, not a client error. `GetDepotUrl` is one of
+    // the operations still carrying the scaffold marker (`grep -rl '^//! SCAFFOLDED,
+    // NOT IMPLEMENTED:' src/ops/`); a request this service's own validator accepts, so
+    // the 501 is the handler's answer and not a refusal before it.
+    let (status, body) = call(
+        &router,
+        "GetDepotUrl",
+        &json!({ "environmentId": "env-0000000000" }),
+    )
+    .await;
     assert_eq!(
         status, 501,
         "case a scaffolded operation: expected HTTP 501, got {status} {body}"

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `ClusterId`, persists every supplied input against it and reports the cluster
+//! back, so a later `DescribeCluster` or `UpdateCluster` reads what was stored. A cluster
+//! is created `AwaitingQuorum` — it is still waiting for its node jobs — and an
+//! `InitialClusterSize` creates that many node jobs with it, each inheriting the
+//! cluster's attributes, which is what can give the cluster its quorum straight away.
 //!
 //! ## Shape of an operation
 //!
@@ -224,18 +221,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+        let mut store = state.lock();
+
+        // A cluster is built from the address its devices ship to, exactly as a job is:
+        // an id no stored address answers to names none. A forwarding address is an
+        // address too, so the same rule holds for it.
+        for address_id in [
+            Some(input.address_id.as_str()),
+            input.forwarding_address_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !store.addresses.contains_key(address_id) {
+                return Err(CreateClusterErrorModeled::InvalidResourceException(
+                    InvalidResourceException {
+                        message: Some(format!(
+                            "The address ID {address_id} can't be found. Check the information \
+                             you provided in your last request, and try again."
+                        )),
+                        resource_type: Some("address".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "If provided, each job will be automatically created and associated with the new
+        // cluster. If not provided, will be treated as 0"
+        // (`CreateClusterRequest$InitialClusterSize`). The member is modelled
+        // `range 0..16`, so a request that reaches here is already within those bounds.
+        // `ForceCreateJobs` guards over- and under-provisioning, which the model defines
+        // against "what [is] needed to meet capacity requirement specified with
+        // OnDeviceServiceConfiguration" — a requirement this emulator stages no data for
+        // and so cannot compute, which is why no request is treated as misprovisioned and
+        // the flag changes nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        // An initial size past the five-node quorum is created as asked: this operation
+        // models no limit error (`smithy_query(query="operation",
+        // operation="CreateCluster")` declares Ec2RequestFailed,
+        // InvalidInputCombination, InvalidResource and KMSRequestFailed only), while
+        // `ClusterLimitExceededException` — "create jobs until your cluster has exactly
+        // five nodes" — is declared on `CreateJob`, which is where a node JOINING a
+        // cluster is refused past the quorum. So the quorum is what the join enforces and
+        // what the cluster's state turns on, not a bound on this member, whose own
+        // modelled bound is `range 0..16`.
+        let initial_cluster_size =
+            usize::try_from(input.initial_cluster_size.unwrap_or(0)).unwrap_or(0);
+
+        // Nothing in this API deletes a cluster or a job, so a store that cannot hold the
+        // cluster together with the node jobs it asks for refuses the create rather than
+        // growing the process further, and before anything is written. The model declares
+        // no quota error on this operation, so each refusal travels on the framework's
+        // channel, naming the limit reached.
+        if !store.can_store_another_cluster() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator stores at most {} clusters, and that limit has been reached",
+                crate::state::MAX_STORED_CLUSTERS
+            )));
+        }
+        if !store.can_store_jobs(initial_cluster_size) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator stores at most {} jobs, and that limit has been reached",
+                crate::state::MAX_STORED_JOBS
+            )));
+        }
+
+        let cluster_id = store.mint_cluster_id();
+        // One instant for the whole create: the cluster and the node jobs it makes are
+        // created by the same call, so they carry the same creation date.
+        let created = ::std::time::SystemTime::now();
+        let cluster = crate::state::StoredCluster {
+            cluster_id: cluster_id.clone(),
+            // "Creates an empty cluster … You use the CreateJob action separately to
+            // create the jobs for each of these nodes": a cluster AWS has accepted is
+            // waiting for its node jobs, which is what `AwaitingQuorum` says. It leaves
+            // that state once the quorum of node jobs exists — a caller's work, not a
+            // clock's — which is what `add_cluster_node_jobs` records.
+            cluster_state: crate::state::ClusterState::AwaitingQuorum,
+            job_type: input.job_type,
+            snowball_type: input.snowball_type,
+            shipping_option: input.shipping_option,
+            address_id: input.address_id,
+            creation_date: created,
+            snowball_capacity_preference: input.snowball_capacity_preference,
+            description: input.description,
+            forwarding_address_id: input.forwarding_address_id,
+            role_arn: input.role_arn,
+            kms_key_arn: input.kms_key_arn,
+            resources: input.resources,
+            notification: input.notification,
+            on_device_service_configuration: input.on_device_service_configuration,
+            tax_documents: input.tax_documents,
+            remote_management: input.remote_management,
+            long_term_pricing_ids: input.long_term_pricing_ids.unwrap_or_default(),
+            // Filled in by `add_cluster_node_jobs` below for the nodes this create makes.
+            node_job_ids: Vec::new(),
+        };
+
+        // The node jobs this create makes, each one the cluster's attributes under an id
+        // of its own. "Lists long-term pricing id that will be used to associate with jobs
+        // automatically created for the new cluster"
+        // (`CreateClusterRequest$LongTermPricingIds`): the ids are a list over those jobs,
+        // so the nth job created carries the nth id, and a job past the end of a shorter
+        // list carries none.
+        let mut nodes = Vec::with_capacity(initial_cluster_size);
+        for node_index in 0..initial_cluster_size {
+            let node_id = store.mint_job_id();
+            let mut node = cluster.node_job(node_id, created);
+            node.long_term_pricing_id = cluster.long_term_pricing_ids.get(node_index).cloned();
+            nodes.push(node);
+        }
+        // "List of jobs created for this cluster" (`CreateClusterResult$JobListEntries`):
+        // a create that made no job reports no list rather than an empty one.
+        let job_list_entries: Option<Vec<JobListEntry>> = (!nodes.is_empty())
+            .then(|| nodes.iter().map(|node| node.to_job_list_entry()).collect());
+
+        // Both ceilings were checked above, so neither insertion can refuse here; the
+        // assertions keep a later change to the ceilings from answering 200 with nothing
+        // stored.
+        let cluster_stored = store.insert_cluster(cluster);
+        debug_assert!(cluster_stored, "the cluster ceiling was checked above");
+        let nodes_stored = store.add_cluster_node_jobs(&cluster_id, nodes);
+        debug_assert!(nodes_stored, "the job ceiling was checked above");
+
+        Ok(CreateClusterOutput {
+            cluster_id: Some(cluster_id),
+            job_list_entries,
+        })
     }
 }

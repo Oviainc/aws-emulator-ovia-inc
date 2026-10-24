@@ -11,6 +11,11 @@
 //! `SubJobMetadata`. Every other job type is one plain job. The `JobId` answered is the
 //! main job's for an export order, the job's own otherwise.
 //!
+//! A request that names a `ClusterId` creates a node of that cluster instead: the job's
+//! attributes are the cluster's ("the other job attributes are inherited from the
+//! cluster"), and the create is refused once the cluster holds the five nodes a cluster
+//! supports.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -282,20 +287,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the cluster it joins — "If you're creating a job for a node in a cluster, you
         // only need to provide the clusterId value; the other job attributes are
         // inherited from the cluster". An id no stored resource answers to names none.
-        if let Some(cluster_id) = input.cluster_id.as_deref() {
-            // `CreateCluster` is not implemented yet (it still answers 501), so this
-            // emulator holds no cluster and every well-formed cluster id names one that
-            // does not exist.
-            return Err(CreateJobErrorModeled::InvalidResourceException(
-                InvalidResourceException {
-                    message: Some(format!(
-                        "The cluster ID {cluster_id} can't be found. Check the information you \
-                         provided in your last request, and try again."
-                    )),
-                    resource_type: Some("cluster".to_string()),
-                },
-            )
-            .into());
+        if let Some(cluster_id) = input.cluster_id.clone() {
+            let Some(cluster) = store.clusters.get(&cluster_id).cloned() else {
+                return Err(CreateJobErrorModeled::InvalidResourceException(
+                    InvalidResourceException {
+                        message: Some(format!(
+                            "The cluster ID {cluster_id} can't be found. Check the information \
+                             you provided in your last request, and try again."
+                        )),
+                        resource_type: Some("cluster".to_string()),
+                    },
+                )
+                .into());
+            };
+            // "Currently, clusters support five nodes. If you have fewer than five nodes
+            // for your cluster and you have more nodes to create for this cluster, try
+            // again and create jobs until your cluster has exactly five nodes"
+            // (`ClusterLimitExceededException`): a cluster that already holds its quorum
+            // of node jobs takes no further node.
+            if cluster.has_quorum() {
+                return Err(CreateJobErrorModeled::ClusterLimitExceededException(
+                    ClusterLimitExceededException {
+                        message: Some(format!(
+                            "Job creation failed. The cluster {cluster_id} already has its {} \
+                             nodes, which is the number of nodes a cluster supports.",
+                            crate::state::CLUSTER_NODE_QUORUM
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // "Job or cluster creation failed. One or more inputs were invalid. Confirm
+            // that the CreateClusterRequest$SnowballType value supports your
+            // CreateJobRequest$JobType, and try again"
+            // (`InvalidInputCombinationException`): a node's job type and device type are
+            // the cluster's, so a request that names either and disagrees with the cluster
+            // is a combination that cannot hold, rather than an instruction to change the
+            // order.
+            for (member, requested, held) in [
+                ("JobType", input.job_type.as_deref(), cluster.job_type.as_str()),
+                (
+                    "SnowballType",
+                    input.snowball_type.as_deref(),
+                    cluster.snowball_type.as_str(),
+                ),
+            ] {
+                if requested.is_some_and(|requested| requested != held) {
+                    return Err(CreateJobErrorModeled::InvalidInputCombinationException(
+                        InvalidInputCombinationException {
+                            message: Some(format!(
+                                "Job creation failed. One or more inputs were invalid: the \
+                                 cluster {cluster_id} is a {held} cluster, so a node of it \
+                                 cannot be created with a different {member}."
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+
+            // The node job IS the cluster's attributes, under an id of its own: "you only
+            // need to provide the clusterId value; the other job attributes are inherited
+            // from the cluster", so a member the cluster carries (the address its device
+            // ships to, the description, the resources, the role, the key, the
+            // notification, the shipping speed, the capacity preference, the tax
+            // documents, the on-device services) is taken from the cluster whether or not
+            // the request repeats it — the model says a node request need not carry it,
+            // so carrying it is not an error, and the cluster is what the order agreed.
+            // Only the members a cluster does not model are this request's to supply.
+            let job_id = store.mint_job_id();
+            let mut node = cluster.node_job(job_id.clone(), ::std::time::SystemTime::now());
+            node.long_term_pricing_id = input.long_term_pricing_id;
+            node.device_configuration = input.device_configuration;
+            node.impact_level = input.impact_level;
+            node.pickup_details = input.pickup_details;
+            if !store.add_cluster_node_jobs(&cluster_id, vec![node]) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "this emulator stores at most {} jobs, and that limit has been reached",
+                    crate::state::MAX_STORED_JOBS
+                )));
+            }
+            return Ok(CreateJobOutput { job_id: Some(job_id) });
         }
 
         let Some(address_id) = input.address_id.clone() else {

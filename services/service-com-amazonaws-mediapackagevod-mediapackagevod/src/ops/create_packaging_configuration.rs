@@ -276,7 +276,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let arn = crate::state::resource_arn("packaging-configurations", &region, &input.id);
+        let arn = crate::state::resource_arn(
+            crate::state::ARN_KIND_PACKAGING_CONFIGURATIONS,
+            &region,
+            &input.id,
+        );
         let record = crate::state::PackagingConfigurationRecord {
             id: input.id.clone(),
             region: region.clone(),

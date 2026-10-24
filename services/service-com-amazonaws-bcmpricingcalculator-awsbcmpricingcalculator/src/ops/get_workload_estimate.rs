@@ -163,9 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = store.lock();
         // Materialise what the clock has already made due: an estimate past its
-        // `expiresAt` reads as gone rather than lingering for the life of the process,
-        // and one whose recomputation window has closed reports the terminal status it
-        // was owed at that instant.
+        // `expiresAt` reads as gone rather than lingering for the life of the process.
         state.settle(crate::state::now_millis());
 
         let Some(estimate) = state.workload_estimate(&input.identifier) else {

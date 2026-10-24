@@ -13,6 +13,11 @@
 //! Beside the resources, the store carries the two facts about the ACCOUNT this service
 //! answers for: its rate-type [`Preferences`], and its [`AccountClass`], which decides
 //! whether the bill-planning surface is open to the caller at all.
+//!
+//! It also carries the PRICE LIST this emulator quotes from — [`RATE_CARD`], the
+//! published on-demand rates [`price_usage`] prices a usage line against — here rather
+//! than in one handler, because every operation that stores or changes a usage line must
+//! price it the same way, and the cost of an estimate is the sum over those lines.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -20,7 +25,7 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     BillInterval, Expression, HistoricalUsageEntity, ResourceNotFoundException, UsageAmount,
-    UsageQuantity, ValidationException, WorkloadEstimateUsageQuantity,
+    UsageQuantity, ValidationException, WorkloadEstimateUsageItem, WorkloadEstimateUsageQuantity,
 };
 
 /// The region segment every ARN this service mints carries: NONE.
@@ -92,24 +97,31 @@ pub const WORKLOAD_ESTIMATE_RETENTION_SECS: i64 = BILL_SCENARIO_RETENTION_SECS;
 /// modelled error.
 pub const MAX_WORKLOAD_ESTIMATES: usize = 1000;
 
-/// The status a workload estimate carries while the service is still working out its
-/// cost: `WorkloadEstimateStatus`'s own non-terminal value (smithy_query:
+/// The status a workload estimate whose whole cost is resolved carries:
+/// `WorkloadEstimateStatus`'s terminal success value (smithy_query:
 /// `shape="WorkloadEstimateStatus"`, values `UPDATING | VALID | INVALID |
 /// ACTION_NEEDED`).
-pub const WORKLOAD_ESTIMATE_STATUS_UPDATING: &str = "UPDATING";
-
-/// The status a workload estimate settles in once the cost it was computing is in:
-/// `WorkloadEstimateStatus`'s terminal success value.
+///
+/// It is the status a created estimate is already in, and the one it returns to after
+/// every change to its usage: the cost of an estimate is computed from the usage it
+/// holds and the rates it is measured against ([`RATE_CARD`]), both of which are in hand
+/// by the time the call that changed them answers, so there is no recomputation left
+/// outstanding for a clock to finish. Nothing here reports `UPDATING`: a status is
+/// transient only where the service really is still working, and inventing a wait a
+/// caller must then poll out of would hang every client that gates on a terminal
+/// status.
 pub const WORKLOAD_ESTIMATE_STATUS_VALID: &str = "VALID";
 
-/// How long a workload estimate stays `UPDATING` before the clock owes it
-/// `VALID`.
+/// The status a workload estimate carries when at least one usage line it holds could
+/// not be priced, so its `totalCost` does not account for that line:
+/// `WorkloadEstimateStatus`'s own "the caller must do something about this" value.
 ///
-/// CHOSEN, not documented: AWS publishes no duration for the recomputation a create
-/// starts. It is deliberately NON-ZERO, so a caller reading the estimate straight after
-/// creating it still sees the transient status the real service reports, and short
-/// enough that a caller polling for the terminal status is not kept waiting.
-pub const WORKLOAD_ESTIMATE_UPDATING_MILLIS: i64 = 500;
+/// It is reported rather than `VALID` because `VALID` over a total that silently omits a
+/// line would report a workload as cheaper than the usage it models, and rather than
+/// `INVALID` because the estimate itself is well-formed — what is missing is a published
+/// rate for that line's usage type, which the caller resolves by modelling usage this
+/// service carries rates for. The `failureMessage` beside it names the usage types.
+pub const WORKLOAD_ESTIMATE_STATUS_ACTION_NEEDED: &str = "ACTION_NEEDED";
 
 /// What the `resourceType` member of a modelled error names a workload estimate as:
 /// the resource's own Smithy shape name (`com.amazonaws.bcmpricingcalculator#\
@@ -138,6 +150,302 @@ pub const COST_CURRENCY: &str = "USD";
 /// rather than in one handler, so every reader of a usage line's cost qualifies it the
 /// same way (see [`WorkloadEstimateUsage::cost_status`]).
 pub const COST_STATUS_VALID: &str = "VALID";
+
+/// The `WorkloadEstimateCostStatus` a usage line whose cost could not be established
+/// carries: the cost of that line is not a valid one, because no rate is published for
+/// its usage type at its location (see [`price_usage`]). Reported rather than left unset
+/// so a caller reading a line with no `cost` is told THAT line's cost is the problem,
+/// which is also what the estimate's `ACTION_NEEDED` status reports over the whole.
+pub const COST_STATUS_INVALID: &str = "INVALID";
+
+/// How many decimal places a cost this service reports is rounded to.
+///
+/// A cost is a rate times an amount, and binary floating point leaves a product like
+/// `24 × 0.0104` a few ulps away from the decimal value it denotes. Rounding to a fixed
+/// number of places makes the reported cost a function of the usage alone, so the same
+/// usage always reports the same number and a sum does not depend on the order it was
+/// added in. Ten places is far finer than any published rate (the finest AWS publishes
+/// are per-request rates with eight decimals) and far coarser than the error it removes.
+pub const COST_DECIMAL_PLACES: i32 = 10;
+
+/// `value` rounded to [`COST_DECIMAL_PLACES`].
+pub fn round_cost(value: f64) -> f64 {
+    let scale = 10f64.powi(COST_DECIMAL_PLACES);
+    (value * scale).round() / scale
+}
+
+/// The pricing location a usage type that carries no region prefix belongs to.
+///
+/// AWS's usage types name their region with a prefix (`USW2-BoxUsage:...`) and leave it
+/// off for the region the service was first offered in, `us-east-1` — the convention the
+/// AWS Billing user guide describes under "Understanding your usage types" and the one a
+/// Cost and Usage Report row follows. See [`REGION_PREFIXES`].
+pub const DEFAULT_USAGE_LOCATION: &str = "us-east-1";
+
+/// The region each usage-type prefix names, as the AWS Billing user guide's usage-type
+/// documentation lists them (the prefix of a usage type is the region abbreviation, e.g.
+/// `USW2-BoxUsage:t3.micro` is `us-west-2`; `EU-` is the legacy spelling of `EUW1-`).
+///
+/// Only prefixes whose region is unambiguous are listed: a usage type carrying a prefix
+/// this table does not name has NO location this service can report (see
+/// [`split_usage_type`]), rather than being silently read as [`DEFAULT_USAGE_LOCATION`].
+pub const REGION_PREFIXES: &[(&str, &str)] = &[
+    ("USE1", "us-east-1"),
+    ("USE2", "us-east-2"),
+    ("USW1", "us-west-1"),
+    ("USW2", "us-west-2"),
+    ("CAN1", "ca-central-1"),
+    ("EU", "eu-west-1"),
+    ("EUW1", "eu-west-1"),
+    ("EUW2", "eu-west-2"),
+    ("EUW3", "eu-west-3"),
+    ("EUC1", "eu-central-1"),
+    ("EUN1", "eu-north-1"),
+    ("APN1", "ap-northeast-1"),
+    ("APN2", "ap-northeast-2"),
+    ("APS1", "ap-southeast-1"),
+    ("APS2", "ap-southeast-2"),
+    ("SAE1", "sa-east-1"),
+];
+
+/// One published on-demand rate of the AWS price list this emulator carries: what one
+/// unit of a usage type costs, per location, and the unit it is measured in.
+///
+/// Each row's `per_location` rates are the PUBLISHED on-demand (undiscounted,
+/// `BEFORE_DISCOUNTS`) prices of that usage type, in [`COST_CURRENCY`], as the service's
+/// pricing pages state them. They are not computed from anything: a price list is data,
+/// and this is the slice of it this emulator ships (see [`RATE_CARD`]).
+#[derive(Debug, Clone, Copy)]
+pub struct PublishedRate {
+    /// The `ServiceCode` this rate belongs to, e.g. `AmazonEC2`.
+    pub service_code: &'static str,
+    /// The usage type WITHOUT its region prefix, e.g. `BoxUsage:t3.micro` — the prefix
+    /// selects the location, which `per_location` keys the rate by.
+    pub usage_type: &'static str,
+    /// The `Operation` dimension of the rate: a usage type priced under one operation is
+    /// a different rate from the same usage type under another (a Linux instance-hour is
+    /// `RunInstances`, a Windows one is not), so it is part of the key rather than
+    /// ignored.
+    pub operation: &'static str,
+    /// The unit of measure one `amount` of this usage type counts, as the price list
+    /// states it (`Hrs`, `GB-Mo`, ...). It is a property of the usage type, so it is
+    /// reported for a line of this usage type even at a location this row publishes no
+    /// rate for.
+    pub unit: &'static str,
+    /// `(location, price of one unit in USD)`.
+    pub per_location: &'static [(&'static str, f64)],
+}
+
+/// The price list this emulator carries.
+///
+/// SOURCE: the published AWS on-demand price lists — Amazon EC2
+/// (<https://aws.amazon.com/ec2/pricing/on-demand/>, Linux/UNIX, shared tenancy),
+/// Amazon S3 (<https://aws.amazon.com/s3/pricing/>, S3 Standard, first 50 TB/month) and
+/// Amazon RDS (<https://aws.amazon.com/rds/mysql/pricing/>, Single-AZ MySQL) — written
+/// out here because a price list is DATA the real service reads and nothing in this
+/// emulator can derive it.
+///
+/// It is deliberately a slice rather than the whole list: a usage type it does not
+/// publish a rate for is answered as a line whose cost could not be established
+/// ([`COST_STATUS_INVALID`]) on an estimate that needs the caller's attention
+/// ([`WORKLOAD_ESTIMATE_STATUS_ACTION_NEEDED`]), never with a made-up number.
+pub const RATE_CARD: &[PublishedRate] = &[
+    PublishedRate {
+        service_code: "AmazonEC2",
+        usage_type: "BoxUsage:t3.micro",
+        operation: "RunInstances",
+        unit: "Hrs",
+        per_location: &[
+            ("us-east-1", 0.0104),
+            ("us-west-2", 0.0104),
+            ("eu-west-1", 0.0114),
+        ],
+    },
+    PublishedRate {
+        service_code: "AmazonEC2",
+        usage_type: "BoxUsage:t3.small",
+        operation: "RunInstances",
+        unit: "Hrs",
+        per_location: &[
+            ("us-east-1", 0.0208),
+            ("us-west-2", 0.0208),
+            ("eu-west-1", 0.0228),
+        ],
+    },
+    PublishedRate {
+        service_code: "AmazonEC2",
+        usage_type: "BoxUsage:t3.medium",
+        operation: "RunInstances",
+        unit: "Hrs",
+        per_location: &[
+            ("us-east-1", 0.0416),
+            ("us-west-2", 0.0416),
+            ("eu-west-1", 0.0456),
+        ],
+    },
+    PublishedRate {
+        service_code: "AmazonEC2",
+        usage_type: "BoxUsage:m5.large",
+        operation: "RunInstances",
+        unit: "Hrs",
+        per_location: &[
+            ("us-east-1", 0.096),
+            ("us-west-2", 0.096),
+            ("eu-west-1", 0.107),
+        ],
+    },
+    PublishedRate {
+        service_code: "AmazonEC2",
+        usage_type: "BoxUsage:m5.xlarge",
+        operation: "RunInstances",
+        unit: "Hrs",
+        per_location: &[
+            ("us-east-1", 0.192),
+            ("us-west-2", 0.192),
+            ("eu-west-1", 0.214),
+        ],
+    },
+    PublishedRate {
+        service_code: "AmazonEC2",
+        usage_type: "BoxUsage:c5.large",
+        operation: "RunInstances",
+        unit: "Hrs",
+        per_location: &[
+            ("us-east-1", 0.085),
+            ("us-west-2", 0.085),
+            ("eu-west-1", 0.096),
+        ],
+    },
+    PublishedRate {
+        service_code: "AmazonEC2",
+        usage_type: "BoxUsage:c5.xlarge",
+        operation: "RunInstances",
+        unit: "Hrs",
+        per_location: &[
+            ("us-east-1", 0.17),
+            ("us-west-2", 0.17),
+            ("eu-west-1", 0.192),
+        ],
+    },
+    PublishedRate {
+        service_code: "AmazonS3",
+        usage_type: "TimedStorage-ByteHrs",
+        operation: "StandardStorage",
+        unit: "GB-Mo",
+        per_location: &[
+            ("us-east-1", 0.023),
+            ("us-west-2", 0.023),
+            ("eu-west-1", 0.023),
+        ],
+    },
+    PublishedRate {
+        service_code: "AmazonRDS",
+        usage_type: "InstanceUsage:db.t3.micro",
+        operation: "CreateDBInstance",
+        unit: "Hrs",
+        per_location: &[
+            ("us-east-1", 0.017),
+            ("us-west-2", 0.017),
+            ("eu-west-1", 0.018),
+        ],
+    },
+];
+
+/// A usage type split into the location its prefix names and the usage type the
+/// [`RATE_CARD`] keys a rate by.
+#[derive(Debug, Clone, Copy)]
+pub struct SplitUsageType<'a> {
+    /// The region the prefix names, [`DEFAULT_USAGE_LOCATION`] when there is no prefix,
+    /// and `None` when the prefix is one [`REGION_PREFIXES`] does not name — nothing can
+    /// be said about that location, so nothing is.
+    pub location: Option<&'static str>,
+    /// The usage type with any region prefix removed.
+    pub usage_type: &'a str,
+}
+
+/// Whether `segment` is shaped like a usage type's region abbreviation: two to five
+/// characters, every one an upper-case letter or a digit, as every prefix
+/// [`REGION_PREFIXES`] lists is. A usage type whose first segment is anything else
+/// (`TimedStorage-ByteHrs`, `DataTransfer-Out-Bytes`) carries no prefix at all.
+fn is_region_prefix_shaped(segment: &str) -> bool {
+    (2..=5).contains(&segment.len())
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && segment.chars().any(|c| c.is_ascii_uppercase())
+}
+
+/// [`SplitUsageType`] for `usage_type`: the location its region prefix names and the
+/// rest of the usage type, by the convention [`DEFAULT_USAGE_LOCATION`] describes.
+pub fn split_usage_type(usage_type: &str) -> SplitUsageType<'_> {
+    match usage_type.split_once('-') {
+        Some((prefix, rest)) if is_region_prefix_shaped(prefix) => SplitUsageType {
+            location: REGION_PREFIXES
+                .iter()
+                .find(|(candidate, _)| *candidate == prefix)
+                .map(|(_, region)| *region),
+            usage_type: rest,
+        },
+        _ => SplitUsageType {
+            location: Some(DEFAULT_USAGE_LOCATION),
+            usage_type,
+        },
+    }
+}
+
+/// The [`RATE_CARD`] row for a usage type (region prefix already removed) under an
+/// operation, or `None` when this emulator publishes no rate for that usage.
+pub fn published_rate(
+    service_code: &str,
+    usage_type: &str,
+    operation: &str,
+) -> Option<&'static PublishedRate> {
+    RATE_CARD.iter().find(|rate| {
+        rate.service_code == service_code
+            && rate.usage_type == usage_type
+            && rate.operation == operation
+    })
+}
+
+/// What this service can say about the price of one usage line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsagePricing {
+    /// The pricing location of the line, from its usage type's region prefix.
+    pub location: Option<String>,
+    /// The unit of measure its quantity counts, from the [`RATE_CARD`] row for its usage
+    /// type.
+    pub unit: Option<String>,
+    /// The cost of `amount` units at that location: the published rate times the amount,
+    /// rounded to [`COST_DECIMAL_PLACES`], and `None` when no rate is published for this
+    /// usage type at this location.
+    pub cost: Option<f64>,
+}
+
+/// Price one usage line: the location its usage type names, the unit that usage type is
+/// measured in, and what `amount` of it costs at the published rate.
+///
+/// ONE function for every usage line of this service, so the batch that creates a line
+/// and every later reader of it report the same price for the same usage.
+pub fn price_usage(
+    service_code: &str,
+    usage_type: &str,
+    operation: &str,
+    amount: f64,
+) -> UsagePricing {
+    let split = split_usage_type(usage_type);
+    let rate = published_rate(service_code, split.usage_type, operation);
+    let unit_price = rate.zip(split.location).and_then(|(rate, location)| {
+        rate.per_location
+            .iter()
+            .find(|(candidate, _)| *candidate == location)
+            .map(|(_, price)| *price)
+    });
+    UsagePricing {
+        location: split.location.map(str::to_string),
+        unit: rate.map(|rate| rate.unit.to_string()),
+        cost: unit_price.map(|price| round_cost(price * amount)),
+    }
+}
 
 /// What the `resourceType` member of a modelled error names a bill scenario as: the
 /// resource's own Smithy shape name (`com.amazonaws.bcmpricingcalculator#BillScenario`),
@@ -362,9 +670,9 @@ pub struct UsageFilterFields<'a> {
     pub service_code: &'a str,
     pub usage_type: &'a str,
     pub operation: &'a str,
-    /// The row's pricing location. Only resolvable from the price list, which this
-    /// emulator does not carry, so no row has one yet and a `LOCATION` filter selects
-    /// nothing rather than being refused — the real service does support it.
+    /// The row's pricing location: the region its usage type names, for a row whose
+    /// creator resolves one (see [`split_usage_type`]). A row with none is selected out
+    /// by a `LOCATION` filter rather than refusing it.
     pub location: Option<&'a str>,
     pub group: Option<&'a str>,
     pub historical_usage: Option<&'a HistoricalUsageEntity>,
@@ -410,34 +718,35 @@ pub struct WorkloadEstimateUsage {
     pub usage_type: String,
     pub operation: String,
     pub usage_account_id: String,
-    /// The pricing location of this line. Only resolvable from the price list, which
-    /// this emulator does not carry, so it stays unset.
+    /// The pricing location of this line: the region its usage type's prefix names (see
+    /// [`split_usage_type`]), resolved once when the line is stored so every reader
+    /// reports the same one.
     pub location: Option<String>,
     pub group: Option<String>,
     /// The usage amount the entry asked to model, which is what this line's
     /// `quantity.amount` reports back.
     pub amount: f64,
-    /// What this line's usage costs, in [`COST_CURRENCY`].
+    /// The unit of measure [`Self::amount`] counts, from the [`RATE_CARD`] row for this
+    /// line's usage type, and unset when this emulator's price list does not carry that
+    /// usage type.
+    pub unit: Option<String>,
+    /// What this line's usage costs, in [`COST_CURRENCY`]: the published rate for its
+    /// usage type at its location times its amount ([`price_usage`]).
     ///
-    /// Pricing a usage type needs the AWS price list, which this emulator does not
-    /// carry, so it stays unset rather than carrying a number nothing computed — the
-    /// same reason [`Self::location`] and a quantity's `unit` stay unset. It is stored
-    /// (rather than assumed absent) because it is what
-    /// [`WorkloadEstimate::cost_over_usage`] sums, so a line that ever does carry a
-    /// cost is counted without changing that sum's definition.
+    /// Unset when this emulator's price list publishes no rate for that usage at that
+    /// location — a cost nothing established is not reported as a number. It is what
+    /// [`WorkloadEstimate::cost_over_usage`] sums, and a line without one is what puts
+    /// its estimate in [`WORKLOAD_ESTIMATE_STATUS_ACTION_NEEDED`].
     pub cost: Option<f64>,
     pub historical_usage: Option<HistoricalUsageEntity>,
 }
 
 impl WorkloadEstimateUsage {
-    /// The modelled quantity of this line's usage.
-    ///
-    /// `unit` stays unset: a usage type's unit of measure comes from the price list,
-    /// which this emulator does not carry, and `WorkloadEstimateUsageQuantity$unit` is
-    /// optional precisely so it can be absent.
+    /// The modelled quantity of this line's usage: the amount asked for, in the unit the
+    /// price list measures that usage type in.
     pub fn quantity(&self) -> WorkloadEstimateUsageQuantity {
         WorkloadEstimateUsageQuantity {
-            unit: None,
+            unit: self.unit.clone(),
             amount: Some(self.amount),
         }
     }
@@ -469,12 +778,92 @@ impl WorkloadEstimateUsage {
     }
 
     /// The `WorkloadEstimateCostStatus` a reader reports for this line: it qualifies the
-    /// reported `cost`, so it is reported exactly when a cost is — and the cost a reader
-    /// has just computed off stored state is current, hence [`COST_STATUS_VALID`]. With
-    /// no cost there is nothing to qualify, so it stays unset rather than asserting a
-    /// cost state nothing established.
+    /// line's cost, so a line priced off the published rate reports
+    /// [`COST_STATUS_VALID`], and one this emulator's price list carries no rate for
+    /// reports [`COST_STATUS_INVALID`] — the cost of that line is not valid, which is
+    /// exactly what the caller needs to know about an item carrying no `cost`.
     pub fn cost_status(&self) -> Option<String> {
-        self.cost.map(|_| COST_STATUS_VALID.to_string())
+        Some(
+            if self.cost.is_some() {
+                COST_STATUS_VALID
+            } else {
+                COST_STATUS_INVALID
+            }
+            .to_string(),
+        )
+    }
+
+    /// This line as the modelled `WorkloadEstimateUsageItem`.
+    ///
+    /// Both operations that report a STORED line through that shape
+    /// (`ListWorkloadEstimateUsage` and `BatchUpdateWorkloadEstimateUsage`) project it
+    /// here, so one line cannot be reported two ways. `BatchCreateWorkloadEstimateUsage`
+    /// answers in its own item shape (which also carries the entry's `key`) and reads the
+    /// same accessors.
+    pub fn usage_item(&self) -> WorkloadEstimateUsageItem {
+        WorkloadEstimateUsageItem {
+            id: Some(self.id.clone()),
+            service_code: self.service_code.clone(),
+            usage_type: self.usage_type.clone(),
+            operation: self.operation.clone(),
+            location: self.location.clone(),
+            group: self.group.clone(),
+            usage_account_id: Some(self.usage_account_id.clone()),
+            quantity: Some(self.quantity()),
+            cost: self.cost,
+            currency: self.cost_currency(),
+            status: self.cost_status(),
+            historical_usage: self.historical_usage.clone(),
+        }
+    }
+
+    /// Re-price this line after a change to the usage it models: the location, unit and
+    /// cost are a function of its usage type, operation and amount, so they are resolved
+    /// again through the one [`price_usage`] every creator of a line uses.
+    pub fn reprice(&mut self) {
+        let pricing = price_usage(
+            &self.service_code,
+            &self.usage_type,
+            &self.operation,
+            self.amount,
+        );
+        self.location = pricing.location;
+        self.unit = pricing.unit;
+        self.cost = pricing.cost;
+    }
+
+    /// A stored line for one batch entry's usage, priced from this service's rate card.
+    ///
+    /// Every operation that stores a usage line goes through here, so the location, unit
+    /// and cost of a line are resolved in ONE place: two creators of the same usage
+    /// cannot price it differently.
+    #[allow(clippy::too_many_arguments)]
+    pub fn priced(
+        id: String,
+        key: Option<String>,
+        service_code: String,
+        usage_type: String,
+        operation: String,
+        usage_account_id: String,
+        group: Option<String>,
+        amount: f64,
+        historical_usage: Option<HistoricalUsageEntity>,
+    ) -> Self {
+        let pricing = price_usage(&service_code, &usage_type, &operation, amount);
+        Self {
+            id,
+            key,
+            service_code,
+            usage_type,
+            operation,
+            usage_account_id,
+            location: pricing.location,
+            group,
+            amount,
+            unit: pricing.unit,
+            cost: pricing.cost,
+            historical_usage,
+        }
     }
 }
 
@@ -492,28 +881,23 @@ pub struct WorkloadEstimate {
     /// [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::resource_tags`].
     pub arn: String,
     pub name: String,
-    /// A `WorkloadEstimateStatus` value (`UPDATING` | `VALID` | `INVALID` |
-    /// `ACTION_NEEDED`).
+    /// A `WorkloadEstimateStatus` value: [`WORKLOAD_ESTIMATE_STATUS_VALID`] while every
+    /// usage line it holds is priced, [`WORKLOAD_ESTIMATE_STATUS_ACTION_NEEDED`] while
+    /// one of them is not ([`Self::recompute_cost`] maintains it).
     pub status: String,
-    /// The epoch-millisecond instant at which the clock owes this estimate a move out
-    /// of [`WORKLOAD_ESTIMATE_STATUS_UPDATING`], applied by
-    /// [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`].
-    pub status_due_at_millis: i64,
     pub created_at: DateTime,
     pub expires_at: DateTime,
-    /// The `WorkloadEstimateRateType` the request asked for, absent when it asked for
-    /// none: the model declares no default for the member, so nothing is invented here.
+    /// The `WorkloadEstimateRateType` this estimate is measured on: what the request
+    /// asked for, or [`DEFAULT_WORKLOAD_ESTIMATE_RATE_TYPE`] when it asked for none.
     pub rate_type: Option<String>,
     /// The instant of the pricing rates this estimate is measured against — the moment
     /// it was created, since that is when the rates were read.
     pub rate_timestamp: DateTime,
     /// The estimated cost of this estimate's usage, in [`COST_CURRENCY`].
     ///
-    /// Maintained by the operations that change that usage: each of them starts the
-    /// recomputation ([`WorkloadEstimate::begin_cost_recompute`]) that
-    /// [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`] lands
-    /// here as [`WorkloadEstimate::cost_over_usage`] once the window closes. An
-    /// estimate holding no usage costs `0.0`.
+    /// Maintained by the operations that change that usage: each of them calls
+    /// [`Self::recompute_cost`], which lands [`Self::cost_over_usage`] here. An estimate
+    /// holding no usage costs `0.0`.
     pub total_cost: f64,
     pub failure_message: Option<String>,
     pub tags: BTreeMap<String, String>,
@@ -541,27 +925,50 @@ impl WorkloadEstimate {
         self.usage.iter().find(|line| line.id == id)
     }
 
-    /// The cost of this estimate's usage: the sum over the costs of its usage lines.
+    /// The cost of this estimate's usage: the sum over the costs of its usage lines,
+    /// rounded to [`COST_DECIMAL_PLACES`] so the total of a set of lines does not depend
+    /// on the order they were added in.
     ///
-    /// A line whose cost this emulator cannot resolve contributes nothing (see
-    /// [`WorkloadEstimateUsage::cost`]), so an estimate whose lines are all unpriced
-    /// costs the same `0.0` an estimate holding no usage does.
+    /// A line whose cost this emulator's price list cannot resolve contributes nothing
+    /// (see [`WorkloadEstimateUsage::cost`]) and is what puts the estimate in
+    /// [`WORKLOAD_ESTIMATE_STATUS_ACTION_NEEDED`], so a total that omits a line is never
+    /// reported as a complete one.
     pub fn cost_over_usage(&self) -> f64 {
-        self.usage.iter().filter_map(|line| line.cost).sum()
+        round_cost(self.usage.iter().filter_map(|line| line.cost).sum())
     }
 
-    /// Start the cost recomputation a change to this estimate's usage owes it: the
-    /// estimate re-enters the non-terminal status it was created in, and the clock owes
-    /// it the terminal one — with the recomputed cost — one
-    /// [`WORKLOAD_ESTIMATE_UPDATING_MILLIS`] window later, applied by
-    /// [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`].
+    /// The usage types of the lines this estimate holds that carry no cost, in stored
+    /// order and without repeats.
+    fn unpriced_usage_types(&self) -> Vec<String> {
+        let mut unpriced: Vec<String> = Vec::new();
+        for line in &self.usage {
+            if line.cost.is_none() && !unpriced.contains(&line.usage_type) {
+                unpriced.push(line.usage_type.clone());
+            }
+        }
+        unpriced
+    }
+
+    /// Recompute what this estimate costs and what status that leaves it in.
     ///
-    /// The window is never zero, so a caller reading the estimate straight after
-    /// changing its usage still sees the transient status the real service reports
-    /// while it works the new cost out.
-    pub fn begin_cost_recompute(&mut self, now_millis: i64) {
-        self.status = WORKLOAD_ESTIMATE_STATUS_UPDATING.to_string();
-        self.status_due_at_millis = now_millis + WORKLOAD_ESTIMATE_UPDATING_MILLIS;
+    /// Called by every operation that changes the usage this estimate holds, and by the
+    /// create that mints it: the cost of an estimate is a function of its usage lines and
+    /// the rates they were priced at, so it is landed by the call that changes them
+    /// rather than left for a later reader to work out.
+    pub fn recompute_cost(&mut self) {
+        self.total_cost = self.cost_over_usage();
+        let unpriced = self.unpriced_usage_types();
+        if unpriced.is_empty() {
+            self.status = WORKLOAD_ESTIMATE_STATUS_VALID.to_string();
+            self.failure_message = None;
+        } else {
+            self.status = WORKLOAD_ESTIMATE_STATUS_ACTION_NEEDED.to_string();
+            self.failure_message = Some(format!(
+                "no rate is published for usage type {}, so its cost is not included in \
+                 totalCost",
+                unpriced.join(", ")
+            ));
+        }
     }
 }
 
@@ -636,6 +1043,19 @@ impl BillScenario {
 /// `BEFORE_DISCOUNTS`: the only rate a calculator can quote knowing nothing about an
 /// account's discounts or commitments.
 pub const DEFAULT_RATE_TYPE_SELECTION: &str = "BEFORE_DISCOUNTS";
+
+/// The `WorkloadEstimateRateType` an estimate is created on when the request names none.
+///
+/// `CreateWorkloadEstimate$rateType` is optional and the model declares no `@default`,
+/// but the estimate is nevertheless priced on SOME rate basis — `totalCost` and every
+/// line's `cost` are only meaningful against one — and the response reports which, so
+/// the effective basis is resolved here instead of being left unsaid. The value is the
+/// un-discounted list rate, `WorkloadEstimateRateType`'s `BEFORE_DISCOUNTS`: the only
+/// basis a calculator can quote knowing nothing about an account's discounts or
+/// commitments, which is the same reason [`DEFAULT_RATE_TYPE_SELECTION`] is the
+/// rate-type preference an account that has written none has in effect, and it is the
+/// basis the rates in [`RATE_CARD`] are published on.
+pub const DEFAULT_WORKLOAD_ESTIMATE_RATE_TYPE: &str = "BEFORE_DISCOUNTS";
 
 /// Which kind of account, in AWS Organizations terms, this service presents its caller
 /// as. It decides the account-class gate in
@@ -997,28 +1417,19 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
         }
     }
 
-    /// Materialise EVERYTHING the clock has already made due at `now_millis`: the
-    /// expiry [`Self::purge_expired`] applies, and the move out of the transient
-    /// `UPDATING` status a workload estimate was owed once its recomputation window
-    /// closed — which lands the recomputed cost
-    /// ([`WorkloadEstimate::cost_over_usage`]) with it, since that recomputation is
-    /// what the transient status was reporting.
+    /// Materialise everything the clock has already made due at `now_millis`: the expiry
+    /// [`Self::purge_expired`] applies.
     ///
-    /// Both changes were owed at `now_millis` whether or not anybody called, which is
-    /// why a reporting operation may apply them; every operation that resolves a
-    /// workload estimate calls this first, so no reader reports a status the clock has
-    /// already moved on from.
+    /// That change was owed at `now_millis` whether or not anybody called, which is why a
+    /// reporting operation may apply it; every operation that resolves a resource of this
+    /// store calls this first, so no reader reports a resource whose advertised
+    /// `expiresAt` has passed.
+    ///
+    /// Nothing else is settled here. A workload estimate's cost and the status over it
+    /// are landed by the call that changes its usage ([`WorkloadEstimate::recompute_cost`]),
+    /// so there is never a transition outstanding for a later reader to apply.
     pub fn settle(&mut self, now_millis: i64) {
         self.purge_expired(now_millis.div_euclid(1000));
-        for estimate in &mut self.workload_estimates {
-            if estimate.status == WORKLOAD_ESTIMATE_STATUS_UPDATING
-                && estimate.status_due_at_millis <= now_millis
-            {
-                let recomputed = estimate.cost_over_usage();
-                estimate.status = WORKLOAD_ESTIMATE_STATUS_VALID.to_string();
-                estimate.total_cost = recomputed;
-            }
-        }
     }
 
     /// Forget every resource id an idempotency record names that no longer exists, and
@@ -1235,8 +1646,8 @@ pub fn now_secs() -> i64 {
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
-/// Wall-clock milliseconds since the Unix epoch, for the sub-second instants a
-/// transient status is due at.
+/// Wall-clock milliseconds since the Unix epoch, the resolution
+/// [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`] takes.
 pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1472,9 +1883,10 @@ pub fn decode_page_token(token: &str, scope: &str) -> Result<usize, String> {
 ///
 /// `max_results` is the caller's page size, defaulting to the model's maximum, and
 /// `scope` binds the token to this request (see [`encode_page_token`]). The returned
-/// token is `Some` only while items remain after this page, so a caller that paginates
-/// to the end sees it absent — and an offset past the end is an empty last page rather
-/// than an error, because the item a live token named may have been deleted in between.
+/// token is `Some` whenever this page FILLED the page size the caller asked for — see
+/// [`paginate_sized`] for why a full last page still carries one — and an offset past the
+/// end is an empty last page rather than an error, because the item a live token named
+/// may have been deleted in between.
 pub fn paginate<T: Clone>(
     items: &[T],
     next_token: Option<&str>,
@@ -1488,6 +1900,12 @@ pub fn paginate<T: Clone>(
 /// different maximum than [`MAX_PAGE_SIZE`] — `default_page_size` is the page size a
 /// caller that sends no `maxResults` gets, which this service takes to be that
 /// operation's own modelled maximum.
+///
+/// A FULL page always carries a continuation token, even when it happens to have
+/// returned the last item: a page that filled the requested size says nothing about
+/// whether anything follows it, and the recorded service answers a full last page with a
+/// token whose next page comes back empty. A page SHORT of the requested size is the end
+/// of the collection, so it carries none and a client's walk terminates.
 pub fn paginate_sized<T: Clone>(
     items: &[T],
     next_token: Option<&str>,
@@ -1515,6 +1933,6 @@ pub fn paginate_sized<T: Clone>(
     }
     let end = (offset + page_size).min(items.len());
     let page = items[offset..end].to_vec();
-    let token = (end < items.len()).then(|| encode_page_token(scope, end));
+    let token = (page.len() == page_size).then(|| encode_page_token(scope, end));
     Ok((page, token))
 }

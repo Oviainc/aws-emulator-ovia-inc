@@ -6,10 +6,13 @@
 //! instant the rates were read (the create instant), and `totalCost` is the cost of the
 //! usage the estimate holds — nothing, at create time, so `0.0` in `USD`.
 //!
-//! The estimate is created in the non-terminal `UPDATING` status and the clock owes it
-//! `VALID` [`crate::state::WORKLOAD_ESTIMATE_UPDATING_MILLIS`] later; every operation
-//! that resolves one calls [`crate::state::ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`]
-//! first, so the move is materialised by whoever reads next rather than by a sleep.
+//! The estimate is created `VALID`: its cost is computed from the usage it holds (none
+//! yet) at the rates `crate::state::RATE_CARD` publishes, so there is no recomputation
+//! left outstanding and nothing for a caller to poll for.
+//!
+//! `rateType` is optional on the request and the response reports the EFFECTIVE basis
+//! the estimate is priced on, so an omitted one is resolved to
+//! `crate::state::DEFAULT_WORKLOAD_ESTIMATE_RATE_TYPE` and persisted.
 //!
 //! The operation is `@idempotent` and `clientToken` is an `@idempotencyToken`, so a
 //! replayed token answers with the estimate the first call created instead of minting a
@@ -195,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now_millis = crate::state::now_millis();
         // Materialise what the clock has already made due before answering, so the
         // retention this store advertises through `expiresAt` is enforced rather than
-        // merely reported, and a replay does not answer with a stale status.
+        // merely reported.
         state.settle(now_millis);
         let now = now_millis.div_euclid(1000);
 
@@ -265,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = state.mint_resource_id();
-        let estimate = crate::state::WorkloadEstimate {
+        let mut estimate = crate::state::WorkloadEstimate {
             arn: ::engine::emulator_arn(
                 crate::state::ARN_NAMESPACE,
                 crate::state::ARN_REGION,
@@ -273,26 +276,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             id: id.clone(),
             name: input.name.clone(),
-            // The estimate exists while the service works its cost out, so it is
-            // created in the non-terminal status and the clock owes it the terminal one
-            // once the window below closes.
-            status: crate::state::WORKLOAD_ESTIMATE_STATUS_UPDATING.to_string(),
-            status_due_at_millis: now_millis + crate::state::WORKLOAD_ESTIMATE_UPDATING_MILLIS,
+            // Replaced by `recompute_cost` below, which is what decides the status an
+            // estimate holding this usage is in.
+            status: crate::state::WORKLOAD_ESTIMATE_STATUS_VALID.to_string(),
             created_at: ::aws_smithy_types::DateTime::from_secs(now),
             expires_at: ::aws_smithy_types::DateTime::from_secs(
                 now + crate::state::WORKLOAD_ESTIMATE_RETENTION_SECS,
             ),
-            rate_type: input.rate_type.clone(),
+            // The estimate is priced on SOME rate basis whether or not the request named
+            // one, and the response reports which, so an omitted `rateType` is resolved
+            // to the service's default basis rather than left unsaid.
+            rate_type: Some(input.rate_type.clone().unwrap_or_else(|| {
+                crate::state::DEFAULT_WORKLOAD_ESTIMATE_RATE_TYPE.to_string()
+            })),
             // The rates this estimate is measured against are the ones current when it
             // was created.
             rate_timestamp: ::aws_smithy_types::DateTime::from_secs(now),
-            // A fresh estimate holds no usage, so the cost of its usage is zero; the
-            // operations that add usage are what move it.
+            // Replaced by `recompute_cost` below: a fresh estimate holds no usage, so
+            // the cost of its usage is zero.
             total_cost: 0.0,
             failure_message: None,
             tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
             usage: Vec::new(),
         };
+        // The cost of an estimate and the status over it are a function of the usage it
+        // holds, landed by the call that sets that usage — here, the create.
+        estimate.recompute_cost();
 
         let output = output_for(&estimate);
         state.workload_estimates.push(estimate);

@@ -187,7 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The id is minted from the store's own monotonic sequence, so it is unique by
         // construction and nothing is minted for a request the cap refuses. Two hosts
         // created under the SAME name therefore get distinct ARNs: nothing about a host
-        // is keyed by its name, which the model does not constrain to be unique.
+        // is keyed by its name, which the model does not constrain to be unique. That
+        // same sequence is the host's creation order, which `ListHosts` pages over.
         let sequence = store.take_sequence();
         let host_id = crate::state::mint_resource_uuid(sequence);
         let host_arn = crate::state::host_arn(&region, &host_id);
@@ -205,6 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // non-terminal status reports.
                 status: crate::state::HOST_STATUS_PENDING.to_string(),
                 status_message: Some(crate::state::HOST_STATUS_MESSAGE_PENDING.to_string()),
+                sequence,
             },
         );
         if let Some(tags) = input.tags.as_deref() {

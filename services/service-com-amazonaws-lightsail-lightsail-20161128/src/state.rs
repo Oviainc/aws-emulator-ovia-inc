@@ -470,6 +470,9 @@ pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE: &str = "CreateRelationalDat
 pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_SNAPSHOT: &str =
     "CreateRelationalDatabaseSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_FROM_SNAPSHOT: &str =
+    "CreateRelationalDatabaseFromSnapshot";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_UPDATE_RELATIONAL_DATABASE_PARAMETERS: &str =
     "UpdateRelationalDatabaseParameters";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -2481,6 +2484,24 @@ impl RelationalDatabaseBundleSpec {
     /// (`micro_ha_1_0`), which the standard plan of the same size does not.
     pub fn is_high_availability(&self) -> bool {
         self.bundle_id.contains("_ha_")
+    }
+
+    /// Whether this plan is SMALLER than `other` — any of the three hardware
+    /// dimensions the catalog publishes (vCPU count, RAM, disk size) below
+    /// `other`'s.
+    ///
+    /// A restore is held to this: "When creating a new database from a snapshot,
+    /// you cannot choose a bundle that is smaller than the bundle of the source
+    /// database" (the modelled `CreateRelationalDatabaseFromSnapshot$relationalDatabaseBundleId`
+    /// documentation). The comparison is over the published HARDWARE rather than
+    /// over the catalog's order, so a plan the catalog gains sits in the ordering
+    /// by what it offers; two plans with the same hardware (a standard plan and
+    /// its high-availability twin) are neither smaller than the other, which is
+    /// what makes a restore onto a standby-backed plan of the same size legal.
+    pub fn is_smaller_than(&self, other: &Self) -> bool {
+        self.cpu_count < other.cpu_count
+            || self.ram_size_in_gb < other.ram_size_in_gb
+            || self.disk_size_in_gb < other.disk_size_in_gb
     }
 
     /// This plan as the modelled `RelationalDatabaseBundle`.
@@ -5665,6 +5686,20 @@ pub struct StoredRelationalDatabaseSnapshot {
     /// The size of the snapshotted database disk in GB, copied from the source
     /// database's bundle.
     pub size_in_gb: i32,
+    /// The name of the database the source database served, copied from the
+    /// source record: a snapshot captures the database it was taken of, so
+    /// `CreateRelationalDatabaseFromSnapshot` restores a database serving the
+    /// same database name — even after the source has been deleted. No member of
+    /// `RelationalDatabaseSnapshot` exposes it.
+    pub master_database_name: String,
+    /// The master user name the source database was created with, copied from
+    /// the source record for the same reason: a restored database is reached
+    /// with the credentials of the database the snapshot was taken of.
+    pub master_username: String,
+    /// The master user password the source database held, copied from the source
+    /// record so a restore reports the credentials the snapshot captured.
+    /// Absent when the source carried none.
+    pub master_user_password: Option<String>,
     /// The current state: [`RELATIONAL_DATABASE_SNAPSHOT_STATE_CREATING`] or
     /// [`RELATIONAL_DATABASE_SNAPSHOT_STATE_AVAILABLE`].
     pub state: &'static str,

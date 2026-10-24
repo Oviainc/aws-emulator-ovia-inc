@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRelationalDatabaseFromSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRelationalDatabaseFromSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Restores one managed relational database into this service's store from a
+//! point-in-time copy of another database: the engine, the version and the
+//! master credentials come from what that copy captured, the hardware from the
+//! bundle the request names (or the source's, and never a smaller one), and the
+//! answer is the operation-log entry the insert appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRelationalDatabaseFromSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +194,439 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRelationalDatabaseFromSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRelationalDatabaseFromSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRelationalDatabaseFromSnapshot"))
+        // A restored database lives in ONE Availability Zone (with a standby in a
+        // second one on a high-availability bundle), exactly as a database
+        // created from scratch does, so the Region it belongs to is the Region of
+        // the zone the request names. The zone must be one that Region PUBLISHES
+        // (`GetRegions` is where a caller resolves it), so a zone letter no
+        // Region has is refused rather than stored. A request that names no zone
+        // is served in the Region it was signed for, and the service picks the
+        // zone out of that Region's own zones.
+        let (region, zones) = match &input.availability_zone {
+            Some(zone) => {
+                let spec =
+                    crate::state::region_spec_of_availability_zone(zone).ok_or_else(|| {
+                        invalid(format!(
+                            "availabilityZone '{zone}' is not an Availability Zone this service \
+                             publishes: it must be one of the zones GetRegions reports for a \
+                             region of [{}]",
+                            crate::state::region_names()
+                        ))
+                    })?;
+                (spec.name.to_string(), spec.zone_names())
+            }
+            None => {
+                let region = crate::state::request_region(ctx.parts());
+                let zones = crate::state::region_spec(&region)
+                    .map(crate::state::RegionSpec::zone_names)
+                    .unwrap_or_default();
+                (region, zones)
+            }
+        };
+
+        // `relationalDatabaseName` is the one modelled `@required` member and
+        // every pattern on this input is a modelled constraint, so the
+        // centralized walk refused anything outside them before this body ran.
+        // What is left is what the model cannot express: exactly one source must
+        // be named, the point-in-time members belong only to that source, a
+        // bundle the request names must be one this service publishes, the
+        // caller-sized tag list must be within its bound, the source must be a
+        // resource this account holds, and the new name must still be free. Each
+        // is checked BEFORE the first write, so a refused request creates
+        // nothing.
+        let source = requested_source(&input)?;
+        let requested_bundle = match input.relational_database_bundle_id.as_deref() {
+            Some(bundle_id) => Some(
+                crate::state::relational_database_bundle_spec(bundle_id).ok_or_else(|| {
+                    invalid(format!(
+                        "relationalDatabaseBundleId '{bundle_id}' is not a database bundle this \
+                         service offers; use GetRelationalDatabaseBundles to list the bundle IDs \
+                         you can specify ([{}])",
+                        crate::state::relational_database_bundle_ids(
+                            crate::state::RELATIONAL_DATABASE_BUNDLE_SPECS
+                        )
+                    ))
+                })?,
+            ),
+            None => None,
+        };
+
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+
+        let name = input.relational_database_name.clone();
+        // This input carries no window member at all, so a restored database
+        // gets the service's own defaults for its own name — the same ones
+        // `CreateRelationalDatabase` assigns a request that names none.
+        let (preferred_backup_window, preferred_maintenance_window) =
+            default_windows(&name).ok_or_else(|| {
+                fault("no backup and maintenance window pair could be assigned to the restored \
+                       database")
+            })?;
+        // "A value of true specifies a database that is available to resources
+        // outside of your Lightsail account": a database the request says
+        // nothing about is reachable only from the account's own resources, the
+        // narrower of the two the member describes.
+        let publicly_accessible = input.publicly_accessible.unwrap_or(false);
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A database name addresses one database, so restoring onto one this
+            // account already holds is refused rather than silently replacing a
+            // record that holds data.
+            if store.relational_database(&name).is_some() {
+                return Err(invalid(format!(
+                    "a relational database named '{name}' already exists"
+                )));
+            }
+            if store.relational_databases.len() >= crate::state::MAX_RELATIONAL_DATABASES {
+                return Err(invalid(format!(
+                    "restoring a relational database would take this account past the {} this \
+                     emulator holds",
+                    crate::state::MAX_RELATIONAL_DATABASES
+                )));
+            }
+
+            // Everything the restored database inherits is read out of the
+            // SNAPSHOT record, which captured it at the instant the snapshot was
+            // taken: nothing here follows the database the snapshot was taken
+            // of, which may have been resized or deleted since.
+            let snapshot_name = match &source {
+                RequestedSource::Snapshot(requested) => requested,
+                // A point-in-time restore replays the source database's
+                // AUTOMATED backups up to the instant asked for. This store
+                // holds none — a database reports no `latestRestorableTime`
+                // because no automated backup has been taken — so, once the
+                // source database is known to exist, there is no backup to
+                // restore from and the request is refused with the service's
+                // `DoesNotExist` envelope rather than answered with a database
+                // restored from nothing.
+                RequestedSource::PointInTime {
+                    database_name,
+                    time,
+                } => {
+                    store.relational_database(database_name).ok_or_else(|| {
+                        not_found(
+                            crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+                            database_name,
+                        )
+                    })?;
+                    return Err(crate::scaffolded::Scaffolded::does_not_exist(format!(
+                        "no automated backup of the {} {database_name} is available to restore \
+                         ({time}): this account has taken none",
+                        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE
+                    )));
+                }
+            };
+            let snapshot = store
+                .relational_database_snapshot(snapshot_name)
+                .ok_or_else(|| {
+                    not_found(
+                        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE_SNAPSHOT,
+                        snapshot_name,
+                    )
+                })?;
+            // A snapshot belongs to the Region it was taken in, and only that
+            // Region's Lightsail endpoint can restore it: moving one between
+            // Regions is what `CopySnapshot` is for.
+            if snapshot.location.region_name != region {
+                return Err(invalid(format!(
+                    "relationalDatabaseSnapshotName '{snapshot_name}' is a snapshot of region {}, \
+                     which cannot be restored into region {region}",
+                    snapshot.location.region_name
+                )));
+            }
+            // A snapshot still being taken holds no complete copy of the
+            // database, so there is nothing to restore from until the copy the
+            // clock owes it is done.
+            if snapshot.state != crate::state::RELATIONAL_DATABASE_SNAPSHOT_STATE_AVAILABLE {
+                return Err(invalid(format!(
+                    "relationalDatabaseSnapshotName '{snapshot_name}' is {}, and only a snapshot \
+                     that is {} can be restored",
+                    snapshot.state,
+                    crate::state::RELATIONAL_DATABASE_SNAPSHOT_STATE_AVAILABLE
+                )));
+            }
+            // The engine and version the restored database runs are the
+            // snapshotted database's own, resolved against the published
+            // blueprint catalog so every read reports the catalog's version
+            // rather than a copy that could drift from it.
+            let blueprint = crate::state::relational_database_blueprint(
+                &snapshot.from_relational_database_blueprint_id,
+            )
+            .ok_or_else(|| {
+                invalid(format!(
+                    "relationalDatabaseSnapshotName '{snapshot_name}' was taken of a database on \
+                     blueprint '{}', which this service no longer offers ([{}])",
+                    snapshot.from_relational_database_blueprint_id,
+                    crate::state::relational_database_blueprint_ids()
+                ))
+            })?;
+            let source_bundle = crate::state::relational_database_bundle_spec(
+                &snapshot.from_relational_database_bundle_id,
+            )
+            .ok_or_else(|| {
+                invalid(format!(
+                    "relationalDatabaseSnapshotName '{snapshot_name}' was taken of a database on \
+                     bundle '{}', which this service no longer offers ([{}])",
+                    snapshot.from_relational_database_bundle_id,
+                    crate::state::relational_database_bundle_ids(
+                        crate::state::RELATIONAL_DATABASE_BUNDLE_SPECS
+                    )
+                ))
+            })?;
+            // The credentials the snapshot captured: a restored database serves
+            // the same database name and is reached with the same master user as
+            // the database the copy was taken of.
+            let master_database_name = snapshot.master_database_name.clone();
+            let master_username = snapshot.master_username.clone();
+            let master_user_password = snapshot.master_user_password.clone();
+
+            // "When creating a new database from a snapshot, you cannot choose a
+            // bundle that is smaller than the bundle of the source database"; a
+            // request that names no bundle is restored onto the source's own
+            // plan, which is the largest one it can never be smaller than.
+            let bundle = match requested_bundle {
+                Some(bundle) => {
+                    if bundle.is_smaller_than(&source_bundle) {
+                        return Err(invalid(format!(
+                            "relationalDatabaseBundleId '{}' is smaller than bundle '{}' of the \
+                             database snapshot '{snapshot_name}' was taken of: a database \
+                             restored from a snapshot cannot be created on a smaller bundle",
+                            bundle.bundle_id, source_bundle.bundle_id
+                        )));
+                    }
+                    bundle
+                }
+                None => source_bundle,
+            };
+
+            // The zone the request named, or the one the service picks for it out
+            // of the Region's own zones; a high-availability bundle also places a
+            // standby, which is what `secondaryAvailabilityZone` reports.
+            let availability_zone = match input.availability_zone.clone() {
+                Some(zone) => zone,
+                None => crate::state::default_availability_zone(&name, &zones).ok_or_else(
+                    || {
+                        invalid(format!(
+                            "the Region '{region}' this request is signed for publishes no \
+                             Availability Zone a database can be restored into; name an \
+                             availabilityZone of one of [{}]",
+                            crate::state::region_names()
+                        ))
+                    },
+                )?,
+            };
+            let secondary_availability_zone = bundle
+                .is_high_availability()
+                .then(|| crate::state::secondary_availability_zone(&availability_zone, &zones))
+                .flatten();
+            let location = crate::state::StoredLocation::zonal(&availability_zone, &region);
+
+            let id = store.mint_uuid();
+            let host_label = store.mint_endpoint_host_label();
+            // A restored database is not serving yet: the clock owes it
+            // `available`, which is why a read straight after this call still
+            // reports `creating` — and no master endpoint — exactly as it does
+            // against AWS.
+            let due = crate::state::DueNamedState::after(
+                now,
+                crate::state::RELATIONAL_DATABASE_STATE_AVAILABLE,
+            );
+            store.insert_relational_database(crate::state::StoredRelationalDatabase {
+                name: name.clone(),
+                // The restored database is a resource of its own: its ARN,
+                // support code, creation time and endpoint are newly minted
+                // here, not the snapshotted database's.
+                arn: crate::state::relational_database_arn(&region, &id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags,
+                blueprint,
+                bundle,
+                master_database_name,
+                master_username,
+                master_user_password,
+                preferred_backup_window,
+                preferred_maintenance_window,
+                publicly_accessible,
+                // `UpdateRelationalDatabase$disableBackupRetention` exists to
+                // turn automated backup retention OFF, so a database is created
+                // with it on, however it was created.
+                backup_retention_enabled: true,
+                secondary_availability_zone,
+                endpoint_address: crate::state::relational_database_endpoint_address(
+                    &id,
+                    &host_label,
+                    &region,
+                ),
+                state: crate::state::RELATIONAL_DATABASE_STATE_CREATING,
+                due: Some(due),
+                // A restored database runs the engine's own defaults: a snapshot
+                // captures the database's data, and nothing has modified a
+                // parameter of THIS database, which is why it reports `in-sync`
+                // until `UpdateRelationalDatabaseParameters` sets one.
+                parameter_overrides: Default::default(),
+            });
+            // `operations` is a list because other Lightsail creates act on
+            // several resources at once; `CreateRelationalDatabaseFromSnapshot`
+            // creates exactly one database, so it answers exactly one entry,
+            // left non-terminal until the provisioning the clock owes the
+            // database is due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_FROM_SNAPSHOT,
+                crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+                &name,
+                &location,
+                Some(due.at_ms),
+            );
+            Ok(CreateRelationalDatabaseFromSnapshotOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The copy the request asked to restore: exactly one of the two mutually
+/// exclusive sources the modelled input admits, resolved against the store once
+/// the request is known to name one.
+enum RequestedSource {
+    /// A manual snapshot, named by `relationalDatabaseSnapshotName`.
+    Snapshot(String),
+    /// A point in time of `database_name`'s own AUTOMATED backups, addressed
+    /// either by the `restoreTime` the request carried or by the latest
+    /// restorable one — which `time` reports as the modelled
+    /// `useLatestRestorableTime` documentation words it.
+    PointInTime { database_name: String, time: String },
+}
+
+/// The source `input` names, or the refusal its combination of members earns.
+///
+/// The modelled documentation states each rule enforced here: `restoreTime`
+/// "Cannot be specified if the use latest restorable time parameter is true" and
+/// `useLatestRestorableTime` "Cannot be specified if the restore time parameter
+/// is provided"; both address a point in the restorable history of the database
+/// `sourceRelationalDatabaseName` names, which is a different source from the
+/// one `relationalDatabaseSnapshotName` names ("The name of the database
+/// snapshot from which to create your new database"). A restore of nothing is
+/// not a restore, so naming neither source is refused too.
+fn requested_source(
+    input: &CreateRelationalDatabaseFromSnapshotInput,
+) -> Result<RequestedSource, CreateRelationalDatabaseFromSnapshotError> {
+    let wants_latest = input.use_latest_restorable_time == Some(true);
+    if input.restore_time.is_some() && wants_latest {
+        return Err(invalid(
+            "restoreTime and useLatestRestorableTime are mutually exclusive: name the point in \
+             time to restore the database from, or ask for the latest restorable one, but not \
+             both"
+                .to_string(),
+        ));
+    }
+    match (
+        &input.relational_database_snapshot_name,
+        &input.source_relational_database_name,
+    ) {
+        (Some(snapshot_name), None) => {
+            if input.restore_time.is_some() || wants_latest {
+                return Err(invalid(
+                    "restoreTime and useLatestRestorableTime address a point in the restorable \
+                     history of the database sourceRelationalDatabaseName names, so neither is \
+                     defined together with relationalDatabaseSnapshotName, which names the \
+                     snapshot to restore"
+                        .to_string(),
+                ));
+            }
+            Ok(RequestedSource::Snapshot(snapshot_name.clone()))
+        }
+        (None, Some(database_name)) => match (&input.restore_time, wants_latest) {
+            (Some(restore_time), false) => Ok(RequestedSource::PointInTime {
+                database_name: database_name.clone(),
+                // The member is "Specified in the Unix time format", which is
+                // how the refusal names the instant back.
+                time: format!("restoreTime {}", restore_time.secs()),
+            }),
+            (None, true) => Ok(RequestedSource::PointInTime {
+                database_name: database_name.clone(),
+                time: "the latest restorable time".to_string(),
+            }),
+            _ => Err(invalid(
+                "sourceRelationalDatabaseName names the database to restore a point in time of, \
+                 so one of restoreTime or useLatestRestorableTime must be defined with it"
+                    .to_string(),
+            )),
+        },
+        (Some(_), Some(_)) => Err(invalid(
+            "relationalDatabaseSnapshotName and sourceRelationalDatabaseName are mutually \
+             exclusive: name the database snapshot to restore, or the database to restore a point \
+             in time of, but not both"
+                .to_string(),
+        )),
+        (None, None) => Err(invalid(
+            "one of relationalDatabaseSnapshotName or sourceRelationalDatabaseName must be \
+             defined: a database is restored from a snapshot of a database, or from a point in \
+             the restorable history of one"
+                .to_string(),
+        )),
+    }
+}
+
+/// The daily backup window and the weekly maintenance window a database
+/// restored under `name` is created with: the service's own defaults, chosen
+/// clear of one another because the two may not conflict (the modelled
+/// `preferredBackupWindow` documentation: "Must not conflict with the preferred
+/// maintenance window").
+///
+/// `None` only when no clear pair exists at all, which the 30-minute defaults
+/// over a 48-slot day always leave.
+fn default_windows(name: &str) -> Option<(String, String)> {
+    let backup = crate::state::default_preferred_backup_window(name, None)?;
+    let span = crate::state::parse_daily_window("preferredBackupWindow", &backup).ok()?;
+    let maintenance = crate::state::default_preferred_maintenance_window(name, span)?;
+    Some((backup, maintenance))
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateRelationalDatabaseFromSnapshotError {
+    CreateRelationalDatabaseFromSnapshotErrorModeled::InvalidInputException(
+        InvalidInputException {
+            message: Some(message),
+            ..Default::default()
+        },
+    )
+    .into()
+}
+
+/// The source the request named is not a resource this account holds:
+/// Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message naming the
+/// resource type and the requested name.
+fn not_found(resource_type: &str, name: &str) -> CreateRelationalDatabaseFromSnapshotError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// A modelled server fault, for a step of this handler that cannot be completed
+/// at all.
+fn fault(message: &str) -> CreateRelationalDatabaseFromSnapshotError {
+    CreateRelationalDatabaseFromSnapshotErrorModeled::ServiceException(ServiceException {
+        message: Some(message.to_string()),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateRelationalDatabaseFromSnapshotError {
+    fault("the Lightsail relational database store is unavailable")
 }

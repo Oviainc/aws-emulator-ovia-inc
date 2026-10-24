@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members a request supplies to a stored cluster, which a later
+//! `DescribeCluster` observes, while that cluster's `ClusterState` is still
+//! `AwaitingQuorum`. A member the request omits is left as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +165,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCluster"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        let mut store = state.lock();
+
+        // An update that names a resource is built from that resource, exactly as the
+        // create is: an id no stored address answers to names none. A forwarding address
+        // is an address too, so the same rule holds for it. The answer is taken here,
+        // before the cluster is borrowed to write, so the cluster is looked up exactly
+        // once below and the write cannot be skipped.
+        let unknown_address: Option<String> = [
+            input.address_id.as_deref(),
+            input.forwarding_address_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|address_id| !store.addresses.contains_key(*address_id))
+        .map(str::to_string);
+
+        let Some(cluster) = store.clusters.get_mut(&input.cluster_id) else {
+            return Err(UpdateClusterErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The cluster ID {} can't be found. Check the information you provided \
+                         in your last request, and try again.",
+                        input.cluster_id
+                    )),
+                    resource_type: Some("cluster".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "While a cluster's ClusterState value is in the AwaitingQuorum state, you can
+        // update some of the information associated with a cluster. Once the cluster
+        // changes to a different job state … this action is no longer available": from any
+        // other state the cluster's current state does not allow the action.
+        if !cluster.cluster_state.is_updatable() {
+            return Err(UpdateClusterErrorModeled::InvalidJobStateException(
+                InvalidJobStateException {
+                    message: Some(format!(
+                        "The cluster {} is in state {} and can't be updated. A cluster's \
+                         information can only be updated while its ClusterState value is \
+                         AwaitingQuorum.",
+                        cluster.cluster_id,
+                        cluster.cluster_state.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if let Some(address_id) = unknown_address {
+            return Err(UpdateClusterErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The address ID {address_id} can't be found. Check the information \
+                         you provided in your last request, and try again."
+                    )),
+                    resource_type: Some("address".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The cluster is the only record this operation writes. A node job created for the
+        // cluster inherits the cluster's attributes at the instant it is created
+        // (`CreateJobRequest$ClusterId`), so a node created after this update carries the
+        // updated values while one created before it keeps what it inherited, which is
+        // what `UpdateJob` is for.
+        apply_update(cluster, &input);
+
+        Ok(UpdateClusterOutput {})
+    }
+}
+
+/// Apply the members this request supplied to `cluster`, leaving every member it omitted
+/// as it was.
+///
+/// `UpdateClusterRequest` models no member that clears a stored value — `Description` is
+/// modelled `length 1..1024`, so not even an empty string reaches a handler — so an absent
+/// member means "leave this as it is", which is what makes an update partial. Every member
+/// the request models is applied; nothing else about the cluster (its id, its job type, its
+/// device type, its state, the instant it was created, the key it was created with, the
+/// node jobs it holds) is something this operation takes.
+fn apply_update(cluster: &mut crate::state::StoredCluster, input: &UpdateClusterInput) {
+    if let Some(address_id) = &input.address_id {
+        cluster.address_id = address_id.clone();
+    }
+    if let Some(forwarding_address_id) = &input.forwarding_address_id {
+        cluster.forwarding_address_id = Some(forwarding_address_id.clone());
+    }
+    if let Some(description) = &input.description {
+        cluster.description = Some(description.clone());
+    }
+    if let Some(role_arn) = &input.role_arn {
+        cluster.role_arn = Some(role_arn.clone());
+    }
+    if let Some(shipping_option) = &input.shipping_option {
+        cluster.shipping_option = shipping_option.clone();
+    }
+    if let Some(notification) = &input.notification {
+        cluster.notification = Some(notification.clone());
+    }
+    if let Some(resources) = &input.resources {
+        cluster.resources = Some(resources.clone());
+    }
+    if let Some(configuration) = &input.on_device_service_configuration {
+        cluster.on_device_service_configuration = Some(configuration.clone());
     }
 }

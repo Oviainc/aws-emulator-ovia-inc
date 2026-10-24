@@ -56,13 +56,18 @@ struct NotFoundCase {
 
 /// Every implemented operation that resolves one of this service's resources by id.
 ///
-/// The remaining ones (`UpdateWorkloadEstimate`, `GetBillEstimate`, the commitment
-/// batches, …) are still scaffold stubs answering HTTP 501, so they have no not-found to
-/// frame yet; `DeleteWorkloadEstimate`/`DeleteBillScenario` model no not-found at all (an
-/// absent resource is already in the state the call asks for).
+/// The remaining ones (`GetBillEstimate`, the commitment batches, …) are still scaffold
+/// stubs answering HTTP 501, so they have no not-found to frame yet;
+/// `DeleteWorkloadEstimate`/`DeleteBillScenario` model no not-found at all (an absent
+/// resource is already in the state the call asks for).
 const CASES: &[NotFoundCase] = &[
     NotFoundCase {
         operation: "GetWorkloadEstimate",
+        resource_type: state::WORKLOAD_ESTIMATE_RESOURCE_TYPE,
+        message: WORKLOAD_ESTIMATE_NOT_FOUND,
+    },
+    NotFoundCase {
+        operation: "UpdateWorkloadEstimate",
         resource_type: state::WORKLOAD_ESTIMATE_RESOURCE_TYPE,
         message: WORKLOAD_ESTIMATE_NOT_FOUND,
     },
@@ -105,6 +110,9 @@ fn request_for(operation: &str, id: &str) -> Value {
     });
     match operation {
         "GetWorkloadEstimate" | "GetBillScenario" => json!({ "identifier": id }),
+        // The rename a later suite exercises; here it is only the unresolvable id that
+        // must refuse the call.
+        "UpdateWorkloadEstimate" => json!({ "identifier": id, "name": "renamed" }),
         "ListWorkloadEstimateUsage" => json!({ "workloadEstimateId": id }),
         "ListBillScenarioUsageModifications" => json!({ "billScenarioId": id }),
         "BatchCreateWorkloadEstimateUsage" => {
