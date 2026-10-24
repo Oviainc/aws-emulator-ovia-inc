@@ -138,11 +138,7 @@ async fn tag_resource(
 }
 
 /// `UntagResource`: remove `keys` from the resource `resource_arn` names.
-async fn untag_resource(
-    router: &MultiServiceRouter,
-    resource_arn: &str,
-    keys: &[&str],
-) -> Reply {
+async fn untag_resource(router: &MultiServiceRouter, resource_arn: &str, keys: &[&str]) -> Reply {
     let query = keys
         .iter()
         .map(|key| format!("tagKeys={}", percent_encoded(key)))

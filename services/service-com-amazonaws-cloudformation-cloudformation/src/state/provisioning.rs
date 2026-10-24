@@ -103,8 +103,9 @@
 //!
 //! For a type whose owning service ASSIGNS the resource's identity it is the other way
 //! round ([`super::template::identity_is_service_assigned`]): FIS mints an experiment
-//! template's id and AWS WAF Classic answers `CreateIPSet` with an `IPSetId` of its own, and
-//! "Ref returns the IPSet ID" — so the id a stack's `Ref`, its `Outputs` and its
+//! template's id, AWS WAF Classic answers `CreateIPSet` with an `IPSetId` of its own and
+//! "Ref returns the IPSet ID", and Amazon EMR answers `RunJobFlow` with the `j-` job-flow id
+//! an `AWS::EMR::Cluster`'s `Ref` returns — so the id a stack's `Ref`, its `Outputs` and its
 //! per-resource reads report is the one that service answered, and the name CloudFormation
 //! computed is only what the create asked for. [`reconcile`] adopts that id ([`Created`])
 //! and the `Id`/`<Type>Id` attributes are re-pointed at it
@@ -438,6 +439,12 @@ fn carry_forward(existing: &StoredResource, resource: &mut StoredResource) {
     for (name, value) in &existing.attributes {
         resource.attributes.insert(name.clone(), value.clone());
     }
+    // The identifier the resource really has. For a type whose physical id CloudFormation
+    // decides, the two are already equal ([`is_same_resource`] compared them); for one its
+    // owning service ASSIGNED, this is the only place the minted identifier comes from, so
+    // a re-deploy keeps reporting the `j-` job-flow id EMR gave the cluster rather than the
+    // name CloudFormation computed for the record.
+    resource.physical_resource_id = existing.physical_resource_id.clone();
     // The properties the resource really has are the ones it was created with. For a
     // resource this deployment keeps unchanged they are the same document; where they
     // differ, this is what keeps the stack from recording a configuration nothing applied.
