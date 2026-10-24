@@ -4,7 +4,7 @@
 //!
 //! The campaign store is the single source of truth for the campaign lifecycle:
 //! `CreateCampaign` writes a record here, `DescribeCampaign` / `ListCampaigns` /
-//! `GetCampaignState` project it, `Start`/`Pause`/`StopCampaign` move its
+//! `GetCampaignState` project it, `Start`/`Pause`/`Resume`/`StopCampaign` move its
 //! [`CampaignState`], and `DeleteCampaign` removes it. No handler keeps a copy of
 //! its own, so every response describes what the store holds.
 //!
@@ -186,15 +186,17 @@ impl CampaignState {
     /// `InvalidCampaignStateException`).
     ///
     /// Start runs a campaign that is not running yet; Pause suspends a running
-    /// one; Stop ends one that has not finished. Nothing moves out of a terminal
-    /// state (`Completed`, `Failed`), and no action is a no-op: repeating one is
-    /// refused rather than silently accepted.
+    /// one; Resume puts a suspended one back to work, so it is legal from `Paused`
+    /// and from nowhere else; Stop ends one that has not finished. Nothing moves
+    /// out of a terminal state (`Completed`, `Failed`), and no action is a no-op:
+    /// repeating one is refused rather than silently accepted.
     pub fn after(self, action: CampaignAction) -> Option<Self> {
         match (self, action) {
             (Self::Initialized | Self::Paused | Self::Stopped, CampaignAction::Start) => {
                 Some(Self::Running)
             }
             (Self::Running, CampaignAction::Pause) => Some(Self::Paused),
+            (Self::Paused, CampaignAction::Resume) => Some(Self::Running),
             (Self::Initialized | Self::Running | Self::Paused, CampaignAction::Stop) => {
                 Some(Self::Stopped)
             }
@@ -221,12 +223,13 @@ impl CampaignState {
     }
 }
 
-/// A lifecycle action a `StartCampaign` / `PauseCampaign` / `StopCampaign` call
-/// asks for, as [`CampaignState::after`] reads it.
+/// A lifecycle action a `StartCampaign` / `PauseCampaign` / `ResumeCampaign` /
+/// `StopCampaign` call asks for, as [`CampaignState::after`] reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CampaignAction {
     Start,
     Pause,
+    Resume,
     Stop,
 }
 
@@ -237,6 +240,7 @@ impl CampaignAction {
         match self {
             Self::Start => "started",
             Self::Pause => "paused",
+            Self::Resume => "resumed",
             Self::Stop => "stopped",
         }
     }

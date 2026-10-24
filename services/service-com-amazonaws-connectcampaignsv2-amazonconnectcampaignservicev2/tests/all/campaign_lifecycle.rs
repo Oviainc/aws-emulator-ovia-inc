@@ -222,6 +222,16 @@ fn the_transition_table_moves_only_on_a_legal_action() {
         (CampaignState::Stopped, CampaignAction::Stop, None),
         (CampaignState::Completed, CampaignAction::Stop, None),
         (CampaignState::Failed, CampaignAction::Stop, None),
+        (
+            CampaignState::Paused,
+            CampaignAction::Resume,
+            Some(CampaignState::Running),
+        ),
+        (CampaignState::Initialized, CampaignAction::Resume, None),
+        (CampaignState::Running, CampaignAction::Resume, None),
+        (CampaignState::Stopped, CampaignAction::Resume, None),
+        (CampaignState::Completed, CampaignAction::Resume, None),
+        (CampaignState::Failed, CampaignAction::Resume, None),
     ];
 
     for (from, action, expected) in cases {

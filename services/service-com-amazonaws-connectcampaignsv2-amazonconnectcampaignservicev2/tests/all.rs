@@ -21,6 +21,8 @@ mod campaign_flow_association;
 mod campaign_lifecycle;
 #[path = "all/campaign_not_found_message.rs"]
 mod campaign_not_found_message;
+#[path = "all/campaign_resume.rs"]
+mod campaign_resume;
 #[path = "all/common.rs"]
 mod common;
 #[path = "all/instance_onboarding.rs"]
