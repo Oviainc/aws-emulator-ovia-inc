@@ -8,11 +8,12 @@
 //! change is asynchronous work, so the record moves into the transient
 //! `UPDATING` status and the clock owes it the settled `ACTIVE` one — a caller
 //! polling `DescribeFHIRDatastore` observes the transition the same way it does
-//! after a create or a delete. A data store no record holds — and one whose
-//! record has reached the terminal `DELETED` — is a
-//! `ResourceNotFoundException`; one in a lifecycle transition (`CREATING`,
-//! `UPDATING`, `DELETING`) is refused with the modelled `ConflictException`
-//! rather than mutated.
+//! after a create or a delete. Only a data store whose status is `ACTIVE` takes
+//! the change: a record in any other status — a lifecycle transition
+//! (`CREATING`, `UPDATING`, `DELETING`) or the terminal `DELETED` — is refused
+//! with the modelled `AccessDeniedException` rather than mutated, and
+//! `ResourceNotFoundException` is reserved for a `DatastoreId` this service
+//! holds no record of at all.
 //!
 //! ## Shape of an operation
 //!
@@ -189,45 +190,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A mutation is only accepted by a data store that is ACTIVE, and what
-        // any other status answers is decided by the resource's STATE — never by
-        // `AccessDeniedException`, which this service reserves for an
-        // authorization failure. The gate comes BEFORE any write, so a refused
-        // call leaves the record exactly as it was. This is the same
-        // classification `DeleteFHIRDatastore` applies, so the two mutations of
-        // one record cannot disagree about what its status means.
-        match datastore.status {
-            crate::state::DatastoreStatus::Active => {}
-            // `ConflictException` is modelled as "the data store is in a
-            // transition state and the user requested action cannot be
-            // performed" — which is exactly `CREATING`, `UPDATING` and
-            // `DELETING`. A data store that is still applying an earlier
-            // configuration change is in a transition like any other, so a
-            // second update is refused rather than racing the first.
-            crate::state::DatastoreStatus::Creating
-            | crate::state::DatastoreStatus::Updating
-            | crate::state::DatastoreStatus::Deleting => {
-                return Err(UpdateFHIRDatastoreErrorModeled::ConflictException(
-                    ConflictException {
-                        message: Some(crate::state::datastore_in_transition_message(
-                            datastore.status,
-                            crate::state::DatastoreAction::Update,
-                        )),
-                    },
-                )
-                .into());
-            }
-            // A deleted data store is not in transition — it is gone, so there
-            // is nothing left to update even while the terminal record stays
-            // readable for its retention.
-            crate::state::DatastoreStatus::Deleted => {
-                return Err(UpdateFHIRDatastoreErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
-                    },
-                )
-                .into());
-            }
+        // This operation accepts the change only from a data store that is
+        // ACTIVE, and it draws ONE line: the record either is ACTIVE or it is
+        // not. Every other status — the lifecycle transitions `CREATING`,
+        // `UPDATING` and `DELETING`, and the terminal `DELETED` — takes the
+        // same refusal, so the answer does not depend on which stage of the
+        // lifecycle the record sits at, and the sentence beside it states only
+        // that the data store is not active. The record is still there and
+        // still reported by `DescribeFHIRDatastore`, so this is NOT a not-found:
+        // `ResourceNotFoundException` stays for a `DatastoreId` the registry
+        // holds no record of, which the lookup above already answered. The gate
+        // comes BEFORE any write, so a refused call leaves the record — and the
+        // transition it was already on — exactly as it was.
+        if datastore.status != crate::state::DatastoreStatus::Active {
+            return Err(UpdateFHIRDatastoreErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::DATASTORE_NOT_ACTIVE_MESSAGE.to_string()),
+                },
+            )
+            .into());
         }
 
         // A partial update: every member besides the id is optional, and one the
