@@ -5,16 +5,16 @@
 //!
 //! The RULE every test here asserts: a create refuses, with the modelled
 //! `CreationLimitExceededException`, a set of notifications or subscribers larger than
-//! the budget it would create can hold — the documented five notifications a single
-//! create attaches, and per notification one SNS and ten email subscribers — and a
-//! refused create stores nothing at all, while a set within every limit is accepted and
-//! reads back whole.
+//! the budget it would create can hold — the documented ten notifications a budget can
+//! hold, and per notification one SNS and ten email subscribers — and a refused create
+//! stores nothing at all, while a set within every limit is accepted and reads back
+//! whole. The notification capacity belongs to the BUDGET, not to the call, so a batch
+//! create and the same notifications appended one at a time are accepted alike.
 //!
-//! The modelled list bounds (`@length(0, 10)` on `NotificationWithSubscribersList`,
-//! `@length(1, 11)` on `Subscribers`) are wider than those limits, so the tables below
-//! span both: a size the model rejects at the boundary is a `ValidationException`, a
-//! size it accepts but the service cannot hold is the modelled limit error, and the
-//! sizes on and under each limit are accepted.
+//! The modelled `@length(1, 11)` on `Subscribers` is wider than the per-type subscriber
+//! limits, so the subscriber table spans both: a size the model rejects at the boundary
+//! is a `ValidationException`, a size it accepts but the service cannot hold is the
+//! modelled limit error, and the sizes on and under each limit are accepted.
 //!
 //! Each table's rows differ along the count, the subscription type and the position of
 //! the offending notification inside the batch; the harness (`router`, `call`,
@@ -27,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The limits are the crate's own model-derived constants, so a table built from them
 /// cannot drift from the handler it checks.
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
-    MAX_EMAIL_SUBSCRIBERS_PER_NOTIFICATION, MAX_NOTIFICATIONS_PER_CREATE,
+    MAX_EMAIL_SUBSCRIBERS_PER_NOTIFICATION, MAX_NOTIFICATIONS_PER_BUDGET,
     MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION,
 };
 
@@ -110,6 +110,27 @@ async fn create(
     .await
 }
 
+/// Append `index`'s notification to an existing budget through `CreateNotification`,
+/// with the one email subscriber the batch form attaches.
+async fn append(
+    router: &MultiServiceRouter,
+    account_id: &str,
+    name: &str,
+    index: usize,
+) -> (u16, Value) {
+    call(
+        router,
+        "CreateNotification",
+        &json!({
+            "AccountId": account_id,
+            "BudgetName": name,
+            "Notification": notification(index),
+            "Subscribers": email_subscribers(1)
+        }),
+    )
+    .await
+}
+
 /// Assert that `case`'s refused create left NO budget behind: a budget the service
 /// cannot hold is not created with the part of the request it could hold.
 async fn assert_nothing_stored(
@@ -153,32 +174,31 @@ async fn reported_notifications(
     body["Notifications"].as_array().cloned().unwrap_or_default()
 }
 
-/// RULE: a single create attaches at most the documented number of notifications — a
-/// set of that size or smaller is accepted and reads back in order, a larger set the
-/// model still deserialises is refused with `CreationLimitExceededException`, and a set
-/// past the modelled list bound is refused at request validation.
+/// RULE: a create attaches any number of notifications the budget it creates can hold —
+/// up to the ten a budget's capacity allows, which is also the modelled list bound — so
+/// every such set is accepted and reads back in order, and only a list past the modelled
+/// bound is refused, at request validation.
 ///
-/// The rows are the counts around both bounds: none, one, the limit, one past it, and
-/// the modelled maximum and one past that.
+/// The rows are the counts across the whole admissible range: none, one, half the
+/// capacity, one under it, the capacity itself, and one past the modelled bound.
 #[tokio::test]
-async fn a_create_attaches_at_most_the_documented_number_of_notifications() {
+async fn a_create_attaches_as_many_notifications_as_the_budget_can_hold() {
     let router = router();
-    // `NotificationWithSubscribersList` is modelled @length(0, 10).
+    // `NotificationWithSubscribersList` is modelled @length(0, 10) — the same ten
+    // `Notification`'s doc gives as a budget's capacity, so the wire bound and the
+    // capacity coincide and the table is built from one figure.
     const MODELLED_MAX: usize = 10;
+    assert_eq!(
+        MAX_NOTIFICATIONS_PER_BUDGET, MODELLED_MAX,
+        "case \"the modelled list bound and a budget's capacity\": expected both to be \
+         {MODELLED_MAX}, got {MAX_NOTIFICATIONS_PER_BUDGET}"
+    );
     let rows: Vec<(usize, Option<&str>)> = vec![
         (0, None),
         (1, None),
-        (MAX_NOTIFICATIONS_PER_CREATE - 1, None),
-        (MAX_NOTIFICATIONS_PER_CREATE, None),
-        (
-            MAX_NOTIFICATIONS_PER_CREATE + 1,
-            Some("CreationLimitExceededException"),
-        ),
-        (
-            MAX_NOTIFICATIONS_PER_CREATE + 2,
-            Some("CreationLimitExceededException"),
-        ),
-        (MODELLED_MAX, Some("CreationLimitExceededException")),
+        (MAX_NOTIFICATIONS_PER_BUDGET / 2, None),
+        (MAX_NOTIFICATIONS_PER_BUDGET - 1, None),
+        (MAX_NOTIFICATIONS_PER_BUDGET, None),
         (MODELLED_MAX + 1, Some("ValidationException")),
     ];
 
@@ -229,6 +249,77 @@ async fn a_create_attaches_at_most_the_documented_number_of_notifications() {
                 );
                 assert_nothing_stored(&router, &case, &account_id, name).await;
             }
+        }
+    }
+}
+
+/// RULE: the notification capacity belongs to the BUDGET, not to the call that attaches
+/// them, so the same end state is reachable however the notifications arrive: a create
+/// carrying some of them and `CreateNotification` appending the rest both answer 200 up
+/// to the capacity, the budget reads back every one of them in arrival order, and only
+/// the notification past the capacity is refused with
+/// `CreationLimitExceededException`.
+///
+/// The rows are every split of the capacity between the batch form and the incremental
+/// form, from all-appended to all-batched.
+#[tokio::test]
+async fn the_notification_capacity_is_the_same_batched_or_appended() {
+    let router = router();
+    for batched in 0..=MAX_NOTIFICATIONS_PER_BUDGET {
+        let appended = MAX_NOTIFICATIONS_PER_BUDGET - batched;
+        let case = format!("{batched} batched, {appended} appended");
+        // One account per row, so no row can see another's budget.
+        let account_id = account(640_000_000 + batched as u64);
+        let name = "capacity-splits";
+        let (status, body) = create(
+            &router,
+            &account_id,
+            name,
+            &notifications_with_subscribers(batched),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the batch create to answer 200, got {status} {body}"
+        );
+        for index in batched..MAX_NOTIFICATIONS_PER_BUDGET {
+            let (status, body) = append(&router, &account_id, name, index).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected notification {index} to append with 200, \
+                 got {status} {body}"
+            );
+        }
+
+        // One past the capacity, whichever way the budget reached it.
+        let (status, body) = append(&router, &account_id, name, MAX_NOTIFICATIONS_PER_BUDGET).await;
+        assert_eq!(
+            status, REFUSAL_STATUS,
+            "case {case:?}: expected the notification past the capacity of \
+             {MAX_NOTIFICATIONS_PER_BUDGET} to be refused at {REFUSAL_STATUS}, \
+             got {status} {body}"
+        );
+        assert!(
+            is_error(&body, "CreationLimitExceededException"),
+            "case {case:?}: expected CreationLimitExceededException past the capacity, \
+             got {body}"
+        );
+
+        let reported = reported_notifications(&router, &account_id, name).await;
+        assert_eq!(
+            reported.len(),
+            MAX_NOTIFICATIONS_PER_BUDGET,
+            "case {case:?}: expected {MAX_NOTIFICATIONS_PER_BUDGET} notifications to read \
+             back, got {reported:?}"
+        );
+        for (index, held) in reported.iter().enumerate() {
+            let expected = notification(index)["Threshold"].clone();
+            let actual = held.get("Threshold").cloned().unwrap_or(Value::Null);
+            assert!(
+                same(&expected, &actual),
+                "case {case:?}: notification {index} expected Threshold {expected}, \
+                 got {actual}"
+            );
         }
     }
 }

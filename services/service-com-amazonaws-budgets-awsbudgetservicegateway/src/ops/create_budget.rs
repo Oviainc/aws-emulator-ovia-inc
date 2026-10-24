@@ -199,12 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // "A budget can have up to five notifications, and each notification can have
+        // "A budget can have up to ten notifications, and each notification can have
         // one SNS subscriber and up to 10 email subscribers" — the capacity limits of
-        // the notifications this call attaches, which the modelled list bounds
-        // (`@length(0, 10)` on the list, `@length(1, 11)` on `Subscribers`) are too wide
-        // to express. A budget this call cannot hold is not created at all, so the whole
-        // request is refused before anything is stored.
+        // the BUDGET this call creates, which the modelled `@length(1, 11)` on
+        // `Subscribers` is too wide to express per subscription type (the ten-per-budget
+        // ceiling is also the modelled `@length(0, 10)` of the list, so a longer list is
+        // already refused at request validation). A budget this call cannot hold is not
+        // created at all, so the whole request is refused before anything is stored.
         crate::state::notification_set_limit_violation(
             // A create starts the budget empty, so the set it attaches is everything
             // the budget will hold.

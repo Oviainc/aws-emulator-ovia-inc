@@ -815,9 +815,13 @@ pub fn same_subscriber(left: &Subscriber, right: &Subscriber) -> bool {
     left.subscription_type == right.subscription_type && left.address == right.address
 }
 
-/// "A budget can have up to ten notifications" (`Notification`). `CreateNotification`
-/// answers `CreationLimitExceededException` ("You've exceeded the notification or
-/// subscriber limit") once a budget already holds this many.
+/// "A budget can have up to ten notifications" (`Notification`), which is also the
+/// modelled `@length(max: 10)` of `NotificationWithSubscribersList` — the list a single
+/// `CreateBudget` attaches. It is a capacity of the BUDGET, so it is the same ceiling
+/// however the notifications arrive: `CreateNotification` answers
+/// `CreationLimitExceededException` ("You've exceeded the notification or subscriber
+/// limit") once a budget already holds this many, and `CreateBudget` answers it for a
+/// set that would put the budget it creates over it.
 pub const MAX_NOTIFICATIONS_PER_BUDGET: usize = 10;
 
 /// "Each notification must have at least one subscriber. A notification can have one
@@ -887,33 +891,29 @@ pub fn subscriber_limit_violation<'a>(
     Ok(())
 }
 
-/// "A budget can have up to five notifications, and each notification can have one SNS
-/// subscriber and up to 10 email subscribers"
-/// (`CreateBudgetRequest$NotificationsWithSubscribers`) — the limit on the notifications
-/// a SINGLE create attaches to the budget it creates, which is tighter than the
-/// [`MAX_NOTIFICATIONS_PER_BUDGET`] a budget reaches by growing one notification at a
-/// time. The modelled `@length(max: 10)` on `NotificationWithSubscribersList` is the
-/// wire bound only, so a list between these two sizes deserialises and is refused here.
-pub const MAX_NOTIFICATIONS_PER_CREATE: usize = 5;
-
 /// The notification and subscriber limits over the set of notifications ONE call would
 /// attach to a budget that already holds `already_held` of them.
 ///
+/// A notification's capacity belongs to the BUDGET, not to the call that attaches it:
+/// the only ceiling is [`MAX_NOTIFICATIONS_PER_BUDGET`] over what the budget ends up
+/// holding, so a set attached in one batch and the same set appended one at a time reach
+/// the same end state and are accepted alike.
+///
 /// `Err` carries the sentence that goes in `CreationLimitExceededException$Message`; `Ok`
-/// means the call stays within [`MAX_NOTIFICATIONS_PER_CREATE`], within
-/// [`MAX_NOTIFICATIONS_PER_BUDGET`] once the set is attached, and within both per-type
-/// halves of [`subscriber_limit_violation`] for every notification in it.
+/// means the call stays within [`MAX_NOTIFICATIONS_PER_BUDGET`] once the set is attached,
+/// and within both per-type halves of [`subscriber_limit_violation`] for every
+/// notification in it.
+///
+/// The count branch is defence in depth and NO request reaches it today: its only caller
+/// creates a budget (so `already_held` is 0) and a longer list than the capacity is
+/// already refused as a request-validation failure by the modelled `@length(0, 10)` of
+/// `NotificationWithSubscribersList`, which happens to be the same ten. It stays because
+/// the capacity is the rule, not the wire bound: a caller that attaches to a budget that
+/// already holds notifications is checked against what the budget would end up with.
 pub fn notification_set_limit_violation(
     already_held: usize,
     attaching: &[NotificationWithSubscribers],
 ) -> Result<(), String> {
-    if attaching.len() > MAX_NOTIFICATIONS_PER_CREATE {
-        return Err(format!(
-            "Unable to create budget: a budget can have at most {MAX_NOTIFICATIONS_PER_CREATE} \
-             notifications, and {} were supplied.",
-            attaching.len()
-        ));
-    }
     if already_held + attaching.len() > MAX_NOTIFICATIONS_PER_BUDGET {
         return Err(format!(
             "Unable to create budget: a budget can have at most {MAX_NOTIFICATIONS_PER_BUDGET} \

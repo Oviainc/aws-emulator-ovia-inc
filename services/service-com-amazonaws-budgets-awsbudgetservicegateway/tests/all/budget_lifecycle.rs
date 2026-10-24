@@ -717,8 +717,9 @@ async fn notifications_paginate_by_max_results() {
     };
     let subscribers =
         |i: u32| json!([{"SubscriptionType": "EMAIL", "Address": format!("n{i}@example.com")}]);
-    // A budget holds up to ten notifications, but a single CreateBudget attaches at most
-    // five of them, so the rest are added one at a time through CreateNotification.
+    // A budget holds up to ten notifications however they arrive, so this budget reaches
+    // ten with five attached by CreateBudget and five added one at a time through
+    // CreateNotification.
     let attached: Vec<Value> = (0..5)
         .map(|i| json!({"Notification": notification(i), "Subscribers": subscribers(i)}))
         .collect();
