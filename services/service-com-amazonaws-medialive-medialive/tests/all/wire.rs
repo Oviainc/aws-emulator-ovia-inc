@@ -83,8 +83,8 @@ pub async fn call_in_region(
 /// Dispatch one request signed for `region` and read back its status, its JSON body
 /// AND its response headers, for a suite whose rule is about a header.
 ///
-/// The one place a request is built and dispatched in this crate: [`call_in_region`]
-/// is this function with the headers dropped, so a suite that reads a header cannot
+/// [`call_in_region`] is this function with the headers dropped, and this one is
+/// [`call_raw`] with the body parsed as JSON, so a suite that reads a header cannot
 /// drift from how every other suite reaches the emulator.
 pub async fn call_with_headers(
     router: &MultiServiceRouter,
@@ -93,17 +93,46 @@ pub async fn call_with_headers(
     uri: &str,
     body: Option<Value>,
 ) -> (u16, Value, Vec<(String, String)>) {
+    let (status, bytes, headers) = call_raw(router, region, method, uri, body, &[]).await;
+    let parsed = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, parsed, headers)
+}
+
+/// Dispatch one request signed for `region`, carrying `request_headers` beside the
+/// ones every call sends, and read back its status, its RAW response body and its
+/// response headers — for a suite whose rule is about a BINARY payload or about a
+/// request header (the thumbnail read, whose response body is an image and whose
+/// `Accept` says which media type it asks for).
+///
+/// The one place a request is built and dispatched in this crate:
+/// [`call_with_headers`] is this function with the body parsed as JSON, so a suite
+/// that reads raw bytes cannot drift from how every other suite reaches the
+/// emulator.
+pub async fn call_raw(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    request_headers: &[(&str, &str)],
+) -> (u16, Vec<u8>, Vec<(String, String)>) {
     let payload = body.map_or_else(Bytes::new, |value| {
         Bytes::from(serde_json::to_vec(&value).expect("serialize the request body"))
     });
-    let request = http::Request::builder()
+    let mut builder = http::Request::builder()
         .method(method)
         .uri(uri)
         .header("host", format!("medialive.{region}.amazonaws.com"))
         .header("authorization", authorization(region))
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build the request");
+        .header("content-type", "application/json");
+    for (name, value) in request_headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(payload).expect("build the request");
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
@@ -117,13 +146,7 @@ pub async fn call_with_headers(
             )
         })
         .collect();
-    let bytes = response.into_body();
-    let parsed = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, parsed, headers)
+    (status, response.into_body().to_vec(), headers)
 }
 
 /// One response header, read as a client reads it (header names are
