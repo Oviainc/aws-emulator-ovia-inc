@@ -282,28 +282,216 @@ impl ResourcePolicy {
 
     /// The JSON-formatted resource-based policy document, as every operation that
     /// returns `policy` reports it: one `Allow` statement per stored action group,
-    /// naming the principals that hold it, the actions the action group grants and
-    /// `resource_arn` — the profiling group's own stored ARN.
+    /// carrying that action group's statement id ([`action_group_statement_id`]), the
+    /// principals that hold it, the actions the action group grants and `resource_arn` —
+    /// the profiling group's own stored ARN.
+    ///
+    /// The document is an IAM policy document, so it is written the way an IAM policy
+    /// document is written: a single principal is the ARN itself rather than a
+    /// one-element list (both forms are accepted by a policy reader, and the single-ARN
+    /// grant is reported in the scalar form), and the whole document is laid out by
+    /// [`PolicyDocumentFormatter`]. The member ORDER is fixed by the structures below
+    /// rather than by a `serde_json::Map`, whose iteration order depends on whether
+    /// something in the build enabled the crate's `preserve_order` feature.
     pub fn document(&self, resource_arn: &str) -> String {
-        let statements: Vec<::serde_json::Value> = self
-            .statements
-            .iter()
-            .map(|(action_group, principals)| {
-                ::serde_json::json!({
-                    "Sid": action_group,
-                    "Effect": "Allow",
-                    "Principal": { "AWS": principals },
-                    "Action": action_group_actions(action_group),
-                    "Resource": resource_arn,
+        let document = PolicyDocumentWire {
+            version: POLICY_VERSION,
+            statement: self
+                .statements
+                .iter()
+                .map(|(action_group, principals)| PolicyStatementWire {
+                    sid: action_group_statement_id(action_group),
+                    effect: POLICY_EFFECT_ALLOW,
+                    principal: PolicyPrincipalWire {
+                        aws: PolicyPrincipalsWire::of(principals),
+                    },
+                    action: action_group_actions(action_group),
+                    resource: resource_arn,
                 })
-            })
-            .collect();
-        ::serde_json::json!({
-            "Version": POLICY_VERSION,
-            "Statement": statements,
-        })
-        .to_string()
+                .collect(),
+        };
+        render_policy_document(&document)
     }
+}
+
+/// The `Effect` a stored grant carries: a resource-based policy holds the grants that
+/// were made, so every statement it renders allows them.
+const POLICY_EFFECT_ALLOW: &str = "Allow";
+
+/// The suffix a policy statement's `Sid` carries past the action group it states: the
+/// statement id of an action group's statement is the action group's own name plus
+/// this, which is how a client locates its statement in the document again.
+pub const STATEMENT_SID_SUFFIX: &str = "-statement";
+
+/// The `Sid` the statement for `action_group` carries — the action group's statement
+/// id. Applies to EVERY action group, so a document rendered for one the catalog does
+/// not know still names its statement the same way.
+pub fn action_group_statement_id(action_group: &str) -> String {
+    format!("{action_group}{STATEMENT_SID_SUFFIX}")
+}
+
+/// One policy document, as the wire renders it. The field ORDER is the order the
+/// document's members are written in, which is why these are structures and not
+/// `serde_json::Value` maps.
+#[derive(Debug, ::serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct PolicyDocumentWire<'a> {
+    version: &'a str,
+    statement: Vec<PolicyStatementWire<'a>>,
+}
+
+/// One `Allow` statement of a policy document: one stored action group's grant.
+#[derive(Debug, ::serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct PolicyStatementWire<'a> {
+    sid: String,
+    effect: &'a str,
+    principal: PolicyPrincipalWire,
+    action: Vec<String>,
+    resource: &'a str,
+}
+
+/// A statement's `Principal` block. `AWS` is spelled by the policy language, not by
+/// Rust's casing rules, so it is renamed rather than derived.
+#[derive(Debug, ::serde::Serialize)]
+struct PolicyPrincipalWire {
+    #[serde(rename = "AWS")]
+    aws: PolicyPrincipalsWire,
+}
+
+/// The principals a statement grants to: an IAM policy document writes ONE principal
+/// as the ARN itself and several as a list, so that is what is rendered.
+#[derive(Debug, ::serde::Serialize)]
+#[serde(untagged)]
+enum PolicyPrincipalsWire {
+    /// Exactly one principal: the ARN as a string scalar.
+    One(String),
+    /// Several (or, for a statement that somehow holds none, zero) principals.
+    Several(Vec<String>),
+}
+
+impl PolicyPrincipalsWire {
+    /// The rendered form of a stored principal set.
+    fn of(principals: &[String]) -> Self {
+        match principals {
+            [only] => Self::One(only.clone()),
+            several => Self::Several(several.to_vec()),
+        }
+    }
+}
+
+/// The JSON layout a resource-based policy document is written in: two-space
+/// indentation, `" : "` between a member name and its value, and an array kept on one
+/// line with a single space inside its brackets — the layout the policy documents this
+/// surface returns carry.
+///
+/// This is `serde_json`'s OWN writer, configured through the one seam that fixes
+/// layout ([`::serde_json::ser::Formatter`]): string escaping, number formatting and
+/// UTF-8 handling all stay with `serde_json`.
+///
+/// Only the OBJECT hooks indent, because an array is written inline — which is the
+/// layout, and which also means an array nested DIRECTLY inside another array would be
+/// written `[ [ … ] ]` on one line, and an empty array as `[ ]`. The empty form is
+/// reachable (an action group outside the catalog grants no actions, so its `Action` is
+/// empty) and is written that way deliberately; an array directly inside an array is
+/// not a shape any member of a policy document takes, and a member that ever took it
+/// would have to be laid out here deliberately.
+#[derive(Debug, Default)]
+struct PolicyDocumentFormatter {
+    /// How many OBJECTS deep the writer is — what the indentation counts. An array is
+    /// written on one line, so it adds no depth.
+    depth: usize,
+    /// Whether the object open at each depth has written a member yet, innermost last:
+    /// an object that wrote none closes as `{ }` rather than across two lines.
+    object_wrote_member: Vec<bool>,
+}
+
+impl PolicyDocumentFormatter {
+    /// A line break, then this depth's indentation.
+    fn newline_indent<W>(&self, writer: &mut W) -> ::std::io::Result<()>
+    where
+        W: ?Sized + ::std::io::Write,
+    {
+        writer.write_all(b"\n")?;
+        for _ in 0..self.depth {
+            writer.write_all(b"  ")?;
+        }
+        Ok(())
+    }
+}
+
+impl ::serde_json::ser::Formatter for PolicyDocumentFormatter {
+    fn begin_object<W>(&mut self, writer: &mut W) -> ::std::io::Result<()>
+    where
+        W: ?Sized + ::std::io::Write,
+    {
+        self.depth += 1;
+        self.object_wrote_member.push(false);
+        writer.write_all(b"{")
+    }
+
+    fn end_object<W>(&mut self, writer: &mut W) -> ::std::io::Result<()>
+    where
+        W: ?Sized + ::std::io::Write,
+    {
+        self.depth = self.depth.saturating_sub(1);
+        if self.object_wrote_member.pop().unwrap_or(false) {
+            self.newline_indent(writer)?;
+        } else {
+            writer.write_all(b" ")?;
+        }
+        writer.write_all(b"}")
+    }
+
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> ::std::io::Result<()>
+    where
+        W: ?Sized + ::std::io::Write,
+    {
+        if !first {
+            writer.write_all(b",")?;
+        }
+        if let Some(wrote) = self.object_wrote_member.last_mut() {
+            *wrote = true;
+        }
+        self.newline_indent(writer)
+    }
+
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> ::std::io::Result<()>
+    where
+        W: ?Sized + ::std::io::Write,
+    {
+        writer.write_all(b" : ")
+    }
+
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> ::std::io::Result<()>
+    where
+        W: ?Sized + ::std::io::Write,
+    {
+        if !first {
+            writer.write_all(b",")?;
+        }
+        writer.write_all(b" ")
+    }
+
+    fn end_array<W>(&mut self, writer: &mut W) -> ::std::io::Result<()>
+    where
+        W: ?Sized + ::std::io::Write,
+    {
+        writer.write_all(b" ]")
+    }
+}
+
+/// `document`, written out with [`PolicyDocumentFormatter`].
+fn render_policy_document(document: &PolicyDocumentWire<'_>) -> String {
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut serializer =
+        ::serde_json::Serializer::with_formatter(&mut buffer, PolicyDocumentFormatter::default());
+    // Infallible: the only fallible steps are the write — into an in-memory buffer —
+    // and the two values `serde_json` refuses (a non-string map key, a non-finite
+    // number), neither of which a policy document holds.
+    ::serde::Serialize::serialize(document, &mut serializer)
+        .expect("a policy document writes into an in-memory buffer");
+    String::from_utf8(buffer).expect("serde_json writes UTF-8")
 }
 
 /// One agent profile as `PostAgentProfile` uploaded it. The bytes are kept verbatim:
@@ -757,22 +945,36 @@ pub enum PostedProfile {
 /// Why a policy write did not match the policy's current revision — every case a
 /// conflict, since each says the caller is writing against a revision that is not the
 /// one stored.
+///
+/// Each case carries the revision ids the conflict is ABOUT: the one the request named,
+/// where it named one, and the one the stored policy carries, where there is a stored
+/// policy. A revision-conflict refusal is self-healing only if it hands the caller the
+/// revision to retry against, so the ids travel with the mismatch rather than being
+/// left for a second `GetPolicy` round trip (see [`revision_conflict_message`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevisionMismatch {
     /// A policy already exists, so the write must name the revision it updates:
     /// `PutPermission`'s doc, "Subsequent calls must provide a revisionId to specify
     /// which revision of the resource-based policy to add the permissions to."
-    Missing,
+    Missing {
+        /// The revision the stored policy carries — the one the next write must name.
+        current: String,
+    },
     /// The write named a revision, but the group has no policy yet:
     /// `PutPermission`'s doc, "The first time you call PutPermission on a profiling
     /// group, do not specify a revisionId because it doesn't have a resource-based
     /// policy."
-    Unexpected,
-    /// The write named a revision other than the current one — a stale revision. The
-    /// revision the policy actually carries is NOT recorded here: it is what a reader
-    /// of the policy learns through `GetPolicy`, so a write refused against it says
-    /// only that it was refused.
-    Stale,
+    Unexpected {
+        /// The revision the request named, which identifies no policy.
+        requested: String,
+    },
+    /// The write named a revision other than the current one — a stale revision.
+    Stale {
+        /// The revision the request named, which the policy has moved past.
+        requested: String,
+        /// The revision the stored policy carries now — the one to retry against.
+        current: String,
+    },
 }
 
 /// Why a policy write would have left a policy larger than the service holds — the
@@ -793,11 +995,20 @@ pub enum PolicyLimit {
 pub enum PolicyWrite {
     /// Applied: the policy document as it now stands, and the revision it now carries.
     Written { policy: String, revision_id: String },
+    /// Applied, and it left the group with NO resource-based policy: the removal took
+    /// the policy's last statement, so there is no document to report and no revision —
+    /// the group is back to the state it was created in, which is what `GetPolicy` then
+    /// reports and what the next `PutPermission` writes against (naming no revision).
+    Cleared,
     /// There is no such profiling group.
     UnknownGroup,
-    /// The group has no policy holding the named action group, so there is nothing to
-    /// remove from.
+    /// The group has no resource-based policy at all, so there is nothing to remove
+    /// from.
     NoPolicy,
+    /// The group HAS a resource-based policy, but it holds no statement for the named
+    /// action group — a different state from [`PolicyWrite::NoPolicy`], and a different
+    /// thing to say about it.
+    NoStatement,
     /// The write was refused against the stored revision; nothing changed.
     RevisionMismatch(RevisionMismatch),
     /// The write was refused because it would have left the policy past one of the
@@ -855,14 +1066,21 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
         // A policy with no grants is no policy (`ProfilingGroup::resource_policy`), so
         // a write against one is a FIRST write and must name no revision.
         match (group.resource_policy(), revision_id) {
-            (None, Some(_)) => {
-                return PolicyWrite::RevisionMismatch(RevisionMismatch::Unexpected);
+            (None, Some(named)) => {
+                return PolicyWrite::RevisionMismatch(RevisionMismatch::Unexpected {
+                    requested: named.to_string(),
+                });
             }
-            (Some(_), None) => {
-                return PolicyWrite::RevisionMismatch(RevisionMismatch::Missing);
+            (Some(policy), None) => {
+                return PolicyWrite::RevisionMismatch(RevisionMismatch::Missing {
+                    current: policy.revision_id.clone(),
+                });
             }
             (Some(policy), Some(named)) if policy.revision_id != named => {
-                return PolicyWrite::RevisionMismatch(RevisionMismatch::Stale);
+                return PolicyWrite::RevisionMismatch(RevisionMismatch::Stale {
+                    requested: named.to_string(),
+                    current: policy.revision_id.clone(),
+                });
             }
             _ => {}
         }
@@ -919,12 +1137,12 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
     /// optimistic locking as [`Self::put_permission`]: the revision is checked first,
     /// so a stale revision is answered as a conflict whatever else the request names.
     ///
-    /// Removing the last statement leaves the group with no resource-based policy at
-    /// all, so a later `GetPolicy` finds none; the answer is the policy as it stands
-    /// after the removal, which is then the empty document. The revision that answer
-    /// carries is the one the removal minted, and with the policy gone it is stored
-    /// nowhere — a caller cannot write against it, exactly as it cannot write against
-    /// any revision of a policy that does not exist.
+    /// Removing the last statement leaves the group with NO resource-based policy at
+    /// all, which is [`PolicyWrite::Cleared`]: there is then no document to report and
+    /// no revision to report, because none is stored — a revision a caller could not
+    /// write against is not handed out. A removal that leaves other statements behind
+    /// is [`PolicyWrite::Written`], carrying the policy as it then stands and the
+    /// revision the change minted.
     pub fn remove_permission(
         &mut self,
         group_name: &str,
@@ -942,10 +1160,25 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
             return PolicyWrite::NoPolicy;
         };
         if policy.revision_id != revision_id {
-            return PolicyWrite::RevisionMismatch(RevisionMismatch::Stale);
+            return PolicyWrite::RevisionMismatch(RevisionMismatch::Stale {
+                requested: revision_id.to_string(),
+                current: policy.revision_id.clone(),
+            });
         }
         if !policy.statements.contains_key(action_group) {
-            return PolicyWrite::NoPolicy;
+            return PolicyWrite::NoStatement;
+        }
+
+        // Whether this removal takes the policy's LAST statement: then the group is
+        // left with no policy, so nothing is rendered and no revision is minted.
+        if policy.statements.len() == 1 {
+            let Some(group) = self.groups.get_mut(group_name) else {
+                // Unreachable: the group was resolved above, under the same `&mut self`.
+                // Reported as the absence rather than as a clear that did not happen.
+                return PolicyWrite::UnknownGroup;
+            };
+            group.policy = None;
+            return PolicyWrite::Cleared;
         }
 
         let revision_id = self.mint_revision_id(group_name, action_group);
@@ -959,13 +1192,9 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
         };
         policy.revoke(action_group);
         policy.set_revision(&revision_id);
-        // Rendered before the policy is possibly cleared: this is the policy as it
-        // stands after the removal, which is the empty document when the removed
-        // statement was the last one.
+        // The policy as it stands after the removal, which still holds at least one
+        // statement — the emptying case returned above.
         let document = policy.document(&group.arn);
-        if policy.statements.is_empty() {
-            group.policy = None;
-        }
         PolicyWrite::Written {
             policy: document,
             revision_id,
@@ -1112,26 +1341,47 @@ pub fn policy_limit_message(group_name: &str, limit: &PolicyLimit) -> String {
 }
 
 /// Why a revision-checked policy write was refused, for the `ConflictException` the
-/// write answers with. The status (409) and the code are the contract; this text says
-/// how the caller gets out of the conflict — which revision the next write must name —
-/// without handing back the stored revision itself, which is for a reader of the policy
-/// to learn through `GetPolicy`.
+/// write answers with. The status (409) and the code are the contract; this text is
+/// built from the request and the stored resource, so it STATES both revisions the
+/// conflict is about: the revision the request named (where it named one) and the
+/// revision the stored policy carries (where there is one) — which is the revision the
+/// caller retries against, so a conflict resolves without a second `GetPolicy`.
+///
+/// Only the `Stale` sentence is a RECORDED one. The other two arms are this emulator's
+/// own wording around the same two facts: a recording that shows how the service words
+/// them is the authority over this text, not a regression against it.
 pub fn revision_conflict_message(group_name: &str, mismatch: &RevisionMismatch) -> String {
     match mismatch {
-        RevisionMismatch::Missing => format!(
+        RevisionMismatch::Missing { current } => format!(
             "profiling group {group_name} already has a resource-based policy; name its \
-             current revisionId to write to it"
+             current revision to write to it, RevisionId: {current}"
         ),
-        RevisionMismatch::Unexpected => format!(
-            "profiling group {group_name} has no resource-based policy yet; do not name a \
-             revisionId when creating one"
+        RevisionMismatch::Unexpected { requested } => format!(
+            "profiling group {group_name} has no resource-based policy, so the revision: \
+             {requested} names none; do not name a revisionId when creating one"
         ),
-        RevisionMismatch::Stale => format!(
-            "the revisionId does not match the current revision of the resource-based \
-             policy of profiling group {group_name}; read it with GetPolicy and write \
-             against that revision"
+        RevisionMismatch::Stale { requested, current } => format!(
+            "Policy has been updated since the revision: {requested}, new RevisionId: \
+             {current}"
         ),
     }
+}
+
+/// The `ResourceNotFoundException` message a policy-scoped operation answers a group
+/// that EXISTS but has no resource-based policy with: the group as the request named it,
+/// and the account the lookup was scoped to — a profiling-group name identifies a group
+/// only within one account, so the account is part of saying whose view of the group had
+/// no policy.
+///
+/// The account is this emulator's own ([`::engine::emulator_account_id`]), which is the
+/// account every resource it mints lives in — the same one the group's ARN carries. This
+/// is distinct from [`group_not_found_message`], which answers a group that is not there
+/// at all.
+pub fn policy_not_found_message(group_name: &str) -> String {
+    format!(
+        "No policy attached to profiling group name: {group_name} in accountId: {}; ",
+        ::engine::emulator_account_id()
+    )
 }
 
 /// The message a 404 about missing profile DATA carries — a FIXED service text, with no
@@ -1179,6 +1429,27 @@ pub fn profiling_group_record_not_found_message(name: &str) -> String {
 /// see [`profiling_group_record_not_found_message`].
 pub fn group_not_found_message(name: &str) -> String {
     format!("CodeGuru Profiler can\u{2019}t complete the operation because {name} was not found.")
+}
+
+/// How the POLICY plane says that the profiling group a request names does not exist:
+/// `GetPolicy` states the LOOKUP it performed — the account the lookup was scoped to and
+/// the name it looked for — rather than the sentence every other group-scoped operation
+/// states ([`group_not_found_message`]).
+///
+/// Why this operation has a form of its own: both "no such group" and "the group has no
+/// resource-based policy" are 404 `ResourceNotFoundException` here, so the message is the
+/// only thing a caller can tell them apart by — this one says the GROUP lookup found
+/// nothing, [`policy_not_found_message`] says the group was found and holds no policy.
+///
+/// `PutPermission` and `RemovePermission` keep [`group_not_found_message`] for a group
+/// that is not there: their own wording for that case is not recorded anywhere, and a
+/// per-operation sentence this service has never been observed to emit would be invented
+/// rather than emulated.
+pub fn policy_group_not_found_message(name: &str) -> String {
+    format!(
+        "No profiling group with accountId: {}; name: {name} was found.",
+        ::engine::emulator_account_id()
+    )
 }
 
 /// The resource-type prefix a profiling-group ARN carries in its resource field, as

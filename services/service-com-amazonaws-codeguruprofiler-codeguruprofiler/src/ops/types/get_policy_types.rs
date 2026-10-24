@@ -17,10 +17,26 @@ pub struct GetPolicyInput {
     pub profiling_group_name: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#GetPolicyResponse")]
+/// `GetPolicyResponse`. Its schema and codec come from [`profiler_schema_and_codec!`]
+/// rather than `#[smithy_macros::smithy(shape = ...)]` because BOTH its members are
+/// `@required` in the model yet neither is in the body of the 200 this operation answers
+/// a profiling group that has no resource-based policy attached — the state a group is
+/// created in, and the state the last `RemovePermission` leaves it in. The derive makes
+/// a `@required` member a non-`Option` field its serializer always writes, which cannot
+/// express that; see `types/date_time_wire.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct GetPolicyOutput {
-    pub policy: String,
-    pub revision_id: String,
+    pub policy: Option<String>,
+    pub revision_id: Option<String>,
 }
+
+profiler_schema_and_codec!(
+    GetPolicyOutput,
+    GET_POLICY_OUTPUT_SCHEMA,
+    "com.amazonaws.codeguruprofiler#GetPolicyResponse",
+    "com.amazonaws.codeguruprofiler",
+    "GetPolicyResponse",
+    (M_POLICY, policy, "policy", 0, opt, string),
+    (M_REVISION_ID, revision_id, "revisionId", 1, opt, string),
+);
 
