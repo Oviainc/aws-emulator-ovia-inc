@@ -39,14 +39,14 @@ use crate::hosted_zone_records::{call, create_zone_body, escape_xml, router, Rep
 /// The region the zones in this suite are first associated with, which is also
 /// a value of the modelled `VPCRegion` enum
 /// (smithy_query(query="shape",shape="VPCRegion")).
-const HOME_REGION: &str = "us-east-1";
+pub(crate) const HOME_REGION: &str = "us-east-1";
 
 /// The VPC every private zone in this suite is created with.
-const CREATION_VPC: &str = "vpc-9f8e7d6c";
+pub(crate) const CREATION_VPC: &str = "vpc-9f8e7d6c";
 
 /// A `<VPC>` block, with each member present only when it is given — so a row
 /// can leave `VPCId` or `VPCRegion` out entirely.
-fn vpc_block(vpc_id: Option<&str>, region: Option<&str>) -> String {
+pub(crate) fn vpc_block(vpc_id: Option<&str>, region: Option<&str>) -> String {
     let id = vpc_id.map_or_else(String::new, |id| {
         format!("<VPCId>{}</VPCId>", escape_xml(id))
     });
@@ -70,7 +70,7 @@ fn associate_body(vpc: &str, comment: Option<&str>) -> String {
 }
 
 /// Send one `AssociateVPCWithHostedZone` request.
-async fn associate(
+pub(crate) async fn associate(
     router: &MultiServiceRouter,
     zone_id: &str,
     vpc: &str,
@@ -86,7 +86,7 @@ async fn associate(
 }
 
 /// Read a zone back.
-async fn get_zone(router: &MultiServiceRouter, zone_id: &str) -> Reply {
+pub(crate) async fn get_zone(router: &MultiServiceRouter, zone_id: &str) -> Reply {
     call(router, "GET", &format!("/2013-04-01/hostedzone/{zone_id}"), "").await
 }
 
@@ -117,7 +117,7 @@ async fn create_zone(
 
 /// Create a PRIVATE zone associated with `vpc_id` in [`HOME_REGION`], and
 /// return its bare id.
-async fn create_private_zone(
+pub(crate) async fn create_private_zone(
     router: &MultiServiceRouter,
     name: &str,
     caller_reference: &str,
@@ -138,7 +138,7 @@ async fn create_private_zone(
 
 /// The `(VPCId, VPCRegion)` pairs a `GetHostedZone` reply reports, in document
 /// order — which is the order the zone holds its associations in.
-fn associations(reply: &Reply) -> Vec<(String, String)> {
+pub(crate) fn associations(reply: &Reply) -> Vec<(String, String)> {
     let ids = reply.all("VPCId");
     let regions = reply.all("VPCRegion");
     assert_eq!(
