@@ -269,7 +269,10 @@ async fn state_changing_operations_emit_one_audit_record_each() {
 }
 
 /// A refused state change is audited too, with the modelled error as its outcome: a
-/// table over the refusals the three state-changing operations can answer.
+/// table over the refusals the state-changing operations can answer. `DeleteDashboard` is
+/// not among them for an absent resource: it models no not-found error and answers a 200
+/// no-op, audited with its SUCCESS outcome by
+/// [`an_idempotent_delete_is_audited_as_a_success`].
 #[tokio::test]
 async fn refused_state_changes_are_audited_with_their_outcome() {
     let absent = "arn:aws:bcm-dashboards::000000000000:dashboard/never-created";
@@ -282,13 +285,6 @@ async fn refused_state_changes_are_audited_with_their_outcome() {
             400,
             absent,
             "ResourceNotFoundException",
-        ),
-        (
-            "DeleteDashboard",
-            json!({"arn": absent}),
-            400,
-            absent,
-            "ValidationException",
         ),
         (
             "UntagResource",
@@ -315,6 +311,52 @@ async fn refused_state_changes_are_audited_with_their_outcome() {
             "case {operation} refusal: expected {expected_status}, got {status}: {body}"
         );
         assert_record(&capture.record_for(operation), operation, resource, outcome);
+    }
+}
+
+/// `DeleteDashboard` answers an ARN no record is stored under with a 200 no-op, so the
+/// one audit record it leaves carries the SUCCESS outcome its answer did — for a record
+/// that was there and for one that never was.
+#[tokio::test]
+async fn an_idempotent_delete_is_audited_as_a_success() {
+    let absent = "arn:aws:bcm-dashboards::000000000000:dashboard/never-created";
+
+    // (label, the arn deleted, whether a dashboard is created under it first)
+    let cases: &[(&str, &str, bool)] = &[
+        ("an arn no dashboard was ever stored under", absent, false),
+        ("the second delete of a dashboard that existed", "", true),
+    ];
+
+    for (label, fixed_arn, create_first) in cases {
+        let router = router();
+        let arn = if *create_first {
+            let created = ok_call(
+                &router,
+                "CreateDashboard",
+                &json!({"name": "Audited Twice", "widgets": []}),
+            )
+            .await;
+            let arn = created["arn"].as_str().expect("an arn").to_string();
+            ok_call(&router, "DeleteDashboard", &json!({"arn": arn})).await;
+            arn
+        } else {
+            (*fixed_arn).to_string()
+        };
+
+        // Capture only the no-op delete, so the record asserted is that call's.
+        let (capture, _guard) = capture_events();
+        let answered = ok_call(&router, "DeleteDashboard", &json!({"arn": arn})).await;
+        assert_eq!(
+            answered["arn"].as_str(),
+            Some(arn.as_str()),
+            "case {label}: the no-op must echo the requested arn: {answered}"
+        );
+        assert_record(
+            &capture.record_for("DeleteDashboard"),
+            "DeleteDashboard",
+            &arn,
+            "SUCCESS",
+        );
     }
 }
 
