@@ -19,9 +19,11 @@
 //! keeps its `ApproverId` and its invitation response; one the request adds is newly
 //! invited, so it is `PENDING` until the clock owes its response.
 //!
-//! `UpdateActions` is accepted and applied to nothing: its only value synchronises MFA
-//! devices, and this service stores none, so there is nothing to synchronise. A request
-//! that carries no field to apply leaves the team — and therefore its version — as it was.
+//! Every `UpdateActions` entry is APPLIED to the team the update produces: the single
+//! modelled action ([`crate::state::SYNCHRONIZE_MFA_DEVICES_ACTION`]) synchronizes the
+//! MFA devices of every approver on the team, which `GetApprovalTeam` reports per
+//! approver in `MfaMethods`. A request that carries no field and no action to apply
+//! leaves the team — and therefore its version — as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -297,6 +299,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Each requested action is applied to the team this update PRODUCES, so an
+        // approver the same request adds is synchronized along with the ones it keeps.
+        let synchronize_mfa_devices = input.update_actions.as_ref().is_some_and(|actions| {
+            actions
+                .iter()
+                .any(|action| action == crate::state::SYNCHRONIZE_MFA_DEVICES_ACTION)
+        });
+
         let team = state.team_mut(&input.arn).ok_or_else(not_found)?;
         let mut applied = false;
         if let Some(description) = input.description.as_ref() {
@@ -309,6 +319,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(approvers) = new_approvers {
             team.approvers = approvers;
+            applied = true;
+        }
+        if synchronize_mfa_devices {
+            team.synchronize_mfa_devices();
             applied = true;
         }
         if applied {
