@@ -146,8 +146,9 @@ fn pls(alphabet: &str, language: &str, lexemes: usize) -> String {
 
 /// A valid PLS lexicon exactly `total` characters long (padding goes in a grapheme).
 fn pls_of_size(total: usize) -> String {
-    const PREFIX: &str =
-        "<lexicon version=\"1.0\" alphabet=\"ipa\" xml:lang=\"en-US\"><lexeme><grapheme>";
+    const PREFIX: &str = "<lexicon version=\"1.0\" \
+                          xmlns=\"http://www.w3.org/2005/01/pronunciation-lexicon\" \
+                          alphabet=\"ipa\" xml:lang=\"en-US\"><lexeme><grapheme>";
     const SUFFIX: &str = "</grapheme></lexeme></lexicon>";
     let padding = total.saturating_sub(PREFIX.len() + SUFFIX.len());
     format!("{PREFIX}{}{SUFFIX}", "x".repeat(padding))
@@ -325,12 +326,16 @@ async fn an_unusable_pls_document_is_refused_with_its_modeled_error() {
         ("empty", "", "InvalidLexiconException"),
         (
             "unknown alphabet",
-            "<lexicon version=\"1.0\" alphabet=\"x-klingon\" xml:lang=\"en-US\"/>",
+            "<lexicon version=\"1.0\" \
+             xmlns=\"http://www.w3.org/2005/01/pronunciation-lexicon\" \
+             alphabet=\"x-klingon\" xml:lang=\"en-US\"/>",
             "InvalidLexiconException",
         ),
         (
             "unknown language",
-            "<lexicon version=\"1.0\" alphabet=\"ipa\" xml:lang=\"xx-ZZ\"/>",
+            "<lexicon version=\"1.0\" \
+             xmlns=\"http://www.w3.org/2005/01/pronunciation-lexicon\" \
+             alphabet=\"ipa\" xml:lang=\"xx-ZZ\"/>",
             "UnsupportedPlsLanguageException",
         ),
     ];

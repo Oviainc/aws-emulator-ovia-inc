@@ -216,6 +216,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The tag rules a write that installs tags enforces for itself: `TagKey`'s and
+        // `TagValue`'s `@length` bounds (the boundary validator walks a map's entry count
+        // and its values' shapes but not its KEYS) and the tag-key prefix AWS reserves.
+        // The same `state::tag_violation` `TagResource` applies, so a pipe cannot be
+        // CREATED carrying a key a later `TagResource` would refuse. Sorted, so a request
+        // carrying several illegal tags is always refused with the same message.
+        for (key, value) in input
+            .tags
+            .iter()
+            .flat_map(|tags| tags.iter().collect::<::std::collections::BTreeMap<_, _>>())
+        {
+            if let Some(violation) = crate::state::tag_violation(key, value) {
+                return Err(CreatePipeErrorModeled::ValidationException(
+                    crate::state::tag_violation_error("Tags", violation),
+                )
+                .into());
+            }
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due_transitions();

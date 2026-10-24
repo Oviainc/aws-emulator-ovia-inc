@@ -33,8 +33,10 @@ pub struct StoredLexicon {
     pub content: String,
     /// The PLS `alphabet` attribute, when the document carries one.
     pub alphabet: Option<String>,
-    /// The PLS `xml:lang` attribute, when the document carries one.
-    pub language_code: Option<String>,
+    /// The PLS `xml:lang` attribute. Every stored lexicon has one: a PLS document
+    /// element that declares no language is not a lexicon this service stores, so
+    /// there is no stored lexicon whose reported attributes omit `LanguageCode`.
+    pub language_code: String,
     /// When this lexicon was last written by `PutLexicon`.
     pub last_modified: SystemTime,
     /// `arn:aws:polly:<region>:<account>:lexicon/<name>`.
@@ -247,7 +249,7 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 pub fn lexicon_attributes(stored: &StoredLexicon) -> crate::ops::types::LexiconAttributes {
     crate::ops::types::LexiconAttributes {
         alphabet: stored.alphabet.clone(),
-        language_code: stored.language_code.clone(),
+        language_code: Some(stored.language_code.clone()),
         last_modified: Some(::aws_smithy_types::DateTime::from(stored.last_modified)),
         lexicon_arn: Some(stored.lexicon_arn.clone()),
         lexemes_count: stored.lexemes_count,

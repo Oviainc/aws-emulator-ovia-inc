@@ -19,3 +19,5 @@ mod pipe_tagging;
 mod pipe_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_key_rules.rs"]
+mod tag_key_rules;
