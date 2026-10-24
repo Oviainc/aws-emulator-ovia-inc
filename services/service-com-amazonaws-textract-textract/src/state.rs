@@ -41,6 +41,23 @@
 //!
 //! Nothing here is derived from a digest, echoed from the request, or randomised: a
 //! block only ever describes text that was actually read out of the document.
+//!
+//! ## Where a block's `Geometry` and `Confidence` come from
+//!
+//! Both are MEASUREMENTS of the part of the document the block was read from, never a
+//! page template:
+//!
+//! * a page recognised off pixels reports, per line and per word, the extent of the ink
+//!   [`ocr`] found it at and the mean score it matched that ink's glyphs with, so two
+//!   words of one line, and one word on two documents, carry their own boxes and their
+//!   own confidences;
+//! * a document read as CHARACTERS has no pixels to measure, so its lines and words are
+//!   laid out on the character grid its own lines, columns and word lengths place them on
+//!   ([`bounding_box`]), and report the one documented [`EXTRACTED_TEXT_CONFIDENCE`] —
+//!   a per-word spread there would be a measurement nothing made;
+//! * every block above a word spans exactly the words it was read from (a `LINE`, a
+//!   `KEY_VALUE_SET`, a `CELL`, an `ExpenseDetection`), and a `PAGE` encloses the page's
+//!   top-level blocks rather than claiming the whole page.
 
 pub mod ocr;
 
@@ -1237,24 +1254,44 @@ pub fn adapter_auto_update(value: Option<&str>) -> Result<String, String> {
 // Reading a document
 // ---------------------------------------------------------------------------
 
-/// A document's text, one entry per page, and the confidence it was read with.
+/// One page's lines as [`ocr`] MEASURED them off the submitted pixels, in reading order.
+pub type MeasuredPage = Vec<ocr::MeasuredLine>;
+
+/// A document's text, one entry per page, the confidence it was read with, and where on
+/// each page that text was found.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DocumentContent {
     pub pages: Vec<String>,
-    /// The `Confidence` every block derived from this text reports: the one documented
-    /// [`EXTRACTED_TEXT_CONFIDENCE`] for text read verbatim, and the mean score the
-    /// recogniser measured for a raster whose text it recognised.
+    /// The `Confidence` a block derived from this text reports when nothing finer was
+    /// measured for it: the one documented [`EXTRACTED_TEXT_CONFIDENCE`] for text read
+    /// verbatim, and the mean score the recogniser measured over the whole page for a
+    /// raster.
     pub confidence: f32,
+    /// Where the text of each page sits on it, index-aligned with [`Self::pages`].
+    ///
+    /// Filled for a page whose text was RECOGNISED off pixels, which is the only case
+    /// where a position and a size were measured; EMPTY for a document that carries no
+    /// pixels (text read verbatim has characters but no page to measure them on), whose
+    /// blocks are laid out on the character grid [`bounding_box`] computes from the
+    /// document's own lines, columns and word lengths instead.
+    pub measured: Vec<MeasuredPage>,
 }
 
 impl DocumentContent {
     /// Text read verbatim out of a document, so reported with the one documented
-    /// confidence.
+    /// confidence and with no measured geometry.
     pub fn read_verbatim(pages: Vec<String>) -> Self {
         Self {
             pages,
             confidence: EXTRACTED_TEXT_CONFIDENCE,
+            measured: Vec::new(),
         }
+    }
+
+    /// The measured lines of page `page_index`, when that page's text was recognised off
+    /// pixels.
+    fn measured_page(&self, page_index: usize) -> Option<&[ocr::MeasuredLine]> {
+        self.measured.get(page_index).map(Vec::as_slice)
     }
 
     /// The page count `DocumentMetadata.Pages` reports.
@@ -1371,6 +1408,7 @@ pub fn read_content(
         return Ok(DocumentContent {
             pages: bounded(vec![page.text])?,
             confidence: page.confidence,
+            measured: vec![page.lines],
         });
     }
     // A PDF is a document format Textract itself accepts, and this emulator reads none:
@@ -1469,13 +1507,15 @@ fn decode_text(bytes: &[u8]) -> Option<String> {
 // Block derivation
 // ---------------------------------------------------------------------------
 
-/// Left and top margin of the page layout, as a page-relative fraction.
+/// Left and top margin of the character grid a TEXT document is laid out on, as a
+/// page-relative fraction. Only a document whose text carries no measured geometry (see
+/// [`DocumentContent::measured`]) is laid out here.
 const PAGE_MARGIN: f32 = 0.05;
-/// Width of one character cell, as a page-relative fraction.
+/// Width of one character cell of that grid, as a page-relative fraction.
 const CHAR_WIDTH: f32 = 0.0075;
-/// Height of a line of text, as a page-relative fraction.
+/// Height of a line of that grid, as a page-relative fraction.
 const LINE_HEIGHT: f32 = 0.018;
-/// Baseline-to-baseline distance, as a page-relative fraction.
+/// Baseline-to-baseline distance of that grid, as a page-relative fraction.
 const LINE_PITCH: f32 = 0.024;
 
 /// A word of a line, with the character column it starts at.
@@ -1483,23 +1523,29 @@ struct WordLayout {
     column: usize,
     text: String,
     id: String,
+    /// Where the word sits on the page: the extent of its own ink when it was recognised
+    /// off pixels, and otherwise its place on the character grid.
+    bbox: BoundingBox,
+    /// The `Confidence` a block derived from this word reports: the mean score ITS OWN
+    /// characters were recognised with, or the document's one confidence when they were
+    /// not recognised but read.
+    confidence: f32,
 }
 
-/// A line of a page: its text, its words, and how analysis reads it.
+/// A line of a page: its text, its words, where it sits, and how analysis reads it.
 struct LineLayout {
     id: String,
     index: usize,
     text: String,
     words: Vec<WordLayout>,
-    /// The `Confidence` every block derived from this line reports.
-    ///
-    /// ONE value per document, not a per-line measurement: for a raster it is the mean
-    /// score the recogniser matched the whole page's characters with (see
-    /// [`ocr::Recognised::confidence`]), and for text read verbatim it is the one
-    /// documented [`EXTRACTED_TEXT_CONFIDENCE`]. It is carried on the line so every block
-    /// derived from the line reports the document's own measured value rather than a
-    /// per-block spread nothing measured.
+    /// The `Confidence` a block derived from the line as a whole reports: the mean score
+    /// the characters of THIS LINE were recognised with, or the document's one
+    /// confidence ([`EXTRACTED_TEXT_CONFIDENCE`]) when its text was read verbatim rather
+    /// than recognised, where a per-line spread would be a measurement nothing made.
     confidence: f32,
+    /// Where the line sits on the page: the extent of the ink it was read from when it
+    /// was recognised off pixels, and otherwise its place on the character grid.
+    bbox: BoundingBox,
     /// Word counts per tab-separated cell, when the line is a table row.
     cells: Vec<usize>,
     /// Character column of the `:` that separates a label from its value.
@@ -1529,6 +1575,12 @@ fn block_id(key: &str, kind: &str, path: &[usize]) -> String {
     )
 }
 
+/// Where a line or a word of a TEXT document sits, on the character grid the document's
+/// own lines, columns and word lengths place it on.
+///
+/// The fallback layout for content that carries no measured geometry: a document read as
+/// characters has no page its text was measured on, so its geometry is computed from the
+/// text itself. A RECOGNISED page reports instead the rectangle [`ocr`] measured for it.
 fn bounding_box(line_index: usize, column: usize, chars: usize) -> BoundingBox {
     // The two bounds are computed independently and never derived from each other:
     // `f32::clamp` panics when its min exceeds its max, and rounding makes `1.0 - left`
@@ -1544,6 +1596,24 @@ fn bounding_box(line_index: usize, column: usize, chars: usize) -> BoundingBox {
         left,
         top,
     }
+}
+
+/// A measured rectangle as the `BoundingBox` a block reports.
+fn box_of(rect: &ocr::Rect) -> BoundingBox {
+    BoundingBox {
+        width: rect.width,
+        height: rect.height,
+        left: rect.left,
+        top: rect.top,
+    }
+}
+
+/// The box enclosing every one of `boxes`, or `None` when there are none.
+fn union_of(boxes: &[BoundingBox]) -> Option<BoundingBox> {
+    if boxes.is_empty() {
+        return None;
+    }
+    Some(union(boxes))
 }
 
 fn union(boxes: &[BoundingBox]) -> BoundingBox {
@@ -1625,12 +1695,19 @@ fn words_of(line: &str) -> Vec<(usize, String)> {
 }
 
 /// Lay out one page's lines, numbering their words so every read path agrees on ids.
+///
+/// The ONE place a line or a word gets its position, its size and its confidence, so the
+/// four read paths over one document cannot disagree on them. Both come from what was
+/// really read: the rectangle and the score [`ocr`] measured for a page recognised off
+/// pixels, and the character grid plus the one documented confidence for text read
+/// verbatim.
 fn layout_page(
     key: &str,
     page_index: usize,
     page_text: &str,
-    confidence: f32,
+    content: &DocumentContent,
 ) -> Vec<LineLayout> {
+    let measured = content.measured_page(page_index);
     page_text
         .lines()
         .map(str::trim_end)
@@ -1639,13 +1716,32 @@ fn layout_page(
         .map(|(index, line)| {
             let cell_texts: Vec<&str> = line.split('\t').collect();
             let is_row = cell_texts.len() > 1;
-            let words: Vec<WordLayout> = words_of(line)
+            let laid_out = words_of(line);
+            // The measured line for this one, used only when its words are the words
+            // laid out here: the recogniser separates the words of its text on exactly
+            // the gaps it measured them at, so the two lists agree, and a line where
+            // they somehow did not is laid out on the character grid rather than given
+            // another word's rectangle.
+            let measured_line = measured
+                .and_then(|lines| lines.get(index))
+                .filter(|line| line.words.len() == laid_out.len());
+            let words: Vec<WordLayout> = laid_out
                 .into_iter()
                 .enumerate()
-                .map(|(wi, (column, text))| WordLayout {
-                    column,
-                    text,
-                    id: block_id(key, "WORD", &[page_index, index, wi]),
+                .map(|(wi, (column, text))| {
+                    let chars = text.chars().count();
+                    let measured_word = measured_line.and_then(|line| line.words.get(wi));
+                    WordLayout {
+                        column,
+                        text,
+                        id: block_id(key, "WORD", &[page_index, index, wi]),
+                        bbox: measured_word.map_or_else(
+                            || bounding_box(index, column, chars),
+                            |word| box_of(&word.rect),
+                        ),
+                        confidence: measured_word
+                            .map_or(content.confidence, |word| word.confidence),
+                    }
                 })
                 .collect();
             // A tab-separated line is a table row; otherwise a `:` with words on both
@@ -1668,9 +1764,14 @@ fn layout_page(
             LineLayout {
                 id: block_id(key, "LINE", &[page_index, index]),
                 index,
+                // A line spans exactly the words it was read from, whichever way those
+                // words got their boxes; a line with no words at all (which a non-blank
+                // line never is) falls back to its place on the character grid.
+                bbox: union_of(&words.iter().map(|w| w.bbox.clone()).collect::<Vec<_>>())
+                    .unwrap_or_else(|| bounding_box(index, 0, line.trim_end().chars().count())),
+                confidence: measured_line.map_or(content.confidence, |line| line.confidence),
                 text: line.to_string(),
                 words,
-                confidence,
                 cells,
                 colon,
             }
@@ -1692,18 +1793,14 @@ pub fn blocks(key: &str, content: &DocumentContent, features: FeatureSet) -> Vec
     let mut out: Vec<Block> = Vec::new();
     for (page_index, page_text) in content.pages.iter().enumerate() {
         let page_number = i32::try_from(page_index + 1).unwrap_or(i32::MAX);
-        let lines = layout_page(key, page_index, page_text, content.confidence);
+        let lines = layout_page(key, page_index, page_text, content);
 
         let mut text_blocks: Vec<Block> = Vec::new();
         for line in &lines {
             let mut line_block = new_block("LINE", line.id.clone(), page_number);
             line_block.text = Some(line.text.trim().to_string());
             line_block.confidence = Some(line.confidence);
-            line_block.geometry = Some(geometry(bounding_box(
-                line.index,
-                line.words.first().map_or(0, |w| w.column),
-                line.text.trim_end().chars().count(),
-            )));
+            line_block.geometry = Some(geometry(line.bbox.clone()));
             if !line.words.is_empty() {
                 line_block.relationships = Some(vec![relationship(
                     "CHILD",
@@ -1714,13 +1811,9 @@ pub fn blocks(key: &str, content: &DocumentContent, features: FeatureSet) -> Vec
             for word in &line.words {
                 let mut word_block = new_block("WORD", word.id.clone(), page_number);
                 word_block.text = Some(word.text.clone());
-                word_block.confidence = Some(line.confidence);
+                word_block.confidence = Some(word.confidence);
                 word_block.text_type = Some("PRINTED".to_string());
-                let mut word_geometry = geometry(bounding_box(
-                    line.index,
-                    word.column,
-                    word.text.chars().count(),
-                ));
+                let mut word_geometry = geometry(word.bbox.clone());
                 // `Geometry$RotationAngle` is "a numerical value corresponding to the
                 // rotation of the WORD block. Possible values are 0, 90, 180, and 270",
                 // so it is reported for WORD blocks only. Every word this service reads
@@ -1751,11 +1844,17 @@ pub fn blocks(key: &str, content: &DocumentContent, features: FeatureSet) -> Vec
         children.extend(table_ids);
 
         let mut page_block = new_block("PAGE", block_id(key, "PAGE", &[page_index]), page_number);
-        page_block.geometry = Some(geometry(BoundingBox {
-            width: 1.0,
-            height: 1.0,
-            left: 0.0,
-            top: 0.0,
+        // A PAGE's `Geometry` bounds what was READ on the page: the box enclosing its
+        // top-level blocks, which is what the service's own recorded answers carry (a box
+        // inside the page, with a polygon of four interior corners) rather than the unit
+        // square. The forms and tables of a page are derived from its lines, so the lines
+        // already enclose them. A page nothing was read on has nothing to bound, so it
+        // reports the whole page: that IS what was examined.
+        let line_boxes: Vec<BoundingBox> = lines.iter().map(|line| line.bbox.clone()).collect();
+        page_block.geometry = Some(geometry(if line_boxes.is_empty() {
+            box_of(&ocr::Rect::whole_page())
+        } else {
+            union(&line_boxes)
         }));
         if !children.is_empty() {
             page_block.relationships = Some(vec![relationship("CHILD", children)]);
@@ -1787,8 +1886,8 @@ fn form_blocks(
 
         let mut key_block = new_block("KEY_VALUE_SET", key_id.clone(), page_number);
         key_block.entity_types = Some(vec!["KEY".to_string()]);
-        key_block.confidence = Some(line.confidence);
-        key_block.geometry = Some(geometry(union(&word_boxes(line, &key_words))));
+        key_block.confidence = Some(words_confidence(line, &key_words));
+        key_block.geometry = Some(geometry(union(&word_boxes(&key_words))));
         key_block.relationships = Some(vec![
             relationship("VALUE", vec![value_id.clone()]),
             relationship("CHILD", key_words.iter().map(|w| w.id.clone()).collect()),
@@ -1796,8 +1895,8 @@ fn form_blocks(
 
         let mut value_block = new_block("KEY_VALUE_SET", value_id.clone(), page_number);
         value_block.entity_types = Some(vec!["VALUE".to_string()]);
-        value_block.confidence = Some(line.confidence);
-        value_block.geometry = Some(geometry(union(&word_boxes(line, &value_words))));
+        value_block.confidence = Some(words_confidence(line, &value_words));
+        value_block.geometry = Some(geometry(union(&word_boxes(&value_words))));
         value_block.relationships = Some(vec![relationship(
             "CHILD",
             value_words.iter().map(|w| w.id.clone()).collect(),
@@ -1811,11 +1910,27 @@ fn form_blocks(
     (out, ids)
 }
 
-fn word_boxes(line: &LineLayout, words: &[&WordLayout]) -> Vec<BoundingBox> {
-    words
+/// Where each of `words` sits on the page, as it was measured or laid out.
+fn word_boxes(words: &[&WordLayout]) -> Vec<BoundingBox> {
+    words.iter().map(|w| w.bbox.clone()).collect()
+}
+
+/// The `Confidence` a block spanning `words` reports.
+///
+/// The confidence of the characters THAT BLOCK was read from: the mean over its own
+/// words, weighted by how many characters each contributed, which for a recognised page
+/// is the mean score of exactly the glyphs inside the block. A block with no words of its
+/// own has no characters to have measured, so it reports its line's.
+fn words_confidence(line: &LineLayout, words: &[&WordLayout]) -> f32 {
+    let characters: usize = words.iter().map(|w| w.text.chars().count()).sum();
+    if characters == 0 {
+        return line.confidence;
+    }
+    let total: f32 = words
         .iter()
-        .map(|w| bounding_box(line.index, w.column, w.text.chars().count()))
-        .collect()
+        .map(|w| w.confidence * w.text.chars().count() as f32)
+        .sum();
+    (total / characters as f32).clamp(0.0, 100.0)
 }
 
 /// The label and the value halves of a labelled line, with the column of the `:` that
@@ -1872,6 +1987,37 @@ fn cell_words(line: &LineLayout, column: usize) -> Vec<&WordLayout> {
         .collect()
 }
 
+/// Where one cell of a table row sits on the page.
+///
+/// The box of the cell's own words, which is what was read in it. A cell with no words at
+/// all has no text to have been read anywhere, so it is bounded by the cells AROUND it:
+/// from the right edge of the nearest populated cell before it to the left edge of the
+/// nearest one after it, on its row's own vertical band — never a cell-sized box at a
+/// position nothing measured.
+fn cell_box(line: &LineLayout, column: usize) -> BoundingBox {
+    let own = word_boxes(&cell_words(line, column));
+    if !own.is_empty() {
+        return union(&own);
+    }
+    let populated = |column: usize| {
+        let boxes = word_boxes(&cell_words(line, column));
+        (!boxes.is_empty()).then(|| union(&boxes))
+    };
+    let left = (0..column)
+        .rev()
+        .find_map(populated)
+        .map_or(line.bbox.left, |before| before.left + before.width);
+    let right = (column + 1..line.cells.len())
+        .find_map(populated)
+        .map_or(line.bbox.left + line.bbox.width, |after| after.left);
+    BoundingBox {
+        width: (right - left).max(0.0),
+        height: line.bbox.height,
+        left,
+        top: line.bbox.top,
+    }
+}
+
 /// `TABLE` and `CELL` blocks for the page's tab-separated rows, and the table ids.
 ///
 /// A contiguous run of tab-separated lines is one table; a cell's `RowIndex` and
@@ -1904,13 +2050,8 @@ fn table_blocks(
                 cell.column_index = Some(i32::try_from(column + 1).unwrap_or(i32::MAX));
                 cell.row_span = Some(1);
                 cell.column_span = Some(1);
-                cell.confidence = Some(line.confidence);
-                let boxes = word_boxes(line, &cell_words);
-                cell.geometry = Some(geometry(if boxes.is_empty() {
-                    bounding_box(line.index, column, 1)
-                } else {
-                    union(&boxes)
-                }));
+                cell.confidence = Some(words_confidence(line, &cell_words));
+                cell.geometry = Some(geometry(cell_box(line, column)));
                 if !cell_words.is_empty() {
                     cell.relationships = Some(vec![relationship(
                         "CHILD",
@@ -1921,12 +2062,11 @@ fn table_blocks(
                 cell_blocks.push(cell);
             }
         }
-        let row_boxes: Vec<BoundingBox> = run
-            .iter()
-            .map(|line| bounding_box(line.index, 0, line.text.chars().count()))
-            .collect();
+        let row_boxes: Vec<BoundingBox> = run.iter().map(|line| line.bbox.clone()).collect();
         let mut table = new_block("TABLE", table_id.clone(), page_number);
-        table.confidence = Some(first_row.confidence);
+        // The table's own characters: every word of every row it was read from.
+        let table_words: Vec<&WordLayout> = run.iter().flat_map(|line| line.words.iter()).collect();
+        table.confidence = Some(words_confidence(first_row, &table_words));
         table.geometry = Some(geometry(union(&row_boxes)));
         table.relationships = Some(vec![relationship("CHILD", cell_ids)]);
 
@@ -1953,6 +2093,9 @@ pub struct Field {
     pub value: String,
     /// Where the value sits on the page, for the answer's `Geometry`.
     pub value_box: BoundingBox,
+    /// The confidence the value's own characters were read with, for the answer's
+    /// `Confidence`.
+    pub value_confidence: f32,
     /// The label's retrieval terms, computed ONCE when the field is read and held as a
     /// set, so matching a query against every field of a document costs a lookup per term
     /// rather than a scan.
@@ -1967,12 +2110,13 @@ pub fn fields(key: &str, content: &DocumentContent) -> Vec<Field> {
     let mut out = Vec::new();
     for (page_index, page_text) in content.pages.iter().enumerate() {
         let page_number = i32::try_from(page_index + 1).unwrap_or(i32::MAX);
-        for line in layout_page(key, page_index, page_text, content.confidence) {
+        for line in layout_page(key, page_index, page_text, content) {
             let Some((colon, _, value_words)) = labelled_split(&line) else {
                 continue;
             };
             let label = char_span(&line.text, 0, colon).trim().to_string();
-            let value_box = union(&word_boxes(&line, &value_words));
+            let value_box = union(&word_boxes(&value_words));
+            let value_confidence = words_confidence(&line, &value_words);
             out.push(Field {
                 page_number,
                 label_terms: terms(&label).into_iter().collect(),
@@ -1981,6 +2125,7 @@ pub fn fields(key: &str, content: &DocumentContent) -> Vec<Field> {
                     .trim()
                     .to_string(),
                 value_box,
+                value_confidence,
             });
         }
     }
@@ -2073,7 +2218,7 @@ pub fn query_blocks(key: &str, content: &DocumentContent, queries: &[PreparedQue
                 result.text = Some(field.value.clone());
                 // Confidence in the answer is the confidence of the text it was read
                 // from, scaled by how much of the query that field's label accounts for.
-                result.confidence = Some((score * content.confidence).clamp(0.0, 100.0));
+                result.confidence = Some((score * field.value_confidence).clamp(0.0, 100.0));
                 result.geometry = Some(geometry(field.value_box.clone()));
                 out.push(block);
                 out.push(result);
@@ -2326,9 +2471,9 @@ fn char_span(text: &str, from: usize, to: usize) -> String {
 
 /// The box covering every one of `words`, or the line's own box when it has none.
 fn words_box(line: &LineLayout, words: &[&WordLayout]) -> BoundingBox {
-    let boxes = word_boxes(line, words);
+    let boxes = word_boxes(words);
     if boxes.is_empty() {
-        bounding_box(line.index, 0, line.text.chars().count())
+        line.bbox.clone()
     } else {
         union(&boxes)
     }
@@ -2347,16 +2492,17 @@ fn summary_fields(lines: &[LineLayout], page_number: i32) -> Vec<ExpenseField> {
         let chars = line.text.chars().count();
         let label = char_span(&line.text, 0, colon).trim().to_string();
         let value = char_span(&line.text, colon + 1, chars).trim().to_string();
+        let value_confidence = words_confidence(line, &value_words);
         out.push(expense_field(
             summary_field_type(&label),
             Some(detection(
                 &label,
                 words_box(line, &label_words),
-                line.confidence,
+                words_confidence(line, &label_words),
             )),
-            detection(&value, words_box(line, &value_words), line.confidence),
+            detection(&value, words_box(line, &value_words), value_confidence),
             page_number,
-            line.confidence,
+            value_confidence,
         ));
     }
     out
@@ -2384,9 +2530,13 @@ fn line_item(line: &LineLayout, header: Option<&LineLayout>, page_number: i32) -
     let mut fields = vec![expense_field(
         EXPENSE_ROW_FIELD_TYPE,
         None,
-        detection(&row_text, words_box(line, &row_words), line.confidence),
+        detection(
+            &row_text,
+            words_box(line, &row_words),
+            words_confidence(line, &row_words),
+        ),
         page_number,
-        line.confidence,
+        words_confidence(line, &row_words),
     )];
     let header_texts = header.map(cell_texts).unwrap_or_default();
     for (column, text) in texts.iter().enumerate() {
@@ -2403,20 +2553,21 @@ fn line_item(line: &LineLayout, header: Option<&LineLayout>, page_number: i32) -
             (Some(header), Some(header_text)) => Some(detection(
                 header_text,
                 words_box(header, &cell_words(header, column)),
-                header.confidence,
+                words_confidence(header, &cell_words(header, column)),
             )),
             _ => None,
         };
+        let cell_confidence = words_confidence(line, &cell_words(line, column));
         fields.push(expense_field(
             kind,
             label,
             detection(
                 text,
                 words_box(line, &cell_words(line, column)),
-                line.confidence,
+                cell_confidence,
             ),
             page_number,
-            line.confidence,
+            cell_confidence,
         ));
     }
     LineItemFields {
@@ -2498,7 +2649,7 @@ pub fn expense_documents(key: &str, content: &DocumentContent) -> Vec<ExpenseDoc
         .enumerate()
         .map(|(page_index, page_text)| {
             let page_number = i32::try_from(page_index + 1).unwrap_or(i32::MAX);
-            let lines = layout_page(key, page_index, page_text, content.confidence);
+            let lines = layout_page(key, page_index, page_text, content);
             ExpenseDocument {
                 expense_index: Some(page_number),
                 summary_fields: Some(summary_fields(&lines, page_number)),
