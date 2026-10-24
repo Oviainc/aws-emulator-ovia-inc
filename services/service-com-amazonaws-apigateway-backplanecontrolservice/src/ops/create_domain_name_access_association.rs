@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomainNameAccessAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomainNameAccessAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomainNameAccessAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores one `DomainNameAccessAssociation` between an access association
+//! source and a stored PRIVATE custom domain name, and reports the record it wrote. The
+//! pair `(domain name, access association source)` IS the association, so a second create
+//! of a pair this account already holds is the modelled `ConflictException` — decided and
+//! written under one store lock, so concurrent creates of one pair store exactly one
+//! record.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +88,74 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    bound_chars, bound_entries, bound_tag, DomainNameAccessAssociationEntry,
+    MAX_DOMAIN_NAME_ACCESS_ASSOCIATIONS, MAX_STRING_CHARS, MAX_TAGS, PRIVATE_ENDPOINT_TYPE,
+};
+
+/// Read `domainNameArn` as the key the domain name it names is stored under
+/// (`smithy_query(query="operation", operation="GetDomainName")`:
+/// `/domainnames/{domainName}` is that ARN's resource portion).
+///
+/// The ARN is read through [`crate::state::parse_tagged_resource`] — the one place this
+/// service reads a caller-supplied ARN — and then held to the kind of resource this
+/// member names, so a value that is not an ARN, an ARN of another vendor, or an ARN
+/// naming another kind of API Gateway resource is refused here the way it is everywhere
+/// else in this service.
+fn domain_name_key_of(value: &str) -> Option<String> {
+    match crate::state::parse_tagged_resource(value) {
+        Some(crate::state::TaggedResource::DomainName { domain_name_key }) => Some(domain_name_key),
+        _ => None,
+    }
+}
+
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all. The tags a create carries are checked by the SAME rule `TagResource`
+/// applies, so a tag this service refuses on one path cannot be stored through the other.
+fn bound_input(input: &CreateDomainNameAccessAssociationInput) -> Result<(), String> {
+    bound_chars("domainNameArn", &input.domain_name_arn, MAX_STRING_CHARS)?;
+    bound_chars(
+        "accessAssociationSource",
+        &input.access_association_source,
+        MAX_STRING_CHARS,
+    )?;
+    if let Some(tags) = &input.tags {
+        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        for (key, value) in tags {
+            bound_tag(key, value)?;
+        }
+    }
+    Ok(())
+}
+
+impl From<&DomainNameAccessAssociationEntry> for CreateDomainNameAccessAssociationOutput {
+    /// The `DomainNameAccessAssociation` body for a stored association — the one place
+    /// this crate renders that shape, so `CreateDomainNameAccessAssociation` and
+    /// `GetDomainNameAccessAssociations` cannot report a record differently.
+    fn from(entry: &DomainNameAccessAssociationEntry) -> Self {
+        Self {
+            domain_name_access_association_arn: Some(
+                entry.domain_name_access_association_arn.clone(),
+            ),
+            domain_name_arn: Some(entry.domain_name_arn.clone()),
+            access_association_source_type: Some(entry.access_association_source_type.clone()),
+            access_association_source: Some(entry.access_association_source.clone()),
+            // The collection of tags is ALWAYS reported, empty when the association
+            // carries none: `tags` is "the collection of tags" of the resource, which is
+            // an empty map on a resource that has none, not an absent one.
+            tags: Some(
+                entry
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,18 +228,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomainNameAccessAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainNameAccessAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomainNameAccessAssociation"))
+        let bad_request = |message: String| -> Self::Error {
+            CreateDomainNameAccessAssociationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store unchecked, and the ARN is read as an ARN,
+        // before the store lock is taken at all. `accessAssociationSourceType` is NOT
+        // checked here: it is a modelled enum, so a value outside it is refused before
+        // this handler runs.
+        bound_input(&input).map_err(bad_request)?;
+        let domain_name_key = domain_name_key_of(&input.domain_name_arn)
+            .ok_or_else(|| bad_request(crate::state::invalid_arn(&input.domain_name_arn)))?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+
+        // Bound the growth a caller drives; see `MAX_DOMAIN_NAME_ACCESS_ASSOCIATIONS`.
+        if store.domain_name_access_associations.len() >= MAX_DOMAIN_NAME_ACCESS_ASSOCIATIONS {
+            return Err(
+                CreateDomainNameAccessAssociationErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        retry_after_seconds: None,
+                        message: Some(format!(
+                            "Maximum number of domain name access associations exceeded: \
+                             {MAX_DOMAIN_NAME_ACCESS_ASSOCIATIONS}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Creates a domain name access association resource between an access association
+        // source and a PRIVATE custom domain name": the domain name the request names must
+        // be a record this emulator holds, and one whose endpoint configuration makes it
+        // private — a domain name reached through VPC endpoints, which is the only kind an
+        // access association is defined for. This operation models no `NotFoundException`,
+        // so a `domainNameArn` that resolves to no such domain name is the modelled bad
+        // request, carrying the one sentence this service answers an unresolvable domain
+        // name identifier with.
+        let domain = store
+            .domain_names
+            .get(&domain_name_key)
+            .ok_or_else(|| bad_request(crate::state::NO_SUCH_DOMAIN_NAME.to_string()))?;
+        let private = domain
+            .endpoint_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.types.as_ref())
+            .is_some_and(|types| types.iter().any(|kind| kind == PRIVATE_ENDPOINT_TYPE));
+        if !private {
+            return Err(bad_request(format!(
+                "A domain name access association may only be created for a \
+                 {PRIVATE_ENDPOINT_TYPE} custom domain name, and {} is not one",
+                domain.domain_name
+            )));
+        }
+        // The domain name's OWN ARN is what the record stores and every read reports, so an
+        // association names the domain name this emulator resolved rather than the spelling
+        // one request happened to carry.
+        let domain_name_arn = domain.domain_name_arn.clone();
+
+        // An access association IS the pair `(domain name, source)`, so this account holds
+        // at most one for a pair: a second create of the same pair is the modelled
+        // conflict. The check and the insert below share ONE hold of the store lock, so
+        // concurrent creates of one pair cannot both pass it — exactly one stores a record
+        // and every other is refused.
+        if let Some(existing) =
+            store.access_association_of(&domain_name_arn, &input.access_association_source)
+        {
+            let existing_arn = existing.domain_name_access_association_arn.clone();
+            return Err(
+                CreateDomainNameAccessAssociationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "The access association source {} is already associated with the \
+                             domain name {domain_name_arn}: {existing_arn}",
+                            input.access_association_source
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_id();
+        let sequence = store.next_sequence();
+        let entry = DomainNameAccessAssociationEntry {
+            domain_name_access_association_arn:
+                crate::state::domain_name_access_association_arn(&region, &id),
+            id: id.clone(),
+            domain_name_arn,
+            access_association_source_type: input.access_association_source_type,
+            access_association_source: input.access_association_source,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<String, String>>(),
+            sequence,
+        };
+
+        // Reading the record back means what the caller is told is what a later
+        // `GetDomainNameAccessAssociations` will report.
+        store
+            .domain_name_access_associations
+            .insert(id.clone(), entry);
+        let stored = store
+            .domain_name_access_associations
+            .get(&id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let output = CreateDomainNameAccessAssociationOutput::from(stored);
+        // Everything below is owned, so the store lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            domain_name_access_association = ?id,
+            outcome = "created",
+            "domain name access association created",
+        );
+        Ok(output)
     }
 }

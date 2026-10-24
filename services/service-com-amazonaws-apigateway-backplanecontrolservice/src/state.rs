@@ -6,7 +6,8 @@
 //! `Resource`s under it (including the implicit root resource every API is created
 //! with), the `Method`s put on those resources, the API's `Stage`s and the gateway
 //! responses a developer has customized on it — beside the
-//! account's `ApiKey`, `VpcLink`, `UsagePlan` and custom `DomainName` records. Every
+//! account's `ApiKey`, `VpcLink`, `UsagePlan` and custom `DomainName` records and the
+//! domain name access associations created against those domain names. Every
 //! handler in `src/ops/` computes its response from these records; nothing is synthesised
 //! per request.
 //!
@@ -51,6 +52,14 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// itself, or `<domainName>+<domainNameId>` for a private one, which is addressed by
     /// both members because several private domain names may carry one name.
     pub domain_names: BTreeMap<String, DomainNameEntry>,
+    /// Every created `DomainNameAccessAssociation`, keyed by the identifier the resource
+    /// portion of its ARN carries — the one `DeleteDomainNameAccessAssociation` and
+    /// `RejectDomainNameAccessAssociation` address an association by, inside the ARN they
+    /// take. An access association belongs to the ACCOUNT rather than to the domain name
+    /// it names, so it sits beside the domain names here rather than inside one of them:
+    /// the operation that lists them lists the account's, whichever domain name each one
+    /// is for.
+    pub domain_name_access_associations: BTreeMap<String, DomainNameAccessAssociationEntry>,
     /// The account-level settings `UpdateAccount` writes and `GetAccount` reports.
     /// There is exactly one per account, so it is a field rather than a map.
     pub account: AccountEntry,
@@ -818,6 +827,38 @@ pub fn domain_name_key(domain_name: &str, domain_name_id: Option<&str>) -> Strin
     }
 }
 
+/// One stored `DomainNameAccessAssociation`: the access association source a private
+/// custom domain name may be invoked from, and the domain name it was created against.
+///
+/// The record stores only what it OWNS — the identifier the service minted for it, the
+/// ARN that identifier spells, the pair of members that say WHICH source is associated
+/// with WHICH domain name, and its tags. Nothing of the domain name's own record is
+/// copied here: two copies of one domain name is how a reader ends up reporting a stale
+/// one.
+#[derive(Debug, Clone, Default)]
+pub struct DomainNameAccessAssociationEntry {
+    /// The identifier this record is keyed by, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::mint_id`].
+    pub id: String,
+    /// The ARN of this association, as
+    /// [`domain_name_access_association_arn`] spells it: assigned when the record is
+    /// created and stored, so every later read reports the same value.
+    pub domain_name_access_association_arn: String,
+    /// The ARN of the domain name this association is for, as the request named it.
+    pub domain_name_arn: String,
+    /// The type of the access association source; the one value the modelled
+    /// `AccessAssociationSourceType` enum declares.
+    pub access_association_source_type: String,
+    /// The access association source itself — "For a VPCE, the value is the VPC endpoint
+    /// ID" — as the request named it.
+    pub access_association_source: String,
+    pub tags: BTreeMap<String, String>,
+    /// This association's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing can report creation order rather than id order.
+    pub sequence: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Service-side defaults for a created `RestApi` or custom `DomainName`
 //
@@ -1213,6 +1254,21 @@ pub const DEFAULT_PAGE_LIMIT: i32 = 25;
 /// API Gateway's documented maximum page size; see [`DEFAULT_PAGE_LIMIT`].
 pub const MAX_PAGE_LIMIT: i32 = 500;
 
+/// The `resourceOwner` that selects the records of ANOTHER account — one of the two
+/// values the modelled `ResourceOwner` enum declares (`smithy_query(query="shape",
+/// shape="ResourceOwner")`: `SELF`, `OTHER_ACCOUNTS`), which
+/// [`crate::ops::types::RESOURCE_OWNER_VALUES`] lists on the wire.
+///
+/// This member selects by OWNER: `SELF` lists the records "owned by your own account"
+/// and `OTHER_ACCOUNTS` those "owned by other AWS accounts". This emulator serves
+/// exactly one account ([`::emulator_server::emulator_account_id`]), and every record it
+/// stores was created by that account's own call, so nothing it holds has another owner:
+/// a request for this owner gets an empty page, rather than this account's own records
+/// reported as somebody else's. ONE spelling of the rule for every collection the member
+/// filters (`GetDomainNames`, `GetDomainNameAccessAssociations`), so two of them cannot
+/// drift on it.
+pub const OTHER_ACCOUNTS_RESOURCE_OWNER: &str = "OTHER_ACCOUNTS";
+
 // ---------------------------------------------------------------------------
 // Store bounds
 //
@@ -1250,6 +1306,11 @@ pub const MAX_USAGE_PLAN_KEYS_PER_PLAN: usize = MAX_API_KEYS;
 /// API Gateway's default quota "Custom domain names (regional or edge-optimized) per
 /// account per Region: 120".
 pub const MAX_DOMAIN_NAMES: usize = 120;
+
+/// Emulator resource guard, NOT an AWS quota: the most domain name access associations
+/// this emulator stores for one account. API Gateway publishes no quota for them, so the
+/// bound is the emulator's own, the same order as the sibling per-account guards above.
+pub const MAX_DOMAIN_NAME_ACCESS_ASSOCIATIONS: usize = 300;
 
 /// API Gateway's default quota "Resources per API: 300".
 pub const MAX_RESOURCES_PER_API: usize = 300;
@@ -1400,17 +1461,14 @@ pub const MAX_TAG_VALUE_CHARS: usize = 256;
 const ARN_SERVICE: &str = "apigateway";
 
 /// The leading resource-portion segment of each taggable resource kind whose records
-/// this emulator does not keep: the operations that create a client certificate or a
-/// domain name access association are still scaffolds, so nothing can answer to one of
-/// these ARNs — while the ARN itself is a well-formed ARN of a taggable API Gateway
-/// resource and so is not a malformed request.
+/// this emulator does not keep: the operation that generates a client certificate is
+/// still a scaffold, so nothing can answer to one of these ARNs — while the ARN itself is
+/// a well-formed ARN of a taggable API Gateway resource and so is not a malformed
+/// request.
 ///
 /// The segments are the first path segment of each kind's read URI; see the section
 /// comment above for the `smithy_query` calls they come from.
-const UNSTORED_TAGGABLE_KINDS: &[&str] = &[
-    "clientcertificates",
-    "domainnameaccessassociations",
-];
+const UNSTORED_TAGGABLE_KINDS: &[&str] = &["clientcertificates"];
 
 /// The resource one `resourceArn` names: the stored record a tag collection hangs off,
 /// as [`parse_tagged_resource`] read it out of the ARN.
@@ -1432,6 +1490,9 @@ pub enum TaggedResource {
     /// `/domainnames/{domainName}` — a [`DomainNameEntry`]'s tags, where the path
     /// segment is the record's [`domain_name_key`].
     DomainName { domain_name_key: String },
+    /// `/domainnameaccessassociations/{id}` — a [`DomainNameAccessAssociationEntry`]'s
+    /// tags, where the path segment is the record's minted id.
+    DomainNameAccessAssociation { access_association_id: String },
     /// A taggable kind this emulator keeps no records of; see
     /// [`UNSTORED_TAGGABLE_KINDS`]. `kind` is that list's entry and `id` the identifier
     /// the ARN carried, so the refusal can name what it could not resolve.
@@ -1459,6 +1520,7 @@ impl TaggedResource {
             TaggedResource::VpcLink { .. } => "vpclinks",
             TaggedResource::UsagePlan { .. } => "usageplans",
             TaggedResource::DomainName { .. } => "domainnames",
+            TaggedResource::DomainNameAccessAssociation { .. } => "domainnameaccessassociations",
             TaggedResource::Unstored { kind, .. } => kind,
         }
     }
@@ -1506,6 +1568,11 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
         ["domainnames", domain_name_key] => Some(TaggedResource::DomainName {
             domain_name_key: (*domain_name_key).to_string(),
         }),
+        ["domainnameaccessassociations", access_association_id] => {
+            Some(TaggedResource::DomainNameAccessAssociation {
+                access_association_id: (*access_association_id).to_string(),
+            })
+        }
         [kind, id] => UNSTORED_TAGGABLE_KINDS
             .iter()
             .copied()
@@ -2322,6 +2389,37 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
         ordered.into_iter().map(DomainNameEntry::key).collect()
     }
 
+    /// The ids of every stored domain name access association in creation order, the
+    /// stable sequence [`page_of`] cuts a `GetDomainNameAccessAssociations` page out of.
+    pub fn domain_name_access_association_ids_in_creation_order(&self) -> Vec<String> {
+        let mut ordered: Vec<&DomainNameAccessAssociationEntry> =
+            self.domain_name_access_associations.values().collect();
+        ordered.sort_by_key(|association| (association.sequence, association.id.clone()));
+        ordered
+            .into_iter()
+            .map(|association| association.id.clone())
+            .collect()
+    }
+
+    /// The stored access association of `access_association_source` with the domain name
+    /// `domain_name_arn`, if this account already has one.
+    ///
+    /// An access association IS that pair — it is what lets one source invoke one private
+    /// custom domain name — so the pair is what identifies an existing association, and
+    /// this is the one lookup that decides whether a create would duplicate one.
+    pub fn access_association_of(
+        &self,
+        domain_name_arn: &str,
+        access_association_source: &str,
+    ) -> Option<&DomainNameAccessAssociationEntry> {
+        self.domain_name_access_associations
+            .values()
+            .find(|association| {
+                association.domain_name_arn == domain_name_arn
+                    && association.access_association_source == access_association_source
+            })
+    }
+
     /// The tag collection stored on the resource a `resourceArn` named, as
     /// [`parse_tagged_resource`] read it.
     ///
@@ -2368,6 +2466,13 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .get(domain_name_key)
                 .map(|domain| &domain.tags)
                 .ok_or_else(|| NO_SUCH_DOMAIN_NAME.to_string()),
+            TaggedResource::DomainNameAccessAssociation {
+                access_association_id,
+            } => self
+                .domain_name_access_associations
+                .get(access_association_id)
+                .map(|association| &association.tags)
+                .ok_or_else(|| NO_SUCH_ACCESS_ASSOCIATION.to_string()),
             TaggedResource::Unstored { kind, id } => Err(no_such_tagged_resource(kind, id)),
         }
     }
@@ -2426,6 +2531,13 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .get_mut(domain_name_key)
                 .map(|domain| &mut domain.tags)
                 .ok_or_else(|| NO_SUCH_DOMAIN_NAME.to_string()),
+            TaggedResource::DomainNameAccessAssociation {
+                access_association_id,
+            } => self
+                .domain_name_access_associations
+                .get_mut(access_association_id)
+                .map(|association| &mut association.tags)
+                .ok_or_else(|| NO_SUCH_ACCESS_ASSOCIATION.to_string()),
             TaggedResource::Unstored { kind, id } => Err(no_such_tagged_resource(kind, id)),
         }
     }
@@ -2576,6 +2688,13 @@ pub const NO_SUCH_USAGE_PLAN: &str = "Invalid Usage Plan ID specified";
 /// all of them say the same thing about the same failure.
 pub const NO_SUCH_DOMAIN_NAME: &str = "Invalid domain name identifier specified";
 
+/// The `NotFoundException` message for a domain name access association ARN that names no
+/// stored association, in the shape of the sibling identifier messages above. Shared by
+/// every operation that resolves one, so all of them say the same thing about the same
+/// failure.
+pub const NO_SUCH_ACCESS_ASSOCIATION: &str =
+    "Invalid domain name access association identifier specified";
+
 /// The `NotFoundException` message for a well-formed ARN of a taggable resource kind
 /// this emulator keeps no records of (see [`UNSTORED_TAGGABLE_KINDS`]): nothing answers
 /// to it, which is a missing resource and not a malformed request.
@@ -2678,6 +2797,15 @@ pub fn service_arn(region: &str, resource_path: &str) -> String {
 /// The ARN of the stored custom domain name addressed by `key` (a [`domain_name_key`]).
 pub fn domain_name_arn(region: &str, key: &str) -> String {
     service_arn(region, &format!("/domainnames/{key}"))
+}
+
+/// The ARN of the stored domain name access association addressed by `id`.
+///
+/// The resource portion is the one [`parse_tagged_resource`] reads back, so the ARN this
+/// service REPORTS from a create is the ARN its readers, its tag operations and
+/// `RejectDomainNameAccessAssociation` resolve again.
+pub fn domain_name_access_association_arn(region: &str, id: &str) -> String {
+    service_arn(region, &format!("/domainnameaccessassociations/{id}"))
 }
 
 /// The length of an API Gateway-minted API key value: 40 characters, as observed from
