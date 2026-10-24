@@ -75,6 +75,24 @@ impl Kind {
             Kind::AppsList => state::apps_list_arn(REGION, id),
         }
     }
+
+    /// The operation a customer calls to delete a resource of this kind, and the
+    /// request naming the resource id `id` — each kind's input names the id
+    /// differently (`PolicyId` / `Identifier` / `ListId`).
+    ///
+    /// It lives on the shared `Kind` so a suite that deletes a resource of an
+    /// arbitrary taggable kind names the mapping once. The
+    /// `crate::managed_list_deletion` suite keeps its own two-variant enum,
+    /// because what it ranges over is the pair of LIST kinds that have a managed
+    /// namespace, not the taggable kinds.
+    pub(crate) fn delete_request(self, id: &str) -> (&'static str, Value) {
+        match self {
+            Kind::Policy => ("DeletePolicy", json!({ "PolicyId": id })),
+            Kind::ResourceSet => ("DeleteResourceSet", json!({ "Identifier": id })),
+            Kind::ProtocolsList => ("DeleteProtocolsList", json!({ "ListId": id })),
+            Kind::AppsList => ("DeleteAppsList", json!({ "ListId": id })),
+        }
+    }
 }
 
 /// A wire `TagList` as the stored `Tag` structs, for the kinds this test seeds
