@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPatientInsightsJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPatientInsightsJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPatientInsightsJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +83,26 @@
 //!   allowed request rate.
 //! * `ValidationException` (HTTP 400) — This error is thrown when the client supplies invalid
 //!   input to the API.
+//!
+//! ---
+//!
+//! # How this operation behaves
+//!
+//! "Get details of a started patient insights job" is a REPORTING operation
+//! (`@readonly`), so every member it answers with is read out of the stored
+//! [`crate::state::PatientInsightsJob`] the matching `StartPatientInsightsJob` wrote.
+//! Nothing is echoed from the request but the two identifiers the record was resolved
+//! against.
+//!
+//! The one thing it writes is what the CLOCK already made due: a domain whose `DELETING`
+//! span has elapsed is purged, and a job whose next status transition has fallen due is
+//! moved on (`advance_due_patient_insights_jobs`). Both were owed at this instant
+//! whether or not anybody called, so reading changes nothing a later caller would not
+//! have seen anyway.
+//!
+//! A `domainId` that names no live domain, and a `jobId` that names no job under it, are
+//! both the modelled `ResourceNotFoundException`: a job started in one domain is not
+//! readable through another.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -168,18 +179,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPatientInsightsJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPatientInsightsJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPatientInsightsJob"))
+        // The store is unreachable only when this service was mounted on a foreign
+        // engine. This operation models `InternalServerException`, so that is the
+        // channel for a server-side failure.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPatientInsightsJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "GetPatientInsightsJob could not reach this service's store".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // A reporting operation, so it writes only what the CLOCK already made due: a
+        // domain whose DELETING span has elapsed is purged, and a job whose next status
+        // transition has fallen due is moved on.
+        store.purge_due_deletions(now);
+        store.advance_due_patient_insights_jobs(now);
+
+        // One miss, one answer. The domain and the job are resolved as a single scoped
+        // chain, so a job started in one domain cannot be read through another: the
+        // request has to name the domain the job actually belongs to.
+        let not_found = |message: String| -> Self::Error {
+            GetPatientInsightsJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+        if store.live_domain(&input.domain_id).is_none() {
+            return Err(not_found(
+                crate::service::error_detail::domain_not_found_message(&input.domain_id),
+            ));
+        }
+        let Some(job) = store.patient_insights_job(&input.domain_id, &input.job_id) else {
+            return Err(not_found(
+                crate::service::error_detail::patient_insights_job_not_found_message(&input.job_id),
+            ));
+        };
+
+        // Every member is read back OUT of the stored record: the identifiers and ARN
+        // the start minted, the status the clock moved the job to, the instants of its
+        // creation and last transition, and the parameters the start persisted.
+        Ok(GetPatientInsightsJobOutput {
+            job_id: job.job_id.clone(),
+            job_arn: job.arn.clone(),
+            job_status: job.status.as_wire().to_string(),
+            creation_time: Some(crate::state::to_timestamp(job.created_at)),
+            updated_time: Some(crate::state::to_timestamp(job.updated_at)),
+            insights_output: job.insights_output.clone(),
+            status_details: job.status_details.clone(),
+            patient_context: job.spec.patient_context.clone(),
+            insights_context: job.spec.insights_context.clone(),
+            encounter_context: job.spec.encounter_context.clone(),
+            user_context: job.spec.user_context.clone(),
+            input_data_config: job.spec.input_data_config.clone(),
+            output_data_config: job.spec.output_data_config.clone(),
+        })
     }
 }

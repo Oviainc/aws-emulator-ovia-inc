@@ -18,9 +18,10 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    MedicalScribeChannelDefinition, MedicalScribeListeningSessionDetails,
-    MedicalScribePostStreamActionSettingsResponse, MedicalScribePostStreamActionsResult,
-    SubscriptionDescription,
+    InputDataConfig, InsightsContext, InsightsOutput, MedicalScribeChannelDefinition,
+    MedicalScribeListeningSessionDetails, MedicalScribePostStreamActionSettingsResponse,
+    MedicalScribePostStreamActionsResult, OutputDataConfig, PatientInsightsEncounterContext,
+    PatientInsightsPatientContext, SubscriptionDescription, UserContext,
 };
 
 /// The region an emulated ARN carries when the request names none.
@@ -75,6 +76,37 @@ pub const MAX_DOMAIN_ALLOCATION_HISTORY: usize = 1024;
 /// The most `Subscription` records one `Domain` holds, so the product
 /// (domains x subscriptions) is bounded too.
 pub const MAX_SUBSCRIPTIONS_PER_DOMAIN: usize = 100;
+
+/// The most `PatientInsightsJob` records one `Domain` holds, so the product
+/// (domains x jobs) is bounded as well: a caller looping `StartPatientInsightsJob`
+/// cannot grow the shared store without limit. A job record stays reachable for as long
+/// as its domain does, so nothing drops one behind a caller's back; past this count a
+/// start is refused instead (see `StartPatientInsightsJob`).
+pub const MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN: usize = 100;
+
+/// How long a patient insights job sits in ONE non-terminal `JobStatus` before the
+/// transition the clock owes it is materialised (`SUBMITTED` -> `IN_PROGRESS`, then
+/// `IN_PROGRESS` -> a terminal status).
+///
+/// AWS documents no duration for a patient insights job, so the span is CHOSEN, and
+/// chosen inside the emulator's transient window (250-750 ms): a caller that reads
+/// straight after `StartPatientInsightsJob` still observes `SUBMITTED` rather than a job
+/// that was already finished by the time the start returned.
+pub const PATIENT_INSIGHTS_JOB_STEP_SPAN: Duration = Duration::from_millis(400);
+
+/// Why every patient insights job this emulator accepts ends in `FAILED`.
+///
+/// A patient insights job is an INFERENCE run: the real service reads the patient data
+/// the request points at and generates clinical insights from it, which nothing inside
+/// this emulator can do — there is no model to run and no S3 object to write. So the
+/// job's control plane is real (the record, its id, ARN, timestamps and status
+/// transitions are all stored and reported from state) while the run itself is reported
+/// as the failure it is, in the service's own modelled failure status and with a
+/// `statusDetails` that says so. Nothing is synthesised to look computed: a job that
+/// generated no insights carries no `insightsOutput`.
+pub const PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE: &str =
+    "Patient insights generation is not available in this emulator: no insights model ran \
+     for this job, so no output was written to the configured output location.";
 
 /// The most tag entries one resource ARN carries — AWS's standard tagging limit of 50,
 /// which also bounds what one request can add to the tag store. `TagMap` itself declares
@@ -228,6 +260,15 @@ pub struct Domain {
     pub web_app_configuration: Option<WebAppConfigurationRecord>,
     pub created_at: SystemTime,
     pub subscriptions: BTreeMap<String, Subscription>,
+    /// The patient insights jobs started in this domain, by `jobId`. Held HERE rather
+    /// than in a map beside the registry, so a job is scoped to its own domain and goes
+    /// away with it.
+    pub patient_insights_jobs: BTreeMap<String, PatientInsightsJob>,
+    /// The `jobId` each `clientToken` a `StartPatientInsightsJob` carried is bound to, so
+    /// a retried start with the same token resolves to the job the first one created
+    /// instead of starting a second. Scoped to the domain, as the job it names is, and
+    /// bounded with it: an entry is written only when a job is created.
+    pub patient_insights_job_ids_by_client_token: BTreeMap<String, String>,
 }
 
 impl Domain {
@@ -243,6 +284,155 @@ impl Domain {
     /// completes within the call and is reported in the terminal `DELETED`.
     pub fn deletion_completes_in_call(&self) -> bool {
         self.web_app_configuration.is_none()
+    }
+}
+
+/// A patient insights job's lifecycle, as the model's `JobStatus` enum declares it
+/// (`smithy_query(query="shape",shape="JobStatus")`: `SUBMITTED`, `IN_PROGRESS`,
+/// `FAILED`, `SUCCEEDED`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Submitted,
+    InProgress,
+    Failed,
+    Succeeded,
+}
+
+impl JobStatus {
+    /// The wire value — one of `types::JOB_STATUS_VALUES`.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Submitted => "SUBMITTED",
+            Self::InProgress => "IN_PROGRESS",
+            Self::Failed => "FAILED",
+            Self::Succeeded => "SUCCEEDED",
+        }
+    }
+
+    /// The status a wire value names, or `None` when it names none.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "SUBMITTED" => Some(Self::Submitted),
+            "IN_PROGRESS" => Some(Self::InProgress),
+            "FAILED" => Some(Self::Failed),
+            "SUCCEEDED" => Some(Self::Succeeded),
+            _ => None,
+        }
+    }
+}
+
+/// The job parameters a `StartPatientInsightsJob` request carries — every member of that
+/// request except the `domainId` it is scoped by and the `clientToken` that identifies
+/// the request rather than the job.
+///
+/// Stored once and rendered back by `GetPatientInsightsJob`, which reports each of them
+/// as a required member: the reader projects the STORED parameters, so what a start
+/// persisted is what a later get reads.
+#[derive(Debug, Clone)]
+pub struct PatientInsightsJobSpec {
+    pub patient_context: PatientInsightsPatientContext,
+    pub insights_context: InsightsContext,
+    pub encounter_context: PatientInsightsEncounterContext,
+    pub user_context: UserContext,
+    pub input_data_config: InputDataConfig,
+    pub output_data_config: OutputDataConfig,
+}
+
+impl PatientInsightsJobSpec {
+    /// A digest of every parameter, so a repeated `clientToken` can be told from a token
+    /// reused for DIFFERENT parameters without keeping a second copy of the request
+    /// around.
+    ///
+    /// Every value is length-prefixed before it is folded in, so two different parameter
+    /// sets cannot collide by running their text together, and an optional member
+    /// contributes a part whether or not it was supplied.
+    pub fn fingerprint(&self) -> String {
+        let mut parts: Vec<String> = vec![
+            self.patient_context.patient_id.clone(),
+            self.patient_context.date_of_birth.clone().unwrap_or_default(),
+            self.patient_context.pronouns.clone().unwrap_or_default(),
+            self.insights_context.insights_type.clone(),
+            self.encounter_context.encounter_reason.clone(),
+            self.user_context.role.clone(),
+            self.user_context.user_id.clone(),
+            self.user_context.specialty.clone().unwrap_or_default(),
+            self.output_data_config.s3_output_path.clone(),
+        ];
+        match &self.input_data_config.fhir_server {
+            Some(server) => {
+                parts.push("fhirServer".to_string());
+                parts.push(server.fhir_endpoint.clone());
+                parts.push(server.oauth_token.clone().unwrap_or_default());
+            }
+            None => parts.push(String::new()),
+        }
+        for source in self.input_data_config.s3_sources.iter().flatten() {
+            parts.push(source.uri.clone());
+        }
+        let mut hasher = Sha256::new();
+        for part in parts {
+            hasher.update((part.len() as u64).to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+        hex::encode(hasher.finalize())
+    }
+}
+
+/// A persisted patient insights job, stored under the `Domain` it was started in — which
+/// is what SCOPES it: a job is reachable only through the `domainId` it belongs to, so
+/// one domain's job cannot be read through another's, and a domain's jobs go away with
+/// the domain.
+#[derive(Debug, Clone)]
+pub struct PatientInsightsJob {
+    pub job_id: String,
+    pub domain_id: String,
+    pub arn: String,
+    pub status: JobStatus,
+    /// The text reported for the CURRENT status; `None` while there is nothing to say
+    /// about it.
+    pub status_details: Option<String>,
+    /// Where the generated insights were written. `None` unless a run actually produced
+    /// them — see [`PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE`] for why no job this emulator
+    /// runs ever does.
+    pub insights_output: Option<InsightsOutput>,
+    pub created_at: SystemTime,
+    /// When the record last changed — the instant of its last status transition, which is
+    /// the creation instant for a job that has not moved yet.
+    pub updated_at: SystemTime,
+    /// When the next status transition the clock owes becomes due; `None` once the job is
+    /// in a terminal status and owes none.
+    pub next_transition_at: Option<SystemTime>,
+    /// The parameters the start persisted, reported back by the reader.
+    pub spec: PatientInsightsJobSpec,
+}
+
+impl PatientInsightsJob {
+    /// Apply every status transition the CLOCK has already made due.
+    ///
+    /// A non-terminal job owes exactly one transition at a time, one
+    /// [`PATIENT_INSIGHTS_JOB_STEP_SPAN`] after the previous one: `SUBMITTED` ->
+    /// `IN_PROGRESS`, then `IN_PROGRESS` -> `FAILED`, which is where a run this emulator
+    /// cannot perform ends ([`PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE`]). Each transition
+    /// is stamped with the instant it FELL DUE rather than the instant somebody happened
+    /// to look, so the record reads the same however late the first read comes.
+    fn apply_due_transitions(&mut self, now: SystemTime) {
+        while let Some(due) = self.next_transition_at.filter(|due| *due <= now) {
+            match self.status {
+                JobStatus::Submitted => {
+                    self.status = JobStatus::InProgress;
+                    self.next_transition_at = Some(due + PATIENT_INSIGHTS_JOB_STEP_SPAN);
+                }
+                JobStatus::InProgress => {
+                    self.status = JobStatus::Failed;
+                    self.status_details = Some(PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE.to_string());
+                    self.next_transition_at = None;
+                }
+                // A terminal status owes nothing; a due instant left on one is dropped
+                // rather than acted on.
+                JobStatus::Failed | JobStatus::Succeeded => self.next_transition_at = None,
+            }
+            self.updated_at = due;
+        }
     }
 }
 
@@ -463,6 +653,23 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         }
     }
 
+    /// Mint a `jobId` unused within `domain_id`: 32 hex characters, which is inside the
+    /// modelled `JobId` bound of 1..36 and inside the `[-a-zA-Z0-9_/.]+` segment the
+    /// `JobArn` pattern allows for a job.
+    pub fn mint_patient_insights_job_id(&mut self, domain_id: &str) -> String {
+        loop {
+            let seq = self.next_seq();
+            let candidate = mint_id("", 32, seq);
+            let taken = self
+                .domains
+                .get(domain_id)
+                .is_some_and(|domain| domain.patient_insights_jobs.contains_key(&candidate));
+            if !taken {
+                return candidate;
+            }
+        }
+    }
+
     /// Mint the Identity Center application id this service creates for a web app.
     pub fn mint_idc_application_id(&mut self) -> String {
         let seq = self.next_seq();
@@ -490,6 +697,38 @@ impl ComAmazonawsConnecthealthConnecthealthState {
                 }
             }
         }
+    }
+
+    /// Materialise every patient-insights-job status transition the CLOCK has already
+    /// made due, in every domain.
+    ///
+    /// Called at the top of every handler beside [`Self::purge_due_deletions`], including
+    /// the reporting ones: it writes only what was owed at this instant whether or not
+    /// anybody called, so a job observed late reads exactly as it would have at the
+    /// moment its transition fell due.
+    pub fn advance_due_patient_insights_jobs(&mut self, now: SystemTime) {
+        for domain in self.domains.values_mut() {
+            for job in domain.patient_insights_jobs.values_mut() {
+                job.apply_due_transitions(now);
+            }
+        }
+    }
+
+    /// The patient insights job `job_id` names under EXACTLY the domain `domain_id`
+    /// names.
+    ///
+    /// `None` when either link of that chain is missing — the domain is absent or no
+    /// longer live, or it holds no job of that id — so a job started in one domain is
+    /// never reachable through another, and both misses are the one answer
+    /// `GetPatientInsightsJob` gives: `ResourceNotFoundException`.
+    pub fn patient_insights_job(
+        &self,
+        domain_id: &str,
+        job_id: &str,
+    ) -> Option<&PatientInsightsJob> {
+        self.live_domain(domain_id)?
+            .patient_insights_jobs
+            .get(job_id)
     }
 
     /// The tags recorded for `arn`, in key order.
@@ -709,6 +948,14 @@ impl<T: ::aws_smithy_schema::serde::SerializableStruct>
 /// The ARN of a `Subscription`: its domain's ARN plus `/subscription/<subscriptionId>`.
 pub fn subscription_arn(domain_arn: &str, subscription_id: &str) -> String {
     format!("{domain_arn}/subscription/{subscription_id}")
+}
+
+/// The ARN of a patient insights job: its domain's ARN plus
+/// `/patient-insights-job/<jobId>`, which is the resource form the modelled `JobArn`
+/// pattern declares (`smithy_query(query="shape",shape="JobArn")`:
+/// `^arn:aws[-a-z]*:health-agent:[-a-z0-9]+:[0-9]{12}:domain/[-a-zA-Z0-9-]+/patient-insights-job/[-a-zA-Z0-9_/.]+$`).
+pub fn patient_insights_job_arn(domain_arn: &str, job_id: &str) -> String {
+    format!("{domain_arn}/patient-insights-job/{job_id}")
 }
 
 /// The web-app URL of a `Domain`, derived from the domain's own id and region.
