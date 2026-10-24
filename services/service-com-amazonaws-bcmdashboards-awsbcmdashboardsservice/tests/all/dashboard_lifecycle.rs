@@ -467,10 +467,11 @@ async fn create_then_get_reads_back_the_stored_dashboard() {
     }
 }
 
-/// The name is not the identity: dashboards created with the same name are distinct
-/// resources with distinct ARNs, each readable on its own.
+/// A dashboard's name identifies it within the account: a create naming a dashboard the
+/// account already holds is refused and stores nothing. See
+/// `tests/all/dashboard_name_uniqueness.rs` for the rule over a table of inputs.
 #[tokio::test]
-async fn same_name_creates_distinct_dashboards() {
+async fn a_second_create_under_a_stored_name_is_refused() {
     let router = router();
     let request = json!({
         "name": "Duplicate Name",
@@ -478,22 +479,31 @@ async fn same_name_creates_distinct_dashboards() {
     });
 
     let first = ok_call(&router, "CreateDashboard", &request).await;
-    let second = ok_call(&router, "CreateDashboard", &request).await;
     let first_arn = first["arn"].as_str().expect("an arn").to_string();
-    let second_arn = second["arn"].as_str().expect("an arn").to_string();
-    assert_ne!(
-        first_arn, second_arn,
-        "two CreateDashboard calls with one name must mint different arns"
+
+    let (status, body) = call(&router, "CreateDashboard", &request).await;
+    assert_eq!(
+        status, 400,
+        "a second create under a stored name must be refused, got {status}: {body}"
+    );
+    assert!(
+        error_code(&body).contains("ValidationException"),
+        "expected ValidationException, got {}",
+        error_code(&body)
     );
 
-    for arn in [&first_arn, &second_arn] {
-        let fetched = ok_call(&router, "GetDashboard", &json!({"arn": arn})).await;
-        assert_eq!(
-            fetched["arn"].as_str(),
-            Some(arn.as_str()),
-            "case {arn}: each dashboard must be readable under its own arn: {fetched}"
-        );
-    }
+    let listed = ok_call(&router, "ListDashboards", &json!({})).await;
+    let arns: Vec<&str> = listed["dashboards"]
+        .as_array()
+        .expect("dashboards")
+        .iter()
+        .map(|item| item["arn"].as_str().unwrap_or("<none>"))
+        .collect();
+    assert_eq!(
+        arns,
+        vec![first_arn.as_str()],
+        "the refused create must have stored nothing: {listed}"
+    );
 }
 
 /// Widget `width` and `height` are refused outside their modelled ranges and accepted
@@ -514,9 +524,11 @@ async fn widget_sizes_are_held_to_their_modelled_range() {
         ("height above max", 4, 11, false),
     ];
 
-    for (label, width, height, accepted) in cases {
+    for (index, (label, width, height, accepted)) in cases.iter().enumerate() {
+        // A distinct name per row: a dashboard's name is unique within the account
+        // (pinned by `dashboard_name_uniqueness`), and this row is about widget sizes.
         let request = json!({
-            "name": "Sized Widgets",
+            "name": format!("Sized Widgets {index}"),
             "widgets": [{
                 "title": "Spend",
                 "width": width,
@@ -1003,11 +1015,15 @@ async fn unknown_and_malformed_arns_are_told_apart() {
 #[tokio::test]
 async fn create_dashboard_stops_at_the_dashboard_quota() {
     let router = router();
-    let request = json!({"name": "Quota Filler", "widgets": []});
+    // A distinct name per create: a dashboard's name is unique within the account, so
+    // the quota — not a name collision — has to be what refuses the create past the
+    // ceiling. `DashboardName` is 2..50 characters matching
+    // `^(?!.* {2})[a-zA-Z][a-zA-Z0-9 _-]{0,48}[a-zA-Z0-9_-]$`, which every row below is.
+    let filler = |index: usize| json!({"name": format!("Quota Filler {index:04}"), "widgets": []});
 
     let mut first_arn = None;
     for index in 0..MAX_DASHBOARDS {
-        let created = ok_call(&router, "CreateDashboard", &request).await;
+        let created = ok_call(&router, "CreateDashboard", &filler(index)).await;
         let arn = created["arn"].as_str().expect("an arn").to_string();
         if index == 0 {
             first_arn = Some(arn);
@@ -1015,7 +1031,7 @@ async fn create_dashboard_stops_at_the_dashboard_quota() {
     }
     let first_arn = first_arn.expect("the first dashboard's arn");
 
-    let (status, body) = call(&router, "CreateDashboard", &request).await;
+    let (status, body) = call(&router, "CreateDashboard", &filler(MAX_DASHBOARDS)).await;
     assert_eq!(
         status, 402,
         "case at the quota: CreateDashboard must refuse past {MAX_DASHBOARDS} dashboards, got {status}: {body}"
@@ -1037,8 +1053,8 @@ async fn create_dashboard_stops_at_the_dashboard_quota() {
 
     // Freeing one record makes room for exactly one more.
     ok_call(&router, "DeleteDashboard", &json!({"arn": first_arn})).await;
-    ok_call(&router, "CreateDashboard", &request).await;
-    let (status, body) = call(&router, "CreateDashboard", &request).await;
+    ok_call(&router, "CreateDashboard", &filler(MAX_DASHBOARDS + 1)).await;
+    let (status, body) = call(&router, "CreateDashboard", &filler(MAX_DASHBOARDS + 2)).await;
     assert_eq!(
         status, 402,
         "case back at the quota: CreateDashboard must refuse again, got {status}: {body}"

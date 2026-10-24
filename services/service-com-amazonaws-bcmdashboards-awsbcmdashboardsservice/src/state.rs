@@ -232,8 +232,8 @@ pub struct ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     /// walks the dashboards in one stable order and a cursor taken on one page
     /// resumes at the right place on the next.
     pub dashboards: BTreeMap<String, Dashboard>,
-    /// Monotonic counter behind every minted dashboard resource id, so two
-    /// `CreateDashboard` calls with the same `name` get different ARNs.
+    /// Monotonic counter behind every minted dashboard resource id, so no two
+    /// dashboards — including one created after another was deleted — share an ARN.
     pub next_dashboard_seq: u64,
     /// Monotonic counter behind every minted widget id.
     pub next_widget_seq: u64,
@@ -262,6 +262,23 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
         self.next_dashboard_seq = self.next_dashboard_seq.wrapping_add(1);
         let resource_id = format!("{:032x}", self.next_dashboard_seq);
         ::engine::emulator_arn("bcm-dashboards", "", &format!("dashboard/{resource_id}"))
+    }
+
+    /// The ARN the dashboard named `name` is stored under, or `None` when no stored
+    /// dashboard carries that name.
+    ///
+    /// A dashboard's name identifies it within the account — `CreateDashboard`'s `name`
+    /// is documented as "The name of the dashboard. The name must be unique within your
+    /// account." (`smithy_query(query="doc",shape="CreateDashboardRequest",member="name")`)
+    /// — so every operation that ASSIGNS a name to a dashboard resolves the name here
+    /// before it writes, rather than each one scanning the map itself. The comparison is
+    /// exact: the model states no case folding, so two names that differ only in case are
+    /// two names.
+    pub fn dashboard_arn_by_name(&self, name: &str) -> Option<&str> {
+        self.dashboards
+            .values()
+            .find(|dashboard| dashboard.name == name)
+            .map(|dashboard| dashboard.arn.as_str())
     }
 
     /// The tags persisted on the resource `resource_arn` names, in the order they
@@ -388,6 +405,20 @@ pub fn record_state_change(
         outcome,
         "state-changing bcm-dashboards operation"
     );
+}
+
+/// How every operation that ASSIGNS a dashboard name words the refusal of a name the
+/// account already holds.
+///
+/// Built from the request, the way the boundary validator words a refusal: it names the
+/// member that broke the constraint, the value it carried and the constraint itself. One
+/// helper so `CreateDashboard` and `UpdateDashboard` cannot drift apart on the wording of
+/// one rule.
+pub fn duplicate_dashboard_name_message(name: &str) -> String {
+    format!(
+        "name: a dashboard named '{name}' already exists in this account; \
+         the name of a dashboard must be unique within your account"
+    )
 }
 
 /// The `scheduleConfig` to store for a create or an update: the supplied config with

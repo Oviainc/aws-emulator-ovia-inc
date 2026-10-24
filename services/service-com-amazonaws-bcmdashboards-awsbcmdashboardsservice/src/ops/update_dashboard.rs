@@ -9,11 +9,13 @@
 //! not-found refusal — HTTP 400 with the error code `ResourceNotFoundException` and a
 //! `resourceId` member carrying the requested ARN, as
 //! `crate::scaffolded::Scaffolded::resource_not_found` renders it (the model's `@httpError`
-//! for that shape is 404, which is not what the recorded service answers).
+//! for that shape is 404, which is not what the recorded service answers). A `name`
+//! another stored dashboard already carries answers the modelled `ValidationException`
+//! (HTTP 400) and changes nothing: a dashboard's name is unique within the account.
 //!
 //! Being state-changing, it emits the audit record `crate::state::record_state_change`
 //! writes (timestamp, source, presented access key id, operation, resource, outcome) on
-//! both the success and the not-found path.
+//! the success, the not-found and the duplicate-name path.
 //!
 //! ## Shape of an operation
 //!
@@ -189,6 +191,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "ResourceNotFoundException",
             );
             return Err(not_found());
+        }
+
+        // A dashboard's name identifies it within the account (`CreateDashboard`'s `name`:
+        // "The name must be unique within your account.") and `name` is @required on every
+        // update — so an update that would give this dashboard a name ANOTHER stored
+        // dashboard already carries is refused with this operation's modelled
+        // `ValidationException` (HTTP 400) and changes nothing. Renaming a dashboard to the
+        // name it already has is not a collision with itself: the only ARN the name may
+        // resolve to is this one.
+        if state
+            .dashboard_arn_by_name(&input.name)
+            .is_some_and(|holder| holder != arn.as_str())
+        {
+            crate::state::record_state_change(ctx, Self::NAME, &arn, "ValidationException");
+            return Err(UpdateDashboardErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::duplicate_dashboard_name_message(&input.name),
+                },
+            )
+            .into());
         }
 
         // Minting an id for a widget that arrived without one needs the state's own
