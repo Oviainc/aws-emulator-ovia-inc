@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopSearchJob
-//! Ends a running search job. The operation is `@idempotent` and asks for ONE end state,
+//! Cancels a search job. The operation is `@idempotent` and asks for ONE end state,
 //! the job stopped, so a job that is already `STOPPED` (or `STOPPING`) answers the
 //! modelled empty 200 and changes nothing: a retry of a safe-to-retry operation is never
-//! a caller-visible failure. Every other status is judged against the gate the model
-//! documents — only a `RUNNING` search job can be stopped
-//! (`crate::state::STOPPABLE_SEARCH_JOB_STATES`) — so a job that has not started
-//! scanning yet (`CREATING`) and one that ended in a status this operation does not
-//! produce (`COMPLETED`, `FAILED`) are both a `ConflictException` (409), and an
-//! identifier this account holds no job for is a `ResourceNotFoundException` (404). An
-//! identifier that is not a well-formed one at all is refused before the lookup as
-//! invalid input — `ValidationException` (400), see
+//! a caller-visible failure. Every other status is judged by
+//! [`crate::state::SearchJob::is_stoppable`]: a job whose scan has already ended in a
+//! status this operation does not produce (`COMPLETED`, `FAILED`) is a
+//! `ConflictException` (409), while any job still on its way to a terminal status —
+//! including one the service has accepted but not started scanning yet (`CREATING`) —
+//! accepts the cancel. An identifier this account holds no job for is a
+//! `ResourceNotFoundException` (404), and an identifier that is not a well-formed one at
+//! all is refused before the lookup as invalid input — `ValidationException` (400), see
 //! [`crate::state::check_job_identifier`].
 //!
 //! A stop moves the job to `STOPPING`, the transient status, and the clock owes it
@@ -194,19 +194,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(StopSearchJobOutput {});
         }
 
-        // Every other status is judged against the gate the operation's own documentation
-        // states: only a job whose scan is RUNNING can be stopped, which is what
-        // `crate::state::STOPPABLE_SEARCH_JOB_STATES` holds. A job that has not started
-        // scanning yet, and a job whose scan already ended in a status this operation does
-        // not produce, are both asking for a transition the record cannot make from where
-        // it is, so both are the modelled conflict and neither is written to.
+        // A job whose scan has already ended in a status this operation does not produce
+        // is asking for a transition the record cannot make from where it is: there is no
+        // scan left to cancel, so it is the modelled conflict and nothing is written to
+        // it. Every other status is still on its way to a terminal one and accepts the
+        // cancel below, the set-up phase included — the service records the cancel against
+        // the job record and the scan honours it whenever it starts, so there is no window
+        // in which an accepted job cannot be cancelled.
         if !job.is_stoppable() {
             return Err(StopSearchJobErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "search job '{identifier}' is {}; only a {} search job can be stopped",
-                    job.status,
-                    crate::state::STOPPABLE_SEARCH_JOB_STATES.join(" or ")
-                ),
+                message: crate::state::stop_conflict_message(&job.status),
                 resource_id: identifier,
                 resource_type: SEARCH_JOB_RESOURCE.to_string(),
             })
@@ -216,7 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         job.status = crate::state::STOPPING.to_string();
         // The stop REPLACES whatever the scan still owed (its own RUNNING and terminal
         // statuses), so a stopped job settles to STOPPED and never to the status its scan
-        // would have reached.
+        // would have reached — which is also what makes a cancel of a job still being set
+        // up converge on STOPPED rather than on the outcome its scan would have had.
         job.owe_only(
             crate::state::due_at(now, crate::state::TRANSITION_DELAY),
             crate::state::STOPPED,

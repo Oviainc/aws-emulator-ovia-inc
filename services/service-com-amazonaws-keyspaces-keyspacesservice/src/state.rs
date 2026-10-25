@@ -1106,19 +1106,6 @@ impl Table {
         }
         specification
     }
-
-    /// Whether any Region this table is replicated in overrides its read capacity auto
-    /// scaling.
-    ///
-    /// Those overrides are the one part of a table's auto scaling settings that does not
-    /// live in this Region's Application Auto Scaling — they belong to another Region's —
-    /// so they are what makes a table with no scalable target here still have settings
-    /// for `GetTableAutoScalingSettings` to report.
-    pub fn has_replica_auto_scaling(&self) -> bool {
-        self.replica_specifications
-            .values()
-            .any(|replica| replica.read_capacity_auto_scaling.is_some())
-    }
 }
 
 /// One user-defined type: the fields `CreateType` was given, plus what the service
@@ -2574,8 +2561,9 @@ pub fn retire_auto_scaling<Eng: Send + Sync + 'static>(
 /// for, which is what a stored `autoScalingDisabled: true` states; one that was never
 /// configured, or whose target has since been deregistered, has no settings at all.
 ///
-/// `None` means the table has no auto scaling settings to report, which is what
-/// `GetTableAutoScalingSettings` answers the modelled not-found for. `stored` is the
+/// `None` means the table has no auto scaling settings to report, which
+/// `GetTableAutoScalingSettings` reports by leaving its OPTIONAL `autoScalingSpecification`
+/// out of an otherwise ordinary report of the table. `stored` is the
 /// specification this service last wrote, which is also all that is known when the
 /// Application Auto Scaling store is not reachable from `engine`.
 ///

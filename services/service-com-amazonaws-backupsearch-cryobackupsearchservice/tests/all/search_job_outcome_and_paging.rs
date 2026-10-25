@@ -322,11 +322,12 @@ async fn stopping_a_job_is_idempotent_and_a_status_outside_the_gate_conflicts() 
     // just-started job reports, the status the job is seeded in, what a StopSearchJob
     // against it must answer, and the status the job holds afterwards. A status that
     // already is the end state this `@idempotent` operation asks for, or is on its way to
-    // it, is a no-op success; every other status outside the one the operation's modelled
-    // documentation acts from (`state::STOPPABLE_SEARCH_JOB_STATES`) is a conflict —
-    // whether the scan has not started yet or has already ended.
+    // it, is a no-op success; a job still on its way to a terminal status accepts the
+    // stop and starts winding down; and only a job whose scan already ended in a status
+    // this operation does not produce is a
+    // conflict.
     let cases: Vec<(&str, u16, &str)> = vec![
-        (state::CREATING, 409, state::CREATING),
+        (state::CREATING, 200, state::STOPPING),
         (state::RUNNING, 200, state::STOPPING),
         (state::STOPPING, 200, state::STOPPING),
         (state::STOPPED, 200, state::STOPPED),

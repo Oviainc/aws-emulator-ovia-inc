@@ -546,9 +546,24 @@ async fn restore_creates_the_target_table_from_the_source_settings_and_the_overr
                     );
                 }
             }
-            // A table with no scalable target is a table this operation "tried to access
-            // a ... resource that doesn't exist" for.
-            None => assert_failure(case.name, auto_scaling_answer, 404, "ResourceNotFoundException"),
+            // A table with no scalable target still EXISTS, so it is reported with the
+            // identity members the response requires and the optional
+            // `autoScalingSpecification` absent.
+            None => {
+                let body = assert_ok(case.name, auto_scaling_answer);
+                assert_eq!(
+                    at(&body, "/autoScalingSpecification"),
+                    Value::Null,
+                    "case {:?}: expected no autoScalingSpecification, got {body}",
+                    case.name
+                );
+                assert_eq!(
+                    at(&body, "/resourceArn"),
+                    json!(table_arn(TARGET_KEYSPACE, &target_table)),
+                    "case {:?}: expected the restored table's ARN, got {body}",
+                    case.name
+                );
+            }
         }
     }
 }
