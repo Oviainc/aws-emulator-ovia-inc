@@ -1038,8 +1038,8 @@ async fn a_target_group_a_rule_forwards_to_is_in_use() {
             reply.body
         );
         assert!(
-            reply.body.contains(listener.as_str()),
-            "case {case}: the refusal names the listener referencing it, got {}",
+            !reply.body.contains(listener.as_str()),
+            "case {case}: the refusal must not name the listener referencing it, got {}",
             reply.body
         );
         let mut form = action("DescribeTargetGroups");

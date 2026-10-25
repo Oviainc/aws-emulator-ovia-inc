@@ -12,10 +12,16 @@
 //! generated `ROUTE_PATH_SEGMENTS`. This suite pins that split in the production
 //! router: the endpoint host does not matter, the modelled path space does.
 //!
+//! The data plane serves a session only over an (application, environment,
+//! configuration profile) triple the control plane holds, so the suite creates that
+//! hierarchy first — through the control plane in this same router, which is itself part
+//! of what is being checked.
+//!
 //! Assembling the router costs stack, so it runs on an explicitly sized thread for
 //! the same reason `boot_serve.rs` does.
 
 use aws_emulator_router::{build_router, InMemoryEngine};
+use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
 /// Keep this at or above the size `boot_serve.rs` uses.
@@ -84,7 +90,7 @@ const CASES: &[Case] = &[
         host: "appconfig.us-east-1.amazonaws.com",
         method: "POST",
         path_and_query: "/applications",
-        body: r#"{"Name":"MyApp"}"#,
+        body: r#"{"Name":"ControlPlaneApp"}"#,
         expect: Expect::ControlPlaneClaims,
     },
     Case {
@@ -92,7 +98,7 @@ const CASES: &[Case] = &[
         host: "127.0.0.1:9297",
         method: "POST",
         path_and_query: "/applications",
-        body: r#"{"Name":"MyApp"}"#,
+        body: r#"{"Name":"OtherControlPlaneApp"}"#,
         expect: Expect::ControlPlaneClaims,
     },
     Case {
@@ -116,10 +122,79 @@ const CASES: &[Case] = &[
         host: "127.0.0.1:9297",
         method: "POST",
         path_and_query: "/applications/",
-        body: r#"{"Name":"MyApp"}"#,
+        body: r#"{"Name":"TrailingSlashApp"}"#,
         expect: Expect::ClaimedByExactlyOne,
     },
 ];
+
+/// The AppConfig control-plane endpoint host, used for the setup calls below.
+const CONTROL_PLANE_HOST: &str = "appconfig.us-east-1.amazonaws.com";
+
+/// Send one request through the assembled router and answer its status and body.
+async fn send(
+    router: &MultiServiceRouter,
+    host: &str,
+    method: &str,
+    path_and_query: &str,
+    body: &str,
+) -> (u16, String) {
+    let request = http::Request::builder()
+        .method(method)
+        .uri(format!("https://{host}{path_and_query}"))
+        .header("host", host)
+        .header("authorization", AUTHORIZATION)
+        .header("content-type", "application/json")
+        .body(bytes::Bytes::copy_from_slice(body.as_bytes()))
+        .expect("the request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(response.body().as_ref()).to_string();
+    (status, body)
+}
+
+/// Create the application, environment and configuration profile `SESSION_BODY` names,
+/// through the AppConfig control plane in this same router.
+///
+/// AppConfigData is AppConfig's DATA plane: a session is started only over a triple the
+/// control plane actually holds, so the hierarchy has to exist before the data plane can
+/// serve one. Driving the setup through the same router is also part of what this suite
+/// checks — both services answer their own paths in one assembled emulator.
+async fn create_hierarchy(router: &MultiServiceRouter) {
+    let (status, body) = send(
+        router,
+        CONTROL_PLANE_HOST,
+        "POST",
+        "/applications",
+        r#"{"Name":"MyApp"}"#,
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "setup CreateApplication: expected 201, got {status} {body}"
+    );
+    let application_id = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|document| document["Id"].as_str().map(str::to_string))
+        .unwrap_or_else(|| panic!("setup CreateApplication: no Id in {body}"));
+
+    for (path, request_body) in [
+        (
+            format!("/applications/{application_id}/environments"),
+            r#"{"Name":"Prod"}"#,
+        ),
+        (
+            format!("/applications/{application_id}/configurationprofiles"),
+            r#"{"Name":"MyProfile","LocationUri":"hosted"}"#,
+        ),
+    ] {
+        let (status, body) =
+            send(router, CONTROL_PLANE_HOST, "POST", &path, request_body).await;
+        assert_eq!(
+            status, 201,
+            "setup POST {path}: expected 201, got {status} {body}"
+        );
+    }
+}
 
 #[test]
 fn appconfig_and_appconfigdata_are_each_claimed_by_exactly_one_service() {
@@ -133,19 +208,17 @@ fn appconfig_and_appconfigdata_are_each_claimed_by_exactly_one_service() {
             runtime.block_on(async {
                 let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
                 let router = build_router(engine);
+                create_hierarchy(&router).await;
 
                 for case in CASES {
-                    let request = http::Request::builder()
-                        .method(case.method)
-                        .uri(format!("https://{}{}", case.host, case.path_and_query))
-                        .header("host", case.host)
-                        .header("authorization", AUTHORIZATION)
-                        .header("content-type", "application/json")
-                        .body(bytes::Bytes::from_static(case.body.as_bytes()))
-                        .expect("the request is well formed");
-                    let response = router.dispatch(request).await;
-                    let status = response.status().as_u16();
-                    let body = String::from_utf8_lossy(response.body().as_ref()).to_string();
+                    let (status, body) = send(
+                        &router,
+                        case.host,
+                        case.method,
+                        case.path_and_query,
+                        case.body,
+                    )
+                    .await;
 
                     assert!(
                         !body.contains("AmbiguousService"),

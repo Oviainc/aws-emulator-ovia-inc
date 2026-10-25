@@ -78,12 +78,16 @@ use std::sync::Arc;
 /// constraint this service validates itself (an absent required member, a `@length` or
 /// `@pattern` violation) keeps the modelled `ValidationException`.
 ///
+/// The code itself is owned by `crate::scaffolded::BAD_REQUEST_CODE`, so the class a
+/// handler refuses through `crate::scaffolded::Scaffolded::bad_request` and the class the
+/// boundary catches here carry ONE code rather than drifting apart.
+///
 /// The Q Connect view of this SAME endpoint — which is the view the shared `wisdom` key
 /// is served from (`services/service-com-amazonaws-qconnect-wisdomservice/src/service.rs`)
 /// — words this class identically, from its own copy of this constant and of
 /// `override_refusal`: the two are one endpoint, so a client must not get a different code
 /// for the same input depending on which key it addressed. Change one and change the other.
-const ENUM_VALUE_REFUSAL_CODE: &str = "BadRequestException";
+const ENUM_VALUE_REFUSAL_CODE: &str = crate::scaffolded::BAD_REQUEST_CODE;
 
 /// The key THIS service answers under, which is NOT the `wisdom` key its model's
 /// `aws.auth#sigv4` name resolves to.

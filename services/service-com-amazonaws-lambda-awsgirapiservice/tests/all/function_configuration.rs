@@ -151,6 +151,8 @@ fn make_activation_due(engine: &Arc<engine::InMemoryEngine>) {
 struct Expected {
     runtime: Value,
     handler: Value,
+    /// `Description` is a member of every `FunctionConfiguration`, so a function created
+    /// without one reports it as the empty string rather than not at all.
     description: Value,
     code_size: i64,
     code_sha256: Value,
@@ -189,7 +191,7 @@ fn fixtures() -> Vec<Fixture> {
             expected: Expected {
                 runtime: json!("python3.12"),
                 handler: json!("index.handler"),
-                description: Value::Null,
+                description: json!(""),
                 code_size: i64::try_from(small.len()).unwrap_or_default(),
                 code_sha256: json!(expected_code_sha256(&small)),
                 timeout: 3,
@@ -249,7 +251,7 @@ fn fixtures() -> Vec<Fixture> {
             expected: Expected {
                 runtime: json!("java21"),
                 handler: json!("Handler::run"),
-                description: Value::Null,
+                description: json!(""),
                 code_size: i64::try_from(small.len()).unwrap_or_default(),
                 code_sha256: json!(expected_code_sha256(&small)),
                 timeout: 3,
@@ -275,7 +277,7 @@ fn fixtures() -> Vec<Fixture> {
             expected: Expected {
                 runtime: json!("ruby3.3"),
                 handler: json!("app.handler"),
-                description: Value::Null,
+                description: json!(""),
                 code_size: 0,
                 code_sha256: Value::Null,
                 timeout: 3,
@@ -300,7 +302,7 @@ fn fixtures() -> Vec<Fixture> {
             expected: Expected {
                 runtime: Value::Null,
                 handler: Value::Null,
-                description: Value::Null,
+                description: json!(""),
                 code_size: 0,
                 code_sha256: Value::Null,
                 timeout: 3,

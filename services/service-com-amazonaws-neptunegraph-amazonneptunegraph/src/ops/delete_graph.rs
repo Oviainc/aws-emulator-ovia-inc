@@ -197,6 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key belongs to the data being snapshotted, not to this request, which carries
         // no key member at all.
         let kms_key_identifier = graph.kms_key_identifier.clone();
+        // A final snapshot captures the graph it is taken of the same way an explicitly
+        // named one does: the data it holds and the configuration it is provisioned
+        // with, so a restore of it reproduces the graph this call is deleting.
+        let source_configuration = crate::state::GraphConfiguration::from(graph);
+        let graph_data = graph.data.clone();
 
         // "Graphs cannot be deleted if delete-protection is enabled."
         if deletion_protection {
@@ -270,6 +275,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The request carries no tags, and a snapshot's tags are its own: the
                 // graph's tag set is not copied onto it.
                 tags: ::std::collections::BTreeMap::new(),
+                source_configuration,
+                data: graph_data,
             })
         };
 

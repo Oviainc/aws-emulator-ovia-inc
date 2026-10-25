@@ -23,6 +23,9 @@
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::insight_rules`] — the
 //!   Contributor Insights rules written by `PutInsightRule` and read back by
 //!   `DescribeInsightRules`.
+//! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::dataset_kms_keys`] — the
+//!   customer managed KMS key each Region's default dataset is encrypted with, read back by
+//!   `GetDataset`.
 //!
 //! An alarm is stored as the modelled [`MetricAlarm`] shape itself rather than a parallel
 //! record, so every member `PutMetricAlarm` accepts round-trips through `DescribeAlarms`
@@ -558,6 +561,15 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// [`alarm_evaluation::MAX_PENDING_NOTIFICATIONS`]; drained by
     /// [`alarm_actions::settle_alarms`], which is what delivers them.
     pub pending_notifications: VecDeque<alarm_actions::AlarmNotification>,
+    /// The customer managed KMS key associated with a Region's default dataset, by Region.
+    ///
+    /// There is no dataset record to create: "The default dataset is implicit for every
+    /// account in every Region" (`GetDataset`), so a Region's dataset exists whether or not
+    /// this map holds an entry for it, and the only thing a dataset carries is the key
+    /// association `AssociateDatasetKmsKey` writes and `DisassociateDatasetKmsKey` removes.
+    /// An absent entry is therefore not an absent dataset: it is a dataset encrypted with an
+    /// Amazon Web Services owned key, which is why `GetDataset` then omits `KmsKeyArn`.
+    pub dataset_kms_keys: HashMap<String, String>,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -638,6 +650,28 @@ pub fn scheduled_query_arn(region: &str, alarm_name: &str) -> String {
 /// A metric stream's ARN: `arn:aws:cloudwatch:<region>:<account>:metric-stream/<Name>`.
 pub fn metric_stream_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("cloudwatch", region, &format!("metric-stream/{name}"))
+}
+
+/// The identifier of the one dataset this service has: "Only the default dataset is
+/// supported." (`GetDataset`), and `GetDatasetOutput$DatasetId` is modelled `^default$`.
+pub const DEFAULT_DATASET_ID: &str = "default";
+
+/// A dataset's ARN: `arn:aws:cloudwatch:<region>:<account>:dataset/<dataset_id>`
+/// (`GetDatasetOutput$Arn`).
+pub fn dataset_arn(region: &str, dataset_id: &str) -> String {
+    ::engine::emulator_arn("cloudwatch", region, &format!("dataset/{dataset_id}"))
+}
+
+/// Whether `identifier` names the default dataset of `region` in this account.
+///
+/// "you can specify either `default` or the full dataset Amazon Resource Name (ARN) in the
+/// format `arn:aws:cloudwatch:Region:account-id:dataset/default`"
+/// (`GetDatasetInput$DatasetIdentifier`): the bare identifier names the dataset of the Region
+/// the request was signed for, and an ARN names it only when it is that dataset's own ARN. An
+/// ARN carrying another partition, Region or account names a dataset in a scope this endpoint
+/// does not serve, so it names no dataset the caller can reach here.
+pub fn names_default_dataset(identifier: &str, region: &str) -> bool {
+    identifier == DEFAULT_DATASET_ID || identifier == dataset_arn(region, DEFAULT_DATASET_ID)
 }
 
 /// Why `value` is not the ARN of an IAM role, or `None` when it is one.

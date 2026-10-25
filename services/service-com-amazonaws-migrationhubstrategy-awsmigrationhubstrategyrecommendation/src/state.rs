@@ -102,6 +102,31 @@ pub const ASSESSMENT_COMPLETE: &str = "COMPLETE";
 /// The `AssessmentStatus` `StopAssessment` moves a running assessment to.
 pub const ASSESSMENT_STOPPED: &str = "STOPPED";
 
+/// The `RunTimeAssessmentStatus` a server of the portfolio carries while the assessment
+/// covering it is collecting data from it.
+///
+/// `ServerDetail$dataCollectionStatus` is documented "The status of assessment for the
+/// server", so it is the per-server face of the assessment's own `AssessmentStatus`: an
+/// assessment reported `IN_PROGRESS` is collecting, and the collection task on each
+/// server it covers has started.
+pub const COLLECTION_STARTED: &str = "dataCollectionTaskStarted";
+
+/// The `RunTimeAssessmentStatus` a server still collecting carries once a caller stopped
+/// the assessment — the per-server face of [`ASSESSMENT_STOPPED`].
+pub const COLLECTION_STOPPED: &str = "dataCollectionTaskStopped";
+
+/// The `RunTimeAssessmentStatus` a server still collecting carries once the assessment
+/// ran to the end — the per-server face of [`ASSESSMENT_COMPLETE`].
+pub const COLLECTION_SUCCESS: &str = "dataCollectionTaskSuccess";
+
+/// The `RunTimeAssessmentStatus` values that mean a collection task is RUNNING on the
+/// server, and so the ones a terminal assessment status moves off that server.
+///
+/// `dataCollectionTaskToBeScheduled` is not one of them: nothing is collecting for a
+/// server whose task was never scheduled, so a stop or a completion leaves it where it
+/// was, as it does a server that already reached a terminal status of its own.
+pub const COLLECTION_RUNNING: &[&str] = &["dataCollectionTaskScheduled", COLLECTION_STARTED];
+
 /// `RecommendationReportStatus`'s non-terminal value: the status a report generation
 /// task carries from the instant `StartRecommendationReportGeneration` returns until the
 /// clock owes it a terminal one.
@@ -381,12 +406,16 @@ pub struct Assessment {
 impl Assessment {
     /// Materialise the completion the clock owes this assessment, if `now` is past its
     /// due instant: every server still in progress has finished collecting by then.
-    pub fn settle(&mut self, now: SystemTime) {
+    ///
+    /// Answers whether THIS call materialised it, which is what tells its caller the
+    /// servers the assessment covers have to be moved off their collecting status too
+    /// ([`RegionState::finish_server_collection`]).
+    pub fn settle(&mut self, now: SystemTime) -> bool {
         let Some(due) = self.completion_due else {
-            return;
+            return false;
         };
         if now < due {
-            return;
+            return false;
         }
         self.status = ASSESSMENT_COMPLETE.to_string();
         self.completion_time = Some(due);
@@ -397,6 +426,7 @@ impl Assessment {
             "Data collection completed for {} of {} servers.",
             self.success, self.servers
         ));
+        true
     }
 
     /// True once this assessment reached a terminal `AssessmentStatus` — nothing is
@@ -722,6 +752,13 @@ pub struct ServerRecord {
     /// `SystemInfo$cpuArchitecture`.
     pub cpu_architecture: Option<String>,
     /// `ServerDetail$dataCollectionStatus` — one of `RunTimeAssessmentStatus`'s values.
+    ///
+    /// Documented "The status of assessment for the server", so it is the per-server face
+    /// of the assessment covering this server: `StartAssessment` puts it in
+    /// [`COLLECTION_STARTED`] ([`RegionState::begin_server_collection`]) and the terminal
+    /// status the assessment reaches moves it to [`COLLECTION_STOPPED`] or
+    /// [`COLLECTION_SUCCESS`] ([`RegionState::finish_server_collection`]). `None` for a
+    /// server no assessment ever covered.
     pub data_collection_status: Option<String>,
     /// `ServerDetail$statusMessage`.
     pub status_message: Option<String>,
@@ -1242,11 +1279,58 @@ impl RegionState {
     }
 
     /// The assessment `id` names, with any completion the clock owes it already
-    /// materialised.
+    /// materialised — on the assessment AND on the servers it covers.
     pub fn settled_assessment_mut(&mut self, id: &str, now: SystemTime) -> Option<&mut Assessment> {
-        let assessment = self.assessments.get_mut(id)?;
-        assessment.settle(now);
-        Some(assessment)
+        let completed = self.assessments.get_mut(id)?.settle(now);
+        if completed {
+            self.finish_server_collection(COLLECTION_SUCCESS);
+        }
+        self.assessments.get_mut(id)
+    }
+
+    /// Stop the assessment `id` names, moving the servers it was still collecting for off
+    /// their collecting status as well.
+    ///
+    /// Answers `None` when this portfolio holds no such assessment, and otherwise whether
+    /// the stop moved a RUNNING assessment to [`ASSESSMENT_STOPPED`]: an assessment that
+    /// already reached a terminal status is left exactly as it was, servers included.
+    /// Any completion the clock already owed the assessment is materialised first, so a
+    /// stop that arrives after the assessment finished finds it terminal.
+    pub fn stop_assessment(&mut self, id: &str, now: SystemTime) -> Option<bool> {
+        let stopped = self.settled_assessment_mut(id, now)?.stop(now);
+        if stopped {
+            self.finish_server_collection(COLLECTION_STOPPED);
+        }
+        Some(stopped)
+    }
+
+    /// Put every server of this portfolio into [`COLLECTION_STARTED`]: an assessment just
+    /// started covering them, so the collection task is running on each one.
+    ///
+    /// It overwrites whatever status an earlier assessment left, because the status
+    /// reports the collection that is running NOW; a portfolio holding no server has
+    /// nothing to move.
+    pub fn begin_server_collection(&mut self) {
+        for server in self.servers.values_mut() {
+            server.data_collection_status = Some(COLLECTION_STARTED.to_string());
+        }
+    }
+
+    /// Move every server whose collection task is still running ([`COLLECTION_RUNNING`])
+    /// to `status`, the per-server face of the terminal status its assessment reached.
+    ///
+    /// A server that is not collecting keeps the status it has: a terminal assessment
+    /// status says nothing about a collection that was never running.
+    pub fn finish_server_collection(&mut self, status: &str) {
+        for server in self.servers.values_mut() {
+            if server
+                .data_collection_status
+                .as_deref()
+                .is_some_and(|held| COLLECTION_RUNNING.contains(&held))
+            {
+                server.data_collection_status = Some(status.to_string());
+            }
+        }
     }
 
     /// The recommendation report task `id` names, with any terminal status the clock owes
@@ -1350,13 +1434,18 @@ impl RegionState {
     }
 
     /// Materialise every completion the clock owes, for a caller about to read across
-    /// all of the records.
+    /// all of the records — including the per-server face of an assessment the clock just
+    /// completed.
     pub fn settle_all(&mut self, now: SystemTime) {
         for task in self.import_tasks.values_mut() {
             task.settle(now);
         }
+        let mut completed = false;
         for assessment in self.assessments.values_mut() {
-            assessment.settle(now);
+            completed |= assessment.settle(now);
+        }
+        if completed {
+            self.finish_server_collection(COLLECTION_SUCCESS);
         }
         for report in self.recommendation_reports.values_mut() {
             report.settle(now);

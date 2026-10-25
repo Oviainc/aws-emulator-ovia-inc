@@ -35,3 +35,5 @@ mod session_configuration;
 mod session_recommendations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource.rs"]
+mod tag_resource;

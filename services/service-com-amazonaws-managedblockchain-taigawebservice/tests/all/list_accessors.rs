@@ -84,15 +84,7 @@ async fn list_accessors(router: &MultiServiceRouter, query: &str) -> Answer {
 
 /// The `Id` of every accessor the answer reports, in the order it reported them.
 fn listed_ids(answer: &Answer) -> Vec<String> {
-    answer.body["Accessors"]
-        .as_array()
-        .map(|accessors| {
-            accessors
-                .iter()
-                .map(|accessor| accessor["Id"].as_str().unwrap_or_default().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::harness::listed_ids(answer, "Accessors")
 }
 
 /// One seeded accessor: what this row varies from the record `CreateAccessor` stored.

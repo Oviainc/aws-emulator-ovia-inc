@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     FirewallDomainList, FirewallDomainListMetadata, IpAddressResponse, OutpostResolver,
     ResolverEndpoint, ResolverRule, ResolverRuleAssociation, ResourceNotFoundException, Tag,
-    TargetAddress,
+    TargetAddress, ValidationException,
 };
 
 /// The region an ARN carries when the request's SigV4 scope names none.
@@ -183,6 +183,18 @@ pub const RSLVR_CODE_ENDPOINT_NOT_FOUND: &str = "RSLVR-00501";
 /// `InvalidRequestException` for it.
 pub const RSLVR_CODE_SYSTEM_RULE_FORWARDING_TARGET: &str = "RSLVR-00707";
 
+/// The Route 53 Resolver service error code reported when a request asks for a
+/// Resolver on an Outpost with fewer EC2 instances than `InstanceCount`'s
+/// documented minimum.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred — and this operation raises `ValidationException` for several
+/// distinct faults — so the code is the only discriminator. The model states no
+/// message text, so this code comes from the recorded responses of the
+/// Resolver-on-Outpost write operations.
+pub const RSLVR_CODE_INSTANCE_COUNT_BELOW_MINIMUM: &str = "RSLVR-03002";
+
 /// `ResourceNotFoundException$ResourceType`, "the type of resource that doesn't
 /// exist": the modelled shape name of a Resolver endpoint.
 pub const RESOURCE_TYPE_RESOLVER_ENDPOINT: &str = "ResolverEndpoint";
@@ -311,6 +323,25 @@ pub fn outpost_resolver_not_found(id: &str) -> ResourceNotFoundException {
             r#"Resolver on Outpost with ID "{id}" does not exist."#
         )),
         resource_type: Some(RESOURCE_TYPE_OUTPOST_RESOLVER.to_string()),
+    }
+}
+
+/// The `ValidationException` the Resolver-on-Outpost write operations answer for
+/// an `InstanceCount` below the documented minimum.
+///
+/// Built here, rather than in each handler, so `CreateOutpostResolver` and
+/// `UpdateOutpostResolver` report the one RSLVR-coded body for this fault: the
+/// code is what tells it apart from the other `ValidationException` faults of
+/// those operations. The sentence states the documented minimum and nothing from
+/// the request, so the rejected count is not echoed back.
+pub fn outpost_resolver_instance_count_below_minimum() -> ValidationException {
+    ValidationException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_INSTANCE_COUNT_BELOW_MINIMUM,
+            &format!(
+                r#"The instance count must be equal to or greater than "{OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT}""#
+            ),
+        )),
     }
 }
 

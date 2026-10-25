@@ -175,18 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `InstanceCount`: "The default and minimal value is 4." The model puts
         // no `range` on the member, so the minimum is enforced here — before
-        // the store is locked, so a refused create writes nothing.
+        // the store is locked, so a refused create writes nothing. The refusal
+        // states the fault with this service's own error code inside the
+        // message, which is what tells it apart from this operation's other
+        // `ValidationException` faults.
         let instance_count = input
             .instance_count
             .unwrap_or(crate::state::OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT);
         if instance_count < crate::state::OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT {
             return Err(CreateOutpostResolverErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "InstanceCount must be at least {}, got {instance_count}",
-                        crate::state::OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT
-                    )),
-                },
+                crate::state::outpost_resolver_instance_count_below_minimum(),
             )
             .into());
         }

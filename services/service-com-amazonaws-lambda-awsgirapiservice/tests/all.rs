@@ -71,6 +71,8 @@ mod policy_versions_and_resources;
 mod provisioned_concurrency;
 #[path = "all/provisioned_concurrency_resolution.rs"]
 mod provisioned_concurrency_resolution;
+#[path = "all/read_representation_and_download_plane.rs"]
+mod read_representation_and_download_plane;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_tags.rs"]

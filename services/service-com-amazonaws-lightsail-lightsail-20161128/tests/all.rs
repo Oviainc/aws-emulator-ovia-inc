@@ -35,10 +35,14 @@ mod bundle_catalog;
 mod cloud_formation_stack;
 #[path = "all/contact_method_notifications.rs"]
 mod contact_method_notifications;
+#[path = "all/container_api_metadata.rs"]
+mod container_api_metadata;
 #[path = "all/container_image_registry.rs"]
 mod container_image_registry;
 #[path = "all/container_image_registry_login.rs"]
 mod container_image_registry_login;
+#[path = "all/container_service_deployment.rs"]
+mod container_service_deployment;
 #[path = "all/container_service_lifecycle.rs"]
 mod container_service_lifecycle;
 #[path = "all/container_service_metric_data.rs"]

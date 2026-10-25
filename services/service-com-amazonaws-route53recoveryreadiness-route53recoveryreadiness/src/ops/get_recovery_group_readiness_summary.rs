@@ -177,24 +177,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // One summary per readiness check that watches a resource scoped to this
-        // recovery group, keyed by check name so the page order — and therefore the
-        // cursor — is the same on every call.
-        let summaries: ::std::collections::BTreeMap<String, ReadinessCheckSummary> = state
-            .readiness_check_names_in_recovery_group(&input.recovery_group_name)
-            .into_iter()
-            .map(|name| {
-                (
-                    name.clone(),
-                    ReadinessCheckSummary {
-                        readiness: Some(crate::state::READINESS_UNKNOWN.to_string()),
-                        readiness_check_name: Some(name),
-                    },
-                )
-            })
-            .collect();
-
-        let page = crate::state::page(&summaries, input.max_results, input.next_token.as_deref())
+        // The checks that watch a resource scoped to this recovery group, summarised,
+        // paged and aggregated by the one implementation both readiness summaries share.
+        let summary = state
+            .recovery_group_readiness_summary(
+                &input.recovery_group_name,
+                input.max_results,
+                input.next_token.as_deref(),
+            )
             .map_err(|message| {
                 GetRecoveryGroupReadinessSummaryErrorModeled::ValidationException(
                     ValidationException {
@@ -204,11 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         Ok(GetRecoveryGroupReadinessSummaryOutput {
-            next_token: page.next_token,
-            // The aggregate of parts that are all UNKNOWN is UNKNOWN — as it is for a
-            // recovery group no check watches yet.
-            readiness: Some(crate::state::READINESS_UNKNOWN.to_string()),
-            readiness_checks: Some(page.records.into_iter().cloned().collect()),
+            next_token: summary.next_token,
+            readiness: Some(summary.readiness),
+            readiness_checks: Some(summary.readiness_checks),
         })
     }
 }

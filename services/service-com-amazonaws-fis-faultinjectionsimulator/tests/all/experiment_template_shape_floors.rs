@@ -12,6 +12,10 @@
 //! that name a destination are optional, so each floor is a server-side rule rather than a
 //! modelled constraint.
 //!
+//! One request shape is NOT a template below a floor: a `logConfiguration` carrying none of
+//! its members names no configuration, so on the update it removes the member instead of
+//! leaving a destination-less one behind ([`Shape::admissible_on_update`]).
+//!
 //! The rule is about the TEMPLATE, not about one request's shape, so every row below is
 //! driven through BOTH `CreateExperimentTemplate` (which builds the template outright) and
 //! `UpdateExperimentTemplate` (which builds it by replacing members of a stored one), and
@@ -56,6 +60,27 @@ struct Shape {
     /// configuration exactly as it was.
     log_configuration: Option<Value>,
     admissible: bool,
+}
+
+impl Shape {
+    /// Whether an UPDATE carrying this shape's members is admissible.
+    ///
+    /// The floors are the same ones the create is judged by, but one member does not mean
+    /// the same thing on both calls: a `logConfiguration` carrying NONE of its members
+    /// names no configuration, which the create cannot express at all (it declares
+    /// `logSchemaVersion` `@required`) and which on the update REMOVES the template's log
+    /// configuration. A template carrying none is not logging, which no floor refuses.
+    fn admissible_on_update(&self) -> bool {
+        self.admissible || self.log_configuration.as_ref().is_some_and(names_no_configuration)
+    }
+}
+
+/// Whether a `logConfiguration` a request carries names NO configuration: an object with
+/// no member set.
+fn names_no_configuration(configuration: &Value) -> bool {
+    configuration
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty)
 }
 
 fn shapes() -> Vec<Shape> {
@@ -134,10 +159,10 @@ fn shapes() -> Vec<Shape> {
             admissible: false,
         },
         Shape {
-            // On the create `logSchemaVersion` is `@required`, so an empty configuration is
-            // refused for that too; either way the answer is the same refusal, and on the
-            // update the schema version comes from the stored configuration and only the
-            // missing destination is left to refuse it.
+            // An empty configuration names no configuration at all: on the create that is
+            // the `@required` `logSchemaVersion` missing, so it is refused; on the update
+            // it REMOVES the template's log configuration, which is admissible and is
+            // what [`Shape::admissible_on_update`] says.
             case: "an empty log configuration",
             actions: json!({ "wait": wait("PT1M") }),
             stop_conditions: json!([{ "source": "none" }]),
@@ -328,7 +353,7 @@ async fn an_update_refuses_a_resulting_template_below_the_shape_floors() {
             .to_string();
 
         let answer = update_template(&router, &id, update_body(&shape)).await;
-        if shape.admissible {
+        if shape.admissible_on_update() {
             assert_eq!(
                 answer.status, 200,
                 "case {case:?}: expected HTTP 200 from UpdateExperimentTemplate, got {} with {:?}",
@@ -346,11 +371,13 @@ async fn an_update_refuses_a_resulting_template_below_the_shape_floors() {
                 after["actions"]
             );
             // A `logConfiguration` the request does not carry leaves the stored one alone,
-            // which is what keeps this row above the destination floor.
-            let expected_logs = shape
-                .log_configuration
-                .clone()
-                .unwrap_or_else(|| before["logConfiguration"].clone());
+            // which is what keeps this row above the destination floor; one carrying no
+            // member at all removes the member, so the template then reports none.
+            let expected_logs = match shape.log_configuration.as_ref() {
+                Some(configuration) if names_no_configuration(configuration) => Value::Null,
+                Some(configuration) => configuration.clone(),
+                None => before["logConfiguration"].clone(),
+            };
             assert_eq!(
                 after["logConfiguration"], expected_logs,
                 "case {case:?}: expected log configuration {expected_logs:?}, got {:?}",

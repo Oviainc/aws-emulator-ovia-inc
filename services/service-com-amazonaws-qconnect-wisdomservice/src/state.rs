@@ -106,6 +106,32 @@ pub const MESSAGE_ASSOCIATION_NOT_FOUND: &str = "Assistant Association does not 
 /// [`MESSAGE_ASSISTANT_NOT_FOUND`] for why it carries nothing from the request.
 pub const MESSAGE_RESOURCE_NOT_FOUND: &str = "The specified resource does not exist.";
 
+/// The most tags one resource carries.
+///
+/// AWS's tagging restrictions put the maximum number of tags per resource at 50, and
+/// this model puts no constraint on the `Tags` map
+/// (`smithy_query(query="shape",shape="Tags")` constrains only each key and value), so
+/// without the limit one caller could store an arbitrarily large tag map in this
+/// process's heap. A `TagResource` that would leave the resource holding more than this
+/// is refused the way the recorded wire answer of this endpoint refuses it
+/// (`crate::ops::tag_resource`).
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The sentence a tagging operation refuses a tag set larger than
+/// [`MAX_TAGS_PER_RESOURCE`] with.
+///
+/// It states the RULE — the ceiling the RESULTING tag set must stay within — and is the
+/// sentence AWS's common tag validator words that rule with, counting the user tags a
+/// resource would be left holding. It carries nothing from the request and nothing about
+/// what the resource already holds, so a caller cannot read the stored tag count out of
+/// the wording. The Amazon Connect Wisdom view of this same endpoint words it from its
+/// own copy of this text
+/// (`services/service-com-amazonaws-wisdom-wisdomservice/src/state.rs`), so a client
+/// cannot get a different sentence depending on which model it addressed.
+pub fn message_too_many_tags() -> String {
+    format!("The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags.")
+}
+
 /// The fixed text of the modelled `ConflictException` a create whose `name` a live
 /// resource already holds is refused with. See [`MESSAGE_ASSISTANT_NOT_FOUND`].
 pub const MESSAGE_NAME_IN_USE: &str = "Name is already in use";
@@ -1293,6 +1319,59 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .and_then(|assistant| assistant.sessions.get(id))
             .filter(|session| session.session_arn == resource_arn)
             .map(|session| &session.tags)
+    }
+
+    /// The same tag map as [`Self::tags_of_resource`], for a caller that WRITES it — the
+    /// seam `TagResource` merges a request into.
+    ///
+    /// It resolves the ARN exactly as the reporting path does, against the ARN the record
+    /// itself carries, and hands back the map ON that stored record: a write here is what
+    /// a later `ListTagsForResource` — or a read of the resource — reports, because there
+    /// is only ever one copy of a resource's tags. `None` means the ARN names no resource
+    /// this account holds.
+    pub fn tags_of_resource_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut HashMap<String, String>> {
+        let id = resolve_id(resource_arn).to_string();
+        if self
+            .assistants
+            .get(&id)
+            .is_some_and(|assistant| assistant.assistant_arn == resource_arn)
+        {
+            return self
+                .assistants
+                .get_mut(&id)
+                .map(|assistant| &mut assistant.tags);
+        }
+        if self
+            .knowledge_bases
+            .get(&id)
+            .is_some_and(|knowledge_base| knowledge_base.knowledge_base_arn == resource_arn)
+        {
+            return self
+                .knowledge_bases
+                .get_mut(&id)
+                .map(|knowledge_base| &mut knowledge_base.tags);
+        }
+        if self
+            .assistant_associations
+            .get(&id)
+            .is_some_and(|association| association.assistant_association_arn == resource_arn)
+        {
+            return self
+                .assistant_associations
+                .get_mut(&id)
+                .map(|association| &mut association.tags);
+        }
+        // A session is reachable only through its parent assistant, whose id a session
+        // ARN carries in the segment before the session's own.
+        let parent = resource_arn.rsplit('/').nth(1)?.to_string();
+        self.assistants
+            .get_mut(&parent)
+            .and_then(|assistant| assistant.sessions.get_mut(&id))
+            .filter(|session| session.session_arn == resource_arn)
+            .map(|session| &mut session.tags)
     }
 
     /// Store a knowledge base and index it by name.

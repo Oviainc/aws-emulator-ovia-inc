@@ -2,8 +2,10 @@
 
 //! @op StartConfigurationSession
 //!
-//! Implemented: mints a configuration session over the requested (application,
-//! environment, configuration profile) triple and persists it in this service's
+//! Implemented: resolves the requested (application, environment, configuration
+//! profile) triple against the AppConfig control plane's own state, refuses an
+//! unresolvable level with the modelled `ResourceNotFoundException`, and otherwise
+//! mints a configuration session over that triple and persists it in this service's
 //! engine state, keyed by the opaque token it returns. `GetLatestConfiguration`
 //! resolves that token back to the session.
 //!
@@ -175,15 +177,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every modelled constraint (the three required identifiers, their 1..128
         // lengths, and `RequiredMinimumPollIntervalInSeconds`'s 15..86400 range) is
-        // already refused before this handler runs, and `service.rs` words that
-        // refusal as the modelled `BadRequestException`. So reaching here means the
-        // input is well formed and the only work left is minting the session.
+        // refused before the session is minted — the schema walk for a value outside a
+        // bound, `crate::service`'s own precheck for an absent required member — and
+        // both are worded as the modelled `BadRequestException`.
         //
-        // The triple is NOT resolved against an AppConfig control plane: this
-        // emulator holds no application / environment / configuration-profile
-        // records to resolve it against, so a session is started for any
-        // well-formed triple and the absence of a deployed configuration surfaces
-        // on `GetLatestConfiguration` as `ResourceNotFoundException`.
+        // The three identifiers are resolved against the AppConfig CONTROL PLANE
+        // before anything is minted: each is "the ID or the name" of its level, and a
+        // level that does not exist cannot be polled, so an unresolvable one is
+        // refused here rather than surfacing later as a poll that never succeeds.
+        let Some(resolution) = crate::state::resolve_triple(
+            &*self.engine,
+            &input.application_identifier,
+            &input.environment_identifier,
+            &input.configuration_profile_identifier,
+        ) else {
+            return Err(StartConfigurationSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the AppConfig control plane state is unavailable in this emulator"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        if let Err(unresolved) = resolution {
+            tracing::debug!(
+                operation = "StartConfigurationSession",
+                outcome = "ResourceNotFoundException",
+                resource_type = unresolved.resource_type,
+                "refused a session for a resource the control plane does not hold"
+            );
+            return Err(StartConfigurationSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(unresolved.message),
+                    resource_type: Some(unresolved.resource_type.to_string()),
+                    referenced_by: unresolved.referenced_by.map(|(member, identifier)| {
+                        std::collections::HashMap::from([(member.to_string(), identifier)])
+                    }),
+                },
+            )
+            .into());
+        }
+
+        // The stored session carries its own expiry (`crate::state::TOKEN_LIFETIME`,
+        // the 24 hours the token members above document) and the store is bounded and
+        // self-reclaiming: `start_session` sweeps the entries that can no longer serve
+        // a poll and holds the map to `crate::state::MAX_SESSIONS`, so a client minting
+        // sessions in a loop cannot grow it without limit.
         let token = state.lock().start_session(
             &input.application_identifier,
             &input.environment_identifier,

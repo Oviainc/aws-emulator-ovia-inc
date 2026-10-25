@@ -21,8 +21,10 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. This service uses it: each of its two routes is pre-checked against
+//!   that operation's own input schema, so an input refusal is answered in the
+//!   operation's modelled error shape and a poll carrying no `configuration_token`
+//!   reaches the operation at all rather than matching no route.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -40,10 +42,228 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::{constraints::path, ProtocolError, Violation, ViolationKind};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused,
+    ServerHttpProtocol, Service,
 };
+use std::marker::PhantomData;
 use std::sync::Arc;
+
+/// One modelled route of this service: its `@http` method and URI, and the operation
+/// the generated routing table wires under it.
+struct ModeledRoute {
+    method: &'static str,
+    path: &'static str,
+    operation: &'static str,
+}
+
+/// This service's whole routed surface: both rows are the `@http` method and URI each
+/// operation declares in this crate's `smithy-model/` document, and are listed in the
+/// crate root's `OPERATIONS.md` ("Route: POST /configurationsessions -> 201" and
+/// "Route: GET /configuration -> 200").
+///
+/// It is read only to name the operation a request is addressed to when the model's own
+/// routing key cannot — see [`ModeledInputCheck`]. Which handler serves the request is
+/// still the generated routing table's answer; this table holds no behaviour.
+const MODELED_ROUTES: &[ModeledRoute] = &[
+    ModeledRoute {
+        method: "POST",
+        path: "/configurationsessions",
+        operation: "StartConfigurationSession",
+    },
+    ModeledRoute {
+        method: "GET",
+        path: "/configuration",
+        operation: "GetLatestConfiguration",
+    },
+];
+
+/// The modelled route `req` is addressed to, by method and URI path, or `None` for a
+/// request this service does not route.
+fn matching_route(req: &aws_smithy_runtime_api::http::Request) -> Option<&'static ModeledRoute> {
+    let uri = req.uri().parse::<http::Uri>().ok()?;
+    let path = uri.path().trim_matches('/').to_string();
+    MODELED_ROUTES
+        .iter()
+        .find(|route| route.method == req.method() && route.path.trim_matches('/') == path)
+}
+
+/// The validation path of `GetLatestConfiguration`'s one required member, as the
+/// constraint vocabulary spells it.
+fn configuration_token_path() -> String {
+    path::member("ConfigurationToken")
+}
+
+/// What AppConfigData says when a request carries no `ConfigurationToken` at all.
+///
+/// The service's OWN fixed text for that member rather than the standard validation
+/// envelope: the member is bound to the query string
+/// (`@httpQuery(configuration_token)`), so there is no body member for a caller to
+/// correct, and the sentence names the operation that mints a token instead. It
+/// carries nothing from the request.
+const CONFIGURATION_TOKEN_REQUIRED_MESSAGE: &str = "ConfigurationToken must be provided. \
+     Use the StartConfigurationSession API to obtain an InitialConfigurationToken";
+
+/// How this service states the refusal `violations` describe, or `None` when they
+/// describe none.
+///
+/// Every violation but one earns the standard request-derived validation envelope
+/// naming the member and the constraint it failed — built by the framework's own
+/// renderer, so an absent member and a value outside a modelled bound read one way. An
+/// absent `ConfigurationToken` earns the service's own sentence; see
+/// [`CONFIGURATION_TOKEN_REQUIRED_MESSAGE`].
+fn refusal_message(violations: &[Violation]) -> Option<String> {
+    let absent_token = violations.iter().any(|violation| {
+        violation.kind == ViolationKind::MissingRequiredMember
+            && violation.path == configuration_token_path()
+    });
+    if absent_token {
+        return Some(CONFIGURATION_TOKEN_REQUIRED_MESSAGE.to_string());
+    }
+    aws_smithy_schema_server::envelope(violations)
+}
+
+/// The wire protocol a refusal this file serializes is framed in: the service's own
+/// [`Service::override_protocol`] when it takes that seam, else the model-derived one —
+/// the same selection the framework's centralized walk makes, so a refusal serialized
+/// here cannot be framed in a different codec from the responses that walk serializes
+/// beside it.
+fn effective_protocol(svc: &dyn Service) -> &dyn ServerHttpProtocol {
+    svc.override_protocol()
+        .unwrap_or_else(|| svc.definition().protocol())
+}
+
+/// Checks one operation's input against that operation's OWN schema, and answers any
+/// refusal in the operation's modelled error shape — then hands a well-formed request
+/// to the generated handler untouched.
+///
+/// Both operations model `BadRequestException` (HTTP 400) as the answer to input that
+/// "fails to satisfy the constraints specified by the service", which is exactly what
+/// an absent `@required` member or a value outside a modelled bound is. Two things make
+/// the framework answer such a request differently, and both are why the check sits
+/// here:
+///
+/// * the framework's pre-dispatch envelope states the refusal under its own message
+///   key, not under the `Message` member this service's `BadRequestException` declares,
+///   so a client reading the modelled shape finds no message at all; and
+/// * a route whose `@required` query binding the request omits matches no operation at
+///   all — `GetLatestConfiguration` binds `ConfigurationToken` to `@httpQuery` — so a
+///   tokenless poll would be answered `501 NotImplemented`, a server-fault class an SDK
+///   does not treat as the client error it is.
+///
+/// Nothing about WHICH input is wrong is decided here: the violations come from
+/// `service_common::validation::refusing_violations`, the shared collecting half built
+/// on the framework's own machinery (the protocol's deserializer plus
+/// `constraints::validate` over the built input), so this wrapper cannot find a
+/// different violation set from the walk that follows it, and a model change needs no
+/// change here. A failure that is not a refusal of the input — a body the codec cannot
+/// read at all — yields no violations and is passed through for the framework to word.
+struct ModeledInputCheck<O> {
+    /// The operation whose schema is checked; its `INPUT_SCHEMA`, `Input` type and
+    /// `NAME` are all that is used, so no instance of it is held — the generated
+    /// routing table owns the one instance built from the shared engine.
+    operation: PhantomData<fn() -> O>,
+}
+
+impl<O> ModeledInputCheck<O> {
+    const fn new() -> Self {
+        Self {
+            operation: PhantomData,
+        }
+    }
+}
+
+impl<O: Operation> ErasedOperation for ModeledInputCheck<O> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            // The protocol is read, used and dropped inside this one block:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the
+            // await below would make this future non-`Send`.
+            let refused = {
+                let protocol = effective_protocol(svc);
+                let violations =
+                    service_common::validation::refusing_violations::<O>(protocol, req);
+                refusal_message(&violations).map(|message| {
+                    let error = crate::ops::types::BadRequestException {
+                        message: Some(message),
+                        // `Reason` and `Details` describe a parameter the service could
+                        // not USE — the modelled `InvalidParameterProblem` values are
+                        // `Corrupted`, `Expired` and `PollIntervalNotSatisfied` — and a
+                        // member that is absent or out of bounds is none of those, so
+                        // neither is reported.
+                        reason: None,
+                        details: None,
+                    };
+                    protocol
+                        .serialize_error(
+                            &error,
+                            &crate::ops::types::SCHEMA_BAD_REQUEST_EXCEPTION,
+                            BAD_REQUEST_EXCEPTION,
+                            BAD_REQUEST_EXCEPTION_STATUS,
+                        )
+                        .unwrap_or_else(|error| svc.definition().framework_error_response(error))
+                })
+            };
+            if let Some(response) = refused {
+                tracing::debug!(
+                    operation = O::NAME,
+                    outcome = BAD_REQUEST_EXCEPTION,
+                    "refused an input the model does not allow"
+                );
+                // The row the framework sequence would have recorded for this request,
+                // so a refused one is not a hole in the telemetry series.
+                record_refusal::<O>(ctx, started.elapsed());
+                return response;
+            }
+            // The input is one the model allows: the generated handler serves it, which
+            // runs the whole framework sequence (deserialize, validate, handle,
+            // serialize) plus its telemetry over the same bytes. Reached through the
+            // routing table rather than through `override_operation`, which would route
+            // straight back here.
+            match svc.definition().routing_table().get(O::NAME) {
+                Some(operation) => operation.run(svc, req, ctx).await,
+                None => svc
+                    .definition()
+                    .framework_error_response(ProtocolError::UnknownOperation(O::NAME.to_string())),
+            }
+        })
+    }
+}
+
+/// The modelled error code and status every refusal above answers with.
+const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+/// See [`BAD_REQUEST_EXCEPTION`]: the shape's `@httpError`.
+const BAD_REQUEST_EXCEPTION_STATUS: u16 = 400;
+
+/// Record the refusal answered above as the operation row the framework sequence would
+/// have recorded, so a request refused by the wrapper is not a hole in the telemetry
+/// series: the same classification (from the refusal's status and error shape), the same
+/// folded handle (this service's signing name and the operation's own name), and the
+/// same already-sanitized request metadata. Everything is gated on a client collecting,
+/// exactly as the framework gates it.
+fn record_refusal<O: Operation>(ctx: &OperationContext<'_>, latency: std::time::Duration) {
+    if !emulator_telemetry::recording_active() {
+        return;
+    }
+    let handle =
+        emulator_telemetry::OperationHandle::folded(ctx.identity().signing_name_static(), O::NAME);
+    emulator_telemetry::record_generated_operation_with_handle(
+        &handle,
+        latency,
+        Some(emulator_telemetry::OperationFailure::classify(
+            BAD_REQUEST_EXCEPTION_STATUS,
+            BAD_REQUEST_EXCEPTION,
+        )),
+        smithy_server_runtime::RequestTelemetry::from_headers(&ctx.parts().headers).into_metadata(),
+    );
+}
 
 /// Whether this service serves the request these `parts` came from.
 ///
@@ -84,6 +304,14 @@ fn can_handle_parts(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Checks `StartConfigurationSession`'s input against its own schema before the
+    /// handler runs; see [`ModeledInputCheck`]. Held on the service because
+    /// [`Service::override_operation`] hands back a borrow of `&self`.
+    start_configuration_session_check:
+        ModeledInputCheck<crate::ops::start_configuration_session::StartConfigurationSession<Eng>>,
+    /// The same check for `GetLatestConfiguration`.
+    get_latest_configuration_check:
+        ModeledInputCheck<crate::ops::get_latest_configuration::GetLatestConfiguration<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -93,6 +321,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            start_configuration_session_check: ModeledInputCheck::new(),
+            get_latest_configuration_check: ModeledInputCheck::new(),
         }
     }
 }
@@ -119,12 +349,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request to one of this service's two routes is checked against that
+        // operation's own input schema first, so a refusal of the input is answered in
+        // the operation's modelled error shape rather than in the framework's
+        // pre-dispatch envelope — and so a poll that carries no `configuration_token`
+        // reaches the operation at all instead of matching no route. The check hands a
+        // well-formed request straight to the generated handler. See
+        // [`ModeledInputCheck`].
+        match matching_route(req)?.operation {
+            "StartConfigurationSession" => Some(&self.start_configuration_session_check),
+            "GetLatestConfiguration" => Some(&self.get_latest_configuration_check),
+            _ => None,
+        }
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

@@ -18,7 +18,8 @@
 //! `CreateOptionGroup`, `ModifyOptionGroup`, `DescribeOptionGroups`,
 //! `DeleteOptionGroup`, `CreateDBSubnetGroup`, `DescribeDBSubnetGroups`, the six
 //! cluster-parameter-group operations, `CreateDBParameterGroup`,
-//! `DescribeDBParameterGroups`, `CreateEventSubscription`,
+//! `DescribeDBParameterGroups`, `ModifyDBParameterGroup`, `DescribeDBParameters`,
+//! `CreateEventSubscription`,
 //! `DescribeEventSubscriptions`, `CreateGlobalCluster` and `DescribeGlobalClusters` all
 //! project the same records.
 //!
@@ -46,8 +47,9 @@
 //! characters and at most [`MAX_TAGS_PER_RESOURCE`] tags of at most [`MAX_TAG_KEY_LEN`] /
 //! [`MAX_TAG_VALUE_LEN`] characters — at most
 //! `MAX_REGIONS * DB_PARAMETER_GROUP_QUOTA_PER_REGION` DB parameter groups, each carrying
-//! a family string and a description of at most [`MAX_FREE_FORM_LEN`] characters and the
-//! same bounded tag list, at most
+//! a family string and a description of at most [`MAX_FREE_FORM_LEN`] characters, at most
+//! [`MAX_PARAMETERS_PER_GROUP`] parameters of at most [`MAX_FREE_FORM_LEN`] characters and
+//! the same bounded tag list, at most
 //! `MAX_REGIONS * CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION` custom engine versions,
 //! and at most one CA certificate override per region,
 //! whatever sequence of requests arrives, and every
@@ -74,9 +76,11 @@ use crate::ops::types::{
 // live once in `service_common::rds_cluster_parameters` and are re-exported here: a handler
 // reads them as `crate::state::<name>`.
 pub use service_common::rds_cluster_parameters::{
-    change_is_pending, default_apply_method, parameter_source_filter, published_parameter,
-    published_parameters, validate_parameter_group_family, validate_parameter_group_name,
-    validate_parameter_name, validate_parameter_setting, ClusterParameterSpec,
+    change_is_pending, change_is_pending_for, default_apply_method, default_apply_method_for,
+    parameter_source_filter, published_parameter, published_parameters, spec_in_catalog,
+    validate_known_setting, validate_parameter_group_family, validate_parameter_group_name,
+    validate_parameter_name, validate_parameter_setting, validate_setting_in_catalog,
+    ClusterParameterSpec,
     ParameterSourceFilter, APPLY_METHOD_IMMEDIATE, APPLY_METHOD_PENDING_REBOOT,
     APPLY_TYPE_DYNAMIC, APPLY_TYPE_STATIC, DOCDB_CLUSTER_PARAMETERS,
     DOCDB_PARAMETER_GROUP_FAMILIES, MAX_PARAMETERS_PER_MODIFY, MAX_PARAMETER_GROUP_NAME_LEN,
@@ -2756,6 +2760,13 @@ pub struct DbParameterGroupRecord {
     /// `ListTagsForResource`, which does, is still scaffolded — but the caller's input is
     /// kept rather than dropped, so it is here when that operation lands.
     pub tags: Vec<Tag>,
+    /// The parameters a caller has set on the group, by `ParameterName`, exactly as the
+    /// cluster-level groups above carry theirs: `ModifyDBParameterGroup` writes them and
+    /// `DescribeDBParameters` reports them with `Source` [`PARAMETER_SOURCE_USER`]. A
+    /// freshly created group carries NONE — the engine's own defaults belong to the FAMILY,
+    /// which publishes them ([`published_db_parameters`]), and are not materialised into a
+    /// group.
+    pub parameters: BTreeMap<String, ParameterSetting>,
 }
 
 impl DbParameterGroupRecord {
@@ -2774,6 +2785,78 @@ impl DbParameterGroupRecord {
             db_parameter_group_arn: Some(self.arn()),
         }
     }
+
+    /// The parameter `name` as the modelled `Parameter`: the value and apply method the
+    /// caller set, plus the metadata this group's family publishes for it when it publishes
+    /// any — the instance-level counterpart of
+    /// [`DbClusterParameterGroupRecord::parameter_to_wire`].
+    pub fn parameter_to_wire(&self, name: &str) -> Parameter {
+        let setting = self.parameters.get(name);
+        let spec = published_db_parameter(&self.family, name);
+        Parameter {
+            parameter_name: Some(name.to_string()),
+            parameter_value: setting.map(|setting| setting.value.clone()),
+            description: spec.map(|spec| spec.description.to_string()),
+            source: Some(PARAMETER_SOURCE_USER.to_string()),
+            apply_type: spec.map(|spec| spec.apply_type.to_string()),
+            data_type: spec.map(|spec| spec.data_type.to_string()),
+            allowed_values: spec.map(|spec| spec.allowed_values.to_string()),
+            is_modifiable: spec.map(|spec| spec.is_modifiable),
+            minimum_engine_version: spec.map(|spec| spec.minimum_engine_version.to_string()),
+            apply_method: setting.map(|setting| setting.apply_method.clone()),
+            supported_engine_modes: None,
+        }
+    }
+}
+
+/// The parameters the DB (instance) parameter group family `family` publishes, or `None`
+/// when this emulator publishes none for it.
+///
+/// This is the catalog `DescribeEngineDefaultParameters` reports for the same family — one
+/// family has ONE published parameter list, whichever operation is asked — so the two can
+/// never disagree about what a parameter admits. It is a SAMPLE of that list rather than the
+/// whole of it (an engine publishes hundreds of parameters per family), which is why
+/// [`validate_db_parameter_setting`] checks the value of a parameter the catalog carries and
+/// admits any name it does not.
+///
+/// A family the catalog is empty for, and a string that names no family at all, publish
+/// nothing.
+///
+/// The cluster-level catalog of a family is the separate [`published_parameters`], which the
+/// DB CLUSTER parameter group operations read.
+pub fn published_db_parameters(family: &str) -> Option<&'static [ClusterParameterSpec]> {
+    crate::ops::describe_engine_default_parameters::engine_default_parameters(family)
+        .filter(|published| !published.is_empty())
+}
+
+/// The spec the DB (instance) parameter group family `family` publishes for the parameter
+/// named `name`, if any; see [`published_db_parameters`].
+pub fn published_db_parameter(family: &str, name: &str) -> Option<&'static ClusterParameterSpec> {
+    spec_in_catalog(published_db_parameters(family), name)
+}
+
+/// Refuse a setting a DB (instance) parameter group of `family` cannot carry: a parameter
+/// the family publishes that the engine does not let a caller modify, or a value outside the
+/// ones that parameter admits.
+///
+/// A name the published catalog does not carry is ADMITTED, because that catalog is a sample
+/// of the family's published list rather than the whole of it: see
+/// [`published_db_parameters`] and [`validate_known_setting`], which carries the rule. The
+/// cluster-level rule is [`validate_parameter_setting`], over a catalog that IS its family's
+/// whole list.
+pub fn validate_db_parameter_setting(
+    family: &str,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    validate_known_setting(published_db_parameters(family), name, value)
+}
+
+/// The apply method a change to a DB (instance) parameter gets when the caller asks for
+/// none: the one the parameter's own apply type implies; see
+/// [`service_common::rds_cluster_parameters::default_apply_method`] for the documented rule.
+pub fn db_parameter_default_apply_method(family: &str, name: &str) -> &'static str {
+    default_apply_method_for(published_db_parameter(family, name))
 }
 
 /// A parameter the engine publishes for a family, as the modelled `Parameter` with its

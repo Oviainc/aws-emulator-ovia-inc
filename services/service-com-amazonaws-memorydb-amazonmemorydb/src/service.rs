@@ -60,7 +60,8 @@ use std::sync::Arc;
 /// a `@pattern` (`UserName`, `AccessString`), a `@length` (a name, a filter's value
 /// list, a tag list), a `@range`, an enum's value set, `@uniqueItems`. Those are the
 /// same rules this service enforces itself one notch tighter (see
-/// `crate::state::resource_name_rejection` and `max_results_rejection`), which is why
+/// `crate::state::resource_name_rejection` and `crate::state::PageSizeWindow`), which is
+/// why
 /// one code has to cover both. OUT OF SCOPE: a member that is absent altogether, left
 /// to the framework's own wording because nothing in the model or this service's
 /// recorded behaviour says which code MemoryDB answers that with; and an

@@ -15,6 +15,8 @@
 mod account_settings;
 #[path = "all/authorization.rs"]
 mod authorization;
+#[path = "all/connector_secret_arn.rs"]
+mod connector_secret_arn;
 #[path = "all/connectors.rs"]
 mod connectors;
 // SUPERSEDED and empty: mainline's `connectors.rs` replaced its connector half and

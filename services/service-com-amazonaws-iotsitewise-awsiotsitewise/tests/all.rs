@@ -198,6 +198,11 @@ mod batch_put_timestamp_and_quality;
 mod dataset_export_jobs;
 #[path = "all/describe_asset_property.rs"]
 mod describe_asset_property;
+// In its alphabetical place inside the sorted list, rather than appended after
+// it: the end of this file is where every concurrent iotsitewise change appends a
+// declaration of its own, and each append there collided with this one.
+#[path = "all/describe_search_reads.rs"]
+mod describe_search_reads;
 #[path = "all/execute_query.rs"]
 mod execute_query;
 #[path = "all/execute_query_follows_the_store.rs"]
@@ -239,6 +244,12 @@ mod update_asset_model;
 // this one. Fold it into the sorted list once the churn settles.
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
+
+// Same reasoning as `application_lifecycle` above: declared after the sorted
+// list, which is the stretch every concurrent iotsitewise change edits. Fold it
+// into the list once the churn settles.
+#[path = "all/list_interface_relationships.rs"]
+mod list_interface_relationships;
 
 // Declared after the sorted list for the reason the note above gives: both
 // stretches above are where every concurrent iotsitewise change inserts a

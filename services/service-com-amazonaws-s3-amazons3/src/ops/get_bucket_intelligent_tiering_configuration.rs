@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketIntelligentTieringConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketIntelligentTieringConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the ONE S3 Intelligent-Tiering configuration an existing bucket
+//! carries under the `Id` the request names, exactly as
+//! `PutBucketIntelligentTieringConfiguration` recorded it. A bucket that carries none
+//! under that id answers `NoSuchConfiguration` (HTTP 404), the way `GetBucketReplication`
+//! answers a bucket with no replication configuration, and a request naming a bucket this
+//! emulator does not hold answers the service-wide `NoSuchBucket` (HTTP 404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketIntelligentTieringConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure REPORT: nothing here writes, so two reads of an unchanged bucket answer the
+//! same thing and a read never configures anything.
 //!
 //! ## Shape of an operation
 //!
@@ -98,9 +98,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 // here — hence the `GetBucketIntelligentTieringConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetBucketIntelligentTieringConfiguration")]
+// Widened by `NoSuchBucket` the way `ListBucketIntelligentTieringConfigurations` widens it:
+// the model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="GetBucketIntelligentTieringConfiguration")`
+// reports `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that
+// does not exist and AWS answers the service-wide `NoSuchBucket` (`httpError 404`).
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetBucketIntelligentTieringConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum GetBucketIntelligentTieringConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -154,18 +163,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketIntelligentTieringConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketIntelligentTieringConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketIntelligentTieringConfiguration"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner … the request fails with the HTTP
+        // status code 403 Forbidden (access denied)", judged as every other bucket-scoped
+        // operation in this crate judges it: this emulator serves one account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no bucket store to read, so this
+            // answers 501 rather than a truthful-looking "this bucket carries none".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetBucketIntelligentTieringConfiguration",
+            ));
+        };
+
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(
+                GetBucketIntelligentTieringConfigurationErrorModeled::NoSuchBucket(
+                    NoSuchBucket {},
+                )
+                .into(),
+            );
+        };
+        // `IntelligentTieringConfiguration` is the whole output, so a bucket carrying none
+        // under this id has nothing to report: that is the per-ID
+        // "there is no such configuration" refusal, answered the way
+        // `GetBucketReplication` answers a bucket with no replication configuration.
+        let Some(configuration) = bucket.intelligent_tiering_configuration(&input.id) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_CONFIGURATION_CODE,
+                crate::state::NO_SUCH_CONFIGURATION_STATUS,
+                crate::state::NO_SUCH_CONFIGURATION_MESSAGE,
+            ));
+        };
+
+        Ok(GetBucketIntelligentTieringConfigurationOutput {
+            // "Container for S3 Intelligent-Tiering configuration" — the stored container,
+            // member for member as the put named it.
+            intelligent_tiering_configuration: Some(configuration.clone()),
+        })
     }
 }
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;

@@ -160,13 +160,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         };
-        if let Some(message) = crate::state::max_results_rejection(
-            crate::state::PageSizeNoun::Records,
-            input.max_results,
-        ) {
-            // A page size outside the window names no page: refused with this
-            // operation's own modelled invalid-value error, through the one rule every
-            // listing in this service reads the page-size window with.
+        if let Some(message) =
+            crate::state::CLUSTER_PAGE_SIZE_WINDOW.rejection(input.max_results)
+        {
+            // A page size outside the window the CLUSTER-side listings serve names no
+            // page: refused with this operation's own modelled invalid-value error,
+            // through the one rule this surface reads its page-size window with.
             return Err(DescribeClustersErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     message: Some(message),

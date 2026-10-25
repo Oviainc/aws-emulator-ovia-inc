@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::enabled_control_lifecycle::{
-    account, control, details, enable, enabled_control_prefix, entries, ou,
+    control, details, enable, enabled_control_prefix, entries, ou,
 };
 use crate::landing_zone_lifecycle::{call, emulator, is_operation_identifier, past_the_settle_span};
 use crate::resource_tags::{read_tags, reported_tags, tags};
@@ -157,22 +157,22 @@ async fn enable_control_persists_the_tag_map_it_was_given() {
 /// non-terminal status and after the clock settles it.
 ///
 /// The rows span the ways two requests can differ: the same control on two targets,
-/// another control on a target already carrying one, and both target types the
-/// `targetIdentifier` docs name (an organizational unit and an account).
+/// another control on a target already carrying one, and a control the catalog publishes
+/// with parameters beside ones that declare none.
 #[tokio::test]
 async fn every_enablement_mints_its_own_arn_and_operation_identifier() {
     let encrypted = control("AWS-GR_ENCRYPTED_VOLUMES");
     let root_user = control("AWS-GR_RESTRICT_ROOT_USER");
     let first_ou = ou("4aa1");
     let second_ou = ou("4aa2");
-    let an_account = account("123456789012");
+    let third_ou = ou("4aa3");
 
     let cases: Vec<(&str, &String, &String)> = vec![
         ("one control on an OU target", &encrypted, &first_ou),
         ("the same control on another OU", &encrypted, &second_ou),
-        ("the same control on an account target", &encrypted, &an_account),
+        ("the same control on a third OU", &encrypted, &third_ou),
         ("another control on a target already carrying one", &root_user, &first_ou),
-        ("another control on the account target", &root_user, &an_account),
+        ("another control on the third OU", &root_user, &third_ou),
     ];
 
     let router = emulator();
@@ -279,17 +279,17 @@ async fn the_enabled_control_store_is_bounded_by_the_modeled_quota() {
     use service_com_amazonaws_controltower_awscontroltowerapis::state::MAX_ENABLED_CONTROLS;
 
     let router = emulator();
-    let target = ou("5bb1");
+    let encrypted = control("AWS-GR_ENCRYPTED_VOLUMES");
 
-    // Fill the store to its cap. Each control/target pair is one entry, so distinct
-    // control identifiers on one target reach the cap.
+    // Fill the store to its cap. Each control/target pair is one entry, so one control on
+    // distinct organizational units reaches the cap.
     let mut last_stored = String::new();
     for index in 0..MAX_ENABLED_CONTROLS {
         let (arn, _) = enable(
             &router,
             serde_json::json!({
-                "controlIdentifier": control(&format!("AWS-GR_CONTROL_{index}")),
-                "targetIdentifier": target,
+                "controlIdentifier": encrypted,
+                "targetIdentifier": ou(&format!("q{index:04}")),
             }),
         )
         .await;
@@ -298,13 +298,13 @@ async fn the_enabled_control_store_is_bounded_by_the_modeled_quota() {
 
     // Past the cap, on a pair nothing has enabled: the refusal is the quota, not the
     // once-per-target rule.
-    let past_the_cap = control("AWS-GR_PAST_THE_CAP");
+    let past_the_cap = ou("qpast");
     let refused = call(
         &router,
         "/enable-control",
         serde_json::json!({
-            "controlIdentifier": past_the_cap,
-            "targetIdentifier": target,
+            "controlIdentifier": encrypted,
+            "targetIdentifier": past_the_cap,
         }),
     )
     .await;
@@ -317,11 +317,11 @@ async fn the_enabled_control_store_is_bounded_by_the_modeled_quota() {
         refused.body
     );
 
-    // The refusal wrote nothing: the control it named is enabled nowhere.
+    // The refusal wrote nothing: the target it named carries no enablement.
     let listed = call(
         &router,
         "/list-enabled-controls",
-        serde_json::json!({ "filter": { "controlIdentifiers": [past_the_cap] } }),
+        serde_json::json!({ "targetIdentifier": past_the_cap }),
     )
     .await;
     assert_eq!(

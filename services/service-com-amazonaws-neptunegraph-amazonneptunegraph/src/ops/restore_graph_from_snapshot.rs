@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreGraphFromSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreGraphFromSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! This operation is implemented: it restores a graph from a stored snapshot, reading
+//! the snapshot out of this service's state and persisting the graph it creates.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreGraphFromSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A restore mints a NEW graph: the request names it and may override each
+//! configuration member it carries, while every member it omits is restored as the
+//! snapshot captured it.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +183,223 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreGraphFromSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreGraphFromSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreGraphFromSnapshot"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RestoreGraphFromSnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Every refusal below is a constraint the BOUNDARY validator cannot check, so
+        // this is where it is enforced; each is worded by the same builders in
+        // `crate::state` the boundary refusal renderer uses, so a caller cannot tell
+        // which side of the boundary caught the violation. `snapshotIdentifier`'s
+        // pattern carries no lookahead, so a malformed one is refused at the boundary
+        // before this handler runs.
+        let mut violations: Vec<String> = Vec::new();
+
+        // `graphName`'s modelled pattern opens with a negative lookahead, which the
+        // boundary validator's regex engine cannot compile — and an uncompilable
+        // `@pattern` is treated as matching — so the name rule is enforced here, through
+        // the same shared rule `CreateGraph` enforces it with. Length (1..63) is already
+        // refused at the boundary by the `@length` trait.
+        if !crate::state::resource_name_is_well_formed(&input.graph_name, GRAPH_ID_PREFIX) {
+            violations.push(crate::state::constraint_clause(
+                "graphName",
+                Some(&input.graph_name),
+                &crate::state::pattern_requirement(GRAPH_NAME_PATTERN),
+            ));
+        }
+
+        // Nothing caller-sized reaches the store unchecked — the bound on what one
+        // record's tags may hold is stated once, in `crate::state`, and is reached by
+        // every operation that accepts a `tags` map.
+        if let Some(tags) = input.tags.as_ref() {
+            if let Err(message) = crate::state::bound_tags(tags) {
+                violations.push(message);
+            }
+        }
+
+        if !violations.is_empty() {
+            return Err(RestoreGraphFromSnapshotErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::validation_envelope(&violations),
+                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // The names a graph reserves are released when its deletion completes, so the
+        // deletions the clock has already made due are materialised before the name is
+        // looked up: the index the conflict check below reads is the one a read taken at
+        // this instant would see.
+        store.reap_deleted_graphs(now);
+
+        // The graph is restored FROM a snapshot, so the snapshot has to exist IN THE
+        // REGION this request was signed for — a snapshot of another Region is not
+        // visible here. The lookup settles the transition the clock already made due
+        // first, so a snapshot whose creation has come due is restorable.
+        let Some(snapshot) = store.settled_snapshot(&input.snapshot_identifier, &region, now)
+        else {
+            return Err(
+                RestoreGraphFromSnapshotErrorModeled::ResourceNotFoundException(
+                    crate::state::snapshot_not_found(&input.snapshot_identifier),
+                )
+                .into(),
+            );
+        };
+        // The facts the rest of this handler needs, read off the snapshot before the
+        // store is written to, so no borrow of one record is held across a change to
+        // the store.
+        let snapshot_id = snapshot.id.clone();
+        let snapshot_status = snapshot.status;
+        // The restored graph's data is encrypted with the key the snapshotted data is
+        // encrypted with: this request carries no key member at all, so the output's
+        // `kmsKeyIdentifier` can only come from the snapshot.
+        let kms_key_identifier = snapshot.kms_key_identifier.clone();
+        // What the snapshot captured of the graph it was taken from: the configuration
+        // every member this request does not override is restored with, and the data
+        // the restored graph comes up holding.
+        let captured_configuration = snapshot.source_configuration.clone();
+        let captured_data = snapshot.data.clone();
+
+        // Only a complete snapshot can be restored: while its creation is still
+        // outstanding the snapshot holds no usable copy of the data, which is the same
+        // precondition `CreateGraphSnapshot` states about the graph it snapshots.
+        if snapshot_status != crate::state::SnapshotStatus::Available {
+            return Err(RestoreGraphFromSnapshotErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "snapshot {snapshot_id} is in status {} and cannot be restored",
+                        snapshot_status.as_wire()
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // `graphName` is unique per account PER REGION, exactly as it is for
+        // `CreateGraph`: the restored graph is a new graph, so a stored graph of the
+        // SAME Region by that name (including one that is still DELETING, which holds
+        // its name until the deletion finishes) conflicts with it.
+        if let Some(existing) = store.graph_id_named(&input.graph_name, &region) {
+            return Err(RestoreGraphFromSnapshotErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "a graph named '{}' already exists with id {existing}",
+                        input.graph_name
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // The store is shared and grows by one graph per call, so it has a ceiling
+        // (`crate::state::MAX_GRAPHS`). Reaching it is the condition the model's
+        // `ServiceQuotaExceededException` (402) describes.
+        if store.graphs.len() >= crate::state::MAX_GRAPHS {
+            return Err(
+                RestoreGraphFromSnapshotErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this emulator holds at most {} graphs; delete a graph before \
+                             restoring another",
+                            crate::state::MAX_GRAPHS
+                        ),
+                        resource_id: None,
+                        resource_type: Some("Graph".to_string()),
+                        service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.next_graph_id();
+        let create_time = ::std::time::SystemTime::now();
+        let graph = crate::state::Graph {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("graph/{id}"),
+            ),
+            endpoint: format!("{id}.{region}.{}.amazonaws.com", crate::state::ARN_NAMESPACE),
+            // The restored graph exists in the Region this request was signed for, which
+            // is the Region the snapshot it is restored from is visible in.
+            region,
+            id,
+            // A restore does not reuse the snapshotted graph's name: the request names
+            // the graph it creates, and that name is required.
+            name: input.graph_name,
+            // The graph is not usable when the call returns; the clock owes the move to
+            // AVAILABLE a fixed span later (see `crate::state::PROVISIONING_SPAN`).
+            status: crate::state::GraphStatus::Creating,
+            pending: Some(crate::state::PendingTransition::owed(
+                crate::state::GraphStatus::Available,
+                now,
+            )),
+            status_reason: None,
+            create_time,
+            // Each configuration member the request carries overrides the snapshotted
+            // graph's value for it; one it omits is restored as the snapshot captured
+            // it, which is what makes this a restore of that graph rather than a create
+            // with this service's defaults.
+            provisioned_memory: input
+                .provisioned_memory
+                .unwrap_or(captured_configuration.provisioned_memory),
+            public_connectivity: input
+                .public_connectivity
+                .unwrap_or(captured_configuration.public_connectivity),
+            deletion_protection: input
+                .deletion_protection
+                .unwrap_or(captured_configuration.deletion_protection),
+            replica_count: input
+                .replica_count
+                .unwrap_or(captured_configuration.replica_count),
+            kms_key_identifier,
+            // This request models no `vectorSearchConfiguration` member, so the restored
+            // graph indexes its vectors exactly as the snapshotted one did.
+            vector_search_configuration: captured_configuration.vector_search_configuration,
+            // The snapshot this graph was restored from, which every later read of the
+            // graph reports.
+            source_snapshot_id: Some(snapshot_id),
+            // The build of the software serving this graph: it is provisioned now, so it
+            // runs the build this service serves.
+            build_number: crate::state::GRAPH_SOFTWARE_BUILD_NUMBER.to_string(),
+            // The tags are the ones this request supplied: a restore mints a new
+            // resource, and the snapshot's own tag set belongs to the snapshot.
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // Nothing has deleted this graph.
+            deletes_at: None,
+            // The restored graph holds the data the snapshot captured; the statistics
+            // over it are the ones this graph came up with.
+            data: captured_data.into_as_of(create_time),
+        };
+
+        // Report the record that was stored, so this response cannot drift from what a
+        // later GetGraph answers.
+        let output = Self::Output::from(&graph);
+        store.insert_graph(graph);
+        Ok(output)
     }
 }
+
+/// The modelled `GraphName` pattern, exactly as the model spells it
+/// (`smithy_query(query="shape",shape="GraphName")`): the expression a refusal reports,
+/// enforced by `crate::state::resource_name_is_well_formed` because the boundary
+/// validator's regex engine cannot compile its leading negative lookahead.
+const GRAPH_NAME_PATTERN: &str = "^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$";
+
+/// The prefix a `graphName` may therefore not take — the `(?!g-)` clause of
+/// [`GRAPH_NAME_PATTERN`], which is also the prefix the modelled `GraphId` requires.
+const GRAPH_ID_PREFIX: &str = "g-";

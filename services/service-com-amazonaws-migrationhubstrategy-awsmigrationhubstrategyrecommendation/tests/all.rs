@@ -26,6 +26,9 @@ mod application_component_strategies;
 #[path = "all/assessment_error_paths.rs"]
 mod assessment_error_paths;
 
+#[path = "all/assessment_server_status.rs"]
+mod assessment_server_status;
+
 #[path = "all/collector_inventory.rs"]
 mod collector_inventory;
 

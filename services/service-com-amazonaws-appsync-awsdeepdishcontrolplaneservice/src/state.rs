@@ -144,6 +144,15 @@ pub struct ApiCacheRecord {
     /// available, or `None` once nothing is owed. Stored rather than slept on: see
     /// [`CACHE_SPAN`].
     pub available_at: Option<SystemTime>,
+    /// The instant the cache's entries were last discarded, or `None` while nothing
+    /// has discarded them. Not a member of the modelled `ApiCache`, so no operation
+    /// projects it: it is read only by whatever serves an entry.
+    ///
+    /// A cache entry is a response the GraphQL endpoint served, so the entries are
+    /// written by the data plane rather than by any control-plane call: what a flush
+    /// leaves behind is this boundary, after which no entry cached before it is
+    /// served. [`ApiCacheRecord::flush`] moves it; nothing else does.
+    pub last_flushed_at: Option<SystemTime>,
 }
 
 impl ApiCacheRecord {
@@ -162,6 +171,15 @@ impl ApiCacheRecord {
         }
         self.available_at = None;
         self.status = CACHE_AVAILABLE.to_string();
+    }
+
+    /// Discard every entry the cache holds, as of `now`.
+    ///
+    /// The instance itself is untouched — its settings and the status it is in are
+    /// properties of the instance, not of the entries it holds — so the only thing a
+    /// flush leaves behind is the new entry boundary ([`Self::last_flushed_at`]).
+    pub fn flush(&mut self, now: SystemTime) {
+        self.last_flushed_at = Some(now);
     }
 
     /// This record as the modelled `ApiCache` shape — the single projection the

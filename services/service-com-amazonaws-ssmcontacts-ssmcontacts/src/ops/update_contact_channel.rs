@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateContactChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateContactChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateContactChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Patches the contact channel `ContactChannelId` names: the members the request names
+//! (`Name`, `DeliveryAddress`) replace their stored values, the members it omits are left
+//! exactly as they were, and nothing else about the channel moves — not its `ContactArn`,
+//! not its `Type`, and not its own ARN, which is the identity the request addressed it by.
+//! The modelled output carries no member, so a later `GetContactChannel` /
+//! `ListContactChannels` read is the only report of the write.
+//!
+//! Three refusals come before anything is written, in this order:
+//!
+//! 1. The ACCOUNT-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]):
+//!    evaluated BEFORE `ContactChannelId` is resolved, so a non-onboarded account is refused
+//!    with the modelled `ValidationException` (HTTP 400) whether or not its channel exists.
+//! 2. The resource lookup: an ARN naming no stored channel is the modelled
+//!    `ResourceNotFoundException` (HTTP 404).
+//! 3. The request is checked WHOLE: a request naming neither updatable member describes no
+//!    update, a `DeliveryAddress` carrying no `SimpleAddress` names nothing to engage, and a
+//!    `Name` another live channel of the SAME contact already carries would leave that
+//!    contact with two channels answering to one name — the inconsistent state this
+//!    operation's modelled `ConflictException` (HTTP 409) is for, and the same uniqueness
+//!    rule `CreateContactChannel` enforces. A refused update leaves the stored channel
+//!    untouched.
+//!
+//! Changing the `DeliveryAddress` returns the channel to `NOT_ACTIVATED` and delivers a
+//! fresh activation code to it. `ActivationStatus` is what the model's
+//! `ActivateContactChannel` gates engagement on ("Incident Manager can't engage a contact
+//! until the contact channel has been activated"), and what it checks is the code delivered
+//! out of band to the address the channel names (`ActivationCode`: "The code sent to the
+//! contact channel"), so an `ACTIVATED` channel attests THAT address. Pointed at a new one,
+//! the attestation no longer holds and the channel has to be activated again; a rename
+//! touches no address, so it leaves the status and the outstanding code alone.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +177,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateContactChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateContactChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The channel is addressed by ARN and nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateContactChannelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+
+        // The account gate comes FIRST: it is evaluated before `ContactChannelId` is
+        // resolved, so a non-onboarded account is refused identically whether or not its
+        // channel exists, and nothing is written.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
+        let Some(channel) = state.contact_channels.get(&input.contact_channel_id) else {
+            return Err(UpdateContactChannelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Contact channel {} not found", input.contact_channel_id),
+                    resource_id: input.contact_channel_id.clone(),
+                    resource_type: CONTACT_CHANNEL_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+        let contact_arn = channel.contact_arn.clone();
+        let stored_name = channel.name.clone();
+        let stored_address = channel.delivery_address.simple_address.clone();
+
+        // The request is checked WHOLE before any of it is applied, so a refused update
+        // leaves the stored channel exactly as it was.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateContactChannel"))
+        // `Name` and `DeliveryAddress` are the only members this operation writes, so a
+        // request naming neither describes no update at all.
+        if input.name.is_none() && input.delivery_address.is_none() {
+            return Err(validation(NOTHING_TO_UPDATE_MESSAGE));
+        }
+
+        // `DeliveryAddress` is "the details that Incident Manager uses when trying to engage
+        // the contact channel", so an address carrying no `SimpleAddress` names nothing to
+        // engage — the same refusal `CreateContactChannel` gives it.
+        let new_address = match &input.delivery_address {
+            Some(address) => match address.simple_address.as_deref() {
+                Some(simple) if !simple.is_empty() => Some(simple.to_string()),
+                _ => {
+                    return Err(validation(
+                        "Value at 'deliveryAddress.simpleAddress' failed to satisfy constraint: \
+                         Member must not be empty",
+                    ))
+                }
+            },
+            None => None,
+        };
+
+        // A channel's `Name` identifies it WITHIN its contact, so a rename onto a name a
+        // SIBLING channel of the same contact already carries is refused rather than
+        // applied. Renaming a channel to the name it already has names only itself, so it is
+        // not a conflict.
+        if let Some(name) = &input.name {
+            if name != &stored_name {
+                if let Some(existing) = state.channel_of_contact_named(&contact_arn, name) {
+                    return Err(UpdateContactChannelErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "The contact channel name '{}' is already in use by {} on \
+                                 contact {}",
+                                name, existing.arn, contact_arn
+                            ),
+                            resource_id: existing.arn.clone(),
+                            resource_type: CONTACT_CHANNEL_RESOURCE_TYPE.to_string(),
+                            dependent_entities: None,
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // An address the request names that is not the one already stored: what makes the
+        // channel's activation stale.
+        let address_changed = new_address
+            .as_ref()
+            .is_some_and(|address| Some(address) != stored_address.as_ref());
+
+        let Some(channel) = state.contact_channels.get_mut(&input.contact_channel_id) else {
+            // Unreachable: the key was found above, under this same lock.
+            return Err(UpdateContactChannelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the contact channel resolved for this update is no longer stored"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        // Named members replace, omitted members are left alone.
+        if let Some(name) = &input.name {
+            channel.name = name.clone();
+        }
+        if let Some(address) = new_address {
+            channel.delivery_address = ContactChannelAddress {
+                simple_address: Some(address),
+            };
+            if address_changed {
+                channel.activation_status = NOT_ACTIVATED.to_string();
+            }
+        }
+
+        // The activation code goes to the channel's own (new) address, never into this
+        // response, exactly as `CreateContactChannel` and `SendActivationCode` deliver it;
+        // it supersedes the code delivered to the address the channel just left.
+        if address_changed {
+            state.deliver_activation_code(&input.contact_channel_id);
+        }
+
+        Ok(UpdateContactChannelOutput {})
     }
+}
+
+/// The `ActivationStatus` a channel pointed at a new, unverified delivery address carries,
+/// from the model's own `ActivationStatus` value set
+/// ([`crate::ops::types::ACTIVATION_STATUS_VALUES`]) — the same value a freshly created
+/// channel starts at.
+const NOT_ACTIVATED: &str = "NOT_ACTIVATED";
+
+/// The `resourceType` this operation's not-found and conflict errors name, spelled as the
+/// channel lifecycle's other handlers spell it.
+const CONTACT_CHANNEL_RESOURCE_TYPE: &str = "contact-channel";
+
+/// The message an update that names none of the members it could write is refused with,
+/// worded as `UpdateContact`'s own "nothing to update" refusal is.
+const NOTHING_TO_UPDATE_MESSAGE: &str =
+    "Invalid value provided - Either name or deliveryAddress must be provided";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` (the account-level failure is none of the model's
+/// `CANNOT_PARSE`/`FIELD_VALIDATION_FAILED`/`UNKNOWN_OPERATION`) and `fields` is present
+/// but EMPTY, because no member of the request is at fault.
+fn account_precondition_failed(message: String) -> UpdateContactChannelError {
+    UpdateContactChannelErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: this operation's modelled `ValidationException`, which the model
+/// classifies `client` with `httpError` 400, carrying `message`.
+fn validation(message: impl Into<String>) -> UpdateContactChannelError {
+    UpdateContactChannelErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
 }

@@ -58,15 +58,7 @@ async fn list_members(router: &MultiServiceRouter, network_id: &str, query: &str
 
 /// The `Id` of every member the answer reports, in the order it reported them.
 fn listed_ids(answer: &Answer) -> Vec<String> {
-    answer.body["Members"]
-        .as_array()
-        .map(|members| {
-            members
-                .iter()
-                .map(|member| member["Id"].as_str().unwrap_or_default().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::harness::listed_ids(answer, "Members")
 }
 
 /// A `CreateNetwork` body whose `MemberConfiguration` is `member`.

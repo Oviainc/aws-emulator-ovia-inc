@@ -145,20 +145,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the ARN is
         // resolved.
         let region = crate::state::request_region(ctx.parts());
-        // The modelled `Arn` pattern pins `ResourceArn` to
-        // `arn:…:outposts:…:<type>/<id>`, so the boundary has already refused every
-        // value this cannot read — with the ARN-syntax code this service names for
-        // it (`EmulatedService::override_refusal`). The handler still does not
-        // assume that; it states the refusal through the error this OPERATION
-        // models, since `BadRequestException` is not one of them and a handler
-        // cannot answer a code its model does not carry.
+        // The same reading of `ResourceArn` every tagging operation does. The
+        // modelled `Arn` pattern pins it to `arn:…:outposts:…:<type>/<id>`, so the
+        // boundary has already refused every value this cannot read — with the
+        // ARN-syntax code this service names for it
+        // (`EmulatedService::override_refusal`). The handler still does not assume
+        // that; it states the refusal through an error this OPERATION models, since
+        // `BadRequestException` is not one of them, and words it through the one
+        // report this crate states that refusal with — which names the member and
+        // the constraint and renders no value.
         let (resource_type, resource_id) = crate::state::resource_arn_parts(&input.resource_arn)
             .ok_or_else(|| {
                 ListTagsForResourceErrorModeled::ValidationException(ValidationException {
-                    message: Some(format!(
-                        "ResourceArn must be an Outposts resource ARN, got {}",
-                        input.resource_arn
-                    )),
+                    message: Some(crate::state::resource_arn_pattern_report()),
                 })
             })?;
 

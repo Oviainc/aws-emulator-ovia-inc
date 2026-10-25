@@ -88,7 +88,11 @@ use std::sync::Arc;
 /// constant and of `override_refusal`: the two are one endpoint, so a client must not get
 /// a different code for the same input depending on which key it addressed. Change one and
 /// change the other.
-const ENUM_VALUE_REFUSAL_CODE: &str = "BadRequestException";
+///
+/// The code itself is owned by `crate::scaffolded::BAD_REQUEST_CODE`, so the class a
+/// handler refuses through `crate::scaffolded::Scaffolded::bad_request` and the class the
+/// boundary catches here carry ONE code rather than drifting apart.
+const ENUM_VALUE_REFUSAL_CODE: &str = crate::scaffolded::BAD_REQUEST_CODE;
 
 /// This model's OWN sdkId-derived key (`sdkId: QConnect`,
 /// `smithy_query(query="service_info")`), beside the shared endpoint identity

@@ -43,3 +43,5 @@ mod source_api_association;
 mod source_graphql_api_association;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/flush_api_cache.rs"]
+mod flush_api_cache;
