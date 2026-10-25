@@ -29,6 +29,8 @@ mod missing_resource_errors;
 mod pending_trn_conflict;
 #[path = "all/put_tax_exemption_state.rs"]
 mod put_tax_exemption_state;
+#[path = "all/repeated_account_ids.rs"]
+mod repeated_account_ids;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/supplemental_tax_registrations.rs"]

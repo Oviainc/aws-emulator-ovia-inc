@@ -154,3 +154,5 @@ mod domain_name_access_associations;
 mod stage_invoke_endpoint;
 #[path = "all/delete_integration_response.rs"]
 mod delete_integration_response;
+#[path = "all/update_authorizer.rs"]
+mod update_authorizer;

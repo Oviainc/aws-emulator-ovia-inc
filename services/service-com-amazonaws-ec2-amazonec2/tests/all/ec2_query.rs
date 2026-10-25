@@ -213,6 +213,55 @@ pub fn error_code(xml: &str) -> String {
     element(xml, "Code").unwrap_or_default()
 }
 
+/// The text of the response envelope's immediate `name` child: `None` when the element is
+/// absent, `Some("")` when it is present and empty — the two cases a suite asserting an
+/// optional member has to tell apart.
+///
+/// Read with the XML parser rather than by substring, so a member of the ENVELOPE is never
+/// confused with one of the same name nested inside a result element.
+pub fn member(body: &str, name: &str) -> Option<String> {
+    let document = roxmltree::Document::parse(body)
+        .unwrap_or_else(|error| panic!("the response body must be XML ({error}): {body}"));
+    document
+        .root_element()
+        .children()
+        .find(|node| node.is_element() && node.tag_name().name() == name)
+        .map(|node| node.text().unwrap_or_default().to_string())
+}
+
+/// The `instanceState/name` `DescribeInstances` reports for one instance, as a string the
+/// "nothing moved" assertions of any suite compare.
+pub async fn described_instance_state(
+    router: &MultiServiceRouter,
+    region: &str,
+    instance_id: &str,
+) -> String {
+    let (status, body) = call(
+        router,
+        region,
+        "DescribeInstances",
+        &[("InstanceId.1".to_string(), instance_id.to_string())],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DescribeInstances for {instance_id} must succeed, got {status}: {body}"
+    );
+    let document = roxmltree::Document::parse(&body)
+        .unwrap_or_else(|error| panic!("the response body must be XML ({error}): {body}"));
+    document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "instanceState")
+        .and_then(|state| {
+            state
+                .children()
+                .find(|node| node.is_element() && node.tag_name().name() == "name")
+        })
+        .and_then(|name| name.text())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// XML text as the service wrote it, with the five entities resolved — an error message
 /// quoting a filter name reaches the wire as `&apos;…&apos;`.
 pub fn unescaped(xml_text: &str) -> String {

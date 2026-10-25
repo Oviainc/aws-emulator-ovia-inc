@@ -34,3 +34,11 @@ $headers.content-type: value_mismatch (expected 'text/xml;charset=UTF-8', got 't
 Boot the ec2 emulator
 Call ConfirmProductInstance and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+
+Implemented, and the two envelope-level divergences the implemented call then exposed fixed with it:
+
+* `ConfirmProductInstance` reports whether the product code the request names is attached to the instance it names — read off the AMI the instance was launched from (`Image$ProductCodes`, the same projection `DescribeInstances` reports as `Instance$ProductCodes`), with `OwnerId` taken from the instance's reservation only when the code IS attached. A caller that owns the code on no stored resource of its own is refused `AuthFailure` (HTTP 400) before the instance id is resolved; an id outside the form EC2 issues is `InvalidInstanceID.Malformed` and an id inside it naming no instance is `InvalidInstanceID.NotFound`, both before `DryRun` is read. The operation writes nothing.
+* The refusal names the product code the REQUEST carried, in the wording recorded from the service (`Not authorised for product code <code>`).
+* The `<RequestID>` EC2's error envelope closes with — the second divergence this unit had — landed on mainline while this fix was in review (in this service's `Ec2QueryEnvelope`, asserted over every operation in `tests/all/ec2_query_envelope.rs`), so this branch keeps mainline's writer rather than a second one.
