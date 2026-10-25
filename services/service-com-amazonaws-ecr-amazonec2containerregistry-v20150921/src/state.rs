@@ -1557,7 +1557,9 @@ pub const LIFECYCLE_POLICY_PARSING_CONSTRAINT: &str =
     "Lifecycle policy parsing failure: Could not map policyString into LifecyclePolicy.";
 
 /// A lifecycle document that maps onto the shape but breaks one of the policy format's
-/// own constraints, which `detail` states.
+/// own constraints, which `detail` states. A `detail` that is the schema validator's
+/// output carries that validator's line terminator (see [`validator_report`]); one ECR
+/// words itself does not.
 pub const LIFECYCLE_POLICY_VALIDATION_CONSTRAINT_PREFIX: &str =
     "Lifecycle policy validation failure: ";
 
@@ -1578,18 +1580,34 @@ fn lifecycle_invalid(detail: String) -> Fault {
     )
 }
 
+/// The schema check of a lifecycle document is a JSON-schema validator, and the
+/// constraint a refusal quotes for a schema failure is that validator's OWN output —
+/// which it writes as a LINE, so the text ends with the newline that terminates it and
+/// the constraint's closing quote follows that newline rather than the last word.
+///
+/// Every phrase below goes through here, because every one of them is a report the
+/// validator produced. The policy format's own cross-member rules (a tag filter against
+/// a `tagStatus`, a `countUnit` against a `countType`, a unique rule priority, the
+/// evaluation order) are checked after the schema and worded by ECR itself, so they are
+/// stated as plain sentences with no terminator.
+fn validator_report(line: String) -> String {
+    format!("{line}\n")
+}
+
 /// The constraint phrase for a member the document leaves out.
 fn missing_required(member: &str) -> String {
-    format!("object has missing required properties ([\"{member}\"])")
+    validator_report(format!(
+        "object has missing required properties ([\"{member}\"])"
+    ))
 }
 
 /// The constraint phrase for a number below the minimum its member declares, naming
 /// both the bound and the value the request carried.
 fn below_minimum(minimum: i64, found: i64) -> String {
-    format!(
+    validator_report(format!(
         "numeric instance is lower than the required minimum (minimum: {minimum}, \
          found: {found})"
-    )
+    ))
 }
 
 /// The constraint phrase for a value outside the set its member admits, naming the
@@ -1599,18 +1617,18 @@ fn not_in_enum<S: AsRef<str>>(value: &str, allowed: &[S]) -> String {
         .iter()
         .map(|value| format!("\"{}\"", value.as_ref()))
         .collect();
-    format!(
+    validator_report(format!(
         "instance value (\"{value}\") not found in enum (possible values: [{}])",
         values.join(",")
-    )
+    ))
 }
 
 /// The constraint phrase for an array holding fewer entries than its member requires.
 fn array_too_short(minimum: usize, found: usize) -> String {
-    format!(
+    validator_report(format!(
         "array is too short: must have at least {minimum} elements but instance has \
          {found} elements"
-    )
+    ))
 }
 
 /// `values` as a lifecycle policy DOCUMENT spells them: the modelled enums
