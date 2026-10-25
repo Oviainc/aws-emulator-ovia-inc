@@ -434,9 +434,10 @@ async fn the_named_catalog_id_and_the_default_address_one_catalog() {
     }
 }
 
-/// A `CatalogId` this emulator holds no Data Catalog under is refused by both
-/// operations, with HTTP 400 `InvalidInputException` naming the id — and the write leaves
-/// no catalog behind, so the default catalog's own settings are untouched.
+/// A `CatalogId` this emulator holds no Data Catalog under belongs to another account,
+/// so both operations refuse it with HTTP 400 `AccessDeniedException` naming the catalog
+/// ARN the request addressed — and the write leaves no catalog behind, so the default
+/// catalog's own settings are untouched.
 #[tokio::test]
 async fn a_catalog_id_this_account_does_not_hold_is_refused_by_both_operations() {
     // Ids that are not this emulator's account: another twelve-digit account, a shorter
@@ -476,8 +477,8 @@ async fn a_catalog_id_this_account_does_not_hold_is_refused_by_both_operations()
                 "case {foreign:?} / {operation}: expected 400, got {status} with {body}"
             );
             assert!(
-                error_code(&body).contains("InvalidInputException"),
-                "case {foreign:?} / {operation}: expected InvalidInputException, got {body}"
+                error_code(&body).contains("AccessDeniedException"),
+                "case {foreign:?} / {operation}: expected AccessDeniedException, got {body}"
             );
             let message = error_message(&body);
             assert!(

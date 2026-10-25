@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTermsByClient
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTermsByClient`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTermsByClient::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves one stored set of terms documents by the app client that holds it and
+//! the document type's name, and renders what is STORED: this read changes nothing
+//! a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -165,20 +160,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTermsByClient` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTermsByClientErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTermsByClient"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // The terms documents this resolves are the ones "associated with an app
+        // client, identified by the app client ID, user pool ID, and terms name"
+        // (`DescribeTermsByClient`), so an app client the named pool does not hold
+        // has no documents to describe.
+        if !pool.clients.contains_key(&input.client_id) {
+            return Err(client_not_found(&input.client_id, &input.user_pool_id));
+        }
+
+        // A terms document's name is unique to its app client, so the app
+        // client and the name together resolve at most one stored set.
+        let terms = pool
+            .terms_for_client(&input.client_id, &input.terms_name)
+            .ok_or_else(|| terms_not_found(&input.terms_name, &input.client_id))?;
+
+        // Rendered from the STORED terms documents, member for member, so this
+        // answers exactly what a read by `TermsId` answers for the same set and
+        // this read changes nothing a later caller sees.
+        Ok(DescribeTermsByClientOutput {
+            terms: Some(terms.to_terms_type()),
+        })
     }
 }
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> DescribeTermsByClientError {
+    DescribeTermsByClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an app client the named pool
+/// does not hold.
+///
+/// Amazon Cognito's observed refusal for THIS operation's app-client lookup
+/// names both halves of what failed to resolve — the app client asked for and
+/// the pool it was looked for in — in the sentence
+/// `User pool client <ClientId> does not exist in user pool <UserPoolId>.`, with
+/// both variable parts taken from the request. Operations that resolve an app
+/// client with no pool to resolve it in report the shorter sentence (the
+/// `resend_confirmation_code` handler beside this one), which is why that wording is left
+/// where it is rather than reused here.
+///
+/// An app client of another pool is this same refusal: it is not an app client
+/// OF THIS pool, so this pool has no documents of it to describe and none of
+/// this pool's documents may be answered for it.
+fn client_not_found(client_id: &str, user_pool_id: &str) -> DescribeTermsByClientError {
+    DescribeTermsByClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "User pool client {client_id} does not exist in user pool {user_pool_id}."
+        )),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an app client that holds no
+/// terms documents under the requested name, worded as
+/// [`crate::state::terms_not_found_for_client_message`].
+fn terms_not_found(terms_name: &str, client_id: &str) -> DescribeTermsByClientError {
+    DescribeTermsByClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::terms_not_found_for_client_message(
+            terms_name, client_id,
+        )),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> DescribeTermsByClientError {
+    DescribeTermsByClientErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+

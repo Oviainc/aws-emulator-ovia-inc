@@ -34,12 +34,16 @@ fn baseline_arn(baseline_id: &str) -> String {
 
 /// An organizational unit ARN, in the form the AWS Organizations documentation publishes.
 /// `suffix` keeps the rows of one case on distinct targets.
-fn ou(suffix: &str) -> String {
+///
+/// Shared with `crate::enabled_baseline_update_validation`, which asserts the same
+/// accepting rule from the update side, so the two suites cannot disagree about the forms
+/// they drive.
+pub(crate) fn ou(suffix: &str) -> String {
     format!("arn:aws:organizations::123456789012:ou/o-exampleorg/ou-vl11-{suffix}")
 }
 
 /// POST `/enable-baseline`, omitting `parameters` when the caller does.
-async fn enable(
+pub(crate) async fn enable(
     router: &MultiServiceRouter,
     baseline_identifier: &str,
     baseline_version: &str,
@@ -58,7 +62,7 @@ async fn enable(
 }
 
 /// POST `/update-enabled-baseline`, omitting `parameters` when the caller does.
-async fn update(
+pub(crate) async fn update(
     router: &MultiServiceRouter,
     enabled_baseline_identifier: &str,
     baseline_version: &str,
@@ -75,7 +79,7 @@ async fn update(
 }
 
 /// POST `/get-enabled-baseline` and hand back its `enabledBaselineDetails` member.
-async fn enabled_baseline_details(
+pub(crate) async fn enabled_baseline_details(
     router: &MultiServiceRouter,
     identifier: &str,
 ) -> (Answer, serde_json::Value) {
@@ -90,13 +94,13 @@ async fn enabled_baseline_details(
 }
 
 /// A member of a JSON object, as a `&str`.
-fn member<'a>(value: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+pub(crate) fn member<'a>(value: &'a serde_json::Value, name: &str) -> Option<&'a str> {
     value.get(name).and_then(serde_json::Value::as_str)
 }
 
 /// The applied `parameters` of an `EnabledBaselineDetails`, as a list — an absent member
 /// reads as the empty list, which is what "no parameters are applied" means.
-fn applied_parameters(details: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn applied_parameters(details: &serde_json::Value) -> serde_json::Value {
     details
         .get("parameters")
         .cloned()
@@ -105,7 +109,7 @@ fn applied_parameters(details: &serde_json::Value) -> serde_json::Value {
 
 /// Assert that `refused` is the status and error code the rule names, and that it minted
 /// nothing: a refusal reports neither an `EnabledBaseline` ARN nor an operation.
-fn assert_refused(case: &str, refused: &Answer, status: u16, code: &str) {
+pub(crate) fn assert_refused(case: &str, refused: &Answer, status: u16, code: &str) {
     assert_eq!(
         (refused.status, refused.error_code.as_deref()),
         (status, Some(code)),
@@ -122,7 +126,7 @@ fn assert_refused(case: &str, refused: &Answer, status: u16, code: &str) {
 
 /// Every version any catalog baseline offers, so a row can ask one baseline for a version
 /// only another one has.
-fn every_offered_version() -> Vec<&'static str> {
+pub(crate) fn every_offered_version() -> Vec<&'static str> {
     let mut versions: Vec<&'static str> = BASELINE_CATALOG
         .iter()
         .flat_map(|baseline| baseline.versions.iter().copied())

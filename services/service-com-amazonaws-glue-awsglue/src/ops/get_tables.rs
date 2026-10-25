@@ -6,20 +6,24 @@
 //!
 //! Lists the tables actually stored in one database, in folded-name order.
 //!
-//! `Expression` selects the tables whose WHOLE name matches a Hive-style pattern: `*`
-//! matches any run of characters (including none), `|` separates alternatives, and
-//! every other character — `.`, `[`, `(` included — is a literal. That pattern language
-//! is [`crate::state::matches_name_pattern`], which every listing of these tables
-//! shares, and its own documentation states why the metastore reads a pattern that way
-//! — which is why `events*` selects `events` and `events_raw`, the behaviour clients and
-//! this service's own reproduction script expect. The model's prose calls the member "A
-//! regular expression pattern"; the difference shows only on a regex metacharacter, and
-//! the Hive reading is the one the catalog implements. Every string is a valid pattern,
-//! so a pattern is never refused as malformed; one carrying more wildcards than
-//! [`MAX_PATTERN_WILDCARDS`] is refused with `InvalidInputException`, so the work a
-//! caller-supplied pattern can buy stays bounded. `MaxResults` truncates the page and
-//! the returned `NextToken` is the last name on it, so the next call resumes at the
-//! first stored name strictly after it.
+//! `Expression` is "A regular expression pattern. If present, only those tables whose
+//! names match the pattern are returned" (`GetTablesRequest$Expression`), and it selects
+//! the tables whose WHOLE name matches it: a metacharacter keeps its regular-expression
+//! meaning (`ev_.*` selects `ev_one` and `ev_two`, `ev?` selects `ev`), while `*` stands
+//! for any run of characters (including none), so `events*` selects `events` and
+//! `events_raw` and a bare `*` selects everything — unless that `*` is escaped (`\*`) or
+//! inside a character class (`[*]`), where it is the expression's own star. That pattern
+//! language is [`crate::state::compile_name_pattern`], which every listing of these
+//! tables shares (Athena's `ListTableMetadata` over this same catalog is the other), so
+//! two listings of one set of tables can never disagree; the `*` substitution is what
+//! keeps it Hive-metastore compatible, the model folding both `DatabaseInput$Name` and
+//! `TableInput$Name` "for Hive compatibility". The match is case-SENSITIVE, so a pattern
+//! spelled in another case than the stored (folded) name selects nothing. A value that is
+//! no pattern at all (an unclosed group, a quantifier with nothing to repeat) is refused
+//! with `InvalidInputException`, as is one whose compiled matcher would be larger than
+//! [`MAX_PATTERN_PROGRAM_BYTES`], so the work a caller-supplied pattern can buy stays
+//! bounded. `MaxResults` truncates the page and the returned `NextToken` is the last name
+//! on it, so the next call resumes at the first stored name strictly after it.
 //!
 //! Members this slice does not act on, and why: `AuditContext` is input-only Lake
 //! Formation audit metadata that does not change this operation's answer. Every other
@@ -121,6 +125,10 @@
 //! * `InternalServiceException` (HTTP 500) — An internal service error occurred.
 //! * `InvalidInputException` (HTTP 400) — The input provided was not valid.
 //! * `OperationTimeoutException` (HTTP 400) — The operation timed out.
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   "Access to a resource was denied." A `CatalogId` naming another account's Data
+//!   Catalog is reachable only through that catalog's resource-based policy, so a caller
+//!   with no grant on it is refused here before any database is looked up.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -130,11 +138,11 @@ use super::types::*;
 /// whose range is 1..100.
 const MAX_PAGE_SIZE: i32 = 100;
 
-/// Ceiling on the number of `*` wildcards and `|` alternatives one `Expression` may
-/// carry, re-exported from where it lives beside the matcher it bounds
-/// ([`crate::state::MAX_PATTERN_WILDCARDS`]) so every listing of these tables is bounded
-/// by ONE number. A pattern past it is refused here with `InvalidInputException`.
-pub use crate::state::MAX_PATTERN_WILDCARDS;
+/// Ceiling on the size of the matcher one `Expression` compiles to, re-exported from
+/// where it lives beside the pattern language it bounds
+/// ([`crate::state::MAX_PATTERN_PROGRAM_BYTES`]) so every listing of these tables is
+/// bounded by ONE number. A pattern past it is refused here with `InvalidInputException`.
+pub use crate::state::MAX_PATTERN_PROGRAM_BYTES;
 
 /// Which members of each `Table` the request asked for.
 ///
@@ -176,9 +184,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `GetTablesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#GetTables")]
+//
+// `AccessDeniedException` — "Access to a resource was denied." — is widened in through
+// `extra_errors`: this SERVICE models the shape, but this operation's own `errors` list
+// omits it, and a cross-account read of a Data Catalog the caller holds no grant on is
+// refused as unauthorized rather than as a missing entity.
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#GetTables",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetTablesErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     EntityNotFoundException(EntityNotFoundException),
     FederationSourceException(FederationSourceException),
     FederationSourceRetryableException(FederationSourceRetryableException),
@@ -239,7 +256,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The model documents that `QueryAsOfTime` "cannot be specified along with
         // TransactionId", so that pair is a client error whatever else is supported.
         if input.transaction_id.is_some() && input.query_as_of_time.is_some() {
@@ -337,27 +353,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
-
-        // `Expression` is a Hive-style pattern matched against the WHOLE table name (see
-        // the module header). Every string is a valid pattern, so the only refusal is a
-        // pattern carrying more wildcards than this operation will match against every
-        // stored name.
-        let filter = input.expression.as_deref();
-        if let Some(pattern) = filter {
-            let wildcards = crate::state::pattern_wildcards(pattern);
-            if wildcards > MAX_PATTERN_WILDCARDS {
-                return Err(GetTablesErrorModeled::InvalidInputException(
-                    InvalidInputException {
-                        message: Some(format!(
-                            "Expression carries {wildcards} wildcards, more than the \
-                             {MAX_PATTERN_WILDCARDS} this catalog matches"
-                        )),
-                        from_federation_source: None,
-                    },
-                )
-                .into());
-            }
+        // Whether the caller may read this catalog at all is decided BEFORE any database
+        // is looked up: a `CatalogId` of another account is reachable only through that
+        // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(GetTablesErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
+
+        // `Expression` is a regular expression in which `*` stands for any run of
+        // characters, matched against the WHOLE table name through the ONE pattern
+        // language every listing of these tables shares
+        // ([`crate::state::compile_name_pattern`]). A value that is no pattern at all, or
+        // whose matcher would be larger than that language compiles, is refused rather
+        // than silently selecting nothing.
+        let filter = match input.expression.as_deref() {
+            None => None,
+            Some(pattern) => match crate::state::compile_name_pattern(pattern) {
+                Ok(matcher) => Some(matcher),
+                Err(error) => {
+                    return Err(GetTablesErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!(
+                                "Expression {pattern:?} is not a valid regular expression: \
+                                 {error}"
+                            )),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
 
         // Absent `MaxResults`, page at the largest value the model accepts for it
         // (`CatalogGetterPageSize`, range 1..100). The clamp re-states that range in
@@ -385,9 +420,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .filter(|table| !federated_only || table.federated_table.is_some())
             .filter(|table| {
-                filter.is_none_or(|pattern| {
-                    crate::state::matches_name_pattern(pattern, &table.name)
-                })
+                filter
+                    .as_ref()
+                    .is_none_or(|matcher| matcher.is_match(&table.name))
             })
             .collect();
 

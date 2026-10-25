@@ -25,8 +25,8 @@ use service_com_amazonaws_glue_awsglue::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
-    assert_echoed, call, emulator, emulator_on, error_code, ok, table_names, ACCOUNT_ID,
-    CALLER_PRINCIPAL,
+    assert_echoed, call, emulator, emulator_on, error_code, error_message, ok, table_names,
+    ACCOUNT_ID, CALLER_PRINCIPAL, REGION,
 };
 
 /// A `CreateDatabase` body for `name`, with no optional members beyond the name.
@@ -447,39 +447,108 @@ async fn get_tables_honours_the_modelled_max_results_range() {
 // Expression
 // ---------------------------------------------------------------------------
 
-/// `GetTables`'s `Expression` selects the tables whose WHOLE name matches a Hive-style
-/// pattern: `*` matches any run of characters, `|` separates alternatives, and every
-/// other character is a literal (the Data Catalog is Hive-metastore compatible, which
-/// is why the bootstrap script's `ev*` selects the `ev`-prefixed tables).
+/// `GetTables`'s `Expression` is "A regular expression pattern. If present, only those
+/// tables whose names match the pattern are returned": it selects the tables whose WHOLE
+/// name matches the value as a regular expression, in which `*` stands for any run of
+/// characters (so `events*` selects the `events`-prefixed tables and a bare `*` selects
+/// everything).
 ///
 /// The rows differ along the shape of the pattern: a literal, a prefix, a suffix, a
 /// wildcard on both sides, an alternation, the match-everything pattern, the empty
-/// pattern, a bare prefix (no match, because the name is matched in full) and a regex
-/// metacharacter (a literal here, so it matches nothing).
+/// pattern, a bare prefix (no match, because the name is matched in full), a pattern in
+/// another case (no match, because the comparison is case-sensitive) and the regex
+/// metacharacters — a `.` any-character, a `?` optional character, a character class, a
+/// group and a `+` repetition — each of which keeps its regular-expression meaning.
 #[tokio::test]
 async fn get_tables_filters_by_the_expression_pattern() {
     let router = emulator();
     create_database(&router, "filtered_db").await;
     // Not the bootstrap issue's names alone: the set spans separators and lengths.
-    for table in ["events", "events_raw", "orders", "clicks", "user_profile"] {
+    for table in [
+        "events",
+        "events_raw",
+        "orders",
+        "clicks",
+        "user_profile",
+        "ev",
+        "ev_one",
+        "ev_two",
+    ] {
         create_table(&router, "filtered_db", table).await;
     }
 
-    let cases: [(&str, &[&str]); 11] = [
+    let cases: [(&str, &[&str]); 24] = [
         ("events", &["events"]),
-        // The bootstrap script's step 8 shape: `*` is a wildcard, not a repetition.
-        ("ev*", &["events", "events_raw"]),
+        // `*` is a wildcard, not a repetition of the character before it.
+        ("ev*", &["ev", "ev_one", "ev_two", "events", "events_raw"]),
         ("events*", &["events", "events_raw"]),
         ("*s", &["clicks", "events", "orders"]),
-        ("*_*", &["events_raw", "user_profile"]),
-        ("*e*", &["events", "events_raw", "orders", "user_profile"]),
+        ("*_*", &["ev_one", "ev_two", "events_raw", "user_profile"]),
+        (
+            "*e*",
+            &[
+                "ev",
+                "ev_one",
+                "ev_two",
+                "events",
+                "events_raw",
+                "orders",
+                "user_profile",
+            ],
+        ),
         ("orders|clicks", &["clicks", "orders"]),
         ("events|user*", &["events", "user_profile"]),
-        ("*", &["clicks", "events", "events_raw", "orders", "user_profile"]),
+        (
+            "*",
+            &[
+                "clicks",
+                "ev",
+                "ev_one",
+                "ev_two",
+                "events",
+                "events_raw",
+                "orders",
+                "user_profile",
+            ],
+        ),
         // A whole-name match, so a bare prefix matches nothing, and so does the empty
         // pattern (which the model's `FilterString` length 0..2048 allows).
         ("event", &[]),
         ("", &[]),
+        // Every other character keeps its regular-expression meaning: `.` stands for one
+        // character, `?` makes the character before it optional, `[…]` is a class, `(…)`
+        // groups and `+` repeats.
+        ("ev.*", &["ev_one", "ev_two", "events", "events_raw"]),
+        ("ev_.*", &["ev_one", "ev_two"]),
+        ("ev?", &["ev"]),
+        ("events.*", &["events_raw"]),
+        (
+            "[a-z]*",
+            &[
+                "clicks",
+                "ev",
+                "ev_one",
+                "ev_two",
+                "events",
+                "events_raw",
+                "orders",
+                "user_profile",
+            ],
+        ),
+        ("(events)", &["events"]),
+        ("ev+", &["ev"]),
+        ("e(v|x)ents", &["events"]),
+        // The comparison is case-sensitive, and a stored name is folded to lowercase.
+        ("EV_ONE", &[]),
+        ("EVENTS*", &[]),
+        ("[A-Z]*", &[]),
+        // A `*` that is escaped or inside a character class is the expression's own
+        // literal star, not the wildcard: `ev\*_one` therefore matches the name
+        // "ev*_one", which nothing stored carries — had the wildcard substitution
+        // reached inside the escape it would have matched `ev_one` — and `e[*]vents`
+        // matches "e*vents".
+        (r"ev\*_one", &[]),
+        (r"e[*]vents", &[]),
     ];
 
     for (expression, expected) in cases {
@@ -497,61 +566,47 @@ async fn get_tables_filters_by_the_expression_pattern() {
         );
     }
 
-    // Regex metacharacters are literals in this pattern language, so they select the
-    // tables whose names really carry them — here, none.
-    for literal in ["events.*", "[a-z]*", "(events)", "ev+"] {
-        let page = ok(
-            &router,
-            "GetTables",
-            &json!({ "DatabaseName": "filtered_db", "Expression": literal }),
-        )
-        .await;
-        assert!(
-            table_names(&page).is_empty(),
-            "case Expression {literal:?}: a metacharacter is a literal, so no stored name \
-             matches; got {:?}",
-            table_names(&page)
-        );
-    }
-
-    // Every string is a valid pattern, so the only refusal is a pattern carrying more
-    // wildcards than this operation will match against every stored name: the pattern
-    // is request text, so the work it can buy is bounded by the handler.
-    let wildcards = service_com_amazonaws_glue_awsglue::ops::get_tables::MAX_PATTERN_WILDCARDS;
-    for pattern in [
-        "*".repeat(wildcards + 1),
-        format!("a{}", "|a".repeat(wildcards + 1)),
-    ] {
+    // A value that is no regular expression at all cannot select anything, so it is
+    // refused rather than quietly answered with an empty catalog.
+    for malformed in ["ev[", "(events", "a{2,1}"] {
         let (status, body) = call(
             &router,
             "GetTables",
-            &json!({ "DatabaseName": "filtered_db", "Expression": pattern }),
+            &json!({ "DatabaseName": "filtered_db", "Expression": malformed }),
         )
         .await;
         assert_eq!(
             status, 400,
-            "case Expression with {} wildcards: must be refused, got {status} with {body}",
-            wildcards + 1
+            "case Expression {malformed:?}: a malformed pattern must be refused, got \
+             {status} with {body}"
         );
         assert!(
             error_code(&body).contains("InvalidInputException"),
-            "case Expression with {} wildcards: expected InvalidInputException, got {}",
-            wildcards + 1,
+            "case Expression {malformed:?}: expected InvalidInputException, got {}",
             error_code(&body)
         );
     }
-    // One wildcard under the ceiling is served.
-    let page = ok(
+
+    // The pattern is request text matched against every stored name, so a pattern whose
+    // matcher would be larger than this operation compiles
+    // (`MAX_PATTERN_PROGRAM_BYTES`) is refused too.
+    let oversized = format!("(?:{}){{200}}", "[a-z0-9]{200}");
+    let (status, body) = call(
         &router,
         "GetTables",
-        &json!({ "DatabaseName": "filtered_db", "Expression": "*".repeat(wildcards) }),
+        &json!({ "DatabaseName": "filtered_db", "Expression": oversized }),
     )
     .await;
     assert_eq!(
-        table_names(&page),
-        ["clicks", "events", "events_raw", "orders", "user_profile"],
-        "case Expression at the wildcard ceiling: every name matches, got {:?}",
-        table_names(&page)
+        status, 400,
+        "case Expression over the compiled-size ceiling: must be refused, got {status} \
+         with {body}"
+    );
+    assert!(
+        error_code(&body).contains("InvalidInputException"),
+        "case Expression over the compiled-size ceiling: expected InvalidInputException, \
+         got {}",
+        error_code(&body)
     );
 }
 
@@ -675,10 +730,10 @@ async fn absent_and_duplicate_resources_answer_the_modelled_errors() {
             "EntityNotFoundException",
         ),
         (
-            "known database in an unknown catalog",
+            "known database in another account's catalog",
             "GetDatabase",
             json!({ "CatalogId": "111111111111", "Name": "present_db" }),
-            "EntityNotFoundException",
+            "AccessDeniedException",
         ),
         (
             "table in an unknown database",
@@ -760,12 +815,15 @@ async fn absent_and_duplicate_resources_answer_the_modelled_errors() {
 
 /// `CatalogId` selects the Data Catalog, and this emulator holds exactly one: the one
 /// for its own account, which is the catalog the model documents as the default. So
-/// naming that id explicitly is the same as omitting it, and naming any other id is a
-/// miss on every operation of the slice — never a new, empty catalog conjured by the
-/// create.
+/// naming that id explicitly is the same as omitting it, and naming ANY other id
+/// addresses another account's catalog: reachable only through that catalog's own
+/// resource-based policy, which this store holds none of, so every operation of the
+/// slice refuses it as unauthorized — never a new, empty catalog conjured by the create,
+/// and never an answer served out of the caller's own catalog.
 ///
 /// The rows span both axes: how the own catalog is addressed (omitted vs named), and
-/// every operation reached with a foreign id.
+/// every operation reached with a foreign id. The own catalog holds a database of the
+/// SAME name throughout, so a row that answered out of it would be visible here.
 #[tokio::test]
 async fn catalog_id_selects_the_one_catalog_this_emulator_holds() {
     let router = emulator();
@@ -825,15 +883,15 @@ async fn catalog_id_selects_the_one_catalog_this_emulator_holds() {
         );
     }
 
-    // A foreign catalog id is a miss everywhere. `CreateDatabase` models no not-found
-    // error, so it answers the modelled client-input error instead.
+    // A catalog id of another account is refused as unauthorized everywhere, before any
+    // lookup: the authorization decision does not depend on what the own catalog holds.
     let foreign = "222222222222";
     let cases: Vec<(&str, &str, Value, &str)> = vec![
         (
             "CreateDatabase in a foreign catalog",
             "CreateDatabase",
             json!({ "CatalogId": foreign, "DatabaseInput": { "Name": "shared_name" } }),
-            "InvalidInputException",
+            "AccessDeniedException",
         ),
         (
             "CreateTable in a foreign catalog",
@@ -843,37 +901,37 @@ async fn catalog_id_selects_the_one_catalog_this_emulator_holds() {
                 "DatabaseName": "shared_name",
                 "TableInput": { "Name": "events" }
             }),
-            "EntityNotFoundException",
+            "AccessDeniedException",
         ),
         (
             "GetDatabase in a foreign catalog",
             "GetDatabase",
             json!({ "CatalogId": foreign, "Name": "shared_name" }),
-            "EntityNotFoundException",
+            "AccessDeniedException",
         ),
         (
             "GetTable in a foreign catalog",
             "GetTable",
             json!({ "CatalogId": foreign, "DatabaseName": "shared_name", "Name": "events" }),
-            "EntityNotFoundException",
+            "AccessDeniedException",
         ),
         (
             "GetTables in a foreign catalog",
             "GetTables",
             json!({ "CatalogId": foreign, "DatabaseName": "shared_name" }),
-            "EntityNotFoundException",
+            "AccessDeniedException",
         ),
         (
             "DeleteTable in a foreign catalog",
             "DeleteTable",
             json!({ "CatalogId": foreign, "DatabaseName": "shared_name", "Name": "events" }),
-            "EntityNotFoundException",
+            "AccessDeniedException",
         ),
         (
             "DeleteDatabase in a foreign catalog",
             "DeleteDatabase",
             json!({ "CatalogId": foreign, "Name": "shared_name" }),
-            "EntityNotFoundException",
+            "AccessDeniedException",
         ),
     ];
 
@@ -888,6 +946,20 @@ async fn catalog_id_selects_the_one_catalog_this_emulator_holds() {
             "case {case}: expected {expected}, got {}",
             error_code(&answer)
         );
+        // The refusal is built from the request and this emulator's own identity: the
+        // calling principal, the IAM action the operation performs, and the ARN of the
+        // catalog the request addressed.
+        let message = error_message(&answer);
+        for part in [
+            CALLER_PRINCIPAL,
+            &format!("glue:{operation}"),
+            &format!("arn:aws:glue:{REGION}:{foreign}:catalog"),
+        ] {
+            assert!(
+                message.contains(part),
+                "case {case}: the refusal must name {part:?}, got {message:?}"
+            );
+        }
     }
 
     // And the own catalog still holds exactly what it held: nothing was created under

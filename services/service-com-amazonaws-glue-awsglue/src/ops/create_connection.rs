@@ -99,9 +99,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `CreateConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#CreateConnection")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#CreateConnection",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum CreateConnectionErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     AlreadyExistsException(AlreadyExistsException),
     GlueEncryptionException(GlueEncryptionException),
     InvalidInputException(InvalidInputException),
@@ -160,7 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateConnectionErrorModeled::InvalidInputException(
                 InvalidInputException {
@@ -172,16 +175,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
-        // A `CatalogId` this emulator does not hold must not be conjured into existence by
-        // the create, exactly as on `CreateDatabase`: this operation models no not-found
-        // error, so the refusal is the modelled client-input error.
-        if !crate::state::is_known_catalog(&catalog_id) {
-            return Err(CreateConnectionErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "CatalogId {catalog_id} is not a Data Catalog in this account"
-                    )),
-                    from_federation_source: None,
+        // A `CatalogId` this emulator does not hold must not be conjured into existence
+        // by the create, exactly as on `CreateDatabase`: any id but its own account's
+        // names another account's catalog, reachable only through that catalog's own
+        // resource policy, so authorization is decided here (see
+        // `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(CreateConnectionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
                 },
             )
             .into());

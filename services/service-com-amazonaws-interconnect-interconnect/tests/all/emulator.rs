@@ -414,6 +414,19 @@ pub(crate) async fn create_with_tags(
     seed: usize,
     tags: &std::collections::BTreeMap<String, String>,
 ) -> Value {
+    create_with_tags_in(emulator, DEFAULT_SIGNING_REGION, placement, seed, tags).await
+}
+
+/// [`create_with_tags`] signed for `region` rather than for the default one, so a
+/// suite's rows can differ in the Region the resource lives in — which is the Region
+/// its ARN carries.
+pub(crate) async fn create_with_tags_in(
+    emulator: &Emulator,
+    region: &str,
+    placement: &(String, String),
+    seed: usize,
+    tags: &std::collections::BTreeMap<String, String>,
+) -> Value {
     let mut request = Map::new();
     request.insert("environmentId".to_string(), json!(placement.0));
     request.insert("bandwidth".to_string(), json!(placement.1));
@@ -429,7 +442,7 @@ pub(crate) async fn create_with_tags(
         request.insert("tags".to_string(), json!(tags));
     }
     let created = emulator
-        .ic_ok("CreateConnection", Value::Object(request))
+        .ic_ok_in(region, "CreateConnection", Value::Object(request))
         .await;
     created["connection"].clone()
 }

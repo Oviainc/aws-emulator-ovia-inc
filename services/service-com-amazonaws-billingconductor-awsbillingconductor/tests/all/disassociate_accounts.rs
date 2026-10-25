@@ -231,14 +231,7 @@ async fn disassociate_accounts_removes_exactly_the_named_members() {
     let plan = create_plan(&em, "DisassociatePlan").await;
     let accounts: Vec<String> = (1..=7).map(|n| format!("{n:012}")).collect();
     let linked: Vec<&str> = accounts.iter().map(String::as_str).collect();
-    let group = create_group(
-        &em,
-        "DisassociateGroup",
-        &plan,
-        Some("999988887777"),
-        &linked,
-    )
-    .await;
+    let group = create_group(&em, "DisassociateGroup", &plan, None, &linked).await;
     let bare = bare_id(&group);
 
     // Rows differ along how many accounts one call removes (0 is the lower modelled
@@ -327,7 +320,7 @@ async fn a_disassociated_account_can_be_associated_again() {
         &em,
         "ReassociateFirst",
         &plan,
-        Some("999988887777"),
+        None,
         &["111122223333", "222233334444"],
     )
     .await;
@@ -381,7 +374,7 @@ async fn an_account_the_group_does_not_hold_is_refused() {
         &em,
         "NotAssociatedGroup",
         &plan,
-        Some("999988887777"),
+        None,
         &["111122223333", "222233334444", "777788889999"],
     )
     .await;
@@ -487,8 +480,8 @@ async fn an_account_the_group_does_not_hold_is_refused() {
 async fn the_primary_account_of_the_group_cannot_be_disassociated() {
     let em = Emulator::new();
     let plan = create_plan(&em, "PrimaryPlan").await;
-    // Rows differ along whether the primary account is also a linked member of the
-    // group it is the primary account of, and on the group's other membership.
+    // Rows differ along the group's other membership and along how many ids one request
+    // names beside the primary account.
     let member_primary = create_group(
         &em,
         "PrimaryIsMember",
@@ -497,8 +490,9 @@ async fn the_primary_account_of_the_group_cannot_be_disassociated() {
         &["111122223333", "222233334444"],
     )
     .await;
-    let loose_primary =
-        create_group(&em, "PrimaryIsNotMember", &plan, Some("555566667777"), &[]).await;
+    let only_primary =
+        create_group(&em, "PrimaryIsOnlyMember", &plan, Some("555566667777"), &["555566667777"])
+            .await;
 
     let cases: Vec<(&str, &str, Vec<&str>)> = vec![
         (
@@ -512,8 +506,8 @@ async fn the_primary_account_of_the_group_cannot_be_disassociated() {
             vec!["222233334444", "111122223333"],
         ),
         (
-            "a primary account that is not a member of its group",
-            loose_primary.as_str(),
+            "the primary account of a group that holds no other",
+            only_primary.as_str(),
             vec!["555566667777"],
         ),
     ];
@@ -563,7 +557,7 @@ async fn a_duplicate_account_and_an_unknown_group_are_refused() {
         &em,
         "RefusalGroup",
         &plan,
-        Some("999988887777"),
+        Some("111122223333"),
         &["111122223333", "222233334444"],
     )
     .await;

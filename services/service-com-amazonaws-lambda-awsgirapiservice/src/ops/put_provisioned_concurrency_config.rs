@@ -22,9 +22,11 @@
 //! Provisioned concurrency is capacity the account commits, so the two documented quotas
 //! on it are enforced here and a request past either stores nothing: a function that
 //! reserves concurrency allocates its provisioned concurrency out of that reservation,
-//! and the account has to keep at least
-//! [`crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS`] simultaneous executions
-//! unreserved.
+//! and a function that reserves none draws the capacity from what the account has left
+//! unreserved, which can neither hand out more than it holds nor be emptied past the
+//! [`crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS`] simultaneous executions an
+//! account keeps unreserved. Each of those is a rule of its own, so each refusal carries
+//! the sentence for the rule the request actually violated.
 //!
 //! ## Shape of an operation
 //!
@@ -258,35 +260,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(reserved) = reserved {
             let total = provisioned_on_other_qualifiers.saturating_add(requested);
             if total > reserved {
-                return Err(invalid_parameter(format!(
-                    "Specified ConcurrentExecutions for function is greater than the \
-                     function's reserved concurrency of [{reserved}]"
-                )));
+                return Err(invalid_parameter(
+                    crate::state::PROVISIONED_ABOVE_RESERVED_MESSAGE.to_string(),
+                ));
             }
         }
 
-        // Provisioned concurrency is capacity the account commits, so it answers to the
-        // same documented floor a reservation does: "You can reserve concurrency for as
-        // many functions as you like, as long as you leave at least 100 simultaneous
-        // executions unreserved for functions that aren't configured with a per-function
-        // limit."
+        // What a function that reserves NOTHING asks to keep initialised is drawn from the
+        // account's unreserved capacity, so the two account-level rules are weighed
+        // against what that pool holds: it cannot hand out more than it has, and what is
+        // left of it stays at or above the documented floor ("You can reserve concurrency
+        // for as many functions as you like, as long as you leave at least 100
+        // simultaneous executions unreserved for functions that aren't configured with a
+        // per-function limit"). The two refusals diagnose different rules and so carry
+        // different sentences. A function that RESERVES capacity has already committed it
+        // and the check above keeps this allocation inside that reservation, so this call
+        // draws nothing further from the pool.
         let committed_elsewhere = store.reserved_concurrency_except(None).saturating_add(
             store.unreserved_provisioned_concurrency_except(Some((
                 &reference.name,
                 Some(&qualifier),
             ))),
         );
-        // A function that reserves capacity has already committed it, and the check above
-        // keeps this allocation inside that reservation; one that reserves none commits
-        // the requested capacity itself.
-        let committed = if reserved.is_some() {
-            committed_elsewhere
-        } else {
-            committed_elsewhere.saturating_add(requested)
-        };
-        if crate::state::CONCURRENT_EXECUTIONS_LIMIT.saturating_sub(committed)
-            < crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS
-        {
+        // What the pool holds for this call: the account's unreserved concurrency, with
+        // the allocation this call REPLACES left out of the sum, since that capacity is
+        // what the new one takes the place of.
+        let unreserved = crate::state::CONCURRENT_EXECUTIONS_LIMIT
+            .saturating_sub(committed_elsewhere)
+            .max(0);
+        let drawn = if reserved.is_some() { 0 } else { requested };
+        if drawn > unreserved {
+            return Err(invalid_parameter(
+                crate::state::provisioned_above_unreserved_message(unreserved),
+            ));
+        }
+        if unreserved.saturating_sub(drawn) < crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS {
             return Err(invalid_parameter(crate::state::unreserved_floor_message(
                 "ConcurrentExecutions",
                 crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS,

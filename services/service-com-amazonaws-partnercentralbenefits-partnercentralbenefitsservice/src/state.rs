@@ -1396,6 +1396,26 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
         self.partner_accounts.insert(account.to_string())
     }
 
+    /// The refusal a request naming a catalog this store does not hold is answered with,
+    /// or `None` when the catalog exists.
+    ///
+    /// Every operation binds a required `Catalog` and every resource this service holds
+    /// lives inside one, so a request whose catalog does not exist has NO resource to look
+    /// up: the missing resource is the catalog, and that is what the answer names — through
+    /// [`not_found_message`], the one construction. One helper for every operation that
+    /// binds the member, so no operation can report a resource inside a catalog that is
+    /// not there.
+    pub fn catalog_refusal(
+        &self,
+        catalog: &str,
+    ) -> Option<crate::ops::types::ResourceNotFoundException> {
+        (!self.catalogs.contains_key(catalog)).then(|| {
+            crate::ops::types::ResourceNotFoundException {
+                message: not_found_message(CATALOG_KIND, catalog),
+            }
+        })
+    }
+
     /// The application `identifier` names inside `catalog`, accepting either form the
     /// modelled `BenefitApplicationIdentifier` allows (`^(arn:.+|benappl-[0-9a-z]{14})$`).
     ///
