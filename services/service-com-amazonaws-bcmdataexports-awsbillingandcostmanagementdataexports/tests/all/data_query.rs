@@ -33,7 +33,7 @@ use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::TABLE_CATALOG;
 
-use crate::export_lifecycle::{cases, error_code, Client, NOT_FOUND_STATUS};
+use crate::export_lifecycle::{cases, error_code, Client};
 
 /// A table name no catalog publishes — the recorded one.
 const BOGUS_TABLE: &str = "totally_bogus_table_that_does_not_exist";
@@ -360,12 +360,28 @@ async fn a_definition_read_back_can_be_submitted_again_unchanged() {
     }
 }
 
-/// A refused create stores NOTHING: the ARN its name would have minted names nothing
-/// afterwards. (Which queries are refused is `export_definition_validation`'s rule; this
+/// A refused create stores NOTHING: no export of its name is in the store afterwards,
+/// while an accepted one is — the listing the check reads is shown to report a name it
+/// really holds. (Which queries are refused is `export_definition_validation`'s rule; this
 /// row is about the store.)
 #[tokio::test]
 async fn a_refused_create_persists_nothing() {
     let client = Client::new();
+
+    // The ANCHOR: one accepted export, whose name every listing below must carry. Without
+    // it the "name is absent" check would also pass on a listing that reported no name at
+    // all.
+    let accepted = "accepted_create".to_string();
+    client
+        .ok(
+            "CreateExport",
+            &create_request(
+                &accepted,
+                &format!("SELECT * FROM {}", TABLE_CATALOG[0].name),
+                None,
+            ),
+        )
+        .await;
 
     for (index, statement) in [
         format!("SELECT x FROM {BOGUS_TABLE}"),
@@ -385,12 +401,26 @@ async fn a_refused_create_persists_nothing() {
             "case {case:?}: a query naming an unpublished table must be refused, got {status} with {body}"
         );
 
-        let arn = engine::emulator_arn("bcm-data-exports", "us-east-1", &format!("export/{name}"));
-        let (status, body) = client.call("GetExport", &json!({ "ExportArn": arn })).await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (NOT_FOUND_STATUS, "ResourceNotFoundException"),
-            "case {case:?}: a refused create must have stored nothing, got {status} with {body}"
+        // Nothing was stored. The minted ARN carries a per-export generated id this test
+        // cannot predict, so the store is asked BY NAME: no export of that name is listed.
+        let listed = client.ok("ListExports", &json!({})).await;
+        let stored_names: Vec<&str> = listed["Exports"]
+            .as_array()
+            .map(|references| {
+                references
+                    .iter()
+                    .filter_map(|reference| reference["ExportName"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            stored_names.contains(&accepted.as_str()),
+            "case {case:?}: the listing must report the accepted export's name, got \
+             {stored_names:?}"
+        );
+        assert!(
+            !stored_names.contains(&name.as_str()),
+            "case {case:?}: a refused create must have stored nothing, got {stored_names:?}"
         );
     }
 }

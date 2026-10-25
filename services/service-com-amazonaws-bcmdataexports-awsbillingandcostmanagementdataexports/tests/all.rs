@@ -35,6 +35,8 @@ mod export_definition_validation;
 mod export_lifecycle;
 #[path = "all/front_door_authorization.rs"]
 mod front_door_authorization;
+#[path = "all/minted_export_arn.rs"]
+mod minted_export_arn;
 #[path = "all/not_found_message.rs"]
 mod not_found_message;
 #[path = "all/not_found_wire_status.rs"]

@@ -18,6 +18,12 @@
 //! backed by the
 //! [`knowledge_bases`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::knowledge_bases)
 //! map, with [`KnowledgeBaseRecord::to_knowledge_base`] as its single projection.
+//!
+//! A knowledge base's data sources (`CreateDataSource`, `GetDataSource`) are
+//! backed by the
+//! [`data_sources`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::data_sources)
+//! map, keyed by `dataSourceId` and carrying the `knowledgeBaseId` it belongs
+//! to, with [`DataSourceRecord::to_data_source`] as its single projection.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -25,9 +31,11 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Agent, AgentSummary, CreateFlowOutput, CustomOrchestration, FlowDefinition, FlowValidation,
-    GetFlowOutput, GuardrailConfiguration, KnowledgeBase, KnowledgeBaseConfiguration,
-    MemoryConfiguration, PromptOverrideConfiguration, StorageConfiguration,
+    Agent, AgentSummary, CreateFlowOutput, CustomOrchestration, DataSource,
+    DataSourceConfiguration, FlowDefinition, FlowValidation, GetFlowOutput,
+    GuardrailConfiguration, KnowledgeBase, KnowledgeBaseConfiguration, MemoryConfiguration,
+    PromptOverrideConfiguration, ServerSideEncryptionConfiguration, StorageConfiguration,
+    VectorIngestionConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned, so it names no
@@ -551,6 +559,196 @@ impl KnowledgeBaseRecord {
     }
 }
 
+/// The most data sources one knowledge base holds; past it `CreateDataSource`
+/// answers the modelled `ServiceQuotaExceededException` instead of growing.
+///
+/// Amazon Bedrock publishes an adjustable quota on data sources per knowledge
+/// base, and this emulator models neither Service Quotas nor an account's
+/// adjustments — so this is the emulator's OWN bound on the store, set far above
+/// any workflow an emulator serves, and it is what stops the data-source state
+/// growing without end.
+pub const DATA_SOURCE_QUOTA: usize = 1_000;
+
+/// The `KnowledgeBaseType` of a service-managed knowledge base: the one kind
+/// whose data sources have a documented `dataDeletionPolicy` default.
+pub const MANAGED_KNOWLEDGE_BASE_TYPE: &str = "MANAGED";
+
+/// The `dataDeletionPolicy` a data source of a service-managed knowledge base
+/// takes when the request names none.
+///
+/// Documented: `CreateDataSource`'s `dataDeletionPolicy` says "For managed
+/// knowledge bases, the only supported option is DELETE, which is also the
+/// default". No default is published for any other kind, so a data source of
+/// one keeps whatever the request supplied — including nothing.
+pub const MANAGED_DATA_DELETION_POLICY: &str = "DELETE";
+
+/// Every modelled `DataSourceType` value, paired with the
+/// `DataSourceConfiguration` member that carries that kind's connection
+/// details — `None` for the kinds the model gives no member for, which
+/// therefore need none.
+///
+/// Source: the `DataSourceType` enum and the `DataSourceConfiguration`
+/// structure of this service's Smithy model
+/// (`smithy_query(query="shape",shape="DataSourceType,DataSourceConfiguration")`).
+pub const DATA_SOURCE_CONFIGURATION_MEMBERS: [(&str, Option<&str>); 8] = [
+    ("S3", Some("s3Configuration")),
+    ("WEB", Some("webConfiguration")),
+    ("CONFLUENCE", Some("confluenceConfiguration")),
+    ("SALESFORCE", Some("salesforceConfiguration")),
+    ("SHAREPOINT", Some("sharePointConfiguration")),
+    (
+        "MANAGED_KNOWLEDGE_BASE_CONNECTOR",
+        Some("managedKnowledgeBaseConnectorConfiguration"),
+    ),
+    ("CUSTOM", None),
+    ("REDSHIFT_METADATA", None),
+];
+
+/// Why a `dataSourceConfiguration` cannot back a data source. Each variant is a
+/// bad request, answered with the modelled `ValidationException`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataSourceConfigurationProblem {
+    /// `type` is none of the modelled `DataSourceType` values.
+    UnknownType(String),
+    /// `type` names a kind whose own connection member was not supplied.
+    MissingConfigurationMember {
+        data_source_type: String,
+        member: &'static str,
+    },
+}
+
+impl DataSourceConfigurationProblem {
+    /// The refusal's message: it names the member and the constraint the
+    /// request failed, so it is built from the request rather than quoted.
+    pub fn message(&self) -> String {
+        match self {
+            Self::UnknownType(value) => {
+                let admitted: Vec<&str> = DATA_SOURCE_CONFIGURATION_MEMBERS
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect();
+                format!(
+                    "Value '{value}' at 'dataSourceConfiguration.type' failed to satisfy \
+                     constraint: Member must satisfy enum value set: [{}]",
+                    admitted.join(", ")
+                )
+            }
+            Self::MissingConfigurationMember {
+                data_source_type,
+                member,
+            } => format!(
+                "dataSourceConfiguration.{member} is required for a \
+                 dataSourceConfiguration.type of {data_source_type}"
+            ),
+        }
+    }
+}
+
+/// Whether `configuration` names a kind this service can store, and whether the
+/// request supplied the connection details that kind needs. `None` when it did.
+///
+/// The `type` member is a discriminator: it names which of
+/// `DataSourceConfiguration`'s sibling members carries that kind's connection
+/// details, and the kinds the model pairs with no member need none.
+pub fn data_source_configuration_problem(
+    configuration: &DataSourceConfiguration,
+) -> Option<DataSourceConfigurationProblem> {
+    let data_source_type = configuration.r#type.as_str();
+    let Some((_, member)) = DATA_SOURCE_CONFIGURATION_MEMBERS
+        .iter()
+        .find(|(name, _)| *name == data_source_type)
+    else {
+        return Some(DataSourceConfigurationProblem::UnknownType(
+            data_source_type.to_string(),
+        ));
+    };
+    // The kinds the model pairs with no sibling member need none.
+    let member = (*member)?;
+
+    let supplied = match data_source_type {
+        "S3" => configuration.s3_configuration.is_some(),
+        "WEB" => configuration.web_configuration.is_some(),
+        "CONFLUENCE" => configuration.confluence_configuration.is_some(),
+        "SALESFORCE" => configuration.salesforce_configuration.is_some(),
+        "SHAREPOINT" => configuration.share_point_configuration.is_some(),
+        _ => configuration
+            .managed_knowledge_base_connector_configuration
+            .is_some(),
+    };
+    if supplied {
+        return None;
+    }
+    Some(DataSourceConfigurationProblem::MissingConfigurationMember {
+        data_source_type: data_source_type.to_string(),
+        member,
+    })
+}
+
+/// The `DataSourceStatus` values this slice of the service can hold, named as
+/// the model's `DataSourceStatus` enum names them on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSourceStatus {
+    /// Created and ready to be ingested from — what `CreateDataSource` answers
+    /// with, since it completes synchronously (HTTP 200) and the modelled
+    /// `DataSource$status` documents this as the status of a data source that
+    /// "has been created and is ready for ingestion into the knowledge base".
+    Available,
+}
+
+impl DataSourceStatus {
+    /// The member value for the modelled `DataSourceStatus` enum.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Available => "AVAILABLE",
+        }
+    }
+}
+
+/// One stored data source: the single source of truth for every data-source
+/// operation.
+#[derive(Debug, Clone)]
+pub struct DataSourceRecord {
+    pub knowledge_base_id: String,
+    pub data_source_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub data_source_configuration: DataSourceConfiguration,
+    pub server_side_encryption_configuration: Option<ServerSideEncryptionConfiguration>,
+    pub vector_ingestion_configuration: Option<VectorIngestionConfiguration>,
+    pub data_deletion_policy: Option<String>,
+    pub status: DataSourceStatus,
+    /// Reasons the last API operation on the data source failed; empty while
+    /// nothing has failed.
+    pub failure_reasons: Vec<String>,
+    pub client_token: Option<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl DataSourceRecord {
+    /// This record as the modelled `DataSource` shape: every member is
+    /// populated from the stored record, never from the request being served.
+    pub fn to_data_source(&self) -> DataSource {
+        DataSource {
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            data_source_id: self.data_source_id.clone(),
+            name: self.name.clone(),
+            status: self.status.as_wire().to_string(),
+            description: self.description.clone(),
+            data_source_configuration: self.data_source_configuration.clone(),
+            server_side_encryption_configuration: self
+                .server_side_encryption_configuration
+                .clone(),
+            vector_ingestion_configuration: self.vector_ingestion_configuration.clone(),
+            data_deletion_policy: self.data_deletion_policy.clone(),
+            created_at: to_date_time(self.created_at),
+            updated_at: to_date_time(self.updated_at),
+            failure_reasons: (!self.failure_reasons.is_empty())
+                .then(|| self.failure_reasons.clone()),
+        }
+    }
+}
+
 /// A `ListAgents` resume cursor, decoded back into the ordering it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageCursor {
@@ -600,6 +798,14 @@ pub struct ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// carrying the same `@idempotencyToken` returns the knowledge base it
     /// already created.
     pub knowledge_base_client_tokens: HashMap<String, String>,
+    /// Every data source that exists, keyed by its 10-character `dataSourceId`.
+    /// Each record names the knowledge base it belongs to, so a read of one
+    /// knowledge base never reports another's data source.
+    pub data_sources: HashMap<String, DataSourceRecord>,
+    /// `clientToken` -> `dataSourceId`, so a retried `CreateDataSource`
+    /// carrying the same `@idempotencyToken` returns the data source it already
+    /// created.
+    pub data_source_client_tokens: HashMap<String, String>,
     /// Feeds id minting; never returned to a caller.
     id_sequence: u64,
 }
@@ -666,6 +872,41 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             }
         }
         None
+    }
+
+    /// Mint an unused `dataSourceId`, which the modelled `Id` shape constrains
+    /// to the same `^[0-9a-zA-Z]{10}$` as an `agentId`. `None` when every one of
+    /// [`MINT_ATTEMPTS`] draws collided.
+    pub fn mint_data_source_id(&mut self, now: SystemTime) -> Option<String> {
+        for _ in 0..MINT_ATTEMPTS {
+            let id = self.next_id_candidate(now);
+            if !self.data_sources.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// The stored data source `data_source_id` names, but only when it belongs
+    /// to `knowledge_base_id`: a data source is identified by the pair, so one
+    /// knowledge base never reports another's.
+    pub fn data_source_of(
+        &self,
+        knowledge_base_id: &str,
+        data_source_id: &str,
+    ) -> Option<&DataSourceRecord> {
+        self.data_sources
+            .get(data_source_id)
+            .filter(|record| record.knowledge_base_id == knowledge_base_id)
+    }
+
+    /// How many data sources `knowledge_base_id` already holds, the count the
+    /// per-knowledge-base bound is checked against.
+    pub fn data_source_count(&self, knowledge_base_id: &str) -> usize {
+        self.data_sources
+            .values()
+            .filter(|record| record.knowledge_base_id == knowledge_base_id)
+            .count()
     }
 
     /// Apply every status transition the CLOCK has already made due.

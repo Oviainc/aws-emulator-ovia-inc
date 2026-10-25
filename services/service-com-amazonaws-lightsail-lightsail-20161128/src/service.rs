@@ -66,6 +66,25 @@
 //! where one IS declared — this emulator runs no container runtime, so the deployed
 //! image's own response is not something it can produce, and synthesising a body
 //! that image never served would be inventing content.
+//!
+//! ## The container image registry address
+//!
+//! `ContainerServiceRegistryLogin$registry` is the same kind of promise — "The
+//! address to use to push container images to the container image registry of a
+//! Lightsail account" — so `CreateContainerServiceRegistryLogin` announces it
+//! beneath the endpoint the request arrived at too
+//! (`crate::state::container_image_registry_url`, under
+//! `crate::state::CONTAINER_IMAGE_REGISTRY_PATH_PREFIX`), and the same two seams
+//! carry it: [`Service::can_handle`] claims a request addressed there (it is
+//! unsigned — a registry client authenticates with the HTTP Basic credentials that
+//! operation handed out, not with SigV4) and [`Service::override_routing_error`]
+//! serves it.
+//!
+//! What it answers is again what this emulator knows: `401` for a client that
+//! presents no live set of log in credentials for that registry, and `501` for one
+//! that does — the push itself is a container image registry protocol this
+//! emulator does not serve, which is also why `RegisterContainerImage` finds no
+//! pushed digest to register.
 
 use aws_smithy_runtime_api::http::{Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
@@ -135,7 +154,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
         // `http::Uri::path` already strips the scheme, the authority and the query,
         // for an origin-form request line and an absolute-form one alike.
-        crate::state::parse_container_service_public_path(parts.uri.path()).is_some()
+        let path = parts.uri.path();
+        crate::state::parse_container_service_public_path(path).is_some()
+            // And a request addressed to the container image registry address this
+            // service announced, which carries no routing key either: a registry
+            // client authenticates with HTTP Basic credentials and signs nothing.
+            || crate::state::parse_container_image_registry_path(path).is_some()
     }
 
     fn override_operation(
@@ -177,9 +201,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // A request to the public URL of a container service is exactly that case by
         // construction — the path is not in the model — so this is where that URL is
         // served. Anything else keeps the framework's default.
-        let target =
-            crate::state::parse_container_service_public_path(request_path(req.uri()))?;
-        Some(self.serve_container_service_endpoint(req.method(), &target))
+        let path = request_path(req.uri());
+        if let Some(target) = crate::state::parse_container_service_public_path(path) {
+            return Some(self.serve_container_service_endpoint(req.method(), &target));
+        }
+        // The announced container image registry address is the same case: not in
+        // the model, so this is where it is served.
+        let region = crate::state::parse_container_image_registry_path(path)?;
+        Some(self.serve_container_image_registry(req.method(), &region, req.headers()))
     }
 
     fn override_framework_error(
@@ -245,7 +274,129 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             Some(true) => endpoint_response(method, 501, NO_CONTAINER_RUNTIME),
         }
     }
+
+    /// Serve one request to the announced address of this account's container
+    /// image registry in `region`.
+    ///
+    /// A registry client logs in with the credentials
+    /// `CreateContainerServiceRegistryLogin` created, presented as HTTP Basic
+    /// credentials, so the request is authenticated against the live sets this
+    /// service's store holds for that region — a set the clock has expired is
+    /// already gone from it, so credentials past their 12 hours are refused like
+    /// any others that match nothing.
+    ///
+    /// This is a pure READ of that store: logging in neither creates nor consumes
+    /// anything, so a client that tries twice changes nothing a later caller
+    /// sees. (The one write behind it is the clock forgetting the sets it had
+    /// already expired, which `crate::state::with_state` applies for every reader
+    /// alike.)
+    fn serve_container_image_registry(
+        &self,
+        method: &str,
+        region: &str,
+        headers: &aws_smithy_runtime_api::http::Headers,
+    ) -> RtResponse {
+        // Every log in attempt is attributable in the emulator's log, whichever way
+        // it goes: the address reached, the region whose registry it names, the
+        // method, the username presented (none, where the client presented no
+        // credentials at all) and the outcome. The presented PASSWORD and the stored
+        // digest are never logged — only the caller ever holds the password.
+        let audit = |outcome: &'static str, username: Option<&str>| {
+            ::tracing::info!(
+                audit = true,
+                operation = "ContainerImageRegistryLogin",
+                outcome,
+                region = %region,
+                method = %method,
+                source_endpoint = headers.get("host").unwrap_or("<none>"),
+                presented_username = username.unwrap_or("<none>"),
+                "container image registry log in attempt"
+            );
+        };
+
+        let Some((username, password)) = basic_credentials(headers) else {
+            audit("refused", None);
+            return registry_unauthorized(method);
+        };
+        let Some(recognised) = crate::state::with_state(&*self.engine, |store| {
+            store.registry_login(region, &username, &password).is_some()
+        }) else {
+            audit("unavailable", Some(&username));
+            return endpoint_response(method, 503, REGISTRY_STORE_UNAVAILABLE);
+        };
+        if !recognised {
+            audit("refused", Some(&username));
+            return registry_unauthorized(method);
+        }
+        audit("accepted", Some(&username));
+        // The credentials are this account's, and what belongs here now is the
+        // container image registry protocol itself: a `docker push` of image
+        // layers and a manifest. This emulator serves no such data plane, so
+        // answering anything but "not implemented" would be claiming a push that
+        // nothing stored.
+        endpoint_response(method, 501, NO_CONTAINER_IMAGE_REGISTRY)
+    }
 }
+
+/// The HTTP Basic challenge a registry address answers an unauthenticated
+/// request with: RFC 9110 requires a `WWW-Authenticate` challenge on a `401`, and
+/// it is what tells a registry client to log in with the credentials
+/// `CreateContainerServiceRegistryLogin` hands out.
+fn registry_unauthorized(method: &str) -> RtResponse {
+    let mut resp = endpoint_response(method, 401, REGISTRY_LOGIN_REQUIRED);
+    resp.headers_mut().insert(
+        "www-authenticate",
+        format!("Basic realm=\"{REGISTRY_REALM}\""),
+    );
+    resp
+}
+
+/// The `user:password` pair an HTTP Basic `Authorization` header carries, or
+/// `None` when the request presents no Basic credentials at all.
+///
+/// The scheme name is compared case-insensitively and separated from the
+/// credentials on any run of whitespace, as RFC 9110's `credentials = scheme
+/// 1*SP token68` admits, and the credentials are base64 with the standard
+/// alphabet — the same codec the wire serializer uses for every Smithy blob.
+fn basic_credentials(
+    headers: &aws_smithy_runtime_api::http::Headers,
+) -> Option<(String, String)> {
+    let value = headers.get("authorization")?.trim();
+    let (scheme, encoded) = value.split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("Basic") {
+        return None;
+    }
+    let decoded = ::aws_smithy_types::base64::decode(encoded.trim()).ok()?;
+    let (user, password) = String::from_utf8(decoded).ok()?.split_once(':').map(
+        |(user, password)| (user.to_string(), password.to_string()),
+    )?;
+    Some((user, password))
+}
+
+/// What the announced registry address answers when this service's store cannot be
+/// reached at all — the engine is not the shared in-memory one. The registry's own
+/// wording of [`STORE_UNAVAILABLE`], and the same `503`: a client that gets here
+/// has reached the registry's front door while its backing store is momentarily
+/// not there, which is what `503` says and what makes the attempt retryable.
+const REGISTRY_STORE_UNAVAILABLE: &str =
+    "The Lightsail container image registry store is unavailable.\n";
+
+/// The realm the registry address names in its `WWW-Authenticate` challenge: a
+/// constant of this module, so it carries nothing from the request.
+const REGISTRY_REALM: &str = "Lightsail container image registry";
+
+/// What the announced registry address answers a client that presents no live set
+/// of log in credentials. One sentence carrying nothing from the request, so a
+/// caller cannot probe with it.
+const REGISTRY_LOGIN_REQUIRED: &str =
+    "Log in to this container image registry with the credentials \
+     CreateContainerServiceRegistryLogin creates.\n";
+
+/// What it answers a client that IS logged in: the push itself is a container
+/// image registry protocol this emulator does not serve.
+const NO_CONTAINER_IMAGE_REGISTRY: &str =
+    "This container image registry is not implemented: the emulator serves no container \
+     image registry protocol, so a pushed image cannot be stored.\n";
 
 /// What the published URL of a container service that fronts no container answers.
 /// One sentence carrying nothing from the request, so a caller cannot probe with it.
