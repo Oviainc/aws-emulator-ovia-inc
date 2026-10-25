@@ -54,6 +54,11 @@ use crate::ops::types::StoredQueryMetadata;
 // status an aggregator read reports one of its aggregation sources as.
 use crate::ops::types::AggregatedSourceStatus;
 
+// The remediation-execution shapes, named separately for the same reason: they are how
+// a remediation execution and its one step are REPORTED, and `ResourceKey` is what
+// names the resource an execution ran for.
+use crate::ops::types::{RemediationExecutionStatus, RemediationExecutionStep, ResourceKey};
+
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
 /// for every ARN this emulator mints.
 pub const ARN_SERVICE: &str = "config";
@@ -517,12 +522,30 @@ pub const CONFORMANCE_PACK_STATE_CREATE_FAILED: &str = "CREATE_FAILED";
 /// `CreatedBy`, which is what tells such a rule apart from one `PutConfigRule` created.
 pub const CONFORMANCE_PACK_SERVICE_PRINCIPAL: &str = "config-conforms.amazonaws.com";
 
+/// The most characters a Config rule name CONFIG ITSELF generates may carry.
+///
+/// A rule's own name is a `ConfigRuleName` (1..128), but the compliance read paths take
+/// the rule name as `StringWithCharLimit64` (1..64) — `GetComplianceDetailsByConfigRule`
+/// and `DeleteEvaluationResults` both do — so 64 is the TIGHTEST published bound on a
+/// member that names a Config rule. A name Config generates has to satisfy it: an
+/// identifier the service mints and then refuses to accept back names a rule no caller
+/// can read the evaluations of.
+pub const GENERATED_CONFIG_RULE_NAME_MAX_LENGTH: usize = 64;
+
 /// The name Config gives a Config rule a conformance pack deploys: the name the
 /// template declares for it, suffixed with the pack's own id, which is what keeps two
 /// packs declaring the same rule name from deploying one rule over the other and keeps
 /// a redeploy of the SAME pack landing on the same rule.
+///
+/// The result stays within [`GENERATED_CONFIG_RULE_NAME_MAX_LENGTH`]: the suffix is
+/// what identifies the pack, so it is the DECLARED half that gives way when the two
+/// together would not fit — the rule is still readable through every path that takes a
+/// rule name, which is what a generated name has to be.
 pub fn conformance_pack_rule_name(declared: &str, pack_id: &str) -> String {
-    format!("{declared}-{pack_id}")
+    let suffix = format!("-{pack_id}");
+    let room = GENERATED_CONFIG_RULE_NAME_MAX_LENGTH.saturating_sub(suffix.chars().count());
+    let kept: String = declared.chars().take(room).collect();
+    format!("{kept}{suffix}")
 }
 
 /// How long after the call that requested it a conformance pack's deployment is due to
@@ -1383,6 +1406,28 @@ impl EvaluationResultEntry {
             result_token: None,
         }
     }
+
+    /// The modelled `AggregateEvaluationResult` an AGGREGATE read reports this result
+    /// as: the same verdict, plus the source account and Region the data was aggregated
+    /// FROM (`AggregateEvaluationResult$AccountId`, `$AwsRegion`), which is what tells
+    /// one source's result from another's in an aggregator's answer.
+    pub fn to_aggregate_shape(
+        &self,
+        config_rule_name: &str,
+        account_id: &str,
+        region: &str,
+    ) -> crate::ops::types::AggregateEvaluationResult {
+        let reported = self.to_shape(config_rule_name);
+        crate::ops::types::AggregateEvaluationResult {
+            evaluation_result_identifier: reported.evaluation_result_identifier,
+            compliance_type: reported.compliance_type,
+            result_recorded_time: reported.result_recorded_time,
+            config_rule_invoked_time: reported.config_rule_invoked_time,
+            annotation: reported.annotation,
+            account_id: Some(account_id.to_string()),
+            aws_region: Some(region.to_string()),
+        }
+    }
 }
 
 /// The invocation-and-evaluation history of one Config rule, as
@@ -1427,6 +1472,16 @@ pub struct RuleEvaluationEntry {
     /// flight has to be part of the record for the precondition to be checkable.
     /// Cleared when the pass completes, like every other in-flight member here.
     pub on_demand: bool,
+    /// The `ResultToken` Config minted for the evaluation it last invoked, for a rule
+    /// whose verdicts are DELIVERED to Config rather than computed by it
+    /// ([`ConfigRuleEntry::delivers_own_evaluations`]).
+    ///
+    /// Config hands the token to whatever performs the evaluation and takes it back on
+    /// `PutEvaluations` ("An encrypted token that associates an evaluation with an
+    /// Config rule. Identifies the rule and the event that triggered the evaluation"),
+    /// so it is the record of WHICH rule and which invocation a delivery belongs to.
+    /// `None` for a rule Config evaluates itself, which delivers nothing back.
+    pub result_token: Option<String>,
 }
 
 impl RuleEvaluationEntry {
@@ -1530,12 +1585,15 @@ pub struct ConfigRuleEntry {
     /// `PutExternalEvaluation` records one for a Config Process Check rule, whose
     /// evaluations are delivered from outside Config. Its evaluated resource is the
     /// account this store stands for, so a process check rule holds at most ONE
-    /// result and a delivery revises it in place. `PutEvaluations` records none yet:
-    /// it identifies the rule only through a `ResultToken` minted by the Lambda
-    /// invocation that produced the evaluation, which this emulator does not run, so
-    /// it stays scaffolded. A rule nothing has delivered an evaluation for therefore
-    /// carries no results — an empty page of evaluation details, and a roll-up of
-    /// `INSUFFICIENT_DATA`.
+    /// result and a delivery revises it in place. `PutEvaluations` records one per
+    /// resource a Custom Lambda rule's own evaluation placed, identified by the
+    /// `ResultToken` Config minted when it invoked that rule
+    /// ([`ConfigRuleEntry::mint_evaluation_result_token`]). A rule nothing has
+    /// delivered an evaluation for carries no results — an empty page of evaluation
+    /// details, and a roll-up of `INSUFFICIENT_DATA`.
+    ///
+    /// BOUNDED at [`EVALUATION_RESULTS_KEPT_PER_RULE`] entries: write it through
+    /// [`ConfigRuleEntry::record_evaluation_result`].
     pub evaluation_results: BTreeMap<EvaluationResultKey, EvaluationResultEntry>,
     /// When Config invoked this rule and when those invocations finished evaluating
     /// the resources in scope, as `DescribeConfigRuleEvaluationStatus` reports it.
@@ -1580,6 +1638,56 @@ impl ConfigRuleEntry {
     pub fn is_process_check(&self) -> bool {
         self.source.owner == OWNER_AWS
             && self.source.source_identifier.as_deref() == Some(SOURCE_IDENTIFIER_PROCESS_CHECK)
+    }
+
+    /// Whether this rule's verdicts are DELIVERED to Config with `PutEvaluations`
+    /// rather than computed by Config itself.
+    ///
+    /// A Config Custom Lambda rule is evaluated by the function the account points the
+    /// rule at, and that function "is required in every Lambda function that is invoked
+    /// by an Config rule" to deliver what it found with `PutEvaluations`
+    /// (`PutEvaluations`). Config's own managed and Custom Policy rules are evaluated
+    /// inside Config, so nothing delivers verdicts for them.
+    pub fn delivers_own_evaluations(&self) -> bool {
+        self.source.owner == OWNER_CUSTOM_LAMBDA
+    }
+
+    /// Mint the `ResultToken` for the evaluation Config has just invoked on this rule,
+    /// or clear the one it carried when this rule is not one that delivers its own
+    /// verdicts ([`Self::delivers_own_evaluations`] — which a write can change, by
+    /// pointing the rule at another source).
+    ///
+    /// The token belongs to ONE invocation, so it is replaced every time Config invokes
+    /// the rule again, and the last one stays valid until then: Config has no further
+    /// invocation to associate a delivery with.
+    pub fn mint_evaluation_result_token(&mut self, invoked_at: SystemTime) {
+        self.evaluation.result_token = self
+            .delivers_own_evaluations()
+            .then(|| mint_result_token(&self.name, invoked_at));
+    }
+
+    /// Record `result` as this rule's verdict on the resource it names, keeping the
+    /// rule's results bounded.
+    ///
+    /// This is the ONE place [`Self::evaluation_results`] GROWS: past
+    /// [`EVALUATION_RESULTS_KEPT_PER_RULE`] results it drops the one whose evaluation
+    /// is OLDEST (by ordering timestamp, then by key so the choice is deterministic),
+    /// so repeated deliveries cannot grow this process's state without end. A result
+    /// for a resource the rule already holds one for REPLACES it: a rule reports its
+    /// last verdict per resource and evaluation mode.
+    pub fn record_evaluation_result(&mut self, result: EvaluationResultEntry) {
+        self.evaluation_results.insert(result.key(), result);
+        while self.evaluation_results.len() > EVALUATION_RESULTS_KEPT_PER_RULE {
+            let oldest = self
+                .evaluation_results
+                .values()
+                .min_by_key(|recorded| (recorded.ordering_timestamp, recorded.key()))
+                .map(EvaluationResultEntry::key);
+            let Some(key) = oldest else {
+                break;
+            };
+            self.evaluation_results.remove(&key);
+        }
     }
 
     /// Whether `DescribeConfigRuleEvaluationStatus` reports a status for this rule.
@@ -1827,6 +1935,174 @@ impl RemediationConfigurationEntry {
             retry_attempt_seconds: self.retry_attempt_seconds,
             arn: Some(self.arn.clone()),
             created_by_service: None,
+        }
+    }
+}
+
+/// `RemediationExecutionState` values
+/// (`com.amazonaws.configservice#RemediationExecutionState`), which are the states one
+/// remediation execution moves through.
+pub const REMEDIATION_EXECUTION_STATE_QUEUED: &str = "QUEUED";
+/// See [`REMEDIATION_EXECUTION_STATE_QUEUED`].
+pub const REMEDIATION_EXECUTION_STATE_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`REMEDIATION_EXECUTION_STATE_QUEUED`].
+pub const REMEDIATION_EXECUTION_STATE_SUCCEEDED: &str = "SUCCEEDED";
+
+/// `RemediationExecutionStepState` values
+/// (`com.amazonaws.configservice#RemediationExecutionStepState`), which are the states
+/// one STEP of an execution moves through.
+pub const REMEDIATION_EXECUTION_STEP_STATE_PENDING: &str = "PENDING";
+/// See [`REMEDIATION_EXECUTION_STEP_STATE_PENDING`].
+pub const REMEDIATION_EXECUTION_STEP_STATE_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`REMEDIATION_EXECUTION_STEP_STATE_PENDING`].
+pub const REMEDIATION_EXECUTION_STEP_STATE_SUCCEEDED: &str = "SUCCEEDED";
+
+/// How long after the call that started it a remediation execution is due to leave
+/// `QUEUED` and start running, and how long after that call it is due to finish.
+///
+/// Both moves are ones the CLOCK owes rather than ones the call makes:
+/// "[r]emediation execution is asynchronous" (`StartRemediationExecution`), so the call
+/// answers before the target has run. AWS documents no duration for either, so the two
+/// spans are CHOSEN inside the 250–750 ms window this project uses for such a
+/// transition (see [`RECORDER_STATUS_SETTLE_AFTER`]), which keeps both the queued and
+/// the running state observable to a caller that reads the status straight after
+/// starting the execution.
+pub const REMEDIATION_EXECUTION_STARTS_AFTER: Duration = Duration::from_millis(250);
+/// See [`REMEDIATION_EXECUTION_STARTS_AFTER`].
+pub const REMEDIATION_EXECUTION_COMPLETES_AFTER: Duration = Duration::from_millis(500);
+
+/// What identifies one remediation execution in the store: the rule it remediates and
+/// the resource it ran for — the `(ConfigRuleName, resourceType, resourceId)` triple,
+/// which is what `DescribeRemediationExecutionStatus` looks one up by.
+///
+/// Ordering the triple gives the store a stable total order, so a page of execution
+/// statuses can resume at a key.
+pub type RemediationExecutionKey = (String, String, String);
+
+/// The most remediation executions the store keeps
+/// ([`ComAmazonawsConfigserviceStarlingdoveserviceState::record_remediation_execution`]
+/// enforces it).
+///
+/// Config publishes no quota for them, and one call starts at most a hundred
+/// (`StartRemediationExecutionRequest$ResourceKeys`, length 1..100), so one call's
+/// worth is what the store keeps: the hundred most recently invoked. Without a bound,
+/// repeated calls naming new resources would grow this process's memory without end.
+pub const REMEDIATION_EXECUTIONS_KEPT: usize = 100;
+
+/// One remediation execution: the run of a rule's remediation action against ONE
+/// resource, as `DescribeRemediationExecutionStatus` reports it.
+///
+/// The execution is asynchronous, so what is stored is when it was invoked and the
+/// instants its two moves are due at; the state it is in is READ OFF the clock
+/// ([`Self::state_at`]) rather than written by whoever reads it.
+#[derive(Debug, Clone)]
+pub struct RemediationExecutionEntry {
+    /// The type of the remediated resource (`ResourceKey$resourceType`).
+    pub resource_type: String,
+    /// The id of the remediated resource (`ResourceKey$resourceId`).
+    pub resource_id: String,
+    /// The remediation target this execution runs — the automation document the rule's
+    /// remediation configuration names (`RemediationConfiguration$TargetId`) — which is
+    /// the one step the execution reports (`RemediationExecutionStep$Name`).
+    pub step_name: String,
+    /// When Config invoked the execution
+    /// (`RemediationExecutionStatus$InvocationTime`), which is the instant of the call
+    /// that started it.
+    pub invoked_at: SystemTime,
+    /// When the execution is due to leave `QUEUED`; see
+    /// [`REMEDIATION_EXECUTION_STARTS_AFTER`].
+    pub starts_at: SystemTime,
+    /// When the execution is due to have finished; see
+    /// [`REMEDIATION_EXECUTION_COMPLETES_AFTER`].
+    pub completes_at: SystemTime,
+}
+
+impl RemediationExecutionEntry {
+    /// The execution `StartRemediationExecution` invoked at `at` for the resource
+    /// `resource_type`/`resource_id`, running the target `step_name`.
+    pub fn invoked(
+        resource_type: &str,
+        resource_id: &str,
+        step_name: &str,
+        at: SystemTime,
+    ) -> Self {
+        Self {
+            resource_type: resource_type.to_string(),
+            resource_id: resource_id.to_string(),
+            step_name: step_name.to_string(),
+            invoked_at: at,
+            starts_at: at + REMEDIATION_EXECUTION_STARTS_AFTER,
+            completes_at: at + REMEDIATION_EXECUTION_COMPLETES_AFTER,
+        }
+    }
+
+    /// The key this execution is stored under within the rule `config_rule_name`.
+    pub fn key(&self, config_rule_name: &str) -> RemediationExecutionKey {
+        (
+            config_rule_name.to_string(),
+            self.resource_type.clone(),
+            self.resource_id.clone(),
+        )
+    }
+
+    /// The `RemediationExecutionState` this execution is in at `now`: queued until the
+    /// instant it is due to start, running until the instant it is due to have
+    /// finished, and succeeded from then on.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now < self.starts_at {
+            REMEDIATION_EXECUTION_STATE_QUEUED
+        } else if now < self.completes_at {
+            REMEDIATION_EXECUTION_STATE_IN_PROGRESS
+        } else {
+            REMEDIATION_EXECUTION_STATE_SUCCEEDED
+        }
+    }
+
+    /// When this execution last moved (`RemediationExecutionStatus$LastUpdatedTime`):
+    /// the instant of the most recent transition the clock has made due, which is the
+    /// invocation itself while the execution is still queued.
+    pub fn last_updated_at(&self, now: SystemTime) -> SystemTime {
+        match self.state_at(now) {
+            REMEDIATION_EXECUTION_STATE_QUEUED => self.invoked_at,
+            REMEDIATION_EXECUTION_STATE_IN_PROGRESS => self.starts_at,
+            _ => self.completes_at,
+        }
+    }
+
+    /// The modelled `RemediationExecutionStatus`, read back out of state at `now`.
+    ///
+    /// The one step is the target the remediation configuration names: it is pending
+    /// while the execution is queued, running while the execution is, and succeeded
+    /// once it has finished — and it carries no `ErrorMessage`, because nothing has
+    /// failed.
+    pub fn to_shape(&self, now: SystemTime) -> RemediationExecutionStatus {
+        let state = self.state_at(now);
+        let step_state = match state {
+            REMEDIATION_EXECUTION_STATE_QUEUED => REMEDIATION_EXECUTION_STEP_STATE_PENDING,
+            REMEDIATION_EXECUTION_STATE_IN_PROGRESS => {
+                REMEDIATION_EXECUTION_STEP_STATE_IN_PROGRESS
+            }
+            _ => REMEDIATION_EXECUTION_STEP_STATE_SUCCEEDED,
+        };
+        RemediationExecutionStatus {
+            resource_key: Some(ResourceKey {
+                resource_type: self.resource_type.clone(),
+                resource_id: self.resource_id.clone(),
+            }),
+            state: Some(state.to_string()),
+            step_details: Some(vec![RemediationExecutionStep {
+                name: Some(self.step_name.clone()),
+                state: Some(step_state.to_string()),
+                error_message: None,
+                // A step that has not started has no start instant to report, and one
+                // that has not finished no stop instant.
+                start_time: (state != REMEDIATION_EXECUTION_STATE_QUEUED)
+                    .then(|| timestamp(self.starts_at)),
+                stop_time: (state == REMEDIATION_EXECUTION_STATE_SUCCEEDED)
+                    .then(|| timestamp(self.completes_at)),
+            }]),
+            invocation_time: Some(timestamp(self.invoked_at)),
+            last_updated_time: Some(timestamp(self.last_updated_at(now))),
         }
     }
 }
@@ -2620,6 +2896,16 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Remediation configurations, keyed by the `ConfigRuleName` they remediate —
     /// Config holds at most one per rule.
     pub remediation_configurations: BTreeMap<String, RemediationConfigurationEntry>,
+    /// Remediation executions `StartRemediationExecution` invoked, keyed by
+    /// [`RemediationExecutionKey`] — the rule they remediate and the resource they ran
+    /// for. A `BTreeMap` so `DescribeRemediationExecutionStatus` pages over a stable
+    /// ordering and a page token survives executions started between pages. Config
+    /// reports one execution per rule and resource, so starting another for the same
+    /// pair REPLACES the record of the last one.
+    ///
+    /// BOUNDED at [`REMEDIATION_EXECUTIONS_KEPT`] entries: write it through
+    /// [`Self::record_remediation_execution`].
+    pub remediation_executions: BTreeMap<RemediationExecutionKey, RemediationExecutionEntry>,
     /// Source of the next remediation configuration id, so every remediation
     /// configuration Config creates here gets a distinct one.
     pub next_remediation_configuration_seq: u64,
@@ -2743,6 +3029,35 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Whether this account holds a customer managed configuration recorder.
     pub fn has_customer_managed_recorder(&self) -> bool {
         self.customer_managed_recorders().next().is_some()
+    }
+
+    /// Record `entry` as a remediation execution of the rule `config_rule_name`.
+    ///
+    /// This is the ONE place [`Self::remediation_executions`] GROWS, so the store
+    /// cannot grow this process's state without end: past
+    /// [`REMEDIATION_EXECUTIONS_KEPT`] entries it drops the execution that was invoked
+    /// EARLIEST (and then the first by key, so the choice is deterministic when two
+    /// were invoked in the same instant).
+    pub fn record_remediation_execution(
+        &mut self,
+        config_rule_name: &str,
+        entry: RemediationExecutionEntry,
+    ) {
+        self.remediation_executions
+            .insert(entry.key(config_rule_name), entry);
+        while self.remediation_executions.len() > REMEDIATION_EXECUTIONS_KEPT {
+            let oldest = self
+                .remediation_executions
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    (left.invoked_at, *left_key).cmp(&(right.invoked_at, *right_key))
+                })
+                .map(|(key, _)| key.clone());
+            let Some(key) = oldest else {
+                break;
+            };
+            self.remediation_executions.remove(&key);
+        }
     }
 
     /// Record `entry` as a started resource evaluation, with the `ClientToken` that
@@ -3172,18 +3487,32 @@ pub fn conformance_pack_stack_arn(region: &str, name: &str, id: &str) -> String 
 }
 
 /// The `ConformancePackId` Config assigns the `seq`-th conformance pack created in this
-/// emulator: `conformance-pack-` and sixteen base-36 characters, which satisfies
-/// `ConformancePackId`'s 1..1024 length and is ARN-safe.
+/// emulator: `conformance-pack-` and [`CONFORMANCE_PACK_ID_CHARS`] base-36 characters,
+/// which satisfies `ConformancePackId`'s 1..1024 length and is ARN-safe.
 ///
 /// [`splitmix64`] is a bijection on `u64`, so distinct sequence numbers give distinct
 /// ids; the mixing input differs from the other mints', so the n-th pack and the n-th
 /// recorder do not carry the same id.
 pub fn mint_conformance_pack_id(seq: u64) -> String {
+    // Reduced to what `CONFORMANCE_PACK_ID_CHARS` base-36 digits can hold, so every
+    // id is exactly that many characters long rather than as many as the mixed value
+    // happens to need.
+    let spread = splitmix64(seq ^ 0x436f_6e66_5061_636b) % 36u64.pow(CONFORMANCE_PACK_ID_CHARS);
     format!(
         "{CONFORMANCE_PACK_ARN_RESOURCE_TYPE}-{}",
-        base36(splitmix64(seq ^ 0x436f_6e66_5061_636b), 16)
+        base36(spread, CONFORMANCE_PACK_ID_CHARS as usize)
     )
 }
+
+/// How many opaque characters a `ConformancePackId` carries after its prefix.
+///
+/// EIGHT, rather than the sixteen this service's other ids carry, because this id is
+/// also the suffix of the name Config gives every Config rule the pack deploys
+/// ([`conformance_pack_rule_name`]): the id's length is what decides how much of a
+/// declared rule name fits inside [`GENERATED_CONFIG_RULE_NAME_MAX_LENGTH`]. Recorded
+/// behaviour: a pack-deployed rule is named `<declared>-conformance-pack-<short
+/// random>` and the whole name stays inside that ceiling.
+const CONFORMANCE_PACK_ID_CHARS: u32 = 8;
 
 /// The `configSnapshotId` of the `seq`-th configuration-snapshot delivery scheduled
 /// in this emulator: sixteen base-36 characters, the same opaque shape this service's
@@ -4079,6 +4408,98 @@ pub fn decode_evaluation_result_token(token: &str) -> Option<EvaluationResultKey
     Some((fields.next()?, fields.next()?, fields.next()?))
 }
 
+/// Encode the resource key a `DescribeRemediationExecutionStatus` page should resume at
+/// as an opaque `NextToken`.
+///
+/// The two fields are LENGTH-PREFIXED rather than joined on a separator, for the reason
+/// [`encode_evaluation_result_token`] gives: a `resourceId` is an unconstrained string,
+/// so no character can be claimed as a separator.
+pub fn encode_remediation_execution_token(resume_at: &(String, String)) -> String {
+    let mut encoded = String::new();
+    for field in [&resume_at.0, &resume_at.1] {
+        encoded.push_str(&format!("{}:{field}", field.len()));
+    }
+    encode_page_token(&encoded)
+}
+
+/// The resource key a `NextToken` resumes at, or `None` when the token is malformed —
+/// i.e. not something [`encode_remediation_execution_token`] produced, so its two
+/// length-prefixed fields do not account for exactly its decoded bytes.
+pub fn decode_remediation_execution_token(token: &str) -> Option<(String, String)> {
+    let decoded = decode_page_token(token)?;
+    let mut rest = decoded.as_str();
+    let mut fields: Vec<String> = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let (length, tail) = rest.split_once(':')?;
+        let length: usize = length.parse().ok()?;
+        fields.push(tail.get(..length)?.to_string());
+        rest = tail.get(length..)?;
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    let mut fields = fields.into_iter();
+    Some((fields.next()?, fields.next()?))
+}
+
+/// The most evaluation results one Config rule's record keeps
+/// ([`ConfigRuleEntry::record_evaluation_result`] enforces it).
+///
+/// Config publishes no quota for evaluation results per rule, and a delivery carries at
+/// most a hundred of them (`PutEvaluationsRequest$Evaluations`, length 0..100), so one
+/// delivery's worth is what a rule keeps: the hundred most recently evaluated
+/// resources. Without a bound, repeated deliveries naming new resource ids would grow
+/// this process's memory without end.
+pub const EVALUATION_RESULTS_KEPT_PER_RULE: usize = 100;
+
+/// Every `ComplianceType` an evaluation DELIVERED to Config may carry: the published
+/// values minus `INSUFFICIENT_DATA`, which Config derives for a rule it could not
+/// evaluate rather than accepting from a caller (`Evaluation$ComplianceType`: "For the
+/// Evaluation data type, Config supports only the COMPLIANT, NON_COMPLIANT, and
+/// NOT_APPLICABLE values. … Config does not accept INSUFFICIENT_DATA as the value for
+/// ComplianceType from a PutEvaluations request").
+pub const DELIVERED_EVALUATION_COMPLIANCE_TYPES: [&str; 3] = [
+    COMPLIANCE_TYPE_COMPLIANT,
+    COMPLIANCE_TYPE_NON_COMPLIANT,
+    COMPLIANCE_TYPE_NOT_APPLICABLE,
+];
+
+/// The `ResultToken` Config mints when it invokes the evaluation of the rule
+/// `config_rule_name` at `invoked_at`.
+///
+/// The token "identifies the rule and the event that triggered the evaluation"
+/// (`PutEvaluationsRequest$ResultToken`), so it is built from exactly those two: the
+/// rule's name and the instant of the invocation it belongs to, encoded opaquely with
+/// the codec this service's other tokens use. The rule name is LENGTH-PREFIXED because
+/// a `ConfigRuleName` is otherwise unconstrained in its characters, so no separator can
+/// be claimed as one.
+pub fn mint_result_token(config_rule_name: &str, invoked_at: SystemTime) -> String {
+    let since_epoch = invoked_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    encode_page_token(&format!(
+        "{}:{config_rule_name}{since_epoch}",
+        config_rule_name.len()
+    ))
+}
+
+/// The Config rule a `ResultToken` identifies, or `None` when the value is not a token
+/// [`mint_result_token`] produced — i.e. it does not decode to a length-prefixed rule
+/// name followed by the digits of an instant.
+pub fn result_token_rule(token: &str) -> Option<String> {
+    let decoded = decode_page_token(token)?;
+    let (length, rest) = decoded.split_once(':')?;
+    let length: usize = length.parse().ok()?;
+    let name = rest.get(..length)?;
+    let invoked_at = rest.get(length..)?;
+    if name.is_empty() || invoked_at.is_empty() || !invoked_at.bytes().all(|at| at.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 /// How Config words `InvalidParameterValueException` for a member whose value is not
 /// one that member accepts.
 ///
@@ -4144,14 +4565,89 @@ pub fn unsupported_evaluation_mode_message(requested: &str) -> String {
 pub const NO_SUCH_CONFIG_RULES: &str = "One or more ConfigRules provided in the request are \
                                         invalid. Please check the configRule names.";
 
-/// How Config words `NoSuchConfigurationRecorderException`.
+/// Which member a request named one configuration recorder BY, which is what the
+/// refusal that cannot find it states: a caller is told to verify the input it actually
+/// sent.
 ///
-/// A FIXED message for the class — it quotes nothing from the request — so every
-/// operation that fails to find a configuration recorder answers with exactly this
-/// text, whether the request named the recorder by name or by ARN.
-pub const NO_SUCH_CONFIGURATION_RECORDER: &str =
-    "The name of the configuration recorder you entered cannot be found. Verify the \
-     configuration recorder name, and try again.";
+/// The selectors are the ones the recorder operations take —
+/// `ConfigurationRecorderName`/`ConfigurationRecorderNames`, `Arn` and
+/// `ServicePrincipal` (`DescribeConfigurationRecorders`,
+/// `DeleteServiceLinkedConfigurationRecorder`) — and a service-linked recorder, whose
+/// name is not the caller's to choose, is addressed only by the last two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecorderSelector {
+    /// The request named the recorder by name.
+    Name,
+    /// The request named the recorder by ARN.
+    Arn,
+    /// The request named the service the recorder is linked to.
+    ServicePrincipal,
+}
+
+impl RecorderSelector {
+    /// What a refusal calls this selector: the member the caller supplied, in the words
+    /// the refusal uses for it.
+    fn member(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Arn => "arn",
+            Self::ServicePrincipal => "service principal",
+        }
+    }
+
+    /// How a refusal that QUOTES the value names the member it came from, which is the
+    /// model's own spelling of it.
+    fn quoted_member(self) -> &'static str {
+        match self {
+            Self::Name => "RecorderName",
+            Self::Arn => "RecorderArn",
+            Self::ServicePrincipal => "ServicePrincipal",
+        }
+    }
+}
+
+/// How Config words `NoSuchConfigurationRecorderException` for a lookup by `selector`.
+///
+/// The message is built from the SELECTOR the request carried rather than from the
+/// value it sent: it names the member the caller has to verify, so a lookup by ARN
+/// cannot be refused with the wording of a lookup by name — which is unactionable for a
+/// service-linked recorder, addressed only by ARN or by service principal. The
+/// service-principal wording is the sentence
+/// [`UNRECOGNIZED_RECORDER_SERVICE_PRINCIPAL_MESSAGE`] already carries in the refusal
+/// class that one belongs to; the arn wording ends in the trailing space the recorded
+/// arn-variant refusal carries.
+pub fn no_such_configuration_recorder_message(selector: RecorderSelector) -> String {
+    let member = selector.member();
+    let trailing = if matches!(selector, RecorderSelector::Arn) {
+        " "
+    } else {
+        ""
+    };
+    format!(
+        "The {member} of the configuration recorder you entered cannot be found. Verify \
+         the configuration recorder {member}, and try again.{trailing}"
+    )
+}
+
+/// How the SERVICE-LINKED recorder path words `NoSuchConfigurationRecorderException`
+/// for a recorder it cannot resolve from `selector` carrying `value`.
+///
+/// `DeleteServiceLinkedConfigurationRecorder` resolves ONE recorder of ONE account from
+/// the selector the request carried, so its refusal states what it looked for and where
+/// — the account and the selector's own value — rather than telling the caller to verify
+/// a member, which is how [`no_such_configuration_recorder_message`] words a lookup that
+/// takes several selectors at once. Recorded behaviour on the ARN selector; the member
+/// is named as the model spells it, so each selector states the one the request carried.
+pub fn service_linked_recorder_not_found_message(
+    selector: RecorderSelector,
+    value: &str,
+) -> String {
+    format!(
+        "Configuration recorder (AccountId: {}, {}: {value}) cannot be found",
+        ::emulator_server::emulator_account_id(),
+        selector.quoted_member(),
+    )
+}
 
 /// How `PutConfigurationRecorder` words `InvalidConfigurationRecorderNameException`
 /// for a name carrying the prefix Config reserves for the recorders it creates itself

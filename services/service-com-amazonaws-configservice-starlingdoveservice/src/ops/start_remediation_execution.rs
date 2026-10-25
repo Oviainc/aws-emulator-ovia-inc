@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartRemediationExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartRemediationExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Runs the remediation action one Config rule's remediation configuration names
+//! against the resources the request lists: one
+//! [`crate::state::RemediationExecutionEntry`] per resource key, which
+//! `DescribeRemediationExecutionStatus` then reports as it moves from `QUEUED` through
+//! `IN_PROGRESS` to `SUCCEEDED` — the execution is asynchronous, so this call records
+//! the invocation and the instants those moves are due at, and answers.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartRemediationExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A rule with no remediation configuration attached — including a rule this account
+//! does not hold — is refused with `NoSuchRemediationConfigurationException` ("You
+//! specified an Config rule without a remediation configuration"), which is the one
+//! refusal this operation makes for that precondition. A resource key the request
+//! carries that cannot be remediated is reported back in `FailedItems` with the
+//! `FailureMessage` saying why, which is what that member is for ("For example, the
+//! resource is already compliant"): a resource the rule's own verdict already places as
+//! compliant has nothing to remediate, and one whose previous execution has not
+//! finished cannot be started again ("An existing StartRemediationExecution call for
+//! the specified resource keys must complete before you can call the API again").
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +167,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartRemediationExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartRemediationExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartRemediationExecution"))
+        // `ctx` carries request metadata only; the execution is recorded in this
+        // service's own state.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // A resource key names ONE resource by its type and its id, so a key missing
+        // either names no resource to remediate. The type is judged here rather than at
+        // the boundary (`skip_validation` on `ResourceKey`, see
+        // `super::types::shared_types`).
+        if let Some(incomplete) = input
+            .resource_keys
+            .iter()
+            .find(|key| key.resource_type.trim().is_empty() || key.resource_id.trim().is_empty())
+        {
+            return Err(
+                StartRemediationExecutionErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "A ResourceKey must name both a resourceType and a resourceId; \
+                             got resourceType '{}' and resourceId '{}'.",
+                            incomplete.resource_type, incomplete.resource_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The remediation configuration is what there is to run: a rule without one —
+        // and a rule this account does not hold has none — is exactly the precondition
+        // `NoSuchRemediationConfigurationException` documents ("You specified an Config
+        // rule without a remediation configuration").
+        let Some(remediation) = store
+            .remediation_configurations
+            .get(&input.config_rule_name)
+        else {
+            return Err(
+                StartRemediationExecutionErrorModeled::NoSuchRemediationConfigurationException(
+                    NoSuchRemediationConfigurationException {
+                        message: Some(no_remediation_configuration_message(
+                            &input.config_rule_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The step an execution runs is the remediation target the configuration names.
+        let target = remediation.target_id.clone();
+
+        // Which of the rule's own verdicts already place a resource as compliant: a
+        // resource that complies has nothing to remediate. Read before the executions
+        // are written, so the decision is about the state this call arrived at.
+        let compliant: ::std::collections::BTreeSet<(String, String)> = store
+            .config_rules
+            .get(&input.config_rule_name)
+            .map(|rule| {
+                rule.evaluation_results
+                    .values()
+                    .filter(|result| {
+                        result.compliance_type == crate::state::COMPLIANCE_TYPE_COMPLIANT
+                    })
+                    .map(|result| (result.resource_type.clone(), result.resource_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut failed = Vec::new();
+        let mut failure_message = None;
+        for key in input.resource_keys {
+            let identity = (key.resource_type.clone(), key.resource_id.clone());
+            // An execution the clock has not finished yet is the precondition this
+            // operation states for a repeat call, so the resource is reported back
+            // rather than started a second time.
+            let running = store
+                .remediation_executions
+                .get(&(
+                    input.config_rule_name.clone(),
+                    identity.0.clone(),
+                    identity.1.clone(),
+                ))
+                .is_some_and(|execution| {
+                    execution.state_at(now) != crate::state::REMEDIATION_EXECUTION_STATE_SUCCEEDED
+                });
+            let reason = if compliant.contains(&identity) {
+                Some(already_compliant_message(&input.config_rule_name))
+            } else if running {
+                Some(EXECUTION_IN_FLIGHT.to_string())
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                failure_message = failure_message.or(Some(reason));
+                failed.push(key);
+                continue;
+            }
+            store.record_remediation_execution(
+                &input.config_rule_name,
+                crate::state::RemediationExecutionEntry::invoked(
+                    &key.resource_type,
+                    &key.resource_id,
+                    &target,
+                    now,
+                ),
+            );
+        }
+
+        // "For resources that have failed to start execution, the API returns a resource
+        // key object": a request every resource of which started reports none.
+        Ok(StartRemediationExecutionOutput {
+            failed_items: (!failed.is_empty()).then_some(failed),
+            failure_message,
+        })
     }
 }
+
+/// How Config words `NoSuchRemediationConfigurationException` for a rule that has no
+/// remediation configuration attached.
+///
+/// The message is BUILT FROM THE REQUEST — it quotes the rule the caller named — and
+/// states the precondition the shape documents ("You specified an Config rule without a
+/// remediation configuration"), so a client can tell this from a request that was
+/// malformed.
+fn no_remediation_configuration_message(config_rule_name: &str) -> String {
+    format!(
+        "There is no applicable RemediationConfiguration setup for AWS Config rule \
+         {config_rule_name}"
+    )
+}
+
+/// The `FailureMessage` for a resource the rule's own evaluation already places as
+/// COMPLIANT, which is the example the member documents ("Returns a failure message.
+/// For example, the resource is already compliant").
+fn already_compliant_message(config_rule_name: &str) -> String {
+    format!(
+        "The resource is already compliant with the AWS Config rule {config_rule_name}, \
+         so there is nothing to remediate."
+    )
+}
+
+/// The `FailureMessage` for a resource whose previous remediation execution has not
+/// finished, which is the precondition this operation documents: "An existing
+/// StartRemediationExecution call for the specified resource keys must complete before
+/// you can call the API again."
+const EXECUTION_IN_FLIGHT: &str = "An existing StartRemediationExecution call for the specified \
+                                   resource keys must complete before you can call the API \
+                                   again.";

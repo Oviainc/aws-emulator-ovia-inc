@@ -342,6 +342,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A replacement maintenance configuration is judged the way the create judges the
+        // one it stores: a `PreferredDayTime` preference whose `Time` names no time of day
+        // names no preference, and the window a start schedules is derived from it, so the
+        // update refuses it rather than storing it (the rule `crate::state` owns for every
+        // operation that takes a maintenance configuration).
+        if let Some(rejection) = input
+            .maintenance_configuration
+            .as_ref()
+            .and_then(crate::state::maintenance_configuration_rejection)
+        {
+            return Err(bad_request(rejection));
+        }
+
         // Nothing above this line has written anything, so a refused request changes nothing
         // at all. The record is taken mutably only now, once every verdict is in.
         let Some(output) = store.router_outputs.get_mut(&input.arn) else {

@@ -282,6 +282,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for name in &names {
             if let Some(rule) = store.config_rules.get_mut(name) {
                 rule.evaluation.invoke_on_demand(now);
+                // The pass Config has just invoked carries a `ResultToken` where the
+                // rule is one whose verdicts are delivered back to Config, the same way
+                // the pass a write invokes does.
+                rule.mint_evaluation_result_token(now);
             }
         }
 

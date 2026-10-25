@@ -315,7 +315,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `STANDBY`; the statuses past it are reached by `ExecuteBudgetAction`,
             // since no spend in this emulator ever crosses an action threshold.
             status: crate::state::ACTION_STATUS_STANDBY.to_string(),
-            subscribers: input.subscribers,
+            // The subscribers of an action are the same modelled `Subscribers` set a
+            // notification holds, keyed by subscription type and address, so a repeat in
+            // the supplied list names a subscriber the set already holds and is collapsed
+            // into it.
+            subscribers: crate::state::distinct_subscribers(input.subscribers),
         };
         let mut held = crate::state::StoredAction::new(
             action,

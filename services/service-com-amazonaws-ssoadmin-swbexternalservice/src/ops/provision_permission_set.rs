@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ProvisionPermissionSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ProvisionPermissionSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: provisions a permission set into the accounts the request targets,
+//! persisting the status record of the workflow it started. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ProvisionPermissionSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Provisioning is what copies a permission set's CURRENT definition into an account:
+//! an account holds the definition the last provisioning put there, which is why
+//! `UpdatePermissionSet` and the policy-attachment operations tell a caller to
+//! "reprovision the permission set to apply the corresponding IAM policy updates to all
+//! assigned accounts". So this call fixes, at the instant it is accepted, the definition
+//! to copy and the accounts to copy it into — the one account an `AWS_ACCOUNT` target
+//! names, or every account that already holds the permission set for an
+//! `ALL_PROVISIONED_ACCOUNTS` one — and records both on the provisioning it stores.
+//!
+//! The work is ASYNCHRONOUS: this call ACCEPTS it and answers with the tracking record of
+//! the workflow it started — the non-terminal `IN_PROGRESS` status, the `RequestId` to
+//! poll it by and the date it was accepted — which is what
+//! `DescribePermissionSetProvisioningStatus` exists to read ("The identifier that is
+//! provided by the ProvisionPermissionSet call to retrieve the current status of the
+//! provisioning workflow"). The workflow reaches the terminal `SUCCEEDED`, and its copy
+//! reaches the target accounts, one `crate::state::PERMISSION_SET_PROVISIONING_SPAN`
+//! later: both are derived from a stored due instant, so nothing sleeps and a caller
+//! polling straight after the call still sees the workflow in flight.
+//!
+//! A COPY is what an account holds of the permission set, and in this emulator an account
+//! holds one through the assignments granted on it: `CreateAccountAssignment` records the
+//! definition it put there and `DeleteAccountAssignment` takes the account's copy away
+//! with the last assignment on it. A provisioning therefore REFRESHES the copies of the
+//! accounts it targets, and a target account that holds no assignment of this permission
+//! set has no copy to refresh — the call is still accepted and tracked (AWS refuses it on
+//! neither the request nor the account), and nothing about that account changes, rather
+//! than this operation inventing an account holding a permission set no principal is
+//! assigned to there. Whether AWS makes such an account report the permission set is not
+//! documented; what IS documented is the reprovisioning of assigned accounts above, so
+//! that is what this implements.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +189,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ProvisionPermissionSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ProvisionPermissionSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ProvisionPermissionSet"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ProvisionPermissionSetErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // What the CLOCK already owes — every instance, the account's ambient instance if
+        // nothing has enabled one yet, and the copy every earlier provisioning has become
+        // due to deliver — so this call reads the state a read at this instant reads.
+        store.on_request(&region, now);
+
+        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: permission
+        // sets are a feature of an organization instance, so on an account instance none
+        // can ever exist to provision and the refusal does not depend on whether this
+        // request's permission set does. An ARN this account holds no instance for is NOT
+        // this refusal — it falls through to the 404 below.
+        if store.permission_set_surface_withdrawn(&input.instance_arn) {
+            return Err(ProvisionPermissionSetErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                    ),
+                    // The model's `ValidationExceptionReason` enum carries only KMS key
+                    // states, none of which this refusal is.
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        if store.instance(&input.instance_arn).is_none() {
+            return Err(ProvisionPermissionSetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No instance found with the ARN {}",
+                        input.instance_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+        // The definition this provisioning copies is the permission set's as it stands
+        // NOW, so a change made to it while this workflow is in flight is not the one
+        // that lands in the target accounts.
+        let Some(permission_set) =
+            store.permission_set(&input.instance_arn, &input.permission_set_arn)
+        else {
+            return Err(ProvisionPermissionSetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No permission set found with the ARN {}",
+                        input.permission_set_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        };
+        let revision = permission_set.definition_revision();
+
+        // The TARGET, resolved to the accounts this provisioning copies into. A target of
+        // one account is the account the request names — which the model leaves optional
+        // because the other target type names none, so a request that omits it there has
+        // named no target at all and is refused. The model's `ProvisionTargetType` declares
+        // exactly two values and that constraint is enforced before this handler runs, so
+        // the other target is every account holding a copy at THIS instant (a `TargetId`
+        // sent with it names nothing further), fixed here rather than re-read when the
+        // workflow completes: an account that starts holding the permission set later is
+        // not part of the work this call accepted.
+        let (account_id, accounts) =
+            if input.target_type == crate::state::PROVISION_TARGET_TYPE_AWS_ACCOUNT {
+                let Some(target_id) = input.target_id.clone() else {
+                    return Err(ProvisionPermissionSetErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::target_id_required_message(
+                                &input.target_type,
+                            )),
+                            reason: None,
+                        },
+                    )
+                    .into());
+                };
+                let accounts = ::std::collections::BTreeSet::from([target_id.clone()]);
+                (Some(target_id), accounts)
+            } else {
+                let accounts = store
+                    .provisioned_accounts(&input.instance_arn, &input.permission_set_arn)
+                    .into_keys()
+                    .collect();
+                (None, accounts)
+            };
+
+        // A freshly minted `RequestId` cannot already be stored; the collision is checked
+        // BEFORE the record is written, so the id this call hands back is the id the
+        // record is stored under.
+        let request_id = crate::state::mint_request_id();
+        if store.permission_set_provisioning_request_id_taken(&request_id) {
+            return Err(ProvisionPermissionSetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the minted RequestId collided with a stored one".to_string()),
+                },
+            )
+            .into());
+        }
+        store.record_permission_set_provisioning(
+            crate::state::PermissionSetProvisioningRecord {
+                request_id: request_id.clone(),
+                instance_arn: input.instance_arn.clone(),
+                permission_set_arn: input.permission_set_arn.clone(),
+                account_id,
+                accounts,
+                revision,
+                // Nothing fails a provisioning here, so the status walks `IN_PROGRESS` to
+                // `SUCCEEDED` and never carries a failure message.
+                failure_reason: None,
+                created_date: ::aws_smithy_types::DateTime::from(now),
+                // The workflow is accepted NOW and completes one span from now; both the
+                // status and the copy are derived from this instant, so no later call has
+                // to write to move it on.
+                succeeded_due: now + crate::state::PERMISSION_SET_PROVISIONING_SPAN,
+                applied: false,
+            },
+            now,
+        );
+        // Answer from the STORED record, so a later `DescribePermissionSetProvisioningStatus`
+        // of this `RequestId` cannot disagree with what this call reported.
+        let stored = store
+            .permission_set_provisioning(&input.instance_arn, &request_id)
+            .ok_or_else(|| {
+                ProvisionPermissionSetErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the stored provisioning-status record could not be read".to_string(),
+                        ),
+                    },
+                )
+            })?;
+        Ok(ProvisionPermissionSetOutput {
+            permission_set_provisioning_status: Some(stored.to_shape(now)),
+        })
     }
 }

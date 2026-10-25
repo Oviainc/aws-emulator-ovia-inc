@@ -69,6 +69,8 @@ mod layer_version_listing;
 mod layer_version_permissions;
 #[path = "all/layer_versions.rs"]
 mod layer_versions;
+#[path = "all/missing_policy_refusal.rs"]
+mod missing_policy_refusal;
 #[path = "all/policy_versions_and_resources.rs"]
 mod policy_versions_and_resources;
 #[path = "all/provisioned_concurrency.rs"]

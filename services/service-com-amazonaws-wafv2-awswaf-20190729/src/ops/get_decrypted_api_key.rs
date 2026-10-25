@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDecryptedAPIKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDecryptedAPIKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the API key the request names "in decrypted form": the token domains the
+//! key was DEFINED with and the instant it was created, both read out of the key's
+//! stored record — the only place they are kept, since the key value itself is
+//! opaque (see [`crate::state::new_api_key`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDecryptedAPIKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A key value is the key's identity within its scope, and a scope is a namespace, so
+//! the three ways a request can name no key of this service are reported apart: a
+//! scope that is not one the model declares is an invalid parameter, a value that does
+//! not decode to a key this service minted is the invalid PARAMETER WAF refuses a
+//! malformed key with — naming the rejected value and no field
+//! ([`crate::state::invalid_key_format_exception`]) — and a well-formed key the scope
+//! does not hold is the nonexistent item.
+//!
+//! A decryption REPORTS: nothing here writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +169,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDecryptedAPIKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDecryptedAPIKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDecryptedAPIKey"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need, and nothing here writes to the store.
+        let _ = ctx;
+        // `Scope`'s enum membership is refused at the request boundary, which words
+        // the member's own constraint, so this is the handler's own guard: a scope
+        // that ever reaches it unchecked names no namespace to look the key up in.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(GetDecryptedAPIKeyErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the API key lives in, and is one of CLOUDFRONT or REGIONAL",
+                ),
+            )
+            .into());
+        }
+
+        // A value that does not decode to a key this service minted is not a key WAF
+        // could decrypt at all, whatever any scope holds: WAF refuses it as the
+        // invalid parameter it is, naming the value it could not decode, and the
+        // store is never read for it — so a malformed value and a well-formed one
+        // naming nothing stored stay two different failures.
+        if !crate::state::is_api_key_shaped(&input.api_key) {
+            return Err(GetDecryptedAPIKeyErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_key_format_exception(&input.api_key),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDecryptedAPIKeyErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // A well-formed key the scope does not hold names nothing stored, which is
+        // the nonexistent item — a key minted in the other scope included, because a
+        // scope is a namespace.
+        let Some(entry) = state.api_key(&input.scope, &input.api_key) else {
+            return Err(GetDecryptedAPIKeyErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        };
+
+        // Exactly what the key was defined with, in the order it was defined: the
+        // decrypted form of the key is its stored record, never a value recomputed
+        // from this request.
+        Ok(GetDecryptedAPIKeyOutput {
+            token_domains: Some(entry.token_domains.clone()),
+            creation_timestamp: Some(::aws_smithy_types::DateTime::from_millis(
+                entry.created_at_millis,
+            )),
+        })
     }
 }

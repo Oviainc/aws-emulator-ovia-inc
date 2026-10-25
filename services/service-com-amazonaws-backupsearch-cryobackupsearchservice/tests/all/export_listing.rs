@@ -11,9 +11,11 @@
 //! partition and account of the `RoleArn`, the shape of the `ExportSpecification`, the
 //! filters, the record count and the page size — never over one cited request:
 //!
-//! * a listing bound to a resource (`ListSearchJobBackups`) refuses an identifier that
-//!   names no such resource with the modelled `ResourceNotFoundException` (404), and
-//!   otherwise pages over the records that resource holds;
+//! * a listing bound to a resource (`ListSearchJobBackups`) refuses a WELL-FORMED
+//!   identifier that names no such resource with the modelled
+//!   `ResourceNotFoundException` (404), and otherwise pages over the records that
+//!   resource holds (a string outside the identifier shape is the syntax guard's
+//!   refusal instead — see `tests/all/job_identifier_syntax.rs`);
 //! * a listing whose members are FILTERS (`ListSearchResultExportJobs`) never refuses a
 //!   filter value for naming nothing: it answers 200 with the records that match, which
 //!   is the empty page when none do;
@@ -85,19 +87,27 @@ async fn started_job(emulator: &MultiServiceRouter) -> String {
 }
 
 /// Seed one search job in `status`, with `backups` recovery points covered, straight
-/// into the store: `FAILED` is a status no sequence of calls reaches in this emulator,
-/// and seeding keeps every row of a status table deterministic and sleep-free.
+/// into the store, and answer the identifier it was seeded under: `FAILED` is a status no
+/// sequence of calls reaches in this emulator, and seeding keeps every row of a status
+/// table deterministic and sleep-free.
+///
+/// The identifier comes from the store's own MINT, so a seeded record is named the way a
+/// started one is: every operation that resolves a job identifier guards its shape before
+/// any lookup (`state::check_job_identifier`), so a record seeded under a name outside
+/// that shape could not be reached by any call.
 pub(crate) fn seed_job(
     engine: &engine::InMemoryEngine,
-    identifier: &str,
     status: &str,
     backups: Vec<types::SearchJobBackupsResult>,
-) {
+) -> String {
     let store = engine.state::<state::ComAmazonawsBackupsearchCryobackupsearchserviceState>();
     let mut store = store.lock();
+    let identifier = store
+        .mint_identifier()
+        .expect("the store mints a fresh identifier");
     store.insert_job(state::SearchJob {
-        identifier: identifier.to_string(),
-        arn: state::search_job_arn("backup-search", REGION, identifier),
+        identifier: identifier.clone(),
+        arn: state::search_job_arn("backup-search", REGION, &identifier),
         name: None,
         status: status.to_string(),
         creation_time: state::timestamp(std::time::SystemTime::now()),
@@ -113,9 +123,10 @@ pub(crate) fn seed_job(
         backups,
         tags: HashMap::new(),
         client_token: None,
-        request_fingerprint: identifier.to_string(),
+        request_fingerprint: identifier.clone(),
         owed_statuses: std::collections::VecDeque::new(),
     });
+    identifier
 }
 
 /// One covered recovery point, with the members `SearchJobBackupsResult` declares.
@@ -148,16 +159,18 @@ pub(crate) async fn listed_exports(emulator: &MultiServiceRouter, query: &str) -
 
 #[tokio::test]
 async fn listing_the_backups_of_an_unknown_search_job_is_the_modelled_not_found() {
-    // The rule: a listing bound to a resource refuses an identifier that names no such
-    // resource, whatever that identifier looks like. The rows differ in form — a UUID,
-    // a minted-shaped id, a single character, a long one — because the refusal is about
-    // what the store holds and not about the shape of the string.
+    // The rule: a listing bound to a resource refuses a WELL-FORMED identifier that names
+    // no such resource, because the refusal is about what the store holds. The rows differ
+    // in the form that well-formed identifier takes — a uuid no call minted, the nil uuid,
+    // an all-f one, an upper-case rendering — so the answer cannot depend on the digits.
+    // (A string outside the identifier shape is a different refusal, the syntax guard's;
+    // its table is `tests/all/job_identifier_syntax.rs`.)
     let emulator = emulator();
     let unknown = [
         "48434c42-40a0-4057-b04d-3b484c610e2b",
-        "searchjob-000000000042",
-        "x",
-        "a-very-long-identifier-that-no-call-ever-minted-0000000000000000",
+        "00000000-0000-0000-0000-000000000000",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "48434C42-40A0-4057-B04D-3B484C610E2B",
     ];
     for identifier in unknown {
         let answer = call(
@@ -225,7 +238,6 @@ async fn backups_are_paged_out_of_the_job_record_exactly_once_whatever_the_page_
     for backup_count in [0_usize, 1, 3, 7] {
         for max_results in [1_usize, 2, 3, 1000] {
             let (emulator, engine) = emulator_with_engine();
-            let identifier = format!("seeded-{backup_count}");
             // `ResourceType` accepts S3 and EBS and `SearchJobState` COMPLETED/FAILED
             // among others (model enums `ResourceType` / `SearchJobState`); the rows mix
             // them so the page carries more than one shape of record.
@@ -240,7 +252,7 @@ async fn backups_are_paged_out_of_the_job_record_exactly_once_whatever_the_page_
                     backup(index, status, resource_type)
                 })
                 .collect();
-            seed_job(&engine, &identifier, state::COMPLETED, seeded.clone());
+            let identifier = seed_job(&engine, state::COMPLETED, seeded.clone());
 
             let case = format!("{backup_count} backups, MaxResults={max_results}");
             let mut seen: Vec<String> = Vec::new();
@@ -295,7 +307,7 @@ async fn export_job_listing_treats_its_members_as_filters_and_never_answers_not_
 
     // A real search job with no export jobs, the reference answer every row is
     // compared against.
-    seed_job(&engine, "has-no-exports", state::COMPLETED, Vec::new());
+    let has_no_exports = seed_job(&engine, state::COMPLETED, Vec::new());
 
     let rows: Vec<(&str, String)> = vec![
         ("no filter at all", String::new()),
@@ -309,7 +321,7 @@ async fn export_job_listing_treats_its_members_as_filters_and_never_answers_not_
         ),
         (
             "a real search job with no export jobs",
-            "?SearchJobIdentifier=has-no-exports".to_string(),
+            format!("?SearchJobIdentifier={has_no_exports}"),
         ),
         // `ExportJobStatus` accepts COMPLETED, FAILED and RUNNING (model enum
         // `ExportJobStatus`, rendered as `types::EXPORT_JOB_STATUS_VALUES`).
@@ -346,13 +358,13 @@ async fn export_job_listing_treats_its_members_as_filters_and_never_answers_not_
 
     // And the filter really filters: an export job on one search job is listed for that
     // identifier and for no other, and only under its own status.
-    seed_job(&engine, "has-one-export", state::STOPPED, Vec::new());
+    let has_one_export = seed_job(&engine, state::STOPPED, Vec::new());
     let started = call(
         &emulator,
         REGION,
         "PUT",
         "/export-search-jobs",
-        Some(export_body("has-one-export", Some(&passable_role("export")))),
+        Some(export_body(&has_one_export, Some(&passable_role("export")))),
     )
     .await;
     assert_eq!(
@@ -367,19 +379,19 @@ async fn export_job_listing_treats_its_members_as_filters_and_never_answers_not_
         ("no filter", String::new(), 1),
         (
             "its own search job",
-            "?SearchJobIdentifier=has-one-export".to_string(),
+            format!("?SearchJobIdentifier={has_one_export}"),
             1,
         ),
         (
             "another search job",
-            "?SearchJobIdentifier=has-no-exports".to_string(),
+            format!("?SearchJobIdentifier={has_no_exports}"),
             0,
         ),
         ("its own status", "?Status=RUNNING".to_string(), 1),
         ("another status", "?Status=COMPLETED".to_string(), 0),
         (
             "its own search job and another status",
-            "?SearchJobIdentifier=has-one-export&Status=FAILED".to_string(),
+            format!("?SearchJobIdentifier={has_one_export}&Status=FAILED"),
             0,
         ),
     ];
@@ -411,7 +423,7 @@ async fn export_job_listing_treats_its_members_as_filters_and_never_answers_not_
             );
             assert_eq!(
                 entry["SearchJobArn"].as_str(),
-                Some(state::search_job_arn("backup-search", REGION, "has-one-export").as_str()),
+                Some(state::search_job_arn("backup-search", REGION, &has_one_export).as_str()),
                 "case {case:?}: the summary must name the search job's own ARN, got {entry:?}"
             );
         }
@@ -426,8 +438,7 @@ async fn an_export_can_only_be_started_from_a_search_job_whose_results_are_final
     let permitted = state::EXPORTABLE_SEARCH_JOB_STATES;
     for status in types::SEARCH_JOB_STATE_VALUES {
         let (emulator, engine) = emulator_with_engine();
-        let identifier = format!("job-in-{status}");
-        seed_job(&engine, &identifier, status, Vec::new());
+        let identifier = seed_job(&engine, status, Vec::new());
 
         let answer = call(
             &emulator,
@@ -518,7 +529,7 @@ async fn an_export_specification_with_no_member_is_a_server_fault_and_creates_no
     ];
     for (case, specification, expected_status, expected_code) in rows {
         let (emulator, engine) = emulator_with_engine();
-        seed_job(&engine, "exportable", state::COMPLETED, Vec::new());
+        let exportable = seed_job(&engine, state::COMPLETED, Vec::new());
 
         let answer = call(
             &emulator,
@@ -526,7 +537,7 @@ async fn an_export_specification_with_no_member_is_a_server_fault_and_creates_no
             "PUT",
             "/export-search-jobs",
             Some(json!({
-                "SearchJobIdentifier": "exportable",
+                "SearchJobIdentifier": exportable,
                 "ExportSpecification": specification,
                 "RoleArn": passable_role("export")
             })),
@@ -564,13 +575,13 @@ async fn an_export_specification_with_no_member_is_a_server_fault_and_creates_no
     // An absent `ExportSpecification` is a different refusal again: the member is
     // `@required`, so the request never reaches the service.
     let (emulator, engine) = emulator_with_engine();
-    seed_job(&engine, "exportable", state::COMPLETED, Vec::new());
+    let exportable = seed_job(&engine, state::COMPLETED, Vec::new());
     let answer = call(
         &emulator,
         REGION,
         "PUT",
         "/export-search-jobs",
-        Some(json!({"SearchJobIdentifier": "exportable", "RoleArn": passable_role("export")})),
+        Some(json!({"SearchJobIdentifier": exportable, "RoleArn": passable_role("export")})),
     )
     .await;
     assert_eq!(
@@ -627,14 +638,14 @@ async fn a_well_formed_role_arn_reaches_the_pass_role_check_and_is_denied_across
     ];
     for (case, role_arn, expected_status) in rows {
         let (emulator, engine) = emulator_with_engine();
-        seed_job(&engine, "exportable", state::STOPPED, Vec::new());
+        let exportable = seed_job(&engine, state::STOPPED, Vec::new());
 
         let answer = call(
             &emulator,
             REGION,
             "PUT",
             "/export-search-jobs",
-            Some(export_body("exportable", Some(&role_arn))),
+            Some(export_body(&exportable, Some(&role_arn))),
         )
         .await;
         assert_eq!(
@@ -675,13 +686,13 @@ async fn a_well_formed_role_arn_reaches_the_pass_role_check_and_is_denied_across
     // A request with no `RoleArn` needs no role passed, so it is accepted: the member is
     // optional in the model.
     let (emulator, engine) = emulator_with_engine();
-    seed_job(&engine, "exportable", state::STOPPED, Vec::new());
+    let exportable = seed_job(&engine, state::STOPPED, Vec::new());
     let answer = call(
         &emulator,
         REGION,
         "PUT",
         "/export-search-jobs",
-        Some(export_body("exportable", None)),
+        Some(export_body(&exportable, None)),
     )
     .await;
     assert_eq!(
@@ -696,7 +707,7 @@ async fn an_export_page_token_cannot_resume_a_differently_filtered_listing() {
     // The cursor names the sequence it indexes, so a token issued for one set of filters
     // is refused rather than silently resuming another sequence at that offset.
     let (emulator, engine) = emulator_with_engine();
-    seed_job(&engine, "exportable", state::COMPLETED, Vec::new());
+    let exportable = seed_job(&engine, state::COMPLETED, Vec::new());
     for index in 0..3 {
         let started = call(
             &emulator,
@@ -704,7 +715,7 @@ async fn an_export_page_token_cannot_resume_a_differently_filtered_listing() {
             "PUT",
             "/export-search-jobs",
             Some(json!({
-                "SearchJobIdentifier": "exportable",
+                "SearchJobIdentifier": exportable,
                 "ExportSpecification": {"s3ExportSpecification": {
                     "DestinationBucket": format!("exports-{index}")
                 }},
@@ -743,7 +754,7 @@ async fn an_export_page_token_cannot_resume_a_differently_filtered_listing() {
         ),
         (
             "a search-job filter",
-            format!("?SearchJobIdentifier=exportable&MaxResults=1&NextToken={token}"),
+            format!("?SearchJobIdentifier={exportable}&MaxResults=1&NextToken={token}"),
         ),
     ];
     for (case, query) in others {

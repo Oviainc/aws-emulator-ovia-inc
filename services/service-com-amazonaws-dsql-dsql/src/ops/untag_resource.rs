@@ -65,7 +65,9 @@
 //! (the same read `ListTagsForResource` makes): a value that names no Aurora DSQL
 //! resource at all is refused as a bad request (the modelled 400 `ValidationException`,
 //! carrying its `reason` and `fieldList`), and one that names a resource this service
-//! does not hold answers the modelled 404 `ResourceNotFoundException`.
+//! does not hold — including one scoped to another region, account or partition than
+//! the endpoint the request reached — answers the modelled 404
+//! `ResourceNotFoundException`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -171,9 +173,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The ARN carries everything this handler addresses the resource with, so
-        // `ctx` (request metadata) is unused.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -211,7 +210,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this instant even if nobody had called, and a settled deletion is what
         // decides whether the named cluster is still addressable at all.
         state.settle(::std::time::SystemTime::now());
-        let Some(tags) = state.resource_tags_mut(&resource) else {
+        // The same scoped resolution the other tagging operations use: an ARN of
+        // another region, account or partition names a resource this endpoint does not
+        // serve, so it removes nothing and answers the modelled 404.
+        let Some(tags) = state.resource_tags_mut(&resource, &crate::state::request_region(ctx))
+        else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(
                     &input.resource_arn,

@@ -1283,6 +1283,9 @@ fn seed_router_outputs(emulator: &Emulator, count: usize) {
                 pending: None,
                 routed_input_arn: None,
                 messages: Vec::new(),
+                // A seeded output has not been started, so nothing has scheduled a
+                // maintenance window for it, exactly as a created one has none.
+                maintenance_schedule: None,
                 client_token: None,
                 // A seeded output is live, like a created one: only DeleteRouterOutput sets
                 // the instant the clock completes a delete at.
