@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCustomDetectionRuleOrgConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCustomDetectionRuleOrgConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the organization configuration this Region's endpoint holds
+//! for the `(RuleId, Mode)` pair the request selects, so a later
+//! `GetCustomDetectionRuleOrgConfiguration` for that pair reports it gone and a
+//! later `CreateCustomDetectionRuleOrgConfiguration` may configure the pair again.
+//! The delete selects by that pair and removes nothing else: the rule's
+//! configuration in the OTHER `AssociationMode`, another rule's configuration,
+//! another Region's, and the rule's own ASSOCIATIONS all stay exactly as they were.
+//! A pair this Region's endpoint holds no configuration for is refused with the
+//! modelled HTTP 404 `ResourceNotFoundException` and removes nothing — which is also
+//! what a replayed delete answers once the first one has taken effect.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCustomDetectionRuleOrgConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The modelled `ConflictException` has no reachable case here: the pair selects at
+//! most one configuration, so there is never a second one for the delete to collide
+//! with.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +149,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCustomDetectionRuleOrgConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCustomDetectionRuleOrgConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteCustomDetectionRuleOrgConfigurationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        let mut state = state.lock();
+
+        // The configuration is selected by `(RuleId, Mode)` — `RuleId` is the URI
+        // label and `Mode` the query parameter `mode`, exactly the binding the read
+        // uses
+        // (`smithy_query(operation="DeleteCustomDetectionRuleOrgConfiguration,GetCustomDetectionRuleOrgConfiguration")`)
+        // — so `Mode` is a SELECTOR here rather than one of the values the update
+        // sets. The key is built once from the request's own values, which nothing
+        // after this needs.
+        let key = (region, input.rule_id, input.mode);
+
+        // Dropping the one entry that pair keys is the whole delete: an organization
+        // configuration owns nothing else, and it is held separately from the
+        // account's own ASSOCIATION with the rule, so withdrawing the organization's
+        // configuration never withdraws this account's association. The
+        // `ClientToken` the create carried lives ON the record, so removing the
+        // record retires that mapping with it and no idempotency key is left
+        // resolving to a configuration the store no longer holds.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCustomDetectionRuleOrgConfiguration"))
+        // A pair the store does not hold takes nothing out, so this still refuses
+        // BEFORE removing anything. `RuleId` carries its own length and pattern
+        // constraints and `Mode` is a modelled enum, both refused at the request
+        // boundary, so a well-formed pair the Region holds no configuration for is
+        // the only way to reach that refusal: the modelled 404, the same class a read
+        // of that pair answers, so "never configured", "configured through another
+        // Region's endpoint" and "already deleted" are one refusal and no caller can
+        // tell them apart.
+        if state
+            .custom_detection_rule_org_configurations
+            .remove(&key)
+            .is_none()
+        {
+            return Err(
+                DeleteCustomDetectionRuleOrgConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::detection_rule_org_configuration_not_found_message(),
+                        ),
+                        // "The error type"
+                        // (`smithy_query(shape="ResourceNotFoundException")`): the
+                        // class, the same value the body's `__type` carries.
+                        r#type: Some(RESOURCE_NOT_FOUND_EXCEPTION.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `DeleteCustomDetectionRuleOrgConfigurationResponse` declares no members
+        // (`smithy_query(operation="DeleteCustomDetectionRuleOrgConfiguration")`):
+        // the removal is observed through
+        // `GetCustomDetectionRuleOrgConfiguration`.
+        Ok(DeleteCustomDetectionRuleOrgConfigurationOutput {})
     }
 }
+
+/// The error CLASS a delete of a configuration this Region's endpoint does not hold
+/// carries on the wire — the modelled 404
+/// (`smithy_query(operation="DeleteCustomDetectionRuleOrgConfiguration")`), the same
+/// class a read of that pair answers, so it is answered as the modelled shape rather
+/// than under the `BadRequestException` envelope this service's 400s use.
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
