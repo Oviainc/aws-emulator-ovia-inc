@@ -155,6 +155,28 @@ pub const TYPES_WITH_DERIVED_LEGAL_ADDRESS: &[(&str, &str)] = &[("PAN", "India")
 /// another jurisdiction accepted adds its row here, and nothing else changes.
 pub const SUPPLEMENTAL_TRN_COUNTRIES: &[(&str, &str)] = &[("CH", "Switzerland")];
 
+/// The jurisdictions whose stored tax registration this API cannot remove,
+/// paired with the country's name as the refusal states it.
+///
+/// Both delete operations carve the same jurisdiction out in their own
+/// documentation: "This API operation can't be used to delete your tax
+/// registration in Brazil. Use the Payment preferences page in the Billing and
+/// Cost Management console instead."
+/// (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#DeleteTaxRegistration")`,
+/// and the same note on `BatchDeleteTaxRegistration`). A registration held in
+/// one of these jurisdictions is therefore removable only outside the API, so a
+/// delete aimed at one is refused and the record stays readable.
+///
+/// The jurisdiction is the one the registration is HELD in — its stored
+/// `legalAddress.countryCode`, the same key [`COUNTRY_RULES`] is applied by —
+/// not the `TaxRegistrationType` the entry was submitted with: the carve-out is
+/// about the country, and a country admits more than one type.
+///
+/// A record no API call can remove still costs a slot of the
+/// [`MAX_STORED_REGISTRATIONS`] the store keeps resident, which is what bounds
+/// the store; the bound is unchanged by this list.
+pub const COUNTRIES_WITH_NON_API_REGISTRATION_DELETE: &[(&str, &str)] = &[("BR", "Brazil")];
+
 /// `ValidationException.errorCode` values, from the model's
 /// `ValidationExceptionErrorCode` enum
 /// (`MalformedToken | ExpiredToken | InvalidToken | FieldValidationFailed |
@@ -1790,6 +1812,42 @@ pub fn invalid_authority_id() -> ValidationException {
         "authorityId",
         "Provided authorityId is not valid.",
     )
+}
+
+/// Whether a tax registration held in `country_code` is one this API cannot
+/// remove, with the country's name — see
+/// [`COUNTRIES_WITH_NON_API_REGISTRATION_DELETE`].
+pub fn non_api_delete_country(country_code: &str) -> Option<&'static str> {
+    COUNTRIES_WITH_NON_API_REGISTRATION_DELETE
+        .iter()
+        .find(|(code, _)| code.eq_ignore_ascii_case(country_code))
+        .map(|(_, country)| *country)
+}
+
+/// Refuse the deletion of a stored registration held in a jurisdiction this API
+/// cannot remove one from ([`COUNTRIES_WITH_NON_API_REGISTRATION_DELETE`]).
+///
+/// The one place both delete paths — `DeleteTaxRegistration` and the per-account
+/// loop of `BatchDeleteTaxRegistration` — decide whether a record is removable
+/// through the API, so the two operations cannot disagree about one record. The
+/// 400 class and the `ValidationException` shape are the contract both declare;
+/// the wording states the documented carve-out, naming the jurisdiction of the
+/// record the call addressed, and `accountId` is the parameter that selected it.
+pub fn check_registration_deletable(
+    stored: &StoredTaxRegistration,
+) -> Result<(), ValidationException> {
+    match non_api_delete_country(&stored.legal_address.country_code) {
+        Some(country) => Err(validation(
+            ERROR_CODE_FIELD_VALIDATION_FAILED,
+            "accountId",
+            format!(
+                "This API operation can't be used to delete your tax registration in {country}. \
+                 Use the Payment preferences page in the Billing and Cost Management console \
+                 instead."
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// This service's modelled `ResourceNotFoundException` (HTTP 404) for an account

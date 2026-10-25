@@ -85,6 +85,18 @@ pub const MAX_SLO_PAGE: i32 = 50;
 /// caller, since nothing else in the create path evicts or expires a record.
 pub const MAX_SLOS: usize = 2_000;
 
+/// The most tags a resource whose API documents a tag maximum may carry.
+///
+/// The maximum is documented per resource, not by the list shape: an SLO's `Tags` member
+/// reads "You can associate as many as 50 tags with an SLO", and `TagResource` states the
+/// same for the CloudWatch resource it addresses — "You can associate as many as 50 tags
+/// with a CloudWatch resource". The modelled `TagList` bound (`length 0..200`) is wider than
+/// that, so the boundary validator admits a list the service itself refuses and the count is
+/// checked where the tags are attached ([`tag_count_refusal`]). A resource whose own API
+/// documents no such maximum — the dynamic instrumentation configuration, whose `Tags` doc
+/// states only that the list is optional — is bounded by the modelled `TagList` instead.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// The largest page `ListAuditFindings` returns when the caller names no `MaxResults`.
 /// Model doc for the member: "The maximum number of audit findings to return in one
 /// operation. If you omit this parameter, the default of 10 is used."
@@ -645,6 +657,26 @@ pub fn validation_envelope(clauses: &[String]) -> String {
     }
 }
 
+/// The refusal for a request that attaches more tags to one resource than that resource's
+/// API documents, or `None` when the list is within [`MAX_TAGS_PER_RESOURCE`].
+///
+/// One helper for every operation that attaches a `TagList` to a resource with a documented
+/// tag maximum, so the bound a create enforces is the bound the whole service enforces (the
+/// SLO create today, and `TagResource` once it is implemented). Worded through the same
+/// clause builder the boundary validator uses for a `@length` maximum, because that is what
+/// this is: a maximum on the member's length that the model states too wide to enforce.
+pub fn tag_count_refusal(tags: Option<&[Tag]>) -> Option<String> {
+    let count = tags.map_or(0, <[Tag]>::len);
+    (count > MAX_TAGS_PER_RESOURCE).then(|| {
+        validation_envelope(&[constraint_clause(
+            "tags",
+            &format!(
+                "Member must have length less than or equal to {MAX_TAGS_PER_RESOURCE}"
+            ),
+        )])
+    })
+}
+
 /// A `@pattern` expression without the anchors a model may spell it with: the requirement
 /// stated is the expression a value must satisfy, not the anchoring the model uses to make
 /// the match total. A `$` escaped by a backslash is a literal dollar sign inside the
@@ -847,8 +879,42 @@ pub fn requested_evaluation_type(
     }
 }
 
+/// The refusal for a request that names BOTH mutually exclusive SLI configs, or `None`
+/// when it names at most one.
+///
+/// Documented on both members — "You can't specify both RequestBasedSliConfig and SliConfig
+/// in the same operation" — and inexpressible in the model, so the boundary validator admits
+/// the pair and every operation that accepts it refuses here, through one wording.
+pub fn exclusive_sli_configs_refusal(
+    sli_config: Option<&ServiceLevelIndicatorConfig>,
+    request_based_sli_config: Option<&RequestBasedServiceLevelIndicatorConfig>,
+) -> Option<&'static str> {
+    (sli_config.is_some() && request_based_sli_config.is_some()).then_some(
+        "You can't specify both RequestBasedSliConfig and SliConfig in the same operation.",
+    )
+}
+
+/// The refusal for a request that must DEFINE an SLO's indicator and names neither config,
+/// or `None` when it names one.
+///
+/// An SLO is its service level indicator: the operation doc states SLOs "use service level
+/// indicators (SLIs) to calculate whether the application is performing at the level that
+/// you want" and that creating one is where "you specify whether it is a period-based SLO or
+/// a request-based SLO", a classification [`requested_evaluation_type`] can only read off
+/// one of the two configs. So a definition that names neither describes no indicator, no
+/// evaluation kind and no metric source, and is refused instead of stored.
+pub fn absent_sli_config_refusal(
+    sli_config: Option<&ServiceLevelIndicatorConfig>,
+    request_based_sli_config: Option<&RequestBasedServiceLevelIndicatorConfig>,
+) -> Option<&'static str> {
+    requested_evaluation_type(sli_config, request_based_sli_config)
+        .is_none()
+        .then_some("You must specify either SliConfig or RequestBasedSliConfig.")
+}
+
 /// The `EvaluationType` a STORED SLO is of, or `None` when the record carries no indicator
-/// at all (a create that supplied neither config).
+/// at all — which no stored record does, since a create names one indicator or is refused
+/// ([`absent_sli_config_refusal`]).
 ///
 /// Judged from the record's own declared `EvaluationType`, falling back to whichever
 /// indicator it holds, so the kind of a record is read off the record rather than recomputed

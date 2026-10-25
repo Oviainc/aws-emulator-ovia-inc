@@ -83,6 +83,8 @@ mod stage_lifecycle;
 mod state_roundtrip;
 #[path = "all/vpc_link_lifecycle.rs"]
 mod vpc_link_lifecycle;
+#[path = "all/vpc_link_update.rs"]
+mod vpc_link_update;
 #[path = "all/websocket_connect_authorization.rs"]
 mod websocket_connect_authorization;
 #[path = "all/websocket_handshake_data_plane.rs"]

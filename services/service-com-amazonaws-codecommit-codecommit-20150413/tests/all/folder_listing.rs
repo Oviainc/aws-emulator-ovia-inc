@@ -359,9 +359,9 @@ async fn get_folder_reports_the_immediate_entries_of_the_stored_folder() {
 
         assert_eq!(
             payload.get("subModules"),
-            None,
-            "case {case}: nothing this service can be asked to write creates a submodule, \
-             got {payload}"
+            Some(&json!([])),
+            "case {case}: nothing this service can be asked to write creates a submodule, so \
+             subModules must be present and empty, got {payload}"
         );
 
         // A read must not change what the next caller sees.
