@@ -127,13 +127,19 @@ fn is_uuid_shaped(value: &str) -> bool {
 
 /// Whether `value` satisfies the modelled `TimeOfDay` pattern
 /// `^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$`.
-fn is_modelled_time_of_day(value: &str) -> bool {
-    let (hour, minute) = match value.split_once(':') {
-        Some(split) => split,
-        None => return false,
+///
+/// `pub(crate)` so a sibling suite in this test target checks a reported hour
+/// against the same pattern rather than keeping a second copy of it.
+pub(crate) fn is_modelled_time_of_day(value: &str) -> bool {
+    let Some((hour, minute)) = value.split_once(':') else {
+        return false;
     };
     hour.len() == 2
         && minute.len() == 2
+        // Every character a digit: the pattern admits no sign, and
+        // `str::parse` would accept a leading `+`.
+        && hour.chars().all(|digit| digit.is_ascii_digit())
+        && minute.chars().all(|digit| digit.is_ascii_digit())
         && hour.parse::<u32>().is_ok_and(|hour| hour <= 23)
         && minute.parse::<u32>().is_ok_and(|minute| minute <= 59)
 }

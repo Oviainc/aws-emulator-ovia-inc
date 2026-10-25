@@ -95,10 +95,12 @@ async fn a_cancel_releases_only_a_contact_that_still_holds_a_reservation() {
     let profile_arn = create_mission_profile(&router, "cancel table", 60, None, None).await;
     let start = epoch(2033, 5, 17, 9, 0);
 
-    for (status, outcome) in CANCEL_OUTCOMES {
-        // A contact of its own per row, so one row's release cannot be what the next row
-        // observes.
-        let contact_id = reserve_pass(&router, &profile_arn, status, start, 20 * 60).await;
+    for (slot, (status, outcome)) in CANCEL_OUTCOMES.iter().enumerate() {
+        // A contact of its own per row, in a window of its own — an antenna serves one
+        // pass at a time, so two rows cannot hold the same window at one ground station —
+        // so one row's release cannot be what the next row observes.
+        let row_start = start + i64::try_from(slot).expect("a row index fits in i64") * 86_400;
+        let contact_id = reserve_pass(&router, &profile_arn, status, row_start, 20 * 60).await;
         put_in_status(&engine, &contact_id, status);
 
         let cancelled = send(&router, "DELETE", &format!("/contact/{contact_id}"), None).await;

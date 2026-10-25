@@ -15,9 +15,19 @@
 //! * with NO `destinationImageSet`, the copy mints an image set at version
 //!   [`crate::state::FIRST_IMAGE_SET_VERSION_ID`]; with one, it pushes a new version
 //!   onto that image set, numbered one past the version the caller named.
-//! * `promoteToPrimary` makes the destination image set primary (`isPrimary`), which is
-//!   what the member documents: the destination is promoted into the primary DICOM
-//!   hierarchy.
+//! * `promoteToPrimary` is NOT a flag written onto a record the caller named: the member
+//!   documents that "a new primary image set ID will be returned as the destination image
+//!   set", so the call MINTS the destination and mints it in the primary DICOM hierarchy.
+//!   A request that also names `destinationImageSet` asks for two different destinations
+//!   at once and cannot hold together, so it is refused with `ValidationException` (400),
+//!   naming the member, like every other refusal this handler raises itself.
+//! * membership of the primary DICOM hierarchy (`isPrimary`) is otherwise CARRIED by the
+//!   copy rather than chosen by the request: a copy of a whole image set mints a
+//!   destination in the hierarchy its source is in, while a copy of a SUBSET of the
+//!   source's SOP instances (`DICOMCopies.copiableAttributes`) reproduces that hierarchy
+//!   only in part and so lands outside the primary one — which is what leaves a caller
+//!   something to promote. An image set the copy VERSIONS keeps the membership it already
+//!   had: a copy into it changes its content, not which hierarchy it belongs to.
 //! * `force` is recorded as the destination version's `Overrides.forced`, which is
 //!   exactly what the model says that member reports — "if `forced` exists, the
 //!   `forced` flag was used when creating the image set" — and is what `GetImageSet`
@@ -109,6 +119,10 @@ const COPIABLE_ATTRIBUTES_PATH: &str =
 
 /// The validation path of the destination image set's identifier.
 const DESTINATION_IMAGE_SET_ID_PATH: &str = "copyImageSetInformation.destinationImageSet.imageSetId";
+
+/// The validation path of the destination image set member itself — the member a promote
+/// request must not carry, since a promote mints its own destination.
+const DESTINATION_IMAGE_SET_PATH: &str = "copyImageSetInformation.destinationImageSet";
 
 /// What this call does to the destination: mint a new image set, or push a version onto
 /// one the data store already holds. Decided while the request is still being checked,
@@ -230,6 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
         let information = &input.copy_image_set_information;
+        let promote_to_primary = input.promote_to_primary.unwrap_or(false);
 
         // `copiableAttributes` is documented as "the JSON string used to specify a
         // subset of SOP Instances to copy", and the model constrains only its length —
@@ -246,6 +261,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
+        }
+
+        // A promote answers with "a new primary image set ID ... as the destination image
+        // set", so it mints its destination: a request that ALSO names one is asking for
+        // two destinations at once and has no coherent answer. Refused as the
+        // input-constraint failure it is, naming the member that cannot be there.
+        if promote_to_primary && information.destination_image_set.is_some() {
+            return Err(CopyImageSetErrorModeled::ValidationException(ValidationException {
+                message: crate::state::handler_requirement_error(
+                    DESTINATION_IMAGE_SET_PATH,
+                    None,
+                    "Member must not be present when promoteToPrimary is requested",
+                ),
+            })
+            .into());
         }
 
         // A copy whose destination IS the source has no coherent answer: the one image
@@ -317,6 +347,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A copy leaves the source's content alone, so the status it reports once the
         // copy has completed is the one it carried going in.
         let source_workflow_status_before_copy = source.latest_version.workflow_status;
+        // Which DICOM hierarchy the source belongs to, which a whole copy of it carries.
+        let source_is_primary = source.is_primary;
         // The pixel data this copy carries to its destination: read from the source as
         // it stands when the copy is admitted, delivered when the copy completes.
         let copied_image_frames = source.image_frames.clone();
@@ -390,7 +422,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anything is reported: a 200 naming a destination that was never stored would
         // dress absence as success.
         let forced = input.force.unwrap_or(false);
-        let promote_to_primary = input.promote_to_primary.unwrap_or(false);
+        // The hierarchy a MINTED destination comes into existence in. A promote asks for a
+        // primary one outright; otherwise the copy carries what it copied — the whole
+        // image set keeps its source's membership, a subset of its SOP instances
+        // reproduces that hierarchy only in part and lands outside the primary one.
+        let minted_is_primary = if promote_to_primary {
+            true
+        } else if information.source_image_set.dicom_copies.is_some() {
+            false
+        } else {
+            source_is_primary
+        };
         let copy_due = PendingImageSetTransition {
             due_at: now + crate::state::IMAGE_SET_COPY_DELAY,
             image_set_state: ImageSetState::Active,
@@ -423,7 +465,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::image_set_arn(&datastore_arn, &image_set_id),
                     ImageSetState::Locked,
                     ImageSetWorkflowStatus::Copying,
-                    promote_to_primary,
+                    minted_is_primary,
                     forced,
                     now,
                 );
@@ -446,11 +488,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     now,
                 );
                 image_set.pending = Some(copy_due.clone());
-                // `promoteToPrimary` promotes the DESTINATION into the primary DICOM
-                // hierarchy; it never demotes an image set that is already primary.
-                if promote_to_primary {
-                    image_set.is_primary = true;
-                }
+                // An image set the copy versions keeps the hierarchy it is already in: a
+                // copy into it changes the content it holds, not which hierarchy holds it
+                // — and a promote never reaches here, having been refused above.
                 image_set_id
             }
         };
