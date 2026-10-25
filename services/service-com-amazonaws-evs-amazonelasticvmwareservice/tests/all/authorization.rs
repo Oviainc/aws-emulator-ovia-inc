@@ -196,6 +196,15 @@ fn every_operation(
             }),
         ),
         (
+            "DeleteEntitlement",
+            json!({
+                "environmentId": environment,
+                "connectorId": "cnctr-0123456789",
+                "vmIds": ["vm-1"],
+                "entitlementType": "WINDOWS_SERVER",
+            }),
+        ),
+        (
             "TagResource",
             json!({ "resourceArn": environment_arn, "tags": { "owner": "team" } }),
         ),

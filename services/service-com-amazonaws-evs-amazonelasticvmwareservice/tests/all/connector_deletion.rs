@@ -219,8 +219,9 @@ async fn create_entitlements(
 }
 
 /// Force every stored entitlement of one environment to a terminal `EntitlementStatus`,
-/// so the state a caller reaches with `DeleteEntitlement` can be exercised while that
-/// operation is still a scaffold. The two terminal values are alternated, because the
+/// so the state a caller reaches is exercised without depending on how a record got
+/// there (`DeleteEntitlement` removes the records it stops, and nothing writes
+/// `ENTITLEMENT_REMOVED`). The two terminal values are alternated, because the
 /// rule is about an entitlement that no longer tracks usage and not about one of them.
 fn force_entitlements_removed(router: &Emulator, environment_id: &str) {
     let store = evs::state::service_state(&*router.engine)

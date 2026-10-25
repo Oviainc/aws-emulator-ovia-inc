@@ -286,14 +286,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it is refused here — with the `DescriptionTooLongException` this operation
         // models for exactly that, the same bound every operation carrying a
         // `description` applies.
-        if let Some(description) = input
+        if input
             .description
             .as_deref()
-            .filter(|description| crate::state::description_too_long(description))
+            .is_some_and(crate::state::description_too_long)
         {
             return Err(CreateDeploymentErrorModeled::DescriptionTooLongException(
                 DescriptionTooLongException {
-                    message: Some(crate::state::description_too_long_message(description)),
+                    message: Some(crate::state::description_too_long_message(
+                        crate::state::Described::Deployment,
+                    )),
                 },
             )
             .into());

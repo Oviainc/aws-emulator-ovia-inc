@@ -22,10 +22,11 @@
 //! restated), the form of the on-device service configuration, and which resource a refused
 //! row names.
 //!
-//! `CreateLongTermPricing` is not served by this emulator yet, so a row that needs a stored
-//! long-term pricing records it in the service's own store before calling — the store the
-//! handler reads, reached the way the service reaches it, exactly as `job_unlock_code` does
-//! for a job state. Everything the rule is about still travels over the wire.
+//! A row picks the long-term pricing ids it supplies before the engine exists, so a row
+//! that needs a stored long-term pricing contract records it under those ids in the
+//! service's own store before calling — the store the handler reads, reached the way the
+//! service reaches it and through the same insertion point `CreateLongTermPricing` writes
+//! through. Everything the rule is about still travels over the wire.
 //!
 //! The harness (`router_with_engine`, `ok`, `refused`, `create_address`,
 //! `deliverable_address`, `string`, `assert_prefixed_uuid`) and the cluster helpers
@@ -35,6 +36,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 // The catalogs the modelled enums admit and the quorum this service holds a cluster to,
@@ -44,7 +46,7 @@ use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::types
     REMOTE_MANAGEMENT_VALUES, SHIPPING_OPTION_VALUES, SNOWBALL_CAPACITY_VALUES,
 };
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::state::{
-    service_state, CLUSTER_NODE_QUORUM,
+    service_state, StoredLongTermPricing, CLUSTER_NODE_QUORUM, LONG_TERM_PRICING_STATUS_ACTIVE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -64,8 +66,18 @@ const INITIAL_CLUSTER_SIZE_MAX: i64 = 16;
 const UNKNOWN_ADDRESS_ID: &str = "ADID00000000-0000-0000-0000-000000000000";
 
 /// A long-term pricing id in the modelled `LongTermPricingId` form that names no stored
-/// long-term pricing record.
-const UNKNOWN_LONG_TERM_PRICING_ID: &str = "LTPIDffffffff-ffff-ffff-ffff-ffffffffffff";
+/// long-term pricing record — the one value this crate's suites use for "an id no create
+/// minted", so it is written down once.
+pub(crate) const UNKNOWN_LONG_TERM_PRICING_ID: &str = "LTPIDffffffff-ffff-ffff-ffff-ffffffffffff";
+
+/// The term, the device type and the window the contracts seeded below are bought for: a
+/// value of the modelled `LongTermPricingType` catalog, the `EDGE` device a cluster's node
+/// jobs are (`CreateClusterRequest$SnowballType`), and the year that term names. None of
+/// the three bears on the rule under test — an order is checked against the contracts the
+/// store holds, not against the term or the device any of them was bought for.
+const SEEDED_PRICING_TYPE: &str = "OneYear";
+const SEEDED_PRICING_DEVICE: &str = "EDGE";
+const SEEDED_PRICING_TERM: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// `ListJobsRequest$MaxResults` is modelled `range 0..100`
 /// (`smithy_query(query="operation", operation="ListJobs")`), so this is the largest page
@@ -99,14 +111,14 @@ fn long_term_pricing_id(seed: usize) -> String {
     format!("LTPID{seed:08x}-0000-0000-0000-{seed:012x}")
 }
 
-/// Record `ids` as long-term pricing this store holds, so a row can associate node jobs
-/// with one.
+/// Record `ids` as long-term pricing contracts this store holds, so a row can associate
+/// node jobs with one.
 ///
-/// `CreateLongTermPricing` is still a scaffold in this crate, so the only way to stand a
-/// long-term pricing record up is to write it into the service's own store — the store the
-/// handler reads, reached the way the service reaches it — exactly as `job_unlock_code`
-/// sets a `JobState` this emulator's operations do not reach yet. Everything the rule is
-/// about still travels over the wire.
+/// A row picks the ids it supplies before the engine exists, so the contracts are stood up
+/// under exactly those ids by writing them into the service's own store — the store the
+/// handler reads, reached the way the service reaches it, and through the same insertion
+/// point `CreateLongTermPricing` writes through, so what is stood up here is the record
+/// that operation stores. Everything the rule is about still travels over the wire.
 fn hold_long_term_pricing<'a>(
     engine: &Arc<engine::InMemoryEngine>,
     ids: impl Iterator<Item = &'a String>,
@@ -114,7 +126,20 @@ fn hold_long_term_pricing<'a>(
     let state = service_state(&**engine).expect("the service's store is on this engine");
     let mut store = state.lock();
     for id in ids {
-        store.long_term_pricing_ids.insert(id.clone());
+        let start = SystemTime::now();
+        assert!(
+            store.insert_long_term_pricing(StoredLongTermPricing {
+                long_term_pricing_id: id.clone(),
+                long_term_pricing_type: SEEDED_PRICING_TYPE.to_string(),
+                snowball_type: SEEDED_PRICING_DEVICE.to_string(),
+                is_long_term_pricing_auto_renew: false,
+                long_term_pricing_start_date: start,
+                long_term_pricing_end_date: start + SEEDED_PRICING_TERM,
+                long_term_pricing_status: LONG_TERM_PRICING_STATUS_ACTIVE.to_string(),
+            }),
+            "case \"seeding long-term pricing\": expected the store to hold a contract under \
+             {id:?}"
+        );
     }
 }
 

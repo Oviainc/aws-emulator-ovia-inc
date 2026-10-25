@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEntitlement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEntitlement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stops usage tracking for the virtual machines the request names, by REMOVING their
+//! Windows Server License entitlement records from the stored Amazon EVS environment —
+//! "Deleting an entitlement stops usage tracking for the specified virtual machines"
+//! (this operation's doc) — and reports the records it removed, each in the terminal
+//! `DELETED` status with the `stoppedAt` instant the call stopped tracking at.
+//! [`crate::ops::list_vm_entitlements`] no longer reports a record this call removed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEntitlement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The (connector, VM) pair is the identity of an entitlement
+//! ([`crate::state::entitlement_key`]), so the records this call addresses are the ones
+//! `CreateEntitlement` stored for `connectorId` and the requested `vmIds`, of the
+//! `entitlementType` the request names.
+//!
+//! The operation is `@idempotent` (`smithy_query(query="operation",
+//! operation="DeleteEntitlement")`), and the end state is what the call asks for: the
+//! named virtual machines are not entitled. So a `vmId` the environment holds no such
+//! record for — one a repeat of this call already removed, or one that was never
+//! entitled through this connector — is not a failure; it is simply not among the
+//! entitlements the response reports, exactly as `DisassociateEipFromVlan` answers a
+//! repeat of its own removal. `EntitlementStatus` declares no state between tracking and
+//! stopped (`smithy_query(query="shape", shape="EntitlementStatus")`), so the stop is
+//! immediate: no transition is owed afterwards.
+//!
+//! The environment and the connector, by contrast, are resources the request ADDRESSES:
+//! an `environmentId` this service holds no live environment for in the request's Region,
+//! or a `connectorId` that environment holds no live connector for, is a
+//! `ResourceNotFoundException` naming the resource the request asked for, and nothing is
+//! removed for it. The connector's TYPE is not a condition here — this removes records of
+//! a connector the environment holds, whichever type it is, as `ListVmEntitlements`
+//! reports them; only `CreateEntitlement` requires the vCenter appliance an entitlement
+//! is tracked through.
 //!
 //! ## Shape of an operation
 //!
@@ -100,12 +121,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `DeleteEntitlementError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#DeleteEntitlement")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#DeleteEntitlement",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteEntitlementErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -159,18 +186,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEntitlement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEntitlementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEntitlement"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteEntitlementErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+        // `clientToken` is read and ignored on purpose: "This parameter is not used in
+        // Amazon EVS currently. If you supply input for this parameter, it will have no
+        // effect." (`clientToken` doc). The operation is idempotent through the stored
+        // records instead — a VM with no such record is a no-op below.
+        let _ = &input.client_token;
+        let region = crate::state::request_region(ctx.parts());
+        // Authorization first: AWS decides it at the IAM layer, BEFORE the resource the
+        // request names is evaluated, so the ARN is the one the REQUEST names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&crate::state::environment_arn(&region, &input.environment_id)),
+        ) {
+            return Err(denied);
+        }
+        // The instant tracking stops, read once so every record this call stops carries
+        // the same `stoppedAt`.
+        let stopped_at_ms = crate::state::now_ms();
+
+        let mut state = state.lock();
+        // Reporting only: this materialises the state changes the clock already owed,
+        // which were due whether or not anybody called, so the environment and its
+        // entitlements are in the state that is due at this instant before the delete is
+        // evaluated.
+        state.materialise_due_transitions();
+
+        // Regional resource: an environment exists at the endpoint of the Region it was
+        // created in, so its entitlements can only be deleted from that Region. An
+        // environment that has reached DELETED is gone as far as this call is concerned:
+        // "The resource might not be specified correctly, or it may have a state of
+        // DELETED" (`ResourceNotFoundException` doc).
+        let environment = state
+            .environment_in_region_mut(&region, &input.environment_id)
+            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .ok_or_else(|| {
+                DeleteEntitlementErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+        let environment_id = environment.environment_id.clone();
+
+        // `connectorId` is a required handle on a resource of that environment: an id the
+        // environment holds no live connector for resolves to nothing, so the request is
+        // refused rather than answered as a delete that removed nothing — the same
+        // reading `ListVmEntitlements` takes of the same member.
+        if crate::state::live_connector(environment, &input.connector_id).is_none() {
+            return Err(DeleteEntitlementErrorModeled::ResourceNotFoundException(
+                crate::state::connector_not_found(&input.connector_id),
+            )
+            .into());
+        }
+
+        // One entitlement per DISTINCT requested virtual machine: the (connector, VM)
+        // pair identifies an entitlement, so a `vmIds` list naming the same VM twice
+        // names one entitlement and that entitlement is reported once. `vmIds` holds at
+        // most 100 entries (modelled len 1..100), which bounds this scan.
+        let mut wanted: Vec<&str> = Vec::with_capacity(input.vm_ids.len());
+        for vm_id in &input.vm_ids {
+            if !wanted.contains(&vm_id.as_str()) {
+                wanted.push(vm_id.as_str());
+            }
+        }
+
+        // "A list of the deleted entitlements" (`entitlements` doc): the records this
+        // call really removed, in the order the request named their virtual machines. A
+        // VM the environment holds no entitlement of this type for through this
+        // connector contributes nothing — the end state it asks for already holds.
+        let mut deleted = Vec::with_capacity(wanted.len());
+        for vm_id in wanted {
+            let key = crate::state::entitlement_key(&input.connector_id, vm_id);
+            // `entitlementType` selects WHICH entitlement of that pair the request
+            // addresses, exactly as it selects the records `ListVmEntitlements` reports,
+            // so a record of another type is not the one this call names.
+            let addressed = environment
+                .entitlements
+                .get(&key)
+                .is_some_and(|entitlement| entitlement.entitlement_type == input.entitlement_type);
+            if !addressed {
+                continue;
+            }
+            if let Some(entitlement) = environment.entitlements.remove(&key) {
+                deleted.push(entitlement.stopped(stopped_at_ms).to_wire(&environment_id));
+            }
+        }
+
+        Ok(DeleteEntitlementOutput {
+            entitlements: Some(deleted),
+        })
     }
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDashboards
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDashboards`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDashboards::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the dashboards this service's store holds. Implemented here, and the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +147,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDashboards` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDashboardsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDashboards"))
+        // A dashboard is global, so nothing here reads the Region the request was signed for.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDashboardsErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch dashboard store is unavailable".into()),
+            })
+        })?;
+
+        // "The maximum length is 255, and valid characters are A-Z, a-z, 0-9, ".", "-", and
+        // "_"." (`ListDashboardsInput$DashboardNamePrefix`) — prose the model carries no
+        // constraint for, so a prefix outside it is refused here.
+        let prefix = input.dashboard_name_prefix.clone().unwrap_or_default();
+        if let Some(message) =
+            crate::state::dashboard_name_prefix_error("DashboardNamePrefix", &prefix)
+        {
+            return Err(invalid_parameter_value(message));
+        }
+
+        // "The token returned by a previous call to indicate that there is more data
+        // available." (`ListDashboardsInput$NextToken`) — a token this service did not issue
+        // names no page, so it is a bad parameter value rather than an empty page.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                invalid_parameter_value(
+                    "The value for field NextToken is not valid. It is not a token this service \
+                     issued.\n"
+                        .to_string(),
+                )
+            })?),
+        };
+
+        let store = state.lock();
+        // Ordered by dashboard name so paging is stable and a token can simply name the
+        // dashboard the next page starts at.
+        let mut names: Vec<&String> = store
+            .dashboards
+            .keys()
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+        names.sort_unstable();
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => names.partition_point(|name| name.as_str() < cursor),
+        };
+        let page = names.get(from..).unwrap_or_default();
+        let next_token = page
+            .get(crate::state::DASHBOARDS_PAGE_SIZE)
+            .map(|name| crate::state::encode_page_token(name));
+
+        let dashboard_entries: Vec<DashboardEntry> = page
+            .iter()
+            .take(crate::state::DASHBOARDS_PAGE_SIZE)
+            .filter_map(|name| store.dashboards.get(*name).map(|stored| (name, stored)))
+            .map(|(name, stored)| DashboardEntry {
+                dashboard_name: Some((*name).clone()),
+                dashboard_arn: Some(crate::state::dashboard_arn(name)),
+                last_modified: Some(crate::state::to_timestamp(stored.last_modified_secs)),
+                // "The size of the dashboard, in bytes." (`DashboardEntry$Size`) — the size of
+                // the document this dashboard holds.
+                size: Some(i64::try_from(stored.body.len()).unwrap_or(i64::MAX)),
+            })
+            .collect();
+
+        Ok(ListDashboardsOutput {
+            dashboard_entries: Some(dashboard_entries),
+            next_token,
+        })
     }
+}
+
+/// Refuse the request with this operation's modelled `InvalidParameterValueException`
+/// (HTTP 400): "The value of an input parameter is bad or out-of-range."
+fn invalid_parameter_value(message: String) -> ListDashboardsError {
+    ListDashboardsErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
 }

@@ -39,6 +39,8 @@ mod common;
 mod connect_instance_config_deletion;
 #[path = "all/connect_instance_integration_deletion.rs"]
 mod connect_instance_integration_deletion;
+#[path = "all/connect_instance_integration_list_paging.rs"]
+mod connect_instance_integration_list_paging;
 #[path = "all/connect_instance_integrations.rs"]
 mod connect_instance_integrations;
 #[path = "all/instance_communication_limits.rs"]

@@ -31,3 +31,13 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the ec2 emulator
 Call DescribeCapacityReservations and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Note from the CreateCapacityReservation fix
+`DescribeCapacityReservations` was IMPLEMENTED by the fix for
+`issues/things-that-now-work/20261022T235108Z-ec2-createcapacityreservation-stub.md`, which
+needed it as the reader a created Capacity Reservation is read back through: its
+`//! SCAFFOLDED, NOT IMPLEMENTED:` census line is gone and
+`services/service-com-amazonaws-ec2-amazonec2/tests/all/capacity_reservations.rs` covers it
+end to end (id and filter narrowing, paging, Region scoping, and its refusals). This report
+is left here rather than moved because its own recorded unit
+(`ec2.op-contract-describe-capacity-reservations`) has not been replayed since.

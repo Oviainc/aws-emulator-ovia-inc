@@ -23,3 +23,28 @@ The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at th
 
 1. Boot the iotsitewise emulator
 2. Call PutStorageConfiguration and observe HTTP 501 with no state persisted
+
+## Resolution
+
+Implemented, together with the `DescribeStorageConfiguration` reader that proves
+the round trip (see
+`issues/things-that-now-work/20261024T100803Z-iotsitewise-describestorageconfiguration-stub.md`
+if that report has since been closed too). The setting is one account-wide
+record in `src/state.rs`; both operations read and write it there, and
+`tests/all/storage_configuration.rs` covers them end to end.
+
+One deliberate divergence is tracked here rather than left implicit: a
+`multiLayerStorage` given beside `SITEWISE_DEFAULT_STORAGE` is refused with a
+400 `InvalidRequestException`, although no documented rule states that
+combination is rejected (the documentation only requires the member FOR
+`MULTI_LAYER_STORAGE`). The alternative would be reporting a cold-tier
+destination for a configuration that keeps no cold copy, or silently dropping a
+member the caller set. Revisit the refusal if a recording shows the real
+service accepting it.
+
+Second, a `warmTierRetentionPeriod` is accepted only where the cold tier keeps a
+copy (`MULTI_LAYER_STORAGE`), which is the condition the member's own
+documentation states ("You can set this only if cold tier is enabled"). It does
+not additionally require `warmTier` `ENABLED`, so the documented condition is the
+whole of the rule; a test row pins the cold-tier case with no warm-tier state
+named, and another pins the refusal on the hot tier.

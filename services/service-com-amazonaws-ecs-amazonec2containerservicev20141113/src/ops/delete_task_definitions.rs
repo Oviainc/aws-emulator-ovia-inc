@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTaskDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTaskDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTaskDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +155,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTaskDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTaskDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTaskDefinitions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTaskDefinitionsErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "You can specify up to 10 task definitions as a comma separated list" — the
+        // documented size of ONE request, refused like every other batch bound this
+        // service states, naming the member and the count it was given.
+        if input.task_definitions.len() > crate::state::MAX_DELETE_TASK_DEFINITIONS {
+            return Err(DeleteTaskDefinitionsErrorModeled::ClientException(
+                ClientException {
+                    message: Some(format!(
+                        "taskDefinitions must name at most {} task definitions; got {}",
+                        crate::state::MAX_DELETE_TASK_DEFINITIONS,
+                        input.task_definitions.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every entry is resolved to ONE (family, revision) BEFORE anything is written,
+        // so a request carrying an entry this service cannot read deletes nothing rather
+        // than deleting the entries ahead of it: "The family and revision
+        // (family:revision) or full Amazon Resource Name (ARN) of the task definition to
+        // delete. You must specify a revision." A value that is neither form, or one that
+        // names a whole family instead of the one revision this call acts on, misses the
+        // member's own constraint — a `ClientException`, the error for a request
+        // "specifying an identifier that isn't valid", carrying the same sentence every
+        // other operation that resolves a `taskDefinition` reference answers.
+        let mut requested = Vec::with_capacity(input.task_definitions.len());
+        for reference in &input.task_definitions {
+            let Some((family, revision)) = crate::state::parse_task_definition_reference(reference)
+            else {
+                return Err(DeleteTaskDefinitionsErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(crate::state::task_definition_reference_message(reference)),
+                    },
+                )
+                .into());
+            };
+            let Some(revision) = revision else {
+                return Err(DeleteTaskDefinitionsErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(format!(
+                            "taskDefinitions entries must each name a revision \
+                             (family:revision or a task-definition ARN); got {reference:?}"
+                        )),
+                    },
+                )
+                .into());
+            };
+            requested.push((family, revision));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let requested_at = crate::state::now();
+
+        let mut guard = state.lock();
+        let mut task_definitions = Vec::new();
+        let mut failures = Vec::new();
+        // The same revision named twice is one revision, so it is deleted — and reported
+        // — once, however many entries name it.
+        let mut seen = ::std::collections::HashSet::new();
+        for (family, revision) in requested {
+            if !seen.insert((family.clone(), revision)) {
+                continue;
+            }
+            let Some(record) = guard.task_definitions.get_mut(&(family.clone(), revision)) else {
+                // An entry that resolves to no stored revision is a per-entry failure,
+                // not a refusal of the request: this operation reports "any failures
+                // associated with the call" beside the revisions it did delete, so one
+                // unknown entry cannot cancel the deletion of the others. The failure
+                // names the ARN the entry pointed at.
+                failures.push(crate::state::missing_failure(
+                    &crate::state::task_definition_arn(&region, &family, revision),
+                ));
+                continue;
+            };
+            // "You must deregister a task definition revision before you delete it" — a
+            // revision that is still `ACTIVE` is reported as a failure of its own entry,
+            // and left exactly as it was stored.
+            if record.status == crate::state::TASK_DEFINITION_ACTIVE {
+                failures.push(crate::state::not_inactive_failure(
+                    &record.arn,
+                    &record.status,
+                ));
+                continue;
+            }
+            // "When you delete a task definition revision, it is immediately transitions
+            // from the INACTIVE to DELETE_IN_PROGRESS", and
+            // `TaskDefinition$deleteRequestedAt` is "the Unix timestamp for the time when
+            // the task definition delete was requested" — the instant THIS call ran. The
+            // revision stays stored: it "will stay in DELETE_IN_PROGRESS status until all
+            // the associated tasks and services have been terminated", and while it is
+            // there "the task definition name is displayed in the console and returned in
+            // the API", so `DescribeTaskDefinition` keeps describing it and
+            // `ListTaskDefinitionFamilies` keeps listing its family. The family's revision
+            // counter does not move either: "The task definition name is retained by
+            // Amazon ECS and the revision is incremented the next time you create a task
+            // definition with that name."
+            //
+            // A revision whose delete is already under way has no second transition to
+            // make, so a repeat call reports it as it stands rather than re-stamping it
+            // with a later instant.
+            if record.status == crate::state::TASK_DEFINITION_INACTIVE {
+                record.status = crate::state::TASK_DEFINITION_DELETE_IN_PROGRESS.to_string();
+                record.delete_requested_at = Some(requested_at);
+            }
+            // "The list of deleted task definitions", built from the stored revision —
+            // the same projection every other task-definition response uses.
+            task_definitions.push(record.view());
+        }
+
+        Ok(DeleteTaskDefinitionsOutput {
+            task_definitions: Some(task_definitions),
+            failures: Some(failures),
+        })
     }
 }

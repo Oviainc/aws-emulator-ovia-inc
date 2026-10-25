@@ -180,13 +180,18 @@ pub const CONNECTOR_TYPE_VCENTER: &str = "VCENTER";
 /// The `EntitlementStatus` values a stored entitlement moves through.
 ///
 /// The model declares `CREATING | CREATED | DELETED | AT_RISK | ENTITLEMENT_REMOVED |
-/// CREATE_FAILED` (`smithy_query(query="shape", shape="EntitlementStatus")`). The two
-/// named here are the ones `CreateEntitlement` produces: an entitlement is `CREATING`
+/// CREATE_FAILED` (`smithy_query(query="shape", shape="EntitlementStatus")`). The first
+/// two are the ones `CreateEntitlement` produces: an entitlement is `CREATING`
 /// while the service validates the virtual machine ("This is an asynchronous
 /// operation. Amazon EVS validates the specified virtual machines before starting
 /// usage tracking", `CreateEntitlement` doc) and `CREATED` once usage tracking has
-/// started. The other values belong to the operations that produce them
-/// (`DeleteEntitlement` still answers 501).
+/// started.
+///
+/// The two statuses of a record that tracks usage no longer are
+/// [`ENTITLEMENT_DELETED`] and [`ENTITLEMENT_REMOVED`], below. `AT_RISK` and
+/// `CREATE_FAILED` belong to facts nothing in this emulator produces: the first to the
+/// Windows Server licence state of a virtual machine in the vCenter inventory, which
+/// this emulator does not run, and the second to a validation that never fails here.
 pub const ENTITLEMENT_CREATING: &str = "CREATING";
 /// See [`ENTITLEMENT_CREATING`].
 pub const ENTITLEMENT_CREATED: &str = "CREATED";
@@ -195,10 +200,16 @@ pub const ENTITLEMENT_CREATED: &str = "CREATED";
 /// Windows Server usage NO LONGER — the two the same enum declares for a record that is
 /// finished with ([`StoredEnvironment::live_entitlements`] is what reads them).
 ///
-/// No operation of this crate writes either one yet, because `DeleteEntitlement` — the
-/// operation that stops usage tracking — is still a scaffold. They are named here
-/// because what they mean is a property of the RECORD rather than of one operation's
-/// output: an entitlement in one of them holds its connector no longer.
+/// What they mean is a property of the RECORD rather than of one operation's output: an
+/// entitlement in one of them holds its connector no longer.
+///
+/// [`ENTITLEMENT_DELETED`] is the status `DeleteEntitlement` reports a record it STOPPED
+/// in ([`StoredEntitlement::stopped`]): "Deleting an entitlement stops usage tracking
+/// for the specified virtual machines" (that operation's doc), and the enum declares no
+/// state between tracking and stopped, so the stop is immediate and terminal — that call
+/// removes the record, so a stopped entitlement is reported and not stored. Nothing
+/// writes [`ENTITLEMENT_REMOVED`] yet: it is decided by the licence state of a virtual
+/// machine in the vCenter inventory this emulator does not run.
 pub const ENTITLEMENT_DELETED: &str = "DELETED";
 /// See [`ENTITLEMENT_DELETED`].
 pub const ENTITLEMENT_REMOVED: &str = "ENTITLEMENT_REMOVED";
@@ -704,6 +715,11 @@ pub struct StoredEntitlement {
     /// entitlement started", `startedAt` doc): set when the entitlement reaches
     /// `CREATED`, and absent while the virtual machine is still being validated.
     pub started_at_ms: Option<i64>,
+    /// Epoch milliseconds usage tracking stopped at ("The date and time that the
+    /// entitlement stopped", `stoppedAt` doc): set by the `DeleteEntitlement` that
+    /// stopped tracking this virtual machine ([`Self::stopped`]), and absent for a
+    /// record nothing has stopped.
+    pub stopped_at_ms: Option<i64>,
     /// The status change the clock owes this entitlement, if any.
     pub pending: Option<PendingStatus>,
 }
@@ -725,8 +741,24 @@ impl StoredEntitlement {
             status: ENTITLEMENT_CREATING.to_string(),
             created_at_ms,
             started_at_ms: None,
+            stopped_at_ms: None,
             pending: Some(pending),
         }
+    }
+
+    /// This record as the `DeleteEntitlement` that removed it reports it: usage tracking
+    /// has stopped, so the status is [`ENTITLEMENT_DELETED`] and `stoppedAt` is the
+    /// instant the call stopped it.
+    ///
+    /// The validation the clock still owed a `CREATING` entitlement is dropped with it:
+    /// tracking is what that change would have started, and this call ended tracking.
+    /// Consumes the record, because the one caller is the delete that has just taken it
+    /// out of its environment's map — the stopped form is reported, never stored.
+    pub fn stopped(mut self, stopped_at_ms: i64) -> Self {
+        self.status = ENTITLEMENT_DELETED.to_string();
+        self.stopped_at_ms = Some(stopped_at_ms);
+        self.pending = None;
+        self
     }
 
     /// Apply the owed status change if `now` has reached its due instant.
@@ -757,9 +789,11 @@ impl StoredEntitlement {
     ///   this emulator does not run, so there is nothing to read it from.
     /// * `lastSyncedAt` — no vCenter is contacted, so no sync has happened; a
     ///   timestamp here would claim work nothing performed.
-    /// * `stoppedAt` and `errorDetail` — usage tracking has not stopped and no
-    ///   entitlement has failed: `DeleteEntitlement`, the operation that stops it,
-    ///   still answers 501.
+    /// * `errorDetail` — no entitlement has failed: the validation a new one waits for
+    ///   is owed by the clock and always comes due, so no record carries an error.
+    ///
+    /// `stoppedAt` is reported for the record a `DeleteEntitlement` stopped
+    /// ([`Self::stopped`]) and absent for one nothing has stopped.
     pub fn to_wire(&self, environment_id: &str) -> VmEntitlement {
         VmEntitlement {
             vm_id: Some(self.vm_id.clone()),
@@ -770,7 +804,7 @@ impl StoredEntitlement {
             status: Some(self.status.clone()),
             last_synced_at: None,
             started_at: self.started_at_ms.map(timestamp),
-            stopped_at: None,
+            stopped_at: self.stopped_at_ms.map(timestamp),
             error_detail: None,
         }
     }

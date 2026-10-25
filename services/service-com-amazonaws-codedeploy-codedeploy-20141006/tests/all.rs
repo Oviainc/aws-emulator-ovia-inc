@@ -71,6 +71,8 @@ mod predefined_traffic_shift_configs;
 mod quotas_waits_and_host_names;
 #[path = "all/read_response_collections.rs"]
 mod read_response_collections;
+#[path = "all/refusal_sentence_templates.rs"]
+mod refusal_sentence_templates;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stop_deployment.rs"]

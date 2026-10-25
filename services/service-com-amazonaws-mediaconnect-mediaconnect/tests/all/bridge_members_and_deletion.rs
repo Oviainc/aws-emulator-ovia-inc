@@ -19,11 +19,12 @@
 //! * DeleteBridge removes the bridge — DescribeBridge stops answering for it — and refuses
 //!   a bridge that has not been stopped.
 //!
-//! Each table's rows differ along what the rule generalises over: the KIND of member
-//! (flow source / network source / network output), how MANY one request carries (one, a
-//! batch, and one past the per-bridge bound), WHICH member of several is addressed (first,
-//! middle, last, the only one), and — for the delete precondition — every value of the
-//! modelled `BridgeState` enum.
+//! Each table's rows differ along what the rule generalises over: the KIND of member (a
+//! source of the kind the bridge's direction admits, a network output), how MANY one
+//! request carries (one, a batch, and one past the per-bridge bound), WHICH member of
+//! several is addressed (first, middle, last, the only one), and — for the delete
+//! precondition — every value of the modelled `BridgeState` enum. Which bridge ingests
+//! which kind of source is `crate::bridge_source_admission`'s own subject.
 //!
 //! The harness is the one `flow_lifecycle` owns (one router, one shared engine), so every
 //! case drives the same request path a MediaConnect client reaches.
@@ -89,6 +90,9 @@ async fn list_bridges(emulator: &Emulator, query: &str) -> (u16, Option<String>,
 }
 
 /// One network source entry, as a request configures it and as a bridge reports it.
+///
+/// A network source "originates at your premises", so it is the kind a ground-to-cloud
+/// (ingress) bridge ingests.
 pub(crate) fn network_source(name: &str, port: i64, protocol: &str) -> Value {
     json!({ "networkSource": {
         "multicastIp": "224.0.1.1",
@@ -96,6 +100,17 @@ pub(crate) fn network_source(name: &str, port: i64, protocol: &str) -> Value {
         "networkName": "net-1",
         "port": port,
         "protocol": protocol,
+    }})
+}
+
+/// One flow source entry, as a request configures it and as a bridge reports it.
+///
+/// A flow source "originates in MediaConnect as an existing cloud flow", so it is the kind
+/// a cloud-to-ground (egress) bridge ingests — which is the fixture bridge below.
+pub(crate) fn flow_source(name: &str, suffix: u64) -> Value {
+    json!({ "flowSource": {
+        "flowArn": minted_flow_arn(suffix, &format!("flow-{suffix}")),
+        "name": name,
     }})
 }
 
@@ -114,9 +129,9 @@ pub(crate) fn network_output(name: &str, port: i64, protocol: &str, ttl: i64) ->
 /// Create one egress bridge carrying `sources` and `outputs`, and answer its ARN.
 ///
 /// A cloud-to-ground (egress) bridge is the kind that delivers to the premises network, so
-/// it is the kind a request configures outputs on; the create itself is the subject of
-/// `bridge_lifecycle`, and here it is only the fixture every member operation below
-/// addresses.
+/// it is the kind a request configures outputs on, and its own sources are the cloud flows
+/// its content comes from. The create itself is the subject of `bridge_lifecycle`, and here
+/// it is only the fixture every member operation below addresses.
 async fn bridge_with(
     emulator: &Emulator,
     name: &str,
@@ -129,6 +144,11 @@ async fn bridge_with(
         "placementArn": placement_arn,
         "egressGatewayBridge": { "maxBitrate": 20_000_000 },
         "sources": sources,
+        // Source failover ACTIVE, which is the state under which a bridge holds a pair of
+        // sources at all: "if the state is active, [it] can have one or two sources"
+        // (`FailoverConfig$State`). The cases below add a second source to this bridge, so
+        // the fixture is the bridge that can hold one.
+        "sourceFailoverConfig": { "state": mc::STATE_ENABLED },
     });
     if !outputs.is_empty() {
         body["outputs"] = json!(outputs);
@@ -165,24 +185,21 @@ struct AddCase {
     outputs: Vec<Value>,
 }
 
-/// The add table. Every row differs in the KIND of the entries, how many one request
-/// carries, and which protocol each one names.
+/// The add table. Every row differs in what the added entries carry, how many one request
+/// carries, and which protocol each one names. The fixture bridge is a cloud-to-ground one
+/// holding one source, so each row adds the second source of the failover pair such a
+/// bridge can ingest; which bridge ingests which KIND of source is
+/// `crate::bridge_source_admission`'s own table.
 fn add_cases() -> Vec<AddCase> {
-    let flow_a = minted_flow_arn(101, "flow-a");
-    let flow_b = minted_flow_arn(102, "flow-b");
     vec![
         AddCase {
-            case: "one network source, one network output",
-            sources: vec![network_source("added-net", 5100, "rtp")],
+            case: "one flow source, one network output",
+            sources: vec![flow_source("added-flow", 101)],
             outputs: vec![network_output("added-out", 6100, "udp", 32)],
         },
         AddCase {
-            case: "a batch of two sources — one flow, one network — and two outputs on \
-                   different protocols",
-            sources: vec![
-                json!({ "flowSource": { "flowArn": flow_a, "name": "added-flow" } }),
-                network_source("added-net-2", 5200, "rtp-fec"),
-            ],
+            case: "a flow source and two outputs on different protocols",
+            sources: vec![flow_source("added-flow-2", 102)],
             outputs: vec![
                 network_output("added-out-udp", 6200, "udp", 16),
                 network_output("added-out-srt", 6201, "srt-listener", 255),
@@ -191,7 +208,7 @@ fn add_cases() -> Vec<AddCase> {
         AddCase {
             case: "a flow source with a VPC interface attachment, and three outputs",
             sources: vec![json!({ "flowSource": {
-                "flowArn": flow_b,
+                "flowArn": minted_flow_arn(103, "flow-b"),
                 "name": "added-flow-vpc",
                 "flowVpcInterfaceAttachment": { "vpcInterfaceName": "vpc-1" },
             }})],
@@ -218,7 +235,7 @@ async fn adding_sources_and_outputs_appends_them_to_the_stored_bridge() {
             sources,
             outputs,
         } = case;
-        let held_source = network_source("base-src", 5000, "rtp");
+        let held_source = flow_source("base-src", 1);
         let held_output = network_output("base-out", 6000, "udp", 8);
         let arn = bridge_with(
             &emulator,
@@ -293,35 +310,36 @@ async fn removing_a_source_or_an_output_takes_it_out_of_the_stored_bridge() {
     let emulator = Emulator::new();
     let placement = minted_gateway_arn(2, "gw-remove");
 
-    // Which of the bridge's three members is removed: the first, the middle and the last,
-    // so the rule is asserted at both ends of the list and inside it.
-    let removal_rows: [(&str, usize); 3] = [
-        ("the first of three", 0),
-        ("the middle of three", 1),
-        ("the last of three", 2),
+    // Which member of the bridge is removed: a source at each end of the failover pair a
+    // bridge can ingest, and an output at the first, the middle and the last position of
+    // three — so the rule is asserted at both ends of each list and inside the longer one.
+    let removal_rows: [(&str, usize, usize); 3] = [
+        ("the first source and the first of three outputs", 0, 0),
+        ("the last source and the middle of three outputs", 1, 1),
+        ("the first source and the last of three outputs", 0, 2),
     ];
 
-    for (name_of_case, position) in removal_rows {
-        let sources: Vec<Value> = (0..3)
-            .map(|index| {
-                network_source(&format!("src-{index}"), 5000 + index as i64, "rtp")
-            })
+    for (index, (name_of_case, source_position, output_position)) in
+        removal_rows.into_iter().enumerate()
+    {
+        let sources: Vec<Value> = (0..2)
+            .map(|offset| flow_source(&format!("src-{offset}"), 200 + offset as u64))
             .collect();
         let outputs: Vec<Value> = (0..3)
-            .map(|index| {
-                network_output(&format!("out-{index}"), 6000 + index as i64, "udp", 32)
+            .map(|offset| {
+                network_output(&format!("out-{offset}"), 6000 + offset as i64, "udp", 32)
             })
             .collect();
         let arn = bridge_with(
             &emulator,
-            &format!("bridge-remove-{position}"),
+            &format!("bridge-remove-{index}"),
             &placement,
             sources.clone(),
             outputs.clone(),
         )
         .await;
 
-        let source_name = format!("src-{position}");
+        let source_name = format!("src-{source_position}");
         let (status, code, removed) = remove_source(&emulator, &arn, &source_name).await;
         assert_eq!(
             (status, code.as_deref()),
@@ -338,7 +356,7 @@ async fn removing_a_source_or_an_output_takes_it_out_of_the_stored_bridge() {
              {removed}"
         );
 
-        let output_name = format!("out-{position}");
+        let output_name = format!("out-{output_position}");
         let (status, code, removed) = remove_output(&emulator, &arn, &output_name).await;
         assert_eq!(
             (status, code.as_deref()),
@@ -355,13 +373,13 @@ async fn removing_a_source_or_an_output_takes_it_out_of_the_stored_bridge() {
              {removed}"
         );
 
-        // The round trip: the member is gone and the other two are reported in their
-        // original order.
+        // The round trip: the member is gone and the others are reported in their original
+        // order.
         let bridge = bridge_of(&emulator, name_of_case, &arn).await;
         let mut expected_sources = sources.clone();
-        expected_sources.remove(position);
+        expected_sources.remove(source_position);
         let mut expected_outputs = outputs.clone();
-        expected_outputs.remove(position);
+        expected_outputs.remove(output_position);
         assert_eq!(
             bridge["sources"],
             json!(expected_sources),
@@ -405,7 +423,7 @@ async fn the_only_source_of_a_bridge_can_be_removed() {
         &emulator,
         "bridge-last-member",
         &placement,
-        vec![network_source("only-src", 5000, "rtp")],
+        vec![flow_source("only-src", 3)],
         vec![network_output("only-out", 6000, "udp", 32)],
     )
     .await;
@@ -448,10 +466,11 @@ struct RefusalCase {
 /// the bridge must be exactly what it was.
 fn refusal_cases(bridge_arn: &str) -> Vec<RefusalCase> {
     let missing = minted_bridge_arn(9_999, "no-such-bridge");
-    // One entry past the per-bridge bound, counting the one source and one output the
-    // fixture bridge already holds (`mc::MAX_BRIDGE_SOURCES` / `mc::MAX_BRIDGE_OUTPUTS`).
+    // One entry past each per-bridge bound, counting the one source and one output the
+    // fixture bridge already holds (`mc::MAX_BRIDGE_SOURCES`, the failover pair a bridge
+    // ingests, and `mc::MAX_BRIDGE_OUTPUTS`).
     let past_sources_bound: Vec<Value> = (0..mc::MAX_BRIDGE_SOURCES)
-        .map(|index| network_source(&format!("over-src-{index}"), 7000 + index as i64, "rtp"))
+        .map(|index| flow_source(&format!("over-src-{index}"), 700 + index as u64))
         .collect();
     let past_outputs_bound: Vec<Value> = (0..mc::MAX_BRIDGE_OUTPUTS)
         .map(|index| {
@@ -500,7 +519,7 @@ fn refusal_cases(bridge_arn: &str) -> Vec<RefusalCase> {
             case: "a source whose name the bridge already holds",
             method: "POST",
             uri: format!("/v1/bridges/{bridge_arn}/sources"),
-            body: Some(json!({ "sources": [network_source("base-src", 5400, "rtp")] })),
+            body: Some(json!({ "sources": [flow_source("base-src", 400)] })),
             status: 400,
             code: "BadRequestException",
         },
@@ -509,8 +528,8 @@ fn refusal_cases(bridge_arn: &str) -> Vec<RefusalCase> {
             method: "POST",
             uri: format!("/v1/bridges/{bridge_arn}/sources"),
             body: Some(json!({ "sources": [
-                network_source("twice", 5500, "rtp"),
-                network_source("twice", 5501, "udp"),
+                flow_source("twice", 500),
+                flow_source("twice", 501),
             ] })),
             status: 400,
             code: "BadRequestException",
@@ -527,7 +546,7 @@ fn refusal_cases(bridge_arn: &str) -> Vec<RefusalCase> {
             case: "an add of sources to a bridge the store does not hold",
             method: "POST",
             uri: format!("/v1/bridges/{missing}/sources"),
-            body: Some(json!({ "sources": [network_source("orphan", 5600, "rtp")] })),
+            body: Some(json!({ "sources": [flow_source("orphan", 600)] })),
             status: 404,
             code: "NotFoundException",
         },
@@ -643,7 +662,7 @@ async fn a_refused_request_names_the_modelled_error_and_leaves_the_bridge_untouc
         &emulator,
         "bridge-refusals",
         &placement,
-        vec![network_source("base-src", 5000, "rtp")],
+        vec![flow_source("base-src", 1)],
         vec![network_output("base-out", 6000, "udp", 32)],
     )
     .await;
@@ -688,7 +707,7 @@ async fn list_bridges_pages_every_stored_bridge_and_filters_by_placement() {
                 &emulator,
                 &format!("bridge-a-{index}"),
                 &placement_a,
-                vec![network_source("src", 5000 + index, "rtp")],
+                vec![flow_source("src", 300 + index as u64)],
                 Vec::new(),
             )
             .await,
@@ -855,7 +874,7 @@ async fn delete_bridge_removes_the_bridge_from_the_store() {
         &emulator,
         "bridge-delete",
         &placement,
-        vec![network_source("src", 5000, "rtp")],
+        vec![flow_source("src", 800)],
         vec![network_output("out", 6000, "udp", 32)],
     )
     .await;
@@ -952,7 +971,7 @@ async fn deleting_a_bridge_that_was_not_stopped_is_refused() {
             &emulator,
             &format!("bridge-state-{index}"),
             &placement,
-            vec![network_source("src", 5000, "rtp")],
+            vec![flow_source("src", 900 + index as u64)],
             Vec::new(),
         )
         .await;
@@ -1023,7 +1042,7 @@ async fn a_gateway_a_bridge_is_placed_on_is_deleted_only_after_the_bridge() {
         &emulator,
         "bridge-on-gateway",
         &gateway_arn,
-        vec![network_source("src", 5000, "rtp")],
+        vec![flow_source("src", 1_000)],
         Vec::new(),
     )
     .await;

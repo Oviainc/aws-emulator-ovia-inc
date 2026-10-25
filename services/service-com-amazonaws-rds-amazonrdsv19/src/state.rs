@@ -21,7 +21,8 @@
 //! `DescribeDBParameterGroups`, `ModifyDBParameterGroup`, `DescribeDBParameters`,
 //! `DeleteDBParameterGroup`,
 //! `CreateEventSubscription`,
-//! `DescribeEventSubscriptions`, `CreateGlobalCluster` and `DescribeGlobalClusters` all
+//! `DescribeEventSubscriptions`, `AddSourceIdentifierToSubscription`,
+//! `CreateGlobalCluster` and `DescribeGlobalClusters` all
 //! project the same records.
 //!
 //! RDS is a REGIONAL service, so every map is keyed by `(region, identifier)`: the
@@ -1517,6 +1518,84 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// order.
     pub fn event_subscriptions_in(&self, region: &str) -> Vec<&EventSubscriptionRecord> {
         range_in(&self.event_subscriptions, region)
+    }
+
+    /// The identifiers an event subscription's source of `source_type` may name in
+    /// `region`, or `None` when this service holds no records of that source type at all.
+    ///
+    /// An event source identifier is bound to one resource type per source type ("If the
+    /// source type is a DB instance, a `DBInstanceIdentifier` value must be supplied; if
+    /// the source type is a DB parameter group, a `DBParameterGroupName` value must be
+    /// supplied", and so on for each published type), so a source identifier is resolved
+    /// against the stored resources of its subscription's source type and one that names
+    /// none is the modelled `SourceNotFoundFault`.
+    ///
+    /// `None` is for a value whose resources this service holds no record of, so there is
+    /// nothing to resolve against. Among the ten values
+    /// [`EVENT_SUBSCRIPTION_SOURCE_TYPES`] publishes, that is `db-security-group`, which no
+    /// operation here creates, and `custom-engine-version`, which this store keys by engine
+    /// AND version rather than by one identifier a source id could carry; an identifier of
+    /// such a type is accepted rather than refused for a record this service could never
+    /// have. A value outside that published list — `db-shard-group`, say, which the WIDER
+    /// `SourceType` enum of `DescribeEvents` carries but a SUBSCRIPTION may not name — also
+    /// falls through here, and never reaches this resolver: `check_event_subscription_source_type`
+    /// refuses it before a subscription of that type can exist.
+    pub fn event_source_identifiers_in(
+        &self,
+        region: &str,
+        source_type: &str,
+    ) -> Option<Vec<String>> {
+        match source_type {
+            "db-instance" => Some(
+                self.instances_in(region)
+                    .into_iter()
+                    .map(|instance| instance.identifier.clone())
+                    .collect(),
+            ),
+            "db-cluster" => Some(
+                self.clusters_in(region)
+                    .into_iter()
+                    .map(|cluster| cluster.identifier.clone())
+                    .collect(),
+            ),
+            "db-snapshot" => Some(
+                self.snapshots_in(region)
+                    .into_iter()
+                    .map(|snapshot| snapshot.snapshot_identifier.clone())
+                    .collect(),
+            ),
+            "db-cluster-snapshot" => Some(
+                self.cluster_snapshots_in(region)
+                    .into_iter()
+                    .map(|snapshot| snapshot.snapshot_identifier.clone())
+                    .collect(),
+            ),
+            "db-parameter-group" => Some(
+                self.parameter_groups_in(region)
+                    .into_iter()
+                    .map(|group| group.name.clone())
+                    .collect(),
+            ),
+            "db-proxy" => Some(
+                self.db_proxies_in(region)
+                    .into_iter()
+                    .map(|proxy| proxy.name.clone())
+                    .collect(),
+            ),
+            "zero-etl" => Some(
+                self.integrations_in(region)
+                    .into_iter()
+                    .map(|integration| integration.name.clone())
+                    .collect(),
+            ),
+            "blue-green-deployment" => Some(
+                self.blue_green_deployments_in(region)
+                    .into_iter()
+                    .map(|deployment| deployment.identifier.clone())
+                    .collect(),
+            ),
+            _ => None,
+        }
     }
 
     /// The option groups stored in `region`, in name order.
@@ -4936,6 +5015,23 @@ pub const MAX_EVENT_CATEGORY_LEN: usize = 64;
 /// state lock: this caps the factor the caller chooses, exactly as [`check_filter_terms`]
 /// does for a describe. Generous next to the forty DB instances a region may hold.
 pub const MAX_SOURCE_IDS_PER_REQUEST: usize = 64;
+
+/// The longest source identifier this service stores: the bound the identifier members
+/// of this service publish for the resources a source identifier names
+/// (`DBInstanceIdentifier`, `DBSnapshotIdentifier`, `DBClusterIdentifier` — 255).
+pub const MAX_SOURCE_ID_LEN: usize = 255;
+
+/// How many source identifiers one subscription may hold at all.
+///
+/// AWS publishes no per-subscription source-identifier quota, so this is THIS emulator's
+/// store guard rather than a modelled limit, and the 400 a handler refuses a further add
+/// with is this service's own refusal rather than a modelled fault.
+///
+/// `CreateEventSubscription` already bounds the list it stores at
+/// [`MAX_SOURCE_IDS_PER_REQUEST`]; a subscription whose sources are added one call at a
+/// time has to be bounded by the same count, or the stored list grows without bound for
+/// the source types this service resolves nothing against.
+pub const MAX_SOURCE_IDS_PER_SUBSCRIPTION: usize = MAX_SOURCE_IDS_PER_REQUEST;
 
 /// How many tags one resource may carry: Amazon RDS's published tag quota ("Tags per
 /// resource": 50). Tags are stored request data, so the bound is enforced rather than

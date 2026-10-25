@@ -170,7 +170,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListCallAnalyticsCategoriesErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -209,16 +208,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DEFAULT_CATEGORY_LIST_MAX_RESULTS,
         );
 
+        // The Region this request is served in: a regional endpoint lists only the
+        // categories created through it.
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
-        let start = match resume_after.as_deref() {
-            Some(name) => ::std::ops::Bound::Excluded(name),
-            None => ::std::ops::Bound::Unbounded,
-        };
         // One past the page, so "is there a further category?" is answered by the
-        // store rather than by counting the whole map.
+        // store rather than by counting the whole Region. The store yields a Region's
+        // records in name order, so skipping every name up to and including the cursor
+        // resumes strictly past it.
         let mut page: Vec<&crate::state::CallAnalyticsCategoryRecord> = store
             .call_analytics_categories
-            .range::<str, _>((start, ::std::ops::Bound::Unbounded))
+            .iter_in(&region)
+            .skip_while(|(name, _)| resume_after.as_deref().is_some_and(|after| *name <= after))
             .map(|(_, record)| record)
             .take(page_size + 1)
             .collect();
@@ -236,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListCallAnalyticsCategoriesOutput {
             next_token,
             // Each category is reported as the record it was stored as — the same
-            // projection `GetCallAnalyticsCategory` answers with. An account holding no
+            // projection `GetCallAnalyticsCategory` answers with. A Region holding no
             // category gets an empty list, which is a page of nothing rather than a
             // missing member.
             categories: Some(page.iter().map(|record| record.to_properties()).collect()),

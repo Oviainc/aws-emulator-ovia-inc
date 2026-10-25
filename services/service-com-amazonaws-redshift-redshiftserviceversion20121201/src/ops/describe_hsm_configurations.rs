@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             DescribeHsmConfigurationsErrorModeled::HsmConfigurationNotFoundFault(
                                 HsmConfigurationNotFoundFault {
                                     message: Some(format!(
-                                        "HSM configuration '{requested}' does not exist."
+                                        "HSM configuration '{requested}' not found."
                                     )),
                                 },
                             )

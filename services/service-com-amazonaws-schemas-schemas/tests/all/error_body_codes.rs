@@ -226,8 +226,8 @@ fn cases(stale_revision: &str, current_revision: &str) -> Vec<Case> {
             shape: "NotFoundException",
             code: CODE_RESOURCE_NOT_FOUND,
         },
-        // ---- the resource already exists: one condition code, each operation's
-        // ---- own modelled shape ------------------------------------------------
+        // ---- the resource already exists: one condition code, one conflict shape
+        // ---- whichever resource was asked for -----------------------------------
         Case {
             case: "CreateRegistry for a registry that already exists",
             method: "POST",
@@ -238,15 +238,15 @@ fn cases(stale_revision: &str, current_revision: &str) -> Vec<Case> {
             code: CODE_RESOURCE_ALREADY_EXIST,
         },
         Case {
-            // `CreateSchema` models no conflict shape (`CreateRegistry` does), so its
-            // duplicate is refused with the 400 client error it DOES model, under the
-            // same already-exists condition code.
+            // A resource that is already there is a conflict with the stored state,
+            // not a malformed request, so it takes the service's conflict shape under
+            // the same already-exists condition code as every other duplicate create.
             case: "CreateSchema for a schema that already exists",
             method: "POST",
             uri: schema_uri(REGISTRY, SCHEMA),
             body: Some(json!({"Content": CONTENT, "Type": "OpenApi3"})),
-            status: 400,
-            shape: "BadRequestException",
+            status: 409,
+            shape: "ConflictException",
             code: CODE_RESOURCE_ALREADY_EXIST,
         },
         // ---- 409: a conflict that is not a duplicate resource ------------------

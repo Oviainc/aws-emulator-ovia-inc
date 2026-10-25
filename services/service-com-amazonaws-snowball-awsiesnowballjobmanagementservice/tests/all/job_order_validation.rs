@@ -14,9 +14,9 @@
 //!    WHOLE cross product of the two modelled enums;
 //! 3. an order that moves data between Amazon S3 and the device names the buckets it
 //!    transfers and the role it transfers them under;
-//! 4. a `LongTermPricingId` on an order has to name a long-term pricing record this
+//! 4. a `LongTermPricingId` on an order has to name a long-term pricing contract this
 //!    service holds, exactly as an `AddressId` and a `ClusterId` do — and one it does
-//!    hold is accepted;
+//!    hold, bought through `CreateLongTermPricing`, is accepted;
 //! 5. a cluster is ordered only in the one job type and device type its own documentation
 //!    says a cluster supports.
 //!
@@ -32,12 +32,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::types::{
     JOB_TYPE_VALUES, SNOWBALL_TYPE_VALUES,
 };
-use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::state::service_state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::job_lifecycle::{
-    complete_order, create_address, deliverable_address, ok, refused, router, router_with_engine,
-    string,
+    complete_order, create_address, deliverable_address, ok, refused, router, string,
 };
 
 /// The `JobType` values each `SnowballType` of device can be ordered for.
@@ -500,23 +498,24 @@ async fn create_job_refuses_a_long_term_pricing_id_no_record_answers_to() {
 
 #[tokio::test]
 async fn create_job_accepts_a_long_term_pricing_id_the_store_holds() {
-    // The rule is about the record, not about the id's form, so an id the store DOES hold
+    // The rule is about the contract, not about the id's form, so an id the store DOES hold
     // is accepted while another id in the same store is still refused. `CreateLongTermPricing`
-    // is what will put an id there; until it is implemented the record is seeded through
-    // the state API, which is the only thing here that does not go over HTTP.
-    let (router, engine) = router_with_engine();
+    // is what puts a contract there, so the held id is the one it minted — bought over the
+    // wire like every other call here.
+    let router = router();
     let address_id = order_address(&router).await;
-    let held = LONG_TERM_PRICING_IDS[2];
+    let bought_case = "a long-term pricing contract bought for the order";
+    let bought = ok(
+        &router,
+        "CreateLongTermPricing",
+        json!({ "LongTermPricingType": "OneYear", "SnowballType": "EDGE" }),
+        bought_case,
+    )
+    .await;
+    let held = string(&bought, "LongTermPricingId", bought_case);
     let never_created = LONG_TERM_PRICING_IDS[3];
-    {
-        let state = service_state(&*engine).expect("the engine carries this service's store");
-        state
-            .lock()
-            .long_term_pricing_ids
-            .insert(held.to_string());
-    }
 
-    let case = "an order billed under a long-term pricing record the store holds";
+    let case = "an order billed under a long-term pricing contract the store holds";
     let mut body = order(&address_id, "LOCAL_USE", "EDGE");
     body["LongTermPricingId"] = json!(held);
     let created = ok(&router, "CreateJob", body, case).await;
@@ -524,13 +523,13 @@ async fn create_job_accepts_a_long_term_pricing_id_the_store_holds() {
     let metadata = job_metadata(&router, &job_id, case).await;
     assert_eq!(
         metadata.get("LongTermPricingId").and_then(Value::as_str),
-        Some(held),
+        Some(held.as_str()),
         "case {case:?}: expected the stored order to report the long-term pricing it is \
          billed under, got {metadata}"
     );
 
     // A cluster order's list is read the same way: the held id is accepted.
-    let cluster_case = "a cluster order billed under the record the store holds";
+    let cluster_case = "a cluster order billed under the contract the store holds";
     let mut cluster = order(&address_id, CLUSTER_JOB_TYPE, CLUSTER_SNOWBALL_TYPE);
     cluster["LongTermPricingIds"] = json!([held]);
     let cluster_created = ok(&router, "CreateCluster", cluster, cluster_case).await;

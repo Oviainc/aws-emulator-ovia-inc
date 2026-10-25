@@ -3,6 +3,10 @@
 //! @op CreateApplication
 //! IMPLEMENTED: creates an application and persists it in this service's state.
 //!
+//! An application's name addresses it within the account, so the account holds at most
+//! one application per name: a create under a name an application already holds is
+//! refused with the modelled `BadRequestException` (HTTP 400) and writes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -172,6 +176,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+
+        // An application's name ADDRESSES it within the account (every
+        // `ApplicationIdentifier` in this service is documented as "the application ID or
+        // name"), so the account holds at most one application per name: a create under a
+        // name an application already holds is refused, naming that application, and
+        // nothing is written. The conflict is on the name alone — the request's
+        // `Description` and `Tags` do not enter into it — and it is checked before the
+        // quota, because a request this account could never store is refused on its own
+        // terms rather than on how full the store is.
+        if let Some(existing_id) = store
+            .application_named(&input.name, None)
+            .map(|existing| existing.id.clone())
+        {
+            return Err(CreateApplicationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::application_name_taken(
+                        &input.name,
+                        &existing_id,
+                    )),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
 
         // The quota `ServiceQuotaExceededException`'s own documentation states:
         // "Applications: 100 max".

@@ -37,10 +37,10 @@
 //! check, so the two cannot disagree about what this service supports.
 //!
 //! The record is the stored half; the wire half (`Application`, `ApplicationSummary`,
-//! `Operation`, `ConfigurationCheckOperation`) is PROJECTED from it by
-//! [`StoredApplication::view`] / [`StoredApplication::summary`] /
-//! [`StoredOperation::view`] / [`StoredConfigurationCheckOperation::view`], so no
-//! handler assembles a response member by hand.
+//! `Operation`, `ConfigurationCheckOperation`, `ComponentSummary`) is PROJECTED from it
+//! by [`StoredApplication::view`] / [`StoredApplication::summary`] /
+//! [`StoredOperation::view`] / [`StoredConfigurationCheckOperation::view`] /
+//! [`StoredComponent::summary`], so no handler assembles a response member by hand.
 //!
 //! An application's SAP HANA databases are DERIVED from that same record rather than
 //! held beside it: the emulator discovers nothing on the registered instances, so the
@@ -54,13 +54,15 @@
 //! [`StoredApplication::database_view`], so the database a caller reads one by one is the
 //! database the listing reports.
 //!
-//! An application's COMPONENTS are held the same way: the [`StoredComponent`] records in
-//! [`StoredApplication::components`] are the ones the registration's `ComponentsInfo`
-//! declared, projected onto the wire `Component` by
-//! [`StoredApplication::component_view`] — which is what `GetComponent` reads back. So a
-//! component a caller can read is one a registration declared, it reports the status its
-//! application is in, and the databases it reports are the ones that registration gave
-//! it.
+//! An application's COMPONENTS are held the same way, ON the application rather than in
+//! a map of their own (a `ComponentId` names a component only within its application):
+//! the [`StoredComponent`] records in [`StoredApplication::components`] are the ones the
+//! registration's `ComponentsInfo` declared, projected onto the wire `Component` by
+//! [`StoredApplication::component_view`] — which is what `GetComponent` reads back — and
+//! onto `ComponentSummary` by [`StoredComponent::summary`], which is what
+//! `ListComponents` reports. So a component a caller can read is one a registration
+//! declared, it reports the status its application is in, and the databases it reports
+//! are the ones that registration gave it.
 //!
 //! What a configuration check RUN produced hangs off that same record: the sub-check
 //! results in [`StoredConfigurationCheckOperation::sub_check_results`], each holding the
@@ -87,9 +89,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Application, ApplicationCredential, ApplicationSummary, AssociatedHost, Component,
-    ConfigurationCheckDefinition, ConfigurationCheckOperation, ConflictException, Database,
-    DatabaseSummary, Filter, InternalServerException, Operation, OperationEvent, Resource,
-    ResourceNotFoundException, RuleResult, SubCheckResult, ValidationException,
+    ComponentInfo, ComponentSummary, ConfigurationCheckDefinition, ConfigurationCheckOperation,
+    ConflictException, Database, DatabaseSummary, Filter, InternalServerException, Operation,
+    OperationEvent, Resource, ResourceNotFoundException, RuleResult, SubCheckResult,
+    ValidationException,
     APPLICATION_TYPE_VALUES, CONFIGURATION_CHECK_TYPE_VALUES,
 };
 
@@ -289,6 +292,46 @@ pub const MAX_RETAINED_OPERATIONS: usize = 10_000;
 /// declares the same `MaxResults` range of 1..50, so 50 is both the largest page the API
 /// allows and the default page.
 pub const MAX_PAGE_SIZE: i32 = 50;
+
+/// How many components ONE registered application holds.
+///
+/// The model gives `ComponentInfoList` `@length(min: 0, max: 5)`
+/// (`smithy_query(query="shape", shape="ComponentInfoList")`) and a component exists
+/// only because a registration declared it, so the boundary validator already refuses a
+/// longer `ComponentsInfo`; [`components_within_bounds`] re-states the bound HERE so the
+/// work every component-scoped call does is bounded by a check in this crate rather than
+/// by one that lives elsewhere. It is reported with `ValidationException`, which
+/// `RegisterApplication` models.
+pub const MAX_COMPONENTS_PER_APPLICATION: usize = 5;
+
+/// How many components one Region can hold, derived from the two ceilings that bound
+/// it: at most [`MAX_APPLICATIONS`] applications, each with at most
+/// [`MAX_COMPONENTS_PER_APPLICATION`] components. So the set a component listing walks
+/// is bounded by a constant, independent of how many requests a caller makes. Both
+/// ceilings are enforced where a component is written, so this is the invariant that
+/// follows from them rather than a third check: a listing states it as a debug-build
+/// assertion and still reports every component it holds.
+pub const MAX_COMPONENTS_PER_REGION: usize = MAX_APPLICATIONS * MAX_COMPONENTS_PER_APPLICATION;
+
+/// Refuse a registration that declares more components than an application may hold
+/// ([`MAX_COMPONENTS_PER_APPLICATION`]).
+///
+/// `Ok(())` when the declaration is within the bound. The boundary validator enforces
+/// the same bound from the model, so this cannot normally fire; it is here so the size
+/// of what one registration stores — and of what a later listing walks — is bounded by
+/// a check in this crate. The caller must apply it BEFORE writing anything, so a refused
+/// registration leaves no application behind.
+pub fn components_within_bounds(
+    components_info: &[ComponentInfo],
+) -> Result<(), ValidationException> {
+    if components_info.len() > MAX_COMPONENTS_PER_APPLICATION {
+        return Err(validation(format!(
+            "ComponentsInfo holds at most {MAX_COMPONENTS_PER_APPLICATION} components, but {} were given",
+            components_info.len()
+        )));
+    }
+    Ok(())
+}
 
 /// The `Version` of a rendered resource policy document: the current IAM policy
 /// language version, which is what every AWS resource policy document carries.
@@ -742,6 +785,33 @@ pub struct StoredComponent {
     pub sid: String,
     /// The `Ec2InstanceId` the component was declared on.
     pub ec2_instance_id: String,
+}
+
+impl StoredComponent {
+    /// Project this component onto the modelled `ComponentSummary`, with its own ARN and
+    /// the tags held for that ARN.
+    ///
+    /// A summary states what identifies the component — the application it belongs to,
+    /// its own id and the type it was declared as — and its ARN, which names both ids
+    /// ([`component_arn`]) because a `ComponentId` is unique only within its
+    /// application. The ARN is passed in rather than rebuilt here, so the caller that
+    /// looked the tags up by it reports the very same spelling. Everything else a
+    /// `Component` carries is read by `GetComponent`
+    /// ([`StoredApplication::component_view`]); a summary does not carry it.
+    pub fn summary(
+        &self,
+        application_id: &str,
+        arn: &str,
+        tags: Option<HashMap<String, String>>,
+    ) -> ComponentSummary {
+        ComponentSummary {
+            application_id: Some(application_id.to_string()),
+            component_id: Some(self.id.clone()),
+            component_type: Some(self.component_type.clone()),
+            tags,
+            arn: Some(arn.to_string()),
+        }
+    }
 }
 
 /// A SAP HANA database of a registered application: the record `DatabaseSummary` is
@@ -1224,6 +1294,38 @@ impl StoredConfigurationCheckOperation {
     }
 }
 
+/// How many `ConfigurationCheckIds` entries one `StartConfigurationChecks` request may
+/// carry.
+///
+/// The model declares no length on the list, and a check named twice in one request is
+/// one check to perform, so a legitimate request MAY repeat ids: this is therefore not a
+/// fidelity claim about a published quota but the emulator's own ceiling, far more
+/// entries than the catalogue holds distinct checks
+/// ([`crate::ops::types::CONFIGURATION_CHECK_TYPE_VALUES`]), so no realistic request
+/// meets it while the work one call causes still cannot grow with the request body's
+/// size. It is reported with `ValidationException`, which `StartConfigurationChecks`
+/// models.
+pub const MAX_CONFIGURATION_CHECKS_PER_REQUEST: usize = 100;
+
+/// Refuse a request carrying more `ConfigurationCheckIds` entries than
+/// [`MAX_CONFIGURATION_CHECKS_PER_REQUEST`].
+///
+/// `Ok(())` when the list is within the ceiling (a request naming none is, and runs the
+/// whole catalogue). The caller must apply this BEFORE the checks are resolved or any
+/// record is filed, so a refused request leaves no half-started set of checks behind.
+pub fn configuration_checks_within_bounds(
+    requested: Option<&[String]>,
+) -> Result<(), ValidationException> {
+    let named = requested.unwrap_or(&[]);
+    if named.len() > MAX_CONFIGURATION_CHECKS_PER_REQUEST {
+        return Err(validation(format!(
+            "ConfigurationCheckIds holds at most {MAX_CONFIGURATION_CHECKS_PER_REQUEST} entries, but {} were given",
+            named.len()
+        )));
+    }
+    Ok(())
+}
+
 /// The configuration checks one `StartConfigurationChecks` call runs, in the order
 /// their operations are reported.
 ///
@@ -1234,7 +1336,14 @@ impl StoredConfigurationCheckOperation {
 /// model is therefore started here without this function changing.
 ///
 /// A check named twice in one request is one check to perform, so the result holds each
-/// requested check once, keeping the position of its first mention.
+/// requested check once, keeping the position of its first mention; the checks already
+/// seen are held in a set, so recognising a repeat costs no scan of the list.
+///
+/// The number of entries read is bounded: [`configuration_checks_within_bounds`] refuses
+/// a longer list before this runs, and the `take` makes that ceiling explicit at the only
+/// place the caller's list is iterated. Because it is the ceiling that check already
+/// implies, it can never drop an entry a caller sent. The result holds at most as many
+/// checks as the catalogue has distinct ones, however many entries the request carried.
 pub fn configuration_checks_to_run(requested: Option<&[String]>) -> Vec<String> {
     let named = requested.unwrap_or(&[]);
     if named.is_empty() {
@@ -1243,9 +1352,10 @@ pub fn configuration_checks_to_run(requested: Option<&[String]>) -> Vec<String> 
             .map(|check| (*check).to_string())
             .collect();
     }
-    let mut checks: Vec<String> = Vec::with_capacity(named.len());
-    for check in named {
-        if !checks.iter().any(|seen| seen == check) {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut checks: Vec<String> = Vec::new();
+    for check in named.iter().take(MAX_CONFIGURATION_CHECKS_PER_REQUEST) {
+        if seen.insert(check.as_str()) {
             checks.push(check.clone());
         }
     }
@@ -2538,21 +2648,68 @@ pub enum PageError {
     InvalidToken(String),
 }
 
+/// Which listing a continuation token belongs to.
+///
+/// A token is opaque to a client, but it still names a position in ONE listing: a token
+/// handed out by one must not resume another, whose keys mean something else. So the
+/// listing is part of what the token marks ([`Listing::token_prefix`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listing {
+    /// `ListApplications`, whose keys are `ApplicationId`s.
+    Applications,
+    /// `ListComponents`, whose keys are `<ApplicationId>/<ComponentId>`.
+    Components,
+    /// `ListDatabases`, whose keys are `<ApplicationId>/<DatabaseId>`.
+    Databases,
+    /// `ListConfigurationCheckOperations`, whose keys are `OperationId`s.
+    ConfigurationCheckOperations,
+    /// `ListConfigurationCheckDefinitions`, whose keys are `ConfigurationCheckType`s.
+    ConfigurationCheckDefinitions,
+    /// `ListOperationEvents`, whose keys are [`OperationEventRecord::page_key`]s.
+    OperationEvents,
+    /// `ListSubCheckResults`, whose keys are `SubCheckResultId`s.
+    SubCheckResults,
+    /// `ListSubCheckRuleResults`, whose keys are `RuleResultId`s.
+    SubCheckRuleResults,
+}
+
+impl Listing {
+    /// Marks a continuation token as this listing's, and at which version it was issued.
+    ///
+    /// Long enough on its own that the hex rendering of any token always satisfies the
+    /// model's `NextToken` pattern (`^.{16,2048}$`, so at least 16 characters).
+    const fn token_prefix(self) -> &'static str {
+        match self {
+            Self::Applications => "ssmsap:applications:v1:",
+            Self::Components => "ssmsap:components:v1:",
+            Self::Databases => "ssmsap:databases:v1:",
+            Self::ConfigurationCheckOperations => "ssmsap:check-operations:v1:",
+            Self::ConfigurationCheckDefinitions => "ssmsap:check-definitions:v1:",
+            Self::OperationEvents => "ssmsap:operation-events:v1:",
+            Self::SubCheckResults => "ssmsap:sub-check-results:v1:",
+            Self::SubCheckRuleResults => "ssmsap:rule-results:v1:",
+        }
+    }
+}
+
 /// Take one page out of an id-ordered listing.
 ///
 /// `all` is every item that matches the request, paired with the key it is ordered by.
 /// The page holds at most `max_results` items starting at `next_token`, and carries a
 /// token only when further items remain — so a caller that follows tokens to exhaustion
-/// sees every item exactly once and the paging terminates.
+/// sees every item exactly once and the paging terminates. `listing` is which listing
+/// the token belongs to, so one listing's token is not resumed from by another.
 pub fn page<T>(
     all: Vec<(String, T)>,
     max_results: Option<i32>,
     next_token: Option<&str>,
+    listing: Listing,
 ) -> Result<Page<T>, PageError> {
     let start = match next_token {
         None => None,
         Some(token) => Some(
-            decode_page_token(token).ok_or_else(|| PageError::InvalidToken(token.to_string()))?,
+            decode_page_token(token, listing)
+                .ok_or_else(|| PageError::InvalidToken(token.to_string()))?,
         ),
     };
     // `MaxResults` carries `@range(1..50)`, so the boundary validator has already
@@ -2565,7 +2722,9 @@ pub fn page<T>(
         .skip_while(|(key, _)| start.as_deref().is_some_and(|from| key.as_str() < from));
     let items: Vec<T> = rest.by_ref().take(limit).map(|(_, item)| item).collect();
     // The token names the first item NOT on this page, so the next call resumes at it.
-    let next_token = rest.next().map(|(key, _)| encode_page_token(&key));
+    let next_token = rest
+        .next()
+        .map(|(key, _)| encode_page_token(&key, listing));
     Ok(Page { items, next_token })
 }
 
@@ -2579,26 +2738,22 @@ pub fn page_validation_exception(error: &PageError) -> ValidationException {
     }
 }
 
-/// Marks a continuation token as this service's, and at which version it was issued.
+/// Encode a listing key as the opaque `NextToken` that listing hands out.
 ///
-/// Long enough on its own that the hex rendering of any token always satisfies the
-/// model's `NextToken` pattern (`^.{16,2048}$`, so at least 16 characters).
-const PAGE_TOKEN_PREFIX: &str = "ssmsap:applications:v1:";
-
-/// Encode a listing key as the opaque `NextToken` this service hands out.
-///
-/// The key is prefixed with a version marker before hex-encoding, so the token is
-/// opaque to a client (it is not the resource id it was built from) AND a value this
-/// service did not issue is refused rather than resumed from. It stays a pure function
-/// of the key, so the token is stable and carries no server-side cursor state.
-fn encode_page_token(key: &str) -> String {
-    ::hex::encode(format!("{PAGE_TOKEN_PREFIX}{key}"))
+/// The key is prefixed with the listing's own version marker before hex-encoding, so
+/// the token is opaque to a client (it is not the resource id it was built from) AND a
+/// value this listing did not issue is refused rather than resumed from. It stays a pure
+/// function of the key, so the token is stable and carries no server-side cursor state.
+fn encode_page_token(key: &str, listing: Listing) -> String {
+    ::hex::encode(format!("{}{key}", listing.token_prefix()))
 }
 
-/// The inverse of [`encode_page_token`]; `None` for anything this service did not issue.
-fn decode_page_token(token: &str) -> Option<String> {
+/// The inverse of [`encode_page_token`]; `None` for anything this listing did not issue.
+fn decode_page_token(token: &str, listing: Listing) -> Option<String> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    decoded.strip_prefix(PAGE_TOKEN_PREFIX).map(str::to_string)
+    decoded
+        .strip_prefix(listing.token_prefix())
+        .map(str::to_string)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

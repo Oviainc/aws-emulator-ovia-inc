@@ -27,5 +27,7 @@ mod connector_vpc_endpoint;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource.rs"]
+mod tag_resource;
 #[path = "all/tag_validation.rs"]
 mod tag_validation;
