@@ -2072,6 +2072,10 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // (cognito-idp's own Smithy model), which a generated name is already inside —
         // letters, digits and the hyphen are all admitted — but may be longer than.
         COGNITO_USER_POOL_GROUP => rules(128, Characters::AsGenerated),
+        // Amazon MSK `CreateCluster.clusterName` and `CreateClusterV2.clusterName`:
+        // `__stringMin1Max64`, `@length(min: 1, max: 64)` (that service's own Smithy
+        // model), which a generated name is already inside but may be longer than.
+        MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => rules(64, Characters::AsGenerated),
         _ => None,
     }
 }
@@ -2347,6 +2351,12 @@ fn declared_name_property(resource_type: &str) -> Option<&'static str> {
         // `GroupName` — the type's last segment is `UserPoolGroup`, so neither
         // `UserPoolGroupName` nor `Name` finds it.
         COGNITO_USER_POOL_GROUP => Some("GroupName"),
+        // Amazon MSK's `CreateClusterV2` takes a `ClusterName` for a serverless cluster
+        // just as `CreateCluster` does for a provisioned one, so the serverless type
+        // publishes `ClusterName` — the type's last segment is `ServerlessCluster`, so
+        // neither `ServerlessClusterName` nor `Name` finds it. (The provisioned type's own
+        // `ClusterName` IS the convention, its last segment being `Cluster`.)
+        MSK_SERVERLESS_CLUSTER => Some("ClusterName"),
         _ => None,
     }
 }
@@ -2468,6 +2478,8 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     FIREHOSE_DELIVERY_STREAM,
     "AWS::Lambda::Function",
     "AWS::Logs::LogGroup",
+    MSK_CLUSTER,
+    MSK_SERVERLESS_CLUSTER,
     "AWS::RDS::DBCluster",
     "AWS::RDS::DBInstance",
     "AWS::RUM::AppMonitor",
@@ -3340,6 +3352,26 @@ fn return_values(
             attributes.insert("Id".to_string(), id.clone());
             (id, attributes)
         }
+        // "Ref returns the ARN of the cluster" for both kinds of Amazon MSK cluster, and
+        // that ARN is the type's one published `Fn::GetAtt` attribute too. Amazon MSK
+        // MINTS it: its resource path is `cluster/<name>/<id>`, where the id is the
+        // service's own, so what is computed here is an ARN of that published shape with a
+        // stand-in id derived from the resource's name. These are also the types
+        // `super::provisioning` creates in Amazon MSK itself, which reports the ARN IT
+        // minted back as the resource's identity — and THAT ARN, not this one, is what the
+        // stack reports for a cluster MSK created.
+        MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => {
+            let arn = ::emulator_server::emulator_arn(
+                MSK_ARN_NAMESPACE,
+                region,
+                &format!(
+                    "cluster/{name}/{}-{MSK_CLUSTER_ARN_ORDINAL}",
+                    generated_uuid(resource_type, name)
+                ),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            (arn, attributes)
+        }
         _ => (name.to_string(), attributes),
     }
 }
@@ -3426,6 +3458,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         APIGATEWAY_RESOURCE => &["ResourceId"],
         APIGATEWAY_DEPLOYMENT => &["DeploymentId"],
         GUARDDUTY_DETECTOR => &["Id"],
+        MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => &["Arn"],
         EVENTS_RULE => &["Arn"],
         SSM_PARAMETER => &["Type", "Value"],
         STEP_FUNCTIONS_ACTIVITY => &["Arn", "Name"],
@@ -3443,7 +3476,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// ([`super::StoredStack::deploy_template`]). Every other type's physical id is a function
 /// of its declared or generated name, which any deployment recomputes identically.
 ///
-/// Seven types this emulator provisions are in that position: an experiment template's id
+/// Nine types this emulator provisions are in that position: an experiment template's id
 /// is minted by FIS (`Ref` returns it, and the type has no name property at all), an AWS
 /// WAF Classic regional IPSet's id is minted by `CreateIPSet` ("Ref returns the IPSet ID"),
 /// an Amazon Managed Grafana workspace's id is minted by `CreateWorkspace` (`Ref` returns
@@ -3454,7 +3487,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// at all, an OpenSearch Serverless collection's `Ref` is the `CollectionId` its create
 /// mints — a template declares the collection's NAME, never that id — and an ACM ACME
 /// endpoint's is the `AcmeEndpointArn` `CreateAcmeEndpoint` mints, that type declaring no
-/// name or identifier property either.
+/// name or identifier property either, and each kind of Amazon MSK cluster's is the
+/// `ClusterArn` its create answers with ("Ref returns the ARN of the cluster"), whose
+/// resource path carries an identifier Amazon MSK mints beside the declared cluster name.
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == FIS_EXPERIMENT_TEMPLATE
         || resource_type == WAF_REGIONAL_IP_SET
@@ -3463,6 +3498,8 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == GUARDDUTY_DETECTOR
         || resource_type == AOSS_COLLECTION
         || resource_type == ACM_ACME_ENDPOINT
+        || resource_type == MSK_CLUSTER
+        || resource_type == MSK_SERVERLESS_CLUSTER
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -3508,6 +3545,32 @@ pub const S3VECTORS_BUCKET_SEGMENT: &str = "bucket/";
 /// `awsService.cloudFormationName: EMR`. "Ref returns the cluster ID", the `j-` job-flow id
 /// `RunJobFlow` mints, which is why [`identity_is_service_assigned`] names this type.
 pub const EMR_CLUSTER: &str = "AWS::EMR::Cluster";
+
+/// The types of the two kinds of Amazon MSK cluster a stack creates: the Amazon MSK model
+/// carries `awsService.cloudFormationName: MSK`, and the namespace publishes one type per
+/// kind of cluster — a provisioned one, whose brokers the declaration sizes, and a
+/// serverless one, which has none.
+///
+/// For both, "Ref returns the ARN of the cluster", which is also each type's one published
+/// `Fn::GetAtt` attribute. Amazon MSK MINTS that ARN (its resource path is
+/// `cluster/<name>/<id>`, where the id is the service's own), which is why
+/// [`identity_is_service_assigned`] names both types.
+pub const MSK_CLUSTER: &str = "AWS::MSK::Cluster";
+pub const MSK_SERVERLESS_CLUSTER: &str = "AWS::MSK::ServerlessCluster";
+
+/// Amazon MSK's ARN namespace, which is its model's own `awsService.arnNamespace`
+/// (`kafka`) rather than the `MSK` its resource types are spelled with.
+pub const MSK_ARN_NAMESPACE: &str = "kafka";
+
+/// The 1-based ordinal an Amazon MSK cluster ARN ends with
+/// (`cluster/<name>/<id>-<ordinal>`), as the stand-in identifier computed here carries it.
+///
+/// A PLACEHOLDER, and one that is never reported for a cluster that exists: the ARN a
+/// created cluster carries is the one Amazon MSK minted, where the ordinal is that
+/// service's own count of the clusters it has registered, and
+/// [`super::provisioning::reconcile`] adopts that ARN over this one. What this value is
+/// for is the shape of the identifier a declaration reports BEFORE its create answers.
+const MSK_CLUSTER_ARN_ORDINAL: u32 = 1;
 
 /// The same for an Amazon SQS queue: the SQS model carries
 /// `awsService.cloudFormationName: SQS`.
