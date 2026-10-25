@@ -347,6 +347,38 @@
 //! and [`byoip_cidr_payload_bytes`] is the one definition of what a range is charged, given
 //! back when the clock's release drops it.
 //!
+//! ## BYOASN: the ASNs brought to IPAM, and their associations with those ranges
+//!
+//! [`ComAmazonawsEc2Amazonec2State::byoasns`] holds the Autonomous System Numbers the
+//! account has brought to IPAM as [`ByoasnRecord`]s — the modelled [`Byoasn`] every
+//! operation that reports one answers with, plus the provisioning move the clock owes it —
+//! keyed by the ASN as the API spells it (`Byoasn$Asn` is a `String`, not a number), which
+//! is the only name `AssociateIpamByoasn`, `DisassociateIpamByoasn` and
+//! `DeprovisionIpamByoasn` take for one. `ProvisionIpamByoasn` is the operation that brings
+//! an ASN to IPAM and `DeprovisionIpamByoasn` the one that gives it back; both are still
+//! scaffolds, so a fresh account holds none — which is why `AssociateIpamByoasn` answers
+//! [`INVALID_BYOASN_NOT_FOUND`] for every ASN until one of them is written, exactly as the
+//! real service does for an ASN that has not been brought to IPAM.
+//!
+//! The ASSOCIATION of such an ASN with a BYOIP range lives on the RANGE, in
+//! `ByoipCidr$AsnAssociations` — "You can view the association with DescribeByoipCidrs"
+//! (`AssociateIpamByoasn`) — rather than in a map beside it, so the associating operation
+//! and that describe cannot report one association differently. Only the state move the
+//! clock owes an association it left in `pending-association` has no member to live in, so
+//! it is kept beside the ranges in
+//! [`ComAmazonawsEc2Amazonec2State::asn_association_moves`], keyed by the canonical range
+//! and the ASN together — the pair that names one association — and applied by
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] on the same clock and
+//! span as every other move this store owes.
+//!
+//! The WRITERS of the ASN store itself — [`ComAmazonawsEc2Amazonec2State::insert_byoasn`],
+//! [`ComAmazonawsEc2Amazonec2State::has_byoasn_capacity`] and [`byoasn_payload_bytes`] —
+//! have no caller in `ops/` yet, because the operation that brings an ASN to IPAM is one of
+//! the scaffolds named above: no API path writes `byoasns`, and the only writer today is a
+//! test seeding one. They are the same ceiling-and-budget contract every other store of
+//! this module is written through, so the operation that does bring an ASN to IPAM has one
+//! bounded insert to call rather than a second arrangement to invent.
+//!
 //! ## Public IPv4 address pools
 //!
 //! "Provisioning an IPv4 or IPv6 address range … creates a corresponding address pool"
@@ -965,10 +997,11 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    Address, AddressTransfer, ApplicationStatus, ApplicationStatusDetail, AttachVolumeOutput,
+    Address, AddressTransfer, ApplicationStatus, ApplicationStatusDetail, AsnAssociation,
+    AttachVolumeOutput,
     AttributeValue,
     AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
-    ByoipCidr,
+    Byoasn, ByoipCidr,
     DhcpConfiguration, DhcpOptions,
     CapacityBlock, CapacityReservation, CapacityReservationBillingRequest,
     CapacityReservationInfo, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport,
@@ -2472,6 +2505,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Every IPAM pool the account holds, by `IpamPoolId`, as the modelled [`IpamPool`]
     /// shape itself.
     pub ipam_pools: BTreeMap<String, IpamPool>,
+    /// Every ASN the account has brought to IPAM, by the ASN as the API spells it — see
+    /// [`ByoasnRecord`] and the module docs. Ordered by that key, the stable order
+    /// `DescribeIpamByoasn` reports and pages over.
+    pub byoasns: BTreeMap<String, ByoasnRecord>,
+    /// The state move the clock owes one ASN-and-BYOIP-CIDR association, by the canonical
+    /// range and the ASN together — the pair that names one association.
+    ///
+    /// Beside [`Self::byoip_cidrs`] rather than on the record, because the association
+    /// itself lives in `ByoipCidr$AsnAssociations` and that shape carries no member for a
+    /// move the clock has not applied yet; the same arrangement as
+    /// [`Self::vpc_endpoint_connection_moves`].
+    pub asn_association_moves: BTreeMap<(String, String), PendingStateMove>,
     /// Every IPAM policy the account holds, by `IpamPolicyId` — see [`IpamPolicyRecord`].
     /// Ordered by id, the stable order every reader of them reports in.
     ///
@@ -2752,6 +2797,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_route_table_announcements: BTreeMap::new(),
             transit_gateway_policy_tables: BTreeMap::new(),
             ipam_pools: BTreeMap::new(),
+            // A fresh account has brought no ASN of its own to IPAM, so nothing is
+            // associated with any of its address ranges either.
+            byoasns: BTreeMap::new(),
+            asn_association_moves: BTreeMap::new(),
             ipam_policies: BTreeMap::new(),
             ipam_scopes: BTreeMap::new(),
             ipam_pool_create_complete_at: BTreeMap::new(),
@@ -5183,6 +5232,50 @@ impl ComAmazonawsEc2Amazonec2State {
                 record.pending = None;
             }
         }
+        // The end of bringing one ASN to IPAM: an ASN `ProvisionIpamByoasn` left in
+        // `pending-provision` reaches the state that provision was headed for, at the
+        // instant it was owed whether or not anybody called — the same contract as the
+        // address ranges above.
+        for record in self.byoasns.values_mut() {
+            if let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            {
+                record.byoasn.state = Some(state);
+                record.pending = None;
+            }
+        }
+        // The end of one ASN-and-range association: "After the association succeeds, the
+        // ASN is eligible for advertisement" (`AssociateIpamByoasn`), so an association
+        // answered as `pending-association` reaches its terminal state here. The move lives
+        // beside the ranges because `AsnAssociation` has no member for it, and it is applied
+        // ONCE — the entry is dropped whether or not the association it names is still
+        // there, so a range that was released meanwhile leaves nothing owed behind. The one
+        // state word is rewritten in place and deliberately NOT re-charged against the byte
+        // budget: the terminal word is no longer than the pending one, so the charge
+        // `insert_byoip_cidr` took stays an upper bound on what the record holds.
+        let byoip_cidrs = &mut self.byoip_cidrs;
+        self.asn_association_moves.retain(|(cidr, asn), pending| {
+            // Through the one definition of "has this move come due", the same
+            // [`PendingStateMove::due_by`] every block above asks.
+            let Some(state) = pending.due_by(now).map(str::to_string) else {
+                return true;
+            };
+            if let Some(association) = byoip_cidrs
+                .get_mut(cidr)
+                .and_then(|record| record.byoip_cidr.asn_associations.as_mut())
+                .and_then(|associations| {
+                    associations
+                        .iter_mut()
+                        .find(|association| association.asn.as_deref() == Some(asn.as_str()))
+                })
+            {
+                association.state = Some(state);
+            }
+            false
+        });
         // The move a Capacity Reservation is owed: the interruptible allocation a
         // `CreateInterruptibleCapacityReservationAllocation` started completes, and the
         // interruptible Capacity Reservation it minted becomes usable. Each was due at its
@@ -14754,6 +14847,333 @@ pub fn invalid_cidr_not_found<E>(cidr: &str) -> Scaffolded<E> {
 // `INCORRECT_STATE` / `incorrect_state`, declared with the fast launch codes below;
 // `WithdrawByoipCidr`'s and `DeprovisionByoipCidr`'s state refusals use that one rather
 // than a second copy.
+
+// ---------------------------------------------------------------------------
+// BYOASN: the ASNs brought to IPAM, and their associations with BYOIP ranges
+// ---------------------------------------------------------------------------
+
+/// The `AsnState` of an ASN IPAM has finished bringing to the account, and the ONE state an
+/// association may be made from: "the ASN is eligible for advertisement" only once the ASN
+/// itself is provisioned (`ProvisionIpamByoasn`, "Tutorial: Bring your ASN to IPAM").
+pub const ASN_STATE_PROVISIONED: &str = "provisioned";
+
+/// The `AsnAssociationState` of an association that has been accepted and is not in force
+/// yet — the state `AssociateIpamByoasn` hands one back in, since "AFTER the association
+/// succeeds, the ASN is eligible for advertisement" (`AssociateIpamByoasn`).
+pub const ASN_ASSOCIATION_STATE_PENDING_ASSOCIATION: &str = "pending-association";
+
+/// The `AsnAssociationState` of an association that is in force.
+pub const ASN_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
+
+/// The `AsnAssociationState` of an association a `DisassociateIpamByoasn` has finished
+/// ending, which is a range-and-ASN pair that holds no association at all.
+pub const ASN_ASSOCIATION_STATE_DISASSOCIATED: &str = "disassociated";
+
+/// The `AsnAssociationState` of an association that never took, read the same way as
+/// [`ASN_ASSOCIATION_STATE_DISASSOCIATED`]: the pair holds nothing.
+pub const ASN_ASSOCIATION_STATE_FAILED_ASSOCIATION: &str = "failed-association";
+
+/// The `AsnAssociationState`s in which a range-and-ASN pair holds NO association: one whose
+/// disassociation has finished, and one that never took.
+///
+/// Stated as the states that are NOT an association, because every other member of that
+/// enum is one the range still holds: `associated` is in force, `pending-association` is on
+/// its way into force, `pending-disassociation` is in force until its disassociation
+/// finishes, and `failed-disassociation` is one whose removal did not take
+/// (`smithy_query(query="shape",shape="AsnAssociationState")`).
+pub const UNHELD_ASN_ASSOCIATION_STATES: &[&str] = &[
+    ASN_ASSOCIATION_STATE_DISASSOCIATED,
+    ASN_ASSOCIATION_STATE_FAILED_ASSOCIATION,
+];
+
+/// Whether an association in `state` is one the range still holds.
+/// See [`UNHELD_ASN_ASSOCIATION_STATES`].
+pub fn asn_association_is_held(state: &str) -> bool {
+    !UNHELD_ASN_ASSOCIATION_STATES.contains(&state)
+}
+
+/// `InvalidByoasn.NotFound` (HTTP 400): the request named an ASN this account has not
+/// brought to IPAM, so there is no ASN to act on.
+///
+/// EC2's `Invalid<Kind>.NotFound` convention for a resource the model publishes no error
+/// shape for, the way [`INVALID_IPAM_POOL_ID_NOT_FOUND`] is for an IPAM pool: the ASN is the
+/// whole name of a BYOASN (`Byoasn$Asn`), so there is no id form to refuse separately.
+pub const INVALID_BYOASN_NOT_FOUND: &str = "InvalidByoasn.NotFound";
+
+/// Refuse a request that named an ASN this account has not brought to IPAM: HTTP 400
+/// [`INVALID_BYOASN_NOT_FOUND`], naming the ASN the request sent.
+pub fn byoasn_not_found<E>(asn: &str) -> Scaffolded<E> {
+    id_not_found(INVALID_BYOASN_NOT_FOUND, "ASN", asn)
+}
+
+/// Refuse a request that named an address range IPAM does not manage: HTTP 400
+/// [`INVALID_CIDR_NOT_FOUND`], EC2's code for a range a request named that there is nothing
+/// to act on under.
+///
+/// Distinct from [`invalid_cidr_not_found`] only in its WORDING, which says where the range
+/// was looked for: the BYOASN operations are addressed by a range IPAM manages
+/// (`ByoipCidr$IpamPoolId`), so a range the account brought to AWS but never moved to IPAM
+/// is as absent to them as one it never brought at all. The message names the range the
+/// request asked about, in EC2's "the value you sent, in parentheses" form.
+pub fn cidr_not_found_in_ipam<E>(cidr: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CIDR_NOT_FOUND,
+        400,
+        format!("The CIDR ({cidr}) could not be found in IPAM."),
+    )
+}
+
+/// Whether `value` is an ASN the BYOASN operations can name.
+///
+/// "A public 2-byte or 4-byte ASN" (`AssociateIpamByoasnRequest$Asn`, `Byoasn$Asn`) — the
+/// member is a `String`, so the form is checked here: the two widths it names are unsigned
+/// 16-bit and 32-bit numbers, so an ASN is a plain decimal number that fits in 32 bits, and
+/// `0` names no autonomous system.
+///
+/// Deliberately NOT a check that the ASN is outside the private ranges the model documents
+/// elsewhere ([`AMAZON_SIDE_ASN_16_BIT`] / [`AMAZON_SIDE_ASN_32_BIT`], "The range is 64512 to
+/// 65534 for 16-bit ASNs and 4200000000 to 4294967294 for 32-bit ASNs",
+/// `TransitGatewayRequestOptions$AmazonSideAsn` — those bound an INTEGER-typed member that
+/// names the Amazon side of a BGP session, a different notion from this string-typed
+/// `Byoasn$Asn`): whether an ASN is one the caller may bring is decided by the registry
+/// authorization a provision carries (`AsnAuthorizationContext`), not by the number's range,
+/// and an ASN that was never brought to IPAM is refused by [`byoasn_not_found`] anyway.
+pub fn byoasn_is_well_formed(value: &str) -> bool {
+    value
+        .parse::<u32>()
+        .is_ok_and(|asn| asn != 0 && value.len() == asn.to_string().len())
+}
+
+/// Hold `value` to [`byoasn_is_well_formed`], or refuse it as EC2 refuses a parameter value
+/// it cannot read: HTTP 400 `InvalidParameterValue` for a value that is not an ASN, and
+/// `MissingParameter` for the empty string a `clientOptional` `@required` member reaches a
+/// handler as when the request carried it empty.
+pub fn require_well_formed_byoasn<E>(member: &str, value: &str) -> Result<(), Scaffolded<E>> {
+    if value.is_empty() {
+        return Err(missing_parameter(format!(
+            "The request must contain the parameter {member}"
+        )));
+    }
+    if !byoasn_is_well_formed(value) {
+        return Err(invalid_parameter_value(format!(
+            "Invalid value '{value}' for {member}. It must be a public 2-byte or 4-byte ASN"
+        )));
+    }
+    Ok(())
+}
+
+/// One ASN the account has brought to IPAM: the modelled [`Byoasn`] every operation that
+/// reports one answers with, plus the provisioning move the clock owes it.
+///
+/// The modelled shape itself rather than a parallel record, for the reason every other store
+/// here holds one: a member a writer sets round-trips through `DescribeIpamByoasn` without a
+/// field-by-field copy that can silently drop one.
+#[derive(Debug, Clone)]
+pub struct ByoasnRecord {
+    /// The ASN as the model shapes it, carrying the state reached so far.
+    pub byoasn: Byoasn,
+    /// The state move the clock owes the ASN while its provision or its release is still
+    /// under way; `None` for an ASN nothing is owed.
+    pub pending: Option<PendingStateMove>,
+}
+
+impl ByoasnRecord {
+    /// The ASN `asn`, brought to the IPAM `ipam_id`, sitting in `state` with nothing owed to
+    /// it by the clock.
+    pub fn in_state(asn: &str, ipam_id: &str, state: &str) -> Self {
+        Self {
+            byoasn: Byoasn {
+                asn: Some(asn.to_string()),
+                ipam_id: Some(ipam_id.to_string()),
+                state: Some(state.to_string()),
+                status_message: None,
+            },
+            pending: None,
+        }
+    }
+
+    /// The ASN's current `AsnState`.
+    pub fn state(&self) -> &str {
+        self.byoasn.state.as_deref().unwrap_or_default()
+    }
+}
+
+/// The bytes one stored BYOASN holds, in the style [`byoip_cidr_payload_bytes`] documents:
+/// the fixed [`STORED_RECORD_OVERHEAD_BYTES`] plus the text the record carries.
+pub fn byoasn_payload_bytes(record: &ByoasnRecord) -> usize {
+    let byoasn = &record.byoasn;
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(byoasn.asn.as_deref().map_or(0, str::len))
+        .saturating_add(byoasn.ipam_id.as_deref().map_or(0, str::len))
+        .saturating_add(byoasn.state.as_deref().map_or(0, str::len))
+        .saturating_add(byoasn.status_message.as_deref().map_or(0, str::len))
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another BYOASN fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), the contract [`Self::has_byoip_cidr_capacity`]
+    /// writes out for address ranges: the key is an ASN a REQUEST names, so without a
+    /// ceiling a client could bring distinct ASNs without end.
+    pub fn has_byoasn_capacity(&self) -> bool {
+        self.byoasns.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store `record` as the account's BYOASN for the ASN it carries, replacing whatever
+    /// that ASN named before, and answer whether it was stored.
+    ///
+    /// `false`, with NOTHING written, for a record carrying no `Asn` or one that is not an
+    /// ASN at all ([`byoasn_is_well_formed`]) — there is no key to file it under — and when
+    /// the bytes it would hold would cross [`MAX_STORED_BYTES`]: for a new ASN the whole
+    /// charge, for one held under the same key the GROWTH, so no sequence of updates can
+    /// walk past the budget. A new ASN must also fit inside
+    /// [`MAX_STORED_RECORDS_PER_STORE`]. Exactly what [`Self::insert_byoip_cidr`] does for a
+    /// range.
+    pub fn insert_byoasn(&mut self, record: ByoasnRecord) -> bool {
+        let Some(asn) = record
+            .byoasn
+            .asn
+            .as_deref()
+            .filter(|asn| byoasn_is_well_formed(asn))
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let charge = byoasn_payload_bytes(&record);
+        let refund = self.byoasns.get(&asn).map(byoasn_payload_bytes);
+        // A new ASN is the only one the record-count ceiling can be about; the BYTE budget
+        // binds every path and is asked about the NET change, through the one helper every
+        // store of this module asks ([`Self::would_exceed_stored_bytes_after_refund`]), so a
+        // record that grows in place cannot walk past [`MAX_STORED_BYTES`] one update at a
+        // time.
+        if refund.is_none() && !self.has_byoasn_capacity() {
+            return false;
+        }
+        if self.would_exceed_stored_bytes_after_refund(charge, refund.unwrap_or(0)) {
+            return false;
+        }
+        if let Some(refund) = refund {
+            self.release_stored_bytes(refund);
+        }
+        self.add_stored_bytes(charge);
+        self.byoasns.insert(asn, record);
+        true
+    }
+
+    /// The BYOIP range `cidr` as the BYOASN operations see it: the record the store holds for
+    /// it, but only while IPAM manages it (`ByoipCidr$IpamPoolId`).
+    ///
+    /// The one definition of "is this range in IPAM", so every operation addressed by a
+    /// range IPAM manages refuses the same ranges the same way.
+    pub fn byoip_cidr_in_ipam(&self, cidr: &str) -> Option<&ByoipCidrRecord> {
+        self.byoip_cidrs
+            .get(cidr)
+            .filter(|record| record.byoip_cidr.ipam_pool_id.is_some())
+    }
+
+    /// The association the range `cidr` holds for the ASN `asn`, whatever state it is in.
+    pub fn asn_association(&self, cidr: &str, asn: &str) -> Option<&AsnAssociation> {
+        self.byoip_cidrs
+            .get(cidr)?
+            .byoip_cidr
+            .asn_associations
+            .iter()
+            .flatten()
+            .find(|association| association.asn.as_deref() == Some(asn))
+    }
+
+    /// Start associating the ASN `asn` with the range `cidr`: write the association onto the
+    /// range in `pending-association` and record the move to `associated` the clock owes it,
+    /// answering the association as the caller is told about it.
+    ///
+    /// The association is NOT in force here. "After the association succeeds, the ASN is
+    /// eligible for advertisement" (`AssociateIpamByoasn`) is work AWS reports as under way,
+    /// so it falls due [`TRANSITION_DELAY`] later through
+    /// [`Self::materialize_due_transitions`]; a caller that reads the range immediately
+    /// still sees the `pending-association` association. A pair whose association is not
+    /// there is associated again by REPLACING that entry, so one range-and-ASN pair never
+    /// holds two.
+    ///
+    /// BOUNDED, because both the range and the ASN come from a REQUEST and an association
+    /// enlarges a stored record rather than adding one: a range already holding
+    /// [`MAX_ASN_ASSOCIATIONS_PER_BYOIP_CIDR`] associations, a store already holding
+    /// [`MAX_STORED_RECORDS_PER_STORE`] pending association moves, and a write the byte
+    /// budget refuses are each answered with EC2's [`RESOURCE_LIMIT_EXCEEDED`] and NOTHING
+    /// written — so no sequence of calls can grow this process's memory without bound.
+    /// A `cidr` IPAM holds no range for answers [`cidr_not_found_in_ipam`]. The range is
+    /// resolved through [`Self::byoip_cidr_in_ipam`], the one definition of "is this range in
+    /// IPAM", so this write cannot reach a range outside IPAM even if a caller skipped that
+    /// check.
+    pub fn begin_asn_association<E>(
+        &mut self,
+        cidr: &str,
+        asn: &str,
+    ) -> Result<AsnAssociation, Scaffolded<E>> {
+        let association = AsnAssociation {
+            asn: Some(asn.to_string()),
+            cidr: Some(cidr.to_string()),
+            state: Some(ASN_ASSOCIATION_STATE_PENDING_ASSOCIATION.to_string()),
+            status_message: None,
+        };
+        let Some(mut record) = self.byoip_cidr_in_ipam(cidr).cloned() else {
+            return Err(cidr_not_found_in_ipam(cidr));
+        };
+        let associations = record
+            .byoip_cidr
+            .asn_associations
+            .get_or_insert_with(Vec::new);
+        match associations
+            .iter()
+            .position(|held| held.asn.as_deref() == Some(asn))
+        {
+            Some(index) => associations[index] = association.clone(),
+            None => {
+                if associations.len() >= MAX_ASN_ASSOCIATIONS_PER_BYOIP_CIDR {
+                    return Err(resource_limit_exceeded(format!(
+                        "The address range '{cidr}' already holds the maximum of \
+                         {MAX_ASN_ASSOCIATIONS_PER_BYOIP_CIDR} ASN associations"
+                    )));
+                }
+                associations.push(association.clone());
+            }
+        }
+        // The pending move is one entry per association, dropped once the clock has applied
+        // it, so its ceiling is the same one the record stores answer: a caller cannot leave
+        // more moves owed than this store holds records.
+        let move_key = (cidr.to_string(), asn.to_string());
+        if !self.asn_association_moves.contains_key(&move_key)
+            && self.asn_association_moves.len() >= MAX_STORED_RECORDS_PER_STORE
+        {
+            return Err(resource_limit_exceeded(
+                "The maximum number of pending ASN associations has been reached; \
+                 wait for the associations already asked for to complete and try again",
+            ));
+        }
+        // Through the one insert that keeps the byte budget in step with what the store
+        // holds: the range is already a key, so this re-charges the record it replaces
+        // rather than taking another slot, and it REFUSES the write when the bytes the
+        // enlarged record adds would cross [`MAX_STORED_BYTES`].
+        if !self.insert_byoip_cidr(record) {
+            return Err(resource_limit_exceeded(format!(
+                "The association of the ASN '{asn}' with the address range '{cidr}' does not \
+                 fit inside this emulator's storage budget"
+            )));
+        }
+        self.asn_association_moves.insert(
+            move_key,
+            PendingStateMove::starting_now(ASN_ASSOCIATION_STATE_ASSOCIATED),
+        );
+        Ok(association)
+    }
+}
+
+/// The most ASN associations one BYOIP address range may hold.
+///
+/// A capacity bound in the same style as [`MAX_FPGA_IMAGES`], not an AWS quota: an
+/// association enlarges a stored record and both the range and the ASN come from a request,
+/// so the number one range can accumulate has to be finite. Well above anything a BYOIP
+/// range plausibly needs — AWS's own BYOASN tutorial associates one ASN per CIDR — so a test
+/// is never refused for a reason this emulator cannot have.
+pub const MAX_ASN_ASSOCIATIONS_PER_BYOIP_CIDR: usize = 25;
 
 // ---------------------------------------------------------------------------
 // Public IPv4 address pools

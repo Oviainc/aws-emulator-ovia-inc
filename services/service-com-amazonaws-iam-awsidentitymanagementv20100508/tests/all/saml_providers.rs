@@ -34,7 +34,7 @@ use crate::user_lifecycle::{account_id, call, element, elements, error_code, rou
 /// Assertion Markup Language (SAML) V2.0", §2.3), so the rule cannot be keyed to the text
 /// of one of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MetadataForm {
+pub(crate) enum MetadataForm {
     /// Root `EntityDescriptor`, the metadata namespace declared as the default.
     Entity,
     /// Root `EntityDescriptor`, the metadata namespace bound to the conventional `md`
@@ -58,7 +58,11 @@ fn certificate_body() -> String {
 
 /// A SAML 2.0 metadata document naming `entity_id` as its issuer, stating `valid_until`
 /// as its expiration when one is given, spelled in the requested `form`.
-fn metadata_document(form: MetadataForm, entity_id: &str, valid_until: Option<&str>) -> String {
+pub(crate) fn metadata_document(
+    form: MetadataForm,
+    entity_id: &str,
+    valid_until: Option<&str>,
+) -> String {
     let certificate = certificate_body();
     let expiry = valid_until
         .map(|until| format!(" validUntil=\"{until}\""))
@@ -249,7 +253,7 @@ fn provider_cases() -> Vec<ProviderCase> {
 
 /// A SAML provider ARN is `arn:aws:iam::<account>:saml-provider/<Name>` — IAM is global,
 /// so the region segment is EMPTY, and the provider is named by its `Name`.
-fn expected_arn(name: &str) -> String {
+pub(crate) fn expected_arn(name: &str) -> String {
     format!("arn:aws:iam::{}:saml-provider/{}", account_id(), name)
 }
 

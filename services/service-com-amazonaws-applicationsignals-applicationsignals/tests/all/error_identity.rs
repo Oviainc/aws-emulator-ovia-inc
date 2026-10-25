@@ -138,7 +138,7 @@ async fn a_missing_slo_is_identified_by_its_arn_on_every_read_write_and_delete()
 ///
 /// The rows differ along the name's form and along the rest of the repeated request, which
 /// the identification must not depend on: a different description, the other (mutually
-/// exclusive) SLI config, no config at all.
+/// exclusive) SLI config, a goal and burn rates the stored record does not carry.
 #[tokio::test]
 async fn a_repeated_create_identifies_the_conflicting_slo_by_its_arn() {
     for name in [
@@ -172,7 +172,9 @@ async fn a_repeated_create_identifies_the_conflicting_slo_by_its_arn() {
                     "SliConfig": sli_config("orders", "POST /orders", 999.0) }),
             json!({ "Name": name, "RequestBasedSliConfig": {
                     "RequestBasedSliMetricConfig": { "MetricType": "AVAILABILITY" } } }),
-            json!({ "Name": name }),
+            json!({ "Name": name, "SliConfig": sli_config("checkout", "GET /cart", 100.0),
+                    "Goal": { "AttainmentGoal": 95.0 },
+                    "BurnRateConfigurations": [{ "LookBackWindowMinutes": 60 }] }),
         ];
         for (index, body) in repeats.iter().enumerate() {
             let (status, error) = create(&router, body.clone()).await;

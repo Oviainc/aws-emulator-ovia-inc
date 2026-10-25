@@ -27,6 +27,8 @@ mod connect_peer_delete;
 mod connect_peer_lifecycle;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/core_network_change_events.rs"]
+mod core_network_change_events;
 #[path = "all/core_network_lifecycle.rs"]
 mod core_network_lifecycle;
 #[path = "all/core_network_policy_version_restore.rs"]

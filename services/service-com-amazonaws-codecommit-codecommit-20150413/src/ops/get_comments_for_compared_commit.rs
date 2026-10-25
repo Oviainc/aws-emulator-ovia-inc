@@ -321,10 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     GetCommentsForComparedCommitErrorModeled::CommitDoesNotExistException(
                         CommitDoesNotExistException {
-                            message: Some(format!(
-                                "the commit {commit_id} does not exist in the repository {}",
-                                input.repository_name
-                            )),
+                            message: Some(crate::state::commit_does_not_exist_message(commit_id)),
                         },
                     )
                     .into(),

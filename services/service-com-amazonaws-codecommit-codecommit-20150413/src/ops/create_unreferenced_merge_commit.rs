@@ -642,10 +642,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let commit_does_not_exist = |specifier: &str| {
             CreateUnreferencedMergeCommitErrorModeled::CommitDoesNotExistException(
                 CommitDoesNotExistException {
-                    message: Some(format!(
-                        "the commit {specifier} does not exist in the repository {}",
-                        input.repository_name
-                    )),
+                    message: Some(crate::state::commit_does_not_exist_message(specifier)),
                 }
             )
         };

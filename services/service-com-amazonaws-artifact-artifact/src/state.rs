@@ -431,6 +431,36 @@ pub fn unsupported_support_mode() -> ValidationException {
 /// could not be reported at all: the bound is the resource's, not just one request's.
 pub const TAGS_PER_RESOURCE_LIMIT: usize = 50;
 
+/// The tag-key namespace Amazon Web Services keeps for the tags it applies itself.
+///
+/// Established AWS-wide tagging semantics: a key under this prefix belongs to AWS, so no
+/// caller may create, change or remove one through a service's tagging API, and no such
+/// key is ever part of a caller-created tag set. `TagKey`'s modelled pattern admits `:`,
+/// so nothing at the boundary refuses such a key — the rule lives here, beside the
+/// per-resource count every tag write is checked against.
+///
+/// Tag keys are case-sensitive strings, and what is reserved is this literal lowercase
+/// prefix: a key that merely contains it, or starts with `aws` without the colon, is an
+/// ordinary tag ([`is_reserved_tag_key`]).
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` names a tag in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+///
+/// A PREFIX test on the key as text, so a key carrying the prefix anywhere but at its
+/// start is an ordinary tag.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.starts_with(RESERVED_TAG_KEY_PREFIX)
+}
+
+/// The first key of `keys` that is in the reserved namespace, if any — the one test every
+/// path that writes or removes tags states the rule through.
+pub fn reserved_tag_key<'a, I>(keys: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    keys.into_iter().find(|key| is_reserved_tag_key(key))
+}
+
 /// The visibility of a report AWS publishes in the Artifact catalog: it is visible to
 /// every account, as opposed to a report scoped to one customer.
 pub const VISIBILITY_PUBLIC: &str = "PUBLIC";
@@ -2182,6 +2212,25 @@ pub fn too_many_tags(total: usize) -> ValidationException {
             message,
         }]),
     }
+}
+
+/// The requirement a tag key in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace failed
+/// — the AWS-wide tagging rule stated as the constraint the member's value did not
+/// satisfy.
+pub fn reserved_tag_key_requirement() -> String {
+    format!("Member must not contain a tag key beginning with {RESERVED_TAG_KEY_PREFIX}")
+}
+
+/// The modelled `ValidationException` for a request naming a tag key in the reserved
+/// [`RESERVED_TAG_KEY_PREFIX`] namespace, stated against `member` — the member of THAT
+/// request which carried the key (`tags` on a tag write or a create, `tagKeys` on a
+/// removal).
+///
+/// The same validation envelope every other service-decided refusal here is stated in
+/// ([`field_validation_failed`]): the clause names the member and the requirement its
+/// value failed, and the refused key is not echoed back — the request already carried it.
+pub fn reserved_tag_keys(member: &str) -> ValidationException {
+    field_validation_failed(member, &reserved_tag_key_requirement())
 }
 
 /// The modelled `ValidationException` for a request whose query identifiers name queries

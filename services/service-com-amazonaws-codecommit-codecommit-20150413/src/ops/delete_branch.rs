@@ -214,12 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteBranchErrorModeled::DefaultBranchCannotBeDeletedException(
                     DefaultBranchCannotBeDeletedException {
-                        message: Some(
-                            "The specified branch is the default branch for the repository, \
-                             and cannot be deleted. To delete this branch, you must first set \
-                             another branch as the default branch."
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::default_branch_cannot_be_deleted_message(
+                            &input.branch_name,
+                        )),
                     },
                 )
                 .into(),
