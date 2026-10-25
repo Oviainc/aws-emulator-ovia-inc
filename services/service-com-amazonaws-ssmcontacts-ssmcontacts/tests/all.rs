@@ -19,6 +19,8 @@ mod contact_channel_deactivation;
 mod contact_channel_name_uniqueness;
 #[path = "all/contact_lifecycle.rs"]
 mod contact_lifecycle;
+#[path = "all/contact_plan_references.rs"]
+mod contact_plan_references;
 #[path = "all/contact_updates.rs"]
 mod contact_updates;
 #[path = "all/cross_service_onboarding.rs"]
