@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartRouterOutput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartRouterOutput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartRouterOutput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the router output the request's `@httpLabel Arn` addresses: the STORED record
+//! enters the non-terminal `STARTING` state and the clock settles it into `ACTIVE` one
+//! [`crate::state::TRANSITION_SPAN`] later, so a caller reading the output straight
+//! afterwards still sees the start in flight. Starting an output is also what schedules
+//! the maintenance window it reports: the window is resolved from the output's own
+//! maintenance configuration ([`crate::state::maintenance_window_schedule`], the function
+//! the sibling [`crate::ops::start_router_input`] schedules through) and HELD on the
+//! record, so GetRouterOutput reports the same window this call answered.
+//!
+//! An output that is already started, or already starting, keeps the state it is in; one
+//! the clock still owes a DIFFERENT change (a create or a reconfiguration still settling,
+//! a delete already accepted) is refused with the modelled `ConflictException`, the same
+//! precondition [`crate::ops::stop_router_output`] applies.
 //!
 //! ## Shape of an operation
 //!
@@ -93,6 +98,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The server-side failure for a store this service cannot reach.
+fn store_unavailable(detail: &str) -> StartRouterOutputError {
+    StartRouterOutputErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: detail.to_string(),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -167,18 +180,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartRouterOutput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartRouterOutputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartRouterOutput"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable(
+                "the mediaconnect router output store is unavailable",
+            ));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The ONE lookup a router output operation resolves an `@httpLabel` ARN through,
+        // which materialises the changes the clock already owes first: an output whose
+        // `CREATING` became `STANDBY` while nobody was looking is a settled output a start
+        // can act on, and one whose deletion has come due is gone.
+        let Some(router_output) = store.router_output_mut(&input.arn, now) else {
+            return Err(StartRouterOutputErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.arn),
+                },
+            )
+            .into());
+        };
+
+        // A start MOVES the output's state, so it cannot be accepted for an output that is
+        // on its way out, or one the clock already owes a DIFFERENT state (a create or a
+        // reconfiguration still settling): the output is going away or between two states,
+        // which is the conflict `ConflictException` describes ("would cause a conflict with
+        // the current state of a service resource associated with the request", 409 and
+        // retryable — the caller retries once the transition it is waiting on has settled).
+        // The status and the error code are the contract; the sentence states the
+        // precondition. This is the precondition StopRouterOutput applies, judged the same
+        // way: the on-its-way-out case FIRST, so an output whose removal is owed is refused
+        // whatever state it is reported in rather than answered as a start that succeeded.
+        let conflict = |router_output: &crate::state::StoredRouterOutput| {
+            StartRouterOutputErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Router output {} is in state {} and a state change is already in \
+                     progress, so it cannot be started yet.",
+                    router_output.arn, router_output.state
+                ),
+            })
+        };
+        if router_output.is_deleting() {
+            return Err(conflict(router_output).into());
+        }
+
+        // A router output that is already carrying content, or already on its way there,
+        // keeps the state it is in: a repeat of the start answers the same thing rather
+        // than restarting the transition the first one began.
+        let already_started = router_output.state == crate::state::ROUTER_OUTPUT_STATE_ACTIVE
+            || router_output.state == crate::state::ROUTER_OUTPUT_STATE_STARTING;
+
+        if !already_started {
+            if router_output.is_transitioning() {
+                return Err(conflict(router_output).into());
+            }
+
+            // Starting is not instantaneous: the output reports `STARTING` and the clock
+            // owes it `ACTIVE` — carrying content — one transition span later.
+            router_output.begin_transition(
+                crate::state::ROUTER_OUTPUT_STATE_STARTING,
+                crate::state::ROUTER_OUTPUT_STATE_ACTIVE,
+                now,
+            );
+            // The start changed the resource, so the record's `UpdatedAt` moves with it.
+            router_output.updated_at = now;
+        }
+
+        // A started output has a maintenance window — this response reports both
+        // `MaintenanceSchedule` and `MaintenanceScheduleType` as REQUIRED members — and that
+        // window is the next occurrence of the output's maintenance CONFIGURATION, resolved
+        // once and then stored, so this response and every later read of the output report
+        // the same window. A window the clock has already carried the output past is spent:
+        // the lookup above re-scheduled it, so the window reused here is never in the past.
+        // This is the rule the sibling StartRouterInput applies, through the same function.
+        let maintenance_schedule = match router_output.maintenance_schedule.clone() {
+            Some(maintenance_schedule) => maintenance_schedule,
+            None => {
+                let maintenance_schedule = crate::state::maintenance_window_schedule(
+                    &router_output.maintenance_configuration,
+                    now,
+                );
+                router_output.maintenance_schedule = Some(maintenance_schedule.clone());
+                // Scheduling the window WROTE the record, so `UpdatedAt` moves with it here
+                // too — including for an output that was already started and therefore took
+                // no new state, whose only change this call made is the window.
+                router_output.updated_at = now;
+                maintenance_schedule
+            }
+        };
+
+        // The response is the STORED record: "the current state of the router output after
+        // being started".
+        Ok(StartRouterOutputOutput {
+            arn: router_output.arn.clone(),
+            name: router_output.name.clone(),
+            state: router_output.state.clone(),
+            maintenance_schedule_type: crate::state::MAINTENANCE_SCHEDULE_TYPE_WINDOW.to_string(),
+            maintenance_schedule,
+        })
     }
 }
