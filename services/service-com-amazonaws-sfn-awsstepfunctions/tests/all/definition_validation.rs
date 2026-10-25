@@ -169,7 +169,7 @@ fn cases() -> Vec<Case> {
         // ---------------- definitions that pass verification ----------------
         ("a Pass state with a static Result", HELLO_DEFINITION.to_string(), true),
         (
-            "a Task state, which this emulator does not execute",
+            "a Task state whose Resource names no integration call",
             r#"{"StartAt":"A","States":{"A":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}}}"#.to_string(),
             true,
         ),

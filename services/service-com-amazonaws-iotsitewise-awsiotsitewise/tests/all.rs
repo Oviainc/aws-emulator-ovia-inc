@@ -203,6 +203,8 @@ mod create_computation_model_bounds;
 mod dataset_export_jobs;
 #[path = "all/describe_asset_property.rs"]
 mod describe_asset_property;
+#[path = "all/describe_pipeline_reads.rs"]
+mod describe_pipeline_reads;
 // In its alphabetical place inside the sorted list, rather than appended after
 // it: the end of this file is where every concurrent iotsitewise change appends a
 // declaration of its own, and each append there collided with this one.

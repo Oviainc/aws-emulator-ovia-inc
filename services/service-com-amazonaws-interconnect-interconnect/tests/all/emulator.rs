@@ -23,6 +23,9 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The signing name the model gives this service; also its ARN namespace.
 pub(crate) const SIGNING_NAME: &str = "interconnect";
 
+/// The region the harness signs for unless a suite names another one.
+pub(crate) const DEFAULT_SIGNING_REGION: &str = "us-east-1";
+
 /// The signing name and `endpointPrefix` the Direct Connect model gives that service
 /// (`smithy_query(query="service_info")` on its model: sigv4Name `directconnect`), whose
 /// `awsJson1_1` target prefix is its service shape name, `OvertureService`.
@@ -81,7 +84,7 @@ impl Emulator {
     }
 
     /// `POST /` for one operation of `signing_name`, with that service's target and
-    /// JSON protocol version.
+    /// JSON protocol version, signed for the default region.
     async fn post(
         &self,
         signing_name: &str,
@@ -89,8 +92,14 @@ impl Emulator {
         json_version: &str,
         body: Value,
     ) -> (u16, Value) {
-        self.post_in("us-east-1", signing_name, target, json_version, body)
-            .await
+        self.post_in(
+            DEFAULT_SIGNING_REGION,
+            signing_name,
+            target,
+            json_version,
+            body,
+        )
+        .await
     }
 
     /// [`Self::post`], signed for `region` rather than for the default one.
@@ -132,12 +141,12 @@ impl Emulator {
 
     /// One Interconnect operation (`awsJson1_0`), as a `(status, body)` pair.
     pub(crate) async fn ic(&self, operation: &str, body: Value) -> (u16, Value) {
-        self.ic_in("us-east-1", operation, body).await
+        self.ic_in(DEFAULT_SIGNING_REGION, operation, body).await
     }
 
     /// One Interconnect operation signed for `region`, so a suite's rows can differ in
     /// the Region the request addresses (which is the Region every ARN it mints
-    /// carries).
+    /// carries, and the Region whose connections it sees).
     pub(crate) async fn ic_in(&self, region: &str, operation: &str, body: Value) -> (u16, Value) {
         self.post_in(
             region,
@@ -149,22 +158,17 @@ impl Emulator {
         .await
     }
 
+    /// One Interconnect operation, required to succeed.
+    pub(crate) async fn ic_ok(&self, operation: &str, body: Value) -> Value {
+        self.ic_ok_in(DEFAULT_SIGNING_REGION, operation, body).await
+    }
+
     /// One Interconnect operation signed for `region`, required to succeed.
     pub(crate) async fn ic_ok_in(&self, region: &str, operation: &str, body: Value) -> Value {
         let (status, decoded) = self.ic_in(region, operation, body).await;
         assert_eq!(
             status, 200,
-            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
-        );
-        decoded
-    }
-
-    /// One Interconnect operation, required to succeed.
-    pub(crate) async fn ic_ok(&self, operation: &str, body: Value) -> Value {
-        let (status, decoded) = self.ic(operation, body).await;
-        assert_eq!(
-            status, 200,
-            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
+            "{operation} in {region}: expected HTTP 200, got {status} with body {decoded:?}"
         );
         decoded
     }

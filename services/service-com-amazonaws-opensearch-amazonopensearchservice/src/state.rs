@@ -614,16 +614,259 @@ pub fn is_index_name(value: &str) -> bool {
     !forbidden(first) && !INDEX_NAME_FORBIDDEN_FIRST.contains(&first) && !characters.any(forbidden)
 }
 
+/// `IndexStatus`'s `UPDATED` value — the status `UpdateIndex` reports for the index
+/// whose schema it rewrote, the sibling of [`INDEX_STATUS_CREATED`].
+pub const INDEX_STATUS_UPDATED: &str = "UPDATED";
+
 /// One OpenSearch index of a domain, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Index {
     /// `IndexName`. Unique within the domain, so the name IS the key the domain's
     /// map holds it under.
     pub index_name: String,
-    /// The `IndexSchema` document the call that minted this index carried, stored
-    /// VERBATIM as the modelled document rather than as a parsed mirror of it:
-    /// `GetIndex` answers with "the JSON schema of the index", which is this.
+    /// The `IndexSchema` document this index carries, stored VERBATIM as the
+    /// modelled document rather than as a parsed mirror of it: `GetIndex` answers
+    /// with "the JSON schema of the index", which is this. The create persists the
+    /// document it carried and `UpdateIndex` merges each later change onto it
+    /// ([`merged_index_schema`]).
     pub schema: ::aws_smithy_types::Document,
+}
+
+/// The `IndexSchema` section an index's field mappings live in: `UpdateIndex`
+/// carries "any changes to mappings, settings, and semantic enrichment
+/// configuration", and it is the mapped fields under this one whose types are
+/// settled once written.
+const SCHEMA_MAPPINGS: &str = "mappings";
+
+/// The member a mapped field names its field type in.
+const MAPPING_TYPE: &str = "type";
+
+/// The members a mapping document nests further field mappings under: an object
+/// field's own sub-properties, and a field's additional multi-fields. Neither names
+/// a field itself, so a field's path through them is the path of its ancestors and
+/// its own name only.
+const MAPPING_CONTAINERS: [&str; 2] = ["properties", "fields"];
+
+/// How many values ONE index's schema may hold once an update has been merged onto
+/// it, before that update is refused.
+///
+/// Like [`INDEX_QUOTA`] this is the emulator's OWN bound on the store — the model
+/// publishes none. A create persists ONE document, so the request boundary bounds
+/// what it stores; an update MERGES onto the document the index already carries, so
+/// without this a caller looping with fresh members would grow this process's state
+/// without end, one bounded request at a time.
+pub const INDEX_SCHEMA_QUOTA: usize = 10_000;
+
+/// How many values `schema` holds: the document itself, every member of every named
+/// set in it and every element of every list in it.
+///
+/// What [`INDEX_SCHEMA_QUOTA`] bounds. Iterative rather than recursive, so a deeply
+/// nested document costs no stack.
+pub fn index_schema_values(schema: &::aws_smithy_types::Document) -> usize {
+    use ::aws_smithy_types::Document;
+
+    let mut values = 0_usize;
+    let mut pending = vec![schema];
+    while let Some(node) = pending.pop() {
+        values = values.saturating_add(1);
+        match node {
+            Document::Object(members) => pending.extend(members.values()),
+            Document::Array(elements) => pending.extend(elements.iter()),
+            _ => {}
+        }
+    }
+    values
+}
+
+/// The `ValidationException` payload for an update whose merged schema would hold
+/// more values than [`INDEX_SCHEMA_QUOTA`]. It reports both numbers, so a caller
+/// knows how much of the update to drop.
+pub fn index_schema_over_quota(values: usize) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "IndexSchema would hold {values} values, more than the maximum of \
+             {INDEX_SCHEMA_QUOTA} for one index."
+        )),
+    }
+}
+
+/// A field whose mapped type an update would change: the field's dotted path within
+/// the index's mappings, the type the index maps it with, and the type the update
+/// names for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappingTypeConflict {
+    /// The field's path under `mappings`, the way a mapping document addresses a
+    /// field of an object field (`author.name`).
+    pub field: String,
+    /// The type the stored schema maps the field with.
+    pub from: String,
+    /// The type the update names for it.
+    pub to: String,
+}
+
+/// The mapped field whose type `update` would change against `stored`, or `None`
+/// when the update changes no mapped field's type.
+///
+/// A field's type is settled by the write that first maps it: a later mapping of
+/// the same field may add to it but not re-type it. Walking BOTH documents is what
+/// makes that a property of the stored schema rather than of one request — a field
+/// the stored schema does not map yet has no type to conflict with, and a field the
+/// update does not mention is not touched.
+///
+/// Iterative rather than recursive, so a deeply nested schema costs no stack, and
+/// the conflicts it finds are ordered by field path so the same pair of documents
+/// always reports the same one. A field literally named `properties` or `fields` is
+/// addressed by its parent's path, since those two names are how a mapping document
+/// nests rather than field names.
+pub fn mapping_type_conflict(
+    stored: &::aws_smithy_types::Document,
+    update: &::aws_smithy_types::Document,
+) -> Option<MappingTypeConflict> {
+    use ::aws_smithy_types::Document;
+
+    let (Document::Object(stored_root), Document::Object(update_root)) = (stored, update) else {
+        return None;
+    };
+    let (Some(Document::Object(stored_mappings)), Some(Document::Object(update_mappings))) = (
+        stored_root.get(SCHEMA_MAPPINGS),
+        update_root.get(SCHEMA_MAPPINGS),
+    ) else {
+        return None;
+    };
+
+    let mut conflicts: Vec<MappingTypeConflict> = Vec::new();
+    let mut pending = vec![(String::new(), stored_mappings, update_mappings)];
+    while let Some((path, stored_node, update_node)) = pending.pop() {
+        if !path.is_empty() {
+            if let (Some(from), Some(to)) =
+                (stored_node.get(MAPPING_TYPE), update_node.get(MAPPING_TYPE))
+            {
+                // Compared as documents rather than as type NAMES, so a mapping
+                // carrying something other than a name where its type belongs is
+                // still settled by the write that first made it rather than
+                // rewritten by the next one.
+                if from != to {
+                    conflicts.push(MappingTypeConflict {
+                        field: path.clone(),
+                        from: mapping_type_label(from),
+                        to: mapping_type_label(to),
+                    });
+                }
+            }
+        }
+        // Descend only where BOTH documents carry a mapping node, which is where a
+        // type the stored schema already settled can be contradicted.
+        for (name, update_child) in update_node {
+            let Document::Object(update_child) = update_child else {
+                continue;
+            };
+            let Some(Document::Object(stored_child)) = stored_node.get(name) else {
+                continue;
+            };
+            let child_path = if MAPPING_CONTAINERS.contains(&name.as_str()) {
+                path.clone()
+            } else if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{path}.{name}")
+            };
+            pending.push((child_path, stored_child, update_child));
+        }
+    }
+    conflicts
+        .into_iter()
+        .min_by(|left, right| left.field.cmp(&right.field))
+}
+
+/// How a field's `type` member reads in a refusal: the type name the mapping names,
+/// or the value standing where a type name belongs.
+fn mapping_type_label(value: &::aws_smithy_types::Document) -> String {
+    use ::aws_smithy_types::{Document, Number};
+
+    match value {
+        Document::String(name) => name.clone(),
+        Document::Bool(flag) => flag.to_string(),
+        Document::Null => "null".to_string(),
+        Document::Number(Number::PosInt(unsigned)) => unsigned.to_string(),
+        Document::Number(Number::NegInt(signed)) => signed.to_string(),
+        Document::Number(Number::Float(float)) => float.to_string(),
+        Document::Array(_) => "a list".to_string(),
+        Document::Object(_) => "a set of members".to_string(),
+    }
+}
+
+/// `stored` with `update` merged onto it — the schema an accepted update leaves the
+/// index carrying.
+///
+/// An update carries "any CHANGES to mappings, settings, and semantic enrichment
+/// configuration", so every member it names is written and every member of the
+/// stored schema it does not name stays. Only a member whose value is a named set
+/// of further members is descended into: a scalar, a null and an array are single
+/// values, so one of those replaces whatever the stored schema held there, and an
+/// object that names no member changes nothing.
+///
+/// Iterative rather than recursive, so a deeply nested document costs no stack.
+pub fn merged_index_schema(
+    stored: &::aws_smithy_types::Document,
+    update: &::aws_smithy_types::Document,
+) -> ::aws_smithy_types::Document {
+    use ::aws_smithy_types::Document;
+
+    if !matches!(stored, Document::Object(_)) || !matches!(update, Document::Object(_)) {
+        return update.clone();
+    }
+    let mut merged = stored.clone();
+    let mut pending: Vec<(Vec<String>, &Document)> = vec![(Vec::new(), update)];
+    while let Some((path, node)) = pending.pop() {
+        match node {
+            // A named set of members names no value of its own: it is the way to the
+            // members under it, so one that names none changes nothing.
+            Document::Object(members) => {
+                for (name, child) in members {
+                    let mut child_path = path.clone();
+                    child_path.push(name.clone());
+                    pending.push((child_path, child));
+                }
+            }
+            value => write_member(&mut merged, &path, value.clone()),
+        }
+    }
+    merged
+}
+
+/// Write `value` at `path` in `document`, as [`merged_index_schema`]'s one writing
+/// step. Each node above it that is not a named set of members becomes one, so a
+/// nested member is written without dropping the members beside it.
+fn write_member(
+    document: &mut ::aws_smithy_types::Document,
+    path: &[String],
+    value: ::aws_smithy_types::Document,
+) {
+    use ::aws_smithy_types::Document;
+
+    // The root itself is not a member, so a document that names nothing writes
+    // nothing.
+    let Some((name, ancestors)) = path.split_last() else {
+        return;
+    };
+    let mut node = document;
+    for ancestor in ancestors {
+        if !matches!(node, Document::Object(_)) {
+            *node = Document::Object(::std::collections::HashMap::new());
+        }
+        let Document::Object(members) = node else {
+            return;
+        };
+        node = members
+            .entry(ancestor.clone())
+            .or_insert_with(|| Document::Object(::std::collections::HashMap::new()));
+    }
+    if !matches!(node, Document::Object(_)) {
+        *node = Document::Object(::std::collections::HashMap::new());
+    }
+    if let Document::Object(members) = node {
+        members.insert(name.clone(), value);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3968,6 +4211,21 @@ pub fn malformed_index_schema(member: &str) -> ValidationException {
     ValidationException {
         message: Some(format!(
             "{member} must be a JSON object of index schema sections."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for an update that would re-type a field the
+/// index already maps ([`mapping_type_conflict`]).
+///
+/// It names the field and both types, the way the search engine whose mapping the
+/// update would contradict reports a mapping it cannot merge, so a caller can tell
+/// which field of a many-field update was refused and why.
+pub fn mapping_type_immutable(conflict: &MappingTypeConflict) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "mapper [{}] cannot be changed from type [{}] to [{}]",
+            conflict.field, conflict.from, conflict.to
         )),
     }
 }

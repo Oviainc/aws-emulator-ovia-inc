@@ -824,7 +824,10 @@ async fn listing_filters_by_every_modelled_datastore_status() {
         "case \"delete one\": expected HTTP 200, got {deleted:?}"
     );
 
-    // One row per modelled status, with the set of ids that status must select.
+    // One row per modelled status, with the set of ids that status must select. The
+    // `DELETED` row is empty because no deletion has LANDED here — the one delete above
+    // is still in flight, so its store is `DELETING` — not because that status selects
+    // nothing: `crate::datastore_deleted_window` is the suite for the landed deletion.
     let expectations: Vec<(&str, BTreeSet<String>)> = vec![
         ("CREATING", BTreeSet::new()),
         ("CREATE_FAILED", BTreeSet::new()),
@@ -861,8 +864,10 @@ async fn listing_filters_by_every_modelled_datastore_status() {
 // ---------------------------------------------------------------------------
 
 /// RULE: a deleted data store reports `DELETING`, and once the deletion the clock owes
-/// falls due it is gone — reads answer `ResourceNotFoundException` and it leaves the
-/// listing — while every other store is untouched.
+/// has landed AND the record it left behind has been reaped it is gone — reads answer
+/// `ResourceNotFoundException` and it leaves the listing — while every other store is
+/// untouched. (The `DELETED` phase in between is
+/// `crate::datastore_deleted_window`'s rule; this suite waits past both spans.)
 ///
 /// Rows span how many other stores share the emulator, so the rule is asserted on a
 /// collection, not just on a single store.
@@ -917,7 +922,7 @@ async fn a_deleted_datastore_disappears_and_leaves_its_neighbours_alone() {
         let gone = emulator.get_datastore(&victim).await;
         assert_eq!(
             gone.status, 404,
-            "case neighbours={neighbours}: expected HTTP 404 after the deletion span, got {gone:?}"
+            "case neighbours={neighbours}: expected HTTP 404 once the deletion landed and its record was reaped, got {gone:?}"
         );
         assert_eq!(
             gone.error_code, "ResourceNotFoundException",

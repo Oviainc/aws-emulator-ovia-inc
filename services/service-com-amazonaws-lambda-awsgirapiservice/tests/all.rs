@@ -83,6 +83,8 @@ mod provisioned_concurrency_resolution;
 mod read_representation_and_download_plane;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
+#[path = "all/resource_policy_document.rs"]
+mod resource_policy_document;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/runtime_management_config.rs"]

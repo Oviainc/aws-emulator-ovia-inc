@@ -428,7 +428,10 @@ async fn a_successful_response_keeps_its_response_metadata_request_id() {
 /// The escaping invariant the splice rests on, exercised with REQUEST input rather than a
 /// pre-escaped literal: a name carrying XML metacharacters is quoted back in the message
 /// as entities, so it cannot close `<Message>`, `<Error>` or `<ErrorResponse>` early, and
-/// the envelope still carries exactly one `<RequestId>` in the sibling position.
+/// the envelope still carries exactly one `<RequestId>` in the sibling position. The
+/// delete half of each row answers the identifier refusal instead — such a name is not
+/// one of this service's identifiers — which splices nothing and must keep the same
+/// envelope shape.
 #[tokio::test]
 async fn a_name_carrying_xml_metacharacters_cannot_reshape_the_envelope() {
     let emulator = Emulator::new();
@@ -444,7 +447,12 @@ async fn a_name_carrying_xml_metacharacters_cannot_reshape_the_envelope() {
     ];
 
     for (case, name) in names {
-        for action in ["DescribeCacheParameterGroups", "DeleteCacheParameterGroup"] {
+        // Only the READER resolves such a name against the store and quotes it back: a
+        // DELETE holds the name against the service's identifier grammar first, and none
+        // of these names is a legal identifier, so its refusal quotes no request text at
+        // all (asserted below).
+        let action = "DescribeCacheParameterGroups";
+        {
             let reply = emulator
                 .call(action, &params(&[("CacheParameterGroupName", name)]))
                 .await;
@@ -482,6 +490,35 @@ async fn a_name_carrying_xml_metacharacters_cannot_reshape_the_envelope() {
                 reply.body
             );
         }
+
+        // The delete: a name carrying a metacharacter is not a legal identifier, so it is
+        // the modelled parameter-value refusal — and the envelope is still the one shape,
+        // with its single `<RequestId>` as the last child.
+        let deleted = emulator
+            .call(
+                "DeleteCacheParameterGroup",
+                &params(&[("CacheParameterGroupName", name)]),
+            )
+            .await;
+        assert_eq!(
+            (deleted.status, deleted.error_code()),
+            (400, "InvalidParameterValue"),
+            "case {case:?} on DeleteCacheParameterGroup: expected the identifier refusal, got \
+             {} with {:?}",
+            deleted.status,
+            deleted.body
+        );
+        let request_id = error_envelope_request_id(case, &deleted);
+        assert_request_id_shape(case, &request_id);
+        assert!(
+            deleted
+                .body
+                .trim_end()
+                .ends_with(&format!("<RequestId>{request_id}</RequestId></ErrorResponse>")),
+            "case {case:?} on DeleteCacheParameterGroup: expected the element as the envelope's \
+             last child, got {:?}",
+            deleted.body
+        );
     }
 }
 

@@ -310,7 +310,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         ModifyCacheClusterErrorModeled::CacheParameterGroupNotFoundFault(
                             CacheParameterGroupNotFoundFault {
-                                message: Some(format!("CacheParameterGroup {name} not found.")),
+                                message: Some(
+                                    crate::state::cache_parameter_group_not_found_message(name),
+                                ),
                             },
                         )
                         .into(),
