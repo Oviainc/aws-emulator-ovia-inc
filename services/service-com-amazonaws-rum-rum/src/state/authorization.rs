@@ -122,6 +122,10 @@ pub const UPDATE_RUM_METRIC_DEFINITION: &str = "rum:UpdateRumMetricDefinition";
 /// be allowed to install one.
 pub const LOGS_PUT_RESOURCE_POLICY: &str = "logs:PutResourcePolicy";
 
+/// `iam:PassRole`, the IAM action a caller must hold for a request to hand this service an
+/// IAM role that the service will then assume.
+pub const IAM_PASS_ROLE: &str = "iam:PassRole";
+
 /// The `rum:alias` condition key, which `PutRumEventsRequest$Alias` documents: "This alias
 /// will be compared to the `rum:alias` context key in the resource-based policy."
 pub const ALIAS_CONDITION_KEY: &str = "rum:alias";
@@ -236,6 +240,23 @@ pub fn authorize_identity<Eng: Send + Sync + 'static>(
     resource: &str,
 ) -> Result<(), Denied> {
     authorize(engine, ctx, action, resource, None, &[])
+}
+
+/// Whether the caller may hand this service the IAM role `role_arn` to assume.
+///
+/// Passing a role to a service is a permission of the CALLER's, not of the service: a
+/// request that names a role the service will assume is allowed only when the caller holds
+/// `iam:PassRole` for that very role, so a caller allowed this service's own action alone
+/// cannot hand it an arbitrary role. The role lives in IAM, which holds no RUM resource
+/// policy, so the decision is identity-based ([`authorize_identity`]) and is taken against
+/// the role's ARN; an operation makes it BEFORE it writes anything, so a refused request
+/// stores no role.
+pub fn caller_may_pass_role<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    role_arn: &str,
+) -> Result<(), Denied> {
+    authorize_identity(engine, ctx, IAM_PASS_ROLE, role_arn)
 }
 
 /// The principal this request speaks for, and the identity-based policies in force on it.
