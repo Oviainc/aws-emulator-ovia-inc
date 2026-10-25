@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNode
-//! Implemented: removes a stored node from its network in [`crate::state`] — "All data
-//! on the node is lost and cannot be recovered" — so a later `GetNode` answers
-//! `ResourceNotFoundException` and `ListNodes` no longer reports it.
+//! Implemented: STARTS the removal of a stored node of its network in [`crate::state`].
+//! The record stays readable and reports the stage of the removal through its status —
+//! `DELETING` while it runs, `DELETED` once the clock owes it — so a later `GetNode`
+//! answers 200 with that status and `ListNodes` reports the node under it.
 //!
 //! ## Shape of an operation
 //!
@@ -163,8 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
-        guard.settle(::std::time::SystemTime::now());
+        guard.settle(now);
 
         // `DELETE /networks/{NetworkId}/nodes/{NodeId}` nests the node INSIDE the
         // network, so the path labels resolve left to right: a `NetworkId` this service
@@ -212,9 +214,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "The requested resource exists but isn't in a status that can complete the
-        // operation" (`ResourceNotReadyException`): a node still being created cannot be
-        // deleted yet.
-        if node.status != crate::state::STATUS_AVAILABLE {
+        // operation" (`ResourceNotReadyException`): a node whose creation has not finished
+        // ("CREATING - The Amazon Web Services account is in the process of creating a
+        // node", `Node$Status`) cannot be deleted yet. Every other status can be —
+        // `INACCESSIBLE_ENCRYPTION_KEY` explicitly so, "When a resource is in this state,
+        // we recommend deleting and recreating the resource" — so the refusal names that
+        // one status rather than everything other than `AVAILABLE`, exactly as
+        // `DeleteMember` refuses its own. A node already `DELETING` or `DELETED` has no
+        // deletion left to start, and this operation models no state-conflict error for
+        // one, so a repeated delete succeeds while leaving the status and the due instant
+        // the first one set: it never re-arms the transition.
+        if node.status == crate::state::STATUS_CREATING {
             return Err(DeleteNodeErrorModeled::ResourceNotReadyException(
                 ResourceNotReadyException {
                     message: Some(format!(
@@ -228,18 +238,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(network) = guard.network_mut(&region, &input.network_id) else {
+        let node = guard
+            .network_mut(&region, &input.network_id)
+            .and_then(|network| network.node_mut(&region, &input.node_id));
+        let Some(node) = node else {
             return Err(DeleteNodeErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {},
             )
             .into());
         };
-        // "All data on the node is lost and cannot be recovered": the record goes, so
-        // every later read of it is a `ResourceNotFoundException`.
-        network.nodes.remove(&input.node_id);
-        // And so does the idempotency record of the create that minted it: replaying
-        // that token could only hand back an id nothing holds, and the ledger must not
-        // outlive the resources it describes.
+        // The deletion is ASYNCHRONOUS, and `NodeStatus` says how it is reported:
+        // "DELETING - The node is in the process of being deleted", then "DELETED - The
+        // node can no longer participate on the network". So this call STARTS the removal
+        // and the record stays readable in those statuses — a caller that polls `GetNode`
+        // watches it reach the terminal one, and `ListNodes` reports it under the status it
+        // currently holds — while the clock owes `DELETED` a `DELETION_SPAN` later. It is
+        // the same two-stage removal `DeleteMember` starts for a member and the nodes that
+        // go with it, through the same `begin_deletion`.
+        node.begin_deletion(now);
+
+        // The idempotency ledger must not outlive the resources it describes: the node is
+        // the only id the create that minted it named of its own, and a node whose removal
+        // has begun is not one a replayed token could hand back, so that record goes.
         guard.forget_node_token(&input.node_id);
 
         Ok(DeleteNodeOutput {})

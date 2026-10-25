@@ -49,6 +49,8 @@ mod get_table_entity_not_found;
 mod glossaries;
 #[path = "all/job_listing.rs"]
 mod job_listing;
+#[path = "all/job_run_listing.rs"]
+mod job_run_listing;
 #[path = "all/job_runs.rs"]
 mod job_runs;
 #[path = "all/job_updates.rs"]
