@@ -74,12 +74,16 @@ pub const MAX_PULL_THROUGH_CACHE_RULES: usize = 1_000;
 /// past it the create is refused with the `LimitExceededException` that operation models.
 pub const MAX_REPOSITORY_CREATION_TEMPLATES: usize = 1_000;
 
-/// See [`MAX_REPOSITORIES`]. This one bounds `pull_time_update_exclusions`, which grows
-/// by one entry per `RegisterPullTimeUpdateExclusion` naming a principal the registry
-/// does not already exclude; past it a register is refused with the
-/// `LimitExceededException` that operation models. AWS publishes no fixed quota for
-/// pull time update exclusions, so this is the emulator's own bound.
-pub const MAX_PULL_TIME_UPDATE_EXCLUSIONS: usize = 1_000;
+/// How many pull time update exclusions one registry holds. Unlike the caps above this
+/// is NOT the emulator's own number: the model states it, because
+/// `ListPullTimeUpdateExclusions`'s `pullTimeUpdateExclusions` member targets
+/// `PullTimeUpdateExclusionList`, a list declared `@length(min: 0, max: 100)` — read with
+/// `smithy_query(query="shape",shape="PullTimeUpdateExclusionList")`. A collection whose
+/// own read side cannot report more than that many entries cannot hold more than that
+/// many, so `pull_time_update_exclusions` is bounded here at the modelled maximum and a
+/// `RegisterPullTimeUpdateExclusion` that would push it past the bound is refused with
+/// the `LimitExceededException` that operation models, storing nothing.
+pub const MAX_PULL_TIME_UPDATE_EXCLUSIONS: usize = 100;
 
 /// The `ImageStatus` of an image in Amazon ECR standard storage: what a push stores,
 /// and what an image restored out of archive is back in. Which status an image has is
@@ -2874,6 +2878,19 @@ pub fn pull_time_update_exclusion_already_exists_message(principal_arn: &str) ->
     format!(
         "The pull time update exclusion for principal arn '{principal_arn}' already \
          exists in registry with id '{}'",
+        registry_id()
+    )
+}
+
+/// The wording ECR uses when a register would carry the registry past the number of pull
+/// time update exclusions it may hold — `LimitExceededException`. Built the same way as
+/// the two messages above, from the registry the request addressed and the bound it met:
+/// [`MAX_PULL_TIME_UPDATE_EXCLUSIONS`], which is the maximum the model declares for the
+/// list the read side reports.
+pub fn pull_time_update_exclusion_limit_message() -> String {
+    format!(
+        "The registry with id '{}' has the maximum number of pull time update exclusions \
+         allowed, which is {MAX_PULL_TIME_UPDATE_EXCLUSIONS}.",
         registry_id()
     )
 }

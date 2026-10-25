@@ -194,18 +194,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The list is bounded: past its cap a register is refused rather than adding
-        // another record. See [`crate::state::MAX_PULL_TIME_UPDATE_EXCLUSIONS`].
+        // The list is bounded at the maximum the model declares for it, so past that
+        // bound a register is refused rather than adding another record — and nothing is
+        // stored for the refused principal. See
+        // [`crate::state::MAX_PULL_TIME_UPDATE_EXCLUSIONS`].
         if store.pull_time_update_exclusions.len() >= crate::state::MAX_PULL_TIME_UPDATE_EXCLUSIONS
         {
             return Err(
                 RegisterPullTimeUpdateExclusionErrorModeled::LimitExceededException(
                     LimitExceededException {
-                        message: Some(format!(
-                            "this registry already holds the maximum of {} pull time update \
-                             exclusions",
-                            crate::state::MAX_PULL_TIME_UPDATE_EXCLUSIONS
-                        )),
+                        message: Some(
+                            crate::state::pull_time_update_exclusion_limit_message(),
+                        ),
                     },
                 )
                 .into(),

@@ -35,10 +35,24 @@ const MAX_PRINCIPAL_ARN_LEN: usize = 200;
 /// page is still compared in full. (The sibling suite's walker is module-private to it,
 /// and it walks a caller-chosen page size rather than every page of the default one.)
 async fn all_exclusions(router: &MultiServiceRouter, case: &str) -> Vec<String> {
+    all_exclusions_paged(router, case, None).await
+}
+
+/// The same walk as [`all_exclusions`], asking for `max_results` entries per page — for
+/// a case that has to cross a page boundary on a list the registry's quota keeps below
+/// the default page size.
+async fn all_exclusions_paged(
+    router: &MultiServiceRouter,
+    case: &str,
+    max_results: Option<usize>,
+) -> Vec<String> {
     let mut all: Vec<String> = Vec::new();
     let mut token: Option<String> = None;
     loop {
         let mut request = json!({});
+        if let Some(size) = max_results {
+            request["maxResults"] = json!(size);
+        }
         if let Some(ref next) = token {
             request["nextToken"] = json!(next);
         }
@@ -58,6 +72,13 @@ async fn all_exclusions(router: &MultiServiceRouter, case: &str) -> Vec<String> 
                     .to_string()
             })
             .collect::<Vec<String>>();
+        if let Some(size) = max_results {
+            assert!(
+                page.len() <= size,
+                "case {case:?}: a page may hold at most {size} entries, got {}",
+                page.len()
+            );
+        }
         all.extend(page);
         token = body["nextToken"].as_str().map(ToString::to_string);
         if token.is_none() {
@@ -336,9 +357,12 @@ async fn a_deregistered_principal_can_be_registered_again() {
 #[tokio::test]
 async fn removals_from_a_multi_page_list_leave_every_remaining_page_walkable() {
     let router = emulator();
-    // More exclusions than the documented 100-entry page, so the walk below crosses a
-    // page boundary both before and after the removals.
-    let count = 137;
+    // The registry holds at most as many exclusions as `PullTimeUpdateExclusionList`'s
+    // modelled `@length(max: 100)` admits, which is also the default page size, so the
+    // walks below ask for a smaller page: with this many entries the walk crosses a page
+    // boundary several times, both before and after the removals.
+    let count = 97;
+    let page_size = 7;
     let mut remaining: Vec<String> = Vec::new();
     for index in 0..count {
         let arn = generated_arn(index);
@@ -376,7 +400,7 @@ async fn removals_from_a_multi_page_list_leave_every_remaining_page_walkable() {
     remaining.retain(|held| !removed.contains(held));
 
     assert_eq!(
-        all_exclusions(&router, "after the scattered removals").await,
+        all_exclusions_paged(&router, "after the scattered removals", Some(page_size)).await,
         remaining,
         "every remaining exclusion is still walkable, in principal-ARN order, with \
          {} removed of {count}",
