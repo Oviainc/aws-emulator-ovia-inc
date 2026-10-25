@@ -945,14 +945,13 @@ async fn update_stage_changes_only_the_members_supplied() {
         "recordingReconnectWindowSeconds": 15,
     });
     // What a read reports back: the members the request supplied, plus every member it
-    // left out at the default the model documents for it.
-    // `recordParticipantReplicas` carries `@default: false`, so the framework has
-    // already materialised `false` by the time the handler sees the request.
+    // left out at the default the model documents for it — `recordParticipantReplicas`
+    // included, whose doc states "Default: `true`".
     let stored_recording = json!({
         "storageConfigurationArn": storage.as_str(),
         "mediaTypes": ["AUDIO_ONLY"],
         "recordingReconnectWindowSeconds": 15,
-        "recordParticipantReplicas": false,
+        "recordParticipantReplicas": true,
         "thumbnailConfiguration": {
             "targetIntervalSeconds": 60,
             "storage": ["SEQUENTIAL"],
@@ -1354,7 +1353,7 @@ async fn every_stage_projection_carries_endpoints_a_recording_configuration_and_
                 "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_ONLY"],
                 "recordingReconnectWindowSeconds": 30,
-                "recordParticipantReplicas": false,
+                "recordParticipantReplicas": true,
                 "thumbnailConfiguration": {
                     "targetIntervalSeconds": 60,
                     "storage": ["SEQUENTIAL"],
@@ -1484,7 +1483,7 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
                 "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_VIDEO"],
                 "recordingReconnectWindowSeconds": 0,
-                "recordParticipantReplicas": false,
+                "recordParticipantReplicas": true,
                 "thumbnailConfiguration": {
                     "targetIntervalSeconds": 60,
                     "storage": ["SEQUENTIAL"],
@@ -1503,7 +1502,7 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
                 "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_ONLY"],
                 "recordingReconnectWindowSeconds": 0,
-                "recordParticipantReplicas": false,
+                "recordParticipantReplicas": true,
                 "thumbnailConfiguration": {
                     "targetIntervalSeconds": 60,
                     "storage": ["SEQUENTIAL"],
@@ -1526,7 +1525,7 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
                 "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["NONE"],
                 "recordingReconnectWindowSeconds": 0,
-                "recordParticipantReplicas": false,
+                "recordParticipantReplicas": true,
                 "thumbnailConfiguration": {
                     "targetIntervalSeconds": 1,
                     "storage": ["SEQUENTIAL"],
@@ -1548,7 +1547,7 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
                 "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_VIDEO"],
                 "recordingReconnectWindowSeconds": 0,
-                "recordParticipantReplicas": false,
+                "recordParticipantReplicas": true,
                 "thumbnailConfiguration": {
                     "targetIntervalSeconds": 86_400,
                     "storage": ["SEQUENTIAL", "LATEST"],
@@ -1568,7 +1567,7 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
                 "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_VIDEO"],
                 "recordingReconnectWindowSeconds": 0,
-                "recordParticipantReplicas": false,
+                "recordParticipantReplicas": true,
                 "thumbnailConfiguration": {
                     "targetIntervalSeconds": 60,
                     "storage": ["SEQUENTIAL"],

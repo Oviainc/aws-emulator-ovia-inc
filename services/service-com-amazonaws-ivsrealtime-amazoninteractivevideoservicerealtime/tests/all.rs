@@ -25,6 +25,8 @@ mod delete_ingest_configuration;
 mod delete_stage_associations;
 #[path = "all/disconnect_participant.rs"]
 mod disconnect_participant;
+#[path = "all/documented_member_defaults.rs"]
+mod documented_member_defaults;
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
 #[path = "all/encoder_configuration_in_use.rs"]

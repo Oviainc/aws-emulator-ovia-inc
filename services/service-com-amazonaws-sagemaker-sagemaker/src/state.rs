@@ -1781,11 +1781,15 @@ impl PipelineExecution {
 }
 
 /// A batch transform job created by `CreateTransformJob`, as `DescribeTransformJob`
-/// replays it.
+/// replays it and `ListTransformJobs` summarises it.
 ///
 /// `ends_at` is the instant the clock owes the job's terminal status; it is stored,
 /// never slept on, and materialised by whichever reporting call first runs at or after
 /// it.
+///
+/// `last_modified_time` starts at the creation instant and moves only when the record
+/// does, which is what `ListTransformJobs`' `LastModifiedTime` bounds select on and what
+/// its summaries report.
 #[derive(Debug, Clone)]
 pub struct TransformJob {
     pub name: String,
@@ -1806,6 +1810,7 @@ pub struct TransformJob {
     pub experiment_config: Option<ExperimentConfig>,
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
     pub transform_end_time: Option<SystemTime>,
     pub ends_at: SystemTime,
 }
@@ -1816,7 +1821,8 @@ impl TransformJob {
     /// This is the one write a reporting operation may make: the job was due to end at
     /// `ends_at` whether or not anybody called, so the observer makes no difference to
     /// the result. `TransformEndTime` is the instant the end was due, not "now", so the
-    /// value is stable across later reads.
+    /// value is stable across later reads, and `LastModifiedTime` moves to that same
+    /// instant for the same reason.
     ///
     /// The status is [`TRANSFORM_STATUS_FAILED`] with [`TRANSFORM_NOT_RUN_FAILURE`]: see
     /// that constant for why a job this emulator accepted cannot end `Completed`.
@@ -1827,6 +1833,7 @@ impl TransformJob {
             self.status = TRANSFORM_STATUS_FAILED.to_string();
             self.failure_reason = Some(TRANSFORM_NOT_RUN_FAILURE.to_string());
             self.transform_end_time = Some(self.ends_at);
+            self.last_modified_time = self.ends_at;
             return true;
         }
         false

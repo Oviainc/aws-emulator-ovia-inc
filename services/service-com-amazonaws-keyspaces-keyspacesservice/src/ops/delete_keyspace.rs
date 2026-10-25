@@ -177,8 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // The service-managed keyspaces are part of the account before any call.
-        store.ensure_service_managed_catalog(&region);
         store.settle(now);
 
         // A service-managed keyspace is not a resource a client owns: Cassandra refuses
@@ -193,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(keyspace) = store.keyspaces.get_mut(&input.keyspace_name) else {
+        let Some(keyspace) = store.keyspace_mut(&region, &input.keyspace_name) else {
             return Err(DeleteKeyspaceErrorModeled::ResourceNotFoundException(
                 crate::state::keyspace_not_found(&region, &input.keyspace_name),
             )

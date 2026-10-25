@@ -215,27 +215,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        // The service-managed keyspaces are part of the account before any call, so an
-        // account that created nothing still enumerates them.
-        store.ensure_service_managed_catalog(&region);
         // Reporting, not mutating: settling only materialises the status transitions the
         // clock already owed at this instant, which a later caller would have seen anyway.
         store.settle(::std::time::SystemTime::now());
 
+        // Every keyspace this Region holds: the ones created in it, and the
+        // service-managed catalog it holds before any call. A keyspace created in another
+        // Region is not one of them — "keyspace names must be unique within each Region",
+        // so a keyspace belongs to the Region it was created in.
+        //
         // One page, plus one lookahead item: the token is present exactly when a keyspace
         // follows the last one on this page, so the final page carries none.
-        let mut scanned: Vec<&crate::state::Keyspace> = match resume_after.as_deref() {
-            Some(after) => store
-                .keyspaces
-                .range::<str, _>((
-                    ::std::ops::Bound::Excluded(after),
-                    ::std::ops::Bound::Unbounded,
-                ))
-                .map(|(_, keyspace)| keyspace)
-                .take(page_size + 1)
-                .collect(),
-            None => store.keyspaces.values().take(page_size + 1).collect(),
-        };
+        let visible = store.keyspaces(&region);
+        let mut scanned: Vec<&crate::state::Keyspace> = visible
+            .iter()
+            .map(|keyspace| keyspace.as_ref())
+            .filter(|keyspace| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| keyspace.name.as_str() > after)
+            })
+            .take(page_size + 1)
+            .collect();
         let truncated = scanned.len() > page_size;
         scanned.truncate(page_size);
         let next_token = match truncated {

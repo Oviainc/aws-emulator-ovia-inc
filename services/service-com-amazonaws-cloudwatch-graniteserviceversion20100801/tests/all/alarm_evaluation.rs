@@ -29,13 +29,15 @@
 //! The recorded case the issue was filed about (a `SearchableDocuments` datapoint driven
 //! past an alarm's threshold, and a forged `AWS/ES` datapoint) is one row of each table.
 
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{build_router, call, error_code, ok};
+use crate::harness::{
+    build_router, call, element, emulator, error_code, grant_sns_delivery, now_secs, ok, rpc, sns,
+    wait_for_evaluation,
+};
 
 /// The customer namespace the alarm rows below watch.
 const NAMESPACE: &str = "Custom/OpenSearch";
@@ -43,36 +45,12 @@ const NAMESPACE: &str = "Custom/OpenSearch";
 /// The metric the alarm rows below watch.
 const METRIC: &str = "SearchableDocuments";
 
-/// Long enough for a metric alarm's first evaluation to come due.
-///
-/// `PutMetricAlarm` sets a new alarm to `INSUFFICIENT_DATA` and the evaluated state is owed a
-/// span later (`crate::state::alarm_evaluation::EVALUATION_DELAY_SECS`, inside the
-/// framework's 250-750 ms window for a transition the clock owes), so a test that wants the
-/// EVALUATED state waits past the top of that window.
-const PAST_EVALUATION_DELAY: Duration = Duration::from_millis(900);
-
-/// Wait for every alarm evaluation started before now to be due.
-///
-/// A thread sleep rather than `tokio::time::sleep`: this workspace enables tokio's `macros`
-/// and `rt` features only, so there is no timer driver to await on. Each test here drives one
-/// router with no concurrent task, so blocking its own runtime thread holds nothing up.
-fn wait_for_evaluation() {
-    std::thread::sleep(PAST_EVALUATION_DELAY);
-}
-
 /// The shortest `Period` an alarm may be evaluated on: "Valid values are 10, 20, 30, and any
 /// multiple of 60." (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Period")`).
 ///
 /// The rows that wait out a span measured in evaluation periods use it, so they wait the
 /// shortest span an alarm can be configured for.
 const SHORTEST_PERIOD_SECS: i32 = 10;
-
-/// Wall-clock now as epoch seconds, the clock the evaluation windows are measured against.
-fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |since| since.as_secs_f64())
-}
 
 /// The alarm every row of the evaluation table starts from: one 60-second period, one
 /// evaluation period, a static threshold of 10 and a `GreaterThanThreshold` comparison.
@@ -1110,143 +1088,6 @@ async fn a_publish_into_the_reserved_namespace_is_refused_and_stores_nothing() {
             usize::from(*accepted)
         );
     }
-}
-
-/// The emulator the end-to-end test drives: CloudWatch, SNS and SQS on ONE engine, because
-/// an alarm's action is an SNS topic and the notification is asserted where a client sees
-/// it — on the queue subscribed to that topic.
-pub(crate) struct Emulator {
-    pub(crate) router: MultiServiceRouter,
-}
-
-pub(crate) fn emulator() -> Emulator {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    router.register_service(
-        service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
-        Arc::clone(&engine),
-    ))
-    ;
-    Emulator { router }
-}
-
-/// The Region every end-to-end call below is signed for.
-const REGION: &str = "us-east-1";
-
-/// One `awsJson` RPC call against the service whose signing name is `signing_name` — the
-/// credential scope is what routes it.
-pub(crate) async fn rpc(
-    emulator: &Emulator,
-    signing_name: &str,
-    target_prefix: &str,
-    operation: &str,
-    body: &Value,
-) -> Value {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("host", format!("{signing_name}.{REGION}.amazonaws.com"))
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("{target_prefix}.{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTEST/20260101/{REGION}/{signing_name}/\
-                 aws4_request, SignedHeaders=host, Signature=0000"
-            ),
-        )
-        .body(bytes::Bytes::from(body.to_string()))
-        .expect("the test request is well formed");
-    let response = emulator.router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = response.into_body();
-    let parsed: Value = if payload.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&payload).unwrap_or(Value::Null)
-    };
-    assert_eq!(
-        status, 200,
-        "{operation}: expected HTTP 200, got {status} with body {parsed}"
-    );
-    parsed
-}
-
-/// One awsQuery form call against SNS, the protocol that service serves.
-pub(crate) async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
-    let mut body = format!("Action={action}&Version=2010-03-31");
-    for (name, value) in params {
-        body.push('&');
-        body.push_str(name);
-        body.push('=');
-        for byte in value.bytes() {
-            match byte {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    body.push(char::from(byte));
-                }
-                other => body.push_str(&format!("%{other:02X}")),
-            }
-        }
-    }
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("host", format!("sns.{REGION}.amazonaws.com"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTEST/20260101/{REGION}/sns/aws4_request, \
-                 SignedHeaders=host, Signature=0000"
-            ),
-        )
-        .body(bytes::Bytes::from(body))
-        .expect("the test request is well formed");
-    let response = emulator.router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let text = String::from_utf8_lossy(response.body()).to_string();
-    assert_eq!(status, 200, "{action}: expected HTTP 200, got {status} / {text}");
-    text
-}
-
-/// The text of the first `<tag>…</tag>` element of an awsQuery response.
-pub(crate) fn element(body: &str, tag: &str) -> String {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = body
-        .find(&open)
-        .unwrap_or_else(|| panic!("no <{tag}> in {body}"))
-        + open.len();
-    let end = body[start..]
-        .find(&close)
-        .unwrap_or_else(|| panic!("no </{tag}> in {body}"));
-    body[start..start + end].to_string()
-}
-
-/// The queue policy AWS documents for an SQS queue subscribed to an SNS topic: the service
-/// principal `sns.amazonaws.com`, allowed `sqs:SendMessage` on that queue.
-pub(crate) fn grant_sns_delivery(queue_arn: &str) -> String {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Sid": "AllowSNSDelivery",
-            "Effect": "Allow",
-            "Principal": {"Service": "sns.amazonaws.com"},
-            "Action": "sqs:SendMessage",
-            "Resource": queue_arn,
-        }],
-    })
-    .to_string()
 }
 
 #[tokio::test]

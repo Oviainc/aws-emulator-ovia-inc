@@ -37,6 +37,8 @@ mod procurement_portal_preferences;
 mod procurement_portal_suppliers;
 #[path = "all/procurement_portals.rs"]
 mod procurement_portals;
+#[path = "all/refused_procurement_portal_writes.rs"]
+mod refused_procurement_portal_writes;
 #[path = "all/retired_units_and_portal_validation.rs"]
 mod retired_units_and_portal_validation;
 #[path = "all/state_roundtrip.rs"]

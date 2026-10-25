@@ -191,6 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The actions the forced transition fires go out here, together with every
         // evaluation the clock has already made due.
         crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+        // The forced state stands for its own span and the evaluation takes the alarm back
+        // over at its end, with no further CloudWatch call needed to materialise that
+        // transition or to deliver what it owes.
+        crate::state::alarm_actions::drive_alarm_clock(&self.engine, ctx);
 
         Ok(SetAlarmStateOutput)
     }
@@ -236,6 +240,9 @@ fn force_state(
         // state again from its end.
         stored.evaluation_due_secs =
             now + crate::state::alarm_evaluation::forced_state_span_secs(&stored.alarm);
+        // And the state stands for that span even as new datapoints arrive, which is what
+        // makes it a forced state rather than a value the next write overwrites.
+        stored.forced_state_until_secs = Some(stored.evaluation_due_secs);
         // "When the updated state differs from the previous value, the action configured
         // for the appropriate state is invoked. For example, if your alarm is configured
         // to send an Amazon SNS message when an alarm is triggered, temporarily changing
@@ -259,12 +266,17 @@ fn force_state(
         // guaranteed to return to its actual state. It returns to its actual state only
         // once any of its children alarms change state." — so the forced state is stored
         // together with the children's states as they stand now, and the evaluation
-        // takes the alarm back over as soon as that snapshot no longer holds.
-        let snapshot = store
+        // takes the alarm back over as soon as that snapshot no longer holds. The same
+        // children are what the notification this force publishes reports.
+        let children = store
             .composite_alarms
             .get(&input.alarm_name)
-            .map(|stored| store.child_states_of(&stored.child_names))
+            .map(|stored| store.child_alarm_states(&stored.child_names))
             .unwrap_or_default();
+        let snapshot: Vec<(String, Option<String>)> = children
+            .iter()
+            .map(|child| (child.name.clone(), child.state_value.clone()))
+            .collect();
         if let Some(stored) = store.composite_alarms.get_mut(&input.alarm_name) {
             let previous = crate::state::AlarmStateSnapshot::of_composite_alarm(&stored.alarm);
             let changed = stored.alarm.state_value.as_deref() != Some(input.state_value.as_str());
@@ -282,6 +294,7 @@ fn force_state(
                 .then(|| {
                     crate::state::alarm_actions::AlarmNotification::of_composite_transition(
                         &stored.alarm,
+                        &children,
                         previous.state_value.as_deref(),
                         now,
                     )
@@ -340,6 +353,7 @@ fn force_state(
     // This alarm's new state is an input to every composite alarm whose rule references
     // it, so the alarms downstream of this write are evaluated now rather than at
     // whatever call happens to read them next — out of the same budget as the pass above.
+    store.make_parents_due(&input.alarm_name, now);
     store.evaluate_composite_alarms(now, budget);
     Ok(())
 }

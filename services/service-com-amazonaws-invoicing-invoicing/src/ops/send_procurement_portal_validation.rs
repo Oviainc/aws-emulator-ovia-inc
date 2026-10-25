@@ -19,13 +19,12 @@
 //! Minting a code and answering 200 would claim a delivery that did not happen and hand a
 //! caller an OTP the real service only ever delivers through the portal.
 //!
-//! The ATTEMPT is still recorded against the preference
-//! ([`crate::state::StoredProcurementPortalPreference::unconfirmed_validation_attempts`]),
-//! because this call did act on the resource: starting a validation is a write of the
-//! preference, so `Version` — "the version number of the procurement portal preference
-//! configuration" — and `LastUpdateDate` advance, while the plane's verification status
-//! does not move (nothing verified it). None of the attempt record reaches the wire: the
-//! modelled response carries only the ARN.
+//! The refusal leaves the preference exactly as the last SUCCESSFUL write left it:
+//! `Version` is "the version number of the procurement portal preference configuration",
+//! so a call that wrote no configuration and answered 4xx advances neither it nor
+//! `LastUpdateDate`, and no plane's verification status moves (nothing verified it). A
+//! later `GetProcurementPortalPreference` / `ListProcurementPortalPreferences` therefore
+//! reports the same version a reader saw before this call.
 //!
 //! `VerifyProcurementPortalValidation` checks a submitted code against the one issued for
 //! the preference ([`crate::state::IssuedPortalValidation`]), and refuses every
@@ -235,15 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::state_unavailable(),
             )
         })?;
-        let mut store = state.lock();
-        let attempted_at = crate::state::now();
+        let store = state.lock();
 
         // The ARN has to name a preference this emulator holds: validation is state
         // ABOUT a preference, so there is nothing to start for one that does not exist.
         // The model declares `ResourceNotFoundException` (HTTP 404) for exactly this.
         let stored = store
             .procurement_portal_preferences
-            .get_mut(&input.procurement_portal_preference_arn)
+            .get(&input.procurement_portal_preference_arn)
             .ok_or_else(|| {
                 SendProcurementPortalValidationErrorModeled::ResourceNotFoundException(
                     crate::state::no_such_procurement_portal_preference(
@@ -252,20 +250,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        // Starting the validation is what this call DOES, so it writes: the attempt is
-        // recorded against the preference, and `Version` and `LastUpdateDate` advance with
-        // it, the way every write of this resource reports them. The plane's verification
-        // status is NOT moved: nothing verified the portal connection.
-        stored.unconfirmed_validation_attempts = stored.unconfirmed_validation_attempts.saturating_add(1);
-        stored.preference.version = stored.preference.version.saturating_add(1);
-        stored.preference.last_update_date = attempted_at;
-
         // A code exists only once the test e-invoice carrying it has been delivered to
         // the preference's procurement portal. That portal is outside this emulator,
         // which performs no outbound delivery and hosts no procurement portal, so the
         // delivery is never confirmed and the call is refused with the modelled 400 —
         // it issues no code, so no `VerifyProcurementPortalValidation` can complete a
         // connection nothing tested.
+        //
+        // Nothing is written on the way out: this call changed no configuration of the
+        // preference, so `Version` and `LastUpdateDate` stay at what the last successful
+        // write left, and the preference is read (not `get_mut`) above for that reason.
         Err(
             SendProcurementPortalValidationErrorModeled::ValidationException(
                 test_einvoice_delivery_not_confirmed(test_einvoice_delivery_endpoint(
