@@ -26,10 +26,10 @@ pub mod network;
 mod vpc_topology;
 
 use crate::ops::types::{
-    Action, AvailabilityZone, Certificate, Listener, ListenerAttribute, LoadBalancer,
-    LoadBalancerAddress, LoadBalancerState, Matcher, Rule, RuleCondition, RuleTransform,
-    TargetDescription, TargetGroup, TargetGroupAttribute, TargetHealth, TargetHealthDescription,
-    TrustStore,
+    Action, AvailabilityZone, Certificate, IpamPools, Listener, ListenerAttribute, LoadBalancer,
+    LoadBalancerAddress, LoadBalancerAttribute, LoadBalancerState, Matcher, Rule, RuleCondition,
+    RuleTransform, SubnetMapping, TargetDescription, TargetGroup, TargetGroupAttribute,
+    TargetHealth, TargetHealthDescription, TrustStore,
 };
 
 /// How long after the call that starts it a load balancer owes its move out of
@@ -149,7 +149,9 @@ pub struct AvailabilityZoneRecord {
 }
 
 impl AvailabilityZoneRecord {
-    fn to_shape(&self) -> AvailabilityZone {
+    /// This zone as the modelled shape, which `DescribeLoadBalancers` reports and
+    /// `SetSubnets` answers with.
+    pub fn to_shape(&self) -> AvailabilityZone {
         AvailabilityZone {
             zone_name: Some(self.zone_name.clone()),
             subnet_id: Some(self.subnet_id.clone()),
@@ -208,6 +210,23 @@ pub struct LoadBalancerRecord {
     pub security_groups: Vec<String>,
     pub ip_address_type: String,
     pub customer_owned_ipv4_pool: Option<String>,
+    /// Whether inbound security group rules are evaluated for PrivateLink traffic, as a
+    /// caller last set it through `SetSecurityGroups`. `None` until one does, which is
+    /// when the documented default applies
+    /// ([`Self::enforce_security_group_inbound_rules_on_private_link_traffic`]).
+    pub enforce_security_group_inbound_rules_on_private_link_traffic: Option<String>,
+    /// Whether an IPv6 prefix of each subnet is used for source NAT, as `SetSubnets`
+    /// last set it. `None` until it does: the member's documented default is `off`.
+    pub enable_prefix_for_ipv6_source_nat: Option<String>,
+    /// The IPAM pool the load balancer draws its IPv4 addresses from
+    /// (`IpamPools$Ipv4IpamPoolId`), as `CreateLoadBalancer` or `ModifyIpPools` last set
+    /// it; `None` for a load balancer using no pool.
+    pub ipv4_ipam_pool_id: Option<String>,
+    /// When a capacity-reservation write last changed this load balancer's reservation,
+    /// which `DescribeCapacityReservation` reports as `LastModifiedTime`. `None` until
+    /// one does: a load balancer nobody has written a reservation for has no such
+    /// instant to report.
+    pub capacity_reservation_modified_at: Option<SystemTime>,
     pub attributes: HashMap<String, String>,
     pub tags: HashMap<String, String>,
     pub listener_arns: Vec<String>,
@@ -222,6 +241,7 @@ impl LoadBalancerRecord {
             && self.lb_type == other.lb_type
             && self.ip_address_type == other.ip_address_type
             && self.customer_owned_ipv4_pool == other.customer_owned_ipv4_pool
+            && self.ipv4_ipam_pool_id == other.ipv4_ipam_pool_id
             && self.availability_zones == other.availability_zones
             && sorted(&self.security_groups) == sorted(&other.security_groups)
             && self.tags == other.tags
@@ -255,10 +275,80 @@ impl LoadBalancerRecord {
             security_groups: Some(self.security_groups.clone()),
             ip_address_type: Some(self.ip_address_type.clone()),
             customer_owned_ipv4_pool: self.customer_owned_ipv4_pool.clone(),
-            enforce_security_group_inbound_rules_on_private_link_traffic: None,
-            enable_prefix_for_ipv6_source_nat: None,
-            ipam_pools: None,
+            enforce_security_group_inbound_rules_on_private_link_traffic: self
+                .enforce_security_group_inbound_rules_on_private_link_traffic(),
+            enable_prefix_for_ipv6_source_nat: self.enable_prefix_for_ipv6_source_nat.clone(),
+            ipam_pools: self.ipam_pools_shape(),
         }
+    }
+
+    /// Which family of load balancer this is, which decides the attributes it carries
+    /// and the IP address types and security groups it accepts.
+    pub fn family(&self) -> LoadBalancerFamily {
+        load_balancer_family(&self.lb_type)
+    }
+
+    /// The IPAM pools this load balancer draws from, as the modelled shape, or `None`
+    /// for one that draws from no pool — the member is then left unreported rather than
+    /// reported as an empty structure.
+    pub fn ipam_pools_shape(&self) -> Option<IpamPools> {
+        self.ipv4_ipam_pool_id
+            .clone()
+            .map(|pool| IpamPools {
+                ipv4_ipam_pool_id: Some(pool),
+            })
+    }
+
+    /// Whether inbound security group rules are evaluated for PrivateLink traffic: what
+    /// a caller set, else the documented default for a load balancer the member applies
+    /// to at all.
+    ///
+    /// `SetSecurityGroupsInput$EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic`:
+    /// "Indicates whether to evaluate inbound security group rules for traffic sent to a
+    /// Network Load Balancer through Amazon Web Services PrivateLink. Applies only if the
+    /// load balancer has an associated security group. The default is on." So it is
+    /// reported for a Network Load Balancer carrying a security group, and for no other.
+    pub fn enforce_security_group_inbound_rules_on_private_link_traffic(&self) -> Option<String> {
+        if let Some(set) = self
+            .enforce_security_group_inbound_rules_on_private_link_traffic
+            .clone()
+        {
+            return Some(set);
+        }
+        (self.family() == LoadBalancerFamily::Network && !self.security_groups.is_empty())
+            .then(|| PRIVATE_LINK_INBOUND_RULES_DEFAULT.to_string())
+    }
+
+    /// Every attribute this load balancer reports: each one the model documents for a
+    /// load balancer of this family, carrying what a caller set or, failing that, its
+    /// documented default. Sorted by key, so two reads of one load balancer answer
+    /// alike.
+    pub fn effective_attributes(&self) -> Vec<(String, String)> {
+        let mut reported: Vec<(String, String)> = LOAD_BALANCER_ATTRIBUTES
+            .iter()
+            .filter(|spec| spec.applies_to(self))
+            .filter_map(|spec| {
+                let value = self
+                    .attributes
+                    .get(spec.key)
+                    .cloned()
+                    .or_else(|| spec.default_for(self))?;
+                Some((spec.key.to_string(), value))
+            })
+            .collect();
+        reported.sort_by(|left, right| left.0.cmp(&right.0));
+        reported
+    }
+
+    /// [`Self::effective_attributes`] as the modelled shape.
+    pub fn attribute_shapes(&self) -> Vec<LoadBalancerAttribute> {
+        self.effective_attributes()
+            .into_iter()
+            .map(|(key, value)| LoadBalancerAttribute {
+                key: Some(key),
+                value: Some(value),
+            })
+            .collect()
     }
 }
 
@@ -717,6 +807,517 @@ pub fn load_balancer_family(lb_type: &str) -> LoadBalancerFamily {
         // `application` is the modelled default for `Type`.
         _ => LoadBalancerFamily::Application,
     }
+}
+
+/// The value `EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic` has until a caller
+/// sets it, from that member's own documentation: "The default is on."
+pub const PRIVATE_LINK_INBOUND_RULES_DEFAULT: &str = "on";
+
+/// One load balancer attribute: which load balancers carry it, what it accepts, the
+/// value it reports until something sets it, and the value its documentation FIXES for
+/// some load balancers.
+pub struct LoadBalancerAttributeSpec {
+    pub key: &'static str,
+    pub domain: AttributeDomain,
+    /// The load balancer families that carry the attribute, as the model's
+    /// `LoadBalancerAttribute$Key` documentation groups them.
+    families: &'static [LoadBalancerFamily],
+    /// The documented default, or `None` for an attribute the model documents no default
+    /// for — which is then reported only once a caller has set it.
+    default: fn(&LoadBalancerRecord) -> Option<String>,
+    /// The ONE value this attribute has on a load balancer whose documentation states it
+    /// cannot be changed, or `None` where a caller may set it freely.
+    fixed: fn(&LoadBalancerRecord) -> Option<String>,
+}
+
+impl std::fmt::Debug for LoadBalancerAttributeSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadBalancerAttributeSpec")
+            .field("key", &self.key)
+            .field("domain", &self.domain)
+            .field("families", &self.families)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LoadBalancerAttributeSpec {
+    /// Whether `load_balancer` carries this attribute at all.
+    pub fn applies_to(&self, load_balancer: &LoadBalancerRecord) -> bool {
+        self.families.contains(&load_balancer.family())
+    }
+
+    /// The value `load_balancer` reports for this attribute until something sets it.
+    pub fn default_for(&self, load_balancer: &LoadBalancerRecord) -> Option<String> {
+        (self.default)(load_balancer)
+    }
+
+    /// The value this attribute is fixed at on `load_balancer`, or `None` when a caller
+    /// may set it. A write of anything else is a configuration the service refuses.
+    pub fn fixed_for(&self, load_balancer: &LoadBalancerRecord) -> Option<String> {
+        (self.fixed)(load_balancer)
+    }
+}
+
+/// Every load balancer attribute this service models, with the families that carry it,
+/// the values it accepts and its documented default — each one a sentence of the model's
+/// own `LoadBalancerAttribute$Key` documentation
+/// (`smithy_query(query="doc",shape="LoadBalancerAttribute",member="Key")`), which is the
+/// only catalog of them; the Smithy shape itself is an unconstrained key/value pair, so
+/// nothing else in the model lists them.
+pub static LOAD_BALANCER_ATTRIBUTES: &[LoadBalancerAttributeSpec] = &[
+    // "The following attributes are supported by all load balancers:"
+    //
+    // "deletion_protection.enabled - Indicates whether deletion protection is enabled.
+    // The value is true or false. The default is false."
+    LoadBalancerAttributeSpec {
+        key: "deletion_protection.enabled",
+        domain: AttributeDomain::Boolean,
+        families: EVERY_FAMILY,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "load_balancing.cross_zone.enabled - ... The default for Network Load Balancers
+    // and Gateway Load Balancers is false. The default for Application Load Balancers is
+    // true, and can't be changed."
+    LoadBalancerAttributeSpec {
+        key: "load_balancing.cross_zone.enabled",
+        domain: AttributeDomain::Boolean,
+        families: EVERY_FAMILY,
+        default: |load_balancer| {
+            Some(
+                match load_balancer.family() {
+                    LoadBalancerFamily::Application => "true",
+                    LoadBalancerFamily::Network | LoadBalancerFamily::Gateway => "false",
+                }
+                .to_string(),
+            )
+        },
+        fixed: |load_balancer| {
+            (load_balancer.family() == LoadBalancerFamily::Application)
+                .then(|| "true".to_string())
+        },
+    },
+    // "The following attributes are supported by both Application Load Balancers and
+    // Network Load Balancers:"
+    //
+    // "access_logs.s3.enabled - Indicates whether access logs are enabled. The value is
+    // true or false. The default is false."
+    LoadBalancerAttributeSpec {
+        key: "access_logs.s3.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_AND_NETWORK,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "access_logs.s3.bucket - The name of the S3 bucket for the access logs." A name
+    // the caller chooses, with no domain and no default in the model.
+    LoadBalancerAttributeSpec {
+        key: "access_logs.s3.bucket",
+        domain: AttributeDomain::Text,
+        families: APPLICATION_AND_NETWORK,
+        default: |_| None,
+        fixed: |_| None,
+    },
+    // "access_logs.s3.prefix - The prefix for the location in the S3 bucket for the
+    // access logs."
+    LoadBalancerAttributeSpec {
+        key: "access_logs.s3.prefix",
+        domain: AttributeDomain::Text,
+        families: APPLICATION_AND_NETWORK,
+        default: |_| None,
+        fixed: |_| None,
+    },
+    // "ipv6.deny_all_igw_traffic - Blocks internet gateway (IGW) access to the load
+    // balancer. It is set to false for internet-facing load balancers and true for
+    // internal load balancers".
+    LoadBalancerAttributeSpec {
+        key: "ipv6.deny_all_igw_traffic",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_AND_NETWORK,
+        default: |load_balancer| {
+            Some(
+                if load_balancer.scheme == INTERNAL_SCHEME {
+                    "true"
+                } else {
+                    "false"
+                }
+                .to_string(),
+            )
+        },
+        fixed: |_| None,
+    },
+    // "zonal_shift.config.enabled - Indicates whether zonal shift is enabled. The
+    // possible values are true and false. The default is false."
+    LoadBalancerAttributeSpec {
+        key: "zonal_shift.config.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_AND_NETWORK,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "The following attributes are supported by only Application Load Balancers:"
+    //
+    // "idle_timeout.timeout_seconds - The idle timeout value, in seconds. The valid
+    // range is 1-4000 seconds. The default is 60 seconds."
+    LoadBalancerAttributeSpec {
+        key: "idle_timeout.timeout_seconds",
+        domain: AttributeDomain::Integer { min: 1, max: 4000 },
+        families: APPLICATION_ONLY,
+        default: |_| Some("60".to_string()),
+        fixed: |_| None,
+    },
+    // "client_keep_alive.seconds - The client keep alive value, in seconds. The valid
+    // range is 60-604800 seconds. The default is 3600 seconds."
+    LoadBalancerAttributeSpec {
+        key: "client_keep_alive.seconds",
+        domain: AttributeDomain::Integer {
+            min: 60,
+            max: 604_800,
+        },
+        families: APPLICATION_ONLY,
+        default: |_| Some("3600".to_string()),
+        fixed: |_| None,
+    },
+    // "connection_logs.s3.enabled - Indicates whether connection logs are enabled. The
+    // value is true or false. The default is false."
+    LoadBalancerAttributeSpec {
+        key: "connection_logs.s3.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_ONLY,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "connection_logs.s3.bucket - The name of the S3 bucket for the connection logs."
+    LoadBalancerAttributeSpec {
+        key: "connection_logs.s3.bucket",
+        domain: AttributeDomain::Text,
+        families: APPLICATION_ONLY,
+        default: |_| None,
+        fixed: |_| None,
+    },
+    // "connection_logs.s3.prefix - The prefix for the location in the S3 bucket for the
+    // connection logs."
+    LoadBalancerAttributeSpec {
+        key: "connection_logs.s3.prefix",
+        domain: AttributeDomain::Text,
+        families: APPLICATION_ONLY,
+        default: |_| None,
+        fixed: |_| None,
+    },
+    // "health_check_logs.s3.enabled - Indicates whether health check logs are enabled.
+    // The value is true or false. The default is false."
+    LoadBalancerAttributeSpec {
+        key: "health_check_logs.s3.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_ONLY,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "health_check_logs.s3.bucket - The name of the S3 bucket for the health check
+    // logs."
+    LoadBalancerAttributeSpec {
+        key: "health_check_logs.s3.bucket",
+        domain: AttributeDomain::Text,
+        families: APPLICATION_ONLY,
+        default: |_| None,
+        fixed: |_| None,
+    },
+    // "health_check_logs.s3.prefix - The prefix for the location in the S3 bucket for
+    // the health check logs."
+    LoadBalancerAttributeSpec {
+        key: "health_check_logs.s3.prefix",
+        domain: AttributeDomain::Text,
+        families: APPLICATION_ONLY,
+        default: |_| None,
+        fixed: |_| None,
+    },
+    // "routing.http.desync_mitigation_mode - ... The possible values are monitor,
+    // defensive, and strictest. The default is defensive."
+    LoadBalancerAttributeSpec {
+        key: "routing.http.desync_mitigation_mode",
+        domain: AttributeDomain::OneOf(&["monitor", "defensive", "strictest"]),
+        families: APPLICATION_ONLY,
+        default: |_| Some("defensive".to_string()),
+        fixed: |_| None,
+    },
+    // "routing.http.drop_invalid_header_fields.enabled - ... The default is false."
+    LoadBalancerAttributeSpec {
+        key: "routing.http.drop_invalid_header_fields.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_ONLY,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "routing.http.preserve_host_header.enabled - ... The default is false."
+    LoadBalancerAttributeSpec {
+        key: "routing.http.preserve_host_header.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_ONLY,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "routing.http.x_amzn_tls_version_and_cipher_suite.enabled - ... The default is
+    // false."
+    LoadBalancerAttributeSpec {
+        key: "routing.http.x_amzn_tls_version_and_cipher_suite.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_ONLY,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "routing.http.xff_client_port.enabled - ... The default is false."
+    LoadBalancerAttributeSpec {
+        key: "routing.http.xff_client_port.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_ONLY,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "routing.http.xff_header_processing.mode - ... The possible values are append,
+    // preserve, and remove. The default is append."
+    LoadBalancerAttributeSpec {
+        key: "routing.http.xff_header_processing.mode",
+        domain: AttributeDomain::OneOf(&["append", "preserve", "remove"]),
+        families: APPLICATION_ONLY,
+        default: |_| Some("append".to_string()),
+        fixed: |_| None,
+    },
+    // "routing.http2.enabled - ... The default is true."
+    LoadBalancerAttributeSpec {
+        key: "routing.http2.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_ONLY,
+        default: |_| Some("true".to_string()),
+        fixed: |_| None,
+    },
+    // "waf.fail_open.enabled - ... The default is false."
+    LoadBalancerAttributeSpec {
+        key: "waf.fail_open.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_ONLY,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "The following attributes are supported by only Network Load Balancers:"
+    //
+    // "dns_record.client_routing_policy - Indicates how traffic is distributed among the
+    // load balancer Availability Zones. The possible values are
+    // availability_zone_affinity ..., partial_availability_zone_affinity ... and
+    // any_availability_zone ..." — three values and no documented default, so it is
+    // reported once a caller has set one.
+    LoadBalancerAttributeSpec {
+        key: "dns_record.client_routing_policy",
+        domain: AttributeDomain::OneOf(&[
+            "availability_zone_affinity",
+            "partial_availability_zone_affinity",
+            "any_availability_zone",
+        ]),
+        families: NETWORK_ONLY,
+        default: |_| None,
+        fixed: |_| None,
+    },
+    // "secondary_ips.auto_assigned.per_subnet - The number of secondary IP addresses to
+    // configure for your load balancer nodes. ... The valid range is 0 to 7. The default
+    // is 0."
+    LoadBalancerAttributeSpec {
+        key: "secondary_ips.auto_assigned.per_subnet",
+        domain: AttributeDomain::Integer { min: 0, max: 7 },
+        families: NETWORK_ONLY,
+        default: |_| Some("0".to_string()),
+        fixed: |_| None,
+    },
+];
+
+/// The families of an attribute the documentation lists under "supported by all load
+/// balancers".
+const EVERY_FAMILY: &[LoadBalancerFamily] = &[
+    LoadBalancerFamily::Application,
+    LoadBalancerFamily::Network,
+    LoadBalancerFamily::Gateway,
+];
+
+/// The families of an attribute "supported by both Application Load Balancers and
+/// Network Load Balancers".
+const APPLICATION_AND_NETWORK: &[LoadBalancerFamily] =
+    &[LoadBalancerFamily::Application, LoadBalancerFamily::Network];
+
+/// The families of an attribute "supported by only Application Load Balancers".
+const APPLICATION_ONLY: &[LoadBalancerFamily] = &[LoadBalancerFamily::Application];
+
+/// The families of an attribute "supported by only Network Load Balancers".
+const NETWORK_ONLY: &[LoadBalancerFamily] = &[LoadBalancerFamily::Network];
+
+/// The attribute `key` names, or `None` when no load balancer attribute carries that
+/// name.
+pub fn load_balancer_attribute(key: &str) -> Option<&'static LoadBalancerAttributeSpec> {
+    LOAD_BALANCER_ATTRIBUTES.iter().find(|spec| spec.key == key)
+}
+
+/// The `Scheme` of a load balancer that is not reachable from the internet, from the
+/// model's `LoadBalancerSchemeEnum` (`internal`, `internet-facing`).
+pub const INTERNAL_SCHEME: &str = "internal";
+
+/// The one IP address type `IpAddressType` documents for every load balancer family.
+pub const IPV4_ADDRESS_TYPE: &str = "ipv4";
+
+/// The IP address type only an Application Load Balancer accepts, from
+/// `SetIpAddressTypeInput$IpAddressType`: "[Application Load Balancers] The possible
+/// values are ipv4 ..., dualstack ..., and dualstack-without-public-ipv4 ... [Network
+/// Load Balancers and Gateway Load Balancers] The possible values are ipv4 ... and
+/// dualstack".
+pub const APPLICATION_ONLY_ADDRESS_TYPE: &str = "dualstack-without-public-ipv4";
+
+/// Whether a load balancer of `family` with this `scheme` can use `ip_address_type`,
+/// and — when it cannot — the rule it broke, so a refusal can name the value and the
+/// rule the caller has to satisfy.
+///
+/// Two rules, both from `IpAddressType`'s own documentation on the operations that set
+/// it: "Internal load balancers must use ipv4", and `dualstack-without-public-ipv4` is
+/// bracketed for Application Load Balancers alone.
+pub fn check_ip_address_type(
+    family: LoadBalancerFamily,
+    scheme: &str,
+    ip_address_type: &str,
+) -> Result<(), String> {
+    if scheme == INTERNAL_SCHEME && ip_address_type != IPV4_ADDRESS_TYPE {
+        return Err(format!(
+            "The IP address type '{ip_address_type}' is not valid for an internal load \
+             balancer, which must use '{IPV4_ADDRESS_TYPE}'"
+        ));
+    }
+    if ip_address_type == APPLICATION_ONLY_ADDRESS_TYPE && family != LoadBalancerFamily::Application
+    {
+        return Err(format!(
+            "The IP address type '{ip_address_type}' is only valid for an application load \
+             balancer"
+        ));
+    }
+    Ok(())
+}
+
+/// The letters AWS appends to a region to name an Availability Zone.
+const ZONE_LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+
+/// How many subnets one load balancer is placed in at most.
+///
+/// `Subnets`/`SubnetMappings` are caller-chosen lists whose length the model bounds
+/// nowhere, and the rule that bounds them is `Subnets`' own documentation: "you can
+/// specify only one subnet per Availability Zone" — so the ceiling is the number of zones
+/// a Region has. This emulator names those zones with the 26 letters [`ZONE_LETTERS`]
+/// carries, far above the handful any AWS Region publishes, so that is the number: a
+/// request past it cannot be one subnet per zone whatever its subnets are.
+pub const SUBNETS_PER_LOAD_BALANCER: usize = ZONE_LETTERS.len();
+
+/// The zones a load balancer placed in these subnets is attached to, one per requested
+/// subnet, taken from `Subnets` or `SubnetMappings` (the model: "you must specify either
+/// subnets or subnet mappings, but not both").
+///
+/// Which zone a subnet is in is EC2's to say, so it is the zone EC2 reported for that
+/// subnet (`resolved`). A subnet EC2 could not be asked about — no EC2 is mounted, or it
+/// holds no such subnet — is given a zone of the request's region that no other subnet of
+/// this load balancer is in, so two subnets never read as the same zone whether their
+/// zones were resolved or stood in for: the zones already taken are held in a set, and
+/// the stand-in walks a cursor that never goes back, so every subnet is named in one
+/// step. Either way the mapping is persisted on the load balancer, so every later read
+/// reports the same zone for the same subnet.
+///
+/// The ONE reading of a request's subnets, called by `CreateLoadBalancer` for the zones a
+/// new load balancer starts in and by `SetSubnets` for the zones that replace them. The
+/// caller's list is bounded by [`SUBNETS_PER_LOAD_BALANCER`] before this runs.
+pub fn availability_zone_records(
+    subnets: &[String],
+    subnet_mappings: &[SubnetMapping],
+    region: &str,
+    resolved: Option<&[network::SubnetFacts]>,
+) -> Vec<AvailabilityZoneRecord> {
+    let reported_zone = |subnet_id: &str| -> Option<String> {
+        resolved?
+            .iter()
+            .find(|subnet| subnet.subnet_id == subnet_id)?
+            .availability_zone
+            .clone()
+    };
+    // Each requested subnet, in the order the request listed it, with the zone EC2
+    // reported for it when it reported one.
+    let mut requested: Vec<(String, Vec<LoadBalancerAddressRecord>, Option<String>)> = Vec::new();
+    for subnet_id in subnets {
+        let zone = reported_zone(subnet_id);
+        requested.push((subnet_id.clone(), Vec::new(), zone));
+    }
+    for mapping in subnet_mappings {
+        // Only what the caller pinned is kept: the emulator models no address pool,
+        // so it never invents an `IpAddress`.
+        let address = LoadBalancerAddressRecord {
+            allocation_id: mapping.allocation_id.clone(),
+            private_ipv4_address: mapping.private_i_pv4_address.clone(),
+            ipv6_address: mapping.i_pv6_address.clone(),
+        };
+        let addresses = if address.is_empty() {
+            Vec::new()
+        } else {
+            vec![address]
+        };
+        let subnet_id = mapping.subnet_id.clone().unwrap_or_default();
+        let zone = reported_zone(&subnet_id);
+        requested.push((subnet_id, addresses, zone));
+    }
+
+    let mut taken: std::collections::HashSet<String> = requested
+        .iter()
+        .filter_map(|(_, _, zone)| zone.clone())
+        .collect();
+    let mut cursor = 0usize;
+    requested
+        .into_iter()
+        .map(|(subnet_id, addresses, zone)| {
+            let zone_name = zone.unwrap_or_else(|| loop {
+                let letter = char::from(ZONE_LETTERS[cursor % ZONE_LETTERS.len()]);
+                let wrap = cursor / ZONE_LETTERS.len();
+                cursor += 1;
+                let candidate = if wrap == 0 {
+                    format!("{region}{letter}")
+                } else {
+                    format!("{region}{letter}{wrap}")
+                };
+                if taken.insert(candidate.clone()) {
+                    return candidate;
+                }
+            });
+            AvailabilityZoneRecord {
+                zone_name,
+                subnet_id,
+                outpost_id: None,
+                addresses,
+            }
+        })
+        .collect()
+}
+
+/// The message Elastic Load Balancing answers a `ResourceNotFound` with for a policy read
+/// whose `ResourceArn` names no policy to report.
+///
+/// Built from the request: the ARN it names is the only thing the caller can act on, and
+/// what the caller has to fix is that ARN — whether it named a trust store this account
+/// does not have, one no policy is attached to, or a resource that carries no resource
+/// policy at all.
+pub fn trust_store_policy_not_found_message(arn: &str) -> String {
+    format!("Trust store ARN '{arn}' not found")
+}
+
+/// The message Elastic Load Balancing answers a `LoadBalancerNotFound` with for an
+/// operation that addresses ONE load balancer through its own required
+/// `LoadBalancerArn` — the attribute read and write, the network writes
+/// (`SetIpAddressType`, `SetSecurityGroups`, `SetSubnets`, `ModifyIpPools`), the
+/// capacity-reservation read and write, and the creates and reads that hang a resource
+/// off one.
+///
+/// Built from the request: the identifier it names is the only thing the caller can act
+/// on, exactly as the listener-addressing operations quote their `ListenerArn` back
+/// ([`listener_not_found_message`]), while a read over a LIST of load balancers names
+/// either the identifiers it could not resolve ([`load_balancers_not_found_message`]) or
+/// no value at all ([`load_balancer_selection_not_found_message`]).
+pub fn load_balancer_not_found_message(arn: &str) -> String {
+    format!("Load balancer '{arn}' not found")
 }
 
 /// The message Elastic Load Balancing answers a `LoadBalancerNotFound` with for a read
@@ -1486,6 +2087,13 @@ pub struct TrustStoreRecord {
     /// other taggable resource's, and a read answers what is stored rather than
     /// assuming a trust store can carry none.
     pub tags: HashMap<String, String>,
+    /// The resource-based policy attached to this trust store, which
+    /// `GetResourcePolicy` reports. `None` for a trust store no policy was attached to:
+    /// a policy is what SHARING a trust store with another account writes, and this
+    /// model declares no operation that writes one — it only reads a policy and deletes
+    /// a share's association — so the record carries what was attached and a read
+    /// answers from it rather than from a policy made up per call.
+    pub resource_policy: Option<String>,
 }
 
 impl TrustStoreRecord {

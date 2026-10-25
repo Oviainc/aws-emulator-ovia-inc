@@ -11,6 +11,11 @@
 //! `ListRumMetricsDestinations` reads the same map back, and deleting the app monitor
 //! drops its destinations with it, because the map lives on the app-monitor record.
 //!
+//! Two permissions are decided before anything is written: this operation's own
+//! `rum:PutRumMetricsDestination` on the app monitor, and — when the request names an
+//! `IamRoleArn`, the role RUM assumes to write to an Evidently experiment — the caller's
+//! `iam:PassRole` for that role, which is the precondition the member documents.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -233,6 +238,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+        // A request that names an `IamRoleArn` hands RUM a role to ASSUME — that is how it
+        // writes to someone else's Evidently experiment — and passing a role to a service
+        // is a permission of the caller's: the model states it as "you must be signed on to
+        // a role that has PassRole permissions attached to it, to allow the role to be
+        // passed". So the role named is authorized for the caller's `iam:PassRole` as well,
+        // and BEFORE anything is written, so a refused request stores no role
+        // ([`crate::state::authorization::caller_may_pass_role`]).
+        if let Some(role_arn) = iam_role_arn {
+            if let Err(denial) = crate::state::authorization::caller_may_pass_role(
+                &*self.engine,
+                ctx,
+                role_arn,
+            ) {
+                return Err(
+                    PutRumMetricsDestinationErrorModeled::AccessDeniedException(
+                        crate::state::access_denied(&denial),
+                    )
+                    .into(),
+                );
+            }
         }
 
         let mut store = state.lock();

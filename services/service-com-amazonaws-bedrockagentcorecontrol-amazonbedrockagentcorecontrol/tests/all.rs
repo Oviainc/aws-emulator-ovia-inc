@@ -13,6 +13,10 @@
 // points it into `tests/all/`.
 #[path = "all/agent_runtime_lifecycle.rs"]
 mod agent_runtime_lifecycle;
+#[path = "all/capacity_provider_runtime_versions.rs"]
+mod capacity_provider_runtime_versions;
+#[path = "all/control_plane_preconditions.rs"]
+mod control_plane_preconditions;
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
 #[path = "all/gateway_listings.rs"]

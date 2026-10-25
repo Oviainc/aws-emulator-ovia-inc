@@ -136,7 +136,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{AvailabilityZoneRecord, LoadBalancerAddressRecord, LoadBalancerRecord};
+use crate::state::LoadBalancerRecord;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -261,10 +261,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // subnets are, so it is refused here — before the subnets are resolved and before
         // a zone is named for any of them, which is also what bounds the work one request
         // can ask for on this path ([`SUBNETS_PER_LOAD_BALANCER`]).
-        if requested_subnets.len() > SUBNETS_PER_LOAD_BALANCER {
+        if requested_subnets.len() > crate::state::SUBNETS_PER_LOAD_BALANCER {
             return Err(invalid_configuration(&format!(
-                "You can specify only one subnet per Availability Zone, so at most \
-                 {SUBNETS_PER_LOAD_BALANCER} subnets, and this request names {}",
+                "You can specify only one subnet per Availability Zone, so at most {} \
+                 subnets, and this request names {}",
+                crate::state::SUBNETS_PER_LOAD_BALANCER,
                 requested_subnets.len()
             )));
         }
@@ -309,7 +310,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .r#type
                 .clone()
                 .unwrap_or_else(|| "application".to_string()),
-            availability_zones: availability_zones(&input, &region, resolved_subnets.as_deref()),
+            availability_zones: crate::state::availability_zone_records(
+                subnets,
+                subnet_mappings,
+                &region,
+                resolved_subnets.as_deref(),
+            ),
             security_groups: input.security_groups.clone().unwrap_or_default(),
             // The modelled default for `IpAddressType`.
             ip_address_type: input
@@ -317,6 +323,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clone()
                 .unwrap_or_else(|| "ipv4".to_string()),
             customer_owned_ipv4_pool: input.customer_owned_ipv4_pool.clone(),
+            // Nothing has set either of these on a load balancer being created: the
+            // members that carry them belong to `SetSecurityGroups` and `SetSubnets`,
+            // and until one is called the documented default is what a read reports.
+            enforce_security_group_inbound_rules_on_private_link_traffic: None,
+            enable_prefix_for_ipv6_source_nat: None,
+            // "[Application Load Balancers] The IPAM pools to use with the load
+            // balancer": what the request named, which `ModifyIpPools` later changes.
+            ipv4_ipam_pool_id: input
+                .ipam_pools
+                .as_ref()
+                .and_then(|pools| pools.ipv4_ipam_pool_id.clone()),
+            // No capacity-reservation write has touched a load balancer being created.
+            capacity_reservation_modified_at: None,
             attributes: std::collections::HashMap::new(),
             tags: tag_map(input.tags.as_deref())?,
             listener_arns: Vec::new(),
@@ -448,14 +467,9 @@ async fn foreign_security_group(
     vpc_id: &str,
     security_groups: &[String],
 ) -> Option<CreateLoadBalancerError> {
-    let reported =
-        crate::state::network::security_group_vpcs(ctx, region, security_groups).await?;
-    let foreign = reported.iter().any(|(_, group_vpc)| {
-        group_vpc
-            .as_deref()
-            .is_some_and(|holding| holding != vpc_id)
-    });
-    foreign.then(|| invalid_configuration(FOREIGN_SECURITY_GROUP))
+    crate::state::network::has_foreign_security_group(ctx, region, vpc_id, security_groups)
+        .await
+        .then(|| invalid_configuration(FOREIGN_SECURITY_GROUP))
 }
 
 /// The refusal a request whose security groups cannot be applied to the load balancer's
@@ -465,101 +479,6 @@ async fn foreign_security_group(
 /// rather than anything about one value: the request named groups of another VPC, and no
 /// one of them is more at fault than another.
 const FOREIGN_SECURITY_GROUP: &str = "One or more security groups are invalid";
-
-/// The letters AWS appends to a region to name an Availability Zone.
-const ZONE_LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
-
-/// How many subnets one load balancer is placed in at most.
-///
-/// `Subnets`/`SubnetMappings` are caller-chosen lists whose length the model bounds
-/// nowhere, and the rule that bounds them is `Subnets`' own documentation: "you can
-/// specify only one subnet per Availability Zone" — so the ceiling is the number of zones
-/// a Region has. This emulator names those zones with the 26 letters [`ZONE_LETTERS`]
-/// carries, far above the handful any AWS Region publishes, so that is the number: a
-/// request past it cannot be one subnet per zone whatever its subnets are.
-const SUBNETS_PER_LOAD_BALANCER: usize = ZONE_LETTERS.len();
-
-/// The zones the load balancer is attached to, one per requested subnet, taken from
-/// `Subnets` or `SubnetMappings` (the model: "you must specify either subnets or
-/// subnet mappings, but not both").
-///
-/// Which zone a subnet is in is EC2's to say, so it is the zone EC2 reported for that
-/// subnet (`resolved`). A subnet EC2 could not be asked about — no EC2 is mounted, or it
-/// holds no such subnet — is given a zone of the request's region that no other subnet of
-/// this load balancer is in, so two subnets never read as the same zone whether their
-/// zones were resolved or stood in for: the zones already taken are held in a set, and
-/// the stand-in walks a cursor that never goes back, so every subnet is named in one
-/// step. Either way the mapping is persisted on the load balancer, so every later read
-/// reports the same zone for the same subnet.
-///
-/// The caller's list is bounded by [`SUBNETS_PER_LOAD_BALANCER`] before this runs.
-fn availability_zones(
-    input: &CreateLoadBalancerInput,
-    region: &str,
-    resolved: Option<&[crate::state::network::SubnetFacts]>,
-) -> Vec<AvailabilityZoneRecord> {
-    let reported_zone = |subnet_id: &str| -> Option<String> {
-        resolved?
-            .iter()
-            .find(|subnet| subnet.subnet_id == subnet_id)?
-            .availability_zone
-            .clone()
-    };
-    // Each requested subnet, in the order the request listed it, with the zone EC2
-    // reported for it when it reported one.
-    let mut requested: Vec<(String, Vec<LoadBalancerAddressRecord>, Option<String>)> = Vec::new();
-    for subnet_id in input.subnets.iter().flatten() {
-        let zone = reported_zone(subnet_id);
-        requested.push((subnet_id.clone(), Vec::new(), zone));
-    }
-    for mapping in input.subnet_mappings.iter().flatten() {
-        // Only what the caller pinned is kept: the emulator models no address pool,
-        // so it never invents an `IpAddress`.
-        let address = LoadBalancerAddressRecord {
-            allocation_id: mapping.allocation_id.clone(),
-            private_ipv4_address: mapping.private_i_pv4_address.clone(),
-            ipv6_address: mapping.i_pv6_address.clone(),
-        };
-        let addresses = if address.is_empty() {
-            Vec::new()
-        } else {
-            vec![address]
-        };
-        let subnet_id = mapping.subnet_id.clone().unwrap_or_default();
-        let zone = reported_zone(&subnet_id);
-        requested.push((subnet_id, addresses, zone));
-    }
-
-    let mut taken: std::collections::HashSet<String> = requested
-        .iter()
-        .filter_map(|(_, _, zone)| zone.clone())
-        .collect();
-    let mut cursor = 0usize;
-    requested
-        .into_iter()
-        .map(|(subnet_id, addresses, zone)| {
-            let zone_name = zone.unwrap_or_else(|| loop {
-                let letter = char::from(ZONE_LETTERS[cursor % ZONE_LETTERS.len()]);
-                let wrap = cursor / ZONE_LETTERS.len();
-                cursor += 1;
-                let candidate = if wrap == 0 {
-                    format!("{region}{letter}")
-                } else {
-                    format!("{region}{letter}{wrap}")
-                };
-                if taken.insert(candidate.clone()) {
-                    return candidate;
-                }
-            });
-            AvailabilityZoneRecord {
-                zone_name,
-                subnet_id,
-                outpost_id: None,
-                addresses,
-            }
-        })
-        .collect()
-}
 
 /// The load balancer's DNS name, in the form AWS publishes:
 /// `<name>-<id>.<region>.elb.amazonaws.com`, prefixed `internal-` for an internal

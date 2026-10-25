@@ -7,6 +7,11 @@
 //! it. Every later read of the gateway, and every target created on it, comes from that
 //! record.
 //!
+//! The `roleArn` is stored as given and NOT resolved against IAM: the recorded service
+//! answers 202 for a gateway whose role cannot be assumed (it is the gateway's targets
+//! that use it, later), where `CreateAgentRuntime` refuses the same role outright. See
+//! `core/router/tests/all/bedrock_agentcore_execution_role.rs`, which pins both halves.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

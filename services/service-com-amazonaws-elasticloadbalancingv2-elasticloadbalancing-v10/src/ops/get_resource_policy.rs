@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resource-based policy attached to the resource `ResourceArn` names.
+//!
+//! The one resource of this service that carries such a policy is a TRUST STORE: a policy
+//! is what sharing a trust store with another account writes, and this model's only other
+//! operation about a share deletes that share's association. So the ARN is resolved to a
+//! trust store of this store and its stored policy is what is reported
+//! (`crate::state::TrustStoreRecord::resource_policy`).
+//!
+//! Three different refusals, because they are three different mistakes:
+//!
+//! * A request that states nothing in `ResourceArn` names no resource at all, and a
+//!   value that is no ARN names nothing that can be resolved: `ValidationError`, saying
+//!   which of the two it was — and, for a value that was there, naming it.
+//! * An ARN naming a resource this API reads no policy for — another kind of Elastic Load
+//!   Balancing resource, or another vendor's — states a resource TYPE that has no resource
+//!   policy at all, which is a request this API cannot answer for any account:
+//!   `ValidationError` again, naming that.
+//! * A trust store ARN that resolves to no policy — this store holds no such trust store,
+//!   or holds one no policy is attached to — is the modelled `ResourceNotFoundException`,
+//!   the ONE error this operation declares.
+//!
+//! A reporting operation: it reads the store and writes nothing to it.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +149,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy")
+        })?;
+
+        let guard = state.lock();
+        // A request that carries the member but states nothing in it has named no resource
+        // at all, which is a different thing to fix from a value that is not an ARN.
+        if input.resource_arn.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                NO_ARN_SPECIFIED,
+            ));
+        }
+        // A value that is no ARN at all states no resource: the caller has to fix the
+        // FORM of what it sent before anything can be resolved from it, so that is what
+        // the refusal says, naming the value it could not read.
+        if ::service_common::arn::parse(&input.resource_arn).is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "'{}' must be in ARN format",
+                input.resource_arn
+            )));
+        }
+        // The resource TYPE the ARN states is what decides whether this API reads a policy
+        // for it at all, and only a trust store's is read here — so anything else is
+        // refused for its type rather than reported as a missing policy.
+        let names_a_trust_store = crate::state::taggable_resource(&input.resource_arn)
+            .is_some_and(|kind| kind == crate::state::TaggableResource::TrustStore);
+        if !names_a_trust_store {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                UNSUPPORTED_RESOURCE_TYPE,
+            ));
+        }
+        // A trust store this store holds, and a policy attached to it: either one missing
+        // leaves no policy at this ARN to report.
+        let policy = guard
+            .trust_stores
+            .get(&input.resource_arn)
+            .and_then(|trust_store| trust_store.resource_policy.clone());
+        let Some(policy) = policy else {
+            return Err(
+                GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::trust_store_policy_not_found_message(
+                            &input.resource_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetResourcePolicyOutput {
+            policy: Some(policy),
+        })
     }
 }
+
+/// The refusal Elastic Load Balancing answers a policy read that names no resource at
+/// all with: the member is there and carries nothing, so there is no value to quote back.
+const NO_ARN_SPECIFIED: &str = "An ARN must be specified";
+
+/// The refusal Elastic Load Balancing answers a policy read of a resource type it reads no
+/// policy for, in the words it words it.
+///
+/// A fixed sentence: what the caller has to fix is which KIND of resource the call names,
+/// and the type it named is in the request it sent.
+const UNSUPPORTED_RESOURCE_TYPE: &str = "The specified resource type is not supported";

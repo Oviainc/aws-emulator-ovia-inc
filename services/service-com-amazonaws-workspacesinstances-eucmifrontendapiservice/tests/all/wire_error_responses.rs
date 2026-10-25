@@ -488,8 +488,8 @@ async fn an_unknown_instance_is_not_found_with_this_services_status_and_resource
     ];
 
     // Every operation that looks an instance up by id, not only the two the issue
-    // cited. The volume operations and `UntagResource` are still stubs (HTTP 501) and
-    // belong to their own issues.
+    // cited. The volume operations are still stubs (HTTP 501) and belong to their own
+    // issues.
     let mut messages: Vec<String> = Vec::new();
     for id in &ids {
         for (operation, body) in [
@@ -499,6 +499,10 @@ async fn an_unknown_instance_is_not_found_with_this_services_status_and_resource
             (
                 "TagResource",
                 json!({ "WorkspaceInstanceId": id, "Tags": [{ "Key": "env", "Value": "dev" }] }),
+            ),
+            (
+                "UntagResource",
+                json!({ "WorkspaceInstanceId": id, "TagKeys": ["env"] }),
             ),
         ] {
             let case = format!("{operation} on the unknown {id}");

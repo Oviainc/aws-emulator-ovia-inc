@@ -171,8 +171,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The walk, the page bound and the cursor are the listing rule both
-        // endpoint listings serve, so they live in `crate::state`; what is this
+        // The walk, the page bound and the cursor are the one listing rule this
+        // service's listings serve, so they live in `crate::state`; what is this
         // operation's own is which endpoints it reports. The listing is scoped by
         // the Outpost the request named, and by nothing else: the model states
         // `OutpostId` as the only scoping member and documents "all endpoints
@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         Ok(ListSharedEndpointsOutput {
-            endpoints: Some(page.endpoints),
+            endpoints: Some(page.items),
             next_token: page.next_token,
         })
     }

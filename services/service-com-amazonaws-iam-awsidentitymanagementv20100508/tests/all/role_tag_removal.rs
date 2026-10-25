@@ -34,7 +34,10 @@ use crate::user_lifecycle::{error_code, router};
 
 /// The `TagKeys.member.N` parameters of an awsQuery tag-key list, after the
 /// parameters `leading` carries.
-fn with_key_params(leading: Vec<(String, String)>, keys: &[String]) -> Vec<(String, String)> {
+pub(crate) fn with_key_params(
+    leading: Vec<(String, String)>,
+    keys: &[String],
+) -> Vec<(String, String)> {
     let mut params = leading;
     for (index, key) in keys.iter().enumerate() {
         params.push(param(&format!("TagKeys.member.{}", index + 1), key));
@@ -53,12 +56,12 @@ async fn untag_role(
 }
 
 /// `keys` as the owned list a table row names.
-fn keys(list: &[&str]) -> Vec<String> {
+pub(crate) fn keys(list: &[&str]) -> Vec<String> {
     list.iter().map(|key| key.to_string()).collect()
 }
 
 /// `count` distinct tags, the fixture the quota rows are built from.
-fn fixture(count: usize) -> Vec<(String, String)> {
+pub(crate) fn fixture(count: usize) -> Vec<(String, String)> {
     (0..count)
         .map(|index| (format!("key-{index:02}"), format!("value-{index:02}")))
         .collect()

@@ -51,6 +51,8 @@ mod generated_physical_names;
 mod generated_template_reads;
 #[path = "all/generated_templates.rs"]
 mod generated_templates;
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/hook_result_invocations.rs"]
 mod hook_result_invocations;
 #[path = "all/iam_capability_gate.rs"]
@@ -121,6 +123,8 @@ mod state_roundtrip;
 mod template_outputs;
 #[path = "all/template_quotas.rs"]
 mod template_quotas;
+#[path = "all/template_stages_and_resource_events.rs"]
+mod template_stages_and_resource_events;
 #[path = "all/type_testing.rs"]
 mod type_testing;
 #[path = "all/unprovisioned_resources.rs"]

@@ -3,10 +3,12 @@
 //! @op CreateGatewayTarget
 //!
 //! Adds a target to a gateway and PERSISTS it on that gateway's record in
-//! [`crate::state`]. A target whose MCP tool handler is a Lambda function is resolved
-//! against Lambda FIRST — the gateway has to invoke that function to serve a tool call —
-//! so a target naming a function that does not exist is refused with the operation's
-//! modelled validation error and nothing is stored.
+//! [`crate::state`]. The gateway has to be READY to take one: while the clock still
+//! owes it its transition out of `CREATING`, the target is refused with the
+//! operation's modelled validation error. A target whose MCP tool handler is a Lambda
+//! function is then resolved against Lambda — the gateway has to invoke that function
+//! to serve a tool call — so a target naming a function that does not exist is refused
+//! the same way and nothing is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -238,14 +240,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
                 CreateGatewayTargetErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "no gateway with identifier {} exists in this account",
-                            input.gateway_identifier
-                        )),
-                    },
+                    crate::state::resource_not_found(
+                        crate::state::ACTION_RETRIEVE,
+                        crate::state::RESOURCE_GATEWAY,
+                    ),
                 )
             })?;
+            // A target is served BY the gateway, so the gateway has to be ready
+            // to serve it: while the gateway is still in the transient status the
+            // clock owes a transition for (`CREATING` after a create, `UPDATING`
+            // after an update), or on its way out in `DELETING`, it accepts no
+            // target, and the caller is told which status to wait out. The
+            // refusal is worded by the ONE helper every gateway operation this
+            // service refuses on status shares (`UpdateGateway`,
+            // `DeleteGateway`), so the three cannot drift.
+            let status = gateway.status_at(now);
+            if status != crate::state::STATUS_READY {
+                return Err(CreateGatewayTargetErrorModeled::ValidationException(
+                    crate::state::gateway_status_conflict(Self::NAME, status),
+                )
+                .into());
+            }
             // The targets one gateway holds are bounded, so a caller looping on
             // create meets the modelled quota instead of this process's memory
             // limit.
@@ -288,22 +303,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        // The gateway is read again: the guard was dropped for the call above, so
-        // nothing promises it is still there.
-        let gateway_id = store
-            .gateways
-            .get(&input.gateway_identifier)
-            .map(|gateway| gateway.gateway_id.clone())
-            .ok_or_else(|| {
-                CreateGatewayTargetErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "no gateway with identifier {} exists in this account",
-                            input.gateway_identifier
-                        )),
-                    },
-                )
-            })?;
+        // The gateway is read again under the guard that WRITES: the guard was
+        // dropped for the call above, so nothing promises it is still there, nor
+        // that it is still in the status that admits a target — a `DeleteGateway`
+        // in between moves it to `DELETING`, and the clock may have made that
+        // deletion due.
+        store.expire_deleted_gateways(now);
+        let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
+            CreateGatewayTargetErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::ACTION_RETRIEVE,
+                    crate::state::RESOURCE_GATEWAY,
+                ),
+            )
+        })?;
+        let gateway_id = gateway.gateway_id.clone();
+        let status = gateway.status_at(now);
+        if status != crate::state::STATUS_READY {
+            return Err(CreateGatewayTargetErrorModeled::ValidationException(
+                crate::state::gateway_status_conflict(Self::NAME, status),
+            )
+            .into());
+        }
         let target_id = store.mint_target_id(&gateway_id, &name, now);
         let record = crate::state::GatewayTargetRecord {
             target_id: target_id.clone(),

@@ -213,14 +213,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The ARN's form is already checked against the modeled `ControlArn` pattern
         // before this handler runs, so a malformed ARN never reaches here: what is left
-        // to decide is whether the catalog holds the control it names.
+        // to decide is whether the catalog holds the control it names. The refusal is
+        // worded with the service's one fixed not-found sentence, which states the
+        // member the caller should look at and nothing of the ARN it carried.
         let Some(control) = state.resolve_control(&input.control_arn) else {
             return Err(GetControlErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "the Control Catalog holds no control with the ARN {}",
-                        input.control_arn
-                    )),
+                    message: Some(crate::service::CONTROL_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

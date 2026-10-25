@@ -47,6 +47,8 @@ mod core_network_prefix_list_association;
 mod core_network_prefix_list_associations;
 #[path = "all/core_network_segment_actions.rs"]
 mod core_network_segment_actions;
+#[path = "all/create_connect_peer_bounds.rs"]
+mod create_connect_peer_bounds;
 #[path = "all/create_vpc_attachment_bounds.rs"]
 mod create_vpc_attachment_bounds;
 #[path = "all/customer_gateway_association_lifecycle.rs"]

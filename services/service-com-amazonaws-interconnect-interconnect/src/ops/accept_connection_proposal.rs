@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptConnectionProposal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptConnectionProposal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptConnectionProposal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -86,9 +77,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 // here — hence the `AcceptConnectionProposalError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.interconnect#AcceptConnectionProposal")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.interconnect#AcceptConnectionProposal",
+    extra_errors = [
+        "ResourceNotFoundException",
+        "InterconnectValidationException",
+        "InterconnectClientException",
+        "InterconnectServerException",
+    ]
+)]
 #[derive(Debug)]
 pub enum AcceptConnectionProposalErrorModeled {
+    ResourceNotFoundException(ResourceNotFoundException),
+    InterconnectValidationException(InterconnectValidationException),
+    InterconnectClientException(InterconnectClientException),
+    InterconnectServerException(InterconnectServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -125,6 +128,149 @@ impl<Eng> AcceptConnectionProposal<Eng> {
     }
 }
 
+/// What this service's own store says about an `AcceptConnectionProposal` request.
+enum StoreVerdict {
+    /// The proposal the `activationKey` names is still awaiting acceptance: this is
+    /// the connection the acceptance makes, and the Environment it is placed upon,
+    /// which is what an attach-point refusal is worded from.
+    Accept {
+        connection_id: String,
+        environment_id: String,
+    },
+    /// The proposal has already been accepted and the request asks for exactly what
+    /// the connection it made already holds, so that connection is reported again
+    /// rather than accepted a second time. Boxed because a `Connection` is far larger
+    /// than the two identifiers above.
+    AlreadyAccepted(Box<Connection>),
+}
+
+/// Judge a request against everything this service's OWN store answers: the proposal
+/// the `activationKey` resolves to, whether it is still awaiting acceptance, the tag
+/// set the acceptance would leave on it, and the `arn` attach point.
+///
+/// `region` is the Region the request addressed, which is the scope the proposal is
+/// resolved in: a connection belongs to the Region it was created in, so neither an
+/// activation key nor an attach-point ARN of another Region resolves here.
+///
+/// Called under the lock BOTH before the cross-service attach-point resolution and
+/// again at the instant the acceptance is applied, so a verdict is never acted on
+/// from a store that has since moved: check and write happen under one lock.
+fn judge_against_store(
+    store: &crate::state::ComAmazonawsInterconnectInterconnectState,
+    input: &AcceptConnectionProposalInput,
+    region: &str,
+) -> Result<StoreVerdict, AcceptConnectionProposalError> {
+    // The `activationKey` is the proposal's only handle, and it is the same handle
+    // `DescribeConnectionProposal` reads the proposal's parameters through: the
+    // store's `activationKey` -> connection-id index resolves it, and the connection
+    // it names is then resolved in the Region the request was signed for, so a key
+    // minted through another Region's endpoint resolves to nothing here. A key that
+    // resolves to no proposal is the modelled 404, worded without the key itself,
+    // which `ActivationKey` marks `@sensitive`.
+    let stored = store
+        .activation_keys
+        .get(&input.activation_key)
+        .and_then(|connection_id| store.connection_in(region, connection_id));
+    let Some(stored) = stored else {
+        return Err(
+            AcceptConnectionProposalErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::proposal_not_retrievable_message()),
+                },
+            )
+            .into(),
+        );
+    };
+    let connection = &stored.connection;
+
+    // The tag set the accepted connection would carry, judged by the one rule every
+    // writer of a connection's tags uses: each entry inside the lengths the model
+    // gives `TagKey` and `TagValue`, no key in the namespace AWS reserves for its own
+    // system tags, and no more entries than a resource holds once the write is
+    // merged. Judged BEFORE anything is written, so a refused acceptance leaves the
+    // proposal exactly as it was.
+    if let Some(message) = input
+        .tags
+        .as_ref()
+        .and_then(|tags| crate::state::tag_write_violation(connection.tags.as_ref(), tags))
+    {
+        return Err(
+            AcceptConnectionProposalErrorModeled::InterconnectValidationException(
+                InterconnectValidationException { message },
+            )
+            .into(),
+        );
+    }
+
+    // An acceptance can only be made on a proposal that is still awaiting it. Once
+    // the connection has been accepted, a request asking for exactly what that
+    // connection already holds is the SAME acceptance reported again — the operation
+    // is `@idempotent` — while one asking for anything else would re-associate a
+    // connection that is already being provisioned, which is this service's own
+    // client fault. A connection that is being deleted, deleted or failed has no
+    // acceptance left to make at all.
+    if connection.state != crate::state::AWAITING_ACCEPTANCE_CONNECTION_STATE {
+        if crate::state::is_accepted_state(&connection.state) {
+            if crate::state::acceptance_already_applied(
+                connection,
+                &input.attach_point,
+                input.description.as_ref(),
+                input.tags.as_ref(),
+            ) {
+                return Ok(StoreVerdict::AlreadyAccepted(Box::new(connection.clone())));
+            }
+            return Err(
+                AcceptConnectionProposalErrorModeled::InterconnectClientException(
+                    InterconnectClientException {
+                        message: crate::state::proposal_already_accepted_message(&connection.id),
+                    },
+                )
+                .into(),
+            );
+        }
+        return Err(
+            AcceptConnectionProposalErrorModeled::InterconnectClientException(
+                InterconnectClientException {
+                    message: crate::state::proposal_not_acceptable_message(
+                        &connection.id,
+                        &connection.state,
+                    ),
+                },
+            )
+            .into(),
+        );
+    }
+
+    // `AttachPoint$arn` "identifies an attach point by full ARN", and the pattern
+    // that member carries is an Interconnect CONNECTION ARN: the attach point is a
+    // connection of the account, resolved against the store the way every
+    // ARN-addressed operation here resolves one — in full, so an ARN whose Region or
+    // account is not the stored one names no resource this account holds. An ARN that
+    // resolves to nothing has no attach point behind it, so there is nothing to make
+    // the connection onto. The same rule the create path applies, so what a
+    // Connection may be attached to does not depend on how it came to exist.
+    if let AttachPoint::Arn(arn) = &input.attach_point {
+        if store.connection_by_arn(arn).is_none() {
+            return Err(
+                AcceptConnectionProposalErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::attach_point_not_valid_message(
+                            arn,
+                            &connection.environment_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+    }
+
+    Ok(StoreVerdict::Accept {
+        connection_id: connection.id.clone(),
+        environment_id: connection.environment_id.clone(),
+    })
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for AcceptConnectionProposal<Eng>
 {
@@ -137,23 +283,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::ACCEPT_CONNECTION_PROPOSAL_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// "Upon accepting the proposal a connection will be made between the AWS network
+    /// as accessed via the selected Attach Point and the network previously selected
+    /// network on the partner's portal."
+    ///
+    /// The `activationKey` names the proposal this store holds for it — the same
+    /// proposal `DescribeConnectionProposal` reads the chosen parameters out of — and
+    /// accepting it associates that proposal's connection with the Attach Point the
+    /// request selects and hands it on along the documented acceptance progression:
+    /// "pending: The connection has been accepted and is being provisioned between AWS
+    /// and the Partner", then "available: The connection has been fully provisioned",
+    /// which the clock owes it. The Environment and the bandwidth were chosen on the
+    /// partner's portal and "cannot be modified", so they are read from the proposal
+    /// and nothing the request carries can change them; the optional `description` and
+    /// `tags` are the caller's to set on the resulting Connection.
+    ///
+    /// `clientToken` needs no replay index of its own: this acceptance is idempotent
+    /// by construction, because it makes no new resource — it accepts the one proposal
+    /// the key names, and a repeat asking for what that connection already holds is
+    /// answered with that same connection.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptConnectionProposal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptConnectionProposalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptConnectionProposal"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AcceptConnectionProposalErrorModeled::InterconnectServerException(
+                    InterconnectServerException {
+                        message: "the Interconnect connection store is not mounted on this engine"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The Region the request was signed for, which is the scope the proposal and
+        // the attach point are both resolved in.
+        let region = crate::state::request_region(ctx);
+
+        // Everything this service's OWN store answers is judged first, under one
+        // lock, which is dropped before the cross-service resolution below — so no
+        // lock is held across an await. The same judgement is made again where the
+        // acceptance is applied, so what lands is judged against the store as it is
+        // THEN.
+        let environment_id = {
+            let mut store = state.lock();
+            store.materialise_due_transitions(::std::time::Instant::now());
+            match judge_against_store(&store, &input, &region)? {
+                StoreVerdict::AlreadyAccepted(connection) => {
+                    return Ok(AcceptConnectionProposalOutput {
+                        connection: Some(*connection),
+                    })
+                }
+                StoreVerdict::Accept { environment_id, .. } => environment_id,
+            }
+        };
+
+        // `AttachPoint$directConnectGateway` "identifies an DirectConnect Gateway
+        // attach point by DirectConnectGatewayID" — a resource of the service that
+        // OWNS those gateways, so it is resolved against that service, through the
+        // same walk `ListAttachPoints` answers from. A gateway the account does not
+        // hold, or one not ready for use, is not among the attach points valid for
+        // the Environment, and no Connection is made onto one; an account whose
+        // gateways could not be read at all is a different answer again, because then
+        // nothing is known about the identifier either way.
+        if let AttachPoint::directConnectGateway(gateway) = &input.attach_point {
+            match crate::state::direct_connect::resolve_attach_point(ctx, &region, gateway).await {
+                crate::state::direct_connect::AttachPointResolution::Valid => {}
+                crate::state::direct_connect::AttachPointResolution::NotAnAttachPoint => {
+                    return Err(
+                        AcceptConnectionProposalErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(crate::state::attach_point_not_valid_message(
+                                    gateway,
+                                    &environment_id,
+                                )),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+                crate::state::direct_connect::AttachPointResolution::Unresolvable => {
+                    return Err(
+                        AcceptConnectionProposalErrorModeled::InterconnectServerException(
+                            InterconnectServerException {
+                                message: "the attach points of this account could not be resolved, \
+                                          so the requested attach point could not be validated"
+                                    .to_string(),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            }
+        }
+
+        // The acceptance is applied under a fresh lock, and judged against the store
+        // once more under THAT lock: the store may have moved while the attach point
+        // above was being resolved — the clock may have accepted the proposal at the
+        // partner portal in the meantime, or the connection may have been deleted —
+        // so check and write happen together.
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        store.materialise_due_transitions(now);
+        let connection_id = match judge_against_store(&store, &input, &region)? {
+            StoreVerdict::AlreadyAccepted(connection) => {
+                return Ok(AcceptConnectionProposalOutput {
+                    connection: Some(*connection),
+                })
+            }
+            StoreVerdict::Accept { connection_id, .. } => connection_id,
+        };
+        let Some(stored) = store.connection_in_mut(&region, &connection_id) else {
+            return Err(
+                AcceptConnectionProposalErrorModeled::InterconnectServerException(
+                    InterconnectServerException {
+                        message: "the connection the accepted proposal names could not be resolved"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The Attach Point the acceptance selected is what the connection is
+        // associated with from now on; the Environment, the bandwidth and every
+        // server-owned member of the record are untouched, because the proposal's
+        // parameters cannot be modified by the acceptance.
+        stored.connection.attach_point = input.attach_point.clone();
+        // A description the request supplies distinguishes the resulting Connection;
+        // one it omits leaves the proposal's own description alone.
+        if let Some(description) = input.description.clone() {
+            stored.connection.description = description;
+        }
+        // Merge, never replace, the way every tag writer of this service does: each
+        // key the request carries is written over whatever the connection held for it,
+        // and "no tags" keeps its one representation in the store (`None`) when the
+        // request carries none.
+        if let Some(tags) = input.tags.as_ref().filter(|tags| !tags.is_empty()) {
+            stored
+                .connection
+                .tags
+                .get_or_insert_with(::std::collections::HashMap::new)
+                .extend(
+                    tags.iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+        }
+        // The proposal is accepted NOW, so the connection reports the accepted state
+        // at once, and the rest of the progression — being provisioned between AWS and
+        // the Partner, then fully provisioned — is what the clock owes it. The due
+        // instant is stored and materialised by whichever call comes next; this one
+        // never waits for it.
+        stored.connection.state = crate::state::ACCEPTED_CONNECTION_STATE.to_string();
+        stored.pending_transition =
+            crate::state::owed_progression(crate::state::ACCEPTED_CONNECTION_STATE, now);
+
+        Ok(AcceptConnectionProposalOutput {
+            connection: Some(stored.connection.clone()),
+        })
     }
 }

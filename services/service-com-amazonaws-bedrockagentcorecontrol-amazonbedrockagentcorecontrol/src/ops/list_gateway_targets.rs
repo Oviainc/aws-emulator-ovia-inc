@@ -171,12 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // gateway that does not exist is the modelled 404 — never an empty page,
         // which would say the gateway is there and holds nothing.
         let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
-            ListGatewayTargetsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "no gateway with identifier {} exists in this account",
-                    input.gateway_identifier
-                )),
-            })
+            ListGatewayTargetsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::ACTION_RETRIEVE,
+                    crate::state::RESOURCE_GATEWAY,
+                ),
+            )
         })?;
 
         // The token is opaque on the wire: it carries the target id the previous

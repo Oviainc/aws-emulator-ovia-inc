@@ -188,18 +188,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries no `@length`, so the boundary validator admits several entries — but
         // its documentation is explicit that it carries one domain ARN at a time and
         // that passing several is not supported, which is the constraint enforced here.
-        // An entry without an ARN names no domain to filter on.
+        // An entry without an ARN names no domain to filter on. Either way the filter
+        // is one this operation does not accept, so both are refused with the service's
+        // one fixed invalid-filter sentence, which names neither the member nor the
+        // number of entries that were sent.
         let mut domain_filter: Option<String> = None;
         if let Some(filter) = input.objective_filter.as_ref() {
             if let Some(domains) = filter.domains.as_ref() {
                 if domains.len() > 1 {
                     return Err(ListObjectivesErrorModeled::ValidationException(
                         ValidationException {
-                            message: Some(format!(
-                                "objectiveFilter.domains accepts one domain ARN at a time; \
-                                 {} were supplied",
-                                domains.len()
-                            )),
+                            message: Some(crate::service::INVALID_FILTER_MESSAGE.to_string()),
                         },
                     )
                     .into());
@@ -208,9 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let Some(arn) = entry.arn.as_ref() else {
                         return Err(ListObjectivesErrorModeled::ValidationException(
                             ValidationException {
-                                message: Some(
-                                    "objectiveFilter.domains[0].arn must be set".to_string(),
-                                ),
+                                message: Some(crate::service::INVALID_FILTER_MESSAGE.to_string()),
                             },
                         )
                         .into());

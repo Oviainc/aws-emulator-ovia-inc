@@ -415,6 +415,10 @@ async fn the_published_gateway_url_serves_tools_list_from_its_targets() {
             "case {case:?}: expected the gateway's own endpoint host, got {url}"
         );
 
+        // A gateway takes a target only once the clock-owed transition out of `CREATING`
+        // has come due, so the transition is made due before the targets are added.
+        settle_now(&engine);
+
         // Every row's target on this one gateway, so one endpoint aggregates them all.
         let mut expected: Vec<Value> = Vec::new();
         for (row, target_name, tools, reported) in tool_table() {
@@ -585,6 +589,9 @@ async fn a_target_that_declares_no_tools_contributes_none() {
     let case = "targets declaring no inline tools";
     let (gateway_id, _) = create_gateway(&router, case, region, "undeclared", "AWS_IAM").await;
     let url = published_url(&router, case, region, &gateway_id).await;
+    // A gateway takes a target only once the clock-owed transition out of `CREATING` has
+    // come due, so the transition is made due before the targets are added.
+    settle_now(&engine);
 
     // (row, the targetConfiguration) — one per target shape that declares no inline tool
     // schema. Source: `TargetConfiguration` / `McpTargetConfiguration`
@@ -660,6 +667,9 @@ async fn a_tool_call_reports_the_invocation_and_never_invents_a_result() {
         "description": "write an object",
         "inputSchema": {"type": "object"}
     }]);
+    // A gateway takes a target only once the clock-owed transition out of `CREATING` has
+    // come due, so the transition is made due before the target is added.
+    settle_now(&engine);
     create_target(&router, case, region, &gateway_id, "writer", &tools).await;
     settle_now(&engine);
 

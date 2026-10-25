@@ -35,7 +35,7 @@ use crate::user_lifecycle::{call, elements, error_code, router};
 
 /// Create the user `user_name` under `path` carrying `initial`, asserting the
 /// create succeeded.
-async fn create_user(
+pub(crate) async fn create_user(
     router: &MultiServiceRouter,
     user_name: &str,
     path: &str,
@@ -53,7 +53,7 @@ async fn create_user(
 }
 
 /// One `TagUser` call: the HTTP status and the XML body.
-async fn tag_user(
+pub(crate) async fn tag_user(
     router: &MultiServiceRouter,
     user_name: &str,
     list: &[(String, String)],
@@ -64,7 +64,7 @@ async fn tag_user(
 
 /// The tag set `GetUser` reports for `user_name`, as a map, plus how many `<Key>`
 /// elements the response carried — so a duplicated key cannot hide inside a map.
-async fn stored_tags(
+pub(crate) async fn stored_tags(
     router: &MultiServiceRouter,
     user_name: &str,
 ) -> (BTreeMap<String, String>, usize) {

@@ -945,6 +945,16 @@ pub const MAX_LIST_PAGE_SIZE: usize = 50;
 /// above this bound.
 pub const MAX_BATCH_DELETE_IDS: usize = 100;
 
+/// The most resource ids ONE `BatchStop` call may name, counting its
+/// `ChannelIds` and `MultiplexIds` together.
+///
+/// The same ceiling as [`MAX_BATCH_DELETE_IDS`] and for the same reason: the
+/// model targets both members at plain `__listOf__string` with no length
+/// constraint, and each named id costs a lookup and a projection under the state
+/// guard plus one entry in the response. `BatchStop` models
+/// `BadRequestException`, which is the refusal for a batch above this bound.
+pub const MAX_BATCH_STOP_IDS: usize = MAX_BATCH_DELETE_IDS;
+
 /// The state a channel's in-flight transition settles into once it comes due.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Settled {
@@ -4322,6 +4332,20 @@ pub fn busy_input_message(input_id: &str) -> String {
 pub const CHANNEL_NOT_STOPPED_MESSAGE: &str =
     "Cannot delete a channel that has not been stopped yet. \
      Please stop the channel and try again.";
+
+/// The message a channel stop refused on the channel's state carries: the
+/// channel the request named, the state it is in, and the state a stop acts from
+/// — a channel runs before it can be stopped, so every other state is refused.
+///
+/// ONE helper, for the same reason as [`busy_input_message`]: `StopChannel` and
+/// `BatchStop` refuse the same channel, so they cannot word the refusal two
+/// ways.
+pub fn channel_not_running_message(channel_id: &str, state: &str) -> String {
+    format!(
+        "Channel {channel_id} is in state {state} and can only be stopped from {}",
+        channel_state::RUNNING
+    )
+}
 
 /// The message a delete refused on the resource's state carries: the resource,
 /// the state it is in, and the state a delete needs.

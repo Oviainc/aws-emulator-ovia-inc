@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStackPolicy
-//! IMPLEMENTED: answers the stack policy body `CreateStack`/`UpdateStack` last stored for
-//! the named stack, and an absent `StackPolicyBody` when the stack has no policy ("Returns
-//! the stack policy for a specified stack. If a stack doesn't have a policy, a null value
-//! is returned."). A `StackName` that names no stack is refused with the service's
-//! `ValidationError`, as the other stack reads do.
+//! IMPLEMENTED: answers the stack policy body `SetStackPolicy`/`CreateStack`/`UpdateStack`
+//! last stored for the named stack, and an absent `StackPolicyBody` when the stack has no
+//! policy ("Returns the stack policy for a specified stack. If a stack doesn't have a
+//! policy, a null value is returned."). A `StackName` that names no stack is refused with
+//! the service's `ValidationError`, as the other stack reads do.
 //!
 //! ## Shape of an operation
 //!

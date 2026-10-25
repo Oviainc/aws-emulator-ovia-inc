@@ -4,8 +4,10 @@
 //!
 //! Pages the stored broker nodes of one cluster in broker-id order: the cluster
 //! is resolved first (a `ClusterArn` that is not an MSK cluster ARN is a bad
-//! request, a well-formed one this region holds no cluster for is a 404, and a
-//! cluster with no broker nodes is refused as provisioned-only), then
+//! request, a well-formed one this region holds no cluster for is a 404, a
+//! cluster with no broker nodes is refused as provisioned-only, and a cluster
+//! whose brokers the service is still provisioning is refused on its state —
+//! [`crate::state::cluster_has_broker_nodes`]), then
 //! `MaxResults` / `NextToken` page the brokers the record holds. Each node is
 //! rendered by [`crate::state::Cluster::to_node_info`], so what this reader
 //! reports about a broker is what the stored cluster says about it.
@@ -266,6 +268,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ListNodesErrorModeled::BadRequestException(BadRequestException {
                     invalid_parameter: Some("ClusterArn".to_string()),
                     message: Some(crate::state::PROVISIONED_ONLY_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // Nor can a cluster whose brokers the service is still provisioning: it
+        // has no node records yet, so the listing is refused rather than
+        // answering an empty list that would read as "this cluster has no
+        // brokers".
+        if !crate::state::cluster_has_broker_nodes(&cluster.state) {
+            let state = cluster.state.clone();
+            return Err(
+                ListNodesErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::nodes_unavailable_message(&state)),
                 })
                 .into(),
             );

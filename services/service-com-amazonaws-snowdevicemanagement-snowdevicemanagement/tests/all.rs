@@ -29,6 +29,8 @@ mod device_region_gate;
 mod device_resources;
 #[path = "all/device_task_lifecycle.rs"]
 mod device_task_lifecycle;
+#[path = "all/device_unlock_transient.rs"]
+mod device_unlock_transient;
 #[path = "all/empty_inventory_refusals.rs"]
 mod empty_inventory_refusals;
 #[path = "all/one_execution_per_device.rs"]

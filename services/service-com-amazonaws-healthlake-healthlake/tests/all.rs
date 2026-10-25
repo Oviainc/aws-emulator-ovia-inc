@@ -63,6 +63,8 @@ mod restore_fhir_datastore;
 mod start_data_transformation_job;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_mutation_requires_a_live_resource.rs"]
+mod tag_mutation_requires_a_live_resource;
 #[path = "all/update_data_transformation_profile.rs"]
 mod update_data_transformation_profile;
 #[path = "all/update_fhir_datastore.rs"]
