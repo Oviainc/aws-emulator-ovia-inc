@@ -165,6 +165,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already refused anything outside them before this body runs. What is left to
         // this handler is the service's own rule about the document itself.
         //
+        // An identifier naming the OTHER resource kind cannot be authorized for this
+        // action, and that decision is taken before the sink table is consulted, so
+        // the refusal says nothing about what is stored.
+        crate::state::require_resource_kind(
+            Self::NAME,
+            &input.sink_identifier,
+            crate::state::ResourceKind::Sink,
+        )?;
+
         // The document is judged BEFORE anything is stored, so a refused put leaves
         // the sink's policy exactly as it was — the rule itself lives on
         // `crate::state::sink_policy_rejection`.

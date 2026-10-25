@@ -151,6 +151,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled constraints, already refused by the centralized walk before this
         // body runs. This operation is `@readonly`: it reports the stored policy and
         // writes nothing.
+        //
+        // An identifier naming the OTHER resource kind cannot be authorized for this
+        // action, and that decision is taken before the sink table is consulted, so
+        // the refusal says nothing about what is stored.
+        crate::state::require_resource_kind(
+            Self::NAME,
+            &input.sink_identifier,
+            crate::state::ResourceKind::Sink,
+        )?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetSinkPolicyErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the sink store is unavailable".to_string()),

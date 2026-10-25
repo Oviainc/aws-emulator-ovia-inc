@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInterpolatedAssetPropertyValues
-//! IMPLEMENTED: this operation computes interpolated values of an asset property's
-//! stored time series (`crate::state`) at the interval timestamps the request names;
-//! this is the ONLY file to touch for it.
+//! IMPLEMENTED: this operation computes interpolated values of the stored data
+//! stream the request names (`crate::state`) — the stream of an asset property, or
+//! the one standing under a `propertyAlias` no property carries — at the interval
+//! timestamps the request names; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -215,24 +216,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "To identify an asset property, you must specify one of the following: The
         // assetId and propertyId of an asset property. A propertyAlias" — so exactly
-        // one of the two forms names the property, resolved through the SAME resolvers
-        // `GetAssetPropertyValue` and `BatchPutAssetPropertyValue` use.
-        let (asset_id, property_id) = match (
+        // one of the two forms names the stream, resolved through the SAME resolvers
+        // every other read of this service uses: the asset label through
+        // `resolve_asset_id`, the property through `AssetRecord::property_position`,
+        // an alias through `resolve_alias_series`. An alias names ONE data stream
+        // whether or not an asset property is currently associated with it, so the
+        // resolver reaches the property's stream or the disassociated series standing
+        // under that alias.
+        let stream = match (
             input.asset_id.as_deref(),
             input.property_id.as_deref(),
             input.property_alias.as_deref(),
         ) {
-            (Some(asset_label), Some(property_id), None) => {
+            (Some(asset_label), Some(property_label), None) => {
                 let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
                     not_found(crate::state::not_found_message(
                         crate::state::RESOURCE_ASSET,
                         asset_label,
                     ))
                 })?;
-                (asset_id, property_id.to_string())
+                let resolved = store.assets.get(&asset_id).and_then(|asset| {
+                    asset
+                        .property_position(property_label)
+                        .map(|at| asset.properties[at].id.clone())
+                });
+                let property_id = resolved.ok_or_else(|| {
+                    not_found(format!(
+                        "The asset {asset_label} has no property {property_label}."
+                    ))
+                })?;
+                crate::state::SeriesKey::Property(asset_id, property_id)
             }
             (None, None, Some(alias)) => {
-                store.property_alias_index.get(alias).cloned().ok_or_else(|| {
+                store.resolve_alias_series(alias).ok_or_else(|| {
                     not_found(crate::state::not_found_message(
                         crate::state::RESOURCE_TIME_SERIES,
                         alias,
@@ -246,21 +262,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The property's declared `PropertyDataType` comes from the same lookup that
-        // proves the property exists, so an interpolation can never be computed for a
-        // property no stored asset declares. `AssetRecord::property` is the shared
-        // resolver every property reader in this crate uses, so one property is named
-        // one way across the service.
+        // The stream's declared `PropertyDataType`, from the one resolver that
+        // answers it for either kind of stream: the declared type of the asset
+        // property that owns it, or the type the disassociated record kept. A stream
+        // the store does not hold has no type, so an interpolation can never be
+        // computed for one — refused naming the stream that was resolved, in the
+        // wording this crate already uses for each of the two forms.
         let data_type = store
-            .assets
-            .get(&asset_id)
-            .and_then(|asset| asset.property(&property_id))
-            .map(|property| property.data_type.clone())
-            .ok_or_else(|| {
-                not_found(format!(
+            .series_data_type(&stream)
+            .ok_or_else(|| match &stream {
+                crate::state::SeriesKey::Disassociated(alias) => not_found(
+                    crate::state::not_found_message(crate::state::RESOURCE_TIME_SERIES, alias),
+                ),
+                crate::state::SeriesKey::Property(asset_id, property_id) => not_found(format!(
                     "The asset {asset_id} has no property {property_id}."
-                ))
-            })?;
+                )),
+            })?
+            .to_string();
 
         // "Valid values: LINEAR_INTERPOLATION | LOCF_INTERPOLATION". `type` is modelled
         // as a plain string, so the value is checked here rather than by the runtime's
@@ -345,39 +363,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // disagrees, and it wins.)
         let last_index = u64::try_from((end - start) / interval).unwrap_or(0);
 
-        // The data points an interpolation may use: this property's series, filtered to
-        // the requested quality. "If not specified, the window ranges between the start
-        // time minus the interval and the end time plus the interval" — with an explicit
-        // window each interval carries its own bounds, so the series is narrowed here
-        // only when the request gave none.
+        // The data points an interpolation may use: the samples of the stream that
+        // was resolved — read through the shared `series` reader, so a disassociated
+        // stream's samples are as reachable as an associated one's — filtered to the
+        // requested quality. "If not specified, the window ranges between the start
+        // time minus the interval and the end time plus the interval" — with an
+        // explicit window each interval carries its own bounds, so the series is
+        // narrowed here only when the request gave none.
         let mut samples: Vec<Sample<'_>> = store
-            .property_values
-            .get(&asset_id)
-            .and_then(|properties| properties.get(&property_id))
-            .map(|series| {
-                series
-                    .iter()
-                    .filter(|value| crate::state::quality_of(value) == input.quality)
-                    .map(|value| {
-                        (
-                            nanos(
-                                value.timestamp.time_in_seconds,
-                                value.timestamp.offset_in_nanos,
-                            ),
-                            value,
-                        )
-                    })
-                    .filter(|(at, _)| {
-                        window.is_some() || (*at >= start - interval && *at <= end + interval)
-                    })
-                    // Linear interpolation reads the two surrounding numbers; a
-                    // `nullValue` reading carries no number ("the type of null asset
-                    // property data"), so it is an absent data point here, not an
-                    // endpoint.
-                    .filter(|(_, value)| locf || numeric(&value.value).is_some())
-                    .collect()
+            .series(&stream)
+            .iter()
+            .filter(|value| crate::state::quality_of(value) == input.quality)
+            .map(|value| {
+                (
+                    nanos(
+                        value.timestamp.time_in_seconds,
+                        value.timestamp.offset_in_nanos,
+                    ),
+                    value,
+                )
             })
-            .unwrap_or_default();
+            .filter(|(at, _)| {
+                window.is_some() || (*at >= start - interval && *at <= end + interval)
+            })
+            // Linear interpolation reads the two surrounding numbers; a
+            // `nullValue` reading carries no number ("the type of null asset
+            // property data"), so it is an absent data point here, not an
+            // endpoint.
+            .filter(|(_, value)| locf || numeric(&value.value).is_some())
+            .collect();
         // The stored series is kept ascending by timestamp; make the order this code
         // relies on explicit rather than inherited.
         samples.sort_by_key(|(at, _)| *at);

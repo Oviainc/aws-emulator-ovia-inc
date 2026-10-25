@@ -15,6 +15,8 @@
 mod account_settings_document;
 #[path = "all/appconfig_workflow.rs"]
 mod appconfig_workflow;
+#[path = "all/aws_authored_extensions.rs"]
+mod aws_authored_extensions;
 #[path = "all/configuration_profile_type.rs"]
 mod configuration_profile_type;
 #[path = "all/control_plane_fidelity.rs"]
@@ -33,6 +35,8 @@ mod environment_state_wire_form;
 mod environment_update;
 #[path = "all/experiment_definitions.rs"]
 mod experiment_definitions;
+#[path = "all/extension_associations.rs"]
+mod extension_associations;
 #[path = "all/extensions.rs"]
 mod extensions;
 #[path = "all/feature_flag_metadata.rs"]

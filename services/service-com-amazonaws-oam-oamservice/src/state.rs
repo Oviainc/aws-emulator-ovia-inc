@@ -565,6 +565,55 @@ pub fn unmodelled_resource_type(resource_types: &[String]) -> Option<&str> {
         .find(|supplied| !crate::ops::types::RESOURCE_TYPE_VALUES.contains(supplied))
 }
 
+/// The lower bound of the modelled `ResourceTypesInput` `@length`, which the list
+/// declares as 1..50 with `@uniqueItems` over elements targeting the `ResourceType`
+/// enum (`smithy_query(query="shape",shape="ResourceTypesInput")`).
+pub const MIN_RESOURCE_TYPES: usize = 1;
+
+/// The upper bound of that same `@length`.
+pub const MAX_RESOURCE_TYPES: usize = 50;
+
+/// Why `resource_types` is not a `ResourceTypesInput` the model admits, or `None` when
+/// it is one.
+///
+/// Every clause is a modelled constraint of that list, and the refusal names the
+/// member, the rule and what the request sent for it, so a caller can fix the request
+/// from the text alone. For an operation whose `ResourceTypes` the centralized
+/// pre-handler walk sees, this is a second check of what that walk already refuses;
+/// for `UpdateLink`, whose authorization decision comes first, it is the only one (see
+/// [`crate::ops::types::UpdateLinkRequest`]).
+pub fn resource_types_rejection(resource_types: &[String]) -> Option<String> {
+    if resource_types.len() < MIN_RESOURCE_TYPES {
+        return Some(format!(
+            "ResourceTypes must name at least {MIN_RESOURCE_TYPES} resource type"
+        ));
+    }
+    if resource_types.len() > MAX_RESOURCE_TYPES {
+        return Some(format!(
+            "ResourceTypes names {} resource types, past the {MAX_RESOURCE_TYPES} this list \
+             admits",
+            resource_types.len()
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    if resource_types
+        .iter()
+        .any(|resource_type| !seen.insert(resource_type.as_str()))
+    {
+        return Some("ResourceTypes must not name one resource type twice".to_string());
+    }
+    if let Some(unmodelled) = unmodelled_resource_type(resource_types) {
+        // The offending value is caller-controlled text, so only its first characters
+        // are echoed back.
+        let shown: String = unmodelled.chars().take(64).collect();
+        return Some(format!(
+            "ResourceTypes contains '{shown}', which is not one of [{}]",
+            crate::ops::types::RESOURCE_TYPE_VALUES.join(", ")
+        ));
+    }
+    None
+}
+
 /// The most bytes of sink policy document this emulator will attach to a sink.
 ///
 /// Emulator resource guard, NOT an AWS quota: the modelled `SinkPolicy` string
@@ -597,6 +646,134 @@ pub const POLICY_EFFECTS: &[&str] = &["Allow", "Deny"];
 /// behavioural recording of this service covers answers this one constant string. A
 /// not-found refusal therefore never embeds the identifier the request asked about.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found.";
+
+/// The most sinks one account may hold in one Region.
+///
+/// From `CreateSink`'s own documentation: "Each account can contain one sink per
+/// Region. If you delete a sink, you can then create a new one in that Region." The
+/// bound is on the account/Region, NOT on the sink's name: a create is refused
+/// because the one slot is taken, whatever name it asks for, and deleting the stored
+/// sink frees the slot again.
+pub const MAX_SINKS_PER_REGION: usize = 1;
+
+/// The refusal message a `CreateSink` earns when the account/Region already holds its
+/// one sink.
+///
+/// Built from the quota and the account the request is served for, which is the whole
+/// of what the refusal is about; nothing of the request (least of all the `Name`,
+/// which played no part in the decision) reaches it.
+pub fn sink_quota_message() -> String {
+    format!(
+        "Reached account sink max({MAX_SINKS_PER_REGION}) for account({}).",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// Which of this service's two resource kinds an operation's identifier may name.
+///
+/// Every operation that takes a `ResourceIdentifier` acts on ONE kind — `DeleteSink`
+/// on a sink, `UpdateLink` on a link — and that is what its IAM action is authorized
+/// against. See [`require_resource_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    Sink,
+    Link,
+}
+
+impl ResourceKind {
+    /// The resource portion an ARN of this kind carries before its id.
+    pub fn arn_prefix(self) -> &'static str {
+        match self {
+            Self::Sink => SINK_ARN_RESOURCE_PREFIX,
+            Self::Link => LINK_ARN_RESOURCE_PREFIX,
+        }
+    }
+
+    /// The other kind — the one an operation acting on `self` is never authorized for.
+    pub fn other(self) -> Self {
+        match self {
+            Self::Sink => Self::Link,
+            Self::Link => Self::Sink,
+        }
+    }
+}
+
+/// The identity every request to this emulator is authenticated as: the one IAM user
+/// of the single account it serves.
+///
+/// The emulator verifies a request's signature but has no IAM directory behind the
+/// credential it was signed with, so there is one principal for an authorization
+/// decision to name — the identity `sts:GetCallerIdentity` answers with for a
+/// credential that names no session, which every other service of this emulator names
+/// the same way.
+pub fn caller_principal() -> String {
+    ::engine::emulator_arn("iam", "", "user/emulator")
+}
+
+/// The ARN naming a resource KIND of this service in `region` rather than one resource
+/// of it: the wildcard an authorization decision taken on the kind reports.
+pub fn resource_kind_wildcard(region: &str, kind: ResourceKind) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("{}*", kind.arn_prefix()))
+}
+
+/// How much of a caller-supplied identifier a refusal echoes.
+///
+/// The modelled `ResourceIdentifier` pattern admits 2048 characters, and the value
+/// lands in a response message, so only the leading characters are echoed: a request
+/// can never be amplified into an arbitrarily long refusal.
+const MAX_ECHOED_IDENTIFIER: usize = 256;
+
+/// The explicit-deny refusal for `operation` on the resource `identifier` names.
+///
+/// The message states the decision: WHO was refused (the one principal this emulator
+/// serves), WHAT action was asked for (`oam:` plus the operation, the IAM action name
+/// for it) and WHICH resource it was asked for (the identifier the request supplied),
+/// and that a resource-based policy denied it. Every part is a fact of this request,
+/// so nothing is kept from one and replayed into another.
+pub fn explicit_deny(operation: &str, identifier: &str) -> crate::scaffolded::AccessDeniedException {
+    let shown: String = identifier.chars().take(MAX_ECHOED_IDENTIFIER).collect();
+    crate::scaffolded::AccessDeniedException::new(format!(
+        "User: {} is not authorized to perform: {ARN_SERVICE}:{operation} on resource: {shown} \
+         with an explicit deny in a resource-based policy",
+        caller_principal()
+    ))
+}
+
+/// How this service words a refusal for a required member the request left out.
+///
+/// The ONE wording for an absent member, whether the centralized walk found it before
+/// a handler ran or a handler enforced it itself after taking an authorization
+/// decision first: both render the framework's clause for it, so the two cannot drift
+/// into two sentences for one refusal.
+pub fn missing_member_message(member: &str) -> String {
+    ::aws_smithy_schema_server::constraints::Violation {
+        path: ::aws_smithy_schema_server::constraints::path::member(member),
+        kind: ::aws_smithy_schema_server::constraints::ViolationKind::MissingRequiredMember,
+        value: None,
+    }
+    .message()
+}
+
+/// Refuse `identifier` when it is an ARN of this service naming the resource kind
+/// `operation` does NOT act on.
+///
+/// An IAM action applies to one resource kind, so an identifier naming the other kind
+/// cannot be authorized for it however the store happens to be populated: the
+/// authorization decision is taken on the resource the ARN names, BEFORE any lookup,
+/// and the refusal therefore discloses nothing about whether anything is stored under
+/// it. Any other form the modelled pattern admits — a bare id, a sink's name, an ARN
+/// of the kind this operation does act on — is a resource this action can apply to,
+/// and is resolved against the store as usual.
+pub fn require_resource_kind(
+    operation: &str,
+    identifier: &str,
+    kind: ResourceKind,
+) -> Result<(), crate::scaffolded::AccessDeniedException> {
+    if id_from_arn(identifier, kind.other().arn_prefix()).is_some() {
+        return Err(explicit_deny(operation, identifier));
+    }
+    Ok(())
+}
 
 /// Why `policy` is not a sink policy document this service will attach, or `None`
 /// when it is one.

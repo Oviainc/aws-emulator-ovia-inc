@@ -10,7 +10,8 @@
 //! 2. an execution starts only in the form the referenced command ADMITS — a command
 //!    the control plane deprecated admits none, and a command whose payload is static
 //!    admits none carrying `parameters` — and such a start is refused 400
-//!    `ValidationException` with nothing persisted either;
+//!    `ValidationException` with nothing persisted either; the deprecation refusal is
+//!    built from the request, naming the command the `commandArn` named;
 //! 3. a `targetArn` the service cannot target is refused 400 with the value READ
 //!    BACK out of the request — the resource type when it names an IoT resource,
 //!    the value itself when it does not — so two rejections of two targets are
@@ -515,10 +516,10 @@ async fn a_command_admits_only_the_starts_its_payload_and_lifecycle_allow() {
         "The parameters option is unsupported for commands with static payloads.";
 
     /// The refusal a start against a DEPRECATED command gets, which names the command
-    /// the request's `commandArn` named.
+    /// the request's `commandArn` named and states that it has been deprecated.
     fn deprecated_refusal(command_arn: &str) -> String {
         format!(
-            "The command {} is deprecated and cannot be used to start new command executions.",
+            "The command {} has been deprecated.",
             command_arn.rsplit('/').next().unwrap_or_default()
         )
     }
@@ -661,4 +662,144 @@ async fn a_command_admits_only_the_starts_its_payload_and_lifecycle_allow() {
             usize::from(refusal.is_none())
         );
     }
+}
+
+/// RULE: the refusal of a start whose command the control plane has DEPRECATED is built
+/// FROM THE REQUEST — the modelled `ValidationException` (HTTP 400) whose message names
+/// the command the supplied `commandArn` named and states that THAT command has been
+/// deprecated — so two rejections of two deprecated commands are distinguishable
+/// rather than one fixed template, and nothing is persisted for the target device.
+///
+/// The rows differ in what the rule generalises over: the form of the command id
+/// (hyphens, underscores, digits, mixed case, a 64-character id — `CommandId` is
+/// modelled `len 1..64, ^[a-zA-Z0-9_-]+$`), the partition, region and account of the
+/// command's ARN, and the command's payload kind — a deprecated command admits no start
+/// whichever payload it carries, and the message depends on none of these except the
+/// command the ARN names.
+#[tokio::test]
+async fn a_deprecated_command_is_read_back_in_the_refusal() {
+    /// One deprecated command, and the start the table makes against it.
+    struct Row {
+        case: &'static str,
+        thing: &'static str,
+        command_arn: &'static str,
+        /// Whether the command was created with a literal, static payload.
+        static_payload: bool,
+    }
+
+    let rows: [Row; 6] = [
+        Row {
+            case: "a hyphenated command id",
+            thing: "laser-retired-1",
+            command_arn: "arn:aws:iot:us-east-1:111122223333:command/reboot-now",
+            static_payload: true,
+        },
+        Row {
+            case: "an underscored command id, templated payload",
+            thing: "laser-retired-2",
+            command_arn: "arn:aws:iot:us-east-1:111122223333:command/install_firmware_2",
+            static_payload: false,
+        },
+        Row {
+            case: "a numeric command id",
+            thing: "laser-retired-3",
+            command_arn: "arn:aws:iot:us-east-1:111122223333:command/20261024",
+            static_payload: true,
+        },
+        Row {
+            case: "a mixed-case command id, templated payload",
+            thing: "laser-retired-4",
+            command_arn: "arn:aws:iot:eu-west-1:111122223333:command/Reboot_Laser-7",
+            static_payload: false,
+        },
+        Row {
+            case: "a 64-character command id",
+            thing: "laser-retired-5",
+            command_arn: "arn:aws:iot:us-east-1:111122223333:command/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            static_payload: true,
+        },
+        Row {
+            case: "a command of another partition and account",
+            thing: "laser-retired-6",
+            command_arn: "arn:aws-cn:iot:cn-north-1:444455556666:command/eject",
+            static_payload: true,
+        },
+    ];
+
+    /// A command that is NOT deprecated, to show the refusal is about the deprecation
+    /// and not about the ARN or the payload kind.
+    const LIVE: &str = "arn:aws:iot:us-east-1:111122223333:command/reboot-now-live";
+
+    let mut registered: Vec<(&str, CommandFacts)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.command_arn,
+                CommandFacts {
+                    static_payload: row.static_payload,
+                    deprecated: true,
+                },
+            )
+        })
+        .collect();
+    registered.push((LIVE, CommandFacts::default()));
+    let emulator = Emulator::with_commands(&registered);
+
+    let mut reported: Vec<String> = Vec::new();
+    for row in &rows {
+        let Row {
+            case,
+            thing,
+            command_arn,
+            ..
+        } = *row;
+        let command_id = command_arn.rsplit('/').next().unwrap_or_default();
+        let (status, body) = emulator.start_command(&thing_arn(thing), command_arn).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400 for a deprecated command, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
+        );
+        assert_eq!(
+            message(&body),
+            format!("The command {command_id} has been deprecated."),
+            "case {case:?}: the refusal must name the deprecated command the request \
+             named, got {body}"
+        );
+        reported.push(message(&body).to_string());
+
+        // The refused start persists NOTHING: the target keeps an empty queue.
+        let (status, pending) = emulator.pending(thing).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from the queue read, got {status} {pending}"
+        );
+        assert_eq!(
+            pending["queuedJobs"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: a refused start must queue nothing, got {pending}"
+        );
+    }
+
+    // One message per rejected command, which a fixed template could not be.
+    let distinct: std::collections::BTreeSet<&String> = reported.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        rows.len(),
+        "expected one message per deprecated command, got {reported:?}"
+    );
+
+    // The command that was never deprecated is still one an execution starts for.
+    let (status, body) = emulator
+        .start_command(&thing_arn("laser-retired-live"), LIVE)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"a command that is not deprecated\": expected the start to be served, got \
+         {status} {body}"
+    );
 }

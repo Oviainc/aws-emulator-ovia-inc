@@ -200,6 +200,85 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     pub fn key_value_store_by_arn(&self, arn: &str) -> Option<&StoredKeyValueStore> {
         self.key_value_stores.values().find(|store| store.arn == arn)
     }
+
+    /// The reason `config` describes no function this service can hold, or `None` when it
+    /// describes one.
+    ///
+    /// ONE check for every payload that carries a `FunctionConfig` — a create and an
+    /// update both store a whole configuration, so both refuse the same configurations:
+    ///
+    /// * a list wrapper whose `Quantity` disagrees with its `Items`
+    ///   ([`function_config_quantity_mismatch`]);
+    /// * more key value store associations than a function may carry
+    ///   ([`MAX_KEY_VALUE_STORE_ASSOCIATIONS`]);
+    /// * an association naming a key value store this service does not hold — the ARN is
+    ///   compared against the STORED ARN of a key value store, never taken on trust from
+    ///   the request.
+    ///
+    /// The caller reports the reason as the `InvalidArgument` its operation models for an
+    /// unusable argument.
+    pub fn function_config_unusable(&self, config: &FunctionConfig) -> Option<String> {
+        if let Some(message) = function_config_quantity_mismatch(config) {
+            return Some(message);
+        }
+
+        let associations = config
+            .key_value_store_associations
+            .as_ref()
+            .map_or(&[][..], |associations| {
+                associations.items.as_deref().unwrap_or_default()
+            });
+        if associations.len() > MAX_KEY_VALUE_STORE_ASSOCIATIONS {
+            return Some(format!(
+                "the configuration associates {} key value stores with the function but at \
+                 most {} may be associated",
+                associations.len(),
+                MAX_KEY_VALUE_STORE_ASSOCIATIONS
+            ));
+        }
+        for association in associations {
+            if self
+                .key_value_store_by_arn(&association.key_value_store_arn)
+                .is_none()
+            {
+                return Some(format!(
+                    "the key value store {} does not exist",
+                    association.key_value_store_arn
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// Replace the code and the configuration of the `DEVELOPMENT` stage of the function
+    /// `name` names, and report the record as it now stands — or `None` when the store
+    /// holds no such function.
+    ///
+    /// "You can update a function's code or the comment that describes the function. You
+    /// cannot update a function's name", and an update addresses no stage: the function's
+    /// identity (its name, its ARN and its tags) and its `LIVE` stage are left exactly as
+    /// they stand, because `LIVE` holds what a `PublishFunction` COPIED into it. The
+    /// stage's `LastModifiedTime` moves to `now` and a FRESH version token is minted, so
+    /// the version this caller just replaced no longer satisfies an `If-Match`.
+    pub fn apply_function_update(
+        &mut self,
+        name: &str,
+        config: FunctionConfig,
+        code: Vec<u8>,
+        now: SystemTime,
+    ) -> Option<&StoredFunction> {
+        if !self.functions.contains_key(name) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.functions.get_mut(name)?;
+        stored.development.config = config;
+        stored.development.code = code;
+        stored.development.last_modified_time = now;
+        stored.development.etag = etag;
+        Some(stored)
+    }
 }
 
 /// The ARN of a CloudFront function. CloudFront is a GLOBAL service, so the ARN's region

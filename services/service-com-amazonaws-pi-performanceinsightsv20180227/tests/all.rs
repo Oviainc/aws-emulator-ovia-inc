@@ -35,6 +35,8 @@ mod pi_harness;
 mod resource_dimensions;
 #[path = "all/resource_features.rs"]
 mod resource_features;
+#[path = "all/resource_metadata.rs"]
+mod resource_metadata;
 #[path = "all/resource_metrics.rs"]
 mod resource_metrics;
 #[path = "all/resource_tags.rs"]

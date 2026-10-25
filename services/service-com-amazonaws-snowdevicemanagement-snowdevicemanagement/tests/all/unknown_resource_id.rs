@@ -3,13 +3,13 @@
 //! What every id-addressed operation of this service answers for an id that names
 //! nothing, end to end over HTTP.
 //!
-//! The rule under test: an operation addressed to a resource by id answers the
+//! The rule under test: an operation addressed to a resource by id, in a Region this
+//! account has at least one Snow-Device-Management-activated device in, answers the
 //! modelled `ResourceNotFoundException` (HTTP 404) for an id that names no such
-//! resource in the signed Region, never the permission refusal —
-//! `AccessDeniedException` (HTTP 403) is for a caller the action is not permitted
-//! for, which is not what an id naming nothing is. The same ids are asked of a
-//! Region that holds an inventory and of one that holds none, so the answer is shown
-//! to come from the id rather than from how much the Region holds.
+//! resource there. The same ids are asked of two Regions that each hold an inventory,
+//! so the answer is shown to come from the id rather than from how much the Region
+//! holds. What a Region holding NO device answers is a different rule, pinned in
+//! `device_region_gate.rs`.
 //!
 //! Rows differ along what the rule generalises over: the operation (every one the
 //! model gives a `ResourceNotFoundException` and an id to resolve), the kind of id
@@ -511,24 +511,26 @@ async fn an_execution_is_read_out_of_the_region_its_task_was_created_in() {
 
 #[tokio::test]
 async fn an_id_is_resolved_against_the_signed_region_whatever_that_region_holds() {
-    // The SAME calls with the SAME unknown ids, in a Region this account has
-    // activated no device in: an id names nothing there either, so the answer is the
-    // one above. Nothing turns a sparse Region into a permission problem.
+    // The SAME calls with the SAME unknown ids, signed for another Region of the same
+    // account — one that holds an inventory of its own, so the device/region
+    // precondition is met there and the id itself decides the answer. A Region this
+    // account has activated NO device in is a different rule, pinned in
+    // `device_region_gate.rs`.
     let (router, managed, _) = emulator_with(SIGNED_REGION, ACTIVATED_DEVICES);
     let task = create_task(&router, &managed[0]).await;
-    let empty_region = "ap-northeast-1";
+    let sparser_region = OTHER_REGION;
 
     let mut rows: Vec<Request> = device_addressed("smd-ffffffffffffffff", &task);
     rows.extend(task_addressed("st-ffffffffffffffff", &managed[0]));
-    // The ids that DO exist in the signed Region name nothing in the empty one: the
+    // The ids that DO exist in the signed Region name nothing in the other one: the
     // lookup is regional.
     rows.extend(device_addressed(&managed[0], &task));
 
     for request in rows {
-        let case = format!("{} in {empty_region}", request.operation);
+        let case = format!("{} in {sparser_region}", request.operation);
         let answer = call(
             &router,
-            empty_region,
+            sparser_region,
             request.method,
             &request.uri,
             request.body,

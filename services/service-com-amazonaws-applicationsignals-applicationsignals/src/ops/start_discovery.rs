@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDiscovery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDiscovery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDiscovery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enables Application Signals for this account, by creating the account's
+//! service-linked role.
 //!
 //! ## Shape of an operation
 //!
@@ -60,6 +53,17 @@
 //! send data to Application Signals. For more information, see Enabling Application
 //! Signals.
 //!
+//! `POST /start-discovery`, success code 200.
+//!
+//! ## Input
+//!
+//! `StartDiscoveryInput` — an empty structure, so the request carries nothing to read.
+//!
+//! ## Output
+//!
+//! `StartDiscoveryOutput` — an empty structure, so a success is HTTP 200 with the empty
+//! JSON body `{}`: what the call leaves behind is the account's enablement, not a value.
+//!
 //! ## Errors
 //!
 //! * `AccessDeniedException` (HTTP 403) — You don't have sufficient permissions to perform
@@ -90,14 +94,13 @@ pub enum StartDiscoveryErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::start_discovery::StartDiscoveryError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+/// (`crate::ops::start_discovery::StartDiscoveryError`). The wrapper stays once the
+/// operation is implemented: it is also the only channel a refusal this operation's model
+/// has no shape for could travel on.
 pub type StartDiscoveryError = crate::scaffolded::Scaffolded<StartDiscoveryErrorModeled>;
 
-/// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
-/// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
+/// writes `Err(SomeModeledError.into())` rather than naming the wrapper variant.
 impl From<StartDiscoveryErrorModeled> for StartDiscoveryError {
     fn from(modeled: StartDiscoveryErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
@@ -135,23 +138,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::START_DISCOVERY_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Enable this account to use Application Signals, and answer the empty success.
+    ///
+    /// "Enables this Amazon Web Services account to be able to use CloudWatch Application
+    /// Signals by creating the AWSServiceRoleForCloudWatchApplicationSignals service-linked
+    /// role": what the call leaves behind is the account's own enablement — the role it
+    /// gains and the instant it gained it — which is why the modelled output declares no
+    /// members at all.
+    ///
+    /// Idempotent in effect, though the model does not mark it `@idempotent`: a
+    /// service-linked role is created only while the account holds none, so the first call
+    /// enables the account and every later one finds it already enabled, leaves the record
+    /// of that first call exactly as it is and answers the same 200 (see
+    /// `crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::start_discovery`).
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDiscovery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDiscoveryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDiscovery"))
+        // `StartDiscoveryInput` is an empty structure and `ctx` carries request metadata
+        // only: neither holds anything this operation reads.
+        let _ = (&input, ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartDiscoveryErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The role is created at the moment the account is enabled, so the instant is the
+        // clock reading here — and it is kept only by the call that enables the account.
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        state.lock().start_discovery(now);
+
+        Ok(StartDiscoveryOutput {})
     }
 }

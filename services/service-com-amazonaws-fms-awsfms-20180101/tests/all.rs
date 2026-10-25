@@ -55,6 +55,8 @@ mod policy_identifier_lookup;
 mod policy_lifecycle;
 #[path = "all/policy_resource_cleanup.rs"]
 mod policy_resource_cleanup;
+#[path = "all/policy_status_derivation.rs"]
+mod policy_status_derivation;
 #[path = "all/protection_status.rs"]
 mod protection_status;
 #[path = "all/protocols_list_lifecycle.rs"]

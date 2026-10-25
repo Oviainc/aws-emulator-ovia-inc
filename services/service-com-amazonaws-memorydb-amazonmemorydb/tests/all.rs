@@ -29,6 +29,8 @@ mod engine_versions;
 mod events;
 #[path = "all/fault_http_status.rs"]
 mod fault_http_status;
+#[path = "all/page_size_window.rs"]
+mod page_size_window;
 #[path = "all/parameter_catalog.rs"]
 mod parameter_catalog;
 #[path = "all/parameter_groups.rs"]

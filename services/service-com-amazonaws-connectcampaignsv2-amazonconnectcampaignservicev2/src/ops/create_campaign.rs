@@ -292,6 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             lifecycle_state: crate::state::CampaignState::Initialized,
             created_at: std::time::SystemTime::now(),
             outbound_requests: std::collections::BTreeMap::new(),
+            profile_outbound_requests: std::collections::BTreeMap::new(),
         });
 
         let stored = match stored {

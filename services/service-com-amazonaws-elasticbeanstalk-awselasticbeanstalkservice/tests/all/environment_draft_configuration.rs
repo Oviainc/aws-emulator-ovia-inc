@@ -405,7 +405,11 @@ async fn a_configuration_change_becomes_the_environments_draft_until_the_clock_d
 /// the status change that call owed the clock, so the reads that follow cannot
 /// race it. See this file's module docs: an update carries its own completion
 /// one transition span later, and an abort carries its own return to `Ready`.
-fn hold_where_it_is(emulator: &Emulator, case: &str, environment: &str) {
+///
+/// `pub(crate)` because the `configuration_set_deployment_status` suite needs
+/// the same precondition — an in-flight update with nothing owed — rather than a
+/// second copy of this seam.
+pub(crate) fn hold_where_it_is(emulator: &Emulator, case: &str, environment: &str) {
     let state = emulator.store();
     let mut store = state.lock();
     let environment_id = store
@@ -744,10 +748,10 @@ async fn deleting_a_configuration_of_an_environment_nothing_answers_to_is_refuse
 }
 
 #[tokio::test]
-async fn a_configuration_template_is_reported_with_no_deployment_status_and_no_draft() {
+async fn a_configuration_template_is_reported_as_deployed_and_carries_no_draft() {
     // The OTHER configuration set `DescribeConfigurationSettings` reports is a
-    // template, which is "not associated with a running environment": it has no
-    // deployment status, and no draft can belong to it.
+    // template: it names no environment, carries no draft beside it, and the
+    // one set it reports is the configuration the saved template holds.
     let case = "a template is no environment";
     let emulator = Emulator::new();
     ok(
@@ -791,8 +795,8 @@ async fn a_configuration_template_is_reported_with_no_deployment_status_and_no_d
     );
     assert_eq!(
         reported[0].value("DeploymentStatus"),
-        None,
-        "case {case:?}: a template is not associated with a running environment, got {}",
+        Some(eb::state::DEPLOYMENT_STATUS_DEPLOYED),
+        "case {case:?}: a stored template reports its configuration set as deployed, got {}",
         described.body
     );
     assert_eq!(

@@ -1547,6 +1547,8 @@ pub(crate) fn new_deployment() -> NewDeployment {
         description: None,
         kms_key_identifier: None,
         version_label: None,
+        // The schedule tests drive one deployment's clock, not the association store.
+        applied_extensions: Vec::new(),
         tags: std::collections::HashMap::new(),
     }
 }

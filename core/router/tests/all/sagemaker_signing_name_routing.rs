@@ -486,9 +486,9 @@ async fn the_job_runtime_answers_its_own_modelled_rejections_through_the_whole_r
     let long_trajectory_id = "t".repeat(280);
     let job_arn_header = "x-amzn-sagemaker-job-arn";
     let trajectory_id_header = "x-amzn-sagemaker-trajectory-id";
-    // Any ARN the modelled `JobArn` constraints admit names the job the caller's own job
-    // execution was handed: this data plane models no job creation and holds no registry
-    // to resolve one against.
+    // The job the data plane's rows address: a job ARN the modelled `JobArn` constraints
+    // admit, naming a job no `CreateJob` ever minted — which is what the rows below
+    // require, since each asserts a REFUSAL.
     let job = "arn:aws:sagemaker:us-west-2:000000000000:job/AgentRFT/wire-sjr-rollout-1";
 
     // One row: a request to one of the job runtime's paths, and the answer the one
@@ -589,6 +589,150 @@ async fn the_job_runtime_answers_its_own_modelled_rejections_through_the_whole_r
             "case {case:?}: expected the Message to state {fragment:?}, got {:?}",
             answer.message()
         );
+    }
+}
+
+/// RULE: a data-plane operation that routes a request to a resource the CONTROL PLANE
+/// creates resolves it against what the control plane recorded — so with the whole family
+/// mounted on one engine, a job `SageMaker.CreateJob` minted is sampled end to end, and
+/// an equally well-formed ARN no create minted is refused by the job runtime's own
+/// modelled `ValidationException` naming that ARN.
+///
+/// This is the cross-service half of the rule: the two services are different crates
+/// reading one shared job directory, so neither side alone can produce this answer.
+#[tokio::test]
+async fn a_job_the_control_plane_created_is_sampled_through_the_whole_router() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = build_router(&engine);
+
+    let job_arn_header = "x-amzn-sagemaker-job-arn";
+    let trajectory_id_header = "x-amzn-sagemaker-trajectory-id";
+    let payload = r#"{"messages":[{"role":"user","content":"go"}]}"#;
+
+    // Rows differ along the job's category and name, and along which sampling operation
+    // serves the rollout; each row is created through the control plane and then sampled,
+    // and a sibling ARN that was never created is refused.
+    let rows: [(&str, &str, &str, &str); 3] = [
+        (
+            "a fine-tuning job, non-streaming",
+            "AgentRFT",
+            "router-rollout-1",
+            "/sample",
+        ),
+        (
+            "an evaluation job, streaming",
+            "AgentRFTEvaluation",
+            "router-eval-1",
+            "/sample-with-response-stream",
+        ),
+        (
+            "a fine-tuning job, streaming",
+            "AgentRFT",
+            "router-rollout-2",
+            "/sample-with-response-stream",
+        ),
+    ];
+
+    for (case, category, name, path) in rows {
+        let created = control_plane_call(
+            &router,
+            "CreateJob",
+            &serde_json::json!({
+                "JobName": name,
+                "JobCategory": category,
+                "JobConfigSchemaVersion": "1.0.0",
+                "JobConfigDocument": "{\"baseModel\":\"demo-model\"}",
+                "RoleArn": "arn:aws:iam::000000000000:role/service-role/AmazonSageMaker-ExecutionRole",
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected HTTP 200 from SageMaker.CreateJob, got {} / {}",
+            created.status, created.body
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&created.body).unwrap_or(serde_json::Value::Null);
+        let minted = parsed["JobArn"].as_str().unwrap_or_default().to_string();
+        assert_eq!(
+            minted,
+            format!("arn:aws:sagemaker:us-east-1:000000000000:job/{category}/{name}"),
+            "case {case:?}: expected the minted JobArn, got {}",
+            created.body
+        );
+
+        let served = dispatch(
+            &router,
+            path,
+            &[(job_arn_header, &minted), (trajectory_id_header, "traj-1")],
+            payload,
+        )
+        .await;
+        assert_eq!(
+            (served.status, served.error_code().as_str()),
+            (200, ""),
+            "case {case:?}: expected the job runtime to serve the created job, got {} {:?} / {}",
+            served.status,
+            served.error_type,
+            served.body
+        );
+
+        // A sibling ARN of the same form that no create minted: the same request, refused.
+        let ghost = format!("arn:aws:sagemaker:us-east-1:000000000000:job/{category}/{name}-ghost");
+        let refused = dispatch(
+            &router,
+            path,
+            &[(job_arn_header, &ghost), (trajectory_id_header, "traj-1")],
+            payload,
+        )
+        .await;
+        assert_eq!(
+            (refused.status, refused.error_code().as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException for a job no create minted, got {} \
+             {:?} / {}",
+            refused.status,
+            refused.error_type,
+            refused.body
+        );
+        assert!(
+            refused.message().contains(&ghost),
+            "case {case:?}: expected the refusal to name the requested jobArn, got {:?}",
+            refused.message()
+        );
+    }
+}
+
+/// One awsJson1_1 control-plane call (`POST /` with `X-Amz-Target: SageMaker.<Op>`), which
+/// is how every operation of the SageMaker control plane arrives.
+async fn control_plane_call(router: &MultiServiceRouter, target: &str, body: &str) -> Answer {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://emulator.local/")
+        .header("host", "emulator.local")
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("SageMaker.{target}"))
+        .header("authorization", authorization("sagemaker"))
+        .body(Bytes::from(body.to_string()))
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let error_type = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    Answer {
+        status,
+        error_type,
+        content_type,
+        body: String::from_utf8_lossy(response.body()).to_string(),
     }
 }
 

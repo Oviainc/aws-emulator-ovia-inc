@@ -419,18 +419,19 @@ fn assert_template(answer: &Answer, case: &TemplateCase, operation: &str) {
         answer.body
     );
     // "Templates aren't associated with any environment. The EnvironmentName
-    // response element is always null", and a configuration that is not
-    // associated with a running environment reports no DeploymentStatus.
+    // response element is always null."
     assert_eq!(
         answer.value("EnvironmentName"),
         None,
         "case {label:?}: a template names no environment, got {}",
         answer.body
     );
+    // A stored template IS the configuration set the saved configuration holds,
+    // so the set a describe reports is the one in effect for it.
     assert_eq!(
         answer.value("DeploymentStatus"),
-        None,
-        "case {label:?}: a template has no DeploymentStatus, got {}",
+        Some(eb::state::DEPLOYMENT_STATUS_DEPLOYED),
+        "case {label:?}: a stored template reports its configuration set as deployed, got {}",
         answer.body
     );
     let date_created = answer
