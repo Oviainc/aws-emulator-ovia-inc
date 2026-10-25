@@ -494,6 +494,16 @@ pub const MIN_LIST_CONSUMABLE_RESOURCES_RESULTS: i32 = 1;
 /// returns up to 100 results and a `nextToken` value if applicable."
 pub const MAX_LIST_CONSUMABLE_RESOURCES_RESULTS: i32 = 100;
 
+/// The fewest results `ListQuotaShares$maxResults` accepts, from the member's doc: "This
+/// value can be between 1 and 100." The model types it as a plain `Integer`, so the bound
+/// is applied in the handler.
+pub const MIN_LIST_QUOTA_SHARES_RESULTS: i32 = 1;
+/// The most results `ListQuotaShares$maxResults` accepts; see
+/// [`MIN_LIST_QUOTA_SHARES_RESULTS`]. Also the page size of a request that names none, from
+/// the same doc: "If this parameter isn't used, `ListQuotaShares` returns up to 100 results
+/// and a `nextToken` value if applicable."
+pub const MAX_LIST_QUOTA_SHARES_RESULTS: i32 = 100;
+
 /// The fewest results `ListSchedulingPolicies$maxResults` accepts, from the member's doc:
 /// "This value can be between 1 and 100." The model types it as a plain `Integer`, so the
 /// bound is applied in the handler.
@@ -3614,7 +3624,9 @@ pub fn matches_created_at_filter(name: &str, created_at: i64, bounds: &[i64]) ->
 ///
 /// The token is the index the next page starts at, so a caller that pages to the
 /// end sees every item exactly once. An unparseable or out-of-range token is an
-/// error the caller gets as a `ClientException`.
+/// error the caller gets as a `ClientException`, worded the way AWS Batch words an
+/// unusable `nextToken` ([`NEXT_TOKEN_NOT_PROCESSABLE`]): the detail states that the token
+/// could not be processed and echoes nothing of the token itself.
 pub fn paginate<T>(
     items: Vec<T>,
     max_results: Option<i32>,
@@ -3626,7 +3638,7 @@ pub fn paginate<T>(
             .parse::<usize>()
             .ok()
             .filter(|start| *start <= total)
-            .ok_or_else(|| format!("The nextToken {token} is not valid."))?,
+            .ok_or_else(|| NEXT_TOKEN_NOT_PROCESSABLE.to_string())?,
         None => 0,
     };
     let limit = max_results

@@ -248,7 +248,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let associated = state
             .associated_pricing_plan_count(&rule_arn, &crate::state::current_billing_period());
         let output = render(&updated, associated);
-        state.pricing_rules.insert(rule_arn.clone(), updated);
+        // A write takes effect in the billing period it is made in, so the rule the
+        // period BEFORE this one reports is the generation this write supersedes rather
+        // than the one it leaves ([`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_pricing_rule`]).
+        state.put_pricing_rule(updated);
 
         // The audit record for a state-changing call: who asked, what changed and
         // that it succeeded. Never a secret, and never a `@sensitive` member (the

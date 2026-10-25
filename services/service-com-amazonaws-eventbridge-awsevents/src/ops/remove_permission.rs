@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The bus's resource policy is part of the bus, so revoking a grant is a
         // modification of the bus.
-        bus.last_modified = modified;
+        bus.touch(modified);
 
         Ok(RemovePermissionOutput)
     }

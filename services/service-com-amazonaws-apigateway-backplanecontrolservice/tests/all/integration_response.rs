@@ -101,7 +101,10 @@ pub(crate) async fn delete_integration_response(
 /// A fresh resource under `root` carrying one `verb` method with a MOCK integration on
 /// it, answering its resource id: an integration response hangs off the integration, so
 /// every case needs one standing first.
-async fn resource_with_an_integration(
+///
+/// `pub(crate)` so the sibling `update_integration_response` suite, which patches the
+/// responses this harness's integrations carry, stands an integration up the same way.
+pub(crate) async fn resource_with_an_integration(
     gateway: &Gateway,
     api: &str,
     root: &str,

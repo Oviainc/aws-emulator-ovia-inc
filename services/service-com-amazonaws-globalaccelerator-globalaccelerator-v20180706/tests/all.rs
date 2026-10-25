@@ -17,6 +17,8 @@ mod accelerator_lifecycle;
 mod endpoint_groups;
 #[path = "all/input_refusals.rs"]
 mod input_refusals;
+#[path = "all/not_found_error_status.rs"]
+mod not_found_error_status;
 #[path = "all/resource_projection.rs"]
 mod resource_projection;
 #[path = "all/state_roundtrip.rs"]

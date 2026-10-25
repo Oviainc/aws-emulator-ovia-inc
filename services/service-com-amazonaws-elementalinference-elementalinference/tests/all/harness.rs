@@ -235,6 +235,24 @@ pub fn subtitling_output(name: &str, dictionary: Option<&str>) -> Value {
     json!({"name": name, "outputConfig": config, "status": "ENABLED"})
 }
 
+/// One output named `name` whose clipping config names `fixture_id` as its data source
+/// (`DataSourceConfiguration$fixtureId`: "The ID of the fixture whose event data you want
+/// Elemental Inference to map onto this clipping output").
+///
+/// A clipping output's data source is the ONLY way a feed references a fixture, so this is
+/// the one builder every suite that needs that reference goes through — the fixture's
+/// counterpart of [`subtitling_output`].
+pub fn clipping_output(name: &str, fixture_id: &str) -> Value {
+    json!({
+        "name": name,
+        "status": "ENABLED",
+        "outputConfig": {"clipping": {
+            "callbackMetadata": "season opener",
+            "dataSourceConfiguration": {"fixtureId": fixture_id}
+        }},
+    })
+}
+
 /// A `CreateFeed` body with one enabled cropping output and no optional members: the
 /// smallest feed a suite can create when the feed's own shape is not what it is
 /// testing.

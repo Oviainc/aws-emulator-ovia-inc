@@ -30,7 +30,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::TEMPLATE_BODY_MA
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    call, member, router, router_with_engine, store, xml_text, xml_unescape,
+    call, list_members, member, router, router_with_engine, store, xml_text, xml_unescape,
 };
 
 /// The fixed form of `CapabilitiesReason`: "the list of resources that generated the
@@ -60,25 +60,6 @@ fn parameter(
         no_echo: Some(no_echo.to_string()),
         description: description.map(ToString::to_string),
     }
-}
-
-/// Every `<member>` block inside the first `<tag>` list of the response, in wire order.
-///
-/// An element is matched by its NAME, not by `<name>`: the serializer puts the envelope's
-/// `xmlns` on some elements, so an opening tag may carry attributes.
-fn list_members(xml: &str, tag: &str) -> Vec<String> {
-    let Some(block) = element_body(xml, tag) else {
-        return Vec::new();
-    };
-    let mut found = Vec::new();
-    let mut rest = block.as_str();
-    while let Some(entry) = element_body(rest, "member") {
-        let close = "</member>";
-        let end = rest.find(close).expect("a member that opened also closed");
-        found.push(entry);
-        rest = &rest[end + close.len()..];
-    }
-    found
 }
 
 /// The text between `<tag …>` and `</tag>`, matching the element by name so an opening

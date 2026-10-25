@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the ONE alias of the named function the request addresses, and answers the
+//! modelled 204 with no body.
+//!
+//! The operation is `@idempotent`, so its answer states the END STATE rather than
+//! whether this call was the one that reached it: a name the function holds no alias of
+//! is already in the state the request asks for, so the call succeeds having removed
+//! nothing. The FUNCTION still has to exist — the idempotence is the alias's, not the
+//! function's — so a name that resolves to no function is the modelled 404.
+//!
+//! An alias a provisioned concurrency configuration is attached to is IN USE by it:
+//! `PutProvisionedConcurrencyConfig` "Adds a provisioned concurrency configuration to a
+//! function's alias or version", so that configuration holds capacity against this
+//! alias's ARN, and deleting the alias under it would leave the allocation addressed to
+//! a resource that no longer exists. Such a delete is refused with the modelled
+//! `ResourceConflictException` (409) until the configuration is removed; see
+//! [`crate::state::provisioned_concurrency_in_use_message`].
+//!
+//! Everything else keyed by the alias's own qualifier goes WITH the alias, because the
+//! ARN those records are addressed by stops naming anything once the alias is gone: its
+//! function URL (attached to the qualifier it was created on) and its resource-based
+//! policy (attached to the ARN the permission named). Leaving either behind would
+//! resurface on a later alias of the same name, which never held them.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +188,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAlias"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(service_error("Lambda state is not reachable on this engine"));
+        };
+
+        // The `Alias` pattern's negative lookahead (`^(?!^[0-9]+$)([a-zA-Z0-9-_]+)$`) is
+        // what keeps an alias name out of the version-number namespace, so a name that
+        // does not satisfy it names no alias a function could ever hold. The check
+        // belongs to the request's SHAPE, so it is answered the way the framework's own
+        // constraint walk answers one — its regex engine does not compile the lookahead,
+        // so the value arrives here unchecked (the same reason `CreateAlias` states it).
+        if !crate::state::is_alias_name(&input.name) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::alias_name_message(&input.name),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // An alias belongs to the FUNCTION rather than to one of its versions, so a
+        // `FunctionName` qualified with anything else names no function an alias can be
+        // deleted from — the same reading `CreateAlias` applies to the same member.
+        let reference =
+            crate::state::parse_function_reference(&input.function_name).ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{}' at 'functionName' failed to \
+                     satisfy constraint: Member must satisfy one of the documented name \
+                     formats (name, name:qualifier, partial ARN or function ARN)",
+                    input.function_name
+                ))
+            })?;
+        if let Some(qualifier) = reference
+            .qualifier
+            .as_deref()
+            .filter(|qualifier| *qualifier != crate::state::VERSION_LATEST)
+        {
+            return Err(invalid_parameter(format!(
+                "An alias belongs to a function and is addressed by 'Name', and the \
+                 qualifier '{qualifier}' in 'functionName' names a published version or an \
+                 alias"
+            )));
+        }
+
+        let Some(record) = store.functions.get_mut(&reference.name) else {
+            return Err(not_found(format!(
+                "Function not found: {}",
+                crate::state::function_arn(&region, &reference.name)
+            )));
+        };
+        record.materialize(now);
+
+        // `@idempotent`: the answer states the end state. A function that holds no alias
+        // of this name is already in it, so the call succeeds having removed nothing —
+        // and removes nothing, so a repeated delete cannot take a later alias of the
+        // same name with it.
+        if !record.aliases.contains_key(&input.name) {
+            return Ok(DeleteAliasOutput);
+        }
+
+        // An alias that still has provisioned concurrency attached is in use by that
+        // allocation; see the module docs.
+        if record
+            .provisioned_concurrency_configs
+            .contains_key(&input.name)
+        {
+            return Err(resource_conflict(
+                crate::state::provisioned_concurrency_in_use_message(
+                    &record.versioned_arn(&input.name),
+                ),
+            ));
+        }
+
+        record.aliases.remove(&input.name);
+        // What was addressed by this alias's ARN goes with it; see the module docs.
+        record.url_configs.remove(&input.name);
+        record.policies.remove(&input.name);
+
+        // A successful delete carries no body; the modelled 204 is `SUCCESS_STATUS`.
+        Ok(DeleteAliasOutput)
     }
+}
+
+/// The modelled 400 for a `FunctionName` that is not one of the documented name forms,
+/// or that qualifies a version an alias cannot belong to.
+fn invalid_parameter(message: String) -> DeleteAliasError {
+    DeleteAliasErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 404 for a name that names no function this emulator holds.
+fn not_found(message: String) -> DeleteAliasError {
+    DeleteAliasErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 409 for an alias another resource still holds.
+fn resource_conflict(message: String) -> DeleteAliasError {
+    DeleteAliasErrorModeled::ResourceConflictException(ResourceConflictException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 500 for a failure of the store itself.
+fn service_error(message: &str) -> DeleteAliasError {
+    DeleteAliasErrorModeled::ServiceException(ServiceException {
+        r#type: None,
+        message: Some(message.to_string()),
+    })
+    .into()
 }

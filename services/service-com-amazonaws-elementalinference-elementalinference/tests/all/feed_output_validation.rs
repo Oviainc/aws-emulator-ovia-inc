@@ -34,8 +34,8 @@
 //! rule says must differ.
 
 use crate::harness::{
-    call, call_in_region, held_fixture_id, message_of, output_config, past_the_transition_span,
-    router, subtitling_output, REGION,
+    call, call_in_region, clipping_output, held_fixture_id, message_of, output_config,
+    past_the_transition_span, router, subtitling_output, REGION,
 };
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
@@ -186,19 +186,6 @@ fn refusal(label: &str, answer: (u16, Value), status: u16, kind: &str) -> String
         "case {label:?}: expected {kind}, got {body}"
     );
     message_of(&body).to_string()
-}
-
-/// One output named `name` whose clipping config names `fixture_id` as its data source
-/// (`DataSourceConfiguration$fixtureId`).
-fn clipping_output(name: &str, fixture_id: &str) -> Value {
-    json!({
-        "name": name,
-        "status": "ENABLED",
-        "outputConfig": {"clipping": {
-            "callbackMetadata": "season opener",
-            "dataSourceConfiguration": {"fixtureId": fixture_id}
-        }},
-    })
 }
 
 /// `CreateFeed` with an empty `outputs` is refused whatever else the request carries, and

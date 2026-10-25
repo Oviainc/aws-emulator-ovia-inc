@@ -61,6 +61,8 @@ mod scraper_update;
 mod state_roundtrip;
 #[path = "all/taggable_resource_kinds.rs"]
 mod taggable_resource_kinds;
+#[path = "all/tagging_api_arn_resolution.rs"]
+mod tagging_api_arn_resolution;
 #[path = "all/wire_fidelity.rs"]
 mod wire_fidelity;
 #[path = "all/workspace_configuration.rs"]

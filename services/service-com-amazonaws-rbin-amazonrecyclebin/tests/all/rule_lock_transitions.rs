@@ -291,11 +291,12 @@ async fn lock_rule_is_refused_for_every_rule_that_cannot_be_locked() {
     )
     .await;
 
-    // The expected `Reason` for the 404 is the fault class the model names for an
-    // addressed rule that does not exist (see `tests/all/error_response_bodies.rs`,
-    // which asserts those bodies over the whole class).
+    // The 404 for an identifier no rule holds carries no `Reason`: the member is optional
+    // and this service does not populate it on that path (see
+    // `tests/all/not_found_error_body_members.rs`, which asserts those bodies over the
+    // whole class).
     let rows: [RefusalRow<'_>; 4] = [
-        ("unknown identifier", "0000000000z", 404, Some("RULE_NOT_FOUND"), None),
+        ("unknown identifier", "0000000000z", 404, None, None),
         (
             "tag-level rule",
             tag_level.as_str(),
@@ -522,9 +523,9 @@ async fn unlock_rule_is_refused_unless_the_rule_is_locked() {
          got {status}"
     );
 
-    // As above, the 404 carries the `RULE_NOT_FOUND` fault class.
+    // As above, the 404 carries no `Reason`.
     let rows: [RefusalRow<'_>; 3] = [
-        ("unknown identifier", "zzzzzzzzzz0", 404, Some("RULE_NOT_FOUND"), None),
+        ("unknown identifier", "zzzzzzzzzz0", 404, None, None),
         (
             "never locked rule",
             never_locked.as_str(),

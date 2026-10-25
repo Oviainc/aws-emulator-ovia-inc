@@ -44,11 +44,11 @@ use ec2::ops::cancel_export_task::INSTANCE_EXPORT_TASK_ID_PREFIX;
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, EXPORT_TASK_STATE_ACTIVE,
     EXPORT_TASK_STATE_CANCELLED, EXPORT_TASK_STATE_CANCELLING, EXPORT_TASK_STATE_COMPLETED,
-    FPGA_IMAGE_STATE_FAILED, FPGA_IMAGE_STATE_PENDING, ImageSpec,
-    MAX_S3_BUCKET_NAME_CHARS,
-    MIN_S3_BUCKET_NAME_CHARS, RECYCLE_BIN_PAGE_SIZE_RANGE, VOLUME_ATTACHMENT_STATE_ATTACHED,
-    VOLUME_ATTACHMENT_STATE_DETACHING, VOLUME_STATE_AVAILABLE, VOLUME_STATE_DELETED,
-    VOLUME_STATE_IN_USE, WATERMARK_NAME_PUNCTUATION, ExportTaskRecord, system_time_to_date_time,
+    FPGA_IMAGE_STATE_FAILED, FPGA_IMAGE_STATE_PENDING, IMAGE_USAGE_REPORT_ID_PREFIX, ImageSpec,
+    MAX_S3_BUCKET_NAME_CHARS, MIN_S3_BUCKET_NAME_CHARS, RECYCLE_BIN_PAGE_SIZE_RANGE,
+    VOLUME_ATTACHMENT_STATE_ATTACHED, VOLUME_ATTACHMENT_STATE_DETACHING, VOLUME_STATE_AVAILABLE,
+    VOLUME_STATE_DELETED, VOLUME_STATE_IN_USE, WATERMARK_NAME_PUNCTUATION, ExportTaskRecord,
+    system_time_to_date_time,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -68,7 +68,7 @@ const UNKNOWN_FPGA_IMAGE_ID: &str = "afi-0123456789abcdef0";
 const UNKNOWN_IMAGE_ID: &str = "ami-0123456789abcdef0";
 const UNKNOWN_VOLUME_ID: &str = "vol-0123456789abcdef0";
 const UNKNOWN_INSTANCE_ID: &str = "i-0123456789abcdef0";
-const UNKNOWN_REPORT_ID: &str = "imgrpt-0123456789abcdef0";
+const UNKNOWN_REPORT_ID: &str = "imgusgrpt-0123456789abcdef0";
 
 /// A bucket name that satisfies every one of Amazon S3's general-purpose bucket naming
 /// rules, for the rows that are about something other than the bucket.
@@ -967,7 +967,7 @@ async fn attach_image_watermark_refuses_an_ami_it_cannot_watermark() {
 fn seed_image_usage_report(engine: &engine::InMemoryEngine, image_id: &str) -> String {
     let store = engine.state::<Ec2State>();
     let mut guard = store.lock();
-    let report_id = guard.next_id("imgrpt");
+    let report_id = guard.next_id(IMAGE_USAGE_REPORT_ID_PREFIX);
     guard.image_usage_reports.insert(
         report_id.clone(),
         ImageUsageReport {

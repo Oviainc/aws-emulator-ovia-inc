@@ -102,6 +102,20 @@ pub const EXECUTION_START_SPAN: Duration = Duration::from_millis(400);
 /// reason as [`EXECUTION_START_SPAN`].
 pub const EXECUTION_FINISH_SPAN: Duration = Duration::from_millis(400);
 
+/// How long an Amazon EC2 instance stays in a state that names work ALREADY
+/// UNDER WAY before the clock owes it the state that work ends in.
+///
+/// Three of `InstanceStateName`'s values name a change in flight rather than a
+/// state an instance rests in, and each has exactly one outcome
+/// ([`instance_state_after`]), so the outcome is owed from the instant the cache
+/// first reported the in-flight state — nothing has to be asked of the instance
+/// for it to arrive. The span is the emulator's OWN choice, like the execution
+/// spans above, and is deliberately not zero, so a caller reading the cache right
+/// after the event that started the change still observes the in-flight state. The
+/// due instant is stored on the instance record and materialised by whichever later
+/// call reads it ([`Ec2Instance::settle`]) — nothing sleeps.
+pub const INSTANCE_TRANSITION_SPAN: Duration = Duration::from_millis(400);
+
 /// The `resourceType` segment a not-found message names for a managed device.
 pub const DEVICE_RESOURCE_TYPE: &str = "managed-device";
 
@@ -205,6 +219,12 @@ pub struct Device {
     /// live inside the device record: an instance cannot outlive the device it
     /// runs on, and `DescribeDeviceEc2Instances` reads the cloud-side cache of
     /// exactly this set. A `BTreeMap` gives that cache a stable total order.
+    ///
+    /// The entries are not frozen, though: the cache is what the device last
+    /// reported, so an instance state that names work in flight is carried to the
+    /// state that work ends in, and a device that answered a `reboot` reports the
+    /// whole set afresh
+    /// ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::settle`]).
     pub ec2_instances: BTreeMap<String, Ec2Instance>,
 }
 
@@ -238,6 +258,12 @@ impl Device {
 /// Holds the members the modelled `Instance` reports, as the cloud-side device
 /// cache holds them; `DescribeDeviceEc2Instances` projects them with
 /// [`Ec2Instance::to_summary`].
+///
+/// A cache entry is the last thing the device reported about that instance, so it
+/// carries WHEN that was ([`Ec2Instance::updated_at`], which both freshness
+/// members are read from) and, while the state it reports names work in flight,
+/// WHEN the state that work ends in is owed
+/// ([`Ec2Instance::transition_due`]).
 #[derive(Debug, Clone)]
 pub struct Ec2Instance {
     pub instance_id: String,
@@ -267,9 +293,74 @@ pub struct Ec2Instance {
     pub security_group_name: String,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
+    /// The instant the clock owes this instance the state its in-flight state ends
+    /// in, while it has one. `None` once the reported state is one the instance
+    /// rests in, which is every state nothing is in flight on.
+    pub transition_due: Option<SystemTime>,
 }
 
 impl Ec2Instance {
+    /// Report this instance in `state_name` as of `at`: the cache entry the device
+    /// pushed at that instant.
+    ///
+    /// The code comes from the documented catalog ([`instance_state_code`]), so a
+    /// reported name and its code cannot drift apart; the freshness members advance
+    /// to `at`, since what `InstanceSummary$lastUpdatedAt` and `Instance$updatedAt`
+    /// report is when the cache entry last changed; and a state that names work in
+    /// flight arms the outcome it is owed, which [`Ec2Instance::settle`]
+    /// materialises once that instant has passed.
+    pub fn enter_state(&mut self, state_name: &str, at: SystemTime) {
+        self.state_code = instance_state_code(state_name).unwrap_or(self.state_code);
+        self.state_name = state_name.to_string();
+        self.updated_at = at;
+        self.transition_due =
+            instance_state_after(state_name).map(|_| at + INSTANCE_TRANSITION_SPAN);
+    }
+
+    /// Materialise the state change the clock already owes this instance.
+    ///
+    /// An in-flight state resolves to its outcome AT THE INSTANT IT CAME DUE, not at
+    /// the instant someone looked: the same change was owed then even if nobody had
+    /// called. The outcome can be in flight in turn, so the walk repeats until the
+    /// record owes nothing at or before `now`.
+    pub fn settle(&mut self, now: SystemTime) {
+        while let Some(due) = self.transition_due {
+            if now < due {
+                break;
+            }
+            match instance_state_after(&self.state_name) {
+                Some(next) => self.enter_state(next, due),
+                // A state nothing is in flight on owes nothing, so this is
+                // unreachable; clearing the instant keeps the invariant true rather
+                // than looping forever on a record that broke it.
+                None => self.transition_due = None,
+            }
+        }
+    }
+
+    /// The cache entry of this instance after the device it runs on restarted at
+    /// `at`.
+    ///
+    /// Restarting a device restarts the compute environment its instances run in, so
+    /// the device reports its whole instance set afresh: the freshness members
+    /// advance whatever the state, work that was in flight ends with the restart (an
+    /// in-flight state is carried to its outcome), and an instance that was up comes
+    /// back up — which is the state an instance that is starting reports, owed
+    /// `RUNNING` in turn. An instance that was deliberately stopped, or that no
+    /// longer exists, stays that way: restarting the host it ran on starts neither.
+    pub fn restart(&mut self, at: SystemTime) {
+        let settled = match instance_state_after(&self.state_name) {
+            Some(outcome) => outcome.to_string(),
+            None => self.state_name.clone(),
+        };
+        let next = if settled == INSTANCE_STATE_RUNNING {
+            INSTANCE_STATE_PENDING
+        } else {
+            settled.as_str()
+        };
+        self.enter_state(next, at);
+    }
+
     /// The `InstanceSummary` projection `DescribeDeviceEc2Instances` returns.
     pub fn to_summary(&self) -> InstanceSummary {
         InstanceSummary {
@@ -762,9 +853,15 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     /// which is the order this map is keyed in — the task ids a Region's records
     /// carry are minted from a monotonic counter at a fixed width, so iterating
     /// `(region, taskId, managedDeviceId)` reaches each device's executions oldest
-    /// first. A task whose every execution is terminal becomes `COMPLETED`. Nothing
-    /// here depends on who called: the same changes were owed at this instant even
-    /// if nobody had.
+    /// first. A task whose every execution is terminal becomes `COMPLETED`.
+    ///
+    /// A device's Amazon EC2 instance cache evolves under the same clock: an
+    /// instance state that names work in flight is carried to the state that work
+    /// ends in ([`Ec2Instance::settle`]), and a device that answered a `reboot`
+    /// reports its whole instance set afresh ([`Ec2Instance::restart`]).
+    ///
+    /// Nothing here depends on who called: the same changes were owed at this
+    /// instant even if nobody had.
     pub fn settle(&mut self, now: SystemTime) {
         let tasks = &self.tasks;
         // What the finished executions ask of their devices, applied after the
@@ -834,6 +931,17 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
             }
         }
 
+        // The devices' Amazon EC2 instance caches: an instance state that names
+        // work in flight resolves to the state that work ends in once its own
+        // instant has passed ([`Ec2Instance::settle`]). This is owed whoever calls
+        // and whether or not any task ran, so it is materialised for every device,
+        // ahead of what a finished execution asks of its own device below.
+        for device in self.devices.values_mut() {
+            for instance in device.ec2_instances.values_mut() {
+                instance.settle(now);
+            }
+        }
+
         for (managed_device_id, command) in effects {
             let Some(device) = self.devices.get_mut(&managed_device_id) else {
                 continue;
@@ -849,10 +957,17 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
                         device.last_updated_at = now;
                     }
                 }
-                // "Reboots the device." A reboot leaves no member of the device
-                // record different afterwards; only the check-in above records
-                // that it happened.
-                TaskCommand::Reboot => {}
+                // "Reboots the device." The device restarted, so it brought the
+                // compute environment its instances run in back up and reported
+                // that whole set afresh: the cloud-side cache this account reads is
+                // the one the restart produced ([`Ec2Instance::restart`]). Nothing
+                // else about the device record changes — a reboot is not an unlock,
+                // and `UnlockState` is unaffected by one.
+                TaskCommand::Reboot => {
+                    for instance in device.ec2_instances.values_mut() {
+                        instance.restart(now);
+                    }
+                }
             }
         }
 
@@ -934,9 +1049,11 @@ const FIXTURE_INSTANCE_COUNTS: &[u64] = &[4, 2, 0];
 /// `InstanceStateName`'s values, each with the `InstanceState$code` the model
 /// documents for it ("the valid values for the instance state code" — `0`:
 /// pending, `16`: running, `32`: shutting-down, `48`: terminated, `64`:
-/// stopping, `80`: stopped). The fixture cycles through the whole set, so every
-/// published name/code pair appears in some instance.
-const FIXTURE_INSTANCE_STATES: &[(&str, i32)] = &[
+/// stopping, `80`: stopped). This is the catalog every reported state comes from
+/// ([`instance_state_code`]), and the fixture cycles through the whole set, so
+/// every published name/code pair appears in some instance a device has just been
+/// activated with.
+const INSTANCE_STATES: &[(&str, i32)] = &[
     ("PENDING", 0),
     ("RUNNING", 16),
     ("SHUTTING_DOWN", 32),
@@ -944,6 +1061,44 @@ const FIXTURE_INSTANCE_STATES: &[(&str, i32)] = &[
     ("STOPPING", 64),
     ("STOPPED", 80),
 ];
+
+/// `InstanceStateName$PENDING` — the state an instance that is starting reports.
+const INSTANCE_STATE_PENDING: &str = "PENDING";
+
+/// `InstanceStateName$RUNNING` — the state an instance that is up reports.
+const INSTANCE_STATE_RUNNING: &str = "RUNNING";
+
+/// Each `InstanceStateName` value that names work ALREADY UNDER WAY, with the
+/// state that work ends in.
+///
+/// The three are the in-flight half of the catalog, and each has exactly one
+/// outcome: an instance that is starting ends up running, one that is shutting down
+/// ends up terminated, and one that is stopping ends up stopped. The other three
+/// values name a state an instance RESTS in until something asks it to change, so
+/// nothing is owed for them.
+const INSTANCE_STATE_TRANSITIONS: &[(&str, &str)] = &[
+    ("PENDING", "RUNNING"),
+    ("SHUTTING_DOWN", "TERMINATED"),
+    ("STOPPING", "STOPPED"),
+];
+
+/// The `InstanceState$code` the model documents for `state_name`, or `None` when
+/// that name is not an `InstanceStateName` value.
+pub fn instance_state_code(state_name: &str) -> Option<i32> {
+    INSTANCE_STATES
+        .iter()
+        .find(|(name, _)| *name == state_name)
+        .map(|(_, code)| *code)
+}
+
+/// The state the work `state_name` names ends in, or `None` when that state has no
+/// work in flight and so owes nothing ([`INSTANCE_STATE_TRANSITIONS`]).
+pub fn instance_state_after(state_name: &str) -> Option<&'static str> {
+    INSTANCE_STATE_TRANSITIONS
+        .iter()
+        .find(|(in_flight, _)| *in_flight == state_name)
+        .map(|(_, outcome)| *outcome)
+}
 
 /// The Snow Family compute instance types the fixture cycles through, each with
 /// the number of vCPUs it has, as the Snowball Edge developer guide's
@@ -996,8 +1151,7 @@ fn fixture_instances(device_index: u64, now: SystemTime) -> BTreeMap<String, Ec2
     for slot in 0..instance_count(device_index) {
         let index = usize::try_from(offset + slot).expect("the fixture instance count fits usize");
         let launch_index = i32::try_from(slot).expect("the per-device instance count fits in i32");
-        let (state_name, state_code) =
-            FIXTURE_INSTANCE_STATES[index % FIXTURE_INSTANCE_STATES.len()];
+        let (state_name, state_code) = INSTANCE_STATES[index % INSTANCE_STATES.len()];
         let (instance_type, vcpus) = FIXTURE_INSTANCE_TYPES[index % FIXTURE_INSTANCE_TYPES.len()];
         let instance_id = instance_id(offset + slot);
         instances.insert(
@@ -1026,6 +1180,11 @@ fn fixture_instances(device_index: u64, now: SystemTime) -> BTreeMap<String, Ec2
                 security_group_name: "default".to_string(),
                 created_at: now,
                 updated_at: now,
+                // An instance the cache reports as starting, shutting down or
+                // stopping has that work in flight from the instant the cache
+                // first held it, so its outcome is owed from then.
+                transition_due: instance_state_after(state_name)
+                    .map(|_| now + INSTANCE_TRANSITION_SPAN),
             },
         );
     }

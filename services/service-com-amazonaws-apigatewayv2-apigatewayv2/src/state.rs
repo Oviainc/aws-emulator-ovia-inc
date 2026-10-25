@@ -83,6 +83,49 @@ pub const INTEGRATION_TARGET_PREFIX: &str = "integrations/";
 /// calls growing this store without end.
 pub const MAX_APIS: usize = 600;
 
+/// The length window the shape an api's `Name` targets documents:
+/// `CreateApi$Name` / `UpdateApi$Name` / `ImportApi`'s `title` all target
+/// `StringWithLengthBetween1And128`, whose own documentation is "A string with a length
+/// between [1-128]" (`smithy_query(query="shape",
+/// shape="StringWithLengthBetween1And128")`).
+pub const API_NAME_LEN: (usize, usize) = (1, 128);
+
+/// The length window an api's `Description` falls in: `StringWithLengthBetween0And1024`,
+/// "A string with a length between [0-1024]".
+pub const API_DESCRIPTION_LEN: (usize, usize) = (0, 1024);
+
+/// The length window an api's `Version` falls in: `StringWithLengthBetween1And64`,
+/// "A string with a length between [1-64]".
+pub const API_VERSION_LEN: (usize, usize) = (1, 64);
+
+/// Refuse a string member whose length falls outside the window the shape it targets
+/// documents.
+///
+/// None of this model's `StringWithLengthBetween…` shapes carries an `@length` trait, so
+/// the boundary validator does not enforce the window its name and documentation state
+/// and the operation that writes the member does — otherwise a value no AWS API Gateway
+/// would store is stored here and reported back by every later reader. This is the one
+/// implementation of that check, so no two operations can state the same bound
+/// differently.
+///
+/// `Ok(())`, or the message for the operation's `BadRequestException`: it names the
+/// member, the window and the length the request carried.
+pub fn validate_member_length(
+    member: &str,
+    value: &str,
+    (min, max): (usize, usize),
+) -> Result<(), String> {
+    // Characters, not bytes: the window the shape documents is a string length, so a
+    // multi-byte character counts once.
+    let length = value.chars().count();
+    if length < min || length > max {
+        return Err(format!(
+            "Invalid value for {member}: must have length between {min} and {max}, got {length}."
+        ));
+    }
+    Ok(())
+}
+
 /// The most routes one api may hold, after which CreateRoute is refused. AWS's
 /// published quota is 300 routes per API.
 pub const MAX_ROUTES_PER_API: usize = 300;
@@ -1742,8 +1785,9 @@ pub const STAGE_ALREADY_EXISTS_MESSAGE: &str = "Stage already exists";
 pub const DEFAULT_STAGE_NAME: &str = "$default";
 
 /// The longest `StageName` the service accepts: the upper bound of
-/// `StringWithLengthBetween1And128`, the shape `CreateStage$StageName` targets.
-pub const MAX_STAGE_NAME_LEN: usize = 128;
+/// `StringWithLengthBetween1And128`, the shape `CreateStage$StageName` targets — the
+/// same window an api's `Name` falls in ([`API_NAME_LEN`]).
+pub const MAX_STAGE_NAME_LEN: usize = API_NAME_LEN.1;
 
 /// The longest stage variable VALUE the service accepts: the upper bound of
 /// `StringWithLengthBetween0And2048`, the value shape of `StageVariablesMap`
@@ -1764,13 +1808,7 @@ pub fn validate_stage_name(stage_name: &str) -> Result<(), String> {
     if stage_name == DEFAULT_STAGE_NAME {
         return Ok(());
     }
-    let length = stage_name.chars().count();
-    if length == 0 || length > MAX_STAGE_NAME_LEN {
-        return Err(format!(
-            "Invalid value for StageName: must have length between 1 and \
-             {MAX_STAGE_NAME_LEN}, got {length}."
-        ));
-    }
+    validate_member_length("StageName", stage_name, API_NAME_LEN)?;
     if !stage_name
         .chars()
         .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
@@ -3060,7 +3098,7 @@ pub fn validate_ec2_resource_ids(
 /// between [1-128]" (`smithy_query(query="shape",
 /// shape="StringWithLengthBetween1And128")`). The shape carries no `@length` trait, so
 /// the bound is a handler's to enforce rather than the boundary validator's.
-pub const MAX_VPC_LINK_NAME_LEN: usize = 128;
+pub const MAX_VPC_LINK_NAME_LEN: usize = API_NAME_LEN.1;
 
 /// Refuse a VPC link `Name` outside the documented bound of the shape it targets: at
 /// least one character and at most [`MAX_VPC_LINK_NAME_LEN`].
@@ -3068,14 +3106,7 @@ pub const MAX_VPC_LINK_NAME_LEN: usize = 128;
 /// `Ok(())` or the message for the operation's `BadRequestException`: it names the member
 /// and the bound it broke.
 pub fn validate_vpc_link_name(name: &str) -> Result<(), String> {
-    let length = name.chars().count();
-    if length == 0 || length > MAX_VPC_LINK_NAME_LEN {
-        return Err(format!(
-            "Invalid value for Name: must have length between 1 and \
-             {MAX_VPC_LINK_NAME_LEN}, got {length}."
-        ));
-    }
-    Ok(())
+    validate_member_length("Name", name, API_NAME_LEN)
 }
 
 /// The ARN of a portal: API Gateway's ARNs name the resource by its own REST path

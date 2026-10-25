@@ -65,6 +65,8 @@ mod pricing_rule_association_billing_periods;
 mod pricing_rule_association_period_subsets;
 #[path = "all/pricing_rule_association_periods.rs"]
 mod pricing_rule_association_periods;
+#[path = "all/pricing_rule_billing_periods.rs"]
+mod pricing_rule_billing_periods;
 #[path = "all/pricing_rule_core_loop.rs"]
 mod pricing_rule_core_loop;
 #[path = "all/pricing_rule_lifecycle.rs"]

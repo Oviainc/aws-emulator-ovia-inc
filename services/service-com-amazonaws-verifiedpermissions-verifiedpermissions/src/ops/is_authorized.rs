@@ -159,7 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let not_found = || {
             IsAuthorizedErrorModeled::ResourceNotFoundException(
-                crate::state::policy_store_reference(&input.policy_store_id).not_found(),
+                // An authorization call's not-found NAMES the resource: see
+                // `crate::state::resource_not_found_naming`.
+                crate::state::policy_store_reference(&input.policy_store_id)
+                    .not_found_naming_the_resource(),
             )
         };
 

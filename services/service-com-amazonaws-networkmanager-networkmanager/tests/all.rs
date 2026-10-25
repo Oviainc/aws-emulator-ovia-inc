@@ -31,6 +31,8 @@ mod connect_peer_lifecycle;
 mod connection_lifecycle;
 #[path = "all/core_network_change_events.rs"]
 mod core_network_change_events;
+#[path = "all/core_network_change_set.rs"]
+mod core_network_change_set;
 #[path = "all/core_network_lifecycle.rs"]
 mod core_network_lifecycle;
 #[path = "all/core_network_policy_version_listing.rs"]

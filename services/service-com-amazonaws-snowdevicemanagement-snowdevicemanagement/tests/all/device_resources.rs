@@ -34,7 +34,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -110,12 +110,28 @@ fn unissued_tokens() -> Vec<String> {
 ///
 /// The API models no device-creation operation, so the activation goes through the one
 /// state seam that puts a device in the inventory.
+///
+/// The fixture reports some instances in a state that names work already under way,
+/// which the clock owes an outcome to a few hundred milliseconds later
+/// (`device_ec2_instance_cache.rs` covers that). This suite is about the resource
+/// LIST and the cache entries it round-trips against, so the owed instants are held
+/// past its lifetime and every case reads one unchanging cache.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    service_state(&*engine)
-        .expect("the in-memory engine carries this service's state")
-        .lock()
-        .activate_devices(SIGNED_REGION, ACTIVATED_DEVICES, SystemTime::now());
+    {
+        let state =
+            service_state(&*engine).expect("the in-memory engine carries this service's state");
+        let mut store = state.lock();
+        store.activate_devices(SIGNED_REGION, ACTIVATED_DEVICES, SystemTime::now());
+        let held = SystemTime::now() + Duration::from_secs(3600);
+        for device in store.devices.values_mut() {
+            for instance in device.ec2_instances.values_mut() {
+                if instance.transition_due.is_some() {
+                    instance.transition_due = Some(held);
+                }
+            }
+        }
+    }
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));

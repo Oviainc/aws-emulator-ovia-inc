@@ -14,8 +14,11 @@
 //!   token the balance it moves is reported under.
 //! * an amount of a native token is QUOTED IN THAT CURRENCY, which subdivides into a
 //!   published number of smallest units (10^8 satoshi to the bitcoin, 10^18 wei to the
-//!   ether), while an amount of a token a CONTRACT issues is quoted in the contract's own
-//!   units, whose precision is a property of the contract and not of this API.
+//!   ether), and an amount of a token a CONTRACT issues is quoted at the `decimals` that
+//!   contract publishes — the same number `GetAssetContract` reports for it — so a token
+//!   whose contract publishes no metadata is the only one quoted as the ledger holds it.
+//!   The contract-issued half of that rule is driven end-to-end against what the service
+//!   itself publishes in `contract_token_denomination.rs`.
 //!
 //! Every expectation here is restated from those two sources rather than borrowed from
 //! the implementation, and each test is a TABLE: the rows are every network, every
@@ -27,9 +30,13 @@
 //! The harness (`Emulator`) is the one `chain_query_slice.rs` builds, so this target has
 //! a single front door for every suite.
 
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::state::{
-    amount_string, HoldingKey,
+    amount_string, ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState as Ledgers,
+    HoldingKey,
 };
 
 use crate::chain_query_slice::{token_json, Emulator, FILTERED_EVENTS, TRANSACTION_EVENTS};
@@ -48,18 +55,62 @@ pub(crate) fn native_token(network: &str) -> &'static str {
     }
 }
 
+/// A contract address in the one spelling that identifies it: an EVM address is 20 bytes,
+/// so the `0x` prefix and the letter case of a checksummed spelling are presentation.
+pub(crate) fn contract_key(address: &str) -> String {
+    let lowercase = address.to_ascii_lowercase();
+    lowercase
+        .strip_prefix("0x")
+        .unwrap_or(&lowercase)
+        .to_string()
+}
+
+/// The `decimals` this service publishes for the contract deployed at `address` —
+/// `ContractMetadata$decimals`, "the decimals used by the token contract", the member
+/// `GetAssetContract` reports.
+///
+/// `None` for a contract the index holds no metadata for and for an address no contract
+/// is deployed at: neither publishes a subdivision. Read out of a ledger of this service
+/// because WHICH contracts the index holds is the fixture's own fact; that the number
+/// here is the one the wire reports is asserted over HTTP in
+/// `contract_token_denomination.rs`.
+pub(crate) fn published_decimals(address: &str) -> Option<i32> {
+    static CATALOG: OnceLock<BTreeMap<String, i32>> = OnceLock::new();
+    CATALOG
+        .get_or_init(|| {
+            let ledgers = Ledgers::default();
+            ledgers
+                .networks
+                .values()
+                .flat_map(|ledger| ledger.contracts.values())
+                .filter_map(|contract| {
+                    let decimals = contract.metadata.as_ref()?.decimals?;
+                    Some((contract_key(&contract.contract_address), decimals))
+                })
+                .collect()
+        })
+        .get(&contract_key(address))
+        .copied()
+}
+
 /// How many decimal places an amount of the token `(contract_address, token_id)` names is
 /// quoted with.
 ///
-/// Restated from the chains' own published subdivisions rather than borrowed from the
-/// implementation: a native token — no contract, the currency's 3-character abbreviation
-/// as its `tokenId` — is quoted in the currency, 10^8 satoshi to the bitcoin and 10^18 wei
-/// to the ether; a token a contract issues is quoted in the contract's own units.
+/// Restated from the chains' and the contracts' own published subdivisions rather than
+/// borrowed from the implementation: a native token — no contract, the currency's
+/// 3-character abbreviation as its `tokenId` — is quoted in the currency, 10^8 satoshi to
+/// the bitcoin and 10^18 wei to the ether; a token a contract issues is quoted at the
+/// `decimals` that contract publishes ([`published_decimals`]), and one whose contract
+/// publishes none is quoted as the ledger holds it.
 pub(crate) fn amount_decimals(contract_address: Option<&str>, token_id: Option<&str>) -> u32 {
-    match (contract_address, token_id) {
-        (None, Some("btc")) => 8,
-        (None, Some("eth")) => 18,
-        _ => 0,
+    match contract_address {
+        None => match token_id {
+            Some("btc") => 8,
+            Some("eth") => 18,
+            _ => 0,
+        },
+        // A scale past 10^38 could not divide an amount held in 128 bits at all.
+        Some(address) => published_decimals(address).unwrap_or(0).clamp(0, 38) as u32,
     }
 }
 
@@ -98,7 +149,7 @@ pub(crate) fn amount_units(reported: &str, decimals: u32) -> Option<i128> {
 /// Whether `reported` is in the CANONICAL form the rendering fixes: a fixed-point decimal
 /// of at most `decimals` places, with no trailing zero left in the fraction and no point
 /// at all where the amount is whole.
-fn is_canonical(reported: &str, decimals: u32) -> bool {
+pub(crate) fn is_canonical(reported: &str, decimals: u32) -> bool {
     if amount_units(reported, decimals).is_none() {
         return false;
     }
@@ -227,15 +278,21 @@ async fn an_amount_is_rendered_as_the_fixed_point_decimal_of_its_smallest_unit()
     }
 
     // The subdivisions are the chains' published ones (10^8 satoshi to the bitcoin, 10^18
-    // wei to the ether) and the contract rows stand for a token whose precision belongs
-    // to its contract. The rows span a whole currency unit, a thousand of them, a
+    // wei to the ether) and the contract rows the `decimals` those token contracts publish
+    // (USD Coin 6, Wrapped BTC 8, Dai 18 — the addresses they are deployed at on the
+    // Ethereum mainnet). The rows span a whole currency unit, a thousand of them, a
     // sub-unit fraction, a fraction whose last places are zero, every place a currency
     // has, its smallest unit, and zero — amounts the fixture ledger does not all hold.
     const BTC: i128 = 100_000_000;
     const ETH: i128 = 1_000_000_000_000_000_000;
-    // An address the fixture holds a fungible contract at is not needed here: the rule
-    // turns on there BEING a contract, not on which one.
-    const CONTRACT: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+    /// USD Coin, 6 decimals.
+    const USDC: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+    /// Wrapped BTC, 8 decimals.
+    const WBTC: &str = "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599";
+    /// Dai Stablecoin, 18 decimals.
+    const DAI: &str = "0x6b175474e89094c44da98b954eedeac495271d0f";
+    /// An address this index holds no contract — and so no `decimals` — for.
+    const UNPUBLISHED: &str = "0x9999999999999999999999999999999999999999";
     let rows = [
         Row { case: "one bitcoin", contract: None, token_id: Some("btc"), units: BTC, text: "1" },
         Row { case: "a thousand bitcoin", contract: None, token_id: Some("btc"), units: 1_000 * BTC, text: "1000" },
@@ -251,8 +308,14 @@ async fn an_amount_is_rendered_as_the_fixed_point_decimal_of_its_smallest_unit()
         Row { case: "a two-hundredth of an ether", contract: None, token_id: Some("eth"), units: ETH / 200, text: "0.005" },
         Row { case: "one wei", contract: None, token_id: Some("eth"), units: 1, text: "0.000000000000000001" },
         Row { case: "no ether at all", contract: None, token_id: Some("eth"), units: 0, text: "0" },
-        Row { case: "a fungible contract's units", contract: Some(CONTRACT), token_id: None, units: 119_094_756_568, text: "119094756568" },
-        Row { case: "one unit of a non-fungible token", contract: Some(CONTRACT), token_id: Some("7"), units: 1, text: "1" },
+        Row { case: "a million whole six-decimal tokens", contract: Some(USDC), token_id: None, units: 1_000_000_000_000, text: "1000000" },
+        Row { case: "a fraction of a six-decimal token", contract: Some(USDC), token_id: None, units: 119_094_756_568, text: "119094.756568" },
+        Row { case: "the smallest unit of a six-decimal token", contract: Some(USDC), token_id: None, units: 1, text: "0.000001" },
+        Row { case: "one whole eight-decimal token", contract: Some(WBTC), token_id: None, units: 100_000_000, text: "1" },
+        Row { case: "a fraction of an eight-decimal token", contract: Some(WBTC), token_id: None, units: 12_345_678, text: "0.12345678" },
+        Row { case: "half an eighteen-decimal token", contract: Some(DAI), token_id: None, units: ETH / 2, text: "0.5" },
+        Row { case: "a contract that publishes no decimals", contract: Some(UNPUBLISHED), token_id: None, units: 119_094_756_568, text: "119094756568" },
+        Row { case: "one unit of a non-fungible token", contract: Some(UNPUBLISHED), token_id: Some("7"), units: 1, text: "1" },
     ];
 
     for Row {
@@ -263,12 +326,12 @@ async fn an_amount_is_rendered_as_the_fixed_point_decimal_of_its_smallest_unit()
         text: expected,
     } in rows
     {
-        let got = amount_string(amount, contract, token_id);
+        let decimals = amount_decimals(contract, token_id);
+        let got = amount_string(amount, decimals);
         assert_eq!(
             got, expected,
             "case {case}: {amount} of the smallest unit reads as {expected}, got {got}"
         );
-        let decimals = amount_decimals(contract, token_id);
         assert!(
             is_canonical(&got, decimals),
             "case {case}: {got} is not the canonical form of a {decimals}-place amount"
@@ -282,7 +345,7 @@ async fn an_amount_is_rendered_as_the_fixed_point_decimal_of_its_smallest_unit()
 }
 
 #[tokio::test]
-async fn a_native_balance_is_quoted_in_the_currency_and_a_contract_balance_in_its_units() {
+async fn a_balance_is_quoted_at_the_subdivision_its_token_publishes() {
     let emulator = Emulator::new();
 
     for network in emulator.fixture() {
@@ -321,22 +384,18 @@ async fn a_native_balance_is_quoted_in_the_currency_and_a_contract_balance_in_it
             );
             if key.contract_address.is_some() {
                 contract_rows += 1;
-                assert!(
-                    !text.contains('.'),
-                    "case {case}: a contract-issued token is quoted in the contract's own \
-                     units, got {text:?}"
-                );
-            } else if text.contains('.') {
+            }
+            if text.contains('.') {
                 fractional += 1;
             }
         }
-        // The native balances of this ledger are not whole currency units — the events
-        // move fractions of one — so quoting them in the currency has to show a fraction
-        // somewhere. Without this row the rule could be satisfied by reporting the
-        // smallest-unit count unchanged.
+        // The balances of this ledger are not whole units of their token — the events
+        // move fractions of one — so quoting them at the subdivision the token publishes
+        // has to show a fraction somewhere. Without this row the rule could be satisfied
+        // by reporting the smallest-unit count unchanged.
         assert!(
             fractional > 0,
-            "case {}: a native balance of this ledger is a fraction of a currency unit, \
+            "case {}: a balance of this ledger is a fraction of a unit of its token, \
              got none",
             network.network
         );

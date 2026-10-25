@@ -208,16 +208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if secret.region == region {
-            // The secret in this Region is the PRIMARY, not a replica, so there
-            // is no link to the primary to remove here.
+            // The secret in this Region is the PRIMARY (or a standalone secret,
+            // which is a primary with no replicas), not a replica, so there is
+            // no link to a primary to remove here.
             return Err(
                 StopReplicationToReplicaErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(
-                            "Operation not permitted on a primary secret. Call must be made in \
-                             replica secret's region."
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::NOT_A_REPLICA_MESSAGE.to_string()),
                     },
                 )
                 .into(),

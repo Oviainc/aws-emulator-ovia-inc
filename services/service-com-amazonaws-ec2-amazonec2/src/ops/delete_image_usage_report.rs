@@ -4,12 +4,16 @@
 //! IMPLEMENTED: takes the AMI usage report the request names out of [`crate::state`] and
 //! answers whether the delete succeeded. This is the ONLY file to touch for this operation.
 //!
-//! `ImageUsageReportId` carries no modelled pattern and EC2 publishes no `.Malformed` code
-//! for one, so a report id this account holds no report for is answered the one way there
-//! is: `InvalidImageUsageReportId.NotFound`. `DryRun` is answered BEFORE that lookup,
-//! because the flag asks whether the CALLER MAY make the request — "checks whether you have
-//! the required permissions for the action, without actually making the request" — which is
-//! a question about the caller and not about the resource.
+//! `ImageUsageReportId` carries no modelled pattern, so the id form comes from this
+//! service's own id space ([`crate::state::image_usage_report_id_is_well_formed`]): a
+//! report id EC2 could never have ISSUED is refused `InvalidImageUsageReportId.Malformed`
+//! BEFORE anything is looked up, and only a well-formed id the account holds no report for
+//! is `InvalidImageUsageReportId.NotFound` — the split that lets a caller tell a typo from
+//! a report that is gone. `DryRun` is answered between the two, because the flag asks
+//! whether the CALLER MAY make the request — "checks whether you have the required
+//! permissions for the action, without actually making the request" — which is a question
+//! about the caller and not about the resource, while a request that names no id at all is
+//! not a request whose permissions can be checked.
 //!
 //! ## Shape of an operation
 //!
@@ -136,12 +140,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            dry_run_operation, invalid_image_usage_report_id_not_found, require_service_state,
+            dry_run_operation, image_usage_report_id_is_well_formed,
+            invalid_image_usage_report_id_malformed, invalid_image_usage_report_id_not_found,
+            require_service_state,
         };
 
         // An AMI usage report carries no Region member of its own, so nothing here depends
         // on the Region the request was signed for.
         let _ = ctx;
+
+        // Something that is not a report id at all is refused as malformed, before there is
+        // anything to look up (see the module docs).
+        if !image_usage_report_id_is_well_formed(&input.report_id) {
+            return Err(invalid_image_usage_report_id_malformed(&input.report_id));
+        }
 
         // The permission question, answered before the resource one and before the write
         // (see the module docs).
