@@ -10,8 +10,9 @@
 //!   JSON document in the exception's `message`, and the same entries in the modelled
 //!   `fieldList`; for `SourceParameters` the entry names the member that was supplied and
 //!   the source type the pipe resolves to;
-//! * an absent pipe is reported by ONE sentence naming the pipe the request asked for, the
-//!   same sentence whichever operation was asked for it;
+//! * an absent pipe is reported by ONE sentence per addressing form — the name-addressed
+//!   control-plane operations name the pipe the request asked for, the ARN-addressed
+//!   tagging operations state the constant resource-agnostic sentence;
 //! * an `UpdatePipe` that lands while a move is already in flight is reported by ONE
 //!   sentence naming the pipe, whichever move that is, leaking none of the pipe's states.
 //!
@@ -48,15 +49,10 @@ const PIPE_STATES: &[&str] = &[
     "UPDATING",
 ];
 
-/// The exception message a refusal carries, however this protocol's error body spells the
-/// modelled `message` member.
+/// The exception message a refusal carries. The reading of it belongs to the harness, so
+/// every suite reads it the same way.
 fn message(reply: &Reply) -> String {
-    for member in ["message", "Message"] {
-        if let Some(text) = reply.member(member).as_str() {
-            return text.to_string();
-        }
-    }
-    String::new()
+    reply.message()
 }
 
 /// The `fieldList` entries a refusal carries, as `(name, message)` pairs.
@@ -332,16 +328,18 @@ async fn source_parameters_of_the_pipes_own_source_type_still_apply() {
     );
 }
 
-/// RULE: an absent pipe is reported by ONE sentence built from the request — the pipe the
-/// caller named interpolated into it — the same sentence whichever operation was asked for
-/// that pipe.
+/// RULE: an absent pipe is reported by ONE sentence per addressing form — the
+/// NAME-addressed control-plane operations interpolate the pipe the caller named into one
+/// fixed sentence, and the ARN-addressed tagging operations, which resolve no pipe name,
+/// report the constant resource-agnostic sentence instead — the same sentence whichever
+/// operation of that form was asked for the pipe.
 ///
 /// The rows differ along which operation is called (every one that addresses a single
 /// pipe, by name and by ARN) and along the form of the absent name: plain, the longest
 /// `PipeName` allows, one carrying the other characters its pattern admits, and one
 /// differing from a stored name only in case.
 #[tokio::test]
-async fn an_absent_pipe_is_reported_by_one_sentence_naming_it() {
+async fn an_absent_pipe_is_reported_by_one_sentence_per_addressing_form() {
     let router = router();
     let created = create(
         &router,
@@ -358,51 +356,70 @@ async fn an_absent_pipe_is_reported_by_one_sentence_naming_it() {
     for name in ["ghost", &long_name, "ghost.with-other_chars", "STORED"] {
         let arn = pipe_arn(name);
         let tags_uri = format!("/tags/{}", encode(&arn));
-        // (the case, method, uri, body) of every operation that addresses one pipe.
-        let rows: Vec<(&str, &str, String, Option<Value>)> = vec![
-            ("DescribePipe", "GET", format!("/v1/pipes/{name}"), None),
+        // (the case, method, uri, body, whether the pipe is addressed BY NAME) of every
+        // operation that addresses one pipe.
+        let rows: Vec<(&str, &str, String, Option<Value>, bool)> = vec![
+            ("DescribePipe", "GET", format!("/v1/pipes/{name}"), None, true),
             (
                 "UpdatePipe",
                 "PUT",
                 format!("/v1/pipes/{name}"),
                 Some(json!({"RoleArn": ROLE})),
+                true,
             ),
             (
                 "StartPipe",
                 "POST",
                 format!("/v1/pipes/{name}/start"),
                 None,
+                true,
             ),
-            ("StopPipe", "POST", format!("/v1/pipes/{name}/stop"), None),
-            ("DeletePipe", "DELETE", format!("/v1/pipes/{name}"), None),
-            ("ListTagsForResource", "GET", tags_uri.clone(), None),
+            ("StopPipe", "POST", format!("/v1/pipes/{name}/stop"), None, true),
+            ("DeletePipe", "DELETE", format!("/v1/pipes/{name}"), None, true),
+            ("ListTagsForResource", "GET", tags_uri.clone(), None, false),
             (
                 "TagResource",
                 "POST",
                 tags_uri.clone(),
                 Some(json!({"tags": {"env": "test"}})),
+                false,
             ),
             (
                 "UntagResource",
                 "DELETE",
                 format!("{tags_uri}?tagKeys=env"),
                 None,
+                false,
             ),
         ];
 
-        for (case, method, uri, body) in rows {
+        for (case, method, uri, body, by_name) in rows {
             let refused = call(&router, method, &uri, body, REGION).await;
             assert_eq!(
                 (refused.status, refused.error_code.as_str()),
                 (404, "NotFoundException"),
                 "case {case} {name:?}: expected 404 NotFoundException, got {refused:?}"
             );
+            let expected = if by_name {
+                format!("Pipe {name} does not exist.")
+            } else {
+                "Resource was not found".to_string()
+            };
             assert_eq!(
                 message(&refused),
-                format!("Pipe {name} does not exist."),
-                "case {case} {name:?}: expected the one absent-pipe sentence naming the \
-                 pipe, got {refused:?}"
+                expected,
+                "case {case} {name:?}: expected the absent-pipe sentence of its addressing \
+                 form, got {refused:?}"
             );
+            if !by_name {
+                // The constant sentence resolves nothing and echoes nothing: neither the
+                // pipe the ARN names nor any other part of it reaches the caller.
+                assert!(
+                    !message(&refused).contains(name) && !message(&refused).contains("arn:"),
+                    "case {case} {name:?}: the ARN-addressed sentence must echo no part of \
+                     the ARN it was given, got {refused:?}"
+                );
+            }
         }
     }
 }

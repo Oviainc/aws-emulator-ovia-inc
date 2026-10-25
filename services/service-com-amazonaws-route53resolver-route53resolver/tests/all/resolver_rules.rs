@@ -982,3 +982,531 @@ async fn associating_is_refused_without_a_rule_and_refused_twice_over() {
         "case \"the same rule in another VPC\": the association must be its own record, got {other}"
     );
 }
+
+/// The service error code of the "a forwarding rule must say where to forward"
+/// fault, as recorded on AWS for the rule write path. It is the per-fault
+/// discriminator: the HTTP status (400) and the exception shape name are shared
+/// by every other `InvalidRequestException` fault of the same operation.
+const RSLVR_CODE_FORWARD_REQUIRES_TARGET: &str = "RSLVR-00706";
+
+/// The service error code of its mirror image, the "only a forwarding rule may
+/// say where to forward" fault. Carried for the same reason.
+const RSLVR_CODE_SYSTEM_FORBIDS_TARGET: &str = "RSLVR-00707";
+
+/// A rule's forwarding target — the Resolver endpoint to forward through and the
+/// IP addresses to forward to — is ONE precondition of the rule type, and a
+/// request that breaks it is refused with Route 53 Resolver's own service error
+/// code inside the message, whichever of the two members is at fault.
+///
+/// The table spans what the rule generalises over: the rule type on both sides
+/// of the precondition (a type that forwards, a type Resolver answers itself),
+/// and which part of the forwarding target the request got wrong — the endpoint,
+/// the target addresses, or both. The requests the precondition admits are
+/// checked too, so the refusal is keyed on the precondition and not on "a rule
+/// of this type was asked for".
+#[tokio::test]
+async fn a_rule_forwarding_target_precondition_is_refused_with_its_rslvr_error_code() {
+    let forward_requires = format!(
+        "[{RSLVR_CODE_FORWARD_REQUIRES_TARGET}] Resolver endpoint ID and target IP are required for FORWARD type resolver rule."
+    );
+    let system_forbids = format!(
+        "[{RSLVR_CODE_SYSTEM_FORBIDS_TARGET}] Cannot specify resolver endpoint ID and target IP for SYSTEM type resolver rule."
+    );
+
+    let router = emulator();
+    let endpoint = endpoint_id(&router, "ep-precondition", "OUTBOUND").await;
+
+    let cases: Vec<(&str, Value, &String)> = vec![
+        (
+            "FORWARD naming neither the endpoint nor the target addresses",
+            json!({
+                "RuleType": "FORWARD",
+                "DomainName": "neither.example.com",
+            }),
+            &forward_requires,
+        ),
+        (
+            "FORWARD naming target addresses but no endpoint",
+            json!({
+                "RuleType": "FORWARD",
+                "DomainName": "no-endpoint.example.com",
+                "TargetIps": [{ "Ip": "10.1.2.6", "Port": 53 }],
+            }),
+            &forward_requires,
+        ),
+        (
+            "FORWARD naming an endpoint but no target addresses",
+            json!({
+                "RuleType": "FORWARD",
+                "DomainName": "no-targets.example.com",
+                "ResolverEndpointId": endpoint.clone(),
+            }),
+            &forward_requires,
+        ),
+        (
+            "FORWARD naming several target addresses but no endpoint",
+            json!({
+                "RuleType": "FORWARD",
+                "DomainName": "many-no-endpoint.example.com",
+                "TargetIps": [
+                    { "Ipv6": "2001:db8::1" },
+                    { "Ipv6": "2001:db8::2" },
+                ],
+            }),
+            &forward_requires,
+        ),
+        (
+            "SYSTEM naming target addresses",
+            json!({
+                "RuleType": "SYSTEM",
+                "DomainName": "system-targets.example.com",
+                "TargetIps": [{ "Ip": "10.1.2.6", "Port": 53 }],
+            }),
+            &system_forbids,
+        ),
+        (
+            "SYSTEM naming an endpoint",
+            json!({
+                "RuleType": "SYSTEM",
+                "DomainName": "system-endpoint.example.com",
+                "ResolverEndpointId": endpoint.clone(),
+            }),
+            &system_forbids,
+        ),
+        (
+            "SYSTEM naming both",
+            json!({
+                "RuleType": "SYSTEM",
+                "DomainName": "system-both.example.com",
+                "ResolverEndpointId": endpoint.clone(),
+                "TargetIps": [{ "Ip": "10.1.2.7" }],
+            }),
+            &system_forbids,
+        ),
+    ];
+
+    for (index, (case, body, expected)) in cases.iter().enumerate() {
+        let mut request = body.clone();
+        request["CreatorRequestId"] = json!(format!("req-precondition-{index}"));
+        let (status, parsed) = call(&router, "CreateResolverRule", request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status}: {parsed}"
+        );
+        assert!(
+            error_type(&parsed).contains("InvalidRequestException"),
+            "case {case:?}: expected InvalidRequestException, got {parsed}"
+        );
+        let message = string_member(&parsed, "Message");
+        assert_eq!(
+            &message, *expected,
+            "case {case:?}: expected Message {expected:?}, got {message:?}"
+        );
+    }
+
+    // The precondition itself, not the rule type, is what decides: a FORWARD
+    // rule that names both parts of its forwarding target and a SYSTEM rule that
+    // names neither are both served.
+    for (case, body) in [
+        (
+            "FORWARD naming the endpoint and the target addresses",
+            json!({
+                "CreatorRequestId": "req-precondition-forward-ok",
+                "RuleType": "FORWARD",
+                "DomainName": "served.example.com",
+                "ResolverEndpointId": endpoint.clone(),
+                "TargetIps": [{ "Ip": "10.1.2.8" }],
+            }),
+        ),
+        (
+            "SYSTEM naming no forwarding target at all",
+            json!({
+                "CreatorRequestId": "req-precondition-system-ok",
+                "RuleType": "SYSTEM",
+                "DomainName": "served-system.example.com",
+            }),
+        ),
+    ] {
+        let created = ok(&router, "CreateResolverRule", body).await;
+        assert!(
+            !string_member(rule(&created), "Id").is_empty(),
+            "case {case:?}: the rule must be created, got {created}"
+        );
+    }
+
+    // The codes are per-fault discriminators, so another fault of the same
+    // operation (and a read of a rule that does not exist) carries neither.
+    let other_faults = [
+        (
+            "GetResolverRule for an id that was never minted",
+            "GetResolverRule",
+            json!({ "ResolverRuleId": "rslvr-rr-ffffffffffffffff" }),
+        ),
+        (
+            "DELEGATE carrying target addresses",
+            "CreateResolverRule",
+            json!({
+                "CreatorRequestId": "req-precondition-delegate",
+                "RuleType": "DELEGATE",
+                "DomainName": "delegate.example.com",
+                "DelegationRecord": "ns.example.com",
+                "TargetIps": [{ "Ip": "10.1.2.9" }],
+            }),
+        ),
+    ];
+    for (case, operation, body) in other_faults {
+        let (_, parsed) = call(&router, operation, body).await;
+        let message = string_member(&parsed, "Message");
+        assert!(
+            !message.contains(RSLVR_CODE_FORWARD_REQUIRES_TARGET)
+                && !message.contains(RSLVR_CODE_SYSTEM_FORBIDS_TARGET),
+            "case {case:?}: another fault must not carry a forwarding-target code, got {message:?}"
+        );
+    }
+}
+
+/// Create the rule table `ListResolverRules` is exercised over, and return
+/// `(outbound endpoint, second outbound endpoint, rule ids in creation order)`.
+///
+/// The rules span what a list query selects on: the rule type, the endpoint a
+/// forwarding rule routes through, `Name` present or absent, and a `DomainName`
+/// written relative or already fully qualified.
+async fn seed_rules(router: &MultiServiceRouter) -> (String, String, Vec<String>) {
+    let first_endpoint = endpoint_id(router, "ep-list-one", "OUTBOUND").await;
+    let second_endpoint = endpoint_id(router, "ep-list-two", "OUTBOUND").await;
+
+    let bodies = vec![
+        json!({
+            "CreatorRequestId": "req-list-forward-one",
+            "Name": "list-forward-one",
+            "RuleType": "FORWARD",
+            "DomainName": "one.list.example.com",
+            "ResolverEndpointId": first_endpoint.clone(),
+            "TargetIps": [{ "Ip": "192.0.2.50" }],
+        }),
+        json!({
+            "CreatorRequestId": "req-list-forward-two",
+            "RuleType": "FORWARD",
+            "DomainName": "two.list.example.com.",
+            "ResolverEndpointId": second_endpoint.clone(),
+            "TargetIps": [{ "Ipv6": "2001:db8::50" }],
+        }),
+        json!({
+            "CreatorRequestId": "req-list-system",
+            "Name": "list-system",
+            "RuleType": "SYSTEM",
+            "DomainName": "apex.one.list.example.com",
+        }),
+        json!({
+            "CreatorRequestId": "req-list-delegate",
+            "Name": "list-delegate",
+            "RuleType": "DELEGATE",
+            "DomainName": "delegated.list.example.com",
+            "DelegationRecord": "ns.list.example.com",
+        }),
+    ];
+
+    let mut ids = Vec::new();
+    for body in bodies {
+        let created = ok(router, "CreateResolverRule", body).await;
+        ids.push(string_member(rule(&created), "Id"));
+    }
+    (first_endpoint, second_endpoint, ids)
+}
+
+/// The `Id`s of the rules one `ListResolverRules` response carries.
+fn listed_ids(body: &Value) -> Vec<String> {
+    body.get("ResolverRules")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(|item| string_member(item, "Id")).collect())
+        .unwrap_or_default()
+}
+
+/// `ListResolverRules` enumerates the stored rules in creation order, projects
+/// each one exactly as its reader does — the rule domain in the canonical
+/// fully-qualified form it is stored in — and restricts the page to the rules
+/// whose named member matches one of `Values`.
+///
+/// The filter names are exactly the catalog the model documents for this
+/// operation (`smithy_query(query="doc",shape="Filter",member="Name")`, section
+/// **ListResolverRules**): `CreatorRequestId`, `DomainName`, `Name`,
+/// `ResolverEndpointId`, `Status`, `Type` — each exercised here, in the
+/// documented spelling and in the early upper-snake one the same doc says is
+/// "still supported". A `DomainName` filter is exercised in both the dotted
+/// spelling the doc asks for and the dotless one, which name one domain.
+#[tokio::test]
+async fn rules_are_listed_from_state_and_filtered_on_every_documented_member() {
+    let router = emulator();
+    let (first_endpoint, second_endpoint, ids) = seed_rules(&router).await;
+
+    // The unfiltered page is every stored rule, in creation order, and each
+    // entry is the same projection `GetResolverRule` answers.
+    let listed = ok(&router, "ListResolverRules", json!({})).await;
+    assert_eq!(
+        listed_ids(&listed),
+        ids,
+        "case \"no filters\": every stored rule must be listed in creation order, got {listed}"
+    );
+    for (index, id) in ids.iter().enumerate() {
+        let fetched = ok(
+            &router,
+            "GetResolverRule",
+            json!({ "ResolverRuleId": id.clone() }),
+        )
+        .await;
+        let from_list = listed
+            .get("ResolverRules")
+            .and_then(Value::as_array)
+            .and_then(|items| items.get(index))
+            .expect("the page carries this rule");
+        assert_eq!(
+            from_list,
+            rule(&fetched),
+            "case {id:?}: the listed rule must be the stored one, got {from_list}"
+        );
+        let domain = string_member(from_list, "DomainName");
+        assert!(
+            domain.ends_with('.'),
+            "case {id:?}: a listed rule domain must be fully qualified, got {domain:?}"
+        );
+    }
+
+    let cases: Vec<(&str, Value, Vec<String>)> = vec![
+        (
+            "CreatorRequestId",
+            json!([{ "Name": "CreatorRequestId", "Values": ["req-list-forward-two"] }]),
+            vec![ids[1].clone()],
+        ),
+        (
+            "CREATOR_REQUEST_ID, the early spelling",
+            json!([{ "Name": "CREATOR_REQUEST_ID", "Values": ["req-list-system"] }]),
+            vec![ids[2].clone()],
+        ),
+        (
+            "DomainName, the dotted spelling the doc asks for",
+            json!([{ "Name": "DomainName", "Values": ["one.list.example.com."] }]),
+            vec![ids[0].clone()],
+        ),
+        (
+            "DomainName, the dotless spelling of the same domain",
+            json!([{ "Name": "DomainName", "Values": ["one.list.example.com"] }]),
+            vec![ids[0].clone()],
+        ),
+        (
+            "DOMAIN_NAME, two domains written in the two spellings",
+            json!([{
+                "Name": "DOMAIN_NAME",
+                "Values": ["two.list.example.com", "apex.one.list.example.com."],
+            }]),
+            vec![ids[1].clone(), ids[2].clone()],
+        ),
+        (
+            "DomainName, a domain no rule names",
+            json!([{ "Name": "DomainName", "Values": ["absent.list.example.com."] }]),
+            vec![],
+        ),
+        (
+            "Name",
+            json!([{ "Name": "Name", "Values": ["list-delegate"] }]),
+            vec![ids[3].clone()],
+        ),
+        (
+            "Name, which a rule created without one does not match",
+            json!([{ "Name": "Name", "Values": ["list-forward-one", "list-system"] }]),
+            vec![ids[0].clone(), ids[2].clone()],
+        ),
+        (
+            "ResolverEndpointId",
+            json!([{ "Name": "ResolverEndpointId", "Values": [first_endpoint.clone()] }]),
+            vec![ids[0].clone()],
+        ),
+        (
+            "RESOLVER_ENDPOINT_ID, the early spelling",
+            json!([{ "Name": "RESOLVER_ENDPOINT_ID", "Values": [second_endpoint.clone()] }]),
+            vec![ids[1].clone()],
+        ),
+        (
+            "Status, the status every stored rule reports",
+            json!([{ "Name": "Status", "Values": ["COMPLETE"] }]),
+            ids.clone(),
+        ),
+        (
+            "Status, one no rule reports",
+            json!([{ "Name": "Status", "Values": ["DELETING"] }]),
+            vec![],
+        ),
+        (
+            "Type, the forwarding rules",
+            json!([{ "Name": "Type", "Values": ["FORWARD"] }]),
+            vec![ids[0].clone(), ids[1].clone()],
+        ),
+        (
+            "TYPE, the early spelling",
+            json!([{ "Name": "TYPE", "Values": ["SYSTEM"] }]),
+            vec![ids[2].clone()],
+        ),
+        (
+            "Type, two values",
+            json!([{ "Name": "Type", "Values": ["SYSTEM", "DELEGATE"] }]),
+            vec![ids[2].clone(), ids[3].clone()],
+        ),
+        (
+            "two filters combine with AND, both matching",
+            json!([
+                { "Name": "Type", "Values": ["FORWARD"] },
+                { "Name": "ResolverEndpointId", "Values": [second_endpoint.clone()] },
+            ]),
+            vec![ids[1].clone()],
+        ),
+        (
+            "two filters combine with AND, disagreeing",
+            json!([
+                { "Name": "Type", "Values": ["SYSTEM"] },
+                { "Name": "ResolverEndpointId", "Values": [first_endpoint.clone()] },
+            ]),
+            vec![],
+        ),
+        (
+            "an empty value list matches nothing",
+            json!([{ "Name": "Type", "Values": [] }]),
+            vec![],
+        ),
+        ("an empty filter list restricts nothing", json!([]), ids.clone()),
+    ];
+
+    for (case, filters, expected) in cases {
+        let listed = ok(&router, "ListResolverRules", json!({ "Filters": filters })).await;
+        assert_eq!(
+            listed_ids(&listed),
+            expected,
+            "case {case:?}: the filtered page is wrong, got {listed}"
+        );
+    }
+
+    // A name outside THIS operation's catalog is refused, not ignored — including
+    // the ones that are valid for the endpoint and association lists.
+    for case in [
+        "Direction",
+        "HostVPCId",
+        "SecurityGroupIds",
+        "IpAddressCount",
+        "VPCId",
+        "Arn",
+        "Id",
+    ] {
+        expect_error(
+            &router,
+            "ListResolverRules",
+            json!({ "Filters": [{ "Name": case, "Values": ["anything"] }] }),
+            case,
+            "InvalidParameterException",
+        )
+        .await;
+    }
+}
+
+/// `ListResolverRules` pages the collection the query selects: `MaxResults`
+/// bounds the page and is echoed back, `NextToken` resumes where the previous
+/// page stopped, the last page carries none, and a cursor only means anything
+/// for the query that minted it.
+#[tokio::test]
+async fn paging_walks_every_rule_exactly_once() {
+    let router = emulator();
+    let (_, _, ids) = seed_rules(&router).await;
+
+    for (case, page_size) in [
+        ("one rule per page", 1),
+        ("two rules per page", 2),
+        ("a page larger than the collection", 10),
+    ] {
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut request = json!({ "MaxResults": page_size });
+            if let Some(token) = token.as_ref() {
+                request["NextToken"] = json!(token);
+            }
+            let listed = ok(&router, "ListResolverRules", request).await;
+            let page = listed_ids(&listed);
+            assert!(
+                page.len() <= usize::try_from(page_size).unwrap_or_default(),
+                "case {case:?}: a page must hold at most MaxResults rules, got {listed}"
+            );
+            assert_eq!(
+                listed.get("MaxResults").and_then(Value::as_i64),
+                Some(i64::from(page_size)),
+                "case {case:?}: MaxResults must be echoed back, got {listed}"
+            );
+            walked.extend(page);
+            token = listed
+                .get("NextToken")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            walked, ids,
+            "case {case:?}: paging must walk every rule exactly once, in creation order"
+        );
+    }
+
+    // A cursor is scoped to the query that minted it: the same offset under a
+    // different `Filters` is not a page of this query.
+    let first = ok(
+        &router,
+        "ListResolverRules",
+        json!({ "MaxResults": 1, "Filters": [{ "Name": "Type", "Values": ["FORWARD"] }] }),
+    )
+    .await;
+    let token = string_member(&first, "NextToken");
+    assert!(
+        !token.is_empty(),
+        "the filtered query must owe a cursor, got {first}"
+    );
+    for (case, request) in [
+        (
+            "a cursor minted under a filter, replayed with none",
+            json!({ "MaxResults": 1, "NextToken": token.clone() }),
+        ),
+        (
+            "a cursor minted under a filter, replayed under another",
+            json!({
+                "MaxResults": 1,
+                "NextToken": token.clone(),
+                "Filters": [{ "Name": "Type", "Values": ["SYSTEM"] }],
+            }),
+        ),
+        (
+            "a cursor this service never minted",
+            json!({ "NextToken": "6e6f742d612d746f6b656e" }),
+        ),
+    ] {
+        expect_error(
+            &router,
+            "ListResolverRules",
+            request,
+            case,
+            "InvalidNextTokenException",
+        )
+        .await;
+    }
+
+    // The same cursor under the query that minted it resumes that query.
+    let resumed = ok(
+        &router,
+        "ListResolverRules",
+        json!({
+            "MaxResults": 1,
+            "NextToken": token,
+            "Filters": [{ "Name": "Type", "Values": ["FORWARD"] }],
+        }),
+    )
+    .await;
+    assert_eq!(
+        listed_ids(&resumed),
+        vec![ids[1].clone()],
+        "case \"the cursor's own query\": the second page must resume after the first, got {resumed}"
+    );
+}

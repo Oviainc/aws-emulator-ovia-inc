@@ -45,3 +45,5 @@ mod state_roundtrip;
 mod tag_sync_tasks;
 #[path = "all/ungroup_resources.rs"]
 mod ungroup_resources;
+#[path = "all/update_group_query.rs"]
+mod update_group_query;

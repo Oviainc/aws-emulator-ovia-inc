@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use serde_json::Value;
+use serde_json::{json, Value};
 use service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -129,6 +129,85 @@ pub async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Va
         "case {operation} {body}: expected HTTP 200, got {status} with {parsed}"
     );
     parsed
+}
+
+/// Every record a table's stream holds, read from its trim horizon through the STREAMS
+/// surface — the loop a change-data-capture consumer runs, shared by every suite that
+/// reads a change feed. `case` names the row the assertions below belong to.
+///
+/// The walk is bounded, so a handler that never advances its iterator fails rather than
+/// hanging, and it asserts the stream serves a shard and a position in it: a drain that
+/// silently answered nothing would surface only as a record mismatch far from its cause.
+pub async fn drain_stream(
+    router: &MultiServiceRouter,
+    case: &str,
+    stream_arn: &str,
+) -> Vec<Value> {
+    let (status, described) =
+        call_streams(router, "DescribeStream", json!({"StreamArn": stream_arn})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeStream must resolve the table's stream, got {status} with \
+         {described}"
+    );
+    let shards = described["StreamDescription"]["Shards"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !shards.is_empty(),
+        "case {case:?}: DescribeStream must list at least one shard, got {described}"
+    );
+    let mut records: Vec<Value> = Vec::new();
+    for shard in &shards {
+        let shard_id = shard["ShardId"].as_str().unwrap_or_default();
+        let (status, minted) = call_streams(
+            router,
+            "GetShardIterator",
+            json!({
+                "StreamArn": stream_arn,
+                "ShardId": shard_id,
+                "ShardIteratorType": "TRIM_HORIZON",
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetShardIterator answered {status} with {minted}"
+        );
+        let mut iterator = minted["ShardIterator"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !iterator.is_empty(),
+            "case {case:?}: GetShardIterator must mint a position in shard {shard_id:?}, got \
+             {minted}"
+        );
+        for _ in 0..16 {
+            let (status, page) =
+                call_streams(router, "GetRecords", json!({"ShardIterator": iterator})).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: GetRecords answered {status} with {page}"
+            );
+            let batch = page["Records"].as_array().cloned().unwrap_or_default();
+            records.extend(batch.iter().cloned());
+            match page["NextShardIterator"].as_str() {
+                Some(next) if !batch.is_empty() => iterator = next.to_string(),
+                _ => break,
+            }
+        }
+    }
+    records
+}
+
+/// The `eventName` of every stream record, in order.
+pub fn event_names(records: &[Value]) -> Vec<String> {
+    records
+        .iter()
+        .map(|record| record["eventName"].as_str().unwrap_or_default().to_string())
+        .collect()
 }
 
 /// The `GlobalSecondaryIndexes` entry of a description by index name, or `Null` when

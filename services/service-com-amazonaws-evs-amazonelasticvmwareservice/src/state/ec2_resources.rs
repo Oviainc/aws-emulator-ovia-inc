@@ -35,6 +35,8 @@
 //! * an Amazon EVS host IS an EC2 bare metal instance (`Host` doc), so
 //!   [`launch_host_instance`] puts that instance in EC2's own store through EC2's own
 //!   state API, and the host reports the id EC2 minted for it;
+//!   [`terminate_host_instance`] ends it again when the host is deleted from its
+//!   environment, so no instance of a host no environment holds is left running;
 //! * Amazon EVS "provisions the VLAN subnets" of an environment inside the VPC the
 //!   request names, and "environment deletion also deletes the associated Amazon EVS
 //!   VLAN subnets" (`CreateEnvironment` / `DeleteEnvironment` docs) — those subnets are
@@ -501,6 +503,55 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         instance_id,
         network_interface_ids,
     })
+}
+
+/// Terminate the EC2 bare metal instance an ESX host IS, in the account's own Amazon EC2
+/// store, and report whether this call moved one.
+///
+/// The counterpart of [`launch_host_instance`], and owed for the same reason: a host IS
+/// an EC2 instance ("An ESX host that runs on an Amazon EC2 bare metal instance", `Host`
+/// doc), so a host that is deleted from its environment cannot leave that instance
+/// running in the account — `DescribeInstances` would report an instance of a host no
+/// Amazon EVS environment holds, and the account would keep paying for it. The change is
+/// written through EC2's own record exactly as that service's own termination writes it:
+/// `shutting-down` with the move to `terminated` the clock owes it, and the terminated
+/// record kept, so the instance is indistinguishable from one `TerminateInstances`
+/// stopped.
+///
+/// `false` when the EC2 store cannot be read at all, when it holds no instance of that
+/// id, or when the instance is already on its way to `terminated` — nothing to do in any
+/// of the three.
+///
+/// The caller holds this service's own store while this runs, the one safe nesting order
+/// (EVS -> EC2) every writer here takes.
+pub fn terminate_host_instance<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    instance_id: &str,
+) -> bool {
+    let Some(state) = ec2_state(engine) else {
+        return false;
+    };
+    let mut store = state.lock();
+    let Some(instance) = store.instances.get_mut(instance_id) else {
+        return false;
+    };
+    if instance.state.is_terminating() {
+        return false;
+    }
+    instance.state = ec2::InstanceStateName::ShuttingDown;
+    instance.pending_transition = Some(ec2::PendingTransition::starting_now(
+        ec2::InstanceStateName::Terminated,
+    ));
+    // The caller asked for the host to go, so the shutdown is the client's, which is the
+    // reason EC2 records for a termination a caller asked for.
+    instance.state_transition_reason = Some(ec2::user_initiated_reason(
+        ::std::time::SystemTime::now(),
+    ));
+    instance.state_reason = Some((
+        "Client.UserInitiatedShutdown".to_string(),
+        "Client.UserInitiatedShutdown: User initiated shutdown".to_string(),
+    ));
+    true
 }
 
 /// What came of asking Amazon EC2 to record the association of an Elastic IP allocation

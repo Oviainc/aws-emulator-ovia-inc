@@ -29,7 +29,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_dynamodb_dynamodb_20120810::state::STATUS_TRANSITION;
 use service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::ops::types::STREAM_VIEW_TYPE_VALUES;
 
-use crate::emulator::{call, call_in, call_streams, emulator_with_streams, error_code, REGION};
+use crate::emulator::{
+    call, call_in, call_streams, drain_stream, emulator_with_streams, error_code, event_names,
+    REGION,
+};
 
 /// Every value the model's `StreamViewType` enum declares, read from the list the
 /// streams crate derives from that model, so this suite cannot drift from the enum.
@@ -130,69 +133,6 @@ async fn statuses_until_active(
         tokio::time::sleep(POLL_INTERVAL).await;
     }
     panic!("case {case:?}: the table never reached ACTIVE within {ACTIVE_DEADLINE:?}, saw {seen:?}")
-}
-
-/// Every record the stream holds, read from its trim horizon through the STREAMS
-/// surface — the loop a consumer runs.
-async fn drain_stream(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    case: &str,
-    stream_arn: &str,
-) -> Vec<Value> {
-    let (status, described) =
-        call_streams(router, "DescribeStream", json!({"StreamArn": stream_arn})).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: DescribeStream must resolve the table's stream, got {status} with \
-         {described}"
-    );
-    let shards = described["StreamDescription"]["Shards"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let mut records: Vec<Value> = Vec::new();
-    for shard in &shards {
-        let shard_id = shard["ShardId"].as_str().unwrap_or_default();
-        let (status, minted) = call_streams(
-            router,
-            "GetShardIterator",
-            json!({
-                "StreamArn": stream_arn,
-                "ShardId": shard_id,
-                "ShardIteratorType": "TRIM_HORIZON",
-            }),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: GetShardIterator answered {status} with {minted}"
-        );
-        let mut iterator = minted["ShardIterator"].as_str().unwrap_or_default().to_string();
-        // Bounded so a handler that never advances fails rather than hanging.
-        for _ in 0..16 {
-            let (status, page) =
-                call_streams(router, "GetRecords", json!({"ShardIterator": iterator})).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: GetRecords answered {status} with {page}"
-            );
-            let batch = page["Records"].as_array().cloned().unwrap_or_default();
-            records.extend(batch.iter().cloned());
-            match page["NextShardIterator"].as_str() {
-                Some(next) if !batch.is_empty() => iterator = next.to_string(),
-                _ => break,
-            }
-        }
-    }
-    records
-}
-
-/// The `eventName` of every record, in order.
-fn event_names(records: &[Value]) -> Vec<String> {
-    records
-        .iter()
-        .map(|record| record["eventName"].as_str().unwrap_or_default().to_string())
-        .collect()
 }
 
 #[tokio::test]

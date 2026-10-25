@@ -232,7 +232,15 @@ fn assert_everything_else_unchanged(case: &str, before: &Value, after: &Value) {
 /// through the same public state API a handler uses, so the exception is exercised
 /// against the one persisted record rather than a copy. Writing what that
 /// operation will write, so it stays correct once the stub is implemented.
-fn attach_static_ip(emulator: &Emulator, static_ip_name: &str, instance_name: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite in this test target makes the same attachment
+/// rather than carrying a second copy of it (`resource_ip_address_type.rs`, where
+/// the attachment is what refuses an IPv6-only address type).
+pub(crate) fn attach_static_ip(
+    emulator: &Emulator,
+    static_ip_name: &str,
+    instance_name: &str,
+) -> String {
     lightsail_state::with_state(emulator.engine(), |store| {
         let static_ip = store
             .static_ips

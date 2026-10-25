@@ -31,6 +31,32 @@ pub struct DescribeEdgeConfigurationOutput {
     pub edge_agent_status: Option<EdgeAgentStatus>,
 }
 
+/// How a [`DescribeEdgeConfigurationOutput`] reaches the wire: as a [`Report`], so
+/// EVERY modelled output member is present and one the service has no value for is JSON
+/// `null` rather than an absent key. `FailedStatusDetails` (there is no failed sync to
+/// describe) and `EdgeAgentStatus` (no Edge Agent has reported a job) are those members.
+impl ReportedOutput for DescribeEdgeConfigurationOutput {
+    fn output_schema() -> &'static ::aws_smithy_schema::Schema {
+        &Self::SCHEMA
+    }
+
+    fn has_no_value(&self, member: &::aws_smithy_schema::Schema) -> bool {
+        match member.member_name() {
+            Some("StreamName") => self.stream_name.is_none(),
+            Some("StreamARN") => self.stream_arn.is_none(),
+            Some("CreationTime") => self.creation_time.is_none(),
+            Some("LastUpdatedTime") => self.last_updated_time.is_none(),
+            Some("SyncStatus") => self.sync_status.is_none(),
+            Some("FailedStatusDetails") => self.failed_status_details.is_none(),
+            Some("EdgeConfig") => self.edge_config.is_none(),
+            Some("EdgeAgentStatus") => self.edge_agent_status.is_none(),
+            // A member added to the model is written by the record itself; it is
+            // reported as absent only once this match names it.
+            _ => false,
+        }
+    }
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.kinesisvideo#EdgeAgentStatus")]
 #[derive(Debug, Clone, Default)]
 pub struct EdgeAgentStatus {

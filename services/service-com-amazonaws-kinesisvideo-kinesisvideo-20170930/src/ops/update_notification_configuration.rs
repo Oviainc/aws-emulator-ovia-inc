@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNotificationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNotificationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNotificationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the notification configuration of the stored stream a `StreamName`/`StreamARN`
+//! pair names, or deletes it when the request carries no structure.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +153,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNotificationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNotificationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNotificationConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateNotificationConfigurationErrorModeled::ClientLimitExceededException(
+                    ClientLimitExceededException {
+                        message: Some(
+                            "The stream store is unavailable. Try again later.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        let stream = store
+            .resolve_mut(input.stream_name.as_deref(), input.stream_arn.as_deref())
+            .map_err(lookup_error)?;
+
+        // The request REPLACES whatever the stream carried, and a request carrying no
+        // structure clears it: "If the structure is null, the configuration will be
+        // deleted from the stream" (`NotificationConfiguration` on this input).
+        stream.notification_configuration = input.notification_configuration;
+
+        Ok(UpdateNotificationConfigurationOutput {})
     }
+}
+
+/// State the failure to resolve a `StreamName`/`StreamARN` pair as this service's
+/// own modeled error: absent or contradictory identifiers are a bad argument (400),
+/// a well-formed identifier for no stored stream is a missing resource (404).
+fn lookup_error(error: crate::state::LookupError) -> UpdateNotificationConfigurationError {
+    match error {
+        crate::state::LookupError::NoIdentifier => {
+            UpdateNotificationConfigurationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+        }
+        crate::state::LookupError::Mismatch => {
+            UpdateNotificationConfigurationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string()),
+                },
+            )
+        }
+        crate::state::LookupError::NotFound => {
+            UpdateNotificationConfigurationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::STREAM_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+        }
+    }
+    .into()
 }

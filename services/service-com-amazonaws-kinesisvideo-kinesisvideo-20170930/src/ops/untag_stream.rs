@@ -193,17 +193,17 @@ fn lookup_error(error: crate::state::LookupError) -> UntagStreamError {
     match error {
         crate::state::LookupError::NoIdentifier => {
             UntagStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
-                message: Some("Either StreamName or StreamARN must be specified.".to_string()),
+                message: Some(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
             })
         }
         crate::state::LookupError::Mismatch => {
             UntagStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
-                message: Some("StreamName and StreamARN refer to different streams.".to_string()),
+                message: Some(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string()),
             })
         }
         crate::state::LookupError::NotFound => {
             UntagStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some("The requested stream is not found or not active.".to_string()),
+                message: Some(crate::state::STREAM_NOT_FOUND_MESSAGE.to_string()),
             })
         }
     }

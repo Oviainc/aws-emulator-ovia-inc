@@ -3546,21 +3546,91 @@ pub fn parse_max_results(raw: Option<&str>) -> Result<usize, String> {
     }
 }
 
-/// One page of a key-ordered store.
+/// The sentence a paginated reader refuses a `NextToken` it did not issue with.
 ///
-/// Walks `items` in key order from `next_token` (inclusive) and takes at most
-/// `max_results`. The returned token is the key of the first item that did NOT
-/// fit, so it is present only when more remain and resuming from it continues
-/// exactly where this page stopped.
+/// A pagination token is OPAQUE: the service mints it and the caller echoes it back
+/// unchanged, so a string that is not one of this service's tokens for the collection
+/// being read names no position in it, and the request is not valid
+/// (`BadRequestException`: "The request is not valid, for example, the input is
+/// incomplete or incorrect"). API Gateway names the pagination cursor the POSITION in
+/// the collection, and this is the one sentence it refuses a cursor it cannot read
+/// with: it names nothing from the request, so the refusal a caller sees does not vary
+/// with the token it sent.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid position parameter";
+
+/// Separates the collection a token was issued for from the key its page resumes at.
+/// A unit separator, so it cannot occur in either part.
+const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// The collection a pagination token is issued for: `Stage`s of one api, `Api`s of the
+/// account, and so on. Two readers of different collections never accept each other's
+/// tokens, so `parts` is every name that identifies the collection — the resource path
+/// of the collection being read.
+pub fn page_scope(parts: &[&str]) -> String {
+    parts.join("/")
+}
+
+/// Mint the opaque `NextToken` that resumes `scope` at `key`.
+///
+/// The token's CONTENT is the service's own: the model documents `NextToken` only as
+/// "The next page of elements from this collection", so what a caller may do with one
+/// is echo it back. Hex, so the token needs no escaping in a query string and carries
+/// no resource name in the clear, and the collection travels with the key so a token
+/// is only ever accepted by the reader that issued it.
+fn encode_page_token(scope: &str, key: &str) -> String {
+    ::hex::encode(format!("{scope}{PAGE_TOKEN_SEPARATOR}{key}"))
+}
+
+/// The longest a token this service minted can be, in bytes.
+///
+/// A minted token is hex over the collection's resource path, one separator and a key —
+/// and every key this store holds is bounded (a `StageName` by
+/// [`MAX_STAGE_NAME_LEN`], the others comparably), so a token past this length is one
+/// this service cannot have issued. Checked BEFORE the decode, so the work a rejected
+/// token costs does not grow with the length a caller chose for it.
+const MAX_PAGE_TOKEN_LEN: usize = 2048;
+
+/// The key a token issued for `scope` resumes at, or `Err` when this service did not
+/// issue `token` for that collection.
+fn decode_page_token(scope: &str, token: &str) -> Result<String, String> {
+    if token.len() > MAX_PAGE_TOKEN_LEN {
+        return Err(INVALID_NEXT_TOKEN_MESSAGE.to_string());
+    }
+    let decoded = ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(|| INVALID_NEXT_TOKEN_MESSAGE.to_string())?;
+    let (token_scope, key) = decoded
+        .split_once(PAGE_TOKEN_SEPARATOR)
+        .ok_or_else(|| INVALID_NEXT_TOKEN_MESSAGE.to_string())?;
+    if token_scope != scope {
+        return Err(INVALID_NEXT_TOKEN_MESSAGE.to_string());
+    }
+    Ok(key.to_string())
+}
+
+/// One page of the key-ordered collection `scope`.
+///
+/// Walks `items` in key order from where `next_token` left off (inclusive) and takes at
+/// most `max_results`. The returned token resumes at the first item that did NOT fit, so
+/// it is present only when more remain and resuming from it continues exactly where this
+/// page stopped. `Err` carries the message for the operation's `BadRequestException`:
+/// a token this service did not issue for `scope` is refused rather than served as a
+/// page of its own.
 pub fn page<'a, V>(
     items: &'a BTreeMap<String, V>,
+    scope: &str,
     next_token: Option<&str>,
     max_results: usize,
-) -> (Vec<&'a V>, Option<String>) {
+) -> Result<(Vec<&'a V>, Option<String>), String> {
+    let resume = match next_token {
+        Some(token) => Some(decode_page_token(scope, token)?),
+        None => None,
+    };
     // `range` seeks straight to the resume key, so a full paginated walk costs one
     // traversal rather than one scan per page.
-    let start = match next_token {
-        Some(token) => ::std::ops::Bound::Included(token),
+    let start = match &resume {
+        Some(key) => ::std::ops::Bound::Included(key.as_str()),
         None => ::std::ops::Bound::Unbounded,
     };
     let mut rest = items.range::<str, _>((start, ::std::ops::Bound::Unbounded));
@@ -3569,8 +3639,10 @@ pub fn page<'a, V>(
         .take(max_results)
         .map(|(_, value)| value)
         .collect();
-    let token = rest.next().map(|(key, _)| key.clone());
-    (page, token)
+    let token = rest
+        .next()
+        .map(|(key, _)| encode_page_token(scope, key.as_str()));
+    Ok((page, token))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
