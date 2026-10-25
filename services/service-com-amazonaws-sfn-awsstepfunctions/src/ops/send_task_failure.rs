@@ -241,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.cause,
             execution.last_event_id(),
         );
-        match store.answer_activity_task(&input.task_token, planned.opening, planned.pending, 0) {
+        match store.fail_activity_task(&input.task_token, planned.opening, planned.pending) {
             Ok(()) => Ok(SendTaskFailureOutput {}),
             Err(crate::state::TaskReplyRejection::Gone) => {
                 Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {

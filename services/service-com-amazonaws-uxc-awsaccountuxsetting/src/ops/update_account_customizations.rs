@@ -4,10 +4,12 @@
 //!
 //! Implemented: merges the supplied settings into the calling account's
 //! persisted customization record and answers with the record read back out of
-//! state. Every value the model's own constraints admit is accepted: a body that
-//! breaks a modelled SHAPE constraint never reaches this handler at all — this
-//! service's front door (`crate::service`) refuses it with HTTP 400
-//! `BadRequestException` — and nothing beyond those constraints is refused here.
+//! state. A body that breaks a modelled SHAPE constraint never reaches this
+//! handler at all — this service's front door (`crate::service`) refuses it with
+//! HTTP 400 `BadRequestException`. What this handler owns is the one admission
+//! rule the model states in prose: a `visibleServices` member the service
+//! catalog does not name is refused with the modelled `ValidationException`
+//! (HTTP 400), before anything is written.
 //! A list setting is stored, echoed and read back in ONE canonical sequence —
 //! its members ascending — whatever sequence the request named them in
 //! (`crate::state::canonical_members`).
@@ -99,6 +101,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How this service words the refusal of a `visibleServices` member that is not
+/// an identifier of the console service catalog: the wording AWS states for this
+/// refusal class, which names the setting's subject and nothing of the request —
+/// the identifiers it refused are the caller's own values.
+const INVALID_SERVICES: &str = "Invalid services provided";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -173,20 +181,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The write needs no request metadata beyond the calling account.
         let _ = ctx;
 
-        // No validity guard lives here. A body that breaks a modelled shape
-        // constraint — an `accountColor` outside `ACCOUNT_COLOR_VALUES`, a
-        // `visibleServices`/`visibleRegions` element outside its pattern or
-        // length, a list longer than its `@length` — is refused by this
-        // service's front door (`crate::service`) with HTTP 400
-        // `BadRequestException` before any handler runs, and the model states no
-        // further admission rule for either list setting.
-        //
-        // In particular `visibleServices` is NOT checked against the catalog
-        // `ListServices` pages over: that operation's doc ("For valid service
-        // identifiers, call ListServices") points a caller at where identifiers
-        // can be DISCOVERED; neither it nor the model says an identifier the
-        // catalog omits is refused. Refusing one would turn a modelled-valid
-        // request into a 400 on a rule the service never published.
+        // A body that breaks a modelled shape constraint — an `accountColor`
+        // outside the enum, a `visibleServices`/`visibleRegions` element outside
+        // its pattern or length, a list longer than its `@length` — is refused by
+        // this service's front door (`crate::service`) with HTTP 400
+        // `BadRequestException` before any handler runs. The one admission rule
+        // left to this handler is the one the model states in prose, and it is
+        // enforced below, under the same guard as the write.
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateAccountCustomizationsErrorModeled::InternalServerException(
@@ -202,12 +203,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another caller's concurrent update, and then the body would describe
         // state this request did not produce.
         let stored = {
+            let mut guard = state.lock();
+
+            // Catalog membership is part of a `visibleServices` value's validity:
+            // the member holds "service identifiers to make visible in the
+            // Management Console" and the model sends a caller to `ListServices`
+            // "for valid service identifiers", so an identifier that catalog does
+            // not name is not one of the setting's values and is refused with the
+            // modelled `ValidationException` (HTTP 400). The check runs over the
+            // WHOLE supplied list and under the same guard as the write, BEFORE
+            // the record is reached: a refused request leaves the setting the
+            // account already had exactly as it was, so nothing partial is stored.
+            //
+            // `visibleRegions` has no such check: this service publishes no
+            // catalog of Region codes — no operation of it enumerates Regions and
+            // the model offers only the member's `@pattern` — so there is nothing
+            // to decide membership against, and the pattern stays its whole rule.
+            if let Some(supplied) = input.visible_services.as_deref() {
+                if supplied
+                    .iter()
+                    .any(|service| !guard.is_catalog_service(service))
+                {
+                    return Err(UpdateAccountCustomizationsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: INVALID_SERVICES.to_string(),
+                            // No `fieldList`: that member reports a value outside
+                            // a constraint the MODEL declares for it, member by
+                            // member, and this refusal is not one of those — the
+                            // identifiers here satisfy every modelled constraint.
+                            field_list: None,
+                        },
+                    )
+                    .into());
+                }
+            }
+
             // "Only the settings that you include in the request body are
             // modified. Omitted settings remain unchanged." At the typed boundary
             // an omitted member arrives as `None`, so `None` leaves the stored
             // value alone; a colour is reset with the modelled `none` value and a
             // list by sending it empty.
-            let mut guard = state.lock();
             let record = guard.customization_mut(account_id);
             if let Some(color) = input.account_color {
                 record.account_color = Some(color);

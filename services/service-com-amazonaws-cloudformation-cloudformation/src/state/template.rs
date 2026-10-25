@@ -45,9 +45,9 @@
 //! the output is reported with its key and description and without an `OutputValue`,
 //! because `Output$OutputValue` is optional and a made-up ARN is worse than an absent
 //! one. What is left unevaluated is an expression whose INPUT this emulator does not
-//! hold — a `Ref` to a name the template never declares, a `Fn::ImportValue` of an
-//! export no stack of this account published (the account-wide export registry is
-//! `ListExports`'s, and it is still scaffolded), a `Fn::Transform` macro, or a
+//! hold — a `Ref` to a name the template never declares, a `Fn::ImportValue` (nothing
+//! here resolves an import against the exports `ListExports` reports), a
+//! `Fn::Transform` macro, or a
 //! `Fn::GetAtt` for an attribute that is neither published for the type, declared as a
 //! property of the resource, nor one of the conventional names — never a function whose
 //! value follows from the template and the stack.
@@ -4196,8 +4196,8 @@ fn bounded(resolved: Resolved, budget: &mut Budget) -> Option<Resolved> {
 /// Evaluate one intrinsic function.
 ///
 /// The functions this module does not implement yield no value, so an output that uses
-/// one is reported without an `OutputValue`: `Fn::ImportValue` (the account-wide registry
-/// of exported output values is `ListExports`'s, and that operation is still scaffolded)
+/// one is reported without an `OutputValue`: `Fn::ImportValue` (nothing here resolves an
+/// import against the exported output values `ListExports` reports)
 /// and `Fn::Transform` (a macro this emulator runs nothing for). The CONDITION functions
 /// (`Fn::Equals`, `Fn::And`, `Fn::Or`, `Fn::Not`, `Condition`) are not values either:
 /// they are evaluated where CloudFormation allows them — the `Conditions` section and

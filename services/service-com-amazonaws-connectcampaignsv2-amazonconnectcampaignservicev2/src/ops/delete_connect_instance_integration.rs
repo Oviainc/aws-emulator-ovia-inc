@@ -190,6 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let kind = crate::state::integration_identifier_key(&input.integration_identifier).0;
 
         let now = ::std::time::SystemTime::now();
+        // The instance and its integrations are the ones the region this request was
+        // signed for holds.
+        let region = crate::state::request_region(ctx);
         // One guard spans the onboarding check and the removal, so a concurrent change
         // to the instance cannot leave this delete applied to a store the instance is
         // no longer in.
@@ -198,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An integration belongs to a Connect instance onboarded to Campaigns: the
         // instance-onboarding store is the one record of which instances those are, so
         // an instance whose onboarding job has not finished holds nothing to delete.
-        if !store.is_onboarded(&input.connect_instance_id, now) {
+        if !store.is_onboarded(&region, &input.connect_instance_id, now) {
             crate::state::audit_onboarding_change(
                 ctx.parts(),
                 Self::NAME,
@@ -225,8 +228,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // remove and the call is not found rather than a silent success — this
         // operation, unlike this service's config deletes, is not modelled
         // `@idempotent`.
-        let removed = store
-            .delete_instance_integration(&input.connect_instance_id, &input.integration_identifier);
+        let removed = store.delete_instance_integration(
+            &region,
+            &input.connect_instance_id,
+            &input.integration_identifier,
+        );
         if !removed {
             crate::state::audit_onboarding_change(
                 ctx.parts(),

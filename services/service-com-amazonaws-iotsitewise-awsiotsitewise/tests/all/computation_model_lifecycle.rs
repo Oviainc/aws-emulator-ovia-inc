@@ -62,7 +62,7 @@ fn settle() -> Duration {
 
 /// The ARN form this emulator mints for a computation model, as the
 /// `computationModelArn` member documents it.
-fn expected_arn(id: &str) -> String {
+pub(crate) fn expected_arn(id: &str) -> String {
     format!(
         "arn:aws:iotsitewise:{REGION}:{}:computation-model/{id}",
         engine::EMULATOR_ACCOUNT_ID
@@ -70,18 +70,18 @@ fn expected_arn(id: &str) -> String {
 }
 
 /// `CreateComputationModel` with `body`.
-async fn create(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+pub(crate) async fn create(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(router, "POST", COMPUTATION_MODELS_URI, Some(body)).await
 }
 
 /// `DescribeComputationModel` on `id`, with no version filter.
-async fn describe(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn describe(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &computation_model_uri(id), None).await
 }
 
 /// A `ComputationModelDataBindingValue` naming an asset model's property. Both
 /// members of `AssetModelPropertyBindingValue` are modelled `ID`s.
-fn asset_model_property(asset_model_id: &str, property_id: &str) -> Value {
+pub(crate) fn asset_model_property(asset_model_id: &str, property_id: &str) -> Value {
     json!({
         "assetModelProperty": { "assetModelId": asset_model_id, "propertyId": property_id }
     })
@@ -100,7 +100,7 @@ fn binding_list(values: Vec<Value>) -> Value {
 
 /// A modelled `ID`: a lowercase hyphenated UUID built from `digit`, so each row
 /// of a table can name ids of its own without minting any.
-fn id_of(digit: char) -> String {
+pub(crate) fn id_of(digit: char) -> String {
     let repeat = |count: usize| std::iter::repeat_n(digit, count).collect::<String>();
     format!(
         "{}-{}-4{}-8{}-{}",
@@ -114,7 +114,7 @@ fn id_of(digit: char) -> String {
 
 /// An `anomalyDetection` configuration referencing the binding variables
 /// `input` and `result`, in the `${VariableName}` form the members document.
-fn anomaly_detection(input: &str, result: &str) -> Value {
+pub(crate) fn anomaly_detection(input: &str, result: &str) -> Value {
     json!({
         "anomalyDetection": {
             "inputProperties": format!("${{{input}}}"),

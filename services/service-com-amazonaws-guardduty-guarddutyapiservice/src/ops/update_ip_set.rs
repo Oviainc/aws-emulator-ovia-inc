@@ -148,6 +148,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The `Name` an update carries is the IPSet's user-friendly name, the same
+        // member the create takes, so it is held to the same documented alphabet —
+        // "alphanumeric, whitespace, dash (-), and underscores (_)"
+        // (`smithy_query(query="doc",shape="CreateIPSetRequest",member="Name")`) —
+        // which the modelled `len 1..300` does not express. Checked BEFORE anything
+        // is written, so a refused update leaves the stored name where it was.
+        if input
+            .name
+            .as_deref()
+            .is_some_and(|name| !crate::state::is_ip_set_name(name))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::IP_SET_NAME_MEMBER),
+            ));
+        }
+
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
         // A MUTATION: the instant this hands out is the IPSet's new `UpdatedAt` and,

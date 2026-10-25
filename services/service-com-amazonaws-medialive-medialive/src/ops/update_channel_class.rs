@@ -258,6 +258,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // started from.
         crate::state::begin_update(channel, now);
 
+        // A class that adds a pipeline adds the public address that pipeline
+        // egresses from; one that drops a pipeline leaves the addresses the
+        // channel already holds alone, so going back reports the same ones.
+        state.allocate_channel_egress_addresses(&input.channel_id);
+
         // Read back out of the store, so the response reports the channel that
         // was written rather than one this handler assembled from the request.
         let channel = state

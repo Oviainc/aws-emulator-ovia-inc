@@ -149,6 +149,8 @@ mod fast_launch_images;
 // What `DisableFastSnapshotRestores` answers per (snapshot, Availability Zone) pair.
 #[path = "all/fast_snapshot_restores.rs"]
 mod fast_snapshot_restores;
+#[path = "all/filter_matcher_budget.rs"]
+mod filter_matcher_budget;
 #[path = "all/fleet_instances.rs"]
 mod fleet_instances;
 #[path = "all/fpga_image_tasks_and_volume_io.rs"]
@@ -346,8 +348,17 @@ mod export_task_cancellation;
 // Associating a VPC with a local gateway route table, and reading the association back.
 #[path = "all/local_gateway_route_table_vpc_associations.rs"]
 mod local_gateway_route_table_vpc_associations;
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. What `DeleteTags` removes from a resource of any
+// kind, and what it refuses.
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 // Giving Dedicated Hosts back: which of the named hosts `ReleaseHosts` releases, what it
 // reports per id, and what a released host still looks like through `DescribeHosts`.
 // Declared LAST for the reason the header gives.
 #[path = "all/release_hosts.rs"]
 mod release_hosts;
+// Declared LAST for the reason the header gives: taking one AMI back out of the Recycle
+// Bin, and what that refuses.
+#[path = "all/image_recycle_bin.rs"]
+mod image_recycle_bin;
