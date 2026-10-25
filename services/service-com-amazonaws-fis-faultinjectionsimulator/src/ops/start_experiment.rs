@@ -19,7 +19,8 @@
 //! none of them, and the template's `emptyTargetResolutionMode` decides what an empty
 //! target resolution does — skip the actions that name such a target, or fail the run.
 //! A template id naming no record answers `ResourceNotFoundException`
-//! (HTTP 404); a template whose role does not let FIS assume it answers
+//! (HTTP 404); a template whose role does not let FIS assume it, and one that targets
+//! MULTIPLE accounts while holding no target account configuration to name them, answer
 //! `ValidationException` (HTTP 400); a start beyond the published active-experiments quota
 //! answers `ServiceQuotaExceededException` (HTTP 402); and the `@idempotencyToken` either
 //! replays the experiment it already started or, when the request differs from the one it
@@ -244,6 +245,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A template's account targeting and the target account configurations it holds
+        // state ONE thing between them — which accounts the experiment runs in — so a
+        // template that targets multiple accounts and names none of them describes a run
+        // this call cannot carry out, and is refused before any experiment is minted (see
+        // [`crate::state::multi_account_configuration_refusal`]).
+        if let Some(refusal) = crate::state::multi_account_configuration_refusal(&template) {
+            return Err(StartExperimentErrorModeled::ValidationException(refusal).into());
+        }
 
         // FIS runs the experiment as the template's role, so it checks up front that the
         // role lets it: a start it could never carry out is refused here instead of

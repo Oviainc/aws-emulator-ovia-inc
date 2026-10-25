@@ -295,17 +295,17 @@ impl ScheduledReportRecord {
     }
 }
 
-/// The outcome one `ExecuteScheduledReport` call recorded under the `clientToken` it
-/// presented, so a retry inside [`EXECUTION_IDEMPOTENCY_WINDOW`] answers that same
-/// outcome rather than triggering a second execution.
+/// The outcome one `ExecuteScheduledReport` call recorded under the report it executed
+/// and the `clientToken` it presented, so a RETRY of that same call inside
+/// [`EXECUTION_IDEMPOTENCY_WINDOW`] answers that same outcome rather than triggering a
+/// second execution.
 ///
-/// `arn` is the report the token executed: a token identifies ONE execution, so the
-/// same token presented for a different report inside the window is a conflicting
-/// reuse, not a retry, and is refused rather than answered with another report's
-/// outcome.
+/// The record is keyed by the pair, never by the token alone: the token suppresses a
+/// repeat of the request that carried it, and the request names the report, so the same
+/// token presented for another report is a different request and is decided on its own
+/// merits.
 #[derive(Debug, Clone)]
 pub struct ScheduledReportExecution {
-    pub arn: String,
     pub executed_at: SystemTime,
     pub execution_triggered: bool,
     pub health_status: HealthStatus,
@@ -334,12 +334,15 @@ pub struct ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     /// caller presenting it wins and every later one is refused with the modelled
     /// `ConflictException`, so a retried token can never mint a second report.
     pub scheduled_report_client_tokens: BTreeMap<String, String>,
-    /// The `clientToken` of every `ExecuteScheduledReport` that has triggered (or
-    /// declined to trigger) an execution, mapped to that call's outcome. An entry lives
-    /// for [`EXECUTION_IDEMPOTENCY_WINDOW`] from the call that wrote it and is dropped
-    /// once the clock has closed its window ([`Self::expire_execution_tokens`]), so the
-    /// map a caller can grow stays bounded by the tokens of one minute's calls.
-    pub scheduled_report_executions: BTreeMap<String, ScheduledReportExecution>,
+    /// Every `ExecuteScheduledReport` call that has triggered (or declined to trigger)
+    /// an execution under a `clientToken`, keyed by the pair (the executed report's ARN,
+    /// that token) and mapped to that call's outcome — the scope an idempotency token
+    /// has, which is the request it was presented with, not every request sharing its
+    /// value. An entry lives for [`EXECUTION_IDEMPOTENCY_WINDOW`] from the call that
+    /// wrote it and is dropped once the clock has closed its window
+    /// ([`Self::expire_execution_tokens`]), so the map a caller can grow stays bounded by
+    /// the calls of one minute.
+    pub scheduled_report_executions: BTreeMap<(String, String), ScheduledReportExecution>,
 }
 
 impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {

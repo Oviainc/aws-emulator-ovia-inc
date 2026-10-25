@@ -7,11 +7,17 @@
 //! terminal `ACTIVE` state, which is the state recorded traffic reads a
 //! just-created entity back in.
 //!
-//! Three refusals this handler owns, each a `ValidationException` (the model
+//! Four refusals this handler owns, each a `ValidationException` (the model
 //! declares no `ResourceNotFoundException` for `CreateEntity`):
 //!
 //! * the workspace does not exist;
 //! * `parentEntityId` names an entity that does not exist in the workspace;
+//! * a component — top-level or composite — instantiates a component type the
+//!   workspace holds and that type is ABSTRACT
+//!   ([`crate::state::ComponentType::is_abstract`]): an abstract component type
+//!   has no way to serve the values of a property it declares, so it is
+//!   extended rather than instantiated, and a component of one is refused
+//!   BEFORE anything is stored;
 //! * a `compositeComponents` key is not the path of a composite component this
 //!   entity has: the path's first segment must name one of the request's
 //!   `components`, and each further segment an entry in the
@@ -23,14 +29,15 @@
 //!
 //! An `entityId` that is already taken in the workspace is a `ConflictException`.
 //!
-//! Two deliberate gaps: a component's `componentTypeId` is stored WITHOUT
-//! checking that the named component type exists (the real service refuses an
-//! unknown one, but a real workspace carries more built-in component types than
-//! this emulator models, so refusing would reject creates the
-//! real service accepts — which is also why a composite component path THROUGH
-//! a component type this workspace does not hold cannot be resolved and is
-//! refused), and authorization is not emulated, so the modelled
-//! `AccessDeniedException` is never returned.
+//! Two deliberate gaps: a `componentTypeId` the workspace does not hold at all
+//! is still stored without being refused (the real service refuses an unknown
+//! one, but a real workspace carries more built-in component types than this
+//! emulator models, so refusing would reject creates the real service accepts —
+//! which is also why a composite component path THROUGH a component type this
+//! workspace does not hold cannot be resolved and is refused), and
+//! authorization is not emulated, so the modelled `AccessDeniedException` is
+//! never returned. A component type the workspace DOES hold is resolved: see
+//! the abstractness refusal above.
 //!
 //! ## Shape of an operation
 //!
@@ -225,9 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if workspace.entities.contains_key(&entity_id) {
             return Err(CreateEntityErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "entity {entity_id} already exists in workspace {}",
-                        input.workspace_id
+                    message: Some(crate::state::already_exists_message(
+                        "Entity",
+                        &entity_id,
+                        Some(&input.workspace_id),
                     )),
                 },
             )
@@ -303,6 +311,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut component_records = components_from_request(components);
 
+        // A component INSTANTIATES the component type its `componentTypeId`
+        // names, so that type has to be one that can be instantiated at all.
+        // An ABSTRACT component type cannot be: it has no way to serve the
+        // values of some property it declares, which is what makes it a base
+        // type to extend rather than one to hold a component of. Walked in
+        // component-name order (the records are keyed by it), so which
+        // component a refusal names does not depend on the request map's
+        // iteration order, and walked BEFORE anything is stored.
+        for component in component_records.values() {
+            if let Some(refusal) =
+                abstract_component_type_refusal(workspace, component.component_type_id.as_deref())
+            {
+                return Err(refusal.into());
+            }
+        }
+
         // A `compositeComponents` entry is accepted exactly when its key
         // RESOLVES as a composite component path: one of this entity's
         // components, then one `compositeComponentTypes` declaration of the
@@ -324,6 +348,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(message),
                 })
             })?;
+            // A composite component instantiates the component type the
+            // declaration its path resolved to names, so the same abstractness
+            // rule holds for it as for a top-level component.
+            if let Some(refusal) =
+                abstract_component_type_refusal(workspace, Some(&resolved.component_type_id))
+            {
+                return Err(refusal.into());
+            }
             let record = crate::state::CompositeComponentRecord {
                 component_path: component_path.clone(),
                 component_name: resolved.composite_name,
@@ -470,6 +502,34 @@ fn property_group_records(
             )
         })
         .collect()
+}
+
+/// Why a component naming `component_type_id` cannot be created — `None` when
+/// it can.
+///
+/// The component type is resolved in the WORKSPACE's own registry, which holds
+/// both the component types a caller created and the built-ins the workspace
+/// was provisioned with, and the refusal is the one an ABSTRACT type earns
+/// ([`crate::state::component_type_is_abstract`] decides which types those
+/// are). An id the workspace does not hold is left alone — see this module's
+/// deliberate gaps — and a component that names no component type instantiates
+/// nothing and so has nothing to resolve.
+///
+/// Shared by the top-level components and the composite ones, so one rule is
+/// applied once to every component a create writes.
+fn abstract_component_type_refusal(
+    workspace: &crate::state::Workspace,
+    component_type_id: Option<&str>,
+) -> Option<CreateEntityErrorModeled> {
+    let component_type_id = component_type_id?;
+    let component_type = workspace.component_types.get(component_type_id)?;
+    component_type.is_abstract.then(|| {
+        CreateEntityErrorModeled::ValidationException(ValidationException {
+            message: Some(crate::state::abstract_component_type_message(
+                component_type_id,
+            )),
+        })
+    })
 }
 
 /// Refuse a requested property whose definition carries no `dataType`.

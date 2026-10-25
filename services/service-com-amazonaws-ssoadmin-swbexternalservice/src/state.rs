@@ -27,7 +27,7 @@ use crate::ops::types::{
     CustomerManagedPolicyReference, DisplayData, EncryptionConfigurationDetails, Grant,
     InstanceAccessControlAttributeConfiguration, InstanceMetadata,
     PermissionSet, PermissionsBoundary, PortalOptions, RegionMetadata, ResourceServerConfig,
-    ResourceServerScopeDetails, Tag, TrustedTokenIssuerConfiguration,
+    ResourceServerScopeDetails, ScopeDetails, Tag, TrustedTokenIssuerConfiguration,
 };
 
 /// The identity-store instance every `InstanceArn`-taking operation resolves against.
@@ -468,9 +468,19 @@ pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 pub const ASSIGNMENT_OPERATION_SPAN: Duration = Duration::from_millis(500);
 
 /// The page size a paginated read uses when the caller sends no `MaxResults`, and the
-/// ceiling it clamps a caller's value to: the model bounds every `MaxResults` member of
-/// this service at `range(min: 1, max: 100)`.
+/// ceiling it clamps a caller's value to: the model's `MaxResults` shape is
+/// `range(min: 1, max: 100)`.
 pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// The largest page `ListApplicationAccessScopes` can answer: the maximum its own
+/// `MaxResults` MEMBER declares, which narrows the `MaxResults` shape's `range(min: 1,
+/// max: 100)` and is the same bound its response's `Scopes` list carries
+/// (`length(min: 0, max: 10)`), so no larger page is expressible.
+///
+/// The validating walk enforces the constraints the SCHEMA carries, which are the target
+/// shape's, so the handler of an operation whose member narrows them states the narrower
+/// bound itself — see [`crate::service::refusal::value_above_maximum`].
+pub const MAX_ACCESS_SCOPES_PER_PAGE: i32 = 10;
 
 /// The maximum number of records this emulator keeps in ANY ONE of its caller-driven
 /// stores ([`ComAmazonawsSsoadminSwbexternalserviceState::permission_sets`],
@@ -1860,6 +1870,34 @@ pub struct ApplicationRecord {
     pub grants: BTreeMap<String, Grant>,
 }
 
+impl ApplicationRecord {
+    /// The access scopes this application carries, in `Scope` order, as the
+    /// `(page key, item)` pairs [`page`] enumerates.
+    ///
+    /// The scope NAME is both the page key and the identity of a scope — an application
+    /// carries a given scope at most once, since [`Self::access_scopes`] is keyed by it —
+    /// so the enumeration order is stable across calls however the scopes were put, and a
+    /// pagination cursor resumes after a KEY rather than after a position a later put
+    /// would shift.
+    pub fn access_scope_details(&self) -> Vec<(String, ScopeDetails)> {
+        self.access_scopes
+            .iter()
+            .map(|(scope, authorized_targets)| {
+                (
+                    scope.clone(),
+                    ScopeDetails {
+                        scope: scope.clone(),
+                        // Reported from the STORED scope: absent for a scope put with no
+                        // `AuthorizedTargets`, since `ScopeTargets` is `length 1..10` and
+                        // cannot express an empty list.
+                        authorized_targets: authorized_targets.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
 /// A direct assignment of one principal to one application.
 ///
 /// Its identity is the tuple (application, principal type, principal id) —
@@ -3217,6 +3255,13 @@ pub fn cursor_permission_sets(instance_arn: &str) -> String {
 /// instance that permission set belongs to (the same pair the read resolves against).
 pub fn cursor_managed_policies(instance_arn: &str, permission_set_arn: &str) -> String {
     format!("managedPolicies|{instance_arn}|{permission_set_arn}")
+}
+
+/// Cursor scope of a `ListApplicationAccessScopes` enumeration: the operation and the
+/// application whose access scopes it walks (the same application every scope read
+/// resolves against).
+pub fn cursor_access_scopes(application_arn: &str) -> String {
+    format!("accessScopes|{application_arn}")
 }
 
 /// Cursor scope of a `ListApplicationGrants` enumeration: the operation and the

@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEC2RecommendationProjectedMetrics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEC2RecommendationProjectedMetrics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEC2RecommendationProjectedMetrics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the projected utilization metrics of Amazon EC2 instance recommendations.
+//!
+//! A REPORTING operation: it reads the instance analysis this service holds for the instance
+//! the request names ([`crate::state::ObservedInstance`]) and writes nothing. Compute
+//! Optimizer's own analysis of an observed workload is what records such an instance, so this
+//! handler invents no recommendation and no observation: the instance types it reports are
+//! the candidates the analysis found, in the analysis' own rank order, and each metric it
+//! projects is computed from a utilization the analysis actually observed on that instance.
+//!
+//! ## The projection
+//!
+//! A projected metric "represents the projected utilization of a recommendation option had
+//! you used that resource during the analyzed period" (`ProjectedMetric`): the observed
+//! metric as it would read on the recommended instance type. "The `Cpu` and `Memory` metrics
+//! are the only projected utilization metrics returned when you run this action", which are
+//! exactly the metrics measured as a percentage of a resource the instance TYPE sizes — its
+//! vCPUs and its memory ([`crate::state::metric_sized_by_instance_type`]) — so each is scaled
+//! by the ratio of the two types' capacities for the resource it measures, because the same
+//! work on half the capacity runs at twice the utilization
+//! ([`crate::state::ObservedInstance::projected_metric_value`]). An observation of the
+//! workload's own traffic is projected by no option here: moving to another instance type does
+//! not resize it, and this action reports no series for it.
+//!
+//! The analysis records ONE utilization figure per metric and statistic over its look-back
+//! period, so the series reported over the requested window carries that one projected value
+//! at each of its data points: nothing finer-grained was observed, and a varying series would
+//! be invented rather than computed. `stat` ("The statistic of the projected metrics") selects
+//! WHICH observations are projected: a metric the analysis observed under another statistic is
+//! not reported under the requested one.
+//!
+//! `recommendationPreferences` selects which candidates are reported: "when you specify
+//! `AWS_ARM64` with a `GetEC2RecommendationProjectedMetrics` request, Compute Optimizer
+//! returns projected utilization metrics for Graviton instance type recommendations only".
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +196,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEC2RecommendationProjectedMetrics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEC2RecommendationProjectedMetricsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetEC2RecommendationProjectedMetricsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer findings store is unavailable.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A malformed request is refused BEFORE the store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as it
+        // does in this service's other readers.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEC2RecommendationProjectedMetrics"))
+        // `instanceArn` is "the Amazon Resource Name (ARN) of the instances for which to
+        // return recommendation projected metrics", so the value is an EC2 instance ARN;
+        // anything else cannot identify an instance to project for. WHICH instance it names
+        // is not checked here: a well-formed ARN this service holds no analysis for is
+        // reported as a missing resource below, not refused. An ARN whose ACCOUNT field names
+        // another account asks about an instance this service cannot report on, so it is
+        // refused with the crate's cross-account message rather than selecting nothing.
+        let parsed = crate::state::parse_resource_arn(&input.instance_arn).filter(|parsed| {
+            parsed.resource_type == crate::state::RESOURCE_TYPE_EC2_INSTANCE
+        });
+        let Some(parsed) = parsed else {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter instanceArn is not valid: {} is not the \
+                 Amazon Resource Name (ARN) of an Amazon EC2 instance.",
+                input.instance_arn
+            )));
+        };
+        if crate::state::is_foreign_account(parsed.account_id) {
+            return Err(invalid_parameter(
+                crate::state::CROSS_ACCOUNT_MESSAGE.to_string(),
+            ));
+        }
+        // `period` is "The granularity, in seconds, of the projected metrics data points", so
+        // it is a span of time: the member's modelled default `0` — which a request omitting
+        // it carries — divides the window into no data points at all.
+        if input.period <= 0 {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter period is not valid: the granularity of the \
+                 projected metrics data points must be a positive number of seconds, not {}.",
+                input.period
+            )));
+        }
+        // `startTime` is "the first projected metrics data point to return" and `endTime`
+        // "the last", so the window runs forwards and holds at least one data point.
+        let start = input.start_time.as_secs_f64();
+        let end = input.end_time.as_secs_f64();
+        if end <= start {
+            return Err(invalid_parameter(
+                "The value supplied for parameter startTime is not valid: it must be earlier \
+                 than endTime."
+                    .to_string(),
+            ));
+        }
+        // The data points of the window, at the requested granularity. Capped at
+        // `MAX_PROJECTED_METRIC_DATA_POINTS`, so no number a request carries can size the
+        // response or the allocation that builds it.
+        let Some(timestamps) =
+            crate::state::projected_metric_timestamps(start, end, f64::from(input.period))
+        else {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter period is not valid: a window of {} seconds \
+                 at a granularity of {} seconds covers more than {} projected metrics data \
+                 points; ask for a coarser period or a shorter window.",
+                end - start,
+                input.period,
+                crate::state::MAX_PROJECTED_METRIC_DATA_POINTS
+            )));
+        };
+        // `cpuVendorArchitectures` selects which candidate instance types are projected:
+        // "when you specify AWS_ARM64 with a GetEC2RecommendationProjectedMetrics request,
+        // Compute Optimizer returns projected utilization metrics for Graviton instance type
+        // recommendations only". A value outside the model's own `CpuVendorArchitecture`
+        // vocabulary is refused by the request walk before this handler runs, so what
+        // reaches here is a list of architectures.
+        let requested_architectures: Vec<String> = input
+            .recommendation_preferences
+            .as_ref()
+            .and_then(|preferences| preferences.cpu_vendor_architectures.clone())
+            .unwrap_or_default();
+
+        let guard = state.lock();
+        // "The account is not opted in to Compute Optimizer": the service analyses an
+        // account's resources only once it has opted in, so an account that never did — or
+        // that opted back out — reads no recommendation and no projection of one.
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                GetEC2RecommendationProjectedMetricsErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Compute Optimizer is a regional service, so the request addresses ONE region's
+        // endpoint: the instance it asks about is that region's, and a resource named by the
+        // ARN of another region is one this endpoint holds no analysis for.
+        let region = crate::state::request_region(ctx);
+        let Some(instance) = guard
+            .visible_instances()
+            .find(|instance| instance.instance_arn(&region) == input.instance_arn)
+        else {
+            // This operation reports one instance's projection and models no per-resource
+            // error list, so an instance it holds no analysis for is "a resource that is
+            // required for the action doesn't exist".
+            return Err(
+                GetEC2RecommendationProjectedMetricsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            "Compute Optimizer has no Amazon EC2 instance recommendation for \
+                             the resource this identifier names."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let options: Vec<RecommendedOptionProjectedMetric> = instance
+            .candidates
+            .iter()
+            // The candidates the request's CPU vendor architecture preference admits; a
+            // request that states no preference restricts nothing.
+            .filter(|candidate| {
+                requested_architectures.is_empty()
+                    || requested_architectures.contains(&candidate.architecture)
+            })
+            .enumerate()
+            .map(|(index, candidate)| {
+                let projected: Vec<ProjectedMetric> = instance
+                    .utilization
+                    .iter()
+                    // "The Cpu and Memory metrics are the only projected utilization metrics
+                    // returned when you run this action"
+                    // (`RecommendedOptionProjectedMetric`): the metrics this operation
+                    // projects are the ones the instance TYPE sizes, so an observation of the
+                    // workload's own traffic — which the recommendation reader reports as
+                    // observed utilization — is projected by no option here.
+                    .filter(|metric| crate::state::metric_sized_by_instance_type(&metric.name))
+                    // `stat` is "The statistic of the projected metrics": the observations
+                    // projected are the ones the analysis recorded under that statistic.
+                    .filter(|metric| metric.statistic == input.stat)
+                    .map(|metric| {
+                        let value = instance.projected_metric_value(
+                            &metric.name,
+                            metric.value,
+                            candidate,
+                        );
+                        ProjectedMetric {
+                            name: Some(metric.name.clone()),
+                            timestamps: Some(timestamps.clone()),
+                            // The analysis observed ONE figure per metric and statistic, so
+                            // the series carries its projection at every data point.
+                            values: Some(vec![value; timestamps.len()]),
+                        }
+                    })
+                    .collect();
+                RecommendedOptionProjectedMetric {
+                    recommended_instance_type: Some(candidate.instance_type.clone()),
+                    // "The top recommendation option is ranked as 1", and "the projected
+                    // metric rank correlates to the recommendation option rank": a
+                    // candidate's rank is its position among the options REPORTED, the way
+                    // the Auto Scaling group reader ranks the options one preference admits,
+                    // so the two readers of one analysis agree under the same preference.
+                    rank: i32::try_from(index + 1).unwrap_or(i32::MAX),
+                    // Where the analysis observed nothing under the requested statistic there
+                    // is no series to report, rather than an empty one.
+                    projected_metrics: (!projected.is_empty()).then_some(projected),
+                }
+            })
+            .collect();
+
+        Ok(GetEC2RecommendationProjectedMetricsOutput {
+            recommended_option_projected_metrics: Some(options),
+        })
     }
+}
+
+/// The 400 `InvalidParameterValueException` this operation refuses a bad request with: "The
+/// value supplied for the input parameter is out of range or not valid."
+fn invalid_parameter(message: String) -> GetEC2RecommendationProjectedMetricsError {
+    GetEC2RecommendationProjectedMetricsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

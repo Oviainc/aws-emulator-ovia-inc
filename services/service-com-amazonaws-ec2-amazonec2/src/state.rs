@@ -785,6 +785,21 @@
 //! ([`PREFIX_LIST_REFERENCE_STATE_PENDING`]) and the clock owes it `available`
 //! [`TRANSITION_DELAY`] later, on the same clock as every other move above.
 //!
+//! ## Transit gateway Connect peers
+//!
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_connect_peers`] holds the Connect peers
+//! of the account's Connect attachments as [`TransitGatewayConnectPeerRecord`]s: the modelled
+//! [`TransitGatewayConnectPeer`] every operation that reports one answers with, plus the move
+//! the clock owes a fresh one, since `CreateTransitGatewayConnectPeer` answers a peer in the
+//! non-terminal `pending` state and the clock owes it `available` one [`TRANSITION_DELAY`]
+//! later — the same span, off the same monotonic clock, as every other move this store owes.
+//! Keyed by `TransitGatewayConnectPeerId` in a [`BTreeMap`], so the describe path has one
+//! stable order and a pagination token can name the id the next page starts at.
+//!
+//! A peer belongs to the Connect attachment it peers over, which lives in the one attachment
+//! store as [`TransitGatewayAttachmentView::Connect`] — so the gateway a peer's addresses come
+//! from is reached through that attachment rather than copied onto the peer.
+//!
 //! ## Capacity Blocks
 //!
 //! [`ComAmazonawsEc2Amazonec2State::capacity_blocks`] holds the account's Capacity Blocks
@@ -1034,7 +1049,8 @@ use crate::ops::types::{
     SnapshotTaskDetail, SpotPlacementScore, StateReason,
     Subnet, SubnetAssociation, SubnetCidrReservation, Subscription, Tag,
     TagSpecification,
-    TransitGateway, TransitGatewayClientVpnAttachment,
+    TransitGateway, TransitGatewayClientVpnAttachment, TransitGatewayConnect,
+    TransitGatewayConnectPeer,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
     TransitGatewayPeeringAttachment, TransitGatewayPolicyTable,
     TransitGatewayPolicyTableAssociation, TransitGatewayPrefixListAttachment,
@@ -2491,6 +2507,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `TransitGatewayRouteTableAnnouncementId`.
     pub transit_gateway_route_table_announcements:
         BTreeMap<String, TransitGatewayRouteTableAnnouncementRecord>,
+    /// Every transit gateway Connect peer the account holds, by
+    /// `TransitGatewayConnectPeerId` — see [`TransitGatewayConnectPeerRecord`] and the module
+    /// docs. Ordered by id, which is the order `DescribeTransitGatewayConnectPeers` reports
+    /// and pages over.
+    pub transit_gateway_connect_peers: BTreeMap<String, TransitGatewayConnectPeerRecord>,
     /// Every transit gateway policy table the account holds, by
     /// `TransitGatewayPolicyTableId`, each with the attachments associated with it — see
     /// [`TransitGatewayPolicyTableRecord`] and the module docs. Ordered by id, the stable
@@ -2795,6 +2816,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_attachments: BTreeMap::new(),
             transit_gateway_multicast_domains: BTreeMap::new(),
             transit_gateway_route_table_announcements: BTreeMap::new(),
+            transit_gateway_connect_peers: BTreeMap::new(),
             transit_gateway_policy_tables: BTreeMap::new(),
             ipam_pools: BTreeMap::new(),
             // A fresh account has brought no ASN of its own to IPAM, so nothing is
@@ -5091,6 +5113,17 @@ impl ComAmazonawsEc2Amazonec2State {
             }
         }
         for record in self.transit_gateway_route_table_announcements.values_mut() {
+            if let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            {
+                record.view.state = Some(state);
+                record.pending = None;
+            }
+        }
+        for record in self.transit_gateway_connect_peers.values_mut() {
             if let Some(state) = record
                 .pending
                 .as_ref()
@@ -13325,6 +13358,128 @@ pub fn ipv4_cidr_block_contains(outer: &str, inner: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CIDR blocks of EITHER family, for the rules that are written for both
+// ---------------------------------------------------------------------------
+
+/// `address` as the family it names and the integer its bits make, or `None` when it is not
+/// an IP address at all.
+///
+/// The family-agnostic counterpart of the IPv4-only readers above, for the rules the model
+/// writes for both families at once ("The peer address and transit gateway address must be
+/// the same IP address family (IPv4 or IPv6)", `CreateTransitGatewayConnectPeer`). The
+/// address itself is parsed by the standard library's own `IpAddr` parser, the same parser
+/// those readers use for each family alone.
+fn ip_address_bits(address: &str) -> Option<(bool, u128)> {
+    match address.parse::<::std::net::IpAddr>().ok()? {
+        ::std::net::IpAddr::V4(address) => Some((false, u128::from(u32::from(address)))),
+        ::std::net::IpAddr::V6(address) => Some((true, u128::from(address))),
+    }
+}
+
+/// Whether `address` is an IPv6 address, or `None` when it is not an address of either
+/// family.
+pub fn ip_address_is_ipv6(address: &str) -> Option<bool> {
+    ip_address_bits(address).map(|(is_ipv6, _)| is_ipv6)
+}
+
+/// `block` as its family, its first address and its last, with the host bits of the base
+/// cleared, or `None` when it is not a CIDR block of either family.
+///
+/// The family-agnostic form of the IPv4 bounds above, for the two questions the Connect peer
+/// rules ask of a block of either family: which addresses it holds
+/// ([`nth_address_in_cidr_block`]) and whether another block or address lies inside it
+/// ([`cidr_block_contains_block`], [`cidr_block_contains_address`]).
+fn cidr_block_bounds(block: &str) -> Option<(bool, u128, u128)> {
+    let (address, prefix_length) = block.split_once('/')?;
+    let (is_ipv6, base) = ip_address_bits(address)?;
+    let width: u32 = if is_ipv6 { 128 } else { 32 };
+    let prefix_length: u32 = prefix_length.parse().ok()?;
+    if prefix_length > width {
+        return None;
+    }
+    let host_bits = width - prefix_length;
+    let span = 1u128.checked_shl(host_bits).unwrap_or_default().wrapping_sub(1);
+    let first = base & !span;
+    Some((is_ipv6, first, first | span))
+}
+
+/// The prefix length `block` names, or `None` when it is not a CIDR block of either family.
+pub fn cidr_block_prefix_length(block: &str) -> Option<u32> {
+    cidr_block_bounds(block)?;
+    let (_, prefix_length) = block.split_once('/')?;
+    prefix_length.parse().ok()
+}
+
+/// Does `block` name a RANGE rather than an address inside one — are the host bits of the
+/// address it names clear?
+///
+/// Asked of the numbers rather than of the spelling, so two spellings of one range are one
+/// range and only a misaligned block is a different thing from the range it lies in. `false`
+/// for anything that is not a CIDR block of either family.
+pub fn cidr_block_names_its_range(block: &str) -> bool {
+    let named = block
+        .split_once('/')
+        .and_then(|(address, _)| ip_address_bits(address));
+    match (named, cidr_block_bounds(block)) {
+        (Some((_, named)), Some((_, first, _))) => named == first,
+        _ => false,
+    }
+}
+
+/// `block`'s own base address in canonical form, or `None` when it is not a CIDR block.
+///
+/// The spelling a block is REPORTED in, whichever of its equivalent spellings a request
+/// named it by; whether it names its range at all is [`cidr_block_names_its_range`].
+pub fn canonical_cidr_block(block: &str) -> Option<String> {
+    let prefix_length = cidr_block_prefix_length(block)?;
+    Some(format!(
+        "{}/{prefix_length}",
+        nth_address_in_cidr_block(block, 0)?
+    ))
+}
+
+/// The address `index` places into `block`, or `None` when `block` is not a CIDR block or
+/// does not reach that far.
+///
+/// Counted from the block's own base address, which is address 0.
+pub fn nth_address_in_cidr_block(block: &str, index: u32) -> Option<String> {
+    let (is_ipv6, first, last) = cidr_block_bounds(block)?;
+    let address = first.checked_add(u128::from(index))?;
+    if address > last {
+        return None;
+    }
+    if is_ipv6 {
+        return Some(Ipv6Addr::from(address).to_string());
+    }
+    Some(::std::net::Ipv4Addr::from(u32::try_from(address).ok()?).to_string())
+}
+
+/// Is every address of `inner` an address of `outer`?
+///
+/// The family-agnostic form of [`ipv4_cidr_block_contains`]: blocks of different families
+/// share no address, and a block this emulator cannot read contains nothing and is contained
+/// by nothing.
+pub fn cidr_block_contains_block(outer: &str, inner: &str) -> bool {
+    match (cidr_block_bounds(outer), cidr_block_bounds(inner)) {
+        (Some((outer_ipv6, outer_first, outer_last)), Some((inner_ipv6, inner_first, inner_last))) => {
+            outer_ipv6 == inner_ipv6 && outer_first <= inner_first && inner_last <= outer_last
+        }
+        _ => false,
+    }
+}
+
+/// Is `address` an address of `block`? An address of another family is not, and neither is
+/// anything this emulator cannot read as an address.
+pub fn cidr_block_contains_address(block: &str, address: &str) -> bool {
+    match (cidr_block_bounds(block), ip_address_bits(address)) {
+        (Some((block_ipv6, first, last)), Some((address_ipv6, value))) => {
+            block_ipv6 == address_ipv6 && (first..=last).contains(&value)
+        }
+        _ => false,
+    }
+}
+
 /// The addresses of `cidr_block` a network interface may be given, as a range of numbers.
 ///
 /// "AWS reserves five IP addresses in each subnet CIDR block"
@@ -19460,6 +19615,9 @@ pub const TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_PEERING: &str = "tgw-peering"
 /// The `TransitGatewayAttachmentResourceType` of a Client VPN attachment: `client-vpn`.
 pub const TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CLIENT_VPN: &str = "client-vpn";
 
+/// The `TransitGatewayAttachmentResourceType` of a Connect attachment: `connect`.
+pub const TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CONNECT: &str = "connect";
+
 /// How one kind of attachment spells the states an acceptance or a rejection walks through.
 ///
 /// The two state enums the model gives attachments name the same states with different
@@ -19494,6 +19652,10 @@ pub enum TransitGatewayAttachmentView {
     Peering(TransitGatewayPeeringAttachment),
     /// A Client VPN attachment (`AcceptTransitGatewayClientVpnAttachment`).
     ClientVpn(TransitGatewayClientVpnAttachment),
+    /// A Connect attachment — the GRE-based attachment a Connect peer peers over
+    /// (`CreateTransitGatewayConnectPeer`, "Creates a Connect peer for a specified transit
+    /// gateway Connect attachment").
+    Connect(TransitGatewayConnect),
 }
 
 impl TransitGatewayAttachmentView {
@@ -19504,7 +19666,7 @@ impl TransitGatewayAttachmentView {
     /// the terminal `rejected` itself.
     pub fn states(&self) -> TransitGatewayAttachmentStates {
         match self {
-            Self::Vpc(_) | Self::Peering(_) => TransitGatewayAttachmentStates {
+            Self::Vpc(_) | Self::Peering(_) | Self::Connect(_) => TransitGatewayAttachmentStates {
                 pending_acceptance: TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING_ACCEPTANCE,
                 accepting: TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING,
                 available: TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE,
@@ -19527,6 +19689,7 @@ impl TransitGatewayAttachmentView {
             Self::Vpc(_) => TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_VPC,
             Self::Peering(_) => TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_PEERING,
             Self::ClientVpn(_) => TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CLIENT_VPN,
+            Self::Connect(_) => TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CONNECT,
         }
     }
 
@@ -19540,6 +19703,12 @@ impl TransitGatewayAttachmentView {
                 .as_ref()
                 .and_then(|info| info.transit_gateway_id.as_deref()),
             Self::ClientVpn(attachment) => attachment.client_vpn_endpoint_id.as_deref(),
+            // "The ID of the attachment from which the Connect attachment was created"
+            // (`TransitGatewayConnect$TransportTransitGatewayAttachmentId`): the resource a
+            // Connect attachment attaches is that transport attachment.
+            Self::Connect(attachment) => attachment
+                .transport_transit_gateway_attachment_id
+                .as_deref(),
         }
     }
 
@@ -19552,6 +19721,9 @@ impl TransitGatewayAttachmentView {
                 .as_ref()
                 .and_then(|info| info.owner_id.as_deref()),
             Self::ClientVpn(attachment) => attachment.client_vpn_owner_id.as_deref(),
+            // `TransitGatewayConnect` carries no owner member: a Connect attachment is made
+            // from an attachment of the same account, so there is no second owner to report.
+            Self::Connect(_) => None,
         }
     }
 
@@ -19561,6 +19733,7 @@ impl TransitGatewayAttachmentView {
             Self::Vpc(attachment) => attachment.state.as_deref(),
             Self::Peering(attachment) => attachment.state.as_deref(),
             Self::ClientVpn(attachment) => attachment.state.as_deref(),
+            Self::Connect(attachment) => attachment.state.as_deref(),
         }
     }
 
@@ -19581,6 +19754,7 @@ impl TransitGatewayAttachmentView {
                 });
             }
             Self::ClientVpn(attachment) => attachment.state = Some(state.to_string()),
+            Self::Connect(attachment) => attachment.state = Some(state.to_string()),
         }
     }
 
@@ -19595,6 +19769,9 @@ impl TransitGatewayAttachmentView {
                 attachment.transit_gateway_attachment_id = Some(attachment_id.to_string());
             }
             Self::ClientVpn(attachment) => {
+                attachment.transit_gateway_attachment_id = Some(attachment_id.to_string());
+            }
+            Self::Connect(attachment) => {
                 attachment.transit_gateway_attachment_id = Some(attachment_id.to_string());
             }
         }
@@ -19627,6 +19804,9 @@ impl TransitGatewayAttachmentView {
                         .unwrap_or_default()
                         .len(),
                 ),
+            Self::Connect(attachment) => {
+                tag_list_bytes(attachment.tags.as_deref().unwrap_or_default())
+            }
         }
     }
 }
@@ -19743,6 +19923,268 @@ pub const ANNOUNCEMENT_STATE_DELETING: &str = "deleting";
 
 /// An announcement a delete has finished with: that enum's `deleted` member.
 pub const ANNOUNCEMENT_STATE_DELETED: &str = "deleted";
+
+// =============================================================================
+// Transit gateway Connect peers
+// =============================================================================
+
+/// The id prefix a transit gateway Connect peer is minted with.
+pub const TRANSIT_GATEWAY_CONNECT_PEER_ID_PREFIX: &str = "tgw-connect-peer";
+
+/// The `ResourceType` a `CreateTransitGatewayConnectPeer` tag specification may name: "The
+/// tags to apply to the Connect peer" is the only resource that action tags.
+pub const RESOURCE_TYPE_TRANSIT_GATEWAY_CONNECT_PEER: &str = "transit-gateway-connect-peer";
+
+/// A Connect peer that is being created: the `TransitGatewayConnectPeerState` enum's
+/// `pending` member.
+pub const CONNECT_PEER_STATE_PENDING: &str = "pending";
+
+/// A Connect peer in service: that enum's `available` member.
+pub const CONNECT_PEER_STATE_AVAILABLE: &str = "available";
+
+/// The tunnel protocol of a Connect attachment and of every peer on it: `ProtocolValue` has
+/// exactly one member, `gre` ("A Connect attachment is a GRE-based tunnel attachment",
+/// `CreateTransitGatewayConnect`).
+pub const PROTOCOL_VALUE_GRE: &str = "gre";
+
+/// A BGP session that is not established: the `BgpStatus` enum's `down` member.
+///
+/// What a Connect peer this emulator mints reports, and keeps reporting: a BGP session is
+/// established by the appliance on the other side of the GRE tunnel, and nothing in this
+/// emulator is that appliance, so reporting `up` would claim a session nobody opened.
+pub const BGP_STATUS_DOWN: &str = "down";
+
+/// The index, into a CIDR block, of its first HOST address: the address after the block's
+/// own base (network) address.
+///
+/// The address a tunnel endpoint can be given out of a block, which is what "the first
+/// available IP address from the transit gateway CIDR block"
+/// (`CreateTransitGatewayConnectPeerRequest$TransitGatewayAddress`) and "the first address
+/// from the range" (`$InsideCidrBlocks`, whose range the AWS CLI reference shows peering from
+/// `169.254.6.1` for an inside block of `169.254.6.0/29`) both name. ONE definition, so the
+/// inside range and the gateway's blocks are counted the same way.
+pub const FIRST_HOST_ADDRESS_INDEX: u32 = 1;
+
+/// `InvalidTransitGatewayConnectPeerID.NotFound` (HTTP 400): the request named a Connect
+/// peer id this account holds no peer for.
+pub const INVALID_TRANSIT_GATEWAY_CONNECT_PEER_ID_NOT_FOUND: &str =
+    "InvalidTransitGatewayConnectPeerID.NotFound";
+
+/// `InvalidTransitGatewayConnectPeerID.Malformed` (HTTP 400): the request named something
+/// that is not a Connect peer id at all.
+pub const INVALID_TRANSIT_GATEWAY_CONNECT_PEER_ID_MALFORMED: &str =
+    "InvalidTransitGatewayConnectPeerID.Malformed";
+
+/// One stored transit gateway Connect peer: the modelled shape its own describe reports,
+/// plus the state move the clock still owes it.
+///
+/// The same shape as [`TransitGatewayAttachmentRecord`] and for the same reason: every member
+/// a writer sets round-trips through `DescribeTransitGatewayConnectPeers` without a
+/// field-by-field copy, and the non-terminal state a create leaves the peer in carries the
+/// [`PendingStateMove`] to its terminal one.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayConnectPeerRecord {
+    /// The Connect peer itself.
+    pub view: TransitGatewayConnectPeer,
+    /// The move to `available` a create owes a `pending` peer; `None` once it has been
+    /// applied.
+    pub pending: Option<PendingStateMove>,
+}
+
+/// The caller-chosen bytes one stored Connect peer holds: its tags and the addresses and
+/// inside CIDR blocks the request asked for.
+///
+/// The ONE definition of that charge, the way [`transit_gateway_payload_bytes`] is a transit
+/// gateway's: the create asks it before the write and
+/// [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway_connect_peer`] charges exactly it.
+pub fn transit_gateway_connect_peer_payload_bytes(peer: &TransitGatewayConnectPeer) -> usize {
+    let tags = tag_list_bytes(peer.tags.as_deref().unwrap_or_default());
+    let configuration = peer.connect_peer_configuration.as_ref();
+    let addresses = configuration
+        .and_then(|configuration| configuration.peer_address.as_deref())
+        .map_or(0, str::len)
+        .saturating_add(
+            configuration
+                .and_then(|configuration| configuration.transit_gateway_address.as_deref())
+                .map_or(0, str::len),
+        );
+    let inside_blocks: usize = configuration
+        .and_then(|configuration| configuration.inside_cidr_blocks.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .map(String::len)
+        .sum();
+    tags.saturating_add(addresses).saturating_add(inside_blocks)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another Connect peer fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_transit_gateway_connect_peer_capacity(&self) -> bool {
+        self.transit_gateway_connect_peers.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store a Connect peer in the non-terminal state a create leaves it in, with the move to
+    /// `available` the clock owes it, and answer the `TransitGatewayConnectPeerId` it was
+    /// given — or `None` when the store is at [`MAX_STORED_RECORDS_PER_STORE`] and nothing
+    /// was stored.
+    ///
+    /// The id, the state and the owed move are minted HERE rather than taken from `view`, the
+    /// way [`Self::insert_transit_gateway_attachment`] mints an attachment id, so no path can
+    /// report a peer in a state the store does not hold or store one uncharged.
+    pub fn insert_transit_gateway_connect_peer(
+        &mut self,
+        mut view: TransitGatewayConnectPeer,
+    ) -> Option<String> {
+        if !self.has_transit_gateway_connect_peer_capacity() {
+            return None;
+        }
+        let peer_id = self.next_id(TRANSIT_GATEWAY_CONNECT_PEER_ID_PREFIX);
+        view.transit_gateway_connect_peer_id = Some(peer_id.clone());
+        view.state = Some(CONNECT_PEER_STATE_PENDING.to_string());
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES + transit_gateway_connect_peer_payload_bytes(&view),
+        );
+        self.transit_gateway_connect_peers.insert(
+            peer_id.clone(),
+            TransitGatewayConnectPeerRecord {
+                view,
+                pending: Some(PendingStateMove::starting_now(CONNECT_PEER_STATE_AVAILABLE)),
+            },
+        );
+        Some(peer_id)
+    }
+
+    /// The transit gateway the Connect attachment `attachment_id` names belongs to, or `None`
+    /// when that id names no Connect attachment of this account.
+    pub fn connect_attachment_transit_gateway_id(&self, attachment_id: &str) -> Option<&str> {
+        match self.transit_gateway_attachments.get(attachment_id) {
+            Some(TransitGatewayAttachmentRecord {
+                view: TransitGatewayAttachmentView::Connect(attachment),
+                ..
+            }) => attachment.transit_gateway_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Every transit gateway address a Connect peer of the transit gateway
+    /// `transit_gateway_id` already holds.
+    ///
+    /// A peer names its Connect attachment, and the attachment names its transit gateway, so
+    /// the set is reached through the attachment store rather than kept as a second copy on
+    /// the peer.
+    pub fn transit_gateway_connect_addresses_in_use(
+        &self,
+        transit_gateway_id: &str,
+    ) -> BTreeSet<&str> {
+        self.transit_gateway_connect_peers
+            .values()
+            .filter(|record| {
+                record
+                    .view
+                    .transit_gateway_attachment_id
+                    .as_deref()
+                    .and_then(|attachment_id| {
+                        self.connect_attachment_transit_gateway_id(attachment_id)
+                    })
+                    == Some(transit_gateway_id)
+            })
+            .filter_map(|record| {
+                record
+                    .view
+                    .connect_peer_configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.transit_gateway_address.as_deref())
+            })
+            .collect()
+    }
+
+    /// Every interior BGP range a Connect peer of the transit gateway `transit_gateway_id`
+    /// already holds, as those peers report them.
+    ///
+    /// Reached through the attachment store for the same reason as
+    /// [`Self::transit_gateway_connect_addresses_in_use`]: a peer names its attachment and
+    /// the attachment names its gateway, so no second copy is kept on the peer.
+    pub fn transit_gateway_connect_inside_blocks_in_use(
+        &self,
+        transit_gateway_id: &str,
+    ) -> BTreeSet<&str> {
+        self.transit_gateway_connect_peers
+            .values()
+            .filter(|record| {
+                record
+                    .view
+                    .transit_gateway_attachment_id
+                    .as_deref()
+                    .and_then(|attachment_id| {
+                        self.connect_attachment_transit_gateway_id(attachment_id)
+                    })
+                    == Some(transit_gateway_id)
+            })
+            .flat_map(|record| {
+                record
+                    .view
+                    .connect_peer_configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.inside_cidr_blocks.as_deref())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(String::as_str)
+            })
+            .collect()
+    }
+
+    /// The address a Connect peer of `transit_gateway_id` gets when the request named none:
+    /// "If not specified, Amazon automatically assigns the first available IP address from
+    /// the transit gateway CIDR block"
+    /// (`CreateTransitGatewayConnectPeerRequest$TransitGatewayAddress`).
+    ///
+    /// The gateway's CIDR blocks are searched in the order the gateway holds them, from
+    /// [`FIRST_HOST_ADDRESS_INDEX`] — a block's base address is the block itself, not an
+    /// address a tunnel endpoint can be given — and only the blocks of the family `want_ipv6`
+    /// names are considered, because the peer's two addresses "must be the same IP address
+    /// family". `None` means the gateway has no block of that family with an address no other
+    /// peer of it already holds.
+    ///
+    /// The search is bounded: the first free address of a block is within its first
+    /// `addresses_in_use + 1` host addresses, so no block is walked further than that.
+    pub fn first_available_transit_gateway_connect_address(
+        &self,
+        transit_gateway_id: &str,
+        want_ipv6: bool,
+    ) -> Option<String> {
+        let in_use = self.transit_gateway_connect_addresses_in_use(transit_gateway_id);
+        let limit = u32::try_from(in_use.len()).unwrap_or(u32::MAX);
+        let blocks = self
+            .transit_gateways
+            .get(transit_gateway_id)?
+            .options
+            .as_ref()?
+            .transit_gateway_cidr_blocks
+            .as_deref()
+            .unwrap_or_default();
+        for block in blocks {
+            if cidr_block_prefix_length(block).is_none()
+                || nth_address_in_cidr_block(block, 0)
+                    .as_deref()
+                    .and_then(ip_address_is_ipv6)
+                    != Some(want_ipv6)
+            {
+                continue;
+            }
+            for offset in 0..=limit {
+                let index = FIRST_HOST_ADDRESS_INDEX.saturating_add(offset);
+                match nth_address_in_cidr_block(block, index) {
+                    None => break,
+                    Some(address) if !in_use.contains(address.as_str()) => return Some(address),
+                    Some(_) => continue,
+                }
+            }
+        }
+        None
+    }
+}
 
 // =============================================================================
 // Transit gateway policy tables, and the attachments associated with them

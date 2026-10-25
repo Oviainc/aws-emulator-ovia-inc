@@ -89,6 +89,8 @@ mod refusal_fidelity;
 mod resource_policies;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/sample_queries.rs"]
+mod sample_queries;
 #[path = "all/start_query.rs"]
 mod start_query;
 #[path = "all/state_roundtrip.rs"]

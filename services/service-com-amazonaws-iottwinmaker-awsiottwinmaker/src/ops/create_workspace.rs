@@ -181,7 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.workspaces.contains_key(&input.workspace_id) {
             return Err(CreateWorkspaceErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!("workspace {} already exists", input.workspace_id)),
+                    message: Some(crate::state::already_exists_message(
+                        "Workspace",
+                        &input.workspace_id,
+                        None,
+                    )),
                 },
             )
             .into());

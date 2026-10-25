@@ -13,14 +13,16 @@
 //! alphabet, the credential age in days, how many credentials a user already holds,
 //! the page size, and which filter the listing carries.
 
-use std::sync::Arc;
-
 use aws_smithy_types::DateTime;
 use aws_smithy_types::date_time::Format;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::user_lifecycle::{account_id, call, element, elements, error_code, router};
+// `router_with_engine` is the shared harness's router whose engine the test also
+// holds: this suite rewinds an instant the clock has already made due.
+use crate::user_lifecycle::{
+    account_id, call, element, elements, error_code, router, router_with_engine,
+};
 
 /// The FORM of credential a service issues, which decides which members of
 /// `ServiceSpecificCredential` carry it.
@@ -111,21 +113,6 @@ async fn list_credentials(router: &MultiServiceRouter, params: &[(&str, &str)]) 
         "expected the listing to succeed for {params:?}, got {status}: {body}"
     );
     body
-}
-
-/// A router over an engine the test also holds, so a test can rewind an instant the
-/// clock has already made due. Every other test uses the shared harness router.
-fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // The suite drives unsigned requests, so no authenticator is registered.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
-            engine.clone(),
-        ),
-    );
-    (router, engine)
 }
 
 /// The instant an ISO-8601 element carries, in whole seconds since the epoch.

@@ -27,7 +27,7 @@
 //! * `SourceName` identifies a source WITHIN a `SourceType`, so it cannot be given
 //!   without one;
 //! * the listing reports the window's events NEWEST FIRST and pages over the whole set
-//!   in that order for any `MaxResults`;
+//!   in that order for every page size its window serves;
 //! * reading the listing changes nothing a later caller sees.
 
 use serde_json::{json, Value};

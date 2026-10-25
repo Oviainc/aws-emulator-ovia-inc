@@ -881,7 +881,7 @@ async fn a_put_outside_the_modelled_constraints_is_refused() {
 }
 
 #[tokio::test]
-async fn a_tag_write_the_service_could_not_report_is_refused_and_stores_nothing() {
+async fn a_tag_write_past_the_tagging_limits_is_refused_and_stores_nothing() {
     let (router, engine) = emulator();
     provision(&engine, "AWSMarketplace", "agmt-tags", &["prod-tags"]);
 
@@ -903,18 +903,17 @@ async fn a_tag_write_the_service_could_not_report_is_refused_and_stores_nothing(
         .expect("a minted resourceArn")
         .to_string();
 
-    // `TagResource$tags` targets the unconstrained `Tags` map, but the set it
-    // writes is reported through the modelled `TagsMap` (keys `TagKey` len 1..128
-    // `^[a-zA-Z0-9/_+=.:@-]+$`, values `TagValue` len 1..256, at most 50 entries),
-    // so a write outside those bounds is refused rather than stored unreportably.
+    // `TagResource$tags` targets the tag map the model leaves UNCONSTRAINED, so what
+    // refuses a write here is AWS's own tagging limits and nothing else: a key must
+    // carry at least one character and at most `TAG_KEY_MAX_LEN`, a value at most
+    // `TAG_VALUE_MAX_LEN`, and the record may not pass `MAX_TAGS_PER_RESOURCE`. The
+    // keys and values those limits ADMIT — spaces, letters outside ASCII, an empty
+    // value — are the `unconstrained_tag_characters` suite's rule.
     let over_the_cap: BTreeMap<String, String> = (0..MAX_TAGS_PER_RESOURCE)
         .map(|i| (format!("extra-{i:02}"), "v".to_string()))
         .collect();
     let refused: Vec<(&str, BTreeMap<String, String>)> = vec![
-        ("a key carrying a space", tag_map(&[("bad key", "v")])),
-        ("a key carrying a bang", tag_map(&[("bad!", "v")])),
         ("an empty key", tag_map(&[("", "v")])),
-        ("an empty value", tag_map(&[("k", "")])),
         (
             "a key one character past its maximum",
             [("k".repeat(TAG_KEY_MAX_LEN + 1), "v".to_string())]

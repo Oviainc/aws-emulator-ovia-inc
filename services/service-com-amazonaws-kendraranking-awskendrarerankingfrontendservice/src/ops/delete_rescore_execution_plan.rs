@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `Id`'s 36-character length and pattern are modelled, so a malformed id is
         // already refused with a 400 `ValidationException` before this handler runs.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteRescoreExecutionPlanErrorModeled::InternalServerException(
                 InternalServerException {
@@ -188,7 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now_millis();
         let mut store = state.lock();
-        let Some(plan) = store.plans.get_mut(&input.id) else {
+        // A plan lives in the region its create was signed for, so an id is resolved in
+        // THIS request's region only: a plan of another region cannot be deleted here.
+        let Some(plan) = store.plan_mut(&region, &input.id) else {
             return Err(
                 DeleteRescoreExecutionPlanErrorModeled::ResourceNotFoundException(
                     crate::state::plan_not_found(),
@@ -218,13 +220,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The plan's ARN index entry and the idempotency tokens that created it go with
+        // it, or a repeated create would answer with the id of a plan that no longer
+        // exists.
         let id = plan.id.clone();
-        let arn = plan.arn.clone();
-        store.plans.remove(&id);
-        store.arn_index.remove(&arn);
-        // The idempotency tokens that created this plan must go with it, or a repeated
-        // create would answer with the id of a plan that no longer exists.
-        store.client_tokens.retain(|_, plan_id| *plan_id != id);
+        store.remove_plan(&region, &id);
 
         Ok(DeleteRescoreExecutionPlanOutput)
     }

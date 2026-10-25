@@ -4,11 +4,11 @@
 //! Derives one `ScalingPlanResource` per stored `ScalingInstruction` of the named
 //! plan, read back from [`crate::state`] and paged by `MaxResults`/`NextToken`.
 //!
-//! Both input members are required and together name ONE plan, so a request whose
-//! (`ScalingPlanName`, `ScalingPlanVersion`) names no stored plan is refused with the
-//! service's not-found sentence ([`crate::state::plan_not_found_message`]) — carried by
-//! the modelled `ValidationException` (HTTP 400), this operation's generic client error,
-//! because it binds no not-found shape of its own.
+//! Both input members are required and together name ONE plan, but this operation binds
+//! no not-found error at all, so a (`ScalingPlanName`, `ScalingPlanVersion`) pair naming
+//! no stored plan is not a client error: it reports the empty set of scalable resources,
+//! HTTP 200 with an empty `ScalingPlanResources` list and no `NextToken`. Only the
+//! request's own members (`MaxResults`, `NextToken`) can make this call a refusal.
 //!
 //! A read, except for the transitions the clock already owes: `settle_due` applies
 //! only what was due at this instant whether or not anybody called.
@@ -171,42 +171,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| invalid_next_token("The NextToken provided is not valid"))?,
         };
 
-        // A lookup by (name, version) that finds no plan is a client error, not an empty
-        // page: both members are required and identify one plan, so there is nothing to
-        // report the resources OF. The refusal carries the service's one not-found
-        // sentence; the shape is this operation's generic `ValidationException`, since it
-        // binds no not-found error of its own (`ObjectNotFoundException` is modelled only
-        // on `DeleteScalingPlan` and `UpdateScalingPlan`).
-        let plan = state
-            .plan(&input.scaling_plan_name, input.scaling_plan_version)
-            .ok_or_else(|| {
-                validation(crate::state::plan_not_found_message(
-                    &input.scaling_plan_name,
-                    input.scaling_plan_version,
-                ))
-            })?;
-
-        let scaling_status_code = plan.scaling_status_code();
-        let total = plan.scaling_instructions.len();
-        let scaling_plan_resources: Vec<ScalingPlanResource> = plan
-            .scaling_instructions
-            .iter()
-            .skip(start)
-            .take(page_size)
-            .map(|instruction| ScalingPlanResource {
-                scaling_plan_name: plan.name.clone(),
-                scaling_plan_version: plan.version,
-                service_namespace: instruction.service_namespace.clone(),
-                resource_id: instruction.resource_id.clone(),
-                scalable_dimension: instruction.scalable_dimension.clone(),
-                // No scaling policies are materialised by this emulator: nothing
-                // creates a target-tracking policy here, so reporting one would be
-                // reporting work that never ran.
-                scaling_policies: None,
-                scaling_status_code: scaling_status_code.to_string(),
-                scaling_status_message: None,
-            })
-            .collect();
+        // A lookup by (name, version) that finds no plan reports the empty set of
+        // scalable resources, not a client error: this operation binds no not-found shape
+        // (`ObjectNotFoundException` is modelled only on the mutating `DeleteScalingPlan`
+        // and `UpdateScalingPlan`), and `ScalingPlanResources` is exactly the list of
+        // resources the named plan covers — which, for a plan this service does not hold,
+        // is empty. Polling for a plan's resources while it is created or drained is
+        // therefore a 200 answer throughout.
+        let (total, scaling_plan_resources) =
+            match state.plan(&input.scaling_plan_name, input.scaling_plan_version) {
+                None => (0usize, Vec::new()),
+                Some(plan) => {
+                    let scaling_status_code = plan.scaling_status_code();
+                    let page: Vec<ScalingPlanResource> = plan
+                        .scaling_instructions
+                        .iter()
+                        .skip(start)
+                        .take(page_size)
+                        .map(|instruction| ScalingPlanResource {
+                            scaling_plan_name: plan.name.clone(),
+                            scaling_plan_version: plan.version,
+                            service_namespace: instruction.service_namespace.clone(),
+                            resource_id: instruction.resource_id.clone(),
+                            scalable_dimension: instruction.scalable_dimension.clone(),
+                            // No scaling policies are materialised by this emulator:
+                            // nothing creates a target-tracking policy here, so reporting
+                            // one would be reporting work that never ran.
+                            scaling_policies: None,
+                            scaling_status_code: scaling_status_code.to_string(),
+                            scaling_status_message: None,
+                        })
+                        .collect();
+                    (plan.scaling_instructions.len(), page)
+                }
+            };
 
         let returned_through = start.saturating_add(scaling_plan_resources.len());
         let next_token = (returned_through < total)

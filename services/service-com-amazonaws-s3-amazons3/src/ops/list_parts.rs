@@ -350,6 +350,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // computed from what the upload holds, not asserted to be empty.
         let parts: Vec<Part> = Vec::new();
 
+        // When the bucket's lifecycle configuration aborts this upload, if any rule does.
+        let abort = bucket.multipart_upload_abort(&upload.key, upload.initiated_at);
+
         Ok(ListPartsOutput {
             // The address the upload was recorded under (no access point is held here, so
             // there is no ARN or alias to report instead).
@@ -386,10 +389,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             storage_class: Some(upload.storage_class.clone()),
             checksum_algorithm: upload.checksum_algorithm.clone(),
             checksum_type: upload.checksum_type.clone(),
-            // `AbortDate` and `AbortRuleId` are reported only for a bucket with a
-            // lifecycle rule that aborts incomplete multipart uploads, and this emulator
-            // records no lifecycle configuration; `RequestCharged` reports a Requester Pays
-            // charge nothing here makes.
+            // "If the bucket has a lifecycle rule configured with an action to abort
+            // incomplete multipart uploads and the prefix in the lifecycle rule matches the
+            // key name of the object being uploaded, the response includes this header"
+            // (`ListPartsOutput$AbortDate`), with the identifier of that rule beside it —
+            // the same answer `CreateMultipartUpload` gave for this upload, since both come
+            // from the bucket's configuration and the upload's own initiation instant.
+            abort_date: abort
+                .as_ref()
+                .map(|abort| ::aws_smithy_types::DateTime::from(abort.aborts_at)),
+            abort_rule_id: abort.map(|abort| abort.rule_id),
+            // `RequestCharged` reports a Requester Pays charge nothing here makes.
             ..ListPartsOutput::default()
         })
     }

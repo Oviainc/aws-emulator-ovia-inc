@@ -156,6 +156,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // WHAT the request asks for is settled before any state is touched. A landing zone
+        // is addressed by the ARN this service reports for it, and `landingZoneIdentifier`
+        // is modelled as a plain `String`, so no front-door check applies and the shape is
+        // this handler's to check: an ARN of that shape naming no landing zone is a
+        // reference to a resource that does not exist (below), while a value that is not
+        // one at all is a malformed input.
+        if let Some(message) =
+            crate::state::non_landing_zone_identifier_message(&input.landing_zone_identifier)
+        {
+            return Err(
+                GetLandingZoneErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
         let mut store = state.lock();
         // Only materialises transitions the clock already owed; this operation is
         // `@readonly` and writes nothing else.

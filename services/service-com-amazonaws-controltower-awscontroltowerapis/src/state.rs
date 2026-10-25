@@ -1090,16 +1090,15 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     /// The stored ARN a `landingZoneIdentifier` names, or `None` when no landing zone
     /// matches.
     ///
-    /// Accepts the full ARN (the map key) and the bare resource id that ARN ends in, so
-    /// either form a caller holds resolves to the one stored landing zone.
+    /// A landing zone is addressed by its own ARN — the only identifier this service ever
+    /// hands a caller for one — so the identifier is matched against the map key exactly.
+    /// A value that is not a landing zone ARN at all is not a lookup that could miss but
+    /// a malformed input; a caller checks it with
+    /// [`non_landing_zone_identifier_message`] BEFORE asking this.
     pub fn resolve_landing_zone_arn(&self, identifier: &str) -> Option<String> {
-        if self.landing_zones.contains_key(identifier) {
-            return Some(identifier.to_string());
-        }
         self.landing_zones
-            .keys()
-            .find(|arn| arn.split('/').next_back() == Some(identifier))
-            .cloned()
+            .get_key_value(identifier)
+            .map(|(arn, _)| arn.clone())
     }
 
     /// Whether any operation against `arn` is still `IN_PROGRESS`. Call [`settle`] first.
@@ -1297,18 +1296,18 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     /// The stored ARN an `enabledBaselineIdentifier` names, or `None` when no enabled
     /// baseline matches.
     ///
-    /// Accepts the full ARN (the map key) and the bare resource id that ARN ends in, the
-    /// same two forms [`resolve_landing_zone_arn`] accepts.
+    /// Matched against the map key exactly, for the same reason
+    /// [`resolve_landing_zone_arn`] is: the identifier of an enablement is the ARN this
+    /// service minted for it, which is what every call reports
+    /// (`EnableBaselineOutput$arn`, `EnabledBaselineSummary$arn`). Every member carrying
+    /// one is typed `Arn`, so the front door refuses a value that is not an ARN before any
+    /// handler runs.
     ///
     /// [`resolve_landing_zone_arn`]: Self::resolve_landing_zone_arn
     pub fn resolve_enabled_baseline_arn(&self, identifier: &str) -> Option<String> {
-        if self.enabled_baselines.contains_key(identifier) {
-            return Some(identifier.to_string());
-        }
         self.enabled_baselines
-            .keys()
-            .find(|arn| arn.split('/').next_back() == Some(identifier))
-            .cloned()
+            .get_key_value(identifier)
+            .map(|(arn, _)| arn.clone())
     }
 
     /// The ARN of the enabled baseline that already applies `baseline_identifier` to
@@ -2134,6 +2133,63 @@ pub fn same_control_configuration(
             .collect()
     }
     as_map(configured) == as_map(requested)
+}
+
+/// Whether `identifier` is a landing zone ARN at all.
+///
+/// A landing zone is addressed by the ARN this service reports for it — the only
+/// identifier a caller is ever handed for one (`CreateLandingZoneOutput$arn`,
+/// `LandingZoneSummary$arn`, both typed `Arn`: length 20..2048, pattern
+/// `^arn:aws[0-9a-zA-Z_\-:\/]+$`) — and the form that ARN carries is
+/// [`landing_zone_arn`]'s: `arn:<partition>:controltower:<region>:<account>:landingzone/<id>`.
+/// `landingZoneIdentifier` is modelled as a plain `String`, so no front-door check
+/// applies and the shape check is the handler's; it is checked segment by segment here,
+/// the way [`is_baseline_arn`] checks a baseline's. The resource id itself is not
+/// constrained beyond being one non-empty segment of `Arn`'s character class: the service
+/// publishes no pattern for it, so a shape check must not reject an id of another form.
+pub fn is_landing_zone_arn(identifier: &str) -> bool {
+    let Some((partition, service, region, account, resource)) = arn_segments(identifier) else {
+        return false;
+    };
+    (20..=2048).contains(&identifier.len())
+        && partition.starts_with("aws")
+        && partition
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+        && service == ARN_NAMESPACE
+        && !region.is_empty()
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && account.len() == 12
+        && account.bytes().all(|byte| byte.is_ascii_digit())
+        && resource.strip_prefix("landingzone/").is_some_and(|id| {
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+}
+
+/// Why `identifier` names no landing zone, or `None` when it is a landing zone ARN.
+///
+/// The one place this refusal's wording is built, so every operation taking a
+/// `landingZoneIdentifier` refuses the same values in the same words. A value that is not
+/// a landing zone ARN ([`is_landing_zone_arn`]) is a malformed input rather than a
+/// reference to a resource that does not exist, so a caller refuses it with the modelled
+/// `ValidationException` and keeps `ResourceNotFoundException` for an ARN of that shape
+/// naming no stored landing zone. The message is built from the request and the rule, so
+/// it tells the caller what it may send.
+pub fn non_landing_zone_identifier_message(identifier: &str) -> Option<String> {
+    if is_landing_zone_arn(identifier) {
+        return None;
+    }
+    Some(format!(
+        "landingZoneIdentifier {identifier:?} is not the ARN of an AWS Control Tower landing \
+         zone; a landing zone is named by the ARN CreateLandingZone and ListLandingZones \
+         report for it, of the form \
+         arn:aws:controltower:<region>:<account>:landingzone/<id>"
+    ))
 }
 
 /// A fresh landing zone resource id, used as the ARN's resource segment.

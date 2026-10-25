@@ -10,6 +10,11 @@
 //! configured for answers `ConflictException` — unless it replays the
 //! `@idempotencyToken` that created that configuration, which reports it back.
 //!
+//! A configuration belongs to a template that targets MULTIPLE accounts: the template's
+//! `experimentOptions.accountTargeting` and the configurations it holds state which
+//! accounts its experiments run in, so a configuration offered to a template that targets
+//! a single account answers `ValidationException` (HTTP 400) and persists nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -195,6 +200,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // A target account configuration says which role FIS assumes in ANOTHER account,
+        // which is what a template targeting multiple accounts does, so one offered to a
+        // template that targets a single account is refused before any state write (see
+        // [`crate::state::target_account_targeting_refusal`]).
+        if let Some(refusal) = crate::state::target_account_targeting_refusal(template) {
+            return Err(
+                CreateTargetAccountConfigurationErrorModeled::ValidationException(refusal).into(),
+            );
+        }
 
         if let Some(existing) = template.target_account_configurations.get(&input.account_id) {
             // `clientToken` is an `@idempotencyToken`: a retry of the request that

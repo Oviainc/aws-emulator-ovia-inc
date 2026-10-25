@@ -251,6 +251,8 @@ mod store_image_tasks;
 mod subnet_cidr_reservations;
 #[path = "all/transit_gateway_acceptance.rs"]
 mod transit_gateway_acceptance;
+#[path = "all/transit_gateway_connect_peers.rs"]
+mod transit_gateway_connect_peers;
 #[path = "all/transit_gateway_lifecycle.rs"]
 mod transit_gateway_lifecycle;
 #[path = "all/transit_gateway_policy_table_associations.rs"]
