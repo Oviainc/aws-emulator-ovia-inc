@@ -1105,6 +1105,11 @@ use crate::ops::types::{
 };
 use crate::scaffolded::Scaffolded;
 
+// The Recycle Bin an AMI waits in between its deregistration and its permanent deletion,
+// and every rule that moves one in or out of it, in a module of its own.
+mod image_recycle_bin;
+pub use image_recycle_bin::{RecycledImageRecord, recycled_image, require_recycled_image};
+
 // One shape a security group rule's aggregated view is made of, imported on its own line so
 // this file's one big `use crate::ops::types::{..}` list stays as it is.
 use crate::ops::types::Ipv6Range;
@@ -2228,6 +2233,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// plus any image a writer stores later. Ordered by id, which is the order the
     /// describe reports and pages over.
     pub images: BTreeMap<String, Image>,
+    /// Every AMI of the account that is currently in the Recycle Bin, by `ImageId` — see
+    /// the module docs. An image is in EITHER this store or [`Self::images`], never both:
+    /// a recycled AMI is not one of the images the account can see until it is restored.
+    /// Ordered by id, which is the order `ListImagesInRecycleBin` reports and pages over.
+    pub images_in_recycle_bin: BTreeMap<String, RecycledImageRecord>,
     /// Every security group the account holds, by `GroupId`, as the modelled
     /// [`SecurityGroup`] shape itself — so a member a writer sets round-trips through
     /// `DescribeSecurityGroups` without a field-by-field copy. Ordered by id, which is the
@@ -2845,6 +2855,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             network_insights_access_scope_analyses: BTreeMap::new(),
             network_insights_access_scope_analysis_client_tokens: HashMap::new(),
             images: BTreeMap::new(),
+            images_in_recycle_bin: BTreeMap::new(),
             security_groups: BTreeMap::new(),
             network_interfaces: BTreeMap::new(),
             network_interface_client_tokens: HashMap::new(),
@@ -4907,6 +4918,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// association moving `associating` -> `associated`.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
+        // The one clock-owed REMOVAL: a recycled AMI whose retention period has run out was
+        // permanently deleted when that instant passed, whether or not anybody called.
+        self.purge_expired_recycled_images(SystemTime::now());
         // A volume whose Recycle Bin retention period has run out was permanently deleted
         // at its exit instant whether or not anybody called, so that deletion is applied
         // before anything reads the bin.
@@ -12270,8 +12284,12 @@ pub fn invalid_ami_id_not_found<E>(image_id: &str) -> Scaffolded<E> {
     )
 }
 
-/// Refuse a request that named something that is not an AMI id at all: HTTP 400
+/// Refuse an AMI id a request named that EC2 cannot resolve as one at all: HTTP 400
 /// `InvalidAMIID.Malformed`.
+///
+/// The message is built from the request's own id, in the `Invalid id: '<id>'` form every
+/// malformed-id refusal in this crate uses, so one code reads one way across every
+/// operation that answers it.
 pub fn invalid_ami_id_malformed<E>(image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_AMI_ID_MALFORMED,
@@ -12434,7 +12452,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// [`Self::would_exceed_stored_bytes`] with [`image_payload_bytes`] beside it, because a
     /// count of records is no bound on the caller-chosen bytes each one holds.
     pub fn has_image_capacity(&self) -> bool {
-        self.images.len() < MAX_IMAGES
+        // A recycled AMI is still held — it is restorable until its retention period runs
+        // out — so it counts against the ceiling the same way a visible image does, and
+        // restoring one can never be refused for want of room.
+        self.images.len().saturating_add(self.images_in_recycle_bin.len()) < MAX_IMAGES
     }
 
     /// Store an AMI, and answer the `ImageId` it was given.

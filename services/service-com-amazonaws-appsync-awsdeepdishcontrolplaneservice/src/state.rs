@@ -650,13 +650,46 @@ pub struct SourceApiAssociationRecord {
     /// The instant the merge this association scheduled comes due, or `None` once
     /// there is no merge left owed. Stored rather than slept on: see [`MERGE_SPAN`].
     pub merge_due_at: Option<SystemTime>,
+    /// The instant the deletion this association scheduled comes due, or `None` while
+    /// no deletion was asked for. Stored rather than slept on: see [`DELETION_SPAN`].
+    pub deletion_due_at: Option<SystemTime>,
 }
 
 impl SourceApiAssociationRecord {
-    /// Whether a merge the clock owes this association has not been materialised yet,
-    /// i.e. whether a modification of this association is still in progress.
+    /// Whether a merge the clock owes this association has not been materialised yet.
     pub fn merge_pending(&self) -> bool {
         self.merge_due_at.is_some()
+    }
+
+    /// Whether the deletion of this association has been scheduled and the clock has
+    /// not made it due yet.
+    pub fn deletion_pending(&self) -> bool {
+        self.deletion_due_at.is_some()
+    }
+
+    /// Whether a modification of this association is still in progress, i.e. whether
+    /// the clock still owes it a merge or a deletion.
+    pub fn modification_pending(&self) -> bool {
+        self.merge_pending() || self.deletion_pending()
+    }
+
+    /// Schedule this association's deletion at `now`.
+    ///
+    /// The deletion is SCHEDULED rather than performed, so the association is left in
+    /// the non-terminal [`DELETION_SCHEDULED`] status with the due instant the clock
+    /// settles, and the merge it was still owed is dropped: an association being
+    /// deleted has no schema left to merge.
+    pub fn schedule_deletion(&mut self, now: SystemTime) {
+        self.merge_due_at = None;
+        self.deletion_due_at = Some(now + DELETION_SPAN);
+        self.status = DELETION_SCHEDULED.to_string();
+        self.status_detail = DELETION_SCHEDULED_DETAIL.to_string();
+    }
+
+    /// Whether the deletion this association scheduled has come due at `now`, i.e.
+    /// whether the association is gone.
+    pub fn deletion_due(&self, now: SystemTime) -> bool {
+        self.deletion_due_at.is_some_and(|due| now >= due)
     }
 
     /// Materialise the merge the CLOCK already made due at `now`.
@@ -824,7 +857,7 @@ pub fn create_source_api_association(
     }
 
     if let Some(existing) = state.association_for_pair(&merged_api_id, &source_api_id) {
-        if existing.merge_pending() {
+        if existing.modification_pending() {
             return Err(AssociationRefusal::ConcurrentModification(
                 CONCURRENT_MODIFICATION_MESSAGE.to_string(),
             ));
@@ -864,6 +897,7 @@ pub fn create_source_api_association(
         status_detail: MERGE_SCHEDULED_DETAIL.to_string(),
         last_successful_merge_date: None,
         merge_due_at: Some(now + MERGE_SPAN),
+        deletion_due_at: None,
     };
     let association = record.to_source_api_association();
     state
@@ -871,6 +905,102 @@ pub fn create_source_api_association(
         .insert(association_id, record);
 
     Ok(association)
+}
+
+/// Which side of an association the request's path addressed.
+///
+/// One association links two APIs, and AppSync lets it be addressed from either side —
+/// `DisassociateSourceGraphqlApi` by the Merged API, `DisassociateMergedGraphqlApi` by
+/// the source API — so this is the only way the two requests differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssociationSide {
+    /// The Merged API side.
+    MergedApi,
+    /// The source API side.
+    SourceApi,
+}
+
+impl AssociationSide {
+    /// The `apiId` `association` holds on this side.
+    pub fn api_id(self, association: &SourceApiAssociationRecord) -> &str {
+        match self {
+            Self::MergedApi => &association.merged_api_id,
+            Self::SourceApi => &association.source_api_id,
+        }
+    }
+}
+
+/// What a request to delete a source-API association asks for, in the form both
+/// disassociates share.
+#[derive(Debug, Clone)]
+pub struct SourceApiDisassociationRequest {
+    /// Which side of the association the path addressed.
+    pub side: AssociationSide,
+    /// That side's API, in either accepted form ([`is_api_identifier`]).
+    pub api_identifier: String,
+    /// The `associationId` AppSync generated for the association.
+    pub association_id: String,
+}
+
+/// Delete the association `request` names and return the `SourceApiAssociationStatus`
+/// it is left in, or the refusal the request meets.
+///
+/// The whole rule a disassociate follows, in one place:
+///
+/// * an identifier that is neither an API id nor an ARN names no API at all, so the
+///   request is malformed rather than pointed at a missing resource;
+/// * the addressed API is resolved from the store in either identifier form, and one
+///   that resolves to nothing is a not-found;
+/// * an `associationId` names an association OF the API addressed, so an association
+///   under another API on that side is not found under this one;
+/// * deleting the association SCHEDULES the deletion, so the call leaves it in the
+///   non-terminal [`DELETION_SCHEDULED`] status with the due instant the clock settles
+///   ([`DELETION_SPAN`]), and reports that status; the association stops existing once
+///   that instant has passed, whether or not anybody calls again.
+pub fn delete_source_api_association(
+    state: &mut ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState,
+    request: SourceApiDisassociationRequest,
+    now: SystemTime,
+) -> Result<String, AssociationRefusal> {
+    if !is_api_identifier(&request.api_identifier) {
+        return Err(AssociationRefusal::BadRequest(invalid_api_id_message(
+            &request.api_identifier,
+        )));
+    }
+
+    // Materialise everything the clock already owes first, so this call decides against
+    // the association state of THIS instant: an association whose deletion came due is
+    // gone before it can be deleted again.
+    state.settle_associations(now);
+
+    let Some(api) = api_by_identifier(&state.graphql_apis, &request.api_identifier) else {
+        return Err(AssociationRefusal::NotFound(
+            API_NOT_FOUND_MESSAGE.to_string(),
+        ));
+    };
+    let api_id = api.api_id.clone();
+
+    let side = request.side;
+    let association = match state
+        .source_api_associations
+        .get_mut(&request.association_id)
+    {
+        Some(association) if api_id == side.api_id(association) => association,
+        _ => {
+            return Err(AssociationRefusal::NotFound(
+                ASSOCIATION_NOT_FOUND_MESSAGE.to_string(),
+            ))
+        }
+    };
+
+    // Scheduling is idempotent: a second call reaching an association whose deletion is
+    // already owed has nothing left to schedule, so it neither moves the due instant nor
+    // reports a different status.
+    if !association.deletion_pending() {
+        association.schedule_deletion(now);
+    }
+
+    Ok(association.status.clone())
 }
 
 /// Per-service state for com-amazonaws-appsync-awsdeepdishcontrolplaneservice. A handler reaches it through [`service_state`].
@@ -894,6 +1024,10 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     /// Apply every merge the clock owes at `now`, so an association reports the same
     /// state to every caller whether or not another call touched it first.
     pub fn settle_associations(&mut self, now: SystemTime) {
+        // A deletion the clock has made due leaves no association behind, so it is
+        // applied before the merges: a record that is gone has no status to settle.
+        self.source_api_associations
+            .retain(|_, association| !association.deletion_due(now));
         for association in self.source_api_associations.values_mut() {
             association.settle(now);
         }
@@ -1276,6 +1410,25 @@ pub const MERGE_SUCCESS_DETAIL: &str = "The source API was merged into the Merge
 /// still observes it. Nothing sleeps for it — the due instant is stored on the record
 /// and [`SourceApiAssociationRecord::settle`] applies it.
 pub const MERGE_SPAN: Duration = Duration::from_millis(500);
+
+/// The `SourceApiAssociationStatus` an association whose deletion has been asked for
+/// carries until the deletion has been performed. Source: the
+/// `SourceApiAssociationStatus` enum, whose deletion values this is the first of.
+pub const DELETION_SCHEDULED: &str = "DELETION_SCHEDULED";
+
+/// The `sourceApiAssociationStatusDetail` that goes with [`DELETION_SCHEDULED`].
+pub const DELETION_SCHEDULED_DETAIL: &str =
+    "The source API association deletion is scheduled and has not been performed yet.";
+
+/// How long after a disassociate the deletion it scheduled comes due.
+///
+/// A chosen span, inside the emulator's 250-750 ms band for a transition the clock
+/// owes: a disassociate reports the association in the non-terminal
+/// [`DELETION_SCHEDULED`] status, so the span is never zero and a caller reading
+/// straight after the call still observes it. Nothing sleeps for it — the due instant
+/// is stored on the record and [`ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::settle_associations`]
+/// applies it.
+pub const DELETION_SPAN: Duration = Duration::from_millis(500);
 
 /// The smallest `ttl` an API cache accepts, in seconds.
 ///

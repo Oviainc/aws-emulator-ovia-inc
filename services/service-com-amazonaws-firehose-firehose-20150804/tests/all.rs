@@ -29,6 +29,8 @@ mod description_defaults;
 mod destination_delivery;
 #[path = "all/destination_update.rs"]
 mod destination_update;
+#[path = "all/http_endpoint_delivery.rs"]
+mod http_endpoint_delivery;
 #[path = "all/processor_parameters.rs"]
 mod processor_parameters;
 #[path = "all/refusal_messages.rs"]

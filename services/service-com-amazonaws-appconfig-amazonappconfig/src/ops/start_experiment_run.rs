@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartExperimentRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartExperimentRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: starts an experiment run of one experiment definition and persists it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartExperimentRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! At most ONE run of a definition is active at a time, so the check for an active run
+//! and the write of the new one happen together under the single state lock: of any
+//! number of simultaneous starts on one definition exactly one creates a run and every
+//! other is refused `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -176,20 +173,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartExperimentRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartExperimentRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartExperimentRun"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartExperimentRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // Every tag key this request would store is checked through the same function
+        // `TagResource` refuses through, and before anything is written.
+        if let Some(reason) = input
+            .tags
+            .as_ref()
+            .and_then(crate::state::first_tag_key_rejection)
+        {
+            return Err(StartExperimentRunErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(reason),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
+        let now = std::time::SystemTime::now();
+        // ONE lock for the whole read-check-write: the active-run check below and the
+        // write that follows it are not separable, or two starts that both found no
+        // active run would both create one. Nothing is awaited while the guard is held,
+        // so simultaneous starts are serialized by it and exactly one of them gets past
+        // the check.
+        let mut store = state.lock();
+
+        // Both path members are `Identifier`s, documented as the resource's "ID or name",
+        // so either addresses the record — and both resolve BEFORE anything is written, so
+        // a refused start writes nothing.
+        let Some(application_id) = store.resolve_application_id(&input.application_identifier)
+        else {
+            return Err(StartExperimentRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::application_not_found(
+                        &input.application_identifier,
+                    )),
+                    resource_name: Some(input.application_identifier),
+                },
+            )
+            .into());
+        };
+        let Some(application) = store.applications.get_mut(&application_id) else {
+            return Err(StartExperimentRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The application could not be read while starting the experiment run"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let Some(definition_id) =
+            application.resolve_experiment_definition_id(&input.experiment_definition_identifier)
+        else {
+            return Err(StartExperimentRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::experiment_definition_not_found(
+                        &input.application_identifier,
+                        &input.experiment_definition_identifier,
+                    )),
+                    resource_name: Some(input.experiment_definition_identifier),
+                },
+            )
+            .into());
+        };
+        let Some(definition) = application.experiment_definitions.get_mut(&definition_id) else {
+            return Err(StartExperimentRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The experiment definition could not be read after it was resolved"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A definition delivers one experiment at a time: while a run of it is still
+        // running, a start of another conflicts with the state of the definition that
+        // holds it and writes nothing, so the duplicate starter can attach to the run
+        // that won instead of creating a second one.
+        if let Some(active) = definition.active_run() {
+            return Err(StartExperimentRunErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::experiment_run_already_active(
+                        &definition.id,
+                        active.run,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Runs are numbered from 1 within the definition and a number is never reissued.
+        let run_number = definition.next_run_number;
+        let run = crate::state::ExperimentRun {
+            run: run_number,
+            application_id: definition.application_id.clone(),
+            experiment_definition_id: definition.id.clone(),
+            description: input.description,
+            // The run is delivering treatments from the moment this call answers.
+            status: crate::state::EXPERIMENT_RUN_RUNNING.to_string(),
+            exposure_percentage: input.exposure_percentage,
+            treatment_overrides: input.treatment_overrides,
+            // The result is the experiment's conclusion, which only the end of the run
+            // supplies; a run that has just started has none and none is invented.
+            result: None,
+            started_at: now,
+            // Nothing has written the record since this call created it.
+            updated_at: now,
+            // Nothing has ended the run.
+            ended_at: None,
+            // The definition as it stands now, so a later update of the definition does
+            // not rewrite what this run ran.
+            definition_snapshot: definition.snapshot(),
+            tags: input.tags.unwrap_or_default(),
+        };
+        // The run is written FIRST, so a start that cannot be stored moves no part of the
+        // definition: it is refused with the definition exactly as it was.
+        let Some(stored) = definition.record_run(run) else {
+            return Err(StartExperimentRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("The next experiment run number was already in use".to_string()),
+                },
+            )
+            .into());
+        };
+        // Answered from the stored record, so `GetExperimentRun` reports the same run this
+        // call did.
+        let output = StartExperimentRunOutput {
+            application_id: Some(stored.application_id.clone()),
+            experiment_definition_id: Some(stored.experiment_definition_id.clone()),
+            run: stored.run,
+            description: stored.description.clone(),
+            status: Some(stored.status.clone()),
+            exposure_percentage: stored.exposure_percentage,
+            treatment_overrides: stored.treatment_overrides.clone(),
+            result: stored.result.clone(),
+            started_at: Some(crate::state::to_date_time(stored.started_at)),
+            updated_at: Some(crate::state::to_date_time(stored.updated_at)),
+            ended_at: stored.ended_at.map(crate::state::to_date_time),
+            experiment_definition_snapshot: Some(stored.definition_snapshot.clone()),
+        };
+
+        // The run exists now, so the number it took is spent and the definition carries
+        // the status `ExperimentDefinitionStatus` reports for a definition with a run in
+        // flight — the one `UpdateExperimentDefinition` and an archiving delete read — and
+        // the write makes this the instant the definition was last updated.
+        definition.next_run_number = run_number.saturating_add(1);
+        definition.status = crate::state::EXPERIMENT_DEFINITION_ACTIVE.to_string();
+        definition.updated_at = now;
+
+        Ok(output)
     }
 }

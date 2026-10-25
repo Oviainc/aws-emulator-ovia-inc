@@ -122,6 +122,130 @@ pub(crate) async fn details(router: &MultiServiceRouter, identifier: &str) -> se
     got.get("enabledControlDetails").clone()
 }
 
+/// `EnableControl` with `parameters` (omitted when `None`), handing back the minted ARN
+/// and the enabling operation's identifier.
+pub(crate) async fn enable_with(
+    router: &MultiServiceRouter,
+    control_identifier: &str,
+    target_identifier: &str,
+    parameters: Option<serde_json::Value>,
+) -> (String, String) {
+    let mut body = serde_json::json!({
+        "controlIdentifier": control_identifier,
+        "targetIdentifier": target_identifier,
+    });
+    if let Some(parameters) = parameters {
+        body["parameters"] = parameters;
+    }
+    enable(router, body).await
+}
+
+/// A member of a JSON object, as a `&str`.
+pub(crate) fn member<'a>(value: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    value.get(name).and_then(serde_json::Value::as_str)
+}
+
+/// `statusSummary.status` of an `EnabledControlDetails`.
+pub(crate) fn status_summary_status(details: &serde_json::Value) -> Option<&str> {
+    details
+        .get("statusSummary")
+        .and_then(|summary| member(summary, "status"))
+}
+
+/// `statusSummary.lastOperationIdentifier` of an `EnabledControlDetails`.
+pub(crate) fn last_operation(details: &serde_json::Value) -> Option<&str> {
+    details
+        .get("statusSummary")
+        .and_then(|summary| member(summary, "lastOperationIdentifier"))
+}
+
+/// `driftStatusSummary.driftStatus` of an `EnabledControlDetails`.
+pub(crate) fn drift(details: &serde_json::Value) -> Option<&str> {
+    details
+        .get("driftStatusSummary")
+        .and_then(|summary| member(summary, "driftStatus"))
+}
+
+/// All THREE drift dimensions a control reports: the summary's own `driftStatus` and the
+/// `inheritance`/`resource` members of its `types`.
+pub(crate) fn drift_dimensions(
+    details: &serde_json::Value,
+) -> (Option<&str>, Option<&str>, Option<&str>) {
+    let types = details
+        .get("driftStatusSummary")
+        .and_then(|summary| summary.get("types"));
+    (
+        drift(details),
+        types
+            .and_then(|types| types.get("inheritance"))
+            .and_then(|inheritance| member(inheritance, "status")),
+        types
+            .and_then(|types| types.get("resource"))
+            .and_then(|resource| member(resource, "status")),
+    )
+}
+
+/// The configuration a control carries, as the key/value mapping a `parameters` list
+/// denotes: the entries sorted by key, so a case compares configurations rather than the
+/// order a list happened to be sent in. An absent member reads as the empty
+/// configuration.
+pub(crate) fn configuration(parameters: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut sorted = entries(parameters);
+    sorted.sort_by_key(|entry| {
+        entry
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    });
+    sorted
+}
+
+/// The configuration `GetEnabledControl` reports for `identifier`.
+pub(crate) async fn configured(
+    router: &MultiServiceRouter,
+    identifier: &str,
+) -> Vec<serde_json::Value> {
+    configuration(
+        details(router, identifier)
+            .await
+            .get("parameters")
+            .unwrap_or(&serde_json::Value::Null),
+    )
+}
+
+/// The control operation log, as `ListControlOperations` reports it, narrowed by `filter`
+/// (`Value::Null` asks for the whole log). `GetControlOperation` is still a scaffold stub
+/// (its own issue), so the log is read through the listing that resolves the same records.
+pub(crate) async fn control_operations(
+    router: &MultiServiceRouter,
+    filter: serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let mut body = serde_json::json!({ "maxResults": 100 });
+    if !filter.is_null() {
+        body["filter"] = filter;
+    }
+    let listed = call(router, "/list-control-operations", body).await;
+    assert_eq!(
+        listed.status, 200,
+        "list-control-operations: expected 200, got {} body {:?}",
+        listed.status, listed.body
+    );
+    entries(listed.get("controlOperations"))
+}
+
+/// The one logged record carrying `operation_identifier`, or `Value::Null`.
+pub(crate) async fn control_operation(
+    router: &MultiServiceRouter,
+    operation_identifier: &str,
+) -> serde_json::Value {
+    control_operations(router, serde_json::Value::Null)
+        .await
+        .into_iter()
+        .find(|record| member(record, "operationIdentifier") == Some(operation_identifier))
+        .unwrap_or(serde_json::Value::Null)
+}
+
 /// The `statusSummary`/`driftStatusSummary` pair a control carries while its enablement
 /// is at `status` and its three drift dimensions all read `drift`.
 fn summaries(

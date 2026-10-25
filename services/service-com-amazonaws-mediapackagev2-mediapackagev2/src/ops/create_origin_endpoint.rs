@@ -358,7 +358,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = input.tags.clone().unwrap_or_default();
         // A create's tag map is the same unbounded-growth site `TagResource` is, so it is
         // judged against the same bounds before anything is stored.
-        if let Some(rejection) = crate::state::tag_bounds_rejection(&tags) {
+        if let Some(rejection) = crate::state::tag_bounds_rejection("Tags", &tags) {
             return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
         }
         // Tag-on-create writes into the same tag map `TagResource` does, so it is held to

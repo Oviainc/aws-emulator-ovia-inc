@@ -1543,6 +1543,25 @@ pub fn app_authorization_already_exists(arn: &str) -> ConflictException {
     }
 }
 
+/// A modelled `ValidationException` refusing an update that would move an app
+/// authorization onto an (application, tenant) pair its app bundle already holds
+/// ANOTHER authorization for.
+///
+/// The same at-most-one-per-triple invariant [`app_authorization_already_exists`]
+/// guards on the create path. AppFabric documents no refusal of its own for an
+/// update that would take a pair the bundle already holds, and
+/// `UpdateAppAuthorization` models no conflict error, so the refusal is the
+/// `ValidationException` it does model, naming the `tenant` member the request
+/// supplied.
+pub fn tenant_already_authorized(app: &str) -> ValidationException {
+    field_validation_failed(
+        "tenant",
+        &format!(
+            "another app authorization for app {app} and the specified tenant already exists"
+        ),
+    )
+}
+
 /// A modelled `ResourceNotFoundException` for a tagging call whose `resourceArn`
 /// names no resource this store holds.
 ///

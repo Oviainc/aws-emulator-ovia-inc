@@ -1256,6 +1256,63 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         parameters: Vec<(String, ::aws_smithy_types::Document)>,
         now: SystemTime,
     ) -> Option<String> {
+        self.start_control_change(
+            ControlOperationType::UpdateEnabledControl,
+            arn,
+            parameters,
+            now,
+        )
+    }
+
+    /// Start a `RESET_ENABLED_CONTROL` against the control `arn` names and return the
+    /// operation's `operationIdentifier`.
+    ///
+    /// A reset re-deploys the configuration the control already carries rather than a new
+    /// one, so the parameters it parks are the DEPLOYED ones and a reporting call reads the
+    /// same configuration before, during and after — exactly as a landing zone's reset
+    /// re-deploys the manifest it already has. What the re-deployment settles is drift: a
+    /// control cannot be assessed against a configuration still being deployed, so the
+    /// three drift dimensions go back to `UNKNOWN` here and [`settle`] makes them `IN_SYNC`
+    /// once the clock has made the operation due.
+    ///
+    /// `None` when `arn` names no stored control, so a handler answers the modelled
+    /// `ResourceNotFoundException` and NOTHING is written. Writes no new resource, so it is
+    /// not bounded by [`MAX_ENABLED_CONTROLS`]; the operation it appends is bounded by the
+    /// log's own retention rule.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn record_enabled_control_reset(&mut self, arn: &str, now: SystemTime) -> Option<String> {
+        // The configuration the reset re-deploys is the one already configured, read out
+        // of the store rather than taken from the request: a reset carries none.
+        let deployed = self.enabled_controls.get(arn)?.parameters.clone();
+        let operation_identifier = self.start_control_change(
+            ControlOperationType::ResetEnabledControl,
+            arn,
+            deployed,
+            now,
+        )?;
+        let control = self.enabled_controls.get_mut(arn)?;
+        control.drift_status = DriftStatus::Unknown;
+        control.inheritance_drift_status = DriftStatus::Unknown;
+        control.resource_drift_status = DriftStatus::Unknown;
+        Some(operation_identifier)
+    }
+
+    /// The one span every call that deploys a configuration against an already enabled
+    /// control shares: append the operation record its type names, mark the control
+    /// `UNDER_CHANGE` until the clock makes that operation due, and park `parameters` for
+    /// [`settle`] to apply then.
+    ///
+    /// `None` when `arn` names no stored control, in which case nothing is written.
+    ///
+    /// [`settle`]: Self::settle
+    fn start_control_change(
+        &mut self,
+        operation_type: ControlOperationType,
+        arn: &str,
+        parameters: Vec<(String, ::aws_smithy_types::Document)>,
+        now: SystemTime,
+    ) -> Option<String> {
         let (control_identifier, target_identifier) = self
             .enabled_controls
             .get(arn)
@@ -1267,14 +1324,14 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             })?;
 
         let operation_identifier = self.record_control_operation(
-            ControlOperationType::UpdateEnabledControl,
+            operation_type,
             &control_identifier,
             &target_identifier,
             arn,
             now,
         );
         let control = self.enabled_controls.get_mut(arn)?;
-        // The control's configuration is changing until the update is due, so a caller
+        // The control's configuration is changing until the operation is due, so a caller
         // reading straight after the call sees the transient status rather than the
         // configuration it asked for.
         control.status = EnablementStatus::UnderChange;

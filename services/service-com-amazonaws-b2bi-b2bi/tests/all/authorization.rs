@@ -86,6 +86,7 @@ impl Emulator {
                 transitive_tag_keys: Vec::new(),
                 packed_policy_size: None,
                 external_id: None,
+                role_arn: Some(format!("arn:aws:iam::{ACCOUNT}:role/{ROLE}")),
                 revoked: false,
             })
             .expect("the session is recorded");

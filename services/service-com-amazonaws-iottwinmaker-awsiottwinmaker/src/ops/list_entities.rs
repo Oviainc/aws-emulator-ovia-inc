@@ -240,6 +240,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it, so the page costs O(page) lookups rather than one full scan of the
         // workspace per reported entity.
         let parent_ids = workspace.parent_ids();
+        // One instant for the whole page, so every row reports the state the
+        // clock had made due at the same moment.
+        let now = ::std::time::SystemTime::now();
         let mut matching = workspace
             .entities
             .values()
@@ -257,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 entity_name: entity.entity_name.clone(),
                 arn: entity.arn.clone(),
                 parent_entity_id: Some(entity.parent_entity_id.clone()),
-                status: entity.status(),
+                status: entity.status(now),
                 // Present, not omitted: an entity always carries a description
                 // (the empty string when its create named none).
                 description: Some(entity.description.clone()),

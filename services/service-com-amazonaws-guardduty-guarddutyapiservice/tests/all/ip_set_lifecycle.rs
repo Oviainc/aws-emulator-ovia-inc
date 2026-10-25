@@ -122,11 +122,13 @@ async fn status_of(router: &Router, detector_id: &str, ip_set_id: &str, case: &s
 // ---------------------------------------------------------------------------
 
 /// One create request and the case it stands for. The rows span the classes the
-/// members admit — `Name` and `Location` are `len 1..300` with no pattern and
-/// `Tags`/`ExpectedBucketOwner` are optional
-/// (`smithy_query(operation="CreateIPSet")`) — differing in SIZE (both ends of the
-/// modelled range), ALPHABET (ASCII, non-ASCII, the documented name punctuation),
-/// PRESENCE (the optional members absent and present) and COUNT (one tag, several).
+/// members admit — `Name` is `len 1..300` within the alphabet its documentation
+/// names (the `ip_set_name_alphabet` suite owns that rule), `Location` is
+/// `len 1..300` with no documented form at all, and `Tags`/`ExpectedBucketOwner`
+/// are optional (`smithy_query(operation="CreateIPSet")`) — differing in SIZE
+/// (both ends of the modelled range), ALPHABET (the documented name punctuation,
+/// a non-ASCII location), PRESENCE (the optional members absent and present) and
+/// COUNT (one tag, several).
 fn round_trip_rows() -> Vec<(&'static str, Value)> {
     let longest_name = "n".repeat(300);
     let longest_location = format!("s3://bucket/{}", "p".repeat(287));
@@ -145,9 +147,9 @@ fn round_trip_rows() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "a non-ASCII name round-trips byte for byte",
+            "a non-ASCII location round-trips byte for byte",
             json!({
-                "name": "リスト – トラスト",
+                "name": "trusted list STIX",
                 "format": "STIX",
                 "location": "https://example.com/lists/トラスト.xml",
                 "activate": false

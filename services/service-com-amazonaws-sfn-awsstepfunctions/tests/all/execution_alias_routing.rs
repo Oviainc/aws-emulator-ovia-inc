@@ -19,8 +19,8 @@
 //! 3. an alias' routing configuration may only name versions that already exist, and
 //!    the refusal states that rule;
 //! 4. `ListStateMachineAliases` reports the alias records of the ARN it names — every
-//!    alias of a state machine, or the aliases routing to one version — newest first
-//!    and paged.
+//!    alias of a state machine, or the aliases routing to one version — in the order
+//!    they were created, and paged.
 //!
 //! The harness (`Emulator`, `string`, `error_code`) is the one
 //! `state_machine_lifecycle` builds; `tests/all.rs` is this binary's crate root, so it
@@ -477,9 +477,12 @@ async fn list_executions_scopes_to_the_version_or_alias_the_arn_names() {
 // ---------------------------------------------------------------------------
 
 /// `ListStateMachineAliases` reports the alias records of the state machine its ARN
-/// names, "sorted by time, with the most recently created aliases listed first", and
-/// — for a version ARN — only the aliases whose routing configuration references that
-/// version.
+/// names, in the order they were created, and — for a version ARN — only the aliases
+/// whose routing configuration references that version.
+///
+/// The order itself, and its stability, is
+/// `tests/all/alias_order_and_redrive_context.rs`; what this suite needs from it is
+/// that one order is what the pages of a listing cut.
 ///
 /// This implements the operation's own stub issue
 /// (`20261024T215142Z-sfn-liststatemachinealiases-stub.md`), which the alias-routing
@@ -490,7 +493,7 @@ async fn list_state_machine_aliases_reports_the_aliases_of_the_arn_it_names() {
     let (machine, first, second) = machine_with_two_versions(&emulator, "alias-listing").await;
     let other = create_machine(&emulator, "alias-listing-other", &definition(1)).await;
 
-    // Created oldest first, so the listing must report them in the opposite order.
+    // The listing reports them in the order they were created in.
     let to_first = create_alias(&emulator, "PROD", &[route(&first, 100)]).await;
     let to_second = create_alias(&emulator, "BETA", &[route(&second, 100)]).await;
     let split = create_alias(
@@ -499,24 +502,24 @@ async fn list_state_machine_aliases_reports_the_aliases_of_the_arn_it_names() {
         &[route(&first, 30), route(&second, 70)],
     )
     .await;
-    let newest_first = vec![split.clone(), to_second.clone(), to_first.clone()];
+    let creation_order = vec![to_first.clone(), to_second.clone(), split.clone()];
 
     // (case, the ARN listed on, the alias ARNs expected in order).
     let cases: Vec<(&str, &str, Vec<String>)> = vec![
         (
-            "the unqualified ARN lists every alias, newest first",
+            "the unqualified ARN lists every alias, in creation order",
             &machine,
-            newest_first.clone(),
+            creation_order.clone(),
         ),
         (
             "a version ARN lists the aliases routing to that version",
             &first,
-            vec![split.clone(), to_first.clone()],
+            vec![to_first.clone(), split.clone()],
         ),
         (
             "the other version ARN lists its own",
             &second,
-            vec![split.clone(), to_second.clone()],
+            vec![to_second.clone(), split.clone()],
         ),
         (
             "a state machine with no alias lists nothing",
@@ -570,7 +573,7 @@ async fn list_state_machine_aliases_reports_the_aliases_of_the_arn_it_names() {
         }
     }
     assert_eq!(
-        paged, newest_first,
+        paged, creation_order,
         "the pages concatenate to the one order, got {paged:?}"
     );
 

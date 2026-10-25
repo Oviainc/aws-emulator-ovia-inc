@@ -668,11 +668,15 @@ async fn a_resource_scoped_policy_authorizes_only_that_resource() {
 #[tokio::test]
 async fn an_assumed_role_session_is_decided_by_the_roles_policies() {
     let emulator = emulator_with_identity_services();
+    // The trust policy names this account's own root principal, which is what lets the
+    // caller below assume the role: `sts:AssumeRole` resolves the role in IAM and
+    // evaluates its trust policy, so a role trusted by some other principal is not
+    // assumable here.
     let trust = json!({
         "Version": "2012-10-17",
         "Statement": [{
             "Effect": "Allow",
-            "Principal": {"Service": "ec2.amazonaws.com"},
+            "Principal": {"AWS": format!("arn:aws:iam::{}:root", engine::emulator_account_id())},
             "Action": "sts:AssumeRole",
         }],
     })
