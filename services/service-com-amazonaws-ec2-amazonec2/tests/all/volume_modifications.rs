@@ -1651,8 +1651,10 @@ mod modify_volume {
 
     /// RULE 2, continued, over the service's OWN catalogs: for every volume type the model
     /// publishes a size range for, a target size at the top of that range is accepted and one
-    /// GiB past it is refused; the same for every type that publishes an IOPS range, at both of
-    /// its published bounds and one past each.
+    /// GiB past it is refused; and for every type that publishes an IOPS range, a rate at either
+    /// published bound is applied as asked while one past a bound is NORMALIZED onto it — the
+    /// rate is never refused, because `Iops` carries no `@range` and the operation models no
+    /// error.
     ///
     /// Source: [`VOLUME_SIZE_RANGES`] (`ModifyVolumeRequest$Size`) and [`VOLUME_IOPS_RANGES`]
     /// (`ModifyVolumeRequest$Iops`), read here rather than restated.

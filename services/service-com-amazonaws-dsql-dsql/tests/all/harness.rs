@@ -150,6 +150,17 @@ impl Dsql {
             .await
     }
 
+    /// `DeleteCluster` carrying `clientToken`, which the model binds to the
+    /// `client-token` query parameter.
+    pub async fn delete_with_token(&self, identifier: &str, token: &str) -> Answer {
+        self.call(
+            "DELETE",
+            &format!("/cluster/{identifier}?client-token={token}"),
+            None,
+        )
+        .await
+    }
+
     pub async fn list(&self, query: &str) -> Answer {
         self.call("GET", &format!("/cluster{query}"), None).await
     }
