@@ -23,6 +23,8 @@ mod managed_node_information;
 mod parameter_deletion;
 #[path = "all/parameter_history.rs"]
 mod parameter_history;
+#[path = "all/parameter_metadata.rs"]
+mod parameter_metadata;
 #[path = "all/parameter_store.rs"]
 mod parameter_store;
 #[path = "all/parameters_by_path.rs"]

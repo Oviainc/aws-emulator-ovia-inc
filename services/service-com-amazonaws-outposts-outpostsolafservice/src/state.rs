@@ -13,7 +13,8 @@
 //! tunnel an Outpost-server installation connection is reported as, cutting an
 //! ordered list into pages with the modelled `Token` the next page resumes from, the
 //! orderable-instance-type catalog and the catalog of orderable hardware
-//! configurations this service publishes, and
+//! configurations this service publishes, pricing a renewal of the subscription an
+//! Outpost's orders hold, and
 //! the two rules this service words its refusals by — the `NotFoundException`
 //! identifier echo and the value-omitting `ValidationException` report.
 
@@ -26,6 +27,7 @@ use crate::ops::types::{
     Address, AssetInfo, AssetInstance, CapacityTaskFailure, CatalogItem, ConnectionDetails,
     DetailedInstanceTypeItem, EC2Capacity, FormFactorConfig, InstanceTypeCapacity,
     InstancesToExclude, Order, Outpost, PricingOption, PrivateConnectivityConfig, Quote, Site,
+    SubscriptionPricingDetails,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -386,34 +388,13 @@ pub struct OutpostRecord {
     /// declaring a value set and AWS publishes no decommissioning value, so the
     /// emulator does not invent one.
     pub decommission_requested_at: Option<std::time::SystemTime>,
-    /// The priced subscription options a RENEWAL of this Outpost's contract can be
-    /// bought under — what `GetRenewalPricing` reports for it, and the list a
-    /// `CreateRenewal` picks a payment option and term out of.
-    ///
-    /// Kept on the Outpost's own record for the reason
-    /// [`OutpostRecord::private_connectivity`] is: renewal pricing is an attribute
-    /// of ONE Outpost (the modelled route is
-    /// `/outpost/{OutpostIdentifier}/renewal-pricing`), so deleting the Outpost
-    /// takes it with the Outpost.
-    ///
-    /// A renewal price is a figure from AWS's own price list for the hardware the
-    /// Outpost's order installed, which this emulator does not have — the same
-    /// reason `CreateQuote` reports no `QuoteOption` — so this holds only priced
-    /// options that were actually recorded and never a number the emulator made
-    /// up. Nothing in the implemented slice of this API records one: an Outpost's
-    /// priced subscriptions arrive with its order, and the order `CreateOrder`
-    /// accepts carries no price for the same reason a quote carries none, while
-    /// `CreateRenewal` and `GetOutpostBillingInformation` are still scaffold stubs
-    /// with issues of their own. So a `CreateOutpost` leaves this empty, and
-    /// an Outpost with no recorded option cannot be priced.
-    pub renewal_pricing: Vec<PricingOption>,
     /// The hardware assets INSTALLED on this Outpost — what `ListAssets` reports
     /// for it — in the order they were installed, which is the order a page of
     /// them is cut in ([`ASSET_PAGE`]).
     ///
     /// Kept on the Outpost's own record for the reason
-    /// [`OutpostRecord::private_connectivity`] and [`OutpostRecord::renewal_pricing`]
-    /// are: an asset belongs to exactly ONE Outpost (the modelled route is
+    /// [`OutpostRecord::private_connectivity`]
+    /// is: an asset belongs to exactly ONE Outpost (the modelled route is
     /// `/outposts/{OutpostIdentifier}/assets`), so deleting the Outpost takes its
     /// assets with it.
     ///
@@ -423,8 +404,7 @@ pub struct OutpostRecord {
     /// leaves this empty: an order this service accepts is never carried as far as
     /// being delivered and installed, because that is exactly the record it would
     /// have to invent (see [`ORDER_STATUS_IN_PROGRESS`]). This therefore holds only
-    /// the assets that were actually recorded for the Outpost, exactly as
-    /// [`OutpostRecord::renewal_pricing`] holds only recorded prices, and an Outpost
+    /// the assets that were actually recorded for the Outpost, and an Outpost
     /// with no installed hardware is reported as having none rather than as having
     /// hardware the emulator made up.
     pub assets: Vec<AssetInfo>,
@@ -1457,6 +1437,14 @@ pub struct CatalogItemRecord {
     /// class member: the class narrows which items an answer holds, and is never
     /// reported.
     pub item_class: String,
+    /// How many vCPUs of EC2 capacity this item's hardware carries.
+    ///
+    /// Held BESIDE the projection for the reason [`Self::item_class`] is: the
+    /// modelled `CatalogItem` reports the capacity per instance family rather than
+    /// one total ([`ec2_capacities`]). It is the published size of the hardware,
+    /// which is what a subscription on it is priced by (see
+    /// [`ComAmazonawsOutpostsOutpostsolafserviceState::renewal_pricing`]).
+    pub capacity_vcpus: i32,
     /// The entry as a read of the catalog reports it.
     pub item: CatalogItem,
 }
@@ -1572,11 +1560,12 @@ pub fn catalog_item_catalog() -> Vec<CatalogItemRecord> {
          scaling type"
     );
     let instance_types = orderable_instance_type_catalog();
-    let mut items: Vec<(String, CatalogItem)> = CATALOG_ITEMS
+    let mut items: Vec<(String, i32, CatalogItem)> = CATALOG_ITEMS
         .iter()
         .map(|config| {
             (
                 config.item_class.to_string(),
+                config.capacity_vcpus,
                 CatalogItem {
                     catalog_item_id: Some(sku_code(&config.sku_seed())),
                     item_status: Some(config.item_status.to_string()),
@@ -1598,22 +1587,76 @@ pub fn catalog_item_catalog() -> Vec<CatalogItemRecord> {
             )
         })
         .collect();
-    items.sort_by(|(_, left), (_, right)| left.catalog_item_id.cmp(&right.catalog_item_id));
+    items.sort_by(|(_, _, left), (_, _, right)| left.catalog_item_id.cmp(&right.catalog_item_id));
     debug_assert!(
         items
             .windows(2)
-            .all(|pair| pair[0].1.catalog_item_id != pair[1].1.catalog_item_id),
+            .all(|pair| pair[0].2.catalog_item_id != pair[1].2.catalog_item_id),
         "no two catalog configurations are published under one SkuCode"
     );
     items
         .into_iter()
         .enumerate()
-        .map(|(index, (item_class, item))| CatalogItemRecord {
-            sequence: u64::try_from(index).unwrap_or_default() + 1,
-            item_class,
-            item,
-        })
+        .map(
+            |(index, (item_class, capacity_vcpus, item))| CatalogItemRecord {
+                sequence: u64::try_from(index).unwrap_or_default() + 1,
+                item_class,
+                capacity_vcpus,
+                item,
+            },
+        )
         .collect()
+}
+
+/// The one `QuotePricingType` the model declares (see
+/// [`crate::ops::types::QUOTE_PRICING_TYPE_VALUES`]): the pricing of this service is
+/// the pricing of a SUBSCRIPTION on hardware, which is the kind of price a
+/// `PricingOption` carries its details of.
+pub const QUOTE_PRICING_TYPE_SUBSCRIPTION: &str = "SUBSCRIPTION";
+
+/// The one `CurrencyCode` the model declares (see
+/// [`crate::ops::types::CURRENCY_CODE_VALUES`]) — "currently only `USD` is
+/// supported", as the model documents `SubscriptionPricingDetails$Currency`.
+pub const CURRENCY_USD: &str = "USD";
+
+/// How many months a subscription bought on each modelled `PaymentTerm` runs for:
+/// the term's own length in years, which is what every value of the modelled set
+/// [`crate::ops::types::PAYMENT_TERM_VALUES`] (`ONE_YEAR` | `THREE_YEARS` |
+/// `FIVE_YEARS`) names, times the twelve months in a year.
+pub const PAYMENT_TERM_MONTHS: &[(&str, i32)] =
+    &[("ONE_YEAR", 12), ("THREE_YEARS", 36), ("FIVE_YEARS", 60)];
+
+/// The share of a subscription's whole-term cost that each modelled `PaymentOption`
+/// is paid UP FRONT, the rest being spread over the term's months.
+///
+/// The three values of the modelled set
+/// [`crate::ops::types::PAYMENT_OPTION_VALUES`] name the share themselves: all of
+/// the cost in advance and nothing monthly, none of it in advance and all of it
+/// monthly, or part in advance and the rest monthly. How big that part is for the
+/// partial option is not published through this API, so the half below is this
+/// emulator's own, exactly as the capacity assignment of [`CATALOG_ITEMS`] is.
+pub const PAYMENT_OPTION_UPFRONT_SHARE: &[(&str, f32)] = &[
+    ("ALL_UPFRONT", 1.0),
+    ("NO_UPFRONT", 0.0),
+    ("PARTIAL_UPFRONT", 0.5),
+];
+
+/// The monthly list price, in [`CURRENCY_USD`], of one vCPU of the EC2 capacity an
+/// Outposts configuration carries — the rate every renewal this service prices is
+/// computed from.
+///
+/// AWS prices a configuration per quote rather than publishing a machine-readable
+/// price list, so the rate itself is this emulator's own, exactly as the capacity
+/// assignment of [`CATALOG_ITEMS`] is. What an emulated renewal has to get right is
+/// that the price FOLLOWS from the hardware under subscription: the same Outpost is
+/// priced the same figure in every process and on every read, twice the capacity
+/// costs twice as much, and a longer term costs more over the term than a shorter
+/// one.
+pub const RENEWAL_PRICE_PER_VCPU_MONTH: f32 = 20.0;
+
+/// `amount` rounded to the cent, the precision a price is quoted to.
+fn to_the_cent(amount: f32) -> f32 {
+    (amount * 100.0).round() / 100.0
 }
 
 /// Per-service state for com-amazonaws-outposts-outpostsolafservice. A handler reaches it through [`service_state`].
@@ -1756,6 +1799,126 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// The order `order_id` names in `region`. See [`Self::site`].
     pub fn order(&self, region: &str, order_id: &str) -> Option<&OrderRecord> {
         in_region(&self.orders, region, order_id)
+    }
+
+    /// How many vCPUs of EC2 capacity this service publishes for the catalog item
+    /// `catalog_item_id` names, or `None` for a SKU it publishes no configuration
+    /// under — a code of the modelled `SkuCode` form that names nothing in the
+    /// catalog, which this service holds no published hardware facts for.
+    pub fn catalog_item_capacity_vcpus(&self, catalog_item_id: &str) -> Option<i32> {
+        self.catalog_items
+            .iter()
+            .find(|record| record.item.catalog_item_id.as_deref() == Some(catalog_item_id))
+            .map(|record| record.capacity_vcpus)
+    }
+
+    /// The EC2 capacity, in vCPUs, UNDER SUBSCRIPTION on the Outpost `outpost_id`
+    /// names in `region`: for every order placed against that Outpost and not
+    /// cancelled, the published capacity of each line item's catalog item times the
+    /// quantity of it the order carries.
+    ///
+    /// This is the hardware a renewal of the Outpost's contract covers, and the only
+    /// thing the store knows about its size. A line item naming a catalog item this
+    /// service publishes no configuration for contributes nothing: the capacity of
+    /// hardware the catalog does not describe is not a figure the emulator has, and
+    /// never one it invents.
+    pub fn subscribed_capacity_vcpus(&self, region: &str, outpost_id: &str) -> i64 {
+        all_in_region(&self.orders, region)
+            .filter(|record| {
+                record.order.outpost_id.as_deref() == Some(outpost_id)
+                    && record.order.status.as_deref() != Some(ORDER_STATUS_CANCELLED)
+            })
+            .flat_map(|record| record.order.line_items.iter().flatten())
+            .filter_map(|item| {
+                let capacity =
+                    self.catalog_item_capacity_vcpus(item.catalog_item_id.as_deref()?)?;
+                // `LineItem$Quantity` is modelled `range(min: 1)`, so a quantity the
+                // boundary accepted is at least one unit of that configuration.
+                let quantity = i64::from(item.quantity.unwrap_or(1).max(0));
+                Some(i64::from(capacity) * quantity)
+            })
+            .sum()
+    }
+
+    /// Every renewal pricing option for the Outpost `outpost_id` names in `region`:
+    /// one priced SUBSCRIPTION option per (`PaymentOption`, `PaymentTerm`)
+    /// combination the model declares — three of each, so the nine the modelled
+    /// `PricingOptionList` maximum (`length(0..9)`) allows — or none at all for an
+    /// Outpost with no subscribed hardware to renew.
+    ///
+    /// Each option is the one subscription on the Outpost's own hardware, quoted
+    /// under that combination: the term's months ([`PAYMENT_TERM_MONTHS`]) of the
+    /// monthly rate its capacity carries ([`RENEWAL_PRICE_PER_VCPU_MONTH`]) make up
+    /// the whole-term cost, of which the payment option's share
+    /// ([`PAYMENT_OPTION_UPFRONT_SHARE`]) is paid up front and the rest in equal
+    /// monthly instalments. So every figure follows from what is persisted for the
+    /// Outpost — the capacity its orders subscribe to
+    /// ([`Self::subscribed_capacity_vcpus`]) — and a read answers the same figures
+    /// as the next one.
+    pub fn renewal_pricing(&self, region: &str, outpost_id: &str) -> Vec<PricingOption> {
+        // The tables may only ever name values the model declares, and must name
+        // every one of them, so a model that adds or renames a payment option or
+        // term trips this in every debug build instead of letting a renewal be
+        // priced under fewer combinations than the service offers.
+        debug_assert!(
+            PAYMENT_OPTION_UPFRONT_SHARE.len() == crate::ops::types::PAYMENT_OPTION_VALUES.len()
+                && PAYMENT_OPTION_UPFRONT_SHARE.iter().all(|(option, _)| {
+                    crate::ops::types::PAYMENT_OPTION_VALUES.contains(option)
+                })
+                && PAYMENT_TERM_MONTHS.len() == crate::ops::types::PAYMENT_TERM_VALUES.len()
+                && PAYMENT_TERM_MONTHS
+                    .iter()
+                    .all(|(term, _)| crate::ops::types::PAYMENT_TERM_VALUES.contains(term)),
+            "every modelled PaymentOption has an upfront share and every modelled PaymentTerm a \
+             length in months"
+        );
+        let capacity = self.subscribed_capacity_vcpus(region, outpost_id);
+        if capacity <= 0 {
+            // Nothing is subscribed on this Outpost, so there is no subscription to
+            // quote a renewal of: the caller is answered no option, which is what
+            // makes the pricing request one the service could not price.
+            return Vec::new();
+        }
+        let monthly_rate = capacity as f32 * RENEWAL_PRICE_PER_VCPU_MONTH;
+        // The combinations are walked in the order the model declares the two value
+        // sets in, so one Outpost's options are reported in the same order on every
+        // read and in every process.
+        let options: Vec<PricingOption> = crate::ops::types::PAYMENT_OPTION_VALUES
+            .iter()
+            .filter_map(|payment_option| {
+                let (_, share) = PAYMENT_OPTION_UPFRONT_SHARE
+                    .iter()
+                    .find(|(option, _)| option == payment_option)?;
+                Some((payment_option, *share))
+            })
+            .flat_map(|(payment_option, share)| {
+                crate::ops::types::PAYMENT_TERM_VALUES
+                    .iter()
+                    .filter_map(move |payment_term| {
+                        let (_, months) = PAYMENT_TERM_MONTHS
+                            .iter()
+                            .find(|(term, _)| term == payment_term)?;
+                        let term = monthly_rate * *months as f32;
+                        Some(PricingOption {
+                            pricing_type: Some(QUOTE_PRICING_TYPE_SUBSCRIPTION.to_string()),
+                            subscription_pricing_details: Some(SubscriptionPricingDetails {
+                                payment_option: Some((*payment_option).to_string()),
+                                payment_term: Some((*payment_term).to_string()),
+                                upfront_price: Some(to_the_cent(term * share)),
+                                monthly_recurring_price: Some(to_the_cent(
+                                    monthly_rate * (1.0 - share),
+                                )),
+                                currency: Some(CURRENCY_USD.to_string()),
+                            }),
+                        })
+                    })
+            })
+            .collect();
+        debug_assert!(
+            options.len() <= 9,
+            "a renewal is priced under at most the nine options PricingOptionList allows"
+        );
+        options
     }
 
     /// Materialise every Outpost lifecycle transition the clock has already made

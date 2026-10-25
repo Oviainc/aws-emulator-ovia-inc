@@ -116,6 +116,7 @@ fn stored_user(password_permanent: bool, password_set_at: Option<SystemTime>) ->
         user_last_modified_date: created,
         groups: std::collections::BTreeSet::new(),
         devices: std::collections::BTreeMap::new(),
+        pending_attribute_verifications: std::collections::BTreeMap::new(),
     }
 }
 
