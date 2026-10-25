@@ -420,6 +420,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new volume is attached to nothing: `AssociateVolume` is the only call
             // that attaches one.
             attachment: None,
+            // And nothing has modified it yet: `ModifyVolume` is the only call that
+            // records a modification.
+            modifications: Vec::new(),
         };
 
         if let Some(token) = input.client_token {
