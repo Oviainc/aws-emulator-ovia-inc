@@ -26,11 +26,11 @@ use crate::wire::{call, error_code, error_message, medialive, ACCOUNT};
 
 /// Every value `NodeRole` accepts, from
 /// `smithy_query(query="shape", shape="NodeRole")`.
-const ROLES: [&str; 2] = ["ACTIVE", "BACKUP"];
+pub(crate) const ROLES: [&str; 2] = ["ACTIVE", "BACKUP"];
 
 /// Every value `NetworkInterfaceMode` accepts, from
 /// `smithy_query(query="shape", shape="NetworkInterfaceMode")`.
-const INTERFACE_MODES: [&str; 2] = ["NAT", "BRIDGE"];
+pub(crate) const INTERFACE_MODES: [&str; 2] = ["NAT", "BRIDGE"];
 
 /// Every value `UpdateNodeState`'s `State` accepts, from
 /// `smithy_query(query="shape", shape="UpdateNodeStateShape")` — named through
@@ -46,7 +46,7 @@ const CREATED_STATE: &str = node_state::CREATED;
 /// `ClusterType` is the member `CreateCluster` needs (see the cluster suite);
 /// what matters here is only that the cluster EXISTS, because that is what a
 /// node is created in.
-async fn cluster(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn cluster(router: &MultiServiceRouter, name: &str) -> String {
     let (status, created) = call(
         router,
         "POST",
@@ -105,7 +105,11 @@ async fn describe_node(router: &MultiServiceRouter, cluster: &str, node: &str) -
     call(router, "GET", &node_uri(cluster, node), None).await
 }
 
-pub(crate) async fn delete_node(router: &MultiServiceRouter, cluster: &str, node: &str) -> (u16, Value) {
+pub(crate) async fn delete_node(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    node: &str,
+) -> (u16, Value) {
     call(router, "DELETE", &node_uri(cluster, node), None).await
 }
 
@@ -153,7 +157,7 @@ async fn state_updated(
 
 /// One node, read back through `DescribeNode` with the read asserted to have
 /// succeeded: a node whose delete was accepted stays readable.
-async fn described(
+pub(crate) async fn described(
     router: &MultiServiceRouter,
     case: &str,
     cluster: &str,
@@ -168,7 +172,7 @@ async fn described(
 }
 
 /// The `id` member of a node-shaped response.
-fn node_id(case: &str, node: &Value) -> String {
+pub(crate) fn node_id(case: &str, node: &Value) -> String {
     node["id"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a node id, got {node}"))
@@ -176,7 +180,7 @@ fn node_id(case: &str, node: &Value) -> String {
 }
 
 /// A `nodeInterfaceMappings` entry pairing `logical` with `physical` in `mode`.
-fn mapping(logical: &str, physical: &str, mode: &str) -> Value {
+pub(crate) fn mapping(logical: &str, physical: &str, mode: &str) -> Value {
     json!({
         "logicalInterfaceName": logical,
         "physicalInterfaceName": physical,
