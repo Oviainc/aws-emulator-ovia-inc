@@ -12,11 +12,10 @@
 //! leaves the store exactly as it found it.
 //!
 //! The sharing record is seeded straight into the service's state here, through the
-//! same seam `report_group_reads` beside this one seeds a report group with:
-//! `PutResourcePolicy`, the operation that stores one over the wire, is still a
-//! scaffold, so the store is where a shared project can come from today — and seeding
-//! it is also what proves this listing is computed from the store rather than from the
-//! request.
+//! same seam `report_group_reads` beside this one seeds a report group with: seeding it
+//! is what proves this listing is computed from the store rather than from the request,
+//! and the operation that stores one over the wire (`PutResourcePolicy`) is covered by
+//! `resource_policy` beside this suite, including the shared listing it feeds.
 //!
 //! The harness (`call`, `create_project`, `emulator_on`, `error_type`, `REGION`) is the
 //! one `project_build_lifecycle` already drives this service with.
