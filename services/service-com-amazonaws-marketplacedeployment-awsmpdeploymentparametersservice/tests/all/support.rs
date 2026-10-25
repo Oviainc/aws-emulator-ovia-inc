@@ -9,6 +9,21 @@
 
 use serde_json::Value;
 
+/// `epoch_secs` as the RFC 3339 date-time string the wire carries a
+/// `@timestampFormat("date-time")` member as.
+///
+/// `PutDeploymentParameterRequest$expirationDate` is marked
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation",operation="PutDeploymentParameter")`), so on
+/// restJson1 the member travels as a string in this form — which is what every AWS
+/// SDK serializes for it. The epoch second is how a test says WHICH instant it means;
+/// the rendering is the model's.
+pub fn rfc3339(epoch_secs: i64) -> String {
+    ::aws_smithy_types::DateTime::from_secs(epoch_secs)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .expect("an epoch second renders as an RFC 3339 date-time")
+}
+
 /// Percent-encode a value the way an SDK does for one `@httpLabel` path segment
 /// or one `@httpQuery` value: everything outside RFC 3986's unreserved set. A
 /// non-greedy label may not carry a raw `/`, and a query value may not carry a

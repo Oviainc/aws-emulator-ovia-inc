@@ -28,8 +28,8 @@ use service_com_amazonaws_workspacesinstances_eucmifrontendapiservice as wsinst;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::workspace_instance_lifecycle::{
-    call, create, error_code, harness, list_all_ids, minimal_create, ok, provision_state,
-    DEFAULT_TEST_REGION,
+    call, create, error_code, harness, launchable_managed_instance, list_all_ids, minimal_create,
+    ok, provision_state, DEFAULT_TEST_REGION, TEST_IMAGE_ID,
 };
 
 /// Every value `ProvisionStateEnum` declares, as the generated constant the model
@@ -70,13 +70,16 @@ fn delete_rows() -> Vec<DeleteRow> {
         },
         DeleteRow {
             case: "an instance created with an idempotency token",
-            body: json!({ "ClientToken": "tok-teardown", "ManagedInstance": {} }),
+            body: json!({
+                "ClientToken": "tok-teardown",
+                "ManagedInstance": launchable_managed_instance(),
+            }),
             settle_first: true,
         },
         DeleteRow {
             case: "an instance carrying tags",
             body: json!({
-                "ManagedInstance": { "InstanceType": "t3.medium" },
+                "ManagedInstance": launchable_managed_instance(),
                 "Tags": [{ "Key": "env", "Value": "dev" }, { "Key": "owner", "Value": "alice" }]
             }),
             settle_first: false,
@@ -85,6 +88,7 @@ fn delete_rows() -> Vec<DeleteRow> {
             case: "an instance with a nested configuration and monthly billing",
             body: json!({
                 "ManagedInstance": {
+                    "ImageId": TEST_IMAGE_ID,
                     "InstanceType": "m5.large",
                     "Placement": { "AvailabilityZone": "us-east-1a", "Tenancy": "default" },
                     "CpuOptions": { "CoreCount": 2, "ThreadsPerCore": 2 }
@@ -413,7 +417,10 @@ async fn a_tag_write_and_a_tag_read_both_still_reach_an_instance_tearing_down() 
     let (router, _engine) = harness();
     let id = create(
         &router,
-        json!({ "ManagedInstance": {}, "Tags": [{ "Key": "env", "Value": "dev" }] }),
+        json!({
+            "ManagedInstance": launchable_managed_instance(),
+            "Tags": [{ "Key": "env", "Value": "dev" }],
+        }),
     )
     .await;
 
