@@ -252,15 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the probe that token already minted rather than minting a second one.
         // A token replays only in the region it was sent to.
         if let Some(token) = input.client_token.as_deref() {
-            let replayed = store
-                .client_token_record(&region, token)
-                .filter(|record| record.monitor_name == input.monitor_name)
-                .and_then(|record| record.probe_id.clone());
-            if let Some(probe) = replayed.and_then(|probe_id| {
-                store
-                    .monitor(&region, &input.monitor_name)
-                    .and_then(|monitor| monitor.probes.get(&probe_id))
-            }) {
+            if let Some(probe) = store.probe_minted_by_token(&region, token, &input.monitor_name) {
                 return Ok(output_for(probe));
             }
         }

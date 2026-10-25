@@ -976,6 +976,37 @@ pub struct ConfigurationRevisionRecord {
 /// clock owes it no transition.
 pub const CONFIGURATION_STATE_ACTIVE: &str = "ACTIVE";
 
+/// The `ConfigurationState` a configuration a delete accepted is reported in: the
+/// delete is what starts it, so no configuration is ever stored in this state —
+/// it is what [`ComAmazonawsKafkaKafkaState::unregister_configuration`] leaves
+/// behind for the response to report, the same way a deleted cluster is reported
+/// `DELETING`.
+pub const CONFIGURATION_STATE_DELETING: &str = "DELETING";
+
+/// What Amazon MSK answers a configuration delete whose `Arn` names no
+/// configuration it holds.
+///
+/// A CONSTANT of the service, not built from the request: the configuration
+/// delete reports an ARN it cannot resolve as a bad request with this one fixed
+/// sentence — not as the `NotFoundException` the resource readers answer — which
+/// is what the behavioural corpus records the real service answering. The
+/// parameter at fault is named by `BadRequestException$InvalidParameter`, not by
+/// the message.
+pub const CONFIGURATION_ARN_NOT_FOUND_MESSAGE: &str = "Configuration ARN does not exist.";
+
+/// How this emulator refuses a delete of a configuration a cluster still uses:
+/// one fixed sentence about the condition, in the same request-independent form
+/// as [`RESOURCE_NOT_FOUND_MESSAGE`] (the apostrophe is U+2019, as the service
+/// writes it). UNVERIFIED wording — no recording of this path was available, so
+/// unlike [`CONFIGURATION_ARN_NOT_FOUND_MESSAGE`] this is the condition stated
+/// in the service's style rather than text observed from Amazon MSK, and it is
+/// held here, in one place, to be reconciled against the real sentence once a
+/// recording of it exists. Which clusters hold the configuration is a listing
+/// the caller gets from the cluster readers, so the refusal describes the
+/// condition rather than this endpoint's registry.
+pub const CONFIGURATION_IN_USE_MESSAGE: &str =
+    "The configuration is in use by one or more clusters and can\u{2019}t be deleted.";
+
 /// Configurations one account may hold in one region, from the Amazon MSK
 /// service quota "Number of configurations per account" (100, per Region). A
 /// create past it is refused with the modelled `TooManyRequestsException`, so the
@@ -1885,6 +1916,55 @@ impl ComAmazonawsKafkaKafkaState {
         self.configurations
             .insert(configuration.arn.clone(), configuration);
         Ok(())
+    }
+
+    /// Remove the configuration `arn` names from every index, as an endpoint for
+    /// `region` sees it, handing the record back. The one removal path, so the
+    /// ARN registry, the (region, name) index and the per-region count cannot
+    /// drift apart — the counterpart of [`Self::register_configuration`].
+    ///
+    /// Follows the same regional rule as [`Self::configuration_in`]: a
+    /// well-formed ARN belonging to another region removes nothing and resolves
+    /// to `None`, exactly as an absent one does, so a delete and a read agree on
+    /// which configurations this endpoint holds. The name it held is free again,
+    /// which is what lets a later create reuse it.
+    pub fn unregister_configuration(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<ConfigurationRecord> {
+        self.configuration_in(region, arn)?;
+        let configuration = self.configurations.remove(arn)?;
+        self.configuration_arn_by_name
+            .remove(&(configuration.region.clone(), configuration.name.clone()));
+        if let Some(count) = self.configurations_per_region.get_mut(&configuration.region) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.configurations_per_region.remove(&configuration.region);
+            }
+        }
+        Some(configuration)
+    }
+
+    /// The ARNs of the clusters in `region` whose stored `ConfigurationInfo`
+    /// names the configuration `arn`, in registry (ARN) order.
+    ///
+    /// A cluster keeps the configuration it was created with, so this is the
+    /// association that decides whether a configuration is still being used:
+    /// computed from the stored clusters rather than from a counter, so a cluster
+    /// that has since left the registry stops holding its configuration down.
+    pub fn clusters_using_configuration(&self, region: &str, arn: &str) -> Vec<String> {
+        self.clusters
+            .values()
+            .filter(|cluster| cluster.region == region)
+            .filter(|cluster| {
+                cluster
+                    .configuration_info
+                    .as_ref()
+                    .is_some_and(|info| info.arn == arn)
+            })
+            .map(|cluster| cluster.arn.clone())
+            .collect()
     }
 
     /// Add `connection` to the VPC-connection registry. The one insertion path,

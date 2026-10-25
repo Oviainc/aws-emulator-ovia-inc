@@ -7,6 +7,51 @@ Issue-Commit: 699f6ed7a7b73d87a9db3c950b6f69a120aa392c
 
 # Config emits no 'Config Rules Compliance Change' events to EventBridge: a compliance verdict flip produces no event on the default bus
 
+## Resolution
+
+Config now evaluates the rules in whose scope a recorded resource falls, and publishes the
+`Config Rules Compliance Change` notification onto the account's default EventBridge bus
+whenever a rule's verdict for a resource changes — which is the whole path the recorded check
+polls for, and that check now passes.
+
+Three legs, all in `services/service-com-amazonaws-configservice-starlingdoveservice/`:
+
+1. RECORDING. `src/state/recording.rs` is what a running configuration recorder does between
+   calls: a pass is owed `RECORDING_PASS_DUE_AFTER` after the call that makes one due (starting
+   a recorder, writing a rule) and is run by the in-process pump `drive_recorder_clock` starts,
+   so a client that consumes only the resulting events makes no further Config call. The pass
+   OBSERVES the resources of the types the recording group names and this emulator can serve
+   (`OBSERVABLE_RESOURCE_TYPES`, S3 buckets today) through the owning service's own API over the
+   in-process callback, and writes a configuration item per resource into the inventory
+   `ListDiscoveredResources` already reads — with each feature's configuration in the
+   `supplementaryConfiguration` block Config records it in, and the states a resource has left
+   kept as its history.
+2. EVALUATION. `MANAGED_RULES` is the catalogue of AWS managed rules this emulator evaluates
+   (`S3_BUCKET_VERSIONING_ENABLED`, `S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED`), each verdict
+   computed from the recorded configuration item alone. A rule's `Scope` decides which recorded
+   resources it places; a rule whose implementation is not in the catalogue records nothing and
+   keeps reporting `INSUFFICIENT_DATA` rather than a synthesised verdict.
+3. EMISSION. A verdict that CHANGED is published through
+   `crate::state::compliance_change_detail` (with `oldEvaluationResult` present exactly when a
+   verdict was REPLACED) and `crate::state::publish_service_event` — the same pair
+   `PutExternalEvaluation`, the verdict writer a client drives, already publishes through.
+
+`GetResourceConfigHistory` is implemented in the same change because the recorded check reads
+the bucket's configuration history between the two verdicts; its own stub issue is
+`20261023T140058Z-config-getresourceconfighistory-stub.md`, and the other configuration-item
+operations are left to theirs. The delivery leg — EventBridge INVOKING the SQS queue targets of
+the rules a published event matched — landed on mainline independently and is kept as mainline
+has it.
+
+Pinned by
+`services/service-com-amazonaws-configservice-starlingdoveservice/tests/all/config_recorded_resource_compliance.rs`
+(Config + S3 + EventBridge + SQS over one engine: the verdict table, the scope table, the
+configuration history and a stopped recorder observing nothing),
+`core/router/tests/all/config_compliance_change_event.rs` (Config -> EventBridge -> SQS),
+`.../tests/all/config_external_evaluation_compliance.rs` (the verdict a client delivers, read
+back) and the tables beside the catalogue in `src/state/recording.rs`.
+
+
 > _Note: this issue was identified against the code base at commit `699f6ed7a7b73d87a9db3c950b6f69a120aa392c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

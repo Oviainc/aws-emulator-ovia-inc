@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyFpgaImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyFpgaImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a new Amazon FPGA Image (AFI) in the Region the call was made in from
+//! the source AFI the request names, persists it in [`crate::state`] beside the AFIs
+//! `CreateFpgaImage` mints, and answers with the id it minted. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyFpgaImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three rules this handler keeps:
+//!
+//! 1. a source AFI this copy cannot resolve is refused with ONE answer — 400
+//!    `InvalidFpgaImageID.Malformed` naming the id ([`unresolvable_source_fpga_image_id`]) —
+//!    whether the id is not an AFI id at all or is well formed and names no AFI, because the
+//!    copy's subject lives in the Region `SourceRegion` names rather than in the Region this
+//!    call is made in, so it validates the id instead of resolving a resource of its own
+//!    Region (which is what `DeleteFpgaImage` and `ResetFpgaImageAttribute` do, keeping the
+//!    malformed-before-not-found pair);
+//! 2. "The Region that contains the source AFI" (`CopyFpgaImageRequest$SourceRegion`) has
+//!    to name a Region of the account's partition, so a value that names no Region is
+//!    refused with `InvalidParameterValue` rather than copied from. It is VALIDATED ONLY:
+//!    the AFI store is keyed by AFI id alone, because "an AFI carries no Region member of
+//!    its own", so the source is resolved out of that one store and `SourceRegion` takes no
+//!    part in resolving it — this emulator holds no per-Region AFI store to read another
+//!    Region's AFIs from, and nothing here claims to have copied across Regions;
+//! 3. the copy is a new AFI whose bitstream is the source's. This emulator stores no
+//!    Amazon S3 objects, so no AFI of this store carries a bitstream (see
+//!    [`crate::state::FpgaImageRecord`]) and the copy has nothing to produce: the call
+//!    hands back a `pending` AFI whose copy then ends in the modelled `failed` state with
+//!    a message that says so, exactly as `CreateFpgaImage`'s own creation does, never in
+//!    an `available` AFI nothing built.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +120,32 @@ impl From<CopyFpgaImageErrorModeled> for CopyFpgaImageError {
     }
 }
 
+/// Refuse a copy whose SOURCE AFI could not be resolved: HTTP 400
+/// `InvalidFpgaImageID.Malformed`, naming the id the copy could not resolve.
+///
+/// This operation is the one here whose subject does not live in the Region the call is made
+/// in — "the Region that contains the source AFI" (`CopyFpgaImageRequest$SourceRegion`) — so
+/// it VALIDATES the source id rather than resolving a resource of its own Region, and it has
+/// ONE answer for a source id it cannot resolve: an id that is not an AFI id at all and a
+/// well-formed id no AFI is stored under are refused alike. That is why this is not the
+/// malformed-before-not-found pair `crate::state::invalid_fpga_image_id_malformed` /
+/// `crate::state::invalid_fpga_image_id_not_found` that every operation resolving an AFI of
+/// its own Region keeps: the recorded service answers a copy whose well-formed source id
+/// names no AFI with `InvalidFpgaImageID.Malformed` and `Image ID '<id>' is invalid.`. The
+/// message is built from the request's own id, and the code is the one
+/// `crate::state::INVALID_FPGA_IMAGE_ID_MALFORMED` every AFI refusal of this service names,
+/// so there is one definition of it.
+///
+/// It lives here rather than in `crate::state` because `CopyFpgaImage` is the only operation
+/// that answers it.
+fn unresolvable_source_fpga_image_id(fpga_image_id: &str) -> CopyFpgaImageError {
+    crate::scaffolded::Scaffolded::service_error(
+        crate::state::INVALID_FPGA_IMAGE_ID_MALFORMED,
+        400,
+        format!("Image ID '{fpga_image_id}' is invalid."),
+    )
+}
+
 /// The `CopyFpgaImage` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -138,18 +182,228 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyFpgaImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyFpgaImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            FPGA_IMAGE_GLOBAL_ID_PREFIX, FPGA_IMAGE_ID_PREFIX, FpgaImageRecord,
+            MAX_CLIENT_TOKEN_CHARS, MAX_FPGA_IMAGES, MAX_STORED_BYTES, TRANSITION_DELAY,
+            dry_run_operation, fpga_image_id_is_well_formed, fpga_image_payload_bytes,
+            regions_in_partition_of, request_region, require_service_state,
+            resource_limit_exceeded, system_time_to_date_time,
+        };
+
+        // Something that is not an AFI id at all names no source AFI, so it is refused
+        // before there is anything to look up — with the ONE answer this operation has for
+        // a source it cannot resolve (see [`unresolvable_source_fpga_image_id`]), which is
+        // a fact of the request and so comes before the `DryRun` probe below.
+        if !fpga_image_id_is_well_formed(&input.source_fpga_image_id) {
+            return Err(unresolvable_source_fpga_image_id(
+                &input.source_fpga_image_id,
+            ));
+        }
+
+        // "The Region that contains the source AFI" (`CopyFpgaImageRequest$SourceRegion`):
+        // held to the Region catalog of the account's own partition, plus the Region this
+        // call was signed for — which is a Region of that account whichever partition it
+        // belongs to — the same reading `GetSpotPlacementScores` gives a Region a request
+        // names. A value that names no Region names no source, so it is refused rather than
+        // copied from.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyFpgaImage"))
+        // `is_catalog_region` answers "is this a Region at all" with one binary search over
+        // the same catalog, so text that is no Region's code is refused without building the
+        // partition's list; only a real Region is then narrowed to this account's partition.
+        //
+        // The refusal is EC2's parameter-validation sentence, in the form and with the
+        // reason clause this crate already gives a parameter that has to name a Region
+        // (`crate::ops::create_ipam`'s `operatingRegion`), so one wording covers the class;
+        // the parameter name is the request member's own and the value is the request's.
+        let region = request_region(ctx.parts());
+        let source_region = input.source_region.as_str();
+        let names_a_region = source_region == region
+            || (crate::state::is_catalog_region(source_region)
+                && regions_in_partition_of(&region).contains(&source_region));
+        if !names_a_region {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Value ({source_region}) for parameter sourceRegion is invalid. \
+                 This is not a valid Region name."
+            )));
+        }
+
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+
+        // DryRun asks whether the CALLER MAY make this request — "checks whether you have
+        // the required permissions for the action, without actually making the request"
+        // (`CopyFpgaImageRequest$DryRun`) — so it is answered once the request's own members
+        // have been read and before the source is resolved, the token is looked up or
+        // anything is written. It is answered BEFORE the idempotency lookup below, rather
+        // than after it as `CreateFpgaImage` does: a probe that makes no request cannot be a
+        // replay of one, so what the token minted is not read on its behalf. Either order
+        // answers the probe before any write, so the two handlers agree on what a `DryRun`
+        // leaves behind — nothing.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`CopyFpgaImageRequest$ClientToken`) — one token names
+        // the one AFI it minted, so a replay reports that AFI and copies nothing. The token
+        // map is `crate::state::ComAmazonawsEc2Amazonec2State::fpga_image_client_tokens`,
+        // the one `CreateFpgaImage` writes: one token names one AFI of this account
+        // whichever of the two minting calls minted it, so neither keeps a token space of
+        // its own. A replay reports the AFI the token minted WITHOUT resolving the source
+        // again: the request it repeats was already answered, so there is nothing left to
+        // refuse — the same reading `CreateFpgaImage` gives its own replay, which skips the
+        // store's ceilings for the same reason. A token whose AFI has since been removed
+        // names nothing to report, which is a state no request sequence of this handler
+        // leaves behind, so it is answered as the server error it is.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.fpga_image_client_tokens.get(token).cloned());
+
+        if let Some(fpga_image_id) = replayed {
+            return store
+                .fpga_images
+                .get(&fpga_image_id)
+                .map(|record| CopyFpgaImageOutput {
+                    fpga_image_id: record.view.fpga_image_id.clone(),
+                })
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "a client token names FPGA image '{fpga_image_id}', which is not stored"
+                    ))
+                });
+        }
+
+        // The copy's source is an AFI of this account's store, which is keyed by AFI id
+        // alone — "an AFI carries no Region member of its own", so nothing about resolving
+        // one depends on a Region: the `SourceRegion` checked above is validated, not
+        // resolved against, since this emulator keeps no per-Region AFI store. An id the
+        // store holds no AFI under is one this copy cannot resolve, and is refused with the
+        // same answer as an id that is not an AFI id at all.
+        let source = store
+            .fpga_images
+            .get(&input.source_fpga_image_id)
+            .ok_or_else(|| unresolvable_source_fpga_image_id(&input.source_fpga_image_id))?
+            .clone();
+
+        // "The name for the new AFI. The default is the name of the source AFI"
+        // (`CopyFpgaImageRequest$Name`). `Description` publishes no such default — it is
+        // "the description for the new AFI" — so a copy the request gave none carries none.
+        let name = input.name.clone().or_else(|| source.view.name.clone());
+        let description = input.description.clone();
+
+        // The caller-chosen bytes this copy retains, counted by the ONE definition of that
+        // charge: the name and description it stores, the `ClientToken` the token map keeps
+        // for it, and the source Region its state message names. The copy carries no tags —
+        // `CopyFpgaImage` models no `TagSpecifications`, and a copy is a new resource rather
+        // than the source — and names no storage location of its own.
+        let payload_bytes = fpga_image_payload_bytes(
+            &[],
+            name.as_deref(),
+            description.as_deref(),
+            &[source_region],
+            input.client_token.as_deref(),
+        );
+        if store.fpga_images.len() >= MAX_FPGA_IMAGES {
+            return Err(resource_limit_exceeded(format!(
+                "This emulator holds {MAX_FPGA_IMAGES} Amazon FPGA Images, \
+                 which is as many as it stores"
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(resource_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        let fpga_image_id = store.next_id(FPGA_IMAGE_ID_PREFIX);
+        let fpga_image_global_id = store.next_id(FPGA_IMAGE_GLOBAL_ID_PREFIX);
+        let copied_at = system_time_to_date_time(::std::time::SystemTime::now());
+        let record = FpgaImageRecord {
+            view: FpgaImage {
+                // The copy is its own AFI with its own identifiers, not a second name for
+                // the source.
+                fpga_image_id: Some(fpga_image_id.clone()),
+                fpga_image_global_id: Some(fpga_image_global_id),
+                name,
+                description,
+                create_time: Some(copied_at),
+                update_time: Some(copied_at),
+                // "Copies the specified Amazon FPGA Image (AFI) to the current Region": the
+                // copy belongs to the account that asked for it.
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                owner_alias: None,
+                // A copy is private until a load permission is granted to everyone, and it
+                // inherits none of the source's: `FpgaImageAttribute$LoadPermissions` is an
+                // attribute of the AFI it was granted on.
+                public: Some(false),
+                // A product code is an attribute of the image being copied, so the copy
+                // reports the source's — read out of the stored source record, like the
+                // bitstream facts below, rather than restarted as none.
+                product_codes: source.view.product_codes.clone(),
+                tags: Some(Vec::new()),
+                // The shell version, the PCI ids, the instance types and data retention
+                // support are facts of the BITSTREAM, so the copy reports exactly what the
+                // source reports for them — read out of the stored source record rather
+                // than restated here.
+                data_retention_support: source.view.data_retention_support,
+                shell_version: source.view.shell_version.clone(),
+                pci_id: source.view.pci_id.clone(),
+                instance_types: source.view.instance_types.clone(),
+                // Derived from `resolved_at` on every read.
+                state: None,
+            },
+            load_permissions: Vec::new(),
+            // The copy of a bitstream is work the clock owes rather than work this call
+            // does: the same span, read off the same monotonic clock, as the move
+            // `CreateFpgaImage` leaves its own AFI owing.
+            resolved_at: now + TRANSITION_DELAY,
+            // No AFI of this store carries an FPGA bitstream — nothing can read the design
+            // checkpoint a creation names, so none is ever produced — so there is nothing
+            // for this copy to produce either, and it ends in the modelled `failed` state
+            // saying so rather than in an `available` AFI nothing built.
+            failure_message: format!(
+                "No FPGA bitstream was copied: the source AFI '{}' in Region {source_region} \
+                 holds none, because this emulator stores no Amazon S3 objects and so built \
+                 none when that AFI was created",
+                input.source_fpga_image_id
+            ),
+            payload_bytes,
+        };
+        if let Some(token) = input.client_token.clone() {
+            store
+                .fpga_image_client_tokens
+                .insert(token, fpga_image_id.clone());
+        }
+        store.add_stored_bytes(payload_bytes);
+        store.fpga_images.insert(fpga_image_id.clone(), record);
+
+        // Read the response back OUT of the store, so the caller is told the id a later call
+        // will resolve rather than one held only in this stack frame.
+        store
+            .fpga_images
+            .get(&fpga_image_id)
+            .map(|record| CopyFpgaImageOutput {
+                fpga_image_id: record.view.fpga_image_id.clone(),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly copied FPGA image '{fpga_image_id}' could not be read back"
+                ))
+            })
     }
 }

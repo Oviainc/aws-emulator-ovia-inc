@@ -159,16 +159,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         names.sort();
 
         // "The first table name that this operation will evaluate" is the one AFTER
-        // the name the previous page ended on (`ListTables$ExclusiveStartTableName`).
-        if let Some(start) = input.exclusive_start_table_name.as_deref() {
-            names.retain(|name| name.as_str() > start);
-        }
-        // "A maximum number of table names to return. If this parameter is not
-        // specified, the limit is 100" (`ListTables$Limit`).
-        let limit = usize::try_from(input.limit.unwrap_or(DEFAULT_LIMIT)).unwrap_or(0);
-        let truncated = names.len() > limit;
-        names.truncate(limit);
-        let last_evaluated_table_name = truncated.then(|| names.last().cloned()).flatten();
+        // the name the previous page ended on (`ListTables$ExclusiveStartTableName`),
+        // and "a maximum number of table names to return. If this parameter is not
+        // specified, the limit is 100" (`ListTables$Limit`) is where the page stops —
+        // the same paging rule every listing of this service follows, so it is applied
+        // by the one helper they share.
+        let last_evaluated_table_name = crate::state::page_by_name(
+            &mut names,
+            input.exclusive_start_table_name.as_deref(),
+            input.limit,
+            DEFAULT_LIMIT,
+            String::as_str,
+        );
 
         Ok(ListTablesOutput {
             table_names: Some(names),

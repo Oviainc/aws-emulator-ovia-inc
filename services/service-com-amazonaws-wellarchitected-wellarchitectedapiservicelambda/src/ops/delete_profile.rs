@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the profile its `ProfileArn` resolves to from [`crate::state`], so the ARN
+//! resolves to nothing afterwards. A retry under the `ClientRequestToken` the completed
+//! delete carried replays that request's result instead of resolving the ARN again
+//! ([`crate::state::delete_replay`]).
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +178,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteProfile"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // `ClientRequestToken` is `@idempotencyToken`, and the rule it documents holds for
+        // a delete exactly as it does for `DeleteWorkload` and `DeleteReviewTemplate`: a
+        // retry under the same token and the same parameters, after the original request
+        // completed successfully, replays that request's result. The only parameter besides
+        // the token is the ARN the request names, so the fingerprint is over that.
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "ProfileArn": &input.profile_arn,
+        }));
+
+        let mut store = state.lock();
+
+        // Read before the ARN is resolved: the original request dropped the profile, so the
+        // ARN no longer resolves and only the recorded delete can answer the retry.
+        match crate::state::delete_replay(
+            &store.delete_profile_tokens,
+            &input.client_request_token,
+            crate::state::PROFILE_RESOURCE_TYPE,
+            &fingerprint,
+        ) {
+            crate::state::DeleteReplay::Replay => return Ok(DeleteProfileOutput),
+            crate::state::DeleteReplay::Conflict(exception) => {
+                return Err(DeleteProfileErrorModeled::ConflictException(exception).into())
+            }
+            crate::state::DeleteReplay::Fresh => {}
+        }
+
+        // "Delete a profile": the profile is resolved by the SAME lookup `GetProfile`
+        // uses, so an ARN that names no stored profile — never created, already deleted
+        // under another token, or belonging to another account — is that lookup's 404 and
+        // nothing is removed. `remove_profile` takes the record and everything keyed to it
+        // with it, exactly as `DeleteWorkload` and `DeleteReviewTemplate` remove theirs.
+        if store.remove_profile(&input.profile_arn).is_none() {
+            return Err(DeleteProfileErrorModeled::ResourceNotFoundException(
+                crate::state::profile_not_found(&input.profile_arn),
+            )
+            .into());
+        }
+
+        // Recorded only now the delete has COMPLETED SUCCESSFULLY: a refused request has
+        // no result to replay, so the token it carried is still free.
+        store.delete_profile_tokens.remember(
+            input.client_request_token,
+            crate::state::CompletedDeleteToken {
+                resource_id: input.profile_arn,
+                fingerprint,
+            },
+        );
+
+        Ok(DeleteProfileOutput)
     }
 }

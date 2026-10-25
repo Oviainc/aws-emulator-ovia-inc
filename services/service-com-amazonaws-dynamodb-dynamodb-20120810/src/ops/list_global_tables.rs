@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGlobalTables
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGlobalTables`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the global tables this emulator holds — the replication groups
+//! in [`crate::state::ComAmazonawsDynamodbDynamodb20120810State::global_table_groups`],
+//! each with the regions holding one of its replicas — in ascending name order, so
+//! `ExclusiveStartGlobalTableName` resumes exactly where the previous page stopped.
+//! `RegionName` narrows the page to the groups with a replica in that region, and
+//! `Limit` (default 100, per the member doc below) truncates the page and sets
+//! `LastEvaluatedGlobalTableName` when more names remain.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGlobalTables::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A table created on its own is NOT a global table: it joins no replication group, so
+//! no page reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +154,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGlobalTables` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGlobalTablesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGlobalTables"))
+        // Which region's replicas are asked about is a MEMBER of this request
+        // (`RegionName`) rather than the region its endpoint names, and a global table is
+        // one resource across regions, so nothing here is read out of `ctx`.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        // "Lists the global tables in a specific Region" (`ListGlobalTables$RegionName`):
+        // with that member the walk holds the global tables with a replica there, and
+        // without it every global table this store holds.
+        let mut groups = store.global_tables_with_replica_in(input.region_name.as_deref());
+
+        // "The first global table name that this operation will evaluate"
+        // (`ExclusiveStartGlobalTableName`) is the one AFTER the name the previous page
+        // ended on, and "the maximum number of table names to return, if the parameter is
+        // not specified DynamoDB defaults to 100" (`ListGlobalTables$Limit`) is where the
+        // page stops — the same paging rule every listing of this service follows, so it
+        // is applied by the one helper they share.
+        let last_evaluated_global_table_name = crate::state::page_by_name(
+            &mut groups,
+            input.exclusive_start_global_table_name.as_deref(),
+            input.limit,
+            DEFAULT_LIMIT,
+            |(name, _)| name.as_str(),
+        );
+
+        Ok(ListGlobalTablesOutput {
+            global_tables: Some(groups.into_iter().map(described_global_table).collect()),
+            last_evaluated_global_table_name,
+        })
     }
+}
+
+/// The page size `ListGlobalTables` uses when the request names none: "if the parameter
+/// is not specified DynamoDB defaults to 100" (`ListGlobalTables$Limit`).
+const DEFAULT_LIMIT: i32 = 100;
+
+/// One stored replication group as the `GlobalTableList` reports it: the global table's
+/// name and the regions holding its replicas ("The Regions where the global table has
+/// replicas" — `GlobalTable$ReplicationGroup`).
+fn described_global_table((name, regions): (String, Vec<String>)) -> GlobalTable {
+    GlobalTable {
+        global_table_name: Some(name),
+        replication_group: Some(
+            regions
+                .into_iter()
+                .map(|region| Replica {
+                    region_name: Some(region),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> ListGlobalTablesError {
+    ListGlobalTablesErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
 }

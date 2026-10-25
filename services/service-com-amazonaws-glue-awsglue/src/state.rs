@@ -18,6 +18,10 @@
 //! each lives here. A job definition also holds the RUNS `StartJobRun` started of it
 //! ([`JobRunEntry`]), because every operation that addresses a run names its job too.
 //!
+//! A catalog also holds ONE security configuration of its own
+//! ([`Catalog::encryption_settings`]): the encryption settings a write set for it, which
+//! every later read of that catalog's settings reports.
+//!
 //! Crawlers sit BESIDE that tree too, in one per-account namespace keyed by crawler name:
 //! every operation that addresses a crawler does so by name alone, so a crawler's
 //! `CatalogId` says where its output goes, not where the crawler itself lives.
@@ -52,14 +56,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CodeGenConfigurationNode, Column, Connection, ConnectionInput, ConnectionsList, Crawler,
-    CrawlerTargets, CreateCrawlerInput, CreateCustomEntityTypeInput, CreateJobInput,
-    DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput, ErrorDetail, ExecutionProperty,
-    FederatedDatabase, FederatedTable, Job, JobCommand, JobRun, JobUpdate,
-    LakeFormationConfiguration, LineageConfiguration, NotificationProperty, PrincipalPermissions,
-    RLSProperties, RecrawlPolicy, RegistryId, Schedule, SchemaChangePolicy, SchemaId,
-    SourceControlDetails, StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput,
-    TableVersion,
+    CodeGenConfigurationNode, Column, Connection, ConnectionInput, ConnectionPasswordEncryption,
+    ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput, CreateCustomEntityTypeInput,
+    CreateJobInput, DataCatalogEncryptionSettings, DataLakePrincipal, Database, DatabaseIdentifier,
+    DatabaseInput, EncryptionAtRest, ErrorDetail, ExecutionProperty, FederatedDatabase,
+    FederatedTable, Job, JobCommand, JobRun, JobUpdate, LakeFormationConfiguration,
+    LineageConfiguration, NotificationProperty, PrincipalPermissions, RLSProperties, RecrawlPolicy,
+    RegistryId, Schedule, SchemaChangePolicy, SchemaId, SourceControlDetails, StartJobRunInput,
+    StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -270,6 +274,43 @@ pub fn catalog_error_detail(error_code: &str, error_message: String) -> ErrorDet
         error_code: Some(error_code.to_string()),
         error_message: Some(error_message),
         __type: Some(ERROR_DETAIL_TYPE_TAG.to_string()),
+    }
+}
+
+/// The `CatalogEncryptionMode` a catalog is in while nothing encrypts its metadata at
+/// rest.
+///
+/// Source: the modelled `CatalogEncryptionMode` enum, whose published values the
+/// generated [`crate::ops::types::CATALOG_ENCRYPTION_MODE_VALUES`] carries (`DISABLED`,
+/// `SSE-KMS`, `SSE-KMS-WITH-SERVICE-ROLE`) and the request layer validates against.
+/// `DISABLED` is the only one of them that names no key, so it is the mode a catalog no
+/// `PutDataCatalogEncryptionSettings` has configured reports.
+pub const CATALOG_ENCRYPTION_MODE_DISABLED: &str = "DISABLED";
+
+/// The `EncryptionAtRest` a catalog reports while no setting has been stored for it.
+///
+/// `EncryptionAtRest$CatalogEncryptionMode` is required, so the structure is only
+/// well formed with a mode in it, and the mode of a catalog nothing configured is
+/// [`CATALOG_ENCRYPTION_MODE_DISABLED`]; with no mode selected there is no key and no
+/// role to report either.
+pub fn default_encryption_at_rest() -> EncryptionAtRest {
+    EncryptionAtRest {
+        catalog_encryption_mode: CATALOG_ENCRYPTION_MODE_DISABLED.to_string(),
+        sse_aws_kms_key_id: None,
+        catalog_encryption_service_role: None,
+    }
+}
+
+/// The `ConnectionPasswordEncryption` a catalog reports while no setting has been stored
+/// for it.
+///
+/// `ConnectionPasswordEncryption$ReturnConnectionPasswordEncrypted` is required and
+/// modelled with a default of `false`, so a catalog nothing configured hands connection
+/// passwords back the way it stored them, under no key of its own.
+pub fn default_connection_password_encryption() -> ConnectionPasswordEncryption {
+    ConnectionPasswordEncryption {
+        return_connection_password_encrypted: false,
+        aws_kms_key_id: None,
     }
 }
 
@@ -516,6 +557,38 @@ impl ComAmazonawsGlueAwsglueState {
         Some(self.catalogs.entry(catalog_id.to_string()).or_default())
     }
 
+    /// The Data Catalog encryption settings `catalog_id` REPORTS: the record a
+    /// `PutDataCatalogEncryptionSettings` stored for it, with each setting the stored
+    /// record left unset filled in with that setting's default
+    /// ([`default_encryption_at_rest`], [`default_connection_password_encryption`]).
+    ///
+    /// Both settings are therefore always reported, for a catalog nothing ever
+    /// configured as much as for one a write named only half of: the catalog holds a
+    /// value for each of them at all times, and a write that named one setting leaves
+    /// the other at its default rather than at whatever an earlier write put there — the
+    /// stored record is the whole settings structure the write carried.
+    pub fn data_catalog_encryption_settings(
+        &self,
+        catalog_id: &str,
+    ) -> DataCatalogEncryptionSettings {
+        let stored = self
+            .catalogs
+            .get(catalog_id)
+            .and_then(|catalog| catalog.encryption_settings.as_ref());
+        DataCatalogEncryptionSettings {
+            encryption_at_rest: Some(
+                stored
+                    .and_then(|settings| settings.encryption_at_rest.clone())
+                    .unwrap_or_else(default_encryption_at_rest),
+            ),
+            connection_password_encryption: Some(
+                stored
+                    .and_then(|settings| settings.connection_password_encryption.clone())
+                    .unwrap_or_else(default_connection_password_encryption),
+            ),
+        }
+    }
+
     /// Whether the store can hold another crawler, i.e. is below [`MAX_CRAWLERS`].
     pub fn can_store_crawler(&self) -> bool {
         self.crawlers.len() < MAX_CRAWLERS
@@ -704,6 +777,15 @@ pub struct Catalog {
     pub databases: HashMap<String, DatabaseEntry>,
     /// Connection definitions keyed by `ConnectionInput$Name`, in name order.
     pub connections: BTreeMap<String, ConnectionEntry>,
+    /// The security configuration `PutDataCatalogEncryptionSettings` last set on this
+    /// catalog, as that write carried it, or `None` while no write has set one.
+    ///
+    /// ONE record per catalog rather than one per resource: every operation that
+    /// addresses it names only a `CatalogId`, and the write takes the whole
+    /// `DataCatalogEncryptionSettings` structure, so a write REPLACES this record rather
+    /// than merging into it. What a read reports from it, defaults included, is
+    /// [`ComAmazonawsGlueAwsglueState::data_catalog_encryption_settings`].
+    pub encryption_settings: Option<DataCatalogEncryptionSettings>,
 }
 
 impl Catalog {

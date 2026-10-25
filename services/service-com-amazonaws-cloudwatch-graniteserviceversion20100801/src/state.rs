@@ -534,6 +534,27 @@ pub struct StoredInsightRule {
     pub rule: InsightRule,
     /// The tags the rule was created with.
     pub tags: Vec<Tag>,
+    /// What this rule was enabled from, for a rule `PutManagedInsightRules` created;
+    /// `None` for one a caller wrote with `PutInsightRule`.
+    pub managed: Option<ManagedRuleOrigin>,
+}
+
+/// What a managed Contributor Insights rule was enabled from: the template
+/// `PutManagedInsightRules` named, and the Amazon Web Services resource whose data the rule
+/// collects.
+///
+/// `ListManagedInsightRules` reports the pair back as the `TemplateName` and `ResourceARN` of
+/// its description ("The template name for the managed rule. Used to enable managed rules
+/// using `PutManagedInsightRules`.", `ManagedRuleDescription$TemplateName`; "If a managed rule
+/// is enabled, this is the ARN for the related Amazon Web Services resource.",
+/// `ManagedRuleDescription$ResourceARN`), which is why it is kept beside the rule rather than
+/// derived back out of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedRuleOrigin {
+    /// The managed-rule template the rule was enabled from.
+    pub template_name: String,
+    /// The ARN of the resource the rule collects data for.
+    pub resource_arn: String,
 }
 
 /// Per-service state for com-amazonaws-cloudwatch-graniteserviceversion20100801. A handler reaches it through [`service_state`].
@@ -815,6 +836,73 @@ pub const INSIGHT_RULE_ENABLED: &str = "ENABLED";
 /// A Contributor Insights rule that is not evaluating log events
 /// (`PutInsightRuleInput$RuleState`).
 pub const INSIGHT_RULE_DISABLED: &str = "DISABLED";
+
+/// The `Schema` a managed Contributor Insights rule carries: "For managed rules, this is
+/// `{"Name": "ServiceLogRule", "Version": 1}`" (`InsightRule$Schema`) — the schema of a rule
+/// `PutManagedInsightRules` enabled, which is why `PutInsightRule` refuses a definition
+/// carrying it ("You cannot edit these rules with PutInsightRule",
+/// `PutManagedInsightRules`).
+pub const MANAGED_INSIGHT_RULE_SCHEMA: &str = "{\"Name\": \"ServiceLogRule\", \"Version\": 1}";
+
+/// The name the managed Contributor Insights rule enabled from `template_name` for
+/// `resource_arn` takes.
+///
+/// Derived from the pair rather than minted per call, so enabling the same template for the
+/// same resource twice names the SAME rule — which is what lets a second call re-enable the
+/// rule the first one created: "If a previously created managed rule is currently disabled, a
+/// subsequent call to this API will re-enable it." (`PutManagedInsightRules`).
+///
+/// The resource's own field of the ARN identifies it within the account and Region the request
+/// is answered in, so that field is what the name carries beside the template. The result is
+/// held inside `InsightRuleName`'s modelled 1..128 length and `^[\x20-\x7E]+$` pattern: a
+/// character the pattern does not allow stands in as `-`, and an over-long name is cut to the
+/// maximum.
+pub fn managed_insight_rule_name(template_name: &str, resource_arn: &str) -> String {
+    let resource = parse_resource_arn(resource_arn).map_or(resource_arn, |arn| arn.resource);
+    let name: String = format!("{template_name}-{resource}")
+        .chars()
+        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '-' })
+        .take(MAX_INSIGHT_RULE_NAME_LEN)
+        .collect();
+    name
+}
+
+/// `InsightRuleName`'s modelled maximum length, which a derived rule name is held inside.
+const MAX_INSIGHT_RULE_NAME_LEN: usize = 128;
+
+/// The managed-rule template `stored` was enabled from, or the empty string for a rule a
+/// caller created with `PutInsightRule` — which orders the unmanaged rules before every
+/// managed one, and is never reported.
+pub fn template_name_of(stored: &StoredInsightRule) -> &str {
+    stored
+        .managed
+        .as_ref()
+        .map_or("", |origin| origin.template_name.as_str())
+}
+
+/// `value`'s ARN fields, or `None` when `value` is not a well-formed Amazon Resource Name.
+///
+/// A member documented as "The ARN of an Amazon Web Services resource"
+/// (`ManagedRule$ResourceARN`, `ListManagedInsightRulesInput$ResourceARN`) is modelled only as
+/// a 1..1024 string, so what makes it an ARN is read here — through the one shared parse, the
+/// same one the alarm actions are read with.
+pub fn parse_resource_arn(value: &str) -> Option<::service_common::arn::Arn<'_>> {
+    ::service_common::arn::parse(value)
+}
+
+/// How CloudWatch states that a `ResourceARN` is not the ARN of an Amazon Web Services
+/// resource, or `None` when it is one.
+///
+/// The sentence is the service's own for this error class and names no value: the caller
+/// renders it through whichever parameter fault its own model declares.
+pub fn resource_arn_error(value: &str) -> Option<String> {
+    parse_resource_arn(value)
+        .is_none()
+        .then(|| INVALID_RESOURCE_ARN.to_string())
+}
+
+/// CloudWatch's wording for a `ResourceARN` that is not an ARN.
+pub const INVALID_RESOURCE_ARN: &str = "INVALID_RESOURCE_ARN: Invalid ARN.";
 
 /// The largest number of Contributor Insights rules this in-memory store holds.
 ///
@@ -1272,6 +1360,35 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
             .collect();
         parents.sort();
         parents
+    }
+
+    /// The managed Contributor Insights rules this store holds for `resource_arn`, as
+    /// (rule name, rule) pairs ordered by template name and then rule name.
+    ///
+    /// "The managed rules that are available for the specified Amazon Web Services resource."
+    /// (`ListManagedInsightRulesOutput$ManagedRules`) — a managed rule belongs to the resource
+    /// its `PutManagedInsightRules` call named, so the resource is what selects them, and the
+    /// order is total so one page of a listing follows the previous one.
+    pub fn managed_insight_rules_for(
+        &self,
+        resource_arn: &str,
+    ) -> Vec<(&String, &StoredInsightRule)> {
+        let mut rules: Vec<(&String, &StoredInsightRule)> = self
+            .insight_rules
+            .iter()
+            .filter(|(_, stored)| {
+                stored
+                    .managed
+                    .as_ref()
+                    .is_some_and(|origin| origin.resource_arn == resource_arn)
+            })
+            .collect();
+        rules.sort_unstable_by(|(left_name, left), (right_name, right)| {
+            template_name_of(left)
+                .cmp(template_name_of(right))
+                .then_with(|| left_name.cmp(right_name))
+        });
+        rules
     }
 
     /// Materialise every composite-alarm rule evaluation the clock has already made due.

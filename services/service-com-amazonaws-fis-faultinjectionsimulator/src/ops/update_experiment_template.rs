@@ -174,8 +174,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every modelled constraint on this input — the required `id`, the lengths and
         // patterns on `id`, `description` and `roleArn`, the bounds on the collections —
         // was refused at the boundary. What the model cannot express is that a `roleArn`
-        // the request carries names an IAM ROLE; refused BEFORE the lookup and before any
-        // write, so the template keeps the role it already held.
+        // the request carries names an IAM ROLE; it is the one rule judged over the
+        // REQUEST here, BEFORE the lookup and before any write, so a malformed role is
+        // refused whether or not the id resolves and the template keeps the role it
+        // already held. The resulting template is judged by the same rule again, over the
+        // candidate, as part of the admissibility sequence below.
         if let Some(refusal) = crate::state::role_arn_refusal("roleArn", input.role_arn.as_deref())
         {
             return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
@@ -196,36 +199,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The change is applied to a CANDIDATE copy and judged before it is committed, so
         // a refused update leaves the stored template exactly as it was — by the same
         // rules, in the same order, as `CreateExperimentTemplate` applies to the template
-        // it builds.
+        // it builds, because both judge the record through the one
+        // `crate::state::template_refusal` sequence that states them. This handler only
+        // decides which of its own errors carries the refusal.
         let mut candidate = stored.clone();
         if let Err(refusal) = candidate.apply_update(&input, now) {
             return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
         }
-        if let Some(refusal) = crate::state::stop_conditions_refusal(&candidate.stop_conditions) {
-            return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
-        }
-        if let Some(refusal) =
-            crate::state::template_experiment_options_refusal(&candidate.experiment_options)
-        {
-            return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
-        }
-        // A log configuration says WHERE the experiment's logs are delivered, so the
-        // candidate's — the one this request named, or the stored one it left alone — is
-        // refused when it names no destination. A candidate carrying NO configuration (one
-        // this request removed, or a template that never had one) is not logging at all,
-        // which is admissible.
-        if let Some(refusal) =
-            crate::state::log_configuration_refusal(candidate.log_configuration.as_ref())
-        {
-            return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
-        }
-        if let Some(refusal) = crate::state::actions_quota_refusal(&candidate.actions) {
-            return Err(
-                UpdateExperimentTemplateErrorModeled::ServiceQuotaExceededException(refusal).into(),
-            );
-        }
-        if let Some(refusal) = crate::state::actions_refusal(&candidate.actions) {
-            return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
+        if let Some(refusal) = crate::state::template_refusal(&candidate) {
+            return Err(match refusal {
+                crate::state::TemplateRefusal::Invalid(refusal) => {
+                    UpdateExperimentTemplateErrorModeled::ValidationException(refusal)
+                }
+                crate::state::TemplateRefusal::QuotaExceeded(refusal) => {
+                    UpdateExperimentTemplateErrorModeled::ServiceQuotaExceededException(refusal)
+                }
+            }
+            .into());
         }
 
         // Built from the record now in the store, so this answer and every later read of
