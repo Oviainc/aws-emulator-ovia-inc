@@ -24,6 +24,19 @@ tracing = { workspace = true }
 # Stable AWS unique ids (AROA…/AIDA…) are derived from a SHA-256 digest of the
 # thing they name, so a role keeps one id across calls; see `src/state.rs`.
 sha2 = { workspace = true }
+# The IAM store in the same shared engine: the account's roles (their `RoleId`, trust
+# policy and `MaxSessionDuration`) and the access keys that name their owning IAM user.
+# The IAM service's OWN accessor is called rather than copied, so STS resolves a role
+# against the very records `iam:CreateRole` wrote.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The tree's ONE evaluation of IAM policy documents against a request, which is how a
+# role's trust policy is read here: two services handed the same document must not
+# answer differently.
+service-common = { path = "../common" }
+# The modelled character class a session tag's key and value must satisfy is a regular
+# expression over Unicode properties, so it is matched with a maintained regex engine
+# rather than by hand; see `src/state.rs`.
+regex = "1.12"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

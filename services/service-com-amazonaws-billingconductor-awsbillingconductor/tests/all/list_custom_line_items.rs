@@ -98,14 +98,17 @@ impl Emulator {
     }
 
     /// Create a billing group and return its ARN.
-    async fn billing_group(&self, name: &str) -> String {
+    /// Create a billing group billing the accounts `linked`, and return its ARN. A
+    /// custom line item's `AccountId` has to be one of them, so a fixture that applies
+    /// an item to an account links that account here.
+    async fn billing_group(&self, name: &str, linked: &[&str]) -> String {
         let (status, body) = self
             .send(
                 "POST",
                 "/create-billing-group",
                 &json!({
                     "Name": name,
-                    "AccountGrouping": { "LinkedAccountIds": [] },
+                    "AccountGrouping": { "LinkedAccountIds": linked },
                     "ComputationPreference": { "PricingPlanArn": MANAGED_PRICING_PLAN },
                 }),
             )
@@ -243,17 +246,20 @@ struct Fixture {
     delta: String,
 }
 
-/// One linked account two of the fixture's items apply to (`AccountId`, `^[0-9]{12}$`).
+/// One linked account of the FIRST billing group, which one of its items applies to
+/// (`AccountId`, `^[0-9]{12}$`).
 const FIRST_ACCOUNT: &str = "111122223333";
 
-/// A second account, so an `AccountIds` filter can list more than one value.
+/// A linked account of the SECOND billing group, so an `AccountIds` filter can name
+/// more than one account. An account belongs to at most one billing group, so the two
+/// groups' items apply to different accounts.
 const SECOND_ACCOUNT: &str = "222233334444";
 
 impl Fixture {
     async fn new() -> Self {
         let emulator = Emulator::new();
-        let first_group = emulator.billing_group("first").await;
-        let second_group = emulator.billing_group("second").await;
+        let first_group = emulator.billing_group("first", &[FIRST_ACCOUNT]).await;
+        let second_group = emulator.billing_group("second", &[SECOND_ACCOUNT]).await;
         emulator
             .custom_line_item(
                 &first_group,
@@ -282,7 +288,7 @@ impl Fixture {
                 &second_group,
                 "delta",
                 json!({
-                    "AccountId": FIRST_ACCOUNT,
+                    "AccountId": SECOND_ACCOUNT,
                     "ChargeDetails": { "Type": "FEE", "Percentage": { "PercentageValue": 1.0 } },
                 }),
             )
@@ -358,7 +364,7 @@ async fn every_filter_reports_the_custom_line_items_whose_attribute_it_names() {
         (
             "AccountIds with one value",
             json!({ "AccountIds": [FIRST_ACCOUNT] }),
-            vec!["alpha", "delta"],
+            vec!["alpha"],
         ),
         (
             "AccountIds with both accounts",
@@ -462,15 +468,28 @@ async fn a_listed_element_reports_what_the_create_persisted() {
 
     for (case, request, associations) in cases {
         let emulator = Emulator::new();
-        let group = emulator.billing_group("home").await;
+        // The group bills both accounts, because a custom line item's `AccountId` has
+        // to be an account of the billing group the item applies to.
+        let group = emulator
+            .billing_group("home", &[FIRST_ACCOUNT, SECOND_ACCOUNT])
+            .await;
         let arn = emulator
             .custom_line_item(&group, "subject", request.clone())
             .await;
-        // The resources a percentage item's charge is computed over: other billing
-        // groups, so the count varies without the item itself changing.
+        // The resources a percentage item's charge is computed over, all of them in
+        // scope of the billing group the item applies to: that group, and custom line
+        // items of that same group — so the count varies without the item itself
+        // changing.
         let mut resources: Vec<String> = Vec::new();
         for index in 0..associations {
-            resources.push(emulator.billing_group(&format!("resource{index}")).await);
+            let resource = if index == 0 {
+                group.clone()
+            } else {
+                emulator
+                    .custom_line_item(&group, &format!("resource{index}"), json!({}))
+                    .await
+            };
+            resources.push(resource);
         }
         if !resources.is_empty() {
             emulator.associate(&arn, &resources).await;
@@ -595,7 +614,7 @@ async fn the_reported_currency_is_the_one_the_items_partition_bills_in() {
 
     for (case, partition, expected) in cases {
         let emulator = Emulator::new();
-        let group = emulator.billing_group("home").await;
+        let group = emulator.billing_group("home", &[]).await;
         let minted = emulator.custom_line_item(&group, "subject", json!({})).await;
         let arn = if partition == "aws" {
             minted
@@ -630,7 +649,7 @@ async fn the_reported_currency_is_the_one_the_items_partition_bills_in() {
 #[tokio::test]
 async fn the_requested_billing_period_selects_the_items_effective_in_it() {
     let emulator = Emulator::new();
-    let group = emulator.billing_group("home").await;
+    let group = emulator.billing_group("home", &[]).await;
     // (name, the BillingPeriodRange the create sets)
     let items: [(&str, Value); 5] = [
         ("always", Value::Null),
@@ -712,7 +731,7 @@ async fn the_requested_billing_period_selects_the_items_effective_in_it() {
 #[tokio::test]
 async fn a_page_is_bounded_by_max_results_and_resumed_by_the_next_token() {
     let emulator = Emulator::new();
-    let group = emulator.billing_group("home").await;
+    let group = emulator.billing_group("home", &[]).await;
     let stored: Vec<String> = (0..7).map(|index| format!("item{index}")).collect();
     for name in &stored {
         emulator.custom_line_item(&group, name, json!({})).await;

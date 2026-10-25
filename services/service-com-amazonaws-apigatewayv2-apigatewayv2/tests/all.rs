@@ -17,6 +17,8 @@ mod api_endpoint_scheme;
 mod api_import;
 #[path = "all/api_lifecycle.rs"]
 mod api_lifecycle;
+#[path = "all/api_reimport.rs"]
+mod api_reimport;
 #[path = "all/api_update.rs"]
 mod api_update;
 #[path = "all/authorizer_lifecycle.rs"]
@@ -37,6 +39,8 @@ mod domain_name_endpoint_required;
 mod domain_name_lifecycle;
 #[path = "all/http_api_jwt_data_plane.rs"]
 mod http_api_jwt_data_plane;
+#[path = "all/http_api_route_precedence.rs"]
+mod http_api_route_precedence;
 #[path = "all/http_api_servable_stage.rs"]
 mod http_api_servable_stage;
 #[path = "all/integration_deletion.rs"]

@@ -55,3 +55,5 @@ mod service_software_rollback;
 mod shared_es_signing_name_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/vpc_endpoint_access.rs"]
+mod vpc_endpoint_access;

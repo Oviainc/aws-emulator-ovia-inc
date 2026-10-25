@@ -34,15 +34,19 @@
 //!
 //! An agreement request names terms that live in an *agreement proposal* (an
 //! offer), which is a resource of a different AWS Marketplace API and is not in
-//! this service's model or state — so there is no per-proposal rate card to
-//! read here. What this emulator holds instead is a rate card of its OWN, as
-//! DATA: [`RATE_CARD`] publishes the per-unit price of each product dimension
-//! it carries, at each contract length, and [`TERM_PRICE_LIST`] the single
-//! price of each kind of term that carries one instead of a rate card. A quote
-//! prices the dimensions and terms those lists publish — quantity times the
-//! published rate — and reports NO amount for anything they do not, which
+//! this service's model or state — so there is no per-proposal term document or
+//! rate card to read here. What this emulator holds instead is an offer of its
+//! OWN, as DATA: [`RATE_CARD`] publishes the per-unit price of each product
+//! dimension it carries, at each contract length, [`TERM_PRICE_LIST`] the single
+//! price of each kind of term that carries one instead of a rate card, and
+//! [`OFFER_DOCUMENT`] what each kind of term proposes beyond those prices (its
+//! documents, policy text, durations, grants and ceilings). A quote prices the
+//! dimensions and terms those lists publish — quantity times the published rate
+//! — and reports NO amount for anything they do not, which
 //! `ExpectedCharge$amount` ("Only available when the charge amount is known")
-//! states. Nothing here derives a price: a rate card is data.
+//! states, and the accepted terms an acceptance stores are the terms of that
+//! same document ([`accepted_term`]). Nothing here derives a price: a rate card
+//! is data.
 //!
 //! Each amount is computed ONCE, by the quote
 //! ([`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::charge_summary`]),
@@ -71,13 +75,14 @@ use crate::ops::types::{
     AgreementInvoiceLineItemGroupSummary, AgreementViewSummary,
     BatchCreateBillingAdjustmentRequestEntry, BillingAdjustmentSummary,
     ByolPricingTerm, Charge, ChargeSummary, ConfigurableUpfrontPricingTerm,
-    ConfigurableUpfrontPricingTermConfiguration, ConflictException, DescribeAgreementOutput,
+    ConfigurableUpfrontPricingTermConfiguration, ConfigurableUpfrontRateCardItem,
+    ConflictException, Constraints, DescribeAgreementOutput, DocumentItem,
     EndTimeBehavior, Entitlement, EstimatedCharges, ExpectedCharge, Filter,
     FixedUpfrontPricingTerm, FreeTrialPricingTerm, GetAgreementPaymentRequestOutput,
-    GetBillingAdjustmentRequestOutput, InternalServerException, InvoiceBillingPeriod,
+    GetBillingAdjustmentRequestOutput, GrantItem, InternalServerException, InvoiceBillingPeriod,
     ItemizedCharge, LegalTerm,
     NetPaymentTerm, PaymentRequestSummary, PaymentScheduleTerm, PricingCurrencyAmount,
-    ProposalSummary, Proposer,
+    ProposalSummary, Proposer, RateCardItem, ScheduleItem, Selector, UsageBasedRateCardItem,
     CreateAgreementRequestInput, PurchaseOrder, RecurringPaymentTerm, RenewalTerm, RequestedTerm,
     RequestedTermConfiguration, Resource, ResourceNotFoundException,
     SendAgreementCancellationRequestInput, SendAgreementPaymentRequestInput, SupportTerm,
@@ -921,7 +926,8 @@ pub const INITIAL_CHARGE_REVISION: i64 = 1;
 /// member spells it (`GetAgreementTerms` documents "`TermType` – The type of
 /// term, such as `LegalTerm`, `RenewalTerm`, or `ConfigurableUpfrontPricingTerm`").
 ///
-/// This is the catalog [`term_kind`] reads a requested term's kind from.
+/// This is also the id each term of [`OFFER_DOCUMENT`] is published under, and
+/// so the catalog [`resolved_term_kind`] resolves a requested term id against.
 pub const TERM_KINDS: &[&str] = &[
     "LegalTerm",
     "SupportTerm",
@@ -938,15 +944,20 @@ pub const TERM_KINDS: &[&str] = &[
     "NetPaymentTerm",
 ];
 
-/// The term kind a requested term with neither a configuration nor a
-/// kind-naming id is accepted as.
+/// The term kind a requested term none of the resolvable signals names a kind
+/// for is accepted as.
 ///
 /// A `RequestedTerm` names a term of an agreement proposal, which this service
-/// neither models nor stores, so the only things the emulator can read a term's
-/// kind from are the request's own `configuration` union member and its `id`.
-/// When neither names a kind, the term is accepted as a legal term: the kind
-/// that takes no configuration and incurs no charge, so reporting it asserts
-/// nothing the emulator does not hold.
+/// neither models nor stores, so the signals a kind can be read from are the
+/// ones [`resolved_term_kind`] lists: the request's own `configuration`, the
+/// term of the same id on the agreement being amended or replaced, and an id
+/// the published document carries a term under. A term none of them names is a
+/// term of a proposal this emulator does not publish; it is accepted as a legal
+/// term, the kind that takes no configuration, incurs no charge and sets no
+/// date, and it carries NO payload from the published document — reporting the
+/// document's own legal documents for it would assert a EULA no proposal
+/// proposed, and leaving them absent is what tells such a term apart from the
+/// legal term the document really proposes.
 pub const DEFAULT_TERM_KIND: &str = "LegalTerm";
 
 /// The attributes `Sort$sortBy` documents: "which can be `EndTime`, `StartTime`,
@@ -1156,49 +1167,388 @@ pub fn page_size(max_results: Option<i32>) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// The offer document
+// ---------------------------------------------------------------------------
+
+/// The term document the offer this emulator serves publishes: what each kind
+/// of term proposes beyond the acceptor's own selection.
+///
+/// SOURCE: the emulator's OWN document, on exactly the same footing as
+/// [`RATE_CARD`] and [`TERM_PRICE_LIST`] and for the same reason — a term
+/// document belongs to the agreement proposal, which is a resource of a
+/// different AWS Marketplace API and is in neither this service's model nor its
+/// state, so there is nothing to read a seller's document from and nothing to
+/// compute one from either. These fields are therefore DATA this emulator
+/// ships, the way a price list is data, and the agreement an acceptance mints
+/// reports the terms of THIS document.
+///
+/// Every amount it publishes is read from the two lists above, so a term
+/// reports the price the quote charged for it rather than a second number.
+#[derive(Debug, Clone, Copy)]
+pub struct OfferDocument {
+    /// `SupportTerm$refundPolicy`, a "free-text field about the refund policy
+    /// description that will be shown to customers as is".
+    pub refund_policy: &'static str,
+    /// `NetPaymentTerm$paymentDuePeriod`, "the duration after an invoice is
+    /// issued within which the payment is due … in the ISO 8601 format (for
+    /// example, `P30D` for 30 days)".
+    pub payment_due_period: &'static str,
+    /// `RecurringPaymentTerm$billingPeriod`, which "defines the recurrence at
+    /// which buyers are charged" — the period [`TERM_PRICE_LIST`]'s recurring
+    /// price is the price of, and the one a usage-based rate is metered over.
+    pub billing_period: &'static str,
+    /// `FreeTrialPricingTerm$duration`, the "duration of the free trial period
+    /// (5–31 days)".
+    pub free_trial_duration: &'static str,
+    /// `RenewalTerm$lockoutPeriod`, "the last day either party can opt in to or
+    /// opt out of the renewal … in whole days (for example, `P30D`)".
+    pub lockout_period: &'static str,
+    /// `RenewalTerm$maxRenewals`, "the maximum number of times the agreement
+    /// can be renewed" (`@range(min: 1)`).
+    pub max_renewals: i32,
+    /// `GrantItem$maxQuantity`, the "maximum amount of capacity that the buyer
+    /// can be entitled to the given dimension of the product"
+    /// (`@range(min: 1)`), for each dimension [`RATE_CARD`] publishes.
+    pub grant_max_quantity: i32,
+    /// `VariablePaymentTerm$maxTotalChargeAmount`, "the maximum total amount
+    /// that can be charged to the customer through variable payment requests
+    /// under this term", in minor units of [`CURRENCY_CODE`].
+    pub max_total_charge_amount: u64,
+    /// `DocumentItem$type` of the one legal document the offer proposes. A
+    /// standard contract "is managed by AWS Marketplace", so the document
+    /// carries a `version` and no `url`.
+    pub eula_type: &'static str,
+    /// `DocumentItem$version`, "version of standard contracts" — the version of
+    /// THIS document.
+    pub eula_version: &'static str,
+    /// How many installments a published payment schedule bills its total in:
+    /// `ScheduleItem` is "an individual installment of the payment".
+    pub installments: u32,
+}
+
+/// See [`OfferDocument`].
+pub const OFFER_DOCUMENT: OfferDocument = OfferDocument {
+    refund_policy: "Refunds are available within 14 days of the agreement start date.",
+    payment_due_period: "P30D",
+    billing_period: "P1M",
+    free_trial_duration: "P14D",
+    lockout_period: "P30D",
+    max_renewals: 3,
+    grant_max_quantity: 10,
+    max_total_charge_amount: 1_000_000,
+    eula_type: "StandardEula",
+    eula_version: "1.0",
+    installments: 4,
+};
+
+/// The contract lengths a configured prepaid purchase is bought in, each with
+/// how long it lasts in days.
+///
+/// The lengths are the selectors [`RATE_CARD`] publishes a rate for, in
+/// ascending order — `ConfigurableUpfrontRateCardItem$selector`
+/// "differentiates between the mutually exclusive rate cards in the same
+/// pricing term to be selected by the buyer" — and the day counts are this
+/// emulator's own reading of them (a month of 30 days, a year of 365), the same
+/// kind of DATA as the rates themselves. They are what an agreement's validity
+/// is measured with: `ValidityTerm$agreementDuration` "defines the duration
+/// that the agreement remains active", "relative to the agreement signature
+/// time" when the terms name no start date.
+pub const CONTRACT_LENGTHS: &[(&str, u64)] = &[
+    ("P1M", 30),
+    DEFAULT_CONTRACT_LENGTH,
+    ("P24M", 730),
+    ("P36M", 1095),
+];
+
+/// The contract length the offer document proposes for an agreement whose
+/// acceptor selected none: the one year [`CONTRACT_LENGTHS`] publishes.
+pub const DEFAULT_CONTRACT_LENGTH: (&str, u64) = ("P12M", 365);
+
+/// How many seconds a day of a contract length lasts.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// The published contract length `selector` names, or `None` when
+/// [`CONTRACT_LENGTHS`] publishes none — the case an agreement runs for
+/// [`DEFAULT_CONTRACT_LENGTH`] instead.
+fn published_contract_length(selector: &str) -> Option<(&'static str, u64)> {
+    CONTRACT_LENGTHS
+        .iter()
+        .copied()
+        .find(|(published, _)| *published == selector)
+}
+
+/// `days` of a contract length, as a duration.
+fn contract_duration(days: u64) -> Duration {
+    Duration::from_secs(days.saturating_mul(SECONDS_PER_DAY))
+}
+
+/// The legal documents the offer document proposes, as `LegalTerm$documents`
+/// reports them: "references to legal resources proposed to the buyers".
+fn published_documents() -> Vec<DocumentItem> {
+    vec![DocumentItem {
+        r#type: Some(OFFER_DOCUMENT.eula_type.to_string()),
+        // "You don't provide a URL for this type because it's managed by AWS
+        // Marketplace."
+        url: None,
+        version: Some(OFFER_DOCUMENT.eula_version.to_string()),
+    }]
+}
+
+/// The entitlements the offer document grants with a prepaid or free-trial
+/// term: one per product dimension [`RATE_CARD`] publishes, each up to the
+/// capacity the document allows.
+fn published_grants() -> Vec<GrantItem> {
+    RATE_CARD
+        .iter()
+        .map(|rate| GrantItem {
+            dimension_key: Some(rate.dimension_key.to_string()),
+            max_quantity: OFFER_DOCUMENT.grant_max_quantity,
+        })
+        .collect()
+}
+
+/// The per-unit rates [`RATE_CARD`] publishes at one contract length, as
+/// `RateCardItem` reports them ("the per unit rates for each individual product
+/// dimension"). A dimension the card does not price at that length is not on
+/// it.
+fn published_rate_card(length: &str) -> Vec<RateCardItem> {
+    RATE_CARD
+        .iter()
+        .filter_map(|rate| {
+            published_unit_rate(rate.dimension_key, length).map(|price| RateCardItem {
+                dimension_key: Some(rate.dimension_key.to_string()),
+                price: Some(amount(u128::from(price))),
+            })
+        })
+        .collect()
+}
+
+/// The rate cards a configured prepaid term proposes: one per contract length
+/// [`CONTRACT_LENGTHS`] publishes, which are "the mutually exclusive rate cards
+/// in the same pricing term to be selected by the buyer".
+fn published_configurable_rate_cards() -> Vec<ConfigurableUpfrontRateCardItem> {
+    CONTRACT_LENGTHS
+        .iter()
+        .map(|(length, _)| ConfigurableUpfrontRateCardItem {
+            selector: Some(Selector {
+                // The category the mutually exclusive cards differ by is the
+                // contract length: `…TermConfiguration$selectorValue` "defines
+                // the length of time for which the particular pricing/dimension
+                // is being purchased".
+                r#type: Some(SELECTOR_TYPE_DURATION.to_string()),
+                value: Some((*length).to_string()),
+            }),
+            // Both constraints carry `Constraints`' own documented default,
+            // "The default value is `Allowed`": the acceptor may select
+            // several dimensions of a card and configure a quantity for each,
+            // which is what this service accepts on a requested term.
+            constraints: Some(Constraints {
+                multiple_dimension_selection: Some(CONSTRAINT_ALLOWED.to_string()),
+                quantity_configuration: Some(CONSTRAINT_ALLOWED.to_string()),
+            }),
+            rate_card: Some(published_rate_card(length)),
+        })
+        .collect()
+}
+
+/// The rate cards a usage-based term proposes: the per-unit rates of one
+/// billing period, since such a term charges "based on product usage" over each
+/// period ([`OfferDocument::billing_period`]).
+fn published_usage_rate_cards() -> Vec<UsageBasedRateCardItem> {
+    vec![UsageBasedRateCardItem {
+        rate_card: Some(published_rate_card(OFFER_DOCUMENT.billing_period)),
+    }]
+}
+
+/// The installments a payment-schedule term bills, as `PaymentScheduleTerm`
+/// reports them: "each element defines one installment of payment".
+///
+/// The total is the one [`TERM_PRICE_LIST`] publishes for the kind — the same
+/// number the quote charged, which `EstimatedCharges$agreementValue` calls "the
+/// sum of all invoice charges in the payment schedule" — split into
+/// [`OfferDocument::installments`] equal charges, the last carrying any
+/// remainder so the schedule sums to exactly that total. The dates divide the
+/// agreement's own contract length, starting on its start date: "invoices are
+/// generated on the date provided".
+fn published_schedule(context: &AcceptedTermContext<'_>) -> Vec<ScheduleItem> {
+    let installments = OFFER_DOCUMENT.installments.max(1);
+    let Some(total) = published_term_price("PaymentScheduleTerm").map(u128::from) else {
+        return Vec::new();
+    };
+    let each = total / u128::from(installments);
+    let interval = contract_duration(context.contract_days) / installments;
+    (0..installments)
+        .map(|index| ScheduleItem {
+            charge_date: Some(::aws_smithy_types::DateTime::from(
+                context.start + interval * index,
+            )),
+            charge_amount: Some(amount(if index + 1 == installments {
+                total - each * u128::from(installments - 1)
+            } else {
+                each
+            })),
+        })
+        .collect()
+}
+
+/// `Selector$type` — "category of selector" — of the cards a configured prepaid
+/// term proposes. See [`published_configurable_rate_cards`].
+const SELECTOR_TYPE_DURATION: &str = "Duration";
+
+/// `Constraints`' documented default for both of its members: "The possible
+/// values are `Allowed` and `Disallowed`. The default value is `Allowed`."
+const CONSTRAINT_ALLOWED: &str = "Allowed";
+
+// ---------------------------------------------------------------------------
 // Terms
 // ---------------------------------------------------------------------------
 
-/// The kind of term `requested` names.
+/// The kind of term `requested` names, resolved from what this service holds.
 ///
-/// The requested `configuration` names it outright — each union member belongs
-/// to exactly one term kind — and otherwise the term's `id` is accepted as
-/// naming one of [`TERM_KINDS`]. See [`DEFAULT_TERM_KIND`] for why a term that
-/// names neither is a legal term.
-pub fn term_kind(requested: &RequestedTerm) -> &'static str {
+/// Three signals name a kind, and a more specific one wins:
+///
+/// 1. the acceptor's own `configuration` — each `RequestedTermConfiguration`
+///    union member belongs to exactly one term kind;
+/// 2. the term of the SAME id on the agreement this request amends or replaces:
+///    `GetAgreementTerms` documents the `TermID` as "common between offer and
+///    agreement", so one id across a chain is one term of one proposal, and the
+///    kind the agreement already holds for it is the kind it keeps;
+/// 3. the term id naming one of the kinds the published offer document carries
+///    ([`TERM_KINDS`]).
+///
+/// `None` when none of them names a kind — a term of a proposal this emulator
+/// does not publish, which [`DEFAULT_TERM_KIND`] covers.
+pub fn resolved_term_kind(
+    requested: &RequestedTerm,
+    source: Option<&Agreement>,
+) -> Option<&'static str> {
+    configured_term_kind(requested)
+        .or_else(|| {
+            source
+                .and_then(|source| source.accepted_term(&requested.id))
+                .map(accepted_term_kind)
+                .and_then(published_term_kind)
+        })
+        .or_else(|| published_term_kind(&requested.id))
+}
+
+/// The kind of term `requested` is accepted as: the one its request resolves to
+/// ([`resolved_term_kind`]), else [`DEFAULT_TERM_KIND`].
+pub fn term_kind(requested: &RequestedTerm, source: Option<&Agreement>) -> &'static str {
+    resolved_term_kind(requested, source).unwrap_or(DEFAULT_TERM_KIND)
+}
+
+/// The kind the acceptor's own configuration names, when it carries one.
+fn configured_term_kind(requested: &RequestedTerm) -> Option<&'static str> {
     match requested.configuration {
         Some(RequestedTermConfiguration::configurableUpfrontPricingTermConfiguration(_)) => {
-            "ConfigurableUpfrontPricingTerm"
+            Some("ConfigurableUpfrontPricingTerm")
         }
-        Some(RequestedTermConfiguration::renewalTermConfiguration(_)) => "RenewalTerm",
+        Some(RequestedTermConfiguration::renewalTermConfiguration(_)) => Some("RenewalTerm"),
         Some(RequestedTermConfiguration::variablePaymentTermConfiguration(_)) => {
-            "VariablePaymentTerm"
+            Some("VariablePaymentTerm")
         }
-        None => TERM_KINDS
-            .iter()
-            .copied()
-            .find(|kind| *kind == requested.id)
-            .unwrap_or(DEFAULT_TERM_KIND),
+        None => None,
     }
+}
+
+/// The kind `name` names, when it is one of the kinds the published offer
+/// document carries ([`TERM_KINDS`]).
+fn published_term_kind(name: &str) -> Option<&'static str> {
+    TERM_KINDS.iter().copied().find(|kind| *kind == name)
+}
+
+/// What the agreement being created contributes to each of its accepted terms:
+/// the instants and the contract length its own record fixes, and the agreement
+/// its terms are inherited from.
+///
+/// One context per agreement, built once from the terms its request asked for,
+/// so every term of one agreement reports the same window and the same length.
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptedTermContext<'a> {
+    /// When the agreement starts, which is its signature time:
+    /// `ValidityTerm$agreementStartDate` is "determined based on agreement
+    /// signature time" when the terms provide no date of their own.
+    pub start: SystemTime,
+    /// The contract length the agreement runs for, as
+    /// `ConfigurableUpfrontPricingTermConfiguration$selectorValue` spells one:
+    /// the length the acceptor selected on a configured prepaid term where they
+    /// selected one the rate card publishes, else the published default.
+    pub contract_length: &'static str,
+    /// How long [`Self::contract_length`] lasts, in days.
+    pub contract_days: u64,
+    /// The agreement this request amends or replaces, whose accepted terms name
+    /// the kind of a term carried over by id ([`resolved_term_kind`]).
+    pub source: Option<&'a Agreement>,
+}
+
+impl<'a> AcceptedTermContext<'a> {
+    /// The context of an agreement starting at `start` over `requested`,
+    /// derived from `source` where it amends or replaces one.
+    pub fn new(
+        requested: &[RequestedTerm],
+        start: SystemTime,
+        source: Option<&'a Agreement>,
+    ) -> Self {
+        let (contract_length, contract_days) = requested
+            .iter()
+            .filter_map(requested_upfront_configuration)
+            .find_map(|configuration| published_contract_length(&configuration.selector_value))
+            .unwrap_or(DEFAULT_CONTRACT_LENGTH);
+        Self {
+            start,
+            contract_length,
+            contract_days,
+            source,
+        }
+    }
+
+    /// When the agreement's validity ends: its start plus its contract length.
+    pub fn validity_end(&self) -> SystemTime {
+        self.start + contract_duration(self.contract_days)
+    }
+}
+
+/// The accepted terms an agreement holds for the terms its request asked for,
+/// in the order the request asked for them.
+///
+/// `AcceptedTerm` is "a subset of terms proposed by the proposer, which have
+/// been accepted by the acceptor as part of agreement creation", so the terms
+/// are exactly the requested ones: nothing adds a term no acceptor accepted.
+pub fn accepted_terms(
+    requested: &[RequestedTerm],
+    context: &AcceptedTermContext<'_>,
+) -> Vec<AcceptedTerm> {
+    requested
+        .iter()
+        .map(|term| accepted_term(term, context))
+        .collect()
 }
 
 /// The accepted term a requested term becomes.
 ///
-/// `GetAgreementTerms` documents what an accepted term carries: the `TermType`,
-/// the `TermID` "which is common between offer and agreement", and the
-/// `Configuration` — "the buyer/acceptor's selection at the time of agreement
-/// creation". The payload members beyond those (a EULA document, a rate card, a
-/// price) belong to the proposal this emulator does not hold, and stay absent.
-pub fn accepted_term(requested: &RequestedTerm) -> AcceptedTerm {
-    let kind = term_kind(requested);
+/// `GetAgreementTerms` documents the three members that come from the request
+/// and the agreement: the `TermType` ([`resolved_term_kind`]), the `TermID`
+/// "which is common between offer and agreement", and the `Configuration` —
+/// "the buyer/acceptor's selection at the time of agreement creation". Every
+/// OTHER payload member belongs to the proposal's own term document, which is
+/// what [`OFFER_DOCUMENT`] publishes: the term's currency and rate cards, its
+/// price, duration, schedule, grants and policy text, and — for a validity term
+/// — the window the agreement itself runs for (`context`). A term whose kind
+/// the request does not resolve carries no payload at all; see
+/// [`DEFAULT_TERM_KIND`].
+pub fn accepted_term(requested: &RequestedTerm, context: &AcceptedTermContext<'_>) -> AcceptedTerm {
+    let resolved = resolved_term_kind(requested, context.source);
+    let kind = resolved.unwrap_or(DEFAULT_TERM_KIND);
     let r#type = Some(kind.to_string());
     let id = Some(requested.id.clone());
     let configuration = requested.configuration.clone();
+    let currency_code = Some(CURRENCY_CODE.to_string());
     match kind {
         "SupportTerm" => AcceptedTerm::supportTerm(SupportTerm {
             r#type,
             id,
-            ..Default::default()
+            refund_policy: Some(OFFER_DOCUMENT.refund_policy.to_string()),
         }),
         "RenewalTerm" => AcceptedTerm::renewalTerm(RenewalTerm {
             r#type,
@@ -1207,17 +1557,33 @@ pub fn accepted_term(requested: &RequestedTerm) -> AcceptedTerm {
                 Some(RequestedTermConfiguration::renewalTermConfiguration(cfg)) => Some(cfg),
                 _ => None,
             },
-            ..Default::default()
+            lockout_period: Some(OFFER_DOCUMENT.lockout_period.to_string()),
+            max_renewals: Some(OFFER_DOCUMENT.max_renewals),
+            // "This field applies only when `PriceIncrease` is a
+            // `PercentageRange`", and the published offer raises no price at
+            // renewal, so neither member carries a value: `priceIncrease` "is
+            // null when the price doesn't change at renewal" and
+            // `termTemplates` "is null when no terms change at renewal".
+            adjustment_deadline: None,
+            price_increase: None,
+            term_templates: None,
         }),
         "UsageBasedPricingTerm" => AcceptedTerm::usageBasedPricingTerm(UsageBasedPricingTerm {
             r#type,
             id,
-            ..Default::default()
+            currency_code,
+            rate_cards: Some(published_usage_rate_cards()),
         }),
         "ConfigurableUpfrontPricingTerm" => {
             AcceptedTerm::configurableUpfrontPricingTerm(ConfigurableUpfrontPricingTerm {
                 r#type,
                 id,
+                currency_code,
+                // "The `RateCard` section will define the prices and dimensions
+                // defined by the seller (proposer), whereas the `Configuration`
+                // section will define the actual dimensions, prices, and units
+                // the buyer has chosen to accept" (`Dimension$dimensionValue`).
+                rate_cards: Some(published_configurable_rate_cards()),
                 configuration: match configuration {
                     Some(
                         RequestedTermConfiguration::configurableUpfrontPricingTermConfiguration(
@@ -1226,60 +1592,93 @@ pub fn accepted_term(requested: &RequestedTerm) -> AcceptedTerm {
                     ) => Some(cfg),
                     _ => None,
                 },
-                ..Default::default()
             })
         }
         "ByolPricingTerm" => AcceptedTerm::byolPricingTerm(ByolPricingTerm { r#type, id }),
         "RecurringPaymentTerm" => AcceptedTerm::recurringPaymentTerm(RecurringPaymentTerm {
             r#type,
             id,
-            ..Default::default()
+            currency_code,
+            billing_period: Some(OFFER_DOCUMENT.billing_period.to_string()),
+            price: published_term_price(kind).map(|price| amount(u128::from(price))),
         }),
         "ValidityTerm" => AcceptedTerm::validityTerm(ValidityTerm {
             r#type,
             id,
-            ..Default::default()
+            agreement_duration: Some(context.contract_length.to_string()),
+            agreement_start_date: Some(::aws_smithy_types::DateTime::from(context.start)),
+            agreement_end_date: Some(::aws_smithy_types::DateTime::from(context.validity_end())),
         }),
         "PaymentScheduleTerm" => AcceptedTerm::paymentScheduleTerm(PaymentScheduleTerm {
             r#type,
             id,
-            ..Default::default()
+            currency_code,
+            schedule: Some(published_schedule(context)),
         }),
         "FreeTrialPricingTerm" => AcceptedTerm::freeTrialPricingTerm(FreeTrialPricingTerm {
             r#type,
             id,
-            ..Default::default()
+            duration: Some(OFFER_DOCUMENT.free_trial_duration.to_string()),
+            grants: Some(published_grants()),
         }),
         "FixedUpfrontPricingTerm" => {
             AcceptedTerm::fixedUpfrontPricingTerm(FixedUpfrontPricingTerm {
                 r#type,
                 id,
-                ..Default::default()
+                currency_code,
+                duration: Some(context.contract_length.to_string()),
+                price: published_term_price(kind).map(|price| amount(u128::from(price))),
+                grants: Some(published_grants()),
             })
         }
         "VariablePaymentTerm" => AcceptedTerm::variablePaymentTerm(VariablePaymentTerm {
             r#type,
             id,
+            currency_code,
+            max_total_charge_amount: Some(amount(u128::from(
+                OFFER_DOCUMENT.max_total_charge_amount,
+            ))),
             configuration: match configuration {
                 Some(RequestedTermConfiguration::variablePaymentTermConfiguration(cfg)) => {
                     Some(cfg)
                 }
                 _ => None,
             },
-            ..Default::default()
         }),
         "NetPaymentTerm" => AcceptedTerm::netPaymentTerm(NetPaymentTerm {
             r#type,
             id,
-            ..Default::default()
+            payment_due_period: Some(OFFER_DOCUMENT.payment_due_period.to_string()),
         }),
-        // `DEFAULT_TERM_KIND`, and the kind a `LegalTerm` id names.
+        // `DEFAULT_TERM_KIND`, and the kind a `LegalTerm` id names. The
+        // documents are the published offer document's own, and a term whose
+        // kind nothing resolved carries NONE of them: it is the one case a term
+        // reaches this arm without naming its kind, and reporting the published
+        // EULA for it would assert a legal document no proposal proposed.
         _ => AcceptedTerm::legalTerm(LegalTerm {
             r#type,
             id,
-            ..Default::default()
+            documents: resolved.is_some().then(published_documents),
         }),
     }
+}
+
+/// When the agreement that holds `terms` ends, or `None` for an agreement whose
+/// terms set no end date.
+///
+/// `ValidityTerm$agreementEndDate` "defines the date when the agreement ends"
+/// and `DescribeAgreementOutput$endTime` is "the date and time when the
+/// agreement ends": one value, so the agreement ends when its accepted validity
+/// term says it does. Terms carrying no validity term leave it absent — "the
+/// field is null for pay-as-you-go agreements, which don't have end dates".
+pub fn agreement_end_time(
+    terms: &[AcceptedTerm],
+    context: &AcceptedTermContext<'_>,
+) -> Option<SystemTime> {
+    terms
+        .iter()
+        .any(|term| matches!(term, AcceptedTerm::validityTerm(_)))
+        .then(|| context.validity_end())
 }
 
 /// When a term of `kind` is charged, or `None` for a kind that carries no
@@ -1454,8 +1853,9 @@ pub struct Agreement {
     pub status: String,
     pub start_time: SystemTime,
     /// "The field is null for pay-as-you-go agreements, which don't have end
-    /// dates." The requested terms this emulator accepts carry no validity
-    /// dates, so an agreement it mints has no end date.
+    /// dates": an agreement ends when its accepted `ValidityTerm` says it does
+    /// ([`agreement_end_time`]), and one whose accepted terms carry no validity
+    /// term has no end date at all.
     pub end_time: Option<SystemTime>,
     pub acceptance_time: SystemTime,
     pub proposal_summary: ProposalSummary,
@@ -1667,6 +2067,19 @@ impl Agreement {
         }
     }
 
+    /// The accepted term of this agreement that `id` names, or `None` when it
+    /// holds none with that id.
+    ///
+    /// The `TermID` is "common between offer and agreement", so a term of this
+    /// id on an agreement derived from this one is the same term of the same
+    /// proposal — which is what [`resolved_term_kind`] reads a carried-over
+    /// term's kind from.
+    pub fn accepted_term(&self, id: &str) -> Option<&AcceptedTerm> {
+        self.accepted_terms
+            .iter()
+            .find(|term| accepted_term_id(term) == Some(id))
+    }
+
     /// The accepted `VariablePaymentTerm` of this agreement that `term_id`
     /// names, or `None` when no accepted term of that kind carries that id.
     ///
@@ -1718,10 +2131,9 @@ pub struct PaymentRequest {
     pub description: Option<String>,
     pub charge_amount: String,
     /// "The currency code for the charge amount": the currency of the accepted
-    /// term, which is `VariablePaymentTerm$currencyCode`. The term belongs to an
-    /// agreement proposal this emulator does not hold (see the module docs), so
-    /// an accepted term carries no currency and neither does a payment request
-    /// sent under it.
+    /// term, which is `VariablePaymentTerm$currencyCode` — read from that term
+    /// when the request is sent, so a request reports the currency the term it
+    /// was sent under is denominated in and nothing re-derives it later.
     pub currency_code: Option<String>,
     /// One of `PaymentRequestStatus`'s values.
     pub status: String,
@@ -2026,6 +2438,26 @@ pub fn accepted_term_kind(term: &AcceptedTerm) -> &str {
         AcceptedTerm::netPaymentTerm(t) => t.r#type.as_deref(),
     };
     r#type.unwrap_or(DEFAULT_TERM_KIND)
+}
+
+/// The id of an accepted term — the `TermID` "which is common between offer and
+/// agreement", so it is what names the same term across a chain of agreements.
+pub fn accepted_term_id(term: &AcceptedTerm) -> Option<&str> {
+    match term {
+        AcceptedTerm::legalTerm(t) => t.id.as_deref(),
+        AcceptedTerm::supportTerm(t) => t.id.as_deref(),
+        AcceptedTerm::renewalTerm(t) => t.id.as_deref(),
+        AcceptedTerm::usageBasedPricingTerm(t) => t.id.as_deref(),
+        AcceptedTerm::configurableUpfrontPricingTerm(t) => t.id.as_deref(),
+        AcceptedTerm::byolPricingTerm(t) => t.id.as_deref(),
+        AcceptedTerm::recurringPaymentTerm(t) => t.id.as_deref(),
+        AcceptedTerm::validityTerm(t) => t.id.as_deref(),
+        AcceptedTerm::paymentScheduleTerm(t) => t.id.as_deref(),
+        AcceptedTerm::freeTrialPricingTerm(t) => t.id.as_deref(),
+        AcceptedTerm::fixedUpfrontPricingTerm(t) => t.id.as_deref(),
+        AcceptedTerm::variablePaymentTerm(t) => t.id.as_deref(),
+        AcceptedTerm::netPaymentTerm(t) => t.id.as_deref(),
+    }
 }
 
 /// One billing adjustment request: what `BatchCreateBillingAdjustmentRequest`
@@ -3517,11 +3949,22 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     ) -> ChargeSummary {
         // "This value is 0 for NEW intent"; an amendment or replacement reads
         // the quantities the source agreement already holds.
-        let old_quantities = source_agreement_id
+        let source = source_agreement_id
             .filter(|_| intent != INTENT_NEW)
-            .and_then(|id| self.agreements.get(id))
+            .and_then(|id| self.agreements.get(id));
+        let old_quantities = source
             .map(|source| dimension_quantities(&source.accepted_terms))
             .unwrap_or_default();
+        // The kind of each requested term, resolved the ONE way the acceptance
+        // of this quote will resolve it ([`term_kind`]) — including from the
+        // agreement an amendment carries a term over from — so the charge a
+        // term is quoted for and the term the agreement reports are about the
+        // same kind of term. Resolved before anything mints a charge id, since
+        // that borrows the store mutably.
+        let kinds: Vec<&'static str> = requested_terms
+            .iter()
+            .map(|requested| term_kind(requested, source))
+            .collect();
 
         let mut expected_charges: Vec<ExpectedCharge> = Vec::new();
         let mut itemized_charges: Vec<ItemizedCharge> = Vec::new();
@@ -3533,8 +3976,7 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
         let mut committed_total: u128 = 0;
         let mut commits = false;
         let mut unpriced = false;
-        for requested in requested_terms {
-            let kind = term_kind(requested);
+        for (requested, kind) in requested_terms.iter().zip(kinds) {
             let Some(timing) = charge_timing(kind) else {
                 continue;
             };

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddFlowVpcInterfaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddFlowVpcInterfaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddFlowVpcInterfaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds VPC interfaces to a flow PERSISTED in [`crate::state`]: each requested VPC
+//! interface is materialised into the flow's record — with the elastic network interface
+//! the service creates for it — so DescribeFlow reports exactly what this operation wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +76,31 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::BTreeSet;
+
+use crate::state::MAX_FLOW_VPC_INTERFACES;
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> AddFlowVpcInterfacesError {
+    AddFlowVpcInterfacesErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the flow `identifier` addressed, in this
+/// service's not-found envelope ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> AddFlowVpcInterfacesError {
+    AddFlowVpcInterfacesErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,18 +175,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddFlowVpcInterfaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddFlowVpcInterfacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing in this operation's answer depends on request metadata: the flow ARN is
+        // an `@httpLabel` the deserializer already put on `input`, the VPC interfaces come
+        // from the body, and the response is read back out of the stored flow. The elastic
+        // network interface ids this call mints are not ARNs, so the request's Region is not
+        // read either.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AddFlowVpcInterfacesErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect flow store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "A list of VPC interfaces that you want to add to the flow" is required, so the
+        // member is present — but an empty list adds nothing, which is a semantic error in
+        // the request rather than a no-op success.
+        if input.vpc_interfaces.is_empty() {
+            return Err(bad_request(
+                "An add flow VPC interfaces request must include at least one VPC interface.",
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The status change the clock already owes this flow is materialised before the flow
+        // is read or written, exactly as the other add operations and the reporting
+        // operations do it.
+        store.settle_due_transitions(now);
+
+        // This operation adds VPC interfaces to an existing flow, addressed by its own ARN.
+        let Some(flow) = store.flows.get(&input.flow_arn) else {
+            return Err(not_found(&input.flow_arn));
+        };
+
+        // The whole request is checked before anything is stored, so a request with one bad
+        // entry adds none of its entries.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddFlowVpcInterfaces"))
+        // How many VPC interfaces a flow HOLDS is bounded (see
+        // `crate::state::MAX_FLOW_VPC_INTERFACES`), so what it already holds counts towards
+        // the bound and no sequence of adds can grow a flow past it.
+        let held = flow.vpc_interfaces.len();
+        if held + input.vpc_interfaces.len() > MAX_FLOW_VPC_INTERFACES {
+            return Err(bad_request(format!(
+                "A flow may hold at most {MAX_FLOW_VPC_INTERFACES} VPC interfaces; this flow \
+                 holds {held} and the request adds {}.",
+                input.vpc_interfaces.len()
+            )));
+        }
+
+        // A VPC interface is addressed by name within its flow and its name "has to be a
+        // unique against other VpcInterfaces in this Flow", so each requested name is
+        // checked against the ones the flow already holds AND against the ones earlier in
+        // this request. The rule is stated once in `crate::state`, so CreateFlow refuses the
+        // same requests this does.
+        let mut names: BTreeSet<String> = flow
+            .vpc_interfaces
+            .iter()
+            .map(|vpc_interface| vpc_interface.name.clone())
+            .collect();
+        for request in &input.vpc_interfaces {
+            if let Some(rejection) = crate::state::vpc_interface_rejection(request, &names) {
+                return Err(bad_request(rejection));
+            }
+            names.insert(request.name.clone());
+        }
+
+        // Nothing above wrote anything, so a refused request leaves the flow exactly as it
+        // was. From here the whole batch is stored: the checks above borrowed the flow to
+        // read it, and the append takes it again mutably, both under the one store lock this
+        // call holds — so the flow found a moment ago is still there, and a store that
+        // somehow no longer holds it holds no flow this request can add to either, which is
+        // the same not-found answer the lookup above gives. Each VPC interface is
+        // materialised through `crate::state`, with a unique suffix for the elastic network
+        // interface the service creates for it.
+        let added: Vec<VpcInterface> = input
+            .vpc_interfaces
+            .iter()
+            .map(|request| {
+                let suffix = store.next_suffix();
+                crate::state::materialise_vpc_interface(request, suffix)
+            })
+            .collect();
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(not_found(&input.flow_arn));
+        };
+        let first_added = flow.vpc_interfaces.len();
+        flow.vpc_interfaces.extend(added);
+
+        // "The details of the newly added VPC interfaces" — read back out of the STORED
+        // flow, not echoed from the request, and only the ones this call appended. Adding a
+        // VPC interface moves nothing else about the flow: its status is left as it was,
+        // because no clock owes a change for an added VPC interface.
+        Ok(AddFlowVpcInterfacesOutput {
+            flow_arn: Some(flow.flow_arn.clone()),
+            vpc_interfaces: Some(flow.vpc_interfaces[first_added..].to_vec()),
+        })
     }
 }

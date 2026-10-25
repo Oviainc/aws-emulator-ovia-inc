@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLensShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLensShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: revokes one share of one CUSTOM lens — the share `CreateLensShare`
+//! recorded in [`crate::state`] — so the principal it was offered to can no longer apply
+//! the lens to new workloads and the same principal can be granted a fresh share. The
+//! lens is resolved by its `LensAlias` and the share by its `ShareId` within that lens,
+//! so a name that resolves to no lens and a share id the lens does not hold are each
+//! `ResourceNotFoundException` (404) and change nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLensShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A lens Amazon Web Services publishes is a 404 here and not the 400
+//! `ValidationException` `CreateLensShare` refuses it with, deliberately: the create is
+//! told the LENS it was given cannot be shared, while this operation is asked to remove a
+//! SHARE, and an official lens — which cannot be shared at all — holds none for any
+//! `ShareId` to name. That reading of the two operations' docs is this emulator's, not
+//! something the model pins, so a recording of the real service could settle it the other
+//! way.
+//!
+//! A retry is keyed to `ClientRequestToken` exactly as `DeleteWorkload` and
+//! `DeleteReviewTemplate` key theirs, through [`crate::state::delete_replay`] and this
+//! service's ledger of completed lens-share deletes: the `@idempotencyToken` rule the
+//! shape documents says a retry under the same token and the same parameters, after the
+//! original request completed successfully, is answered with that request's result — so
+//! the retry replays the empty success rather than the `ResourceNotFoundException` the
+//! original request's own work would otherwise produce. The same token carrying DIFFERENT
+//! parameters is a different request, which is the modelled `ConflictException` (409), and
+//! the token is recorded only once a removal has landed, so a refused request leaves it
+//! free. A delete of a share that is gone under a token of its own is still the 404 any
+//! other `ShareId` naming no share gets.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +208,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLensShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLensShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteLensShareErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool lens store is unavailable".to_string(),
+            })
+        })?;
+
+        // `ClientRequestToken` is `@idempotencyToken`, and the rule it documents holds
+        // here exactly as it does for `DeleteWorkload` and `DeleteReviewTemplate`: a retry
+        // under the same token and the same parameters, after the original request
+        // completed successfully, replays that request's result. The parameters besides
+        // the token are the lens the share belongs to and the share itself, so the
+        // fingerprint is over those two.
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "LensAlias": &input.lens_alias,
+            "ShareId": &input.share_id,
+        }));
+
+        let mut store = state.lock();
+
+        // Read before the lens and the share are resolved: the original request removed
+        // the share, so neither resolves to it any more and only the recorded delete can
+        // answer the retry.
+        match crate::state::delete_replay(
+            &store.delete_lens_share_tokens,
+            &input.client_request_token,
+            crate::state::LENS_SHARE_RESOURCE_TYPE,
+            &fingerprint,
+        ) {
+            crate::state::DeleteReplay::Replay => return Ok(DeleteLensShareOutput),
+            crate::state::DeleteReplay::Conflict(exception) => {
+                return Err(DeleteLensShareErrorModeled::ConflictException(exception).into())
+            }
+            crate::state::DeleteReplay::Fresh => {}
+        }
+
+        // The share belongs to the lens the request names, so that lens has to resolve
+        // first — and a STORED CUSTOM lens is the only kind that can hold a share, because
+        // "Lenses provided by Amazon Web Services (Amazon Web Services Official Content)
+        // cannot be shared" (`CreateLensShare` doc). Its own `lens_id` is what the share
+        // store is keyed by (`CreateLensShare` records a share under it), so the key is
+        // read off the resolved record in ONE lookup rather than derived from the alias a
+        // second time: the two sides of the store cannot drift.
+        let lens_id = match store
+            .lens_by_alias(&input.lens_alias)
+            .map(|record| record.lens_id.clone())
+        {
+            Some(lens_id) => lens_id,
+            // No stored custom lens answers to the name. A lens Amazon Web Services
+            // publishes exists and holds no shares, so what is missing is the SHARE; a
+            // name that resolves to no lens at all is reported as the missing lens.
+            None => {
+                let missing = if crate::state::is_published_official_lens(&input.lens_alias) {
+                    crate::state::lens_share_not_found(&input.lens_alias, &input.share_id)
+                } else {
+                    crate::state::unknown_lens_not_found(&input.lens_alias)
+                };
+                return Err(
+                    DeleteLensShareErrorModeled::ResourceNotFoundException(missing).into(),
+                );
+            }
+        };
+
+        // "After the lens share is deleted, Amazon Web Services accounts, users,
+        // organizations, and organizational units (OUs) that you shared the lens with can
+        // continue to use it, but they will no longer be able to apply it to new
+        // workloads" (this operation's doc): what the delete removes is the SHARE, and
+        // nothing about the lens itself or about what the recipient already applied it to.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLensShare"))
+        // The share is resolved within the lens that holds it, so a `ShareId` belonging to
+        // another lens — or to a lens that holds no shares — is as absent here as one
+        // belonging to no share.
+        if store.remove_lens_share(&lens_id, &input.share_id).is_none() {
+            return Err(DeleteLensShareErrorModeled::ResourceNotFoundException(
+                crate::state::lens_share_not_found(&input.lens_alias, &input.share_id),
+            )
+            .into());
+        }
+
+        // Recorded only now the delete has COMPLETED SUCCESSFULLY, as the sibling deletes
+        // record theirs: a refused request has no result to replay, so the token it
+        // carried is still free. The share is named by its own `ShareId`, which is what a
+        // token spent on another share reports in its conflict.
+        store.delete_lens_share_tokens.remember(
+            input.client_request_token,
+            crate::state::CompletedDeleteToken {
+                resource_id: input.share_id,
+                fingerprint,
+            },
+        );
+
+        Ok(DeleteLensShareOutput)
     }
 }

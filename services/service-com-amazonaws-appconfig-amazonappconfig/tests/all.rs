@@ -65,6 +65,8 @@ mod refusal_message_templates;
 mod resource_deletes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/start_experiment_run.rs"]
+mod start_experiment_run;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stop_deployment.rs"]

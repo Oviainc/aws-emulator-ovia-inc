@@ -81,6 +81,8 @@ mod sam_deployed_resources;
 mod sam_transform;
 #[path = "all/scratch.rs"]
 mod scratch;
+#[path = "all/stack_exports.rs"]
+mod stack_exports;
 #[path = "all/stack_lifecycle.rs"]
 mod stack_lifecycle;
 #[path = "all/stack_output_resolution.rs"]

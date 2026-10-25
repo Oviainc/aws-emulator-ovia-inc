@@ -349,29 +349,28 @@ fn bare_id(arn: &str) -> String {
 /// it in every period.
 #[tokio::test]
 async fn a_disassociation_drops_the_association_however_the_resource_is_named() {
-    // (case, how many billing groups to use, how many custom line items to use, name
-    // them by bare id rather than by full ARN)
-    let cases: [(&str, usize, usize, bool); 7] = [
-        ("one billing group by ARN", 1, 0, false),
-        ("one billing group by bare id", 1, 0, true),
-        ("one custom line item by ARN", 0, 1, false),
-        ("one custom line item by bare id", 0, 1, true),
-        ("two of each class by ARN", 2, 2, false),
-        ("two of each class by bare id", 2, 2, true),
-        ("three billing groups by ARN", 3, 0, false),
+    // (case, name the item's OWN billing group as a resource, how many custom line
+    // items of that group to use, name them by bare id rather than by full ARN)
+    let cases: [(&str, bool, usize, bool); 7] = [
+        ("the own billing group by ARN", true, 0, false),
+        ("the own billing group by bare id", true, 0, true),
+        ("one custom line item by ARN", false, 1, false),
+        ("one custom line item by bare id", false, 1, true),
+        ("the group and two items by ARN", true, 2, false),
+        ("the group and two items by bare id", true, 2, true),
+        ("three custom line items by ARN", false, 3, false),
     ];
 
-    for (case, groups, items, by_id) in cases {
+    for (case, own_group, items, by_id) in cases {
         let emulator = Emulator::new();
         let home = emulator.billing_group("home").await;
         let target = emulator.percentage_item(&home, "target").await;
 
         let mut requested: Vec<String> = Vec::new();
         let mut associated: Vec<(String, String)> = Vec::new();
-        for index in 0..groups {
-            let arn = emulator.billing_group(&format!("group{index}")).await;
-            requested.push(if by_id { bare_id(&arn) } else { arn.clone() });
-            associated.push((arn, "PARENT".to_string()));
+        if own_group {
+            requested.push(if by_id { bare_id(&home) } else { home.clone() });
+            associated.push((home.clone(), "PARENT".to_string()));
         }
         for index in 0..items {
             let arn = emulator
@@ -419,7 +418,9 @@ async fn a_disassociation_leaves_the_associations_it_does_not_name() {
     let emulator = Emulator::new();
     let home = emulator.billing_group("home").await;
     let target = emulator.percentage_item(&home, "target").await;
-    let kept = emulator.billing_group("kept").await;
+    // The resources in scope of the target: the billing group it applies to, and a
+    // custom line item of that same group.
+    let kept = home.clone();
     let dropped = emulator.percentage_item(&home, "dropped").await;
     emulator
         .associate(&target, &[kept.clone(), dropped.clone()], None)
@@ -456,7 +457,9 @@ async fn disassociating_a_resource_the_item_does_not_hold_succeeds_and_changes_n
     let emulator = Emulator::new();
     let home = emulator.billing_group("home").await;
     let target = emulator.percentage_item(&home, "target").await;
-    let kept = emulator.billing_group("kept").await;
+    let kept = home.clone();
+    // A resource that exists but was never associated to the target: a billing group
+    // of its own, which no association of this item could name.
     let never = emulator.billing_group("never").await;
     let once = emulator.percentage_item(&home, "once").await;
     emulator
@@ -557,8 +560,10 @@ async fn a_resource_that_cannot_be_disassociated_fails_as_its_own_element() {
         let emulator = Emulator::new();
         let home = emulator.billing_group("home").await;
         let target = emulator.percentage_item(&home, "target").await;
-        let good = emulator.billing_group("good").await;
-        let other = emulator.billing_group("other").await;
+        // Two resources the target really holds: the billing group it applies to, and
+        // a custom line item of that same group.
+        let good = home.clone();
+        let other = emulator.percentage_item(&home, "other").await;
         emulator
             .associate(&target, &[good.clone(), other.clone()], None)
             .await;
@@ -590,7 +595,7 @@ async fn a_resource_that_cannot_be_disassociated_fails_as_its_own_element() {
         );
         assert_eq!(
             emulator.association_pairs(&target, json!({})).await,
-            vec![(other.clone(), "PARENT".to_string())],
+            vec![(other.clone(), "CHILD".to_string())],
             "case {case:?}: expected only the resource the request succeeded on to be \
              disassociated"
         );
@@ -607,7 +612,7 @@ async fn a_request_level_fault_is_the_calls_own_modelled_error() {
     let home = emulator.billing_group("home").await;
     let target = emulator.percentage_item(&home, "target").await;
     let flat = emulator.flat_item(&home, "flat").await;
-    let group = emulator.billing_group("group").await;
+    let group = home.clone();
     emulator
         .associate(&target, std::slice::from_ref(&group), None)
         .await;
@@ -778,7 +783,7 @@ async fn a_ranged_disassociation_ends_the_association_at_its_inclusive_start() {
         let emulator = Emulator::new();
         let home = emulator.billing_group("home").await;
         let target = emulator.percentage_item(&home, "target").await;
-        let resource = emulator.billing_group("resource").await;
+        let resource = home.clone();
         emulator
             .associate(
                 &target,
@@ -1047,7 +1052,7 @@ async fn a_bounded_disassociation_removes_only_the_periods_its_range_covers() {
         let target = emulator.percentage_item(&home, "target").await;
         // Both classes of resource an association can name, each in one of the two
         // forms the member admits, disassociated in ONE request.
-        let group = emulator.billing_group("resource").await;
+        let group = home.clone();
         let child = emulator.percentage_item(&home, "child").await;
         let requested = vec![group.clone(), bare_id(&child)];
         emulator
@@ -1125,7 +1130,7 @@ async fn the_separate_ranges_of_one_association_are_bounded() {
     let emulator = Emulator::new();
     let home = emulator.billing_group("home").await;
     let target = emulator.percentage_item(&home, "target").await;
-    let resource = emulator.billing_group("resource").await;
+    let resource = home.clone();
     // Open-ended, so it starts as ONE stretch of billing periods.
     emulator
         .associate(&target, std::slice::from_ref(&resource), None)

@@ -720,6 +720,17 @@ pub struct StateMachineAlias {
     /// "The date the state machine alias was last updated. For a newly created
     /// state machine, this is the same as the creation date."
     pub update_date: SystemTime,
+    /// Which create minted this alias, counted by the store: `1` for the first alias
+    /// it ever accepted, `2` for the next, and so on. Stamped by
+    /// [`ComAmazonawsSfnAwsstepfunctionsState::insert_state_machine_alias`].
+    ///
+    /// This is what orders a listing of one state machine's aliases. The stored
+    /// instant cannot do it alone: two creates that land inside one clock tick carry
+    /// the same instant (and the wire reports it in whole milliseconds), so an order
+    /// keyed on it is not total, while the sequence the store hands out is — and it is
+    /// the order the creates were accepted in however coarse the clock is. Nothing but
+    /// a create sets it, so an alias keeps its place when it is updated.
+    pub creation_sequence: u64,
     /// The bytes the store counts for this record against [`MAX_STORE_BYTES`], set
     /// by [`ComAmazonawsSfnAwsstepfunctionsState::insert_state_machine_alias`].
     pub retained_bytes: usize,
@@ -1153,6 +1164,14 @@ pub struct Execution {
     /// the first time instead of redriving a second time.
     pub redrive_tokens: Vec<RedriveToken>,
     pub history: Vec<HistoryEvent>,
+    /// The step a `RedriveExecution` would continue this execution from: the state the
+    /// current attempt stopped at and the raw input it was entered with.
+    ///
+    /// `None` for an execution no attempt has stopped at a recorded step of — one that
+    /// is still running, or that failed inside a walk — which a redrive then walks
+    /// from the definition's `StartAt`. Cleared by the redrive that consumes it, which
+    /// records the next attempt's own step if that attempt stops at one.
+    pub redrive_step: Option<asl::RedriveStep>,
     /// The outcome the interpreter computed, until the clock makes it due.
     pub pending: Option<PendingOutcome>,
     /// The bytes the store counts for this record against [`MAX_STORE_BYTES`], set
@@ -1196,6 +1215,7 @@ impl Execution {
             + self.state_machine_alias_arn.as_ref().map_or(0, String::len)
             + redrive_tokens_bytes(&self.redrive_tokens)
             + history_bytes(&self.history)
+            + self.redrive_step.as_ref().map_or(0, asl::RedriveStep::measure)
             + self.pending.as_ref().map_or(0, PendingOutcome::measure)
             // A running execution can still be stopped, and a stop writes a
             // caller-sized `error` and `cause` plus one event. Those bytes are
@@ -1303,6 +1323,9 @@ impl Execution {
         self.cause = None;
         self.redrive_count = self.redrive_count.saturating_add(1);
         self.redrive_date = Some(now);
+        // The step this redrive continued from has been consumed: the attempt it
+        // begins records its own if it stops at one.
+        self.redrive_step = None;
         if let Some(token) = client_token {
             // Only the last [`MAX_REDRIVE_CLIENT_TOKENS`] are remembered, so this
             // list is bounded however many redrives one execution takes.
@@ -1499,6 +1522,11 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// [`ComAmazonawsSfnAwsstepfunctionsState::fresh_execution_name`] and
     /// [`ComAmazonawsSfnAwsstepfunctionsState::fresh_revision_id`].
     name_counter: u64,
+    /// How many state machine aliases this store has ever accepted, which stamps each
+    /// one's [`StateMachineAlias::creation_sequence`] and so orders a listing of them.
+    /// It only ever increases, so a sequence a deleted alias held is never handed out
+    /// again and the aliases that remain keep their relative order.
+    alias_sequence: u64,
 }
 
 impl ComAmazonawsSfnAwsstepfunctionsState {
@@ -1737,10 +1765,44 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         pending: Option<PendingOutcome>,
         extra_bytes: usize,
     ) -> Result<(), TaskReplyRejection> {
+        self.close_activity_task(token, events, pending, extra_bytes, false)
+    }
+
+    /// Record the reply that reports the task `token` names FAILED.
+    ///
+    /// The same close as [`Self::answer_activity_task`], plus the one thing a failure
+    /// leaves behind: the attempt stopped AT this task's state, so that state and the
+    /// raw input it was entered with are recorded as the step a later
+    /// `RedriveExecution` continues the execution from.
+    pub fn fail_activity_task(
+        &mut self,
+        token: &str,
+        events: Vec<HistoryEvent>,
+        pending: Option<PendingOutcome>,
+    ) -> Result<(), TaskReplyRejection> {
+        self.close_activity_task(token, events, pending, 0, true)
+    }
+
+    /// Close the task `token` names, recording what the call that closed it computed.
+    ///
+    /// `stopped_at_task` is whether the attempt STOPPED at this task's state (the task
+    /// failed) rather than carrying on past it (the task was answered with a result).
+    fn close_activity_task(
+        &mut self,
+        token: &str,
+        events: Vec<HistoryEvent>,
+        pending: Option<PendingOutcome>,
+        extra_bytes: usize,
+        stopped_at_task: bool,
+    ) -> Result<(), TaskReplyRejection> {
         let Some(task) = self.activity_tasks.get(token) else {
             return Err(TaskReplyRejection::Gone);
         };
         let execution_arn = task.execution_arn.clone();
+        let stopped_at = stopped_at_task.then(|| asl::RedriveStep {
+            state_name: task.state_name.clone(),
+            state_input: task.state_input.clone(),
+        });
         // A task whose execution is terminal — stopped, or failed when the clock
         // closed an earlier bound — is answered by nobody: `settle` discards it, and
         // one that is still here when this runs is in that same state.
@@ -1754,6 +1816,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         let before = execution.retained_bytes;
         let mut candidate = execution.clone();
         candidate.apply_continuation(events, pending);
+        if let Some(stopped_at) = stopped_at {
+            candidate.redrive_step = Some(stopped_at);
+        }
         let after = candidate.measure();
         if after + extra_bytes > before && !self.has_room_for(after + extra_bytes - before) {
             return Err(TaskReplyRejection::NoRoom);
@@ -1799,6 +1864,12 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         execution.stop_date = Some(due);
         execution.error = Some(TASK_TIMEOUT_ERROR.to_string());
         execution.cause = Some(cause);
+        // The attempt stopped AT this task's state, so that is the step a later
+        // redrive continues from — the same step a worker's reported failure leaves.
+        execution.redrive_step = Some(asl::RedriveStep {
+            state_name: task.state_name.clone(),
+            state_input: task.state_input.clone(),
+        });
         execution.push_event(EVENT_ACTIVITY_TIMED_OUT, due);
         execution.push_event(EVENT_EXECUTION_FAILED, due);
         // The record is re-measured exactly as a stop re-measures it: the execution
@@ -2230,11 +2301,83 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     // -----------------------------------------------------------------------
 
     /// Store a newly created state machine alias under its own ARN, counting what it
-    /// retains.
+    /// retains and stamping the create's place in the order the store accepted them.
     pub fn insert_state_machine_alias(&mut self, mut alias: StateMachineAlias) {
+        self.alias_sequence = self.alias_sequence.saturating_add(1);
+        alias.creation_sequence = self.alias_sequence;
         alias.retained_bytes = alias.measure();
         self.retained_bytes = self.retained_bytes.saturating_add(alias.retained_bytes);
         self.state_machine_aliases.insert(alias.arn.clone(), alias);
+    }
+
+    /// Apply an `UpdateStateMachineAlias` to the alias `arn` names, and report the
+    /// instant it reports as its `updateDate`.
+    ///
+    /// The record is mutated IN PLACE: an update "modif[ies] its description or
+    /// routingConfiguration" and mints nothing, so the alias keeps its ARN, its
+    /// creation date and its place in the order the store accepted the creates (see
+    /// [`StateMachineAlias::creation_sequence`]). Only the members the request named
+    /// are written — `None` leaves what the alias holds.
+    ///
+    /// "UpdateStateMachineAlias is an idempotent API [...] Requests with the same
+    /// parameters return an idempotent response": a request that would write what the
+    /// record already holds answers the `updateDate` it already reports and changes
+    /// nothing, so a repeat does not keep moving that instant.
+    pub fn update_state_machine_alias(
+        &mut self,
+        arn: &str,
+        description: Option<String>,
+        routing_configuration: Option<Vec<RoutingConfigurationListItem>>,
+        now: SystemTime,
+    ) -> Result<SystemTime, AliasUpdateRejection> {
+        let Some(alias) = self.state_machine_aliases.get(arn) else {
+            return Err(AliasUpdateRejection::NotFound);
+        };
+        let before = alias.retained_bytes;
+        let mut candidate = alias.clone();
+        if let Some(description) = description {
+            candidate.description = Some(description);
+        }
+        if let Some(routing_configuration) = routing_configuration {
+            candidate.routing_configuration = routing_configuration;
+        }
+        if candidate.description == alias.description
+            && same_routing(
+                &candidate.routing_configuration,
+                &alias.routing_configuration,
+            )
+        {
+            return Ok(alias.update_date);
+        }
+        // "The date the state machine alias was last updated" moves only when this
+        // call really updated it.
+        candidate.update_date = now;
+        let after = candidate.measure();
+        if after > before && !self.has_room_for(after - before) {
+            return Err(AliasUpdateRejection::NoRoom);
+        }
+        candidate.retained_bytes = after;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(after)
+            .saturating_sub(before);
+        self.state_machine_aliases
+            .insert(arn.to_string(), candidate);
+        Ok(now)
+    }
+
+    /// Drop the alias `arn` names, giving back the bytes its record held, and report
+    /// it. `None` when the store holds no alias under that ARN.
+    ///
+    /// "When you delete a state machine alias, Step Functions doesn't delete the state
+    /// machine versions that alias references": an alias is a pointer, so this touches
+    /// nothing but the pointer. The store's creation sequence only ever increases, so
+    /// the place this frees is never handed out again and the aliases that remain keep
+    /// their relative order.
+    pub fn remove_state_machine_alias(&mut self, arn: &str) -> Option<StateMachineAlias> {
+        let alias = self.state_machine_aliases.remove(arn)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(alias.retained_bytes);
+        Some(alias)
     }
 
     /// The aliases of one state machine, in ARN order — which is alias-name order,
@@ -2252,32 +2395,30 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .collect()
     }
 
-    /// The aliases of one state machine, NEWEST FIRST.
+    /// The aliases of one state machine, in the order they were CREATED — oldest
+    /// first.
     ///
-    /// From `ListStateMachineAliases`' own documentation: "Results are sorted by
-    /// time, with the most recently created aliases listed first." Two aliases
-    /// created inside one clock tick carry the same creation time, so the ARN — which
-    /// no two aliases of one state machine share — breaks that tie and the order is
-    /// total, exactly as [`Self::versions_newest_first`] makes it total.
-    pub fn aliases_newest_first(&self, state_machine_arn: &str) -> Vec<&StateMachineAlias> {
+    /// This is the order a client observes from `ListStateMachineAliases`: the service
+    /// presents one state machine's aliases in the order the creates were accepted,
+    /// and that relative order does not move when another alias of the same state
+    /// machine is created, updated or deleted. The order is keyed on
+    /// [`StateMachineAlias::creation_sequence`], which no two aliases share, so it is
+    /// total and two listings of one unchanged state machine agree — which is what a
+    /// paged consumer reconciling positions against its own ledger needs.
+    pub fn aliases_in_creation_order(&self, state_machine_arn: &str) -> Vec<&StateMachineAlias> {
         let mut aliases = self.aliases_of(state_machine_arn);
-        aliases.sort_by(|left, right| {
-            right
-                .creation_date
-                .cmp(&left.creation_date)
-                .then_with(|| left.arn.cmp(&right.arn))
-        });
+        aliases.sort_by_key(|alias| alias.creation_sequence);
         aliases
     }
 
     /// The aliases of `state_machine_arn` whose routing configuration names the
-    /// version `version_arn`, newest first.
+    /// version `version_arn`, in the order they were created.
     pub fn aliases_routing_to(
         &self,
         state_machine_arn: &str,
         version_arn: &str,
     ) -> Vec<&StateMachineAlias> {
-        self.aliases_newest_first(state_machine_arn)
+        self.aliases_in_creation_order(state_machine_arn)
             .into_iter()
             .filter(|alias| alias.routes_to(version_arn))
             .collect()
@@ -3680,6 +3821,16 @@ pub enum TaskReplyRejection {
     NoRoom,
 }
 
+/// Why an `UpdateStateMachineAlias` was not applied; see
+/// [`ComAmazonawsSfnAwsstepfunctionsState::update_state_machine_alias`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AliasUpdateRejection {
+    /// The store holds no alias under that ARN — the modelled `ResourceNotFound`.
+    NotFound,
+    /// The updated record would take the store past [`MAX_STORE_BYTES`].
+    NoRoom,
+}
+
 /// Why a tag write was not applied; see
 /// [`ComAmazonawsSfnAwsstepfunctionsState::merge_tags`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4746,6 +4897,47 @@ pub fn plan_run(
         opening,
         previous_event_id,
         EXECUTION_SETTLE_DELAY,
+    )
+}
+
+/// Plan the attempt a `RedriveExecution` begins.
+///
+/// "When you redrive an execution, it continues the failed execution from the
+/// unsuccessful step and uses the same input": when the execution recorded the step
+/// its last attempt stopped at ([`asl::RedriveStep`]), the walk begins THERE, with the
+/// raw input that step was entered with, so the steps it already got past are not run
+/// again; with no such step recorded, the whole definition is walked again from its
+/// `StartAt`, which for the deterministic states this emulator runs reaches the same
+/// values those steps produced.
+///
+/// Either way the attempt opens its history with [`EVENT_EXECUTION_REDRIVEN`] —
+/// "redriven executions append their event history to the existing event history" —
+/// and its outcome is owed to the clock exactly as a start's is.
+pub fn plan_redrive(
+    definition: &str,
+    input: &str,
+    start: SystemTime,
+    context: &asl::Context,
+    from: Option<&asl::RedriveStep>,
+    previous_event_id: i64,
+) -> Planned {
+    let Some(from) = from else {
+        return plan_run(
+            definition,
+            input,
+            start,
+            context,
+            EVENT_EXECUTION_REDRIVEN,
+            previous_event_id,
+        );
+    };
+    let run = asl::redrive(definition, input, start, context, from);
+    plan_from_run(
+        run,
+        start,
+        EXECUTION_SETTLE_DELAY,
+        Some(EVENT_EXECUTION_REDRIVEN),
+        previous_event_id,
     )
 }
 
