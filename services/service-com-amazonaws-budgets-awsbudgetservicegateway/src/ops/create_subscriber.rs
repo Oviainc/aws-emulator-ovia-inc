@@ -156,7 +156,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The budgets control plane is scoped to the account the caller signed with, so
         // an `AccountId` naming any other account is refused with the modelled 403
         // before anything is read or written (`crate::state::foreign_account_refusal`).
@@ -186,88 +185,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let mut store = crate::state::store_at(&state, now);
-        // A subscriber is held inside the notification, which is held inside the budget,
-        // so the budget is resolved by the same `(AccountId, BudgetName)` identity every
-        // other operation uses: "you must create the associated budget and notification
-        // before you create the subscriber".
-        let stored = store
-            .budgets
-            .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
-            .ok_or_else(|| {
-                CreateSubscriberErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Unable to create subscriber: {} - the budget doesn't exist.",
-                        input.budget_name
-                    )),
-                })
-            })?;
-        // A notification carries no id: the caller names the one to subscribe to by
-        // value, and `crate::state::same_notification` holds which members that identity
-        // is made of (the service-owned alarm state is not one of them).
-        let held = crate::state::find_notification_mut(stored, &input.notification)
-            .ok_or_else(|| {
-                // The refusal names the notification the caller asked for by the members
-                // that identify it, so it reads as the notification being missing rather
-                // than the budget that was found.
-                CreateSubscriberErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Unable to create subscriber: {} - the notification doesn't exist \
-                         (NotificationType {}, ComparisonOperator {}, Threshold {}, \
-                         ThresholdType {}).",
-                        input.budget_name,
-                        input.notification.notification_type,
-                        input.notification.comparison_operator,
-                        input.notification.threshold,
-                        input
-                            .notification
-                            .threshold_type
-                            .as_deref()
-                            .unwrap_or(crate::state::THRESHOLD_TYPE_PERCENTAGE)
-                    )),
-                })
-            })?;
+        // Every write this call makes is made under the store's lock, and the lock is
+        // released at the end of this block: the alert it leaves owed is published
+        // afterwards, so no delivery is made while the store is held.
+        let alerts = {
+            let mut store = crate::state::store_at(&state, now);
+            // A subscriber is held inside the notification, which is held inside the
+            // budget, so the budget is resolved by the same `(AccountId, BudgetName)`
+            // identity every other operation uses: "you must create the associated budget
+            // and notification before you create the subscriber".
+            let stored = store
+                .budgets
+                .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+                .ok_or_else(|| {
+                    CreateSubscriberErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(format!(
+                            "Unable to create subscriber: {} - the budget doesn't exist.",
+                            input.budget_name
+                        )),
+                    })
+                })?;
+            // The budget an alert for one of its notifications names, read before the
+            // notification inside it is reached mutably below.
+            let source = crate::state::alerts::source(&input.account_id, &stored.budget);
+            // A notification carries no id: the caller names the one to subscribe to by
+            // value, and `crate::state::same_notification` holds which members that
+            // identity is made of (the service-owned alarm state is not one of them).
+            let held = crate::state::find_notification_mut(stored, &input.notification)
+                .ok_or_else(|| {
+                    // The refusal names the notification the caller asked for by the
+                    // members that identify it, so it reads as the notification being
+                    // missing rather than the budget that was found.
+                    CreateSubscriberErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(format!(
+                            "Unable to create subscriber: {} - the notification doesn't exist \
+                             (NotificationType {}, ComparisonOperator {}, Threshold {}, \
+                             ThresholdType {}).",
+                            input.budget_name,
+                            input.notification.notification_type,
+                            input.notification.comparison_operator,
+                            input.notification.threshold,
+                            input
+                                .notification
+                                .threshold_type
+                                .as_deref()
+                                .unwrap_or(crate::state::THRESHOLD_TYPE_PERCENTAGE)
+                        )),
+                    })
+                })?;
 
-        // The subscription type and the address are what identify a subscriber, so a
-        // notification cannot hold two of the same one: a repeat of one it already has is
-        // the duplicate record, not a second copy in the set a read reports.
-        if held
-            .subscribers
-            .iter()
-            .any(|subscriber| crate::state::same_subscriber(subscriber, &input.subscriber))
-        {
-            return Err(CreateSubscriberErrorModeled::DuplicateRecordException(
-                DuplicateRecordException {
-                    message: Some(format!(
-                        "Unable to create subscriber: {} - the subscriber already exists.",
-                        input.budget_name
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // "A notification can have one SNS subscriber and up to 10 email subscribers, for
-        // a total of 11 subscribers" — checked over the set this call would leave behind,
-        // because this operation grows a notification's subscribers ONE at a time and so
-        // never carries the modelled `@length(1, 11)` list that the create paths have
-        // refused at the boundary. The two per-type halves add up to that total.
-        crate::state::subscriber_limit_violation(
-            held.subscribers
+            // The subscription type and the address are what identify a subscriber, so a
+            // notification cannot hold two of the same one: a repeat of one it already
+            // has is the duplicate record, not a second copy in the set a read reports.
+            if held
+                .subscribers
                 .iter()
-                .chain(::std::iter::once(&input.subscriber)),
-        )
-        .map_err(|message| {
-            CreateSubscriberErrorModeled::CreationLimitExceededException(
-                CreationLimitExceededException {
-                    message: Some(message),
-                },
-            )
-        })?;
+                .any(|subscriber| crate::state::same_subscriber(subscriber, &input.subscriber))
+            {
+                return Err(CreateSubscriberErrorModeled::DuplicateRecordException(
+                    DuplicateRecordException {
+                        message: Some(format!(
+                            "Unable to create subscriber: {} - the subscriber already exists.",
+                            input.budget_name
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        // Appended, so the subscribers keep the order they were created in — the order a
-        // paginated `DescribeSubscribersForNotification` indexes into.
-        held.subscribers.push(input.subscriber);
+            // "A notification can have one SNS subscriber and up to 10 email subscribers,
+            // for a total of 11 subscribers" — checked over the set this call would leave
+            // behind, because this operation grows a notification's subscribers ONE at a
+            // time and so never carries the modelled `@length(1, 11)` list that the create
+            // paths have refused at the boundary. The two per-type halves add up to that
+            // total.
+            crate::state::subscriber_limit_violation(
+                held.subscribers
+                    .iter()
+                    .chain(::std::iter::once(&input.subscriber)),
+            )
+            .map_err(|message| {
+                CreateSubscriberErrorModeled::CreationLimitExceededException(
+                    CreationLimitExceededException {
+                        message: Some(message),
+                    },
+                )
+            })?;
+
+            // A subscriber of a notification that is already in alarm is owed that
+            // notification's alert as soon as it is attached: the threshold it alerts on
+            // has been passed, and this subscriber is one of the addresses that alert
+            // goes to.
+            let alerts = crate::state::alerts::owed(
+                &source,
+                &held.notification,
+                ::std::slice::from_ref(&input.subscriber),
+            );
+            // Appended, so the subscribers keep the order they were created in — the
+            // order a paginated `DescribeSubscribersForNotification` indexes into.
+            held.subscribers.push(input.subscriber);
+            alerts
+        };
+
+        crate::state::alerts::deliver(ctx, &alerts).await;
 
         Ok(CreateSubscriberOutput {})
     }

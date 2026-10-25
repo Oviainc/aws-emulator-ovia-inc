@@ -65,11 +65,11 @@ const RETENTION_SLACK: i64 = 5;
 /// retention period above, which is what makes it the largest the listing serves.
 const MAX_DURATION_MINUTES: i64 = RETENTION_DAYS * 24 * 60;
 
-/// The page-size window every MemoryDB listing serves, from the service's own refusal
-/// ("Must be between 1 and 50"), mirrored from `crate::state::MIN_MAX_RESULTS` /
-/// `MAX_MAX_RESULTS`. Exercised AT each bound and one past it.
-const MIN_MAX_RESULTS: i64 = 1;
-const MAX_MAX_RESULTS: i64 = 50;
+/// The page-size window every MemoryDB listing serves ("Must be between 20 and 100"),
+/// mirrored from `crate::state::MIN_MAX_RESULTS` / `MAX_MAX_RESULTS`. Exercised AT each
+/// bound and one past it.
+const MIN_MAX_RESULTS: i64 = 20;
+const MAX_MAX_RESULTS: i64 = 100;
 
 /// One event as the wire reports it, reduced to what the rule fixes.
 type Reported = (String, String, String);
@@ -531,14 +531,30 @@ async fn the_time_window_selects_which_events_are_reported() {
     }
 }
 
-/// The listing pages over the whole log newest first for any `MaxResults`,
-/// and a page's `NextToken` names the first event of the next page.
+/// The listing pages over the whole log newest first for any `MaxResults` in the
+/// service's page-size window, and a page's `NextToken` names the first event of the
+/// next page.
 #[tokio::test]
 async fn the_listing_pages_over_the_whole_log() {
     let router = router();
-    let whole = drive_every_kind_of_change(&router).await;
+    let driven = drive_every_kind_of_change(&router).await;
+    // More changes than the SMALLEST page the service serves, so even a page size at the
+    // bottom of the window has to walk several pages to cover the log.
+    let extra: Vec<String> = (0..MIN_MAX_RESULTS)
+        .map(|index| format!("paged-user-{index:02}"))
+        .collect();
+    for name in &extra {
+        create_user(&router, name).await;
+    }
+    // Newest first: the last user created is the first event reported.
+    let mut whole: Vec<Reported> = extra
+        .iter()
+        .rev()
+        .map(|name| expected("user", name, "Create"))
+        .collect();
+    whole.extend(driven);
 
-    for page_size in [1_i64, 2, 3, 5, 11, MAX_MAX_RESULTS] {
+    for page_size in [MIN_MAX_RESULTS, MIN_MAX_RESULTS + 1, 37, MAX_MAX_RESULTS] {
         let case = format!("MaxResults={page_size}");
         let mut walked: Vec<Reported> = Vec::new();
         let mut next_token: Option<String> = None;

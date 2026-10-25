@@ -724,18 +724,18 @@ async fn get_hypervisor_refuses_an_arn_outside_the_modelled_constraints() {
     }
 }
 
-/// An import is one record per HOST: the record stands for the machine at that address,
-/// so importing a host this service already holds a hypervisor for is refused with the
-/// modelled `ConflictException` and writes nothing, while another host mints its own
-/// record.
+/// An import mints a record of its own every time: a hypervisor is identified by the ARN
+/// minted for it, and `Host` is metadata the record carries, so importing a host this
+/// service already holds a record for mints a SECOND independent record rather than
+/// being refused.
 #[tokio::test]
-async fn importing_a_host_twice_is_refused_as_a_conflict() {
+async fn importing_one_host_twice_mints_two_independent_records() {
     let engine = build_engine();
     let router = build_router(&engine);
 
-    // The rows differ in host form and in the name the second import asks for: neither
-    // is what the conflict keys on.
-    let rows: [(&str, &str, &str, &str); 3] = [
+    // The rows differ in host form and in whether the two imports share a name: neither
+    // makes an import conditional.
+    let rows: [(&str, &str, &str, &str); 4] = [
         ("an IPv4 host", "198.51.100.10", "hv-first", "hv-second"),
         (
             "an FQDN host",
@@ -744,47 +744,52 @@ async fn importing_a_host_twice_is_refused_as_a_conflict() {
             "hv-fqdn-again",
         ),
         ("the shortest host", "a.b", "A", "B"),
+        (
+            "one host and one name",
+            "203.0.113.7",
+            "hv-identical",
+            "hv-identical",
+        ),
     ];
 
     for (case, host, first, second) in &rows {
         let arn = import(&router, first, host).await;
-        let refused = call(
+        let again = call(
             &router,
             "ImportHypervisorConfiguration",
             &import_body(second, host, None, &BTreeMap::new()),
         )
         .await;
         assert_eq!(
-            (
-                refused.status,
-                refused.code.as_deref(),
-                refused.str_at("/ErrorCode"),
-            ),
-            (
-                409,
-                Some("ConflictException"),
-                Some("HypervisorAlreadyExists")
-            ),
-            "case {case:?}: importing a host already imported must answer 409 \
-             ConflictException, got {} {:?}",
-            refused.status,
-            refused.body
+            again.status, 200,
+            "case {case:?}: importing a host already imported must answer 200, got {} {:?}",
+            again.status, again.body
         );
-        assert!(
-            refused.str_at("/HypervisorArn").is_none(),
-            "case {case:?}: a refused import must hand back no HypervisorArn, got {:?}",
-            refused.body
+        let second_arn = again
+            .str_at("/HypervisorArn")
+            .unwrap_or_else(|| panic!("case {case:?}: no HypervisorArn in {:?}", again.body))
+            .to_string();
+        assert_ne!(
+            second_arn, arn,
+            "case {case:?}: the second import must mint its own ARN, got {arn:?} again"
         );
-        // Nothing was written: the host still reports the record the first import minted.
-        let reply = get_hypervisor(&router, &arn).await;
-        assert_eq!(
-            (reply.status, reply.str_at("/Hypervisor/Name")),
-            (200, Some(*first)),
-            "case {case:?}: the refused import must leave the first record untouched, \
-             got {} {:?}",
-            reply.status,
-            reply.body
-        );
+
+        // Each record reports the name ITS request carried, under the one host.
+        for (which, arn, name) in [("the first", &arn, first), ("the second", &second_arn, second)]
+        {
+            let reply = get_hypervisor(&router, arn).await;
+            assert_eq!(
+                (
+                    reply.status,
+                    reply.str_at("/Hypervisor/Name"),
+                    reply.str_at("/Hypervisor/Host"),
+                ),
+                (200, Some(*name), Some(*host)),
+                "case {case:?}: {which} record must read back its own members, got {} {:?}",
+                reply.status,
+                reply.body
+            );
+        }
     }
 
     assert_eq!(
@@ -792,8 +797,8 @@ async fn importing_a_host_twice_is_refused_as_a_conflict() {
             .expect("the in-memory engine must expose this state")
             .lock()
             .hypervisor_count(),
-        rows.len(),
-        "one record per host: the refused imports must have written nothing"
+        2 * rows.len(),
+        "every import must have left a record of its own"
     );
 }
 
@@ -1193,19 +1198,23 @@ async fn a_record_imported_through_the_state_api_reads_back_the_same_way() {
         reply.body
     );
 
-    // And the same host cannot be imported again over the wire: the conflict is a fact
-    // of the store, not of which path wrote the record.
-    let refused = call(
+    // And the same host imported again over the wire mints its own record: whichever
+    // path wrote a record, the host it carries constrains nothing.
+    let again = call(
         &router,
         "ImportHypervisorConfiguration",
         &import_body("hv-again", "198.51.100.77", None, &BTreeMap::new()),
     )
     .await;
     assert_eq!(
-        (refused.status, refused.code.as_deref()),
-        (409, Some("ConflictException")),
-        "importing the seeded host again must conflict, got {} {:?}",
-        refused.status,
-        refused.body
+        again.status, 200,
+        "importing the seeded host again must answer 200, got {} {:?}",
+        again.status, again.body
+    );
+    assert_ne!(
+        again.str_at("/HypervisorArn"),
+        Some(stored.arn.as_str()),
+        "the second import must mint its own ARN, got the seeded one again: {:?}",
+        again.body
     );
 }

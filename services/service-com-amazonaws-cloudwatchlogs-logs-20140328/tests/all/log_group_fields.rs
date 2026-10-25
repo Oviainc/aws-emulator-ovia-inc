@@ -414,8 +414,8 @@ async fn a_window_holding_no_event_reports_no_field() {
 }
 
 /// Either selector names the same group — the name, or either ARN form of it — and the
-/// pair is refused when it names both or neither; a selector naming no group is refused as
-/// a missing resource.
+/// pair is refused when it names both or neither; a selector naming no group answers an
+/// empty field list rather than a refusal.
 #[tokio::test]
 async fn the_log_group_is_named_by_either_selector_and_the_pair_is_checked() {
     let logs = Logs::new();
@@ -459,21 +459,6 @@ async fn the_log_group_is_named_by_either_selector_and_the_pair_is_checked() {
             "ValidationException",
             "Either LogGroupName or LogGroupArn must be provided.",
         ),
-        (
-            "a name no group carries",
-            json!({"logGroupName": "absent"}),
-            "ResourceNotFoundException",
-            "The specified log group does not exist.",
-        ),
-        (
-            "an ARN no group carries",
-            json!({"logGroupIdentifier": format!(
-                "arn:aws:logs:{REGION}:{}:log-group:absent",
-                engine::emulator_account_id()
-            )}),
-            "ResourceNotFoundException",
-            "The specified log group does not exist.",
-        ),
     ];
     for (case, request, expected_code, expected_message) in refusals {
         let (code, message) = logs.refusal("GetLogGroupFields", &request).await;
@@ -484,6 +469,26 @@ async fn the_log_group_is_named_by_either_selector_and_the_pair_is_checked() {
         assert_eq!(
             message, expected_message,
             "case {case:?}: expected {expected_message:?}, got {message:?}"
+        );
+    }
+
+    // A selector naming no log group is NOT a missing resource here: the operation reports
+    // the fields its index holds for the name it was given, and an index holding nothing
+    // names no field.
+    for (case, request) in [
+        ("a name no group carries", json!({"logGroupName": "absent"})),
+        (
+            "an ARN no group carries",
+            json!({"logGroupIdentifier": format!(
+                "arn:aws:logs:{REGION}:{}:log-group:absent",
+                engine::emulator_account_id()
+            )}),
+        ),
+    ] {
+        let reported = group_fields(&logs, case, &request).await;
+        assert!(
+            reported.is_empty(),
+            "case {case:?}: expected 200 with no field at all, got {reported:?}"
         );
     }
 }

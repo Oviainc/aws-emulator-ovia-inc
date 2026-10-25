@@ -23,7 +23,7 @@
 
 use serde_json::{json, Value};
 
-use crate::pi_harness::{call, emulator_with_engine, Answer};
+use crate::pi_harness::{call, emulator_with_engine, register_data_source, Answer};
 
 use service_com_amazonaws_pi_performanceinsightsv20180227::state;
 
@@ -94,10 +94,15 @@ const UNREGISTERED: &[(&str, &str)] = &[
 /// Seed the shared data-source directory the way a database control plane does when
 /// it mints a resource id.
 fn register(engine: &engine::InMemoryEngine, source: &DataSource) {
-    state::data_source_directory(engine)
-        .expect("the shared data-source directory is reachable from the engine")
-        .lock()
-        .register(source.resource_id, source.owner, source.engine);
+    // No monitoring configuration: this suite asks which ServiceType owns the
+    // data source, which the registration alone decides.
+    register_data_source(
+        engine,
+        source.resource_id,
+        source.owner,
+        source.engine,
+        None,
+    );
 }
 
 /// The requests that name a `(ServiceType, Identifier)` pair and are IMPLEMENTED, so

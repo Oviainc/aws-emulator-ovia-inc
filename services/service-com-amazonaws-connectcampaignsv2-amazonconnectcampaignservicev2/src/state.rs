@@ -498,6 +498,20 @@ pub struct StoredCampaign {
     /// request is no longer dialable, so it neither occupies a buffer slot nor keeps
     /// answering for its token.
     pub outbound_requests: BTreeMap<String, StoredOutboundRequest>,
+    /// The profile outbound requests this campaign has pending, keyed by the
+    /// `clientToken` each was submitted under — the idempotency token
+    /// `PutProfileOutboundRequestBatch` ("This API is idempotent", per the model's own
+    /// documentation) resolves a repeated submission through, so the same token is
+    /// answered with the `ProfileOutboundRequestId` it was first given rather than a
+    /// second one.
+    ///
+    /// A buffer of its own beside [`Self::outbound_requests`], because the two carry
+    /// different resources: a profile request names a Customer Profiles profile and its
+    /// expiration is OPTIONAL, where a dial request names a channel and must carry one.
+    /// A request whose `expirationTime` has passed leaves this buffer for the same
+    /// reason ([`Self::expire_profile_outbound_requests`]): it can no longer be placed,
+    /// so it neither occupies a buffer slot nor keeps answering for its token.
+    pub profile_outbound_requests: BTreeMap<String, StoredProfileOutboundRequest>,
 }
 
 /// An outbound request a campaign has taken, as stored.
@@ -523,19 +537,56 @@ impl StoredOutboundRequest {
     }
 }
 
+/// A profile outbound request a campaign has taken, as stored.
+#[derive(Debug, Clone)]
+pub struct StoredProfileOutboundRequest {
+    /// The `ProfileOutboundRequestId` this request was given. Minted from the store's
+    /// own counter, never from anything in the request, and within
+    /// `ProfileOutboundRequestId`'s pattern `^[a-zA-Z0-9_\-.]*$` and its 0..256 length
+    /// bound.
+    pub id: String,
+    /// The `profileId` the request was submitted for: the Customer Profiles profile the
+    /// campaign is to reach.
+    pub profile_id: String,
+    /// The `expirationTime` the caller sent, when it sent one: the instant after which
+    /// this request can no longer be placed. `ProfileOutboundRequest$expirationTime` is
+    /// OPTIONAL, so a request that carries none never expires and stays pending until
+    /// the campaign goes (see [`Self::is_expired_at`]).
+    pub expires_at: Option<::aws_smithy_types::DateTime>,
+    /// The `eventTriggerContext$sourceEvent` the request carried, when it carried one:
+    /// the event this request was triggered by. Part of the record, not of any response
+    /// — no modelled member of this operation's output carries it.
+    pub source_event: Option<String>,
+}
+
+impl StoredProfileOutboundRequest {
+    /// Whether this request's `expirationTime` has passed at `now`, so it can no longer
+    /// be placed and is no longer one of the campaign's pending profile requests. A
+    /// request submitted without an expiration has no instant to pass, so it never
+    /// expires.
+    pub fn is_expired_at(&self, now: SystemTime) -> bool {
+        self.expires_at
+            .is_some_and(|expires_at| deadline_passed(expires_at, now))
+    }
+}
+
 /// What a campaign's store did with one outbound request of a batch, as
 /// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::take_outbound_request`]
-/// reports it.
+/// and
+/// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::take_profile_outbound_request`]
+/// both report it: the two batch operations decide a request's fate the same way, so
+/// they share one outcome rather than each carrying a copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundRequestOutcome {
-    /// The request is in the campaign's buffer under this `DialRequestId` — either
-    /// freshly minted, or the id an earlier submission under the same `clientToken`
-    /// was given, in which case this repeat stored nothing new.
+    /// The request is in the campaign's buffer under this id (a `DialRequestId` or a
+    /// `ProfileOutboundRequestId`) — either freshly minted, or the id an earlier
+    /// submission under the same `clientToken` was given, in which case this repeat
+    /// stored nothing new.
     Taken(String),
     /// The campaign's buffer already holds [`MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN`]
     /// pending requests, so nothing was stored.
     BufferFull,
-    /// The request's `expirationTime` has already passed, so there is no dial left to
+    /// The request's `expirationTime` has already passed, so there is no call left to
     /// place for it: nothing was stored and no id was minted.
     Expired,
 }
@@ -610,6 +661,32 @@ impl StoredCampaign {
     /// counting the buffer writes nothing.
     pub fn pending_outbound_requests(&self, now: SystemTime) -> usize {
         self.outbound_requests
+            .values()
+            .filter(|request| !request.is_expired_at(now))
+            .count()
+    }
+
+    /// Drop every profile outbound request this campaign's buffer holds whose
+    /// `expirationTime` has passed at `now`, and report how many went.
+    ///
+    /// The same rule as [`Self::expire_outbound_requests`], on the buffer of profile
+    /// requests: a request past its expiration can no longer be placed, so it is no
+    /// longer pending and holds neither one of the
+    /// [`MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN`] slots nor its own `clientToken`. The
+    /// removal is owed to the CLOCK, not to the call that materialises it. A request
+    /// submitted without an expiration never becomes due.
+    pub fn expire_profile_outbound_requests(&mut self, now: SystemTime) -> usize {
+        let before = self.profile_outbound_requests.len();
+        self.profile_outbound_requests
+            .retain(|_, request| !request.is_expired_at(now));
+        before - self.profile_outbound_requests.len()
+    }
+
+    /// The profile outbound requests this campaign still has pending at `now` —
+    /// everything in that buffer which has not passed its `expirationTime`. A pure
+    /// read, so a reader counting the buffer writes nothing.
+    pub fn pending_profile_outbound_requests(&self, now: SystemTime) -> usize {
+        self.profile_outbound_requests
             .values()
             .filter(|request| !request.is_expired_at(now))
             .count()
@@ -911,17 +988,22 @@ impl StoredInstanceOnboarding {
 /// workload and enforced through the error AWS answers a quota breach with.
 pub const MAX_CAMPAIGNS: usize = 1_000;
 
-/// The most outbound requests one campaign's store holds, after which a further
-/// request in a batch is reported as a per-request failure carrying the modelled
-/// `FailureCode` `BufferLimitExceeded` — the code the model declares for a campaign
-/// that cannot take another request right now.
+/// The most outbound requests one campaign's store holds in a buffer, after which a
+/// further request in a batch is reported as a per-request failure carrying the code
+/// the model declares for a campaign that cannot take another request right now:
+/// `FailureCode` `BufferLimitExceeded` for a dial request, and
+/// `ProfileOutboundRequestFailureCode` `Conflict` for a profile request, whose catalog
+/// carries no buffer code and whose nearest entry is the one for a refusal the
+/// resource's own state causes.
 ///
 /// A campaign's buffer grows one record per accepted request and shrinks only as
 /// requests pass their `expirationTime`, so without a ceiling a caller could submit
 /// batches of long-lived requests until the process runs out of memory. The figure is
 /// the emulator's own, set far above any plausible workload. It counts the PENDING
 /// requests: an expired one is not in the buffer any more (see
-/// [`StoredCampaign::expire_outbound_requests`]).
+/// [`StoredCampaign::expire_outbound_requests`] and
+/// [`StoredCampaign::expire_profile_outbound_requests`]). Each buffer is counted on
+/// its own, since each holds its own resource.
 pub const MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN: usize = 10_000;
 
 /// The most Connect instances this emulator's store holds onboarding records for,
@@ -1134,6 +1216,10 @@ pub struct ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     order: Vec<(u64, String)>,
     next_sequence: u64,
     next_dial_sequence: u64,
+    /// The counter the `ProfileOutboundRequestId`s are minted from, store-wide so no
+    /// two profile outbound requests share an id (see
+    /// [`Self::take_profile_outbound_request`]).
+    next_profile_request_sequence: u64,
     /// One onboarding record per Connect instance, keyed by instance id. Bounded by
     /// [`MAX_ONBOARDED_INSTANCES`], enforced by [`Self::start_instance_onboarding`].
     instance_onboarding: HashMap<String, StoredInstanceOnboarding>,
@@ -1318,6 +1404,72 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
                 id: id.clone(),
                 channel_subtype: channel_subtype.to_string(),
                 expires_at,
+            },
+        );
+        Some(OutboundRequestOutcome::Taken(id))
+    }
+
+    /// The id the next profile outbound request this store takes will carry: a
+    /// store-wide sequence number, so no two profile requests of any campaign share an
+    /// id, and none shares one with a dial request.
+    ///
+    /// Minted from the store's own counter, never from anything in the request. The
+    /// text is within `ProfileOutboundRequestId`'s pattern `^[a-zA-Z0-9_\-.]*$` and its
+    /// 0..256 length bound.
+    fn next_profile_outbound_request_id(&mut self) -> String {
+        let sequence = self.next_profile_request_sequence;
+        self.next_profile_request_sequence = self.next_profile_request_sequence.saturating_add(1);
+        format!("profile-{sequence:012}")
+    }
+
+    /// Take the profile outbound request submitted under `client_token` into the
+    /// profile buffer of the campaign stored under `campaign_id`, and report what
+    /// became of it (see [`OutboundRequestOutcome`]). `None` when no campaign is stored
+    /// under that id.
+    ///
+    /// Decided exactly as [`Self::take_outbound_request`] decides a dial request, on
+    /// the buffer of profile requests: a `client_token` the campaign has already taken
+    /// stores nothing and reports the id it was given then (what makes a repeated batch
+    /// idempotent), an `expires_at` the clock has passed is not taken at all, mints no
+    /// id and occupies no slot, and the expiries the clock already owes the buffer are
+    /// materialised at the same instant
+    /// ([`StoredCampaign::expire_profile_outbound_requests`]).
+    ///
+    /// `expires_at` is optional, as `ProfileOutboundRequest$expirationTime` is: a
+    /// request that carries none has no instant to have passed, so it is always taken.
+    pub fn take_profile_outbound_request(
+        &mut self,
+        campaign_id: &str,
+        client_token: &str,
+        profile_id: &str,
+        expires_at: Option<::aws_smithy_types::DateTime>,
+        source_event: Option<&str>,
+        now: SystemTime,
+    ) -> Option<OutboundRequestOutcome> {
+        {
+            let campaign = self.campaigns.get_mut(campaign_id)?;
+            campaign.expire_profile_outbound_requests(now);
+            if expires_at.is_some_and(|expires_at| deadline_passed(expires_at, now)) {
+                return Some(OutboundRequestOutcome::Expired);
+            }
+            if let Some(taken) = campaign.profile_outbound_requests.get(client_token) {
+                return Some(OutboundRequestOutcome::Taken(taken.id.clone()));
+            }
+            if campaign.profile_outbound_requests.len() >= MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN {
+                return Some(OutboundRequestOutcome::BufferFull);
+            }
+        }
+        // Only now, past every refusal, is an id minted — so a refused request
+        // consumes no id and leaves no gap in the sequence.
+        let id = self.next_profile_outbound_request_id();
+        let campaign = self.campaigns.get_mut(campaign_id)?;
+        campaign.profile_outbound_requests.insert(
+            client_token.to_string(),
+            StoredProfileOutboundRequest {
+                id: id.clone(),
+                profile_id: profile_id.to_string(),
+                expires_at,
+                source_event: source_event.map(ToString::to_string),
             },
         );
         Some(OutboundRequestOutcome::Taken(id))

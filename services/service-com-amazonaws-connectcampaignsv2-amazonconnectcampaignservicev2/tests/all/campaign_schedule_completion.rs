@@ -227,6 +227,7 @@ fn stored(lifecycle_state: CampaignState, window: Window) -> StoredCampaign {
         lifecycle_state,
         created_at: SystemTime::now(),
         outbound_requests: std::collections::BTreeMap::new(),
+        profile_outbound_requests: std::collections::BTreeMap::new(),
     }
 }
 

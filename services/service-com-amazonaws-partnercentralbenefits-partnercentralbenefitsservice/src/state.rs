@@ -1422,6 +1422,23 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
         stored.benefits.get(&id)
     }
 
+    /// The `BenefitRequestSchema` of the benefit the application `identifier` names in
+    /// `catalog` is for, CLONED — so an operation can judge the document it would store
+    /// while holding that application for writing.
+    ///
+    /// `None` when no such application is stored, or when its benefit declares no schema:
+    /// neither constrains the document at all (see [`benefit_schema_refusal`]).
+    pub fn benefit_schema_for_application(
+        &self,
+        catalog: &str,
+        identifier: &str,
+    ) -> Option<Document> {
+        let benefit_id = self.application(catalog, identifier)?.benefit_id.clone();
+        self.benefit(catalog, &benefit_id)?
+            .benefit_request_schema
+            .clone()
+    }
+
     /// The allocation `identifier` names inside `catalog`, for a reporting operation.
     ///
     /// Resolved as [`Catalog::resolve_allocation_id`] does, so both forms the modelled
@@ -1812,6 +1829,181 @@ fn document_fits(value: &Document, budget: usize) -> bool {
         Document::Object(members) => members.values().all(|member| document_fits(member, next)),
         _ => true,
     }
+}
+
+/// The input member a refusal of an application-details document names, spelled as the
+/// wire spells it.
+pub const DETAILS_MEMBER: &str = "BenefitApplicationDetails";
+
+/// The input member a refusal of the benefit a create applies for names, spelled as the
+/// wire spells it (`CreateBenefitApplicationInput$BenefitIdentifier`).
+pub const BENEFIT_IDENTIFIER_MEMBER: &str = "BenefitIdentifier";
+
+/// The `BenefitRequestSchema` keyword naming the JSON type a position must have.
+const SCHEMA_TYPE: &str = "type";
+
+/// The `BenefitRequestSchema` keyword naming the fields an object position declares, each
+/// mapped to the schema that field's value must satisfy.
+const SCHEMA_PROPERTIES: &str = "properties";
+
+/// Why a `BenefitApplicationDetails` document does not satisfy the requested benefit's
+/// `BenefitRequestSchema`: the member path the mismatch sits at, and the requirement that
+/// path failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaViolation {
+    /// The input member, followed by the document's own `.`-separated path to the field
+    /// that does not satisfy the schema — the same path form `AmendBenefitApplication`
+    /// addresses a field of the document with, so a caller can act on it.
+    pub member: String,
+    /// The requirement that field failed, worded like every other requirement this
+    /// service states (see [`crate::service::member_clause`]).
+    pub requirement: String,
+}
+
+/// The refusal a request whose `details` do not satisfy `schema` is answered with, or
+/// `None` when they do.
+///
+/// `schema` is the stored [`Benefit::benefit_request_schema`] of the benefit the
+/// application is for — the schema definition that describes the fields a request for
+/// that benefit carries — so what it declares about a field is what the document must
+/// put there. A benefit that declares no schema constrains the document not at all, and
+/// neither does a position the schema says nothing about: a field the schema does not
+/// declare is the caller's own.
+///
+/// The member is modelled optional wherever it is written, so a request that supplies NO
+/// document has nothing to judge; a document it does supply is judged as a whole — which
+/// is why the create, the update and the amendment each apply this to the document they
+/// would store.
+pub fn benefit_schema_refusal(
+    schema: Option<&Document>,
+    details: Option<&Document>,
+) -> Option<crate::ops::types::ValidationException> {
+    let violation = benefit_schema_violation(schema, details)?;
+    let clause = crate::service::member_clause(&violation.member, &violation.requirement, false);
+    Some(crate::ops::types::ValidationException {
+        message: crate::service::validation_envelope(std::slice::from_ref(&clause))
+            .unwrap_or_else(|| clause.clone()),
+        reason: VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(validation_field(
+            &violation.member,
+            &violation.requirement,
+            VALIDATION_CODE_INVALID_VALUE,
+        )),
+    })
+}
+
+/// Why `details` does not satisfy `schema`, or `None` when it does: the rule
+/// [`benefit_schema_refusal`] answers a request with.
+pub fn benefit_schema_violation(
+    schema: Option<&Document>,
+    details: Option<&Document>,
+) -> Option<SchemaViolation> {
+    schema_violation(DETAILS_MEMBER, schema?, details?, MAX_DETAILS_DEPTH)
+}
+
+/// Why `value`, at member path `member`, does not satisfy `schema`.
+///
+/// The keywords read are the ones a `BenefitRequestSchema` of this catalog carries (see
+/// [`benefit_request_schema`]): `type`, the JSON type the position must have, and
+/// `properties`, the schema each declared field's value must satisfy. A keyword this walk
+/// does not read constrains nothing, the way an unrecognised JSON Schema keyword does.
+/// Bounded by `budget`, like every other walk over a caller-supplied document, so the
+/// recursion cannot exhaust the stack.
+fn schema_violation(
+    member: &str,
+    schema: &Document,
+    value: &Document,
+    budget: usize,
+) -> Option<SchemaViolation> {
+    // Nothing below the depth this service stores can be judged, so the exhausted walk
+    // REFUSES rather than passing a document it did not read: the depth bound and this
+    // walk cannot drift into letting one through. A document that deep is already refused
+    // by [`details_rejection`], which every caller of this applies first.
+    let Some(next) = budget.checked_sub(1) else {
+        return Some(SchemaViolation {
+            member: member.to_string(),
+            requirement: format!("Member must nest no deeper than {MAX_DETAILS_DEPTH} levels"),
+        });
+    };
+    let Document::Object(keywords) = schema else {
+        return None;
+    };
+    if let Some(Document::String(declared)) = keywords.get(SCHEMA_TYPE) {
+        if json_type_of(value) != declared.as_str() {
+            return Some(SchemaViolation {
+                member: member.to_string(),
+                requirement: format!("Member must be of type {declared}"),
+            });
+        }
+    }
+    let (Some(Document::Object(properties)), Document::Object(supplied)) =
+        (keywords.get(SCHEMA_PROPERTIES), value)
+    else {
+        return None;
+    };
+    // Sorted by field name, so which mismatch a document carrying two of them is refused
+    // for does not depend on the schema map's iteration order.
+    let mut declared: Vec<(&String, &Document)> = properties.iter().collect();
+    declared.sort_by_key(|(field, _)| *field);
+    declared.into_iter().find_map(|(field, field_schema)| {
+        // A field the document does not carry is nothing to judge: the schema states what
+        // a value put there must be, and no value was put there.
+        let field_value = supplied.get(field)?;
+        schema_violation(
+            &format!("{member}.{field}"),
+            field_schema,
+            field_value,
+            next,
+        )
+    })
+}
+
+/// The JSON type `value` has, named as JSON Schema's own `type` keyword names the types —
+/// so every number is a `number`, whichever Smithy number it arrived as.
+fn json_type_of(value: &Document) -> &'static str {
+    match value {
+        Document::Null => "null",
+        Document::Bool(_) => "boolean",
+        Document::Number(_) => "number",
+        Document::String(_) => "string",
+        Document::Array(_) => "array",
+        Document::Object(_) => "object",
+    }
+}
+
+/// The refusal an application for `benefit` is answered with when the catalog no longer
+/// offers it, or `None` when it is a benefit a partner can still apply for.
+///
+/// `BenefitStatus` is `ACTIVE | INACTIVE`
+/// (`smithy_query(query="shape",shape="BenefitStatus")`), and a benefit that is not
+/// `ACTIVE` is no longer offered, so nothing can be allocated against it and no
+/// application for it can be served — the same reading of the status that keeps such a
+/// benefit out of an allocation's `ApplicableBenefitIds` (see [`applicable_benefit_ids`]).
+/// `member` is the input member that named it, spelled as the wire spells it; the
+/// requirement states the status the record is in, which is the service's own data, and
+/// echoes nothing of the value the caller sent.
+pub fn benefit_not_offered_refusal(
+    member: &str,
+    benefit: &Benefit,
+) -> Option<crate::ops::types::ValidationException> {
+    if benefit.status == BENEFIT_STATUS_ACTIVE {
+        return None;
+    }
+    let requirement = format!(
+        "Member must name a benefit the catalog offers, which a {} benefit is not",
+        benefit.status
+    );
+    let clause = crate::service::member_clause(member, &requirement, false);
+    Some(crate::ops::types::ValidationException {
+        message: crate::service::validation_envelope(std::slice::from_ref(&clause))
+            .unwrap_or_else(|| clause.clone()),
+        reason: VALIDATION_REASON_BUSINESS.to_string(),
+        field_list: Some(validation_field(
+            member,
+            &requirement,
+            VALIDATION_CODE_INVALID_VALUE,
+        )),
+    })
 }
 
 /// The stored `FileDetail` for one supplied `FileInput`.
@@ -2259,6 +2451,12 @@ pub fn matches_any(filter: Option<&Vec<String>>, values: &[String]) -> bool {
 /// model's own `ValidationExceptionReason` enum (see
 /// `crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`).
 pub const VALIDATION_REASON_FIELD: &str = "fieldValidationFailed";
+
+/// The `ValidationExceptionReason` a refusal carries when the request is well formed and
+/// a rule of the service's own refuses what it asks for — a benefit the catalog no
+/// longer offers, say. Also a value of the model's own `ValidationExceptionReason` enum
+/// (see `crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`).
+pub const VALIDATION_REASON_BUSINESS: &str = "BUSINESS_VALIDATION_FAILED";
 
 /// The `ValidationExceptionField$Code` for a member whose value is not one this service
 /// accepts; a value of the model's own `ValidationExceptionErrorCode` enum (see
