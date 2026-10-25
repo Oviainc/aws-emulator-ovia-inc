@@ -182,7 +182,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // string, not the set of versions that exist), and a manifest the request carries
         // must describe a configuration the service could deploy. An update that supplies
         // no manifest changes nothing the manifest describes, so there is nothing to
-        // check.
+        // check. `landingZoneIdentifier` is modelled as a plain `String`, so no front-door
+        // check applies to it either: a value that is not the ARN this service reports for
+        // a landing zone names no landing zone at all, which is a malformed input rather
+        // than a reference to a resource that does not exist (the ARN of that shape naming
+        // no stored landing zone, refused below).
+        if let Some(message) =
+            crate::state::non_landing_zone_identifier_message(&input.landing_zone_identifier)
+        {
+            return Err(
+                UpdateLandingZoneErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
         if let Some(refusal) = crate::state::unsupported_version_message(&input.version) {
             return Err(
                 UpdateLandingZoneErrorModeled::ValidationException(ValidationException {

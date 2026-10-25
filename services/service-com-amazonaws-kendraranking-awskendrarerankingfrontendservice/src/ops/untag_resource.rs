@@ -144,7 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceARN`'s 1..1011 length and every tag key's 1..128 are modelled, so a
         // request outside them is already refused with a 400 `ValidationException`
         // before this handler runs.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -168,8 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // An ARN this emulator holds no rescore execution plan under names no taggable
-        // resource: the modelled `ResourceUnavailableException` (HTTP 404).
-        let Some(plan) = store.plan_by_arn_mut(&input.resource_arn) else {
+        // resource: the modelled `ResourceUnavailableException` (HTTP 404). The ARN is
+        // resolved in THIS request's region, so an ARN naming another region's plan
+        // resolves to nothing.
+        let Some(plan) = store.plan_by_arn_mut(&region, &input.resource_arn) else {
             return Err(UntagResourceErrorModeled::ResourceUnavailableException(
                 ResourceUnavailableException {
                     message: Some(format!(

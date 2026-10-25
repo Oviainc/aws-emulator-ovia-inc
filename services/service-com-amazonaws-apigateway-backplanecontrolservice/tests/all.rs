@@ -53,6 +53,10 @@ mod documentation_versions;
 mod domain_name_access_association_reject;
 #[path = "all/domain_name_collection.rs"]
 mod domain_name_collection;
+#[path = "all/domain_name_create_bounds.rs"]
+mod domain_name_create_bounds;
+#[path = "all/domain_name_lifecycle.rs"]
+mod domain_name_lifecycle;
 #[path = "all/epoch_second_timestamps.rs"]
 mod epoch_second_timestamps;
 #[path = "all/execute_api_data_plane.rs"]
@@ -158,6 +162,8 @@ mod delete_integration_response;
 mod update_authorizer;
 #[path = "all/update_gateway_response.rs"]
 mod update_gateway_response;
+#[path = "all/stage_invoke_shared_stage_names.rs"]
+mod stage_invoke_shared_stage_names;
 #[path = "all/request_validator_collection.rs"]
 mod request_validator_collection;
 #[path = "all/api_key_gate.rs"]

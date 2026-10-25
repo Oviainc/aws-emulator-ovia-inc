@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_inputs.rs"]
 mod arn_inputs;
+#[path = "all/automated_reasoning_policies.rs"]
+mod automated_reasoning_policies;
 #[path = "all/custom_model_deployments.rs"]
 mod custom_model_deployments;
 #[path = "all/custom_models.rs"]
@@ -23,6 +25,8 @@ mod enforced_guardrail_configuration;
 mod evaluation_jobs;
 #[path = "all/foundation_models.rs"]
 mod foundation_models;
+#[path = "all/get_foundation_model.rs"]
+mod get_foundation_model;
 #[path = "all/guardrail_timestamp_wire_form.rs"]
 mod guardrail_timestamp_wire_form;
 #[path = "all/guardrail_wire_shape.rs"]

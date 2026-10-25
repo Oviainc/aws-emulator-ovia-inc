@@ -7,10 +7,10 @@
 //!    refused with the modelled `ValidationException` (HTTP 400) and stores nothing.
 //!    The rows below each name a different documented relation; a maximum capacity
 //!    below its minimum is one of them, not the rule.
-//! 2. `DescribeScalingPlanResources` identifies ONE plan by its two required members, so
-//!    a lookup on (`ScalingPlanName`, `ScalingPlanVersion`) that finds no stored plan is
-//!    refused with the modelled `ValidationException` (HTTP 400) carrying the service's
-//!    not-found sentence, rather than answered with an empty page.
+//! 2. `DescribeScalingPlanResources` identifies ONE plan by its two required members but
+//!    models no not-found error, so a lookup on (`ScalingPlanName`, `ScalingPlanVersion`)
+//!    that finds no stored plan reports the empty set of scalable resources (HTTP 200,
+//!    `ScalingPlanResources` = `[]`) rather than a refusal.
 //!
 //! The harness (`Emulator`, `instruction`, `stack_source`) is the sibling suite's: every
 //! call goes over the same `awsJson1_1` wire path the router serves in production.
@@ -24,7 +24,7 @@ use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice
 };
 
 use crate::scaling_plan_lifecycle::{
-    error_code, error_message, instruction, simple_instructions, stack_source, Emulator,
+    instruction, simple_instructions, stack_source, Emulator,
 };
 
 /// The instruction every row starts from: valid, and the one the sibling suite uses.
@@ -735,7 +735,7 @@ async fn create_refuses_an_application_source_that_names_no_stack() {
 }
 
 #[tokio::test]
-async fn describe_scaling_plan_resources_refuses_a_lookup_that_finds_no_plan() {
+async fn describe_scaling_plan_resources_reports_an_empty_set_for_a_lookup_that_finds_no_plan() {
     let emulator = Emulator::new();
     emulator
         .ok(
@@ -808,20 +808,23 @@ async fn describe_scaling_plan_resources_refuses_a_lookup_that_finds_no_plan() {
             .call("DescribeScalingPlanResources", &request)
             .await;
         assert_eq!(
-            (status, error_code(&body)),
-            (400, "ValidationException"),
-            "case {label:?}: expected a 400 ValidationException, got {status} with {body}"
+            status, 200,
+            "case {label:?} ({name}, {version}): expected HTTP 200, got {status} with {body}"
         );
-        let expected = format!("No scaling plan found for scaling plan name: {name}, version: {version}");
-        let actual = error_message(&body);
         assert_eq!(
-            actual, expected,
-            "case {label:?}: expected {expected:?}, got {actual:?}"
+            body["ScalingPlanResources"],
+            json!([]),
+            "case {label:?} ({name}, {version}): expected an empty ScalingPlanResources \
+             list, got {body}"
+        );
+        assert!(
+            body.get("NextToken").is_none_or(Value::is_null),
+            "case {label:?} ({name}, {version}): an empty page continues nowhere, got {body}"
         );
     }
 
-    // The plan that IS held still reports its own resources, so the refusal is about the
-    // lookup and not about the operation.
+    // The plan that IS held still reports its own resources, so the empty answer is about
+    // the lookup and not about the operation.
     let described = emulator
         .ok(
             "DescribeScalingPlanResources",

@@ -129,8 +129,8 @@ fn only_the_access_denial_is_served_at_a_status_the_model_does_not_declare() {
 /// status [`served_status`] gives it — so the access denial is 400 and nothing else moved.
 ///
 /// The rows differ along the error SHAPE (the class the rule generalises over), along the
-/// operation that produces it (a list, a get, a create, a recall, a stub, both tagging
-/// directions) and along the caller's entitlement.
+/// operation that produces it (a list, a get, a create, a recall, an association, both
+/// tagging directions) and along the caller's entitlement.
 #[tokio::test]
 async fn every_error_carries_the_status_this_service_serves_its_shape_with() {
     let entitled = Harness::new();
@@ -204,6 +204,16 @@ async fn every_error_carries_the_status_this_service_serves_its_shape_with() {
         (
             "ResourceNotFoundException",
             true,
+            "AssociateBenefitApplicationResource",
+            json!({
+                "Catalog": CATALOG,
+                "BenefitApplicationIdentifier": UNKNOWN_APPLICATION,
+                "ResourceArn": application,
+            }),
+        ),
+        (
+            "ResourceNotFoundException",
+            true,
             "TagResource",
             json!({
                 "resourceArn": expected_arn(CATALOG, "benefit-application", UNKNOWN_APPLICATION),
@@ -240,26 +250,8 @@ async fn every_error_carries_the_status_this_service_serves_its_shape_with() {
         );
     }
 
-    // And a stub still answers 501, which is not a modelled shape at all: the override is
-    // over the modelled errors only. `AssociateBenefitApplicationResource` is one of the
-    // operations still carrying the scaffold marker
-    // (`grep -l '^//! SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`); `GetBenefit` and
-    // `GetBenefitAllocation` are implemented, so their entitled answer is the lookup's own
-    // 404 rather than a 501.
-    let (status, out) = entitled
-        .call(
-            "AssociateBenefitApplicationResource",
-            &json!({
-                "Catalog": CATALOG,
-                "BenefitApplicationIdentifier": UNKNOWN_APPLICATION,
-                "ResourceArn": application,
-            }),
-        )
-        .await;
-    assert_eq!(
-        status, 501,
-        "case \"an unimplemented operation, entitled\": expected 501, got {status} {out:?}"
-    );
+    // `GetBenefit` and `GetBenefitAllocation` answer an entitled caller with the lookup's
+    // own 404, like every other implemented operation whose resource is absent.
     for (case, operation, identifier) in [
         (
             "an implemented get of a benefit that does not exist, entitled",

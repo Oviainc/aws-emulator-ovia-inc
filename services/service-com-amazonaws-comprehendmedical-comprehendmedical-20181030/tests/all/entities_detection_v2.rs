@@ -114,8 +114,8 @@ async fn describe_job(router: &MultiServiceRouter, job_id: &str) -> Value {
 ///
 /// The rows span the text-inference operations that are still scaffolds and both ends of
 /// the accepted text length, so an operation that starts answering 200 without a real
-/// inference component behind it fails here. `InferICD10CM` is implemented and is
-/// asserted in its own suite.
+/// inference component behind it fails here. `InferICD10CM` and `InferSNOMEDCT` link
+/// against an ontology, are implemented, and are asserted in their own suites.
 #[tokio::test]
 async fn the_text_inference_operations_answer_not_implemented() {
     let router = router();
@@ -128,7 +128,6 @@ async fn the_text_inference_operations_answer_not_implemented() {
         ("DetectEntities", json!({"Text": "Reports fever."})),
         ("DetectPHI", json!({"Text": "John Doe, 44, reports fever."})),
         ("InferRxNorm", json!({"Text": "Takes 50 mg of ibuprofen."})),
-        ("InferSNOMEDCT", json!({"Text": "A chest x-ray was ordered."})),
     ];
     for (operation, body) in cases {
         let (status, answer) = call(&router, operation, &body).await;

@@ -16,7 +16,8 @@
 //! * an update patches only the members it supplies;
 //! * a resource AWS reports in a transient status settles to its terminal status once
 //!   the clock owes it, without any caller doing anything;
-//! * a listing pages over the whole set in name order for any `MaxResults`;
+//! * a listing pages over the whole set in name order for any `MaxResults` the service's
+//!   page-size window admits;
 //! * naming a resource that is not in state is the modelled not-found fault, and
 //!   re-creating one that is is the modelled already-exists fault.
 

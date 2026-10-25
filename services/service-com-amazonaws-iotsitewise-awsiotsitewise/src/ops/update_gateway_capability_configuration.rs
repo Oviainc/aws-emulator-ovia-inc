@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGatewayCapabilityConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGatewayCapabilityConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGatewayCapabilityConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the capability configuration onto the stored gateway and
+//! reports the sync status that write leaves it in, which
+//! `DescribeGatewayCapabilityConfiguration` reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +182,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGatewayCapabilityConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGatewayCapabilityConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGatewayCapabilityConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateGatewayCapabilityConfigurationError::Modeled(
+                UpdateGatewayCapabilityConfigurationErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        // "The JSON document that defines the configuration for the gateway
+        // capability": a body that is not a JSON document defines no configuration,
+        // and storing it would let a later read answer with something no gateway
+        // could apply. The modelled length bounds are already enforced before this
+        // handler runs; this is the member's own documented form.
+        if ::serde_json::from_str::<::serde_json::Value>(&input.capability_configuration).is_err() {
+            return Err(invalid_request(
+                "The capabilityConfiguration must be a JSON document.".to_string(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let gateway = store.gateways.get_mut(&input.gateway_id).ok_or_else(|| {
+            UpdateGatewayCapabilityConfigurationError::Modeled(
+                UpdateGatewayCapabilityConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::not_found_message(
+                            crate::state::RESOURCE_GATEWAY,
+                            &input.gateway_id,
+                        ),
+                    },
+                ),
+            )
+        })?;
+
+        // The stored list is bounded: a write naming a namespace the gateway does not
+        // hold yet is the only thing that lengthens it and nothing shortens it, so
+        // past the cap that write is a quota refusal. A write REPLACING a namespace
+        // already configured adds nothing, so it is never refused for the cap.
+        if gateway.capability(&input.capability_namespace).is_none()
+            && gateway.capabilities.len() >= crate::state::MAX_CAPABILITIES_PER_GATEWAY
+        {
+            return Err(UpdateGatewayCapabilityConfigurationError::Modeled(
+                UpdateGatewayCapabilityConfigurationErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: format!(
+                            "This emulator holds at most {} capability configurations per gateway.",
+                            crate::state::MAX_CAPABILITIES_PER_GATEWAY
+                        ),
+                    },
+                ),
+            ));
+        }
+
+        // The write is the last word on the namespace it names: a configuration
+        // already there is replaced, a namespace nothing has configured is defined,
+        // and either way the capability is out of sync until the gateway processes it.
+        let capability_sync_status = gateway
+            .set_capability(
+                &input.capability_namespace,
+                input.capability_configuration.clone(),
+                now,
+            )
+            .to_string();
+
+        Ok(UpdateGatewayCapabilityConfigurationOutput {
+            capability_namespace: input.capability_namespace.clone(),
+            capability_sync_status,
+        })
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> UpdateGatewayCapabilityConfigurationError {
+    UpdateGatewayCapabilityConfigurationError::Modeled(
+        UpdateGatewayCapabilityConfigurationErrorModeled::InvalidRequestException(
+            InvalidRequestException { message },
+        ),
+    )
 }

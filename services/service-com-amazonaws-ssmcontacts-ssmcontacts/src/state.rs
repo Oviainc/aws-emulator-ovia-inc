@@ -19,8 +19,9 @@
 //! record, so listing them is a read of one map entry rather than a scan.
 //!
 //! Besides the state itself this module holds the helpers more than one operation needs —
-//! ARN minting, the page/token codec, the shared enum check and the output-shape
-//! rebuilders — so the handlers of the contact/channel lifecycle cannot drift apart.
+//! ARN minting, the page/token codec, the shared enum and recurrence checks and the
+//! output-shape rebuilders — so the handlers of the contact/channel lifecycle cannot drift
+//! apart.
 //!
 //! The account-level Incident Manager precondition lives here too
 //! ([`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]): it is the
@@ -36,6 +37,7 @@ use std::time::SystemTime;
 use crate::ops::types::{
     Contact, ContactChannel, ContactChannelAddress, DescribeEngagementOutput, DescribePageOutput,
     Engagement, Plan, Receipt, RecurrenceSettings, Rotation, RotationOverride, Tag,
+    DAY_OF_WEEK_VALUES,
 };
 
 /// What `CreateContact` persists, and what `GetContact`/`ListContacts` rebuild their
@@ -1334,4 +1336,49 @@ pub fn check_enum(member: &str, value: &str, allowed: &[&str]) -> Result<(), Str
          Member must satisfy enum value set: [{}]",
         allowed.join(", ")
     ))
+}
+
+/// `Ok` when `recurrence` describes a schedule, else the `ValidationException` message
+/// saying why it does not.
+///
+/// Every operation that installs a whole `RecurrenceSettings` on a rotation admits the same
+/// recurrences, so the rule is written once: each `DayOfWeek` the recurrence carries — a
+/// `WeeklySettings` day and a `ShiftCoverages` key, both of which reach a handler as plain
+/// strings because the boundary validator enforces `length`/`pattern`/`range` rather than an
+/// enum's value set — must be one of [`DAY_OF_WEEK_VALUES`], and at least one of the daily,
+/// weekly and monthly settings lists must carry an entry, because a recurrence carrying none
+/// of them says when no shift ever starts.
+///
+/// The order of the checks is the order of the refusals, and every caller refuses with the
+/// member-level `ValidationException` its own model declares.
+pub fn check_recurrence(recurrence: &RecurrenceSettings) -> Result<(), String> {
+    for setting in recurrence.weekly_settings.iter().flatten() {
+        check_enum(
+            "recurrence.weeklySettings.dayOfWeek",
+            &setting.day_of_week,
+            DAY_OF_WEEK_VALUES,
+        )?;
+    }
+    for day in recurrence.shift_coverages.iter().flatten().map(|(day, _)| day) {
+        check_enum("recurrence.shiftCoverages", day, DAY_OF_WEEK_VALUES)?;
+    }
+
+    let describes_a_schedule = carries_a_setting(&recurrence.daily_settings)
+        || carries_a_setting(&recurrence.weekly_settings)
+        || carries_a_setting(&recurrence.monthly_settings);
+    if !describes_a_schedule {
+        return Err("Value at 'recurrence' failed to satisfy constraint: Member must carry one \
+                    of dailySettings, weeklySettings or monthlySettings"
+            .to_string());
+    }
+
+    Ok(())
+}
+
+/// Whether one of `RecurrenceSettings`' settings lists is present AND carries an entry.
+///
+/// An absent list and an empty one say the same thing: this recurrence has no shift of that
+/// period.
+fn carries_a_setting<T>(settings: &Option<Vec<T>>) -> bool {
+    settings.as_ref().is_some_and(|settings| !settings.is_empty())
 }

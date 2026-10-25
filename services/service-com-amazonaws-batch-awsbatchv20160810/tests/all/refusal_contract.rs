@@ -12,7 +12,8 @@
 //!   `ClientException` (HTTP 400) whose message is the bare
 //!   `<the ARN the identifier resolves to> does not exist` — the ARN built from the
 //!   request (region and account of the call), never the plain name and never inside the
-//!   frontend envelope; the job-queue resolver terminates that sentence with a period;
+//!   frontend envelope; the job-queue and scheduling-policy resolvers terminate that
+//!   sentence with a period;
 //! * an operation that REMOVES a resource is idempotent in its identifier: one that
 //!   resolves to nothing is the same empty success, not a not-found refusal;
 //! * a refusal AWS answers INSIDE its frontend envelope carries the id of the call being
@@ -86,7 +87,7 @@ struct Resolver {
     /// (`state::compute_environment_arn`, `state::job_queue_arn`, …).
     kind: &'static str,
     /// Whether the recorded sentence for this resolver ends with a period: the job-queue
-    /// resolver's does (`<arn> does not exist.`), the others' do not.
+    /// and scheduling-policy resolvers' do (`<arn> does not exist.`), the others' do not.
     terminated: bool,
     /// The identifiers to try, which is what this table varies: name shapes, and a job
     /// id, with each one also sent as the full ARN it resolves to.
@@ -134,6 +135,14 @@ fn resolvers() -> Vec<Resolver> {
                 "00000000-0000-0000-0000-000000000000",
                 "ffffffff-ffff-4fff-bfff-ffffffffffff",
             ],
+        },
+        Resolver {
+            label: "UpdateSchedulingPolicy",
+            uri: "/v1/updateschedulingpolicy",
+            member: "arn",
+            kind: "scheduling-policy",
+            terminated: true,
+            identifiers: &["sp-absent", "SP_absent-2"],
         },
     ]
 }

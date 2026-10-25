@@ -64,7 +64,7 @@ use crate::ops::types::{
     NetworkResource, NetworkTelemetry, OrganizationStatus, Peering,
     ResourceNotFoundException, RouteAnalysis, RouteAnalysisCompletion,
     RouteAnalysisEndpointOptions, RouteAnalysisEndpointOptionsSpecification, RouteAnalysisPath,
-    Site, SiteToSiteVpnAttachment, Tag, TransitGatewayPeering,
+    ServiceInsertionSegments, Site, SiteToSiteVpnAttachment, Tag, TransitGatewayPeering,
     TransitGatewayRouteTableAttachment, ValidationException,
     ValidationExceptionField, VpcAttachment, VpcOptions,
 };
@@ -2243,6 +2243,30 @@ impl AttachmentRecord {
         }
     }
 
+    /// The ONE edge location this attachment sits at, or `None` for a kind that spans
+    /// several of them instead.
+    ///
+    /// ONE place decides it, so every answer that names the single Region an attachment
+    /// lives in — the `Attachment$EdgeLocation` of its own reader
+    /// ([`Self::to_attachment_at`]) and the `NetworkResource$AwsRegion` of the global
+    /// network's inventory ([`ComAmazonawsNetworkmanagerNetworkmanagerState::network_resources_of`])
+    /// — reports the same one. A Direct Connect gateway attachment is the kind that spans
+    /// several edges and reports them as `Attachment$EdgeLocations` instead ("This is
+    /// returned only for Direct Connect gateway attachments. All other attachment types
+    /// retrun EdgeLocation", `smithy_query query="doc" shape="Attachment"
+    /// member="EdgeLocations"`), so it has no single edge to name.
+    pub fn sole_edge_location(&self) -> Option<&str> {
+        match &self.detail {
+            AttachmentDetail::DirectConnectGateway { .. } => None,
+            AttachmentDetail::Vpc { .. }
+            | AttachmentDetail::Connect { .. }
+            | AttachmentDetail::SiteToSiteVpn
+            | AttachmentDetail::TransitGatewayRouteTable { .. } => {
+                Some(self.edge_location.as_str())
+            }
+        }
+    }
+
     /// The modelled `Attachment` envelope of this record, as of `now`.
     ///
     /// `EdgeLocations` is absent because "this is returned only for Direct Connect gateway
@@ -2277,19 +2301,9 @@ impl AttachmentRecord {
             attachment_type: Some(self.attachment_type.to_string()),
             state: Some(state.to_string()),
             // Exactly ONE of the two edge members is reported, and which one is a function
-            // of the kind: a Direct Connect gateway attachment spans several edges and
-            // reports them as `EdgeLocations`, every other kind sits at one and reports it
-            // as `EdgeLocation` (see [`AttachmentDetail::DirectConnectGateway`]). Neither
-            // is a copy of the other: the absent member stays absent.
-            edge_location: match &self.detail {
-                AttachmentDetail::DirectConnectGateway { .. } => None,
-                AttachmentDetail::Vpc { .. }
-                | AttachmentDetail::Connect { .. }
-                | AttachmentDetail::SiteToSiteVpn
-                | AttachmentDetail::TransitGatewayRouteTable { .. } => {
-                    Some(self.edge_location.clone())
-                }
-            },
+            // of the kind ([`Self::sole_edge_location`]). Neither is a copy of the other:
+            // the absent member stays absent.
+            edge_location: self.sole_edge_location().map(str::to_string),
             edge_locations: match &self.detail {
                 AttachmentDetail::DirectConnectGateway { edge_locations } => {
                     Some(edge_locations.clone())
@@ -3541,6 +3555,10 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 NetworkResource {
                     // An attachment belongs to the core network it joins a resource to.
                     core_network_id: Some(record.core_network_id.clone()),
+                    // The attachment lives at the edge it was created at, which its own
+                    // reader reports as the Region of that edge
+                    // ([`AttachmentRecord::sole_edge_location`]).
+                    aws_region: record.sole_edge_location().map(str::to_string),
                     definition,
                     ..network_resource(ATTACHMENT_KIND, &record.id, &record.arn, &record.tags, now)
                 },
@@ -3552,6 +3570,9 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 NetworkResource {
                     // A peering belongs to the core network it joins to another resource.
                     core_network_id: Some(record.core_network_id.clone()),
+                    // A peering joins ONE edge of its core network to the peer, and its
+                    // own reader reports that edge as `Peering$EdgeLocation`.
+                    aws_region: Some(record.edge_location.clone()),
                     definition: resource_definition(&Peering::SCHEMA, &record.to_peering(now)),
                     ..network_resource(PEERING_KIND, &record.id, &record.arn, &record.tags, now)
                 },
@@ -3568,6 +3589,9 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                     // A Connect peer belongs to the core network of the Connect attachment
                     // it is carried over.
                     core_network_id: Some(record.core_network_id.clone()),
+                    // A Connect peer lands on the edge of that attachment, which its own
+                    // reader reports as `ConnectPeer$EdgeLocation`.
+                    aws_region: Some(record.edge_location.clone()),
                     definition: resource_definition(&ConnectPeer::SCHEMA, &record.to_shape(now)),
                     ..network_resource(CONNECT_PEER_KIND, &record.id, &record.arn, &record.tags, now)
                 },
@@ -3902,20 +3926,21 @@ pub fn network_resource_key(resource_type: &str, resource_id: &str) -> String {
 
 /// The members every network resource of this service carries, whatever its kind: the
 /// account that holds it, its type, id and ARN, its tags, and the instant the answer read
-/// its definition. The caller fills `Definition` (and, for a core network, `CoreNetworkId`)
-/// from the record itself.
+/// its definition. The caller fills `Definition` (and, where the kind has one,
+/// `CoreNetworkId` and `AwsRegion`) from the record itself.
 ///
-/// Three members are deliberately left absent, because nothing in the store holds them:
+/// `AwsRegion` defaults to absent here and is filled in by the caller for every kind whose
+/// own reader names the single Region the resource lives in — the edge location of an
+/// attachment, a peering or a Connect peer, all typed `ExternalRegionCode` exactly as
+/// `NetworkResource$AwsRegion` is (`smithy_query shape=NetworkResource,Attachment`). A kind
+/// whose reader names no single Region keeps the default: the resource is held under the
+/// global network itself rather than at one edge (a site, a link, a device, a connection),
+/// or it spans several Regions at once and reports them as a LIST (a core network's
+/// `Edges`, a Direct Connect gateway attachment's `EdgeLocations`), which a single-valued
+/// member cannot carry.
 ///
-/// * `AwsRegion` — every resource this service stores is partition-scoped: its ARN carries
-///   an empty region segment (see
-///   [`ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn`]), so none of these
-///   kinds sits in one Region and an `awsRegion` filter selects none of them. The
-///   Region-scoped kinds a global network can also hold (a registered transit gateway, a
-///   VPN connection) are minted by operations that are still scaffold stubs. A kind that
-///   DOES live in one Region must report it here when it starts being stored — a resource
-///   whose Region is known but unreported would be silently under-selected by that filter
-///   (an attachment, for one, knows the edge location it sits at).
+/// Two members are deliberately left absent, because nothing in the store holds them:
+///
 /// * `RegisteredGatewayArn` — only a resource reached through a registered gateway carries
 ///   one, and the registering operation (`RegisterTransitGateway`) is still a scaffold
 ///   stub. Associating a customer gateway with a device does not register one: it ties a
@@ -4881,6 +4906,35 @@ const POLICY_TAG_VALUE_OF_KEY: &str = "tag-value-of-key";
 /// See [`POLICY_REQUIRE_ATTACHMENT_ACCEPTANCE`].
 const POLICY_ADD_TO_NETWORK_FUNCTION_GROUP: &str = "add-to-network-function-group";
 
+/// See [`POLICY_VERSION`]: the keys of a `segment-actions[]` entry, the part of the document
+/// that says what one segment's routes reach. Every entry names the `action` it takes and
+/// the `segment` it acts on; a `share` action lists the segments that segment's routes are
+/// shared with in `share-with`, and a service-insertion action names the network function
+/// groups the segment's traffic goes through under `via.network-function-groups`.
+const POLICY_SEGMENT_ACTIONS: &str = "segment-actions";
+/// See [`POLICY_SEGMENT_ACTIONS`].
+const POLICY_SHARE_WITH: &str = "share-with";
+/// See [`POLICY_SEGMENT_ACTIONS`]: the key of the object form of `share-with`, which shares
+/// with every other segment but the ones it lists.
+const POLICY_EXCEPT: &str = "except";
+/// See [`POLICY_SEGMENT_ACTIONS`].
+const POLICY_VIA: &str = "via";
+
+/// The `segment-actions[].action` values this slice derives the reported topology from:
+/// `share` decides which segments a segment's routes reach, and the two service-insertion
+/// actions — the values the model enumerates as `SegmentActionServiceInsertion`, mirrored
+/// in `ops::types::SEGMENT_ACTION_SERVICE_INSERTION_VALUES` — decide which segments a
+/// network function group serves. Every other action of the published schema says nothing
+/// about either and is passed over.
+const POLICY_ACTION_SHARE: &str = "share";
+/// See [`POLICY_ACTION_SHARE`].
+const POLICY_ACTION_SEND_VIA: &str = "send-via";
+/// See [`POLICY_ACTION_SHARE`].
+const POLICY_ACTION_SEND_TO: &str = "send-to";
+
+/// The `share-with` spelling that means every other segment of the core network.
+const POLICY_SHARE_WITH_ALL: &str = "*";
+
 /// The `condition-logic` value that makes a rule claim an attachment ANY one of its
 /// conditions holds for; the other published value, `and`, is the default and is what every
 /// other string (and an absent member) means here.
@@ -4948,6 +5002,14 @@ pub const MAX_POLICY_NETWORK_FUNCTION_GROUPS: usize = 100;
 pub const MAX_POLICY_ATTACHMENT_POLICIES: usize = 100;
 /// See [`MAX_POLICY_ATTACHMENT_POLICIES`].
 pub const MAX_POLICY_CONDITIONS_PER_RULE: usize = 20;
+/// See [`MAX_POLICY_EDGE_LOCATIONS`]: how many `segment-actions` entries one document may
+/// carry. CHOSEN for the same reason — every entry is walked to derive which segments a
+/// segment's routes reach and which segments a network function group serves, so a document
+/// past this cap is refused rather than silently applied in part. The name lists INSIDE one
+/// entry are capped at [`MAX_POLICY_SEGMENTS`] /
+/// [`MAX_POLICY_NETWORK_FUNCTION_GROUPS`] — the counts of the things they may name — so one
+/// entry's kept names, and the work of reporting them, are bounded by those caps too.
+pub const MAX_POLICY_SEGMENT_ACTIONS: usize = 100;
 
 /// How long one value inside a policy document may be, in characters.
 ///
@@ -5260,6 +5322,72 @@ pub fn validate_policy_document(document: &str) -> Result<(), Vec<CoreNetworkPol
         )),
     }
 
+    // `segment-actions` is the part of the document that says what each segment's routes
+    // reach, which the reported topology is derived from, so a document carrying one is
+    // judged like the lists above: it has to be an array, and both its entry count and the
+    // name lists inside one entry are capped so that derivation stays bounded — a name list
+    // longer than the segment or group list it may name can only be repeating names.
+    match root.get(POLICY_SEGMENT_ACTIONS) {
+        None => {}
+        Some(::serde_json::Value::Array(actions)) => {
+            if actions.len() > MAX_POLICY_SEGMENT_ACTIONS {
+                errors.push(policy_error(
+                    POLICY_ERROR_TOO_MANY_ENTRIES,
+                    format!(
+                        "$.{POLICY_SEGMENT_ACTIONS} carries {} entries, but at most {MAX_POLICY_SEGMENT_ACTIONS} are allowed",
+                        actions.len()
+                    ),
+                    &format!("$.{POLICY_SEGMENT_ACTIONS}"),
+                ));
+            }
+            for (index, entry) in actions.iter().enumerate().take(MAX_POLICY_SEGMENT_ACTIONS) {
+                let share_with = entry.get(POLICY_SHARE_WITH);
+                for (listed, path, cap) in [
+                    (
+                        share_with.and_then(::serde_json::Value::as_array),
+                        format!("$.{POLICY_SEGMENT_ACTIONS}[{index}].{POLICY_SHARE_WITH}"),
+                        MAX_POLICY_SEGMENTS,
+                    ),
+                    (
+                        share_with
+                            .and_then(::serde_json::Value::as_object)
+                            .and_then(|with| with.get(POLICY_EXCEPT))
+                            .and_then(::serde_json::Value::as_array),
+                        format!(
+                            "$.{POLICY_SEGMENT_ACTIONS}[{index}].{POLICY_SHARE_WITH}.{POLICY_EXCEPT}"
+                        ),
+                        MAX_POLICY_SEGMENTS,
+                    ),
+                    (
+                        entry
+                            .get(POLICY_VIA)
+                            .and_then(::serde_json::Value::as_object)
+                            .and_then(|via| via.get(POLICY_NETWORK_FUNCTION_GROUPS))
+                            .and_then(::serde_json::Value::as_array),
+                        format!(
+                            "$.{POLICY_SEGMENT_ACTIONS}[{index}].{POLICY_VIA}.{POLICY_NETWORK_FUNCTION_GROUPS}"
+                        ),
+                        MAX_POLICY_NETWORK_FUNCTION_GROUPS,
+                    ),
+                ] {
+                    let held = listed.map_or(0, Vec::len);
+                    if held > cap {
+                        errors.push(policy_error(
+                            POLICY_ERROR_TOO_MANY_ENTRIES,
+                            format!("{path} carries {held} entries, but at most {cap} are allowed"),
+                            &path,
+                        ));
+                    }
+                }
+            }
+        }
+        Some(_) => errors.push(policy_error(
+            POLICY_ERROR_INVALID_TYPE,
+            format!("{POLICY_SEGMENT_ACTIONS:?} must be an array"),
+            &format!("$.{POLICY_SEGMENT_ACTIONS}"),
+        )),
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -5295,6 +5423,55 @@ pub struct PolicyTopology {
     /// One entry per `attachment-policies[]` rule of the document, in the order the rules
     /// are evaluated: ascending `rule-number`.
     pub attachment_policies: Vec<AttachmentPolicyRule>,
+    /// One entry per `segment-actions[]` entry of action `share` the document carries, in
+    /// the order it lists them: which segment shares its routes, and which segments they
+    /// are shared with.
+    pub shares: Vec<SegmentShare>,
+    /// One entry per `segment-actions[]` entry of action `send-via` / `send-to` the
+    /// document carries, in the order it lists them: which segment's traffic is served by
+    /// which network function groups.
+    pub service_insertions: Vec<ServiceInsertion>,
+}
+
+/// One `segment-actions[]` entry of action `share`: the segment whose routes are shared,
+/// and how the entry names the segments they are shared with.
+#[derive(Debug, Clone)]
+pub struct SegmentShare {
+    /// The entry's `segment`: the segment that shares its routes. Always a segment the
+    /// document declares, since an entry naming any other segment is not kept.
+    pub segment: String,
+    /// The entry's `share-with`.
+    pub with: ShareWith,
+}
+
+/// How a `share` entry names the segments the sharing segment's routes are shared with:
+/// either the names it lists, or every other declared segment save the ones it excepts.
+///
+/// Both forms hold their names as a SET of declared segment names, so what one entry
+/// retains is bounded by [`MAX_POLICY_SEGMENTS`] however long — and however repetitive —
+/// the list the document spelled was.
+#[derive(Debug, Clone)]
+pub enum ShareWith {
+    /// The array form: the segments the entry lists, each one the document declares.
+    Named(BTreeSet<String>),
+    /// The `*` form (nothing excepted) and the `{"except": [...]}` form: every other
+    /// segment the document declares, less the ones listed here.
+    AllExcept(BTreeSet<String>),
+}
+
+/// One `segment-actions[]` entry of action `send-via` / `send-to`: the segment the entry
+/// acts on, and the network function groups it sends that segment's traffic through.
+#[derive(Debug, Clone)]
+pub struct ServiceInsertion {
+    /// Whether the entry's action is `send-via`; `send-to` otherwise. The two are reported
+    /// through separate members of `ServiceInsertionSegments`, so which one it is is kept.
+    pub send_via: bool,
+    /// The entry's `segment`, always one the document declares.
+    pub segment: String,
+    /// The entry's `via.network-function-groups`, each one the document declares. Held as
+    /// a SET, so it is bounded by [`MAX_POLICY_NETWORK_FUNCTION_GROUPS`] however long the
+    /// list the document spelled was, and a membership test over it is logarithmic.
+    pub network_function_groups: BTreeSet<String>,
 }
 
 /// One named `segments[]` / `network-function-groups[]` entry of a policy document.
@@ -5549,8 +5726,14 @@ impl PolicyTopology {
     }
 
     /// The modelled `Segments` of this topology.
+    ///
+    /// A segment's `SharedSegments` are the segments its routes are shared with, which the
+    /// document's `segment-actions` entries of action `share` declare: a segment no such
+    /// entry acts on shares with nothing and reports the empty list. The answer is in the
+    /// order the document declares the segments, and never names the segment itself.
     pub fn to_segments(&self) -> Vec<CoreNetworkSegment> {
         let everywhere = self.everywhere();
+        let declared = self.declared_segments();
         self.segments
             .iter()
             .map(|group| CoreNetworkSegment {
@@ -5561,17 +5744,21 @@ impl PolicyTopology {
                         .clone()
                         .unwrap_or_else(|| everywhere.clone()),
                 ),
-                // Which segments a segment shares routes with is decided by the
-                // document's segment actions, which no operation of this slice acts on,
-                // so the member is absent rather than guessed.
-                shared_segments: None,
+                shared_segments: Some(self.shared_segments_of(&group.name, &declared)),
             })
             .collect()
     }
 
     /// The modelled `NetworkFunctionGroups` of this topology.
+    ///
+    /// A group's `Segments` are the segments whose traffic the document's `segment-actions`
+    /// send through this group, split by the action that sent them: `SendVia` for the
+    /// `send-via` entries and `SendTo` for the `send-to` ones. A group no such entry names
+    /// serves no segment and reports two empty lists. Each list is in the order the
+    /// document declares the segments.
     pub fn to_network_function_groups(&self) -> Vec<CoreNetworkNetworkFunctionGroup> {
         let everywhere = self.everywhere();
+        let declared = self.declared_segments();
         self.network_function_groups
             .iter()
             .map(|group| CoreNetworkNetworkFunctionGroup {
@@ -5582,11 +5769,77 @@ impl PolicyTopology {
                         .clone()
                         .unwrap_or_else(|| everywhere.clone()),
                 ),
-                // As with `shared_segments` above: a group's send-via / send-to segments
-                // come from the document's segment actions, which this slice does not act
-                // on.
-                segments: None,
+                segments: Some(ServiceInsertionSegments {
+                    send_via: Some(self.inserted_segments_of(&group.name, true, &declared)),
+                    send_to: Some(self.inserted_segments_of(&group.name, false, &declared)),
+                }),
             })
+            .collect()
+    }
+
+    /// The names of the segments this document declares, in the order it declares them and
+    /// each named once: the order every segment list of a reported topology is in, and the
+    /// only names such a list may carry — a `segment-actions` entry naming anything else
+    /// names no segment of this core network.
+    fn declared_segments(&self) -> Vec<&str> {
+        let mut declared: Vec<&str> = Vec::with_capacity(self.segments.len());
+        for group in &self.segments {
+            if !declared.contains(&group.name.as_str()) {
+                declared.push(group.name.as_str());
+            }
+        }
+        declared
+    }
+
+    /// The segments the routes of the segment `name` are shared with: the union of what
+    /// every `share` entry acting on it declares, in `declared` order.
+    ///
+    /// Bounded by the caps: at most [`MAX_POLICY_SEGMENT_ACTIONS`] entries are walked, each
+    /// holding at most [`MAX_POLICY_SEGMENTS`] names, and the answer is at most `declared`
+    /// long.
+    fn shared_segments_of(&self, name: &str, declared: &[&str]) -> Vec<String> {
+        let mut shared: BTreeSet<&str> = BTreeSet::new();
+        for share in self.shares.iter().filter(|share| share.segment == name) {
+            match &share.with {
+                ShareWith::Named(names) => shared.extend(names.iter().map(String::as_str)),
+                ShareWith::AllExcept(excepted) => shared.extend(
+                    declared
+                        .iter()
+                        .copied()
+                        .filter(|candidate| !excepted.contains(*candidate)),
+                ),
+            }
+        }
+        declared
+            .iter()
+            .copied()
+            // A segment never shares with itself, however the entry names it: its own
+            // routes are already its own.
+            .filter(|candidate| *candidate != name && shared.contains(candidate))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The segments whose traffic the network function group `name` serves under the
+    /// `send-via` action (`send_via`) or the `send-to` one, in `declared` order.
+    ///
+    /// Bounded by the caps the same way [`Self::shared_segments_of`] is: at most
+    /// [`MAX_POLICY_SEGMENT_ACTIONS`] entries are walked, each answering whether it names
+    /// this group in logarithmic time.
+    fn inserted_segments_of(&self, name: &str, send_via: bool, declared: &[&str]) -> Vec<String> {
+        let served: BTreeSet<&str> = self
+            .service_insertions
+            .iter()
+            .filter(|insertion| {
+                insertion.send_via == send_via && insertion.network_function_groups.contains(name)
+            })
+            .map(|insertion| insertion.segment.as_str())
+            .collect();
+        declared
+            .iter()
+            .copied()
+            .filter(|candidate| served.contains(candidate))
+            .map(str::to_string)
             .collect()
     }
 }
@@ -5785,7 +6038,11 @@ fn same_edge(left: &CoreNetworkEdge, right: &CoreNetworkEdge) -> bool {
 /// to or, where it names none, in every edge location of the core network; the same
 /// location rule holds for each named entry of `network-function-groups`; and each
 /// `attachment-policies` rule is kept with its conditions and its action, ordered by the
-/// ascending `rule-number` the rules are evaluated in.
+/// ascending `rule-number` the rules are evaluated in. The `segment-actions` entries say
+/// what each segment's routes reach: a `share` entry shares the routes of the segment it
+/// acts on with the segments its `share-with` names, and a `send-via` / `send-to` entry
+/// sends that segment's traffic through the network function groups its
+/// `via.network-function-groups` names ([`segment_actions`]).
 ///
 /// A document this service cannot parse describes no topology, so it answers the empty
 /// one rather than guessing: a document is only stored once
@@ -5859,11 +6116,136 @@ pub fn policy_topology(document: &str) -> PolicyTopology {
             .collect()
     };
 
+    let segments = named(POLICY_SEGMENTS);
+    let network_function_groups = named(POLICY_NETWORK_FUNCTION_GROUPS);
+    // The segment actions are read LAST, because an action is only kept where the segments
+    // and groups it names are ones the document declares.
+    let (shares, service_insertions) = segment_actions(root, &segments, &network_function_groups);
     PolicyTopology {
-        segments: named(POLICY_SEGMENTS),
-        network_function_groups: named(POLICY_NETWORK_FUNCTION_GROUPS),
+        segments,
+        network_function_groups,
         edges,
         attachment_policies: attachment_policies(root),
+        shares,
+        service_insertions,
+    }
+}
+
+/// The `segment-actions` entries of a policy document's root object this slice derives the
+/// reported topology from: the `share` entries, which decide which segments a segment's
+/// routes are shared with, and the `send-via` / `send-to` ones, which decide which segments
+/// a network function group serves.
+///
+/// An entry is kept only where it is readable AND names declared resources: a segment or a
+/// network function group no entry of `segments` / `network-function-groups` declares is
+/// none of this core network's, so it is dropped rather than reported. An action of any
+/// other kind decides neither member and is passed over.
+///
+/// Every list this walks is capped, which is what bounds both the walk and what it retains:
+/// the entry count at [`MAX_POLICY_SEGMENT_ACTIONS`], and one entry's name lists at the
+/// segment and group caps — the counts [`validate_policy_document`] refuses a document
+/// past, so a STORED document carries none longer. The kept names are held as SETS, so a
+/// list repeating one name retains it once.
+fn segment_actions(
+    root: &::serde_json::Map<String, ::serde_json::Value>,
+    segments: &[NamedGroup],
+    network_function_groups: &[NamedGroup],
+) -> (Vec<SegmentShare>, Vec<ServiceInsertion>) {
+    fn declares(groups: &[NamedGroup], name: &str) -> bool {
+        groups.iter().any(|group| group.name == name)
+    }
+
+    let mut shares = Vec::new();
+    let mut service_insertions = Vec::new();
+    for entry in root
+        .get(POLICY_SEGMENT_ACTIONS)
+        .and_then(::serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .take(MAX_POLICY_SEGMENT_ACTIONS)
+    {
+        let Some(action) = entry
+            .get(POLICY_ACTION)
+            .and_then(::serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Some(segment) = entry
+            .get(POLICY_SEGMENT)
+            .and_then(::serde_json::Value::as_str)
+            .filter(|name| declares(segments, name))
+        else {
+            continue;
+        };
+        match action {
+            POLICY_ACTION_SHARE => {
+                if let Some(with) = share_with(entry.get(POLICY_SHARE_WITH), segments) {
+                    shares.push(SegmentShare {
+                        segment: segment.to_string(),
+                        with,
+                    });
+                }
+            }
+            POLICY_ACTION_SEND_VIA | POLICY_ACTION_SEND_TO => {
+                let groups: BTreeSet<String> = entry
+                    .get(POLICY_VIA)
+                    .and_then(::serde_json::Value::as_object)
+                    .and_then(|via| via.get(POLICY_NETWORK_FUNCTION_GROUPS))
+                    .and_then(::serde_json::Value::as_array)
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .take(MAX_POLICY_NETWORK_FUNCTION_GROUPS)
+                    .filter_map(::serde_json::Value::as_str)
+                    .filter(|name| declares(network_function_groups, name))
+                    .map(str::to_string)
+                    .collect();
+                // An entry sending a segment through no declared group serves nothing, so
+                // there is nothing to keep.
+                if !groups.is_empty() {
+                    service_insertions.push(ServiceInsertion {
+                        send_via: action == POLICY_ACTION_SEND_VIA,
+                        segment: segment.to_string(),
+                        network_function_groups: groups,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    (shares, service_insertions)
+}
+
+/// How a `share` entry's `share-with` names the segments it shares with, or `None` where
+/// the entry carries none or spells it in a form this slice cannot read — such an entry
+/// shares with NOTHING, since an unreadable one must not silently widen the sharing it
+/// belongs to.
+///
+/// The published spellings are the list of segment names, the string `*` for every other
+/// segment, and an object excepting some of them. Each list is walked only as far as
+/// [`MAX_POLICY_SEGMENTS`] entries — the count [`validate_policy_document`] refuses a
+/// document past — and only names `segments` declares are kept, each once, so what one
+/// entry retains is bounded by that cap.
+fn share_with(value: Option<&::serde_json::Value>, segments: &[NamedGroup]) -> Option<ShareWith> {
+    let declared = |name: &&str| segments.iter().any(|group| group.name == *name);
+    let kept = |names: &[::serde_json::Value]| -> BTreeSet<String> {
+        names
+            .iter()
+            .take(MAX_POLICY_SEGMENTS)
+            .filter_map(::serde_json::Value::as_str)
+            .filter(declared)
+            .map(str::to_string)
+            .collect()
+    };
+    match value? {
+        ::serde_json::Value::String(spelt) if spelt == POLICY_SHARE_WITH_ALL => {
+            Some(ShareWith::AllExcept(BTreeSet::new()))
+        }
+        ::serde_json::Value::Array(names) => Some(ShareWith::Named(kept(names))),
+        ::serde_json::Value::Object(object) => object
+            .get(POLICY_EXCEPT)
+            .and_then(::serde_json::Value::as_array)
+            .map(|excepted| ShareWith::AllExcept(kept(excepted))),
+        _ => None,
     }
 }
 

@@ -54,6 +54,11 @@
 //! `ops/list_custom_model_deployments.rs` reports, together with the instant each
 //! deployment's non-terminal `status` is owed its move to `Active`.
 //!
+//! And it holds the Automated Reasoning policies `ops/create_automated_reasoning_policy.rs`
+//! mints and `ops/get_automated_reasoning_policy.rs` reads back, each with the draft
+//! definition it was created with and the hash of that definition, so the hash the create
+//! answered is the hash the read reports.
+//!
 //! And it holds the account's acknowledged use case for model access — the single form
 //! `ops/put_use_case_for_model_access.rs` submits and `ops/get_use_case_for_model_access.rs`
 //! reads back, so the form one request submits is the form the next request gets.
@@ -63,8 +68,9 @@
 //! removes, each holding the foundation models that profile tracks metrics and costs for.
 //!
 //! And it holds the published foundation model catalog — the base models
-//! `ops/list_foundation_models.rs` reports — which is seeded with the store and never
-//! written, because no operation of this service creates a foundation model.
+//! `ops/list_foundation_models.rs` reports and `ops/get_foundation_model.rs` resolves one
+//! row of — which is seeded with the store and never written, because no operation of this
+//! service creates a foundation model.
 //!
 //! And it holds the resource policies `ops/put_resource_policy.rs` attaches and
 //! `ops/get_resource_policy.rs` reports, keyed by the [`TaggedResource`] each one is
@@ -88,9 +94,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CustomModelDataSource, CustomModelDeploymentSummary, CustomModelSummary, EndpointConfig,
-    EvaluationConfig, EvaluationInferenceConfig, EvaluationOutputDataConfig,
-    GuardrailAutomatedReasoningPolicy, GuardrailAutomatedReasoningPolicyConfig,
+    AutomatedReasoningPolicyDefinition, CustomModelDataSource, CustomModelDeploymentSummary,
+    CustomModelSummary, EndpointConfig, EvaluationConfig, EvaluationInferenceConfig,
+    EvaluationOutputDataConfig, FoundationModelDetails, FoundationModelLifecycle,
+    FoundationModelSummary, GuardrailAutomatedReasoningPolicy,
+    GuardrailAutomatedReasoningPolicyConfig,
     GuardrailContentFilter, GuardrailContentFilterConfig, GuardrailContentFiltersTier,
     GuardrailContentFiltersTierConfig, GuardrailContentPolicy, GuardrailContentPolicyConfig,
     GuardrailContextualGroundingFilter, GuardrailContextualGroundingFilterConfig,
@@ -109,6 +117,13 @@ use crate::ops::types::{
 
 /// The working version every guardrail always has, as `GuardrailDraftVersion`
 /// (`^DRAFT$`) spells it.
+///
+/// An Automated Reasoning policy carries the same spelling for its own working version:
+/// `CreateAutomatedReasoningPolicyResponse$version` documents "The initial version is
+/// always DRAFT"
+/// (`smithy_query(query="operation",operation="CreateAutomatedReasoningPolicy")`), so the
+/// two resources name their draft with ONE constant rather than two spellings that could
+/// drift.
 pub const DRAFT_VERSION: &str = "DRAFT";
 
 /// `GuardrailStatus` — a guardrail that is serving. The status every revision this
@@ -1222,6 +1237,63 @@ impl CustomModelRecord {
     }
 }
 
+/// The most Automated Reasoning policies this account may hold at once, across every
+/// region it has created one in, past which a create is refused with
+/// `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota: without a server-side cap a
+/// caller could grow this part of the store with nothing but fresh policy names, or with
+/// fresh regions, which is why the bound is over the whole store rather than per region.
+pub const MAX_AUTOMATED_REASONING_POLICIES_PER_ACCOUNT: usize = 100;
+
+/// `AutomatedReasoningPolicyDefinition$version` when the request carried no version of
+/// its own — the member's modelled `@default("1")`
+/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`).
+pub const POLICY_DEFINITION_FORMAT_VERSION: &str = "1";
+
+/// A stored Automated Reasoning policy: the identity `CreateAutomatedReasoningPolicy`
+/// minted, and the draft definition every later read of that policy reports.
+///
+/// The `definitionHash` is held beside the definition rather than recomputed per read, so
+/// the hash the create answered is the hash the read reports; it is a function of the
+/// DEFINITION alone ([`policy_definition_hash`]), which is what makes it usable as the
+/// concurrency token its member documents.
+#[derive(Debug, Clone)]
+pub struct AutomatedReasoningPolicyRecord {
+    /// The `AutomatedReasoningPolicyArn` this policy is addressed by, minted by
+    /// [`automated_reasoning_policy_arn`] — also the key this family's store is keyed by.
+    pub arn: String,
+    /// `policyId` — the resource half of [`Self::arn`] (`^[a-z0-9]{12}$`), which
+    /// `GetAutomatedReasoningPolicy` reports beside it.
+    pub id: String,
+    /// `name`, as the create request spelled it.
+    pub name: String,
+    /// The region the create addressed, which [`Self::arn`] also carries. Kept beside it
+    /// so the name index is per region without re-parsing an ARN, exactly as
+    /// [`CustomModelRecord::region`] is.
+    pub region: String,
+    /// `description`, as the create request carried it (absent when it carried none).
+    pub description: Option<String>,
+    /// `policyDefinition`, as the create request carried it (absent when it carried none,
+    /// which is how a policy whose rules a build workflow is to extract starts out).
+    pub definition: Option<AutomatedReasoningPolicyDefinition>,
+    /// `definitionHash` — [`policy_definition_hash`] of [`Self::definition`].
+    pub definition_hash: String,
+    /// `kmsKeyArn` — the customer managed key the create named, completed to a `KmsKeyArn`
+    /// by [`kms_key_arn`], or `None` when the create named none (Amazon Bedrock then uses
+    /// an AWS managed key, which is no key of this account to report).
+    pub kms_key_arn: Option<String>,
+    /// `tags` — the tags the create request attached to the policy.
+    ///
+    /// Kept for the reason [`CustomModelRecord::tags`] is: it is part of the request that
+    /// minted the record, and the policy's own reads report no tag member.
+    pub tags: Vec<Tag>,
+    pub created_at: SystemTime,
+    /// When the policy was last written. The creation instant until an update rewrites
+    /// the draft.
+    pub updated_at: SystemTime,
+}
+
 /// One stored application inference profile: the identity `CreateInferenceProfile`
 /// minted, the model source that request named, and what a read reports.
 ///
@@ -1364,6 +1436,13 @@ pub struct EnforcedGuardrailConfiguration {
 ///   `CreateCustomModelDeployment` enforces, and
 ///   `custom_model_deployment_create_tokens` holds at most one entry per live deployment
 ///   for the same reason `create_tokens` does.
+///
+/// * `automated_reasoning_policies` and `automated_reasoning_policy_names` hold one entry
+///   per live Automated Reasoning policy, capped at
+///   [`MAX_AUTOMATED_REASONING_POLICIES_PER_ACCOUNT`] by the quota
+///   `CreateAutomatedReasoningPolicy` enforces, and
+///   `automated_reasoning_policy_create_tokens` holds at most one entry per live policy for
+///   the same reason `create_tokens` does.
 ///
 /// * `inference_profiles` holds one entry per live application inference profile, capped
 ///   at [`MAX_INFERENCE_PROFILES_PER_ACCOUNT`] by the quota `CreateInferenceProfile`
@@ -1535,6 +1614,24 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many custom model ids this store has minted; the uniqueness half of a minted
     /// id.
     pub minted_custom_models: u64,
+    /// Every stored Automated Reasoning policy, keyed by its
+    /// `AutomatedReasoningPolicyArn` — the one identifier
+    /// `GetAutomatedReasoningPolicy` addresses a policy by, which carries the region too,
+    /// so the same id in another region is another key.
+    pub automated_reasoning_policies: HashMap<String, AutomatedReasoningPolicyRecord>,
+    /// `(region, name)` -> `AutomatedReasoningPolicyArn`, so a duplicate name is a
+    /// `ConflictException`.
+    ///
+    /// Keyed by the region too because the ARN carries one, so the same name in another
+    /// region names another policy.
+    pub automated_reasoning_policy_names: HashMap<(String, String), String>,
+    /// `CreateAutomatedReasoningPolicy` idempotency: `(region, clientRequestToken)` -> the
+    /// `policyArn` that token minted. Scoped to that one operation, and to the region the
+    /// request addressed, the way the custom model index is.
+    pub automated_reasoning_policy_create_tokens: HashMap<(String, String), String>,
+    /// How many Automated Reasoning policy ids this store has minted; the uniqueness half
+    /// of a minted id.
+    pub minted_automated_reasoning_policies: u64,
     /// Every stored application inference profile, keyed by its `InferenceProfileArn` —
     /// one of the two spellings an `InferenceProfileIdentifier` carries.
     pub inference_profiles: HashMap<String, InferenceProfileRecord>,
@@ -1619,6 +1716,32 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     pub fn mint_prompt_router_id(&mut self, now: SystemTime) -> String {
         self.minted_prompt_routers += 1;
         minted_id(self.minted_prompt_routers, now)
+    }
+
+    /// Mint a fresh Automated Reasoning policy id: the resource half of an
+    /// `automated-reasoning-policy/<id>` ARN, unique within this store.
+    ///
+    /// Built like a guardrail id, and for the same two reasons;
+    /// `AutomatedReasoningPolicyArn` admits exactly `[a-z0-9]{12}` there, which is what
+    /// two [`ID_HALF_WIDTH`] base-36 halves spell, and `AutomatedReasoningPolicyId` is
+    /// that same `^[a-z0-9]{12}$`.
+    pub fn mint_automated_reasoning_policy_id(&mut self, now: SystemTime) -> String {
+        self.minted_automated_reasoning_policies += 1;
+        minted_id(self.minted_automated_reasoning_policies, now)
+    }
+
+    /// The Automated Reasoning policy an `AutomatedReasoningPolicyArn` names.
+    ///
+    /// The lookup is EXACT, so the ARN's region and its optional `:<version>` suffix both
+    /// select: the base ARN names the draft this store holds, and a versioned ARN names a
+    /// version, of which this store holds none until `CreateAutomatedReasoningPolicyVersion`
+    /// mints one.
+    #[must_use]
+    pub fn automated_reasoning_policy(
+        &self,
+        policy_arn: &str,
+    ) -> Option<&AutomatedReasoningPolicyRecord> {
+        self.automated_reasoning_policies.get(policy_arn)
     }
 
     /// Mint a fresh inference profile id: the resource half of an
@@ -1977,9 +2100,10 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// read back to the first — the one the store is keyed by — in the region the ARN
     /// itself carries, so neither spelling reaches another region's resource.
     ///
-    /// The families this service holds no record of (a custom model, an automated reasoning
-    /// policy, a model invocation job, an async invoke) resolve to `None`: nothing creates
-    /// one yet, so this account holds no such resource to tag.
+    /// The families this resolution does not reach (a custom model, an Automated Reasoning
+    /// policy, a model invocation job, an async invoke) resolve to `None`, so a tagging
+    /// call that names one is answered as naming no taggable resource of this account;
+    /// wiring a family in is that family's own work, not a create's.
     pub fn tagged_resource(
         &mut self,
         resource_arn: &str,
@@ -2481,6 +2605,110 @@ pub fn application_inference_profile_arn(region: &str, id: &str) -> String {
 /// endpoint that already exists — so the `endpointArn` every marketplace endpoint
 /// operation carries is that SageMaker endpoint's ARN, whose resource id is the endpoint
 /// name. `Arn` declares no pattern (`@length(max: 2048)` only), so nothing in the model
+/// The `AutomatedReasoningPolicyArn` of the policy `id` names in `region`:
+/// `arn:aws:bedrock:<region>:<account>:automated-reasoning-policy/<id>`, which is the
+/// form `AutomatedReasoningPolicyArn` spells without its optional version suffix.
+#[must_use]
+pub fn automated_reasoning_policy_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("automated-reasoning-policy/{id}"),
+    )
+}
+
+/// The `definitionHash` of an Automated Reasoning policy definition: 128 digits of
+/// `[0-9a-z]`, as `AutomatedReasoningPolicyHash` requires.
+///
+/// A function of the DEFINITION alone, so two policies whose definitions agree report one
+/// hash and any change to a definition changes it — which is what the member documents it
+/// for ("used as a concurrency token for creating policy versions"). The digest is SHA-512
+/// hex, whose 128 lowercase hex digits are exactly the width and alphabet the shape
+/// admits, taken over a canonical rendering of the definition rather than over the request
+/// bytes, so the same definition written two ways hashes alike.
+///
+/// An ABSENT definition hashes as the empty definition the shape's own defaults spell: a
+/// policy created without one still reports a hash, and reports the same one until a
+/// definition is written to it.
+#[must_use]
+pub fn policy_definition_hash(definition: Option<&AutomatedReasoningPolicyDefinition>) -> String {
+    use ::sha2::{Digest, Sha512};
+
+    let canonical = canonical_policy_definition(definition).to_string();
+    ::hex::encode(Sha512::digest(canonical.as_bytes()))
+}
+
+/// A policy definition as the one JSON value [`policy_definition_hash`] digests: every
+/// member of every element in a fixed order, with an absent list rendered as the empty
+/// list and an absent definition as the empty definition, so the rendering depends on the
+/// definition's CONTENT and on nothing else.
+fn canonical_policy_definition(
+    definition: Option<&AutomatedReasoningPolicyDefinition>,
+) -> ::serde_json::Value {
+    let format_version = definition
+        .map(|definition| definition.version.as_str())
+        .filter(|version| !version.is_empty())
+        .unwrap_or(POLICY_DEFINITION_FORMAT_VERSION);
+    let types: Vec<::serde_json::Value> = definition
+        .and_then(|definition| definition.types.as_ref())
+        .map(|types| {
+            types
+                .iter()
+                .map(|declared| {
+                    ::serde_json::json!({
+                        "name": declared.name,
+                        "description": declared.description,
+                        "values": declared
+                            .values
+                            .iter()
+                            .map(|value| ::serde_json::json!({
+                                "value": value.value,
+                                "description": value.description,
+                            }))
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let variables: Vec<::serde_json::Value> = definition
+        .and_then(|definition| definition.variables.as_ref())
+        .map(|variables| {
+            variables
+                .iter()
+                .map(|variable| {
+                    ::serde_json::json!({
+                        "name": variable.name,
+                        "type": variable.r#type,
+                        "description": variable.description,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let rules: Vec<::serde_json::Value> = definition
+        .and_then(|definition| definition.rules.as_ref())
+        .map(|rules| {
+            rules
+                .iter()
+                .map(|rule| {
+                    ::serde_json::json!({
+                        "id": rule.id,
+                        "expression": rule.expression,
+                        "alternateExpression": rule.alternate_expression,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ::serde_json::json!({
+        "version": format_version,
+        "types": types,
+        "variables": variables,
+        "rules": rules,
+    })
+}
+
 /// narrows it further.
 pub fn marketplace_model_endpoint_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("sagemaker", region, &format!("endpoint/{name}"))
@@ -3212,8 +3440,11 @@ const FINE_TUNING_AND_PRE_TRAINING: &[&str] = &["FINE_TUNING", "CONTINUED_PRE_TR
 const FINE_TUNING_AND_DISTILLATION: &[&str] = &["FINE_TUNING", "DISTILLATION"];
 /// `FoundationModelLifecycleStatus` — the model is available.
 const LIFECYCLE_ACTIVE: &str = "ACTIVE";
-/// `FoundationModelLifecycleStatus` — the model is deprecated: its id still resolves, and
-/// callers are expected to move off it.
+/// `FoundationModelLifecycleStatus` — the model is deprecated: it is still offered and
+/// still invocable, and callers are expected to move off it before its end of life. The
+/// two values this enum carries are the two states an OFFERED model can be in; a model
+/// past its end of life is no longer offered, so it is absent from this catalog rather
+/// than carried in it under a status (see [`FOUNDATION_MODELS`]).
 const LIFECYCLE_LEGACY: &str = "LEGACY";
 
 /// Every foundation model this emulator's Amazon Bedrock offers, in `modelId` order.
@@ -3223,11 +3454,19 @@ const LIFECYCLE_LEGACY: &str = "LEGACY";
 /// `ListFoundationModels` reports and `GetFoundationModel` resolves one row of, not
 /// anything a request can add to or remove from.
 ///
+/// It is the set of models the service currently OFFERS, which is what makes it the set
+/// both of those operations answer out of: a model is here while it is available
+/// ([`LIFECYCLE_ACTIVE`]) and while it is deprecated ([`LIFECYCLE_LEGACY`]), and a model
+/// past its end of life is not offered at all, so it is in no row — it is listed by
+/// nothing and resolves for nobody. The inference plane keeps such an id in its own
+/// inventory to refuse it, which is where the end-of-life refusal belongs; the control
+/// plane simply no longer carries the model.
+///
 /// The ids are the base model ids AWS publishes in "Amazon Bedrock base model IDs
 /// (on-demand throughput)" and "Supported foundation models in Amazon Bedrock", and the
-/// rows past their end of life carry the ids "Model lifecycle" lists; this emulator's
-/// bedrock-runtime plane recognises the same ids, so the two planes agree about which
-/// models exist. Each row's provider, modalities, streaming support, customizations and
+/// rows AWS marks deprecated carry the status "Model lifecycle" lists them under; this
+/// emulator's bedrock-runtime plane serves the same ids, so the two planes agree about
+/// which models exist. Each row's provider, modalities, streaming support, customizations and
 /// inference types are as those pages publish them for that model; a per-model attribute
 /// no page publishes is left out of the row rather than invented (the lifecycle's
 /// `startOfLifeTime`, `endOfLifeTime`, `legacyTime` and `publicExtendedAccessTime` are
@@ -3237,17 +3476,6 @@ const LIFECYCLE_LEGACY: &str = "LEGACY";
 /// filter on, because the filter rule — not the catalog's size — is what this emulator
 /// has to get right.
 pub const FOUNDATION_MODELS: &[FoundationModel] = &[
-    FoundationModel {
-        model_id: "ai21.j2-ultra-v1",
-        model_name: "Jurassic-2 Ultra",
-        provider_name: "AI21 Labs",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: false,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_LEGACY,
-    },
     FoundationModel {
         model_id: "ai21.jamba-1-5-mini-v1:0",
         model_name: "Jamba 1.5 Mini",
@@ -3337,17 +3565,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         lifecycle_status: LIFECYCLE_ACTIVE,
     },
     FoundationModel {
-        model_id: "amazon.titan-text-express-v1",
-        model_name: "Titan Text Express",
-        provider_name: "Amazon",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: FINE_TUNING_AND_PRE_TRAINING,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_LEGACY,
-    },
-    FoundationModel {
         model_id: "amazon.titan-text-lite-v1",
         model_name: "Titan Text Lite",
         provider_name: "Amazon",
@@ -3356,7 +3573,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING_AND_PRE_TRAINING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_ACTIVE,
+        lifecycle_status: LIFECYCLE_LEGACY,
     },
     FoundationModel {
         model_id: "amazon.titan-text-premier-v1:0",
@@ -3403,17 +3620,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         lifecycle_status: LIFECYCLE_ACTIVE,
     },
     FoundationModel {
-        model_id: "anthropic.claude-v2",
-        model_name: "Claude",
-        provider_name: "Anthropic",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_LEGACY,
-    },
-    FoundationModel {
         model_id: "cohere.command-light-text-v14",
         model_name: "Command Light",
         provider_name: "Cohere",
@@ -3422,7 +3628,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_ACTIVE,
+        lifecycle_status: LIFECYCLE_LEGACY,
     },
     FoundationModel {
         model_id: "cohere.command-text-v14",
@@ -3433,7 +3639,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_ACTIVE,
+        lifecycle_status: LIFECYCLE_LEGACY,
     },
     FoundationModel {
         model_id: "cohere.embed-english-v3",
@@ -3445,17 +3651,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
-    },
-    FoundationModel {
-        model_id: "meta.llama2-70b-chat-v1",
-        model_name: "Llama 2 Chat 70B",
-        provider_name: "Meta",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: FINE_TUNING,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_LEGACY,
     },
     FoundationModel {
         model_id: "meta.llama3-1-8b-instruct-v1:0",
@@ -3597,6 +3792,64 @@ pub fn provider_matches(model: &FoundationModel, by_provider: &str) -> bool {
         .map_or(model.model_id, |(provider, _)| provider);
     by_provider.eq_ignore_ascii_case(model.provider_name)
         || by_provider.eq_ignore_ascii_case(id_provider)
+}
+
+/// One catalog row as the `FoundationModelSummary` a `ListFoundationModels` response for
+/// `region` carries.
+///
+/// Lives here rather than in `ops/list_foundation_models.rs` because every member it
+/// carries is also a member `GetFoundationModel` reports
+/// ([`foundation_model_details`], which is built out of it), and the two must agree about
+/// them: a listed summary is the same row the read of that one model finds.
+///
+/// `modelLifecycle` reports the row's `status` and none of the four lifecycle instants:
+/// nothing publishes a launch, legacy or end-of-life date per model, and a date is not
+/// something to invent.
+#[must_use]
+pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> FoundationModelSummary {
+    let list = |values: &[&str]| values.iter().map(|value| (*value).to_string()).collect();
+    FoundationModelSummary {
+        model_arn: foundation_model_arn(region, model.model_id),
+        model_id: model.model_id.to_string(),
+        model_name: Some(model.model_name.to_string()),
+        provider_name: Some(model.provider_name.to_string()),
+        input_modalities: Some(list(model.input_modalities)),
+        output_modalities: Some(list(model.output_modalities)),
+        response_streaming_supported: Some(model.response_streaming_supported),
+        customizations_supported: Some(list(model.customizations_supported)),
+        inference_types_supported: Some(list(model.inference_types_supported)),
+        model_lifecycle: Some(FoundationModelLifecycle {
+            status: model.lifecycle_status.to_string(),
+            start_of_life_time: None,
+            end_of_life_time: None,
+            legacy_time: None,
+            public_extended_access_time: None,
+        }),
+    }
+}
+
+/// The same catalog row as the `FoundationModelDetails` a `GetFoundationModel` response
+/// for `region` carries.
+///
+/// `FoundationModelDetails` and `FoundationModelSummary` declare the same ten members, and
+/// a read of a model must report what a listing reports for it, so this moves the ONE
+/// mapping [`foundation_model_summary`] computes into the shape this response declares
+/// rather than computing the members a second time.
+#[must_use]
+pub fn foundation_model_details(model: &FoundationModel, region: &str) -> FoundationModelDetails {
+    let summary = foundation_model_summary(model, region);
+    FoundationModelDetails {
+        model_arn: summary.model_arn,
+        model_id: summary.model_id,
+        model_name: summary.model_name,
+        provider_name: summary.provider_name,
+        input_modalities: summary.input_modalities,
+        output_modalities: summary.output_modalities,
+        response_streaming_supported: summary.response_streaming_supported,
+        customizations_supported: summary.customizations_supported,
+        inference_types_supported: summary.inference_types_supported,
+        model_lifecycle: summary.model_lifecycle,
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

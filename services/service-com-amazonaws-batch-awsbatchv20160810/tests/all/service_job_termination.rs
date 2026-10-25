@@ -112,6 +112,9 @@ pub(crate) fn seed(batch: &Batch, status: &str, filled: Filled) -> ServiceJob {
         scheduling_priority: (filled == Filled::Everything).then_some(42),
         service_request_payload: (filled == Filled::Everything)
             .then(|| r#"{"TrainingJobName":"t-1","InstanceCount":2}"#.to_string()),
+        // The seeded payload states no `ResourceConfig`, so it asks for no capacity this
+        // service can measure — the demand a submit would derive from it is empty.
+        requested_capacity: Vec::new(),
         retry_strategy: (filled == Filled::Everything).then(retry_strategy),
         timeout_config: (filled == Filled::Everything).then_some(ServiceJobTimeout {
             attempt_duration_seconds: Some(600),

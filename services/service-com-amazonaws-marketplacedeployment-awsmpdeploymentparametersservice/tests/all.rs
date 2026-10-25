@@ -37,5 +37,7 @@ mod response_request_id;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/unconstrained_tag_characters.rs"]
+mod unconstrained_tag_characters;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;

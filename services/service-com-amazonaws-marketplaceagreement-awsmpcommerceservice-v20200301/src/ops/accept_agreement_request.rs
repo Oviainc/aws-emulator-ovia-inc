@@ -253,6 +253,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             now,
         );
+        // Both sides of the agreement name an account: the caller accepted these
+        // terms (the buyer's call) and it is also the account this service lets
+        // a seller act under, so it is the proposer too — see
+        // `crate::state::agreement_parties` for the one place that decides it.
+        let (acceptor, proposer) = crate::state::agreement_parties();
         let agreement = crate::state::Agreement {
             // "When an agreement isn't derived from another agreement, its
             // InitialAgreementId is its own AgreementId."
@@ -263,13 +268,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             agreement_request_id: request.id.clone(),
             agreement_type: crate::state::AGREEMENT_TYPE.to_string(),
             catalog: crate::state::CATALOG.to_string(),
-            // The caller accepted these terms, so the emulator's account is the
-            // acceptor. The proposer is the seller who published the proposal,
-            // whose account this emulator holds no record of.
-            acceptor: Acceptor {
-                account_id: Some(::engine::emulator_account_id().to_string()),
-            },
-            proposer: Proposer { account_id: None },
+            acceptor,
+            proposer,
             status: crate::state::STATUS_ACTIVE.to_string(),
             // "AcceptanceTime and StartTime can differ for future dated
             // agreements"; the accepted terms carry no start date, so this

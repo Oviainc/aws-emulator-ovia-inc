@@ -398,6 +398,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // component type reports the non-terminal state an update in flight is
         // in; the clock, not a caller, settles it back in `ACTIVE`.
         updated.begin_update(now);
+        // Abstractness is decided from the definitions, functions and
+        // inheritance the record holds, so a patch that changes any of them
+        // changes the answer: it is recomputed over the PATCHED record, exactly
+        // as the create computes it over the created one. See
+        // `crate::state::component_type_is_abstract`.
+        updated.is_abstract = crate::state::component_type_is_abstract(workspace, &updated);
         let output = UpdateComponentTypeOutput {
             workspace_id: updated.workspace_id.clone(),
             component_type_id: updated.component_type_id.clone(),

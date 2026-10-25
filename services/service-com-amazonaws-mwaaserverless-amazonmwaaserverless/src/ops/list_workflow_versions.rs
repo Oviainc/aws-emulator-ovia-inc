@@ -224,23 +224,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // foreign token is one refusal whatever the ARN resolves to.
         let after: Option<u64> = match input.next_token.as_deref() {
             None => None,
-            Some(token) => {
-                let refused = || {
-                    ListWorkflowVersionsErrorModeled::ValidationException(
-                        crate::state::invalid_page_token("ListWorkflowVersions"),
-                    )
-                };
-                let key = crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(refused)?;
-                let (sequence, scope) =
-                    crate::state::parse_version_listing_key(&key).ok_or_else(refused)?;
+            Some(token) => Some(
                 // A cursor minted while walking ANOTHER workflow's versions was not issued
                 // for this walk: its position means nothing in this history, so honouring
-                // it would silently restart or truncate the listing.
-                if scope != input.workflow_arn {
-                    return Err(refused().into());
-                }
-                Some(sequence)
-            }
+                // it would silently restart or truncate the listing. The scope check lives
+                // in `crate::state::parse_scoped_page_token`, which every child listing of
+                // a workflow reads its cursor through.
+                crate::state::parse_scoped_page_token(PAGE_KIND, token, &input.workflow_arn)
+                    .as_deref()
+                    .and_then(crate::state::parse_version_listing_key)
+                    .ok_or_else(|| {
+                        ListWorkflowVersionsErrorModeled::ValidationException(
+                            crate::state::invalid_page_token("ListWorkflowVersions"),
+                        )
+                    })?,
+            ),
         };
 
         // The entity this listing walks is the workflow its `@httpLabel` names: one this

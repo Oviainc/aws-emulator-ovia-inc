@@ -145,7 +145,22 @@ async fn send(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
 
 /// Create an experiment template to hang target account configurations off, and report
 /// its minted id.
+///
+/// The template targets MULTIPLE accounts, which is the targeting a target account
+/// configuration belongs to: `accountTargeting` and the configurations a template holds
+/// state the same thing between them. [`single_account_template`] is the one for a case
+/// whose experiment holds no configuration at all.
 async fn template(router: &MultiServiceRouter, label: &str) -> String {
+    create_template(router, label, "multi-account").await
+}
+
+/// Create an experiment template that targets a SINGLE account — the documented default —
+/// for a case whose experiment holds no target account configuration.
+async fn single_account_template(router: &MultiServiceRouter, label: &str) -> String {
+    create_template(router, label, "single-account").await
+}
+
+async fn create_template(router: &MultiServiceRouter, label: &str, targeting: &str) -> String {
     let answer = send(
         router,
         "POST",
@@ -155,6 +170,7 @@ async fn template(router: &MultiServiceRouter, label: &str) -> String {
             "description": format!("list experiment target account configurations: {label}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-list-experiment-target-accounts",
             "stopConditions": [{ "source": "none" }],
+            "experimentOptions": { "accountTargeting": targeting },
             // `aws:fis:wait` takes a required `duration`, an ISO 8601 duration within the
             // documented 1 to 720 minutes.
             "actions": {
@@ -617,7 +633,7 @@ async fn a_list_reports_only_the_named_experiments_snapshot_and_changes_nothing(
 
     // An experiment started from a template holding no configuration answers an empty
     // page and no token.
-    let empty_template = template(&router, "scope-empty").await;
+    let empty_template = single_account_template(&router, "scope-empty").await;
     let empty_experiment = start_experiment(&router, &empty_template, "scope-empty").await;
     let empty = list(&router, &empty_experiment, None).await;
     assert_eq!(

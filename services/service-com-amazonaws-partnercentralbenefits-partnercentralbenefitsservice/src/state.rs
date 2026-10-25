@@ -404,6 +404,20 @@ pub const MAX_DETAILS_MEMBERS: usize = 256;
 /// quota; see [`MAX_DETAILS_MEMBERS`].
 pub const MAX_DETAILS_BYTES: usize = 64 * 1024;
 
+/// The most AWS resources one benefit application carries.
+///
+/// It is the model's own published bound on the list: `AssociatedResources` is
+/// `length {max: 10}` on both `CreateBenefitApplicationInput` and
+/// `GetBenefitApplicationOutput`
+/// (`smithy_query(query="shape",shape="CreateBenefitApplicationInput")`), so a create and
+/// an `AssociateBenefitApplicationResource` agree on how many resources one application can
+/// be linked to, and a stored record never holds more than the read can report.
+/// `AssociateBenefitApplicationResourceInput` binds one `ResourceArn` and carries no length
+/// of its own, so this is also the bound that keeps repeated associations from growing one
+/// record without limit; an association past it is refused with the modelled
+/// `ValidationException` and persists nothing.
+pub const MAX_ASSOCIATED_RESOURCES_PER_APPLICATION: usize = 10;
+
 /// The most tags one resource of this service holds.
 ///
 /// It is the model's own published bound on an application's tag set —

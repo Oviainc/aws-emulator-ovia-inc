@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a pure read, answering the function the API holds under the requested
+//! `functionId` from [`crate::state`]. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -63,8 +57,13 @@
 //!
 //! ## Errors
 //!
+//! * `BadRequestException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   an `apiId` that cannot name an API at all is a malformed request on every operation
+//!   of this service that resolves one.
 //! * `ConcurrentModificationException` (HTTP 409) — Another modification is in progress at
 //!   this time and it must complete before you can make your change.
+//! * `InternalFailureException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   the modelled server failure for an unreachable shared store.
 //! * `NotFoundException` (HTTP 404) — The resource specified in the request was not found.
 //!   Check the resource, and then try again.
 //! * `UnauthorizedException` (HTTP 401) — You aren't authorized to perform this operation.
@@ -83,10 +82,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-appsync-awsdeepdishcont
 // here — hence the `GetFunctionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.appsync#GetFunction")]
+//
+// Two shapes this SERVICE models, which this operation's own `errors` list omits, are
+// widened in through `extra_errors`: `BadRequestException`, so an `apiId` that cannot
+// name an API at all is refused here exactly as it is on every other operation that
+// resolves one, and `InternalFailureException`, so an unreachable shared store has a
+// modelled server failure to answer with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.appsync#GetFunction",
+    extra_errors = ["BadRequestException", "InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum GetFunctionErrorModeled {
+    BadRequestException(BadRequestException),
     ConcurrentModificationException(ConcurrentModificationException),
+    InternalFailureException(InternalFailureException),
     NotFoundException(NotFoundException),
     UnauthorizedException(UnauthorizedException),
 }
@@ -142,18 +152,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFunction"))
+        // A pure read: nothing about the stored function depends on this request's
+        // metadata, so `ctx` is unused here.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFunctionErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(GetFunctionErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let guard = state.lock();
+        let Some(api) = guard.graphql_apis.get(&input.api_id) else {
+            return Err(GetFunctionErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // A function is addressed by the id its create minted, within its API, so an
+        // id the API does not hold names no resource — including one held by a
+        // DIFFERENT API, and one whose create was refused.
+        let Some(record) = api.functions.get(&input.function_id) else {
+            return Err(GetFunctionErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::function_not_found_message(&input.function_id)),
+            })
+            .into());
+        };
+
+        Ok(GetFunctionOutput {
+            function_configuration: Some(record.to_function_configuration()),
+        })
     }
 }

@@ -51,7 +51,8 @@ use crate::ops::types::{
     PackageVendingOptions,
     RecurringCharge, ReservedInstance,
     ReservedInstanceOffering, ResourceAlreadyExistsException, ResourceNotFoundException,
-    RollbackServiceSoftwareOptions, SAMLOptionsOutput, ServiceSoftwareOptions, SnapshotOptions,
+    RollbackServiceSoftwareOptions, SAMLOptionsOutput, ScheduledAction, ServiceSoftwareOptions,
+    SnapshotOptions,
     SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus, Tag, UseCaseStatus,
     VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, ValidationException, VersionStatus,
     OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES, RESERVED_INSTANCE_PAYMENT_OPTION_VALUES,
@@ -957,6 +958,79 @@ impl ServiceSoftware {
     }
 }
 
+/// One configuration change scheduled on a domain, as this emulator persists it.
+///
+/// A scheduled action is a record with an identity of its own — an action id, a type,
+/// a severity and the instant it is to happen — rather than a projection of some
+/// other record: `ListScheduledActions` reports it and `UpdateScheduledAction`
+/// reschedules it, so this is the ONE copy both reach. The operations that SCHEDULE
+/// one (`StartServiceSoftwareUpdate` for a service software update, and the Auto-Tune
+/// side of `UpdateDomainConfig` for a blue/green enhancement) are still scaffold
+/// stubs, so today the only writer is whatever puts a record here directly.
+///
+/// Its members are kept as the values the model's own enums admit (`ActionType`,
+/// `ActionSeverity`, `ScheduledBy`, `ActionStatus`) so the report is the stored
+/// record rather than a second derivation of it.
+#[derive(Debug, Clone)]
+pub struct ScheduledChange {
+    /// `ScheduledAction$Id`: "the unique identifier of the scheduled action". Unique
+    /// per domain, so it is the key the domain holds the record under and the place a
+    /// pagination token names.
+    pub id: String,
+    /// `ScheduledAction$Type`, one of `ActionType`'s values: which change is
+    /// scheduled.
+    pub action_type: String,
+    /// `ScheduledAction$Severity`, one of `ActionSeverity`'s values.
+    pub severity: String,
+    /// The instant the change is scheduled to happen, reported as
+    /// `ScheduledAction$ScheduledTime`.
+    pub scheduled_at: SystemTime,
+    /// `ScheduledAction$Description`: "a description of the action to be taken",
+    /// absent where the type and severity say it all.
+    pub description: Option<String>,
+    /// `ScheduledAction$ScheduledBy`, one of `ScheduledBy`'s values: whether a caller
+    /// scheduled this change or the service did.
+    pub scheduled_by: String,
+    /// `ScheduledAction$Status`, one of `ActionStatus`'s values: where the change is
+    /// in its own lifecycle.
+    pub status: String,
+    /// `ScheduledAction$Mandatory`: "whether the action is required or optional".
+    pub mandatory: bool,
+    /// `ScheduledAction$Cancellable`: "whether or not the scheduled action is
+    /// cancellable".
+    pub cancellable: bool,
+}
+
+impl ScheduledChange {
+    /// This record as `ScheduledAction` — the ONE projection of it, so every operation
+    /// that reports a scheduled action reports the same values.
+    pub fn to_action(&self) -> ScheduledAction {
+        ScheduledAction {
+            id: self.id.clone(),
+            r#type: self.action_type.clone(),
+            severity: self.severity.clone(),
+            scheduled_time: epoch_millis(self.scheduled_at),
+            description: self.description.clone(),
+            scheduled_by: Some(self.scheduled_by.clone()),
+            status: Some(self.status.clone()),
+            mandatory: Some(self.mandatory),
+            cancellable: Some(self.cancellable),
+        }
+    }
+}
+
+/// `at` as the epoch-millisecond count a `Long` timestamp of this service carries —
+/// the unit the model states for its epoch timestamps (`InsightTimeRange`'s members
+/// are "epoch millisecond timestamps"), negative for an instant before the epoch.
+pub fn epoch_millis(at: SystemTime) -> i64 {
+    match at.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since) => i64::try_from(since.as_millis()).unwrap_or(i64::MAX),
+        Err(before) => i64::try_from(before.duration().as_millis())
+            .map(|millis| -millis)
+            .unwrap_or(i64::MIN),
+    }
+}
+
 /// One OpenSearch Service domain, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Domain {
@@ -1042,6 +1116,9 @@ pub struct Domain {
     /// newest is the one `DescribeDomainChangeProgress` reports when the request
     /// names no `ChangeId`.
     pub changes: VecDeque<ConfigChange>,
+    /// The configuration changes scheduled on this domain, keyed by their action id
+    /// — unique per domain, so the id IS the key. See [`ScheduledChange`].
+    pub scheduled_actions: BTreeMap<String, ScheduledChange>,
 }
 
 impl Domain {

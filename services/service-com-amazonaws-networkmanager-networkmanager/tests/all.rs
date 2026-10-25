@@ -37,6 +37,8 @@ mod core_network_policy_version_restore;
 mod core_network_policy_versions;
 #[path = "all/core_network_prefix_list_association.rs"]
 mod core_network_prefix_list_association;
+#[path = "all/core_network_segment_actions.rs"]
+mod core_network_segment_actions;
 #[path = "all/customer_gateway_association_lifecycle.rs"]
 mod customer_gateway_association_lifecycle;
 #[path = "all/delete_attachment.rs"]
@@ -67,6 +69,8 @@ mod link_lifecycle;
 mod list_tags_for_resource;
 #[path = "all/network_resource_counts.rs"]
 mod network_resource_counts;
+#[path = "all/network_resource_regions.rs"]
+mod network_resource_regions;
 #[path = "all/network_resources.rs"]
 mod network_resources;
 #[path = "all/network_telemetry.rs"]

@@ -837,9 +837,10 @@ async fn a_plan_arn_names_the_region_the_request_was_signed_for() {
             "region {region}: got {created}"
         );
 
-        // And the stored ARN is what Describe reports, whichever region reads it.
+        // And the stored ARN is what Describe reports, read in the plan's own region —
+        // the only region the plan's id resolves in.
         let (status, described) =
-            call_in(&router, "us-east-1", "DescribeRescoreExecutionPlan", json!({ "Id": id })).await;
+            call_in(&router, region, "DescribeRescoreExecutionPlan", json!({ "Id": id })).await;
         assert_eq!(status, 200, "region {region}: got {described}");
         assert_eq!(
             described["Arn"],

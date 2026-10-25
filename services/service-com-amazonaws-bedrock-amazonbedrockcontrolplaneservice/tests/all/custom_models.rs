@@ -237,11 +237,9 @@ fn is_imported_custom_model_arn(arn: &str, region: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
 }
 
-/// The `FoundationModelArn` of `model_id` in `region`: a foundation model is published by
-/// AWS rather than owned by the account, so it carries an EMPTY account field.
-fn foundation_model_arn(region: &str, model_id: &str) -> String {
-    format!("arn:aws:bedrock:{region}::foundation-model/{model_id}")
-}
+// The `FoundationModelArn` of `model_id` in `region`, as `crate::support` spells it: one
+// spelling across the suites that compare a response's ARN against it.
+use crate::support::foundation_model_arn;
 
 // ---------------------------------------------------------------------------------------
 // 1. A created custom model round-trips through GetCustomModel and the listing.

@@ -216,6 +216,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The same bound store-wide: the per-catalog ceiling alone, multiplied by the
+        // number of catalogs, would still let a caller grow the store past what one
+        // process should hold.
+        if !store.can_store_connection() {
+            return Err(
+                CreateConnectionErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} connections",
+                            crate::state::MAX_STORED_CONNECTIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let entry = crate::state::ConnectionEntry::from_input(
             &input.connection_input,
             // `Connection$LastUpdatedBy` is "the user, group, or role that last updated
@@ -225,12 +242,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.tags.as_ref(),
             ::std::time::SystemTime::now(),
         );
-        store
-            .catalogs
-            .entry(catalog_id.clone())
-            .or_default()
-            .connections
-            .insert(name.clone(), entry);
+        // The catalog container is created here if this store does not hold it yet, and
+        // only if there is room for another one: the number of containers is bounded too,
+        // not just what each one holds.
+        let Some(catalog) = store.catalog_mut_for_create(&catalog_id) else {
+            return Err(
+                CreateConnectionErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} Data Catalogs",
+                            crate::state::MAX_CATALOGS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        catalog.connections.insert(name.clone(), entry);
         ::tracing::info!(
             operation = "CreateConnection",
             catalog_id = %catalog_id,

@@ -261,8 +261,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateMetadataTransferJobErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "metadata transfer job {metadata_transfer_job_id} already exists"
+                    message: Some(crate::state::already_exists_message(
+                        "MetadataTransferJob",
+                        &metadata_transfer_job_id,
+                        None,
                     )),
                 },
             )

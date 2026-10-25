@@ -788,11 +788,11 @@ pub const MAX_INPUT_ATTACHMENTS: usize = 32;
 /// keeps that per-request work a function of the emulator's own ceilings rather
 /// than of one caller's request body. `CreateChannel` refuses a longer list with
 /// its own modelled `BadRequestException`, because the request is what is out of
-/// bounds. Enforced where a caller's destinations are STORED — `CreateChannel`
-/// and `UpdateChannel` — because a handler that stores them without applying
-/// this bound would stop the per-request cost the multiplex slice's feeder index
-/// pays being bounded by this constant. Both word the refusal with
-/// [`too_many_channel_entries_message`].
+/// bounds. Enforced where a caller's destinations are STORED — `CreateChannel`,
+/// `UpdateChannel` and `UpdateChannelClass` — because a handler that stores them
+/// without applying this bound would stop the per-request cost the multiplex
+/// slice's feeder index pays being bounded by this constant. Each words the
+/// refusal with [`too_many_channel_entries_message`].
 pub const MAX_CHANNEL_DESTINATIONS: usize = 32;
 
 /// The most inputs this emulator stores for one account.

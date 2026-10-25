@@ -909,6 +909,32 @@ async fn an_experiment_carries_the_persisted_template_and_runs_to_the_status_its
         let id = template_id(case, &created);
         let template = created.member("experimentTemplate").clone();
 
+        // A template that targets MULTIPLE accounts only runs once it names one: its
+        // `accountTargeting` and the target account configurations it holds state the same
+        // thing between them, which `account_targeting_agreement.rs` owns. This suite is
+        // about what an experiment carries over from its template, so such a row is given
+        // the configuration it needs to be runnable.
+        if template["experimentOptions"]["accountTargeting"].as_str() == Some("multi-account") {
+            let account_id = "919191919191";
+            let configured = send(
+                &router,
+                "POST",
+                &format!("/experimentTemplates/{id}/targetAccountConfigurations/{account_id}"),
+                Some(json!({
+                    "clientToken": token(&format!("configure-{case}")),
+                    "roleArn": format!("arn:aws:iam::{account_id}:role/fis-target")
+                })),
+                FALLBACK_REGION,
+            )
+            .await;
+            assert_eq!(
+                configured.status, 200,
+                "case {case:?}: expected HTTP 200 from CreateTargetAccountConfiguration, \
+                 got {} with {:?}",
+                configured.status, configured.body
+            );
+        }
+
         let started = start_experiment(
             &router,
             json!({

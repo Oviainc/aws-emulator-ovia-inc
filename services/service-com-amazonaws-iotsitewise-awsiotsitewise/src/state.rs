@@ -44,7 +44,12 @@
 //! in [`ComAmazonawsIotsitewiseAwsiotsitewiseState::capture_sources`], keyed by
 //! the workspace and the source's `timeSeriesId`, with
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::capture_source_aliases`] the
-//! index the alias form of that lookup resolves through. The Monitor access
+//! index the alias form of that lookup resolves through. The account's
+//! computation models live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::computation_models`], keyed by
+//! `computationModelId`, each record carrying the configuration and data
+//! binding it was created with and the actions that configuration's computation
+//! type exposes. The Monitor access
 //! policies live in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::access_policies`], keyed by the
 //! minted `accessPolicyId`, each record naming the identity, the Monitor
@@ -65,11 +70,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AggregatedValue, Aggregates, Alarms, AssetCompositeModelPathSegment,
+    ActionDefinition, AggregatedValue, Aggregates, Alarms, AssetCompositeModelPathSegment,
     AssetCompositeModelSummary, AssetHierarchy, AssetModelCompositeModel,
     AssetModelCompositeModelPathSegment, AssetModelCompositeModelSummary, AssetModelHierarchy,
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
-    AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, ComputeNodeExecutionDetails,
+    AssetPropertyValue, AssetStatus, AssetSummary, ComputationModelConfiguration,
+    ComputationModelDataBindingValue, ComputationModelStatus, ComputeNode,
+    ComputeNodeExecutionDetails,
     ComputeNodeExecutionStatus, ConfigurationStatus, DatasetConfig, DatasetSource, DatasetStatus,
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
     ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, HierarchyMapping, Identity,
@@ -393,6 +400,27 @@ pub const DEFAULT_GATEWAY_VERSION: &str = "2";
 /// creating a V3 gateway (gatewayVersion=3), you must also specify the
 /// coreDeviceOperatingSystem".
 pub const GATEWAY_VERSION_V3: &str = "3";
+
+/// The `CapabilitySyncStatus` a capability reports once the gateway has processed
+/// the configuration the last write to it supplied, as the member documents it:
+/// "IN_SYNC - The gateway is running with the latest configuration".
+pub const CAPABILITY_SYNC_IN_SYNC: &str = "IN_SYNC";
+
+/// The `CapabilitySyncStatus` a capability reports until then, as
+/// `UpdateGatewayCapabilityConfiguration` documents it: "After updating a
+/// capability configuration, the sync status becomes OUT_OF_SYNC until the
+/// gateway processes the configuration".
+pub const CAPABILITY_SYNC_OUT_OF_SYNC: &str = "OUT_OF_SYNC";
+
+/// How many capability namespaces one gateway holds configurations for.
+///
+/// The same kind of bound, and for the same reason, as [`MAX_GATEWAYS`]: a write
+/// naming a fresh namespace is the only thing that adds one and nothing evicts
+/// one, so the list needs a maximum entry count. The emulator's own bound, not a
+/// published AWS default, and high enough that no ordinary workflow meets it;
+/// `UpdateGatewayCapabilityConfiguration` refuses past it with the modelled
+/// `LimitExceededException` (HTTP 410).
+pub const MAX_CAPABILITIES_PER_GATEWAY: usize = 100;
 
 /// See [`MAX_ASSET_MODELS`]: the same bound, for the workspace map.
 /// `CreateWorkspace` is the only thing that adds a workspace and it declares the
@@ -1169,8 +1197,12 @@ fn state_at(settling: &str, active_at: SystemTime, now: SystemTime) -> &str {
 /// A stored gateway: everything `DescribeGateway` reports, plus the `tags` the
 /// tagging operations read.
 ///
-/// `capability_summaries` starts EMPTY: a freshly created gateway has no
-/// capability configured, and only `UpdateGatewayCapabilityConfiguration` adds one.
+/// `capabilities` starts EMPTY: a freshly created gateway has no capability
+/// configured, and only `UpdateGatewayCapabilityConfiguration` adds one. The
+/// summaries `DescribeGateway` and `ListGateways` report are DERIVED from that
+/// list ([`Self::capability_summaries`]), so a summary and the configuration
+/// `DescribeGatewayCapabilityConfiguration` answers with can never disagree about
+/// a namespace or its sync status.
 #[derive(Debug, Clone)]
 pub struct GatewayRecord {
     pub id: String,
@@ -1178,10 +1210,99 @@ pub struct GatewayRecord {
     pub name: String,
     pub platform: GatewayPlatform,
     pub version: String,
-    pub capability_summaries: Vec<GatewayCapabilitySummary>,
+    pub capabilities: Vec<GatewayCapabilityRecord>,
     pub creation_date: SystemTime,
     pub last_update_date: SystemTime,
     pub tags: HashMap<String, String>,
+}
+
+impl GatewayRecord {
+    /// The capability configured under `namespace`, or `None` when no write to
+    /// this gateway has named that namespace.
+    ///
+    /// A gateway holds one configuration per namespace and may hold several
+    /// namespaces at once, so the namespace alone selects one.
+    pub fn capability(&self, namespace: &str) -> Option<&GatewayCapabilityRecord> {
+        self.capabilities
+            .iter()
+            .find(|capability| capability.namespace == namespace)
+    }
+
+    /// Every configured capability as the summary a gateway reader reports, in the
+    /// order the namespaces were first configured in.
+    pub fn capability_summaries(&self, now: SystemTime) -> Vec<GatewayCapabilitySummary> {
+        self.capabilities
+            .iter()
+            .map(|capability| GatewayCapabilitySummary {
+                capability_namespace: capability.namespace.clone(),
+                capability_sync_status: capability.sync_status(now).to_string(),
+            })
+            .collect()
+    }
+
+    /// Configure `namespace` on this gateway with `configuration`, replacing
+    /// whatever a previous write put there, and report the sync status the write
+    /// answers with.
+    ///
+    /// A write is the last word on the namespace it names and says nothing about
+    /// any other, so an existing entry is replaced IN PLACE — keeping the order a
+    /// reader reports — and a namespace nothing has configured is appended. The
+    /// gateway's `lastUpdateDate` moves with it, because the capability summaries
+    /// a gateway reader reports are part of what this write changed.
+    pub fn set_capability(
+        &mut self,
+        namespace: &str,
+        configuration: String,
+        now: SystemTime,
+    ) -> &'static str {
+        let record = GatewayCapabilityRecord {
+            namespace: namespace.to_string(),
+            configuration,
+            in_sync_at: now + ACTIVATION_DELAY,
+        };
+        match self
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.namespace == namespace)
+        {
+            Some(existing) => *existing = record,
+            None => self.capabilities.push(record),
+        }
+        self.last_update_date = now;
+        CAPABILITY_SYNC_OUT_OF_SYNC
+    }
+}
+
+/// One capability configured on a gateway: the namespace that selects it, the
+/// JSON document the last write to it supplied, and the instant the gateway has
+/// processed that document.
+///
+/// The sync status is DERIVED from that instant rather than stored, so a read
+/// never has to write for the status to move on.
+#[derive(Debug, Clone)]
+pub struct GatewayCapabilityRecord {
+    pub namespace: String,
+    pub configuration: String,
+    /// When the capability stops being out of sync — see [`Self::sync_status`].
+    pub in_sync_at: SystemTime,
+}
+
+impl GatewayCapabilityRecord {
+    /// This capability's `CapabilitySyncStatus` at `now`.
+    ///
+    /// `UpdateGatewayCapabilityConfiguration` documents the rule: after a write
+    /// "the sync status becomes OUT_OF_SYNC until the gateway processes the
+    /// configuration", which is the owed transition this emulator settles at
+    /// [`ACTIVATION_DELAY`] — so the status is `OUT_OF_SYNC` until then and
+    /// `IN_SYNC` ("The gateway is running with the latest configuration")
+    /// afterwards.
+    pub fn sync_status(&self, now: SystemTime) -> &'static str {
+        if now < self.in_sync_at {
+            CAPABILITY_SYNC_OUT_OF_SYNC
+        } else {
+            CAPABILITY_SYNC_IN_SYNC
+        }
+    }
 }
 
 /// A stored dataset: everything `DescribeDataset` reports, plus the `tags` the
@@ -1505,8 +1626,20 @@ pub fn compute_node_execution_order(computations: &[ComputeNode]) -> Result<Vec<
         order.push(at);
         let released = computations[at].compute_node_name.as_str();
         for dependent in dependents.get(released).into_iter().flatten().copied() {
-            waiting[dependent] -= 1;
-            if waiting[dependent] == 0 {
+            // Decremented through a guard rather than in place: the count is a
+            // `usize`, and a list where two nodes answer to one name would
+            // release the same dependent twice, so the guard is what keeps that
+            // count from wrapping and the dependent from being ordered twice.
+            // Such a list is already refused by `check_compute_nodes` above;
+            // this holds whatever reaches here.
+            let Some(outstanding) = waiting.get_mut(dependent) else {
+                continue;
+            };
+            if *outstanding == 0 {
+                continue;
+            }
+            *outstanding -= 1;
+            if *outstanding == 0 {
                 ready.insert(dependent);
             }
         }
@@ -2363,10 +2496,9 @@ impl ExecutionRecord {
     pub fn targets(&self, resource_type: &str, resource_id: &str) -> bool {
         let addressed = match resource_type {
             TARGET_RESOURCE_TYPE_ASSET => self.target_resource.asset_id.as_deref(),
-            // No computation model is stored while `CreateComputationModel` is a
-            // scaffold stub, so `ListExecutions` refuses a listing scoped to one
-            // before it reaches this arm; the arm is what makes an execution of a
-            // computation model addressable once that writer exists.
+            // An execution of a computation model is addressed by that model's
+            // own id, the same way an execution of an asset is addressed by the
+            // asset's.
             TARGET_RESOURCE_TYPE_COMPUTATION_MODEL => {
                 self.target_resource.computation_model_id.as_deref()
             }
@@ -2957,6 +3089,7 @@ tagged_record!(PipelineRecord);
 tagged_record!(TaskRecord);
 tagged_record!(DatasetRecord);
 tagged_record!(WorkspaceRecord);
+tagged_record!(ComputationModelRecord);
 tagged_record!(AccessPolicyRecord);
 
 /// `record`'s tag set, but only when `record` is the one `arn` names exactly —
@@ -3101,6 +3234,8 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// Written beside the source itself, and bounded by it: at most one entry per
     /// source that carries an alias.
     pub capture_source_aliases: HashMap<String, HashMap<String, String>>,
+    /// Computation models by `computationModelId`.
+    pub computation_models: HashMap<String, ComputationModelRecord>,
     /// The interface relationships, by [`interface_relationship_key`] — the asset
     /// model the interface is applied to and the interface asset model — because
     /// one asset model may implement several interfaces and one interface may be
@@ -3832,6 +3967,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             DATASET_RESOURCE_TYPE => tags_of(self.datasets.get(id), arn),
             APPLICATION_RESOURCE_TYPE => tags_of(self.applications.get(id), arn),
             WORKSPACE_RESOURCE_TYPE => tags_of(self.workspaces.get(id), arn),
+            COMPUTATION_MODEL_RESOURCE_TYPE => tags_of(self.computation_models.get(id), arn),
             ACCESS_POLICY_RESOURCE_TYPE => tags_of(self.access_policies.get(id), arn),
             _ => None,
         }
@@ -3856,6 +3992,9 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             DATASET_RESOURCE_TYPE => tags_of_mut(self.datasets.get_mut(id), arn),
             APPLICATION_RESOURCE_TYPE => tags_of_mut(self.applications.get_mut(id), arn),
             WORKSPACE_RESOURCE_TYPE => tags_of_mut(self.workspaces.get_mut(id), arn),
+            COMPUTATION_MODEL_RESOURCE_TYPE => {
+                tags_of_mut(self.computation_models.get_mut(id), arn)
+            }
             ACCESS_POLICY_RESOURCE_TYPE => tags_of_mut(self.access_policies.get_mut(id), arn),
             _ => None,
         }
@@ -4321,6 +4460,14 @@ pub const RESOURCE_ASSET_COMPOSITE_MODEL: &str = "Asset Composite Model";
 /// kind and the three below, the label is the service's resource name under that
 /// same one form, so every handler addressing one states the absence identically.
 pub const RESOURCE_GATEWAY: &str = "Gateway";
+
+/// The resource kind those errors name for one CAPABILITY of a gateway — the
+/// configuration a gateway holds under one namespace.
+///
+/// A capability is not a top-level resource, so it is named as what it is rather
+/// than as a "Gateway", and it lives here beside its siblings so the operations
+/// that address one cannot each invent a kind of their own.
+pub const RESOURCE_GATEWAY_CAPABILITY: &str = "Gateway Capability";
 
 /// The resource kind those errors name for a data stream, which every operation
 /// that addresses one addresses by its `alias`.
@@ -5644,6 +5791,306 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         });
         self.default_encryption_configuration(now)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Computation models.
+// ---------------------------------------------------------------------------
+
+/// The ARN resource-type segment of a computation model's ARN, as the
+/// `computationModelArn` member documents the form:
+/// `arn:${Partition}:iotsitewise:${Region}:${Account}:computation-model/${ComputationModelId}`.
+pub const COMPUTATION_MODEL_RESOURCE_TYPE: &str = "computation-model";
+
+/// See [`MAX_ASSET_MODELS`]: the same bound, for the computation-model map.
+/// `CreateComputationModel` is the only thing that adds a computation model and
+/// it declares the modelled `LimitExceededException` (HTTP 410), so that is how
+/// this store refuses past the cap. The emulator's own bound, not a published
+/// AWS default.
+pub const MAX_COMPUTATION_MODELS: usize = 1_000;
+
+/// The `computationModelVersion` a freshly created computation model reports.
+///
+/// The version counts the writes the model has accepted — the create is the
+/// first — so it is derived from the stored record rather than minted, and a
+/// read never has to write for it to stay the same. The modelled `Version` type
+/// is a decimal string (`^(0|([1-9]{1}\d*))$`), which is how the counter reaches
+/// the wire.
+pub const COMPUTATION_MODEL_INITIAL_VERSION: u64 = 1;
+
+/// The `ComputationModelType` of a model whose configuration names anomaly
+/// detection — the only value the modelled enum has (see
+/// [`crate::ops::types::COMPUTATION_MODEL_TYPE_VALUES`]).
+pub const COMPUTATION_MODEL_TYPE_ANOMALY_DETECTION: &str = "ANOMALY_DETECTION";
+
+/// The `actionType` of each action an anomaly-detection computation model
+/// exposes, as the model NAMES them: `DescribeExecution`'s `executionDetails`
+/// documents "the training action (Amazon Web Services/ANOMALY_DETECTION_TRAINING)"
+/// and "the inference action (Amazon Web Services/ANOMALY_DETECTION_INFERENCE)"
+/// — the two actions such a model publishes, spelled the way the model spells
+/// them rather than in a prefix form nothing in the model states.
+///
+/// The model carries no enum of action types, so this is the catalog for the one
+/// [`COMPUTATION_MODEL_TYPE_ANOMALY_DETECTION`] computation type; a model of a
+/// computation type this list does not cover exposes no action rather than a
+/// guessed one.
+pub const ANOMALY_DETECTION_ACTION_TYPES: [&str; 2] = [
+    "Amazon Web Services/ANOMALY_DETECTION_TRAINING",
+    "Amazon Web Services/ANOMALY_DETECTION_INFERENCE",
+];
+
+/// The opening and closing delimiters of the `${VariableName}` reference a
+/// computation model's configuration names a data-binding variable with, as the
+/// configuration members document the format ("Define the variable name
+/// associated with input properties, with the following format
+/// `${VariableName}`").
+const BINDING_REFERENCE_OPEN: &str = "${";
+const BINDING_REFERENCE_CLOSE: char = '}';
+
+/// A stored computation model: everything `DescribeComputationModel` reports,
+/// plus the `tags` the tagging operations read and the `clientToken` of the
+/// create that made it.
+///
+/// `settling_state` holds a `ComputationModelState` value, which spells its
+/// states exactly as `AssetState` does — `CREATING`, `ACTIVE`, `UPDATING`,
+/// `DELETING`, `FAILED` — so this record reuses [`STATE_CREATING`] /
+/// [`STATE_ACTIVE`] and the one [`state_at`] rule rather than a second spelling
+/// of the same values.
+#[derive(Debug, Clone)]
+pub struct ComputationModelRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub configuration: ComputationModelConfiguration,
+    pub data_binding: HashMap<String, ComputationModelDataBindingValue>,
+    /// The actions this model exposes, materialised ONCE by the create from the
+    /// computation type its configuration names (see
+    /// [`action_definitions_for`]), so every read reports the same ids.
+    pub action_definitions: Vec<ActionDefinition>,
+    pub creation_date: SystemTime,
+    pub last_update_date: SystemTime,
+    /// The instant the transition the clock owes — from [`Self::settling_state`]
+    /// to `ACTIVE` — falls due.
+    pub active_at: SystemTime,
+    /// The `ComputationModelState` this model reports until [`Self::active_at`]
+    /// falls due: [`STATE_CREATING`] for a freshly created model,
+    /// [`STATE_UPDATING`] while a mutating call it already accepted settles.
+    pub settling_state: String,
+    /// How many writes this model has accepted, which is the
+    /// `computationModelVersion` it reports; see
+    /// [`COMPUTATION_MODEL_INITIAL_VERSION`].
+    pub version: u64,
+    /// The `clientToken` of the create that made this model, if it carried one,
+    /// so a retry of that same create replays its answer rather than minting a
+    /// second model.
+    pub client_token: Option<String>,
+    pub tags: HashMap<String, String>,
+}
+
+impl ComputationModelRecord {
+    /// The model's `ComputationModelState` as of `now`: its
+    /// [`Self::settling_state`] until the owed transition falls due, `ACTIVE`
+    /// from then on. Derived, so a read never has to write.
+    pub fn state(&self, now: SystemTime) -> &str {
+        state_at(&self.settling_state, self.active_at, now)
+    }
+
+    /// The model's status as of `now`.
+    pub fn status(&self, now: SystemTime) -> ComputationModelStatus {
+        ComputationModelStatus {
+            state: self.state(now).to_string(),
+            // No error: nothing in this emulator fails to provision a
+            // computation model, so the modelled `error` details have nothing
+            // to report.
+            error: None,
+        }
+    }
+
+    /// The `computationModelVersion` this model reports: its accepted-write
+    /// count as the decimal string the modelled `Version` type is.
+    pub fn version_label(&self) -> String {
+        self.version.to_string()
+    }
+
+    /// Whether this model answers a read scoped to the version the
+    /// `ComputationModelVersionFilter` `filter` names (`LATEST | ACTIVE | <n>`),
+    /// as of `now`.
+    ///
+    /// This emulator keeps ONE version of a computation model, so that version
+    /// is always its latest one — which is what an absent filter and `LATEST`
+    /// ask for — and is also its ACTIVE one once the transition the clock owes
+    /// has fallen due; while one is still pending the model has no active
+    /// version at all, exactly as [`asset_model_target_etag`] holds it for an
+    /// asset model. An explicit number therefore names a version this store
+    /// holds only when it is that one version's own number.
+    pub fn serves_version(&self, filter: Option<&str>, now: SystemTime) -> bool {
+        match filter {
+            None | Some(VERSION_TYPE_LATEST) => true,
+            Some(VERSION_TYPE_ACTIVE) => self.state(now) == STATE_ACTIVE,
+            Some(explicit) => explicit == self.version_label().as_str(),
+        }
+    }
+}
+
+/// The canonical ARN of a computation model in `region`; see
+/// [`COMPUTATION_MODEL_RESOURCE_TYPE`].
+pub fn computation_model_arn(region: &str, computation_model_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{COMPUTATION_MODEL_RESOURCE_TYPE}/{computation_model_id}"),
+    )
+}
+
+/// The `ComputationModelType` `configuration` names, or `None` when it names
+/// none.
+///
+/// `ComputationModelConfiguration` carries one optional member per computation
+/// type, so the type of a model is DERIVED from the configuration it was created
+/// with rather than stored beside it and able to drift.
+pub fn computation_model_type(
+    configuration: &ComputationModelConfiguration,
+) -> Option<&'static str> {
+    configuration
+        .anomaly_detection
+        .as_ref()
+        .map(|_| COMPUTATION_MODEL_TYPE_ANOMALY_DETECTION)
+}
+
+/// The action definitions a computation model of `model_type` exposes, each with
+/// a freshly minted `actionDefinitionId`.
+///
+/// Called ONCE, by the create, and stored on the model: the ids are then stable
+/// across reads and unique per model, and a read of the model's available
+/// actions writes nothing.
+pub fn action_definitions_for(model_type: &str) -> Vec<ActionDefinition> {
+    let action_types: &[&str] = match model_type {
+        COMPUTATION_MODEL_TYPE_ANOMALY_DETECTION => &ANOMALY_DETECTION_ACTION_TYPES,
+        _ => &[],
+    };
+    action_types
+        .iter()
+        .map(|action_type| ActionDefinition {
+            action_definition_id: new_id(),
+            // The model documents `actionName` as "The name of the action
+            // definition" and `actionType` as "The type of the action
+            // definition", and an action of a computation model is addressed by
+            // the kind of work it does, so each action is named for its type.
+            action_name: (*action_type).to_string(),
+            action_type: (*action_type).to_string(),
+        })
+        .collect()
+}
+
+/// The data-binding variable a `${VariableName}` reference names, or `None` when
+/// `reference` is not in that form; see [`BINDING_REFERENCE_OPEN`].
+fn binding_variable(reference: &str) -> Option<&str> {
+    reference
+        .strip_prefix(BINDING_REFERENCE_OPEN)?
+        .strip_suffix(BINDING_REFERENCE_CLOSE)
+        .filter(|variable| !variable.is_empty())
+}
+
+/// Refuse a computation model whose configuration and data binding do not
+/// describe one model, in the one place every operation that supplies those two
+/// shapes holds the rule.
+///
+/// Three things have to hold:
+///
+/// * the configuration names a computation type — it carries one optional member
+///   per type, and a configuration naming none describes no computation at all;
+/// * every `${VariableName}` the configuration references is a variable the data
+///   binding defines, which is what the binding is documented to be ("Key is a
+///   variable name defined in configuration");
+/// * every binding value sets exactly one of its members, which is what
+///   `ComputationModelDataBindingValue` documents ("can be one of
+///   `assetModelProperty`, `list`") — checked through a `list` as well, since a
+///   list's elements are binding values themselves, down to
+///   [`MAX_BINDING_VALUE_DEPTH`], past which the value is refused rather than
+///   walked further.
+pub fn check_computation_model(
+    configuration: &ComputationModelConfiguration,
+    data_binding: &HashMap<String, ComputationModelDataBindingValue>,
+) -> Result<(), String> {
+    let Some(model_type) = computation_model_type(configuration) else {
+        return Err("computationModelConfiguration must name exactly one computation type."
+            .to_string());
+    };
+    for (member, reference) in configuration_references(configuration) {
+        let Some(variable) = binding_variable(reference) else {
+            return Err(format!(
+                "computationModelConfiguration.{model_type}.{member} must reference a data \
+                 binding variable in the form ${{VariableName}}, but is {reference}."
+            ));
+        };
+        if !data_binding.contains_key(variable) {
+            return Err(format!(
+                "computationModelConfiguration.{model_type}.{member} references the variable \
+                 {variable}, which computationModelDataBinding does not define."
+            ));
+        }
+    }
+    for (variable, value) in data_binding {
+        check_binding_value(variable, value, 1)?;
+    }
+    Ok(())
+}
+
+/// Every `${VariableName}` reference `configuration` makes, as
+/// `(member name, reference)` pairs — the members a refusal names.
+fn configuration_references(
+    configuration: &ComputationModelConfiguration,
+) -> Vec<(&'static str, &str)> {
+    match configuration.anomaly_detection.as_ref() {
+        Some(anomaly_detection) => vec![
+            ("inputProperties", anomaly_detection.input_properties.as_str()),
+            ("resultProperty", anomaly_detection.result_property.as_str()),
+        ],
+        None => Vec::new(),
+    }
+}
+
+/// How deeply a binding value's `list` members may nest.
+///
+/// A binding value's `list` holds binding values, so the shape a caller sends is
+/// as deep as the caller made it; this is the depth past which a value is
+/// refused instead of walked, so the walk below cannot be driven by a request
+/// into unbounded recursion. The emulator's own bound, not a published AWS one.
+pub const MAX_BINDING_VALUE_DEPTH: usize = 8;
+
+/// Refuse a binding value that does not set exactly one member, or that nests
+/// deeper than [`MAX_BINDING_VALUE_DEPTH`]; see [`check_computation_model`].
+/// `depth` is this value's own nesting level, the outermost being 1.
+fn check_binding_value(
+    variable: &str,
+    value: &ComputationModelDataBindingValue,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_BINDING_VALUE_DEPTH {
+        return Err(format!(
+            "The computationModelDataBinding value of {variable} nests lists more than \
+             {MAX_BINDING_VALUE_DEPTH} deep."
+        ));
+    }
+    let set = [
+        value.asset_model_property.is_some(),
+        value.asset_property.is_some(),
+        value.list.is_some(),
+    ]
+    .into_iter()
+    .filter(|member| *member)
+    .count();
+    if set != 1 {
+        return Err(format!(
+            "The computationModelDataBinding value of {variable} must set exactly one of \
+             assetModelProperty, assetProperty and list, but sets {set}."
+        ));
+    }
+    for element in value.list.iter().flatten() {
+        check_binding_value(variable, element, depth + 1)?;
+    }
+    Ok(())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

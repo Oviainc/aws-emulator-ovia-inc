@@ -180,6 +180,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let mut store = state.lock();
+        // "You cannot modify these managed rules by using DisableRule, EnableRule,
+        // PutTargets, PutRule, TagResource, or UntagResource"
+        // (`ManagedRuleException`).
+        if let Some(rule) = store.managed_rule_of(&resource) {
+            return Err(TagResourceErrorModeled::ManagedRuleException(ManagedRuleException {
+                message: Some(crate::state::managed_rule_tag_refusal(&rule)),
+            })
+            .into());
+        }
         // A tag write never brings a resource into being: an ARN this store holds no
         // record for names an entity that does not exist.
         let Some(stored) = store.tags_of_mut(&resource) else {
