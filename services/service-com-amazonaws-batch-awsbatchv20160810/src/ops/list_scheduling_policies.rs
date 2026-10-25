@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSchedulingPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSchedulingPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the scheduling policies `CreateSchedulingPolicy` stored, one
+//! `SchedulingPolicyListingDetail` (an ARN) per policy this service holds, paged through
+//! `maxResults`/`nextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSchedulingPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A listing is a READ: a scheduling policy carries no status member at all, so nothing
+//! about it is owed by the clock and this handler writes nothing — two listings at the
+//! same instant answer identically.
+//!
+//! The policy store is keyed by the name that is unique per account and Region, which is
+//! what gives the listing one stable order; without it paging could show a policy twice
+//! or never. AWS documents no order for this operation.
+//!
+//! Refusals, each the modelled `ClientException` (HTTP 400):
+//!
+//! * a `maxResults` outside the published 1..=100
+//!   ([`crate::state::MIN_LIST_SCHEDULING_POLICIES_RESULTS`]);
+//! * a `nextToken` this service did not issue, or one that resumes past the end.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +164,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSchedulingPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSchedulingPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSchedulingPolicies"))
+        use crate::state as batch;
+
+        // A scheduling policy's ARN was minted when it was created, so nothing here needs
+        // the request's Region.
+        let _ = ctx;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(ListSchedulingPoliciesErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+
+        // `maxResults`: "This value can be between 1 and 100." A plain `Integer` in the
+        // model, so the published bound is applied here.
+        if let Some(requested) = input.max_results.filter(|requested| {
+            !(batch::MIN_LIST_SCHEDULING_POLICIES_RESULTS
+                ..=batch::MAX_LIST_SCHEDULING_POLICIES_RESULTS)
+                .contains(requested)
+        }) {
+            return Err(ListSchedulingPoliciesErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "maxResults {requested} must be between {} and {}",
+                    batch::MIN_LIST_SCHEDULING_POLICIES_RESULTS,
+                    batch::MAX_LIST_SCHEDULING_POLICIES_RESULTS
+                )),
+            )
+            .into());
+        }
+
+        // A read of the policy store, and nothing more: a scheduling policy has no status
+        // member, so the clock owes it no transition to materialise here.
+        let arns: Vec<String> = {
+            let state = state.lock();
+            // The store is keyed by a name that is unique per account and Region, so the
+            // name is what gives one stable order — without which paging could show a
+            // policy twice or never.
+            let mut policies: Vec<(String, String)> = state
+                .scheduling_policies
+                .values()
+                .map(|policy| (policy.name.clone(), policy.arn.clone()))
+                .collect();
+            policies.sort_by(|left, right| left.0.cmp(&right.0));
+            policies.into_iter().map(|(_, arn)| arn).collect()
+        };
+
+        // "If this parameter isn't used, ListSchedulingPolicies returns up to 100 results
+        // and a nextToken value if applicable": the page is bounded even when the request
+        // names no size.
+        let page_size = input
+            .max_results
+            .unwrap_or(batch::MAX_LIST_SCHEDULING_POLICIES_RESULTS);
+        let (page, next_token) =
+            batch::paginate(arns, Some(page_size), input.next_token.as_deref()).map_err(
+                |message| {
+                    ListSchedulingPoliciesError::from(
+                        ListSchedulingPoliciesErrorModeled::ClientException(
+                            batch::client_exception(message),
+                        ),
+                    )
+                },
+            )?;
+
+        Ok(ListSchedulingPoliciesOutput {
+            scheduling_policies: Some(
+                page.into_iter()
+                    .map(|arn| SchedulingPolicyListingDetail { arn })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
