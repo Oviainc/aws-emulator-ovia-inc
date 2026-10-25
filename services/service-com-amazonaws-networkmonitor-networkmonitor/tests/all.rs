@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/authored_refusal_messages.rs"]
 mod authored_refusal_messages;
+#[path = "all/client_token_replay.rs"]
+mod client_token_replay;
 #[path = "all/idempotent_replay_state.rs"]
 mod idempotent_replay_state;
 #[path = "all/list_monitors_pagination.rs"]

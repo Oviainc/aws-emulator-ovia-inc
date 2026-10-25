@@ -10,10 +10,12 @@
 //! ([`crate::state::check_probes_per_subnet`]): a request asking for more probes
 //! than one subnet of a monitor may hold is refused and stores nothing.
 //! A second create naming a monitor that already exists is a RETRY only when it
-//! repeats the stored `clientToken`; any other repeat is refused with
-//! `ConflictException`. A retry REPORTS the monitor the token already minted, so
-//! like every other reporting path it first materialises the transitions the
-//! clock has already made due
+//! repeats the idempotency token recorded for that create
+//! ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::monitor_minted_by_token`],
+//! which reads the one record of which token minted which resource); any other
+//! repeat is refused with `ConflictException`. A retry REPORTS the monitor the
+//! token already minted, so like every other reporting path it first
+//! materialises the transitions the clock has already made due
 //! ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::settle_monitor`]).
 //!
 //! ## Shape of an operation
@@ -261,13 +263,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // retry of anything. A token replays only in the region it was sent to,
         // since that is where the monitor it minted lives.
         if let Some(token) = input.client_token.as_deref() {
-            let replayed = store
-                .client_token_record(&region, token)
-                .filter(|record| {
-                    record.probe_id.is_none() && record.monitor_name == input.monitor_name
-                })
-                .map(|record| record.monitor_name.clone());
-            if let Some(monitor) = replayed.and_then(|name| store.monitor(&region, &name)) {
+            if let Some(monitor) = store.monitor_minted_by_token(&region, token, &input.monitor_name)
+            {
                 return Ok(output_for(monitor));
             }
         }
@@ -357,7 +354,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             activates_at: None,
             created_at: now,
             modified_at: now,
-            client_token: input.client_token.clone(),
         };
         // Nothing is due for a probe-free monitor; one created with probes is
         // owed its activation.
