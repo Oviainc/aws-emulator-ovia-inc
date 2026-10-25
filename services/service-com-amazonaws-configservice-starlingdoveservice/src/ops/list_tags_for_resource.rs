@@ -200,9 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(ListTagsForResourceErrorModeled::InvalidNextTokenException(
                         InvalidNextTokenException {
-                            message: Some(format!(
-                                "The nextToken '{token}' provided in the request is not valid."
-                            )),
+                            message: Some(
+                                crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into())

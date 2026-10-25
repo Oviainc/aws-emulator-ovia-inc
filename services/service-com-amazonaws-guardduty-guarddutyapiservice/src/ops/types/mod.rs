@@ -69,6 +69,7 @@ pub mod get_malware_scan_types;
 pub mod get_master_account_types;
 pub mod get_member_detectors_types;
 pub mod get_members_types;
+pub mod get_organization_statistics_types;
 pub mod get_remaining_free_trial_days_types;
 pub mod get_threat_entity_set_types;
 pub mod get_threat_intel_set_types;
@@ -227,6 +228,8 @@ pub use get_master_account_types::*;
 pub use get_member_detectors_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_members_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_organization_statistics_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_remaining_free_trial_days_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

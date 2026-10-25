@@ -1032,19 +1032,19 @@ async fn the_stored_sli_mirrors_the_config_with_its_documented_defaults() {
         );
     }
 
-    // A config that names only an Application Signals STANDARD metric carries no
-    // `MetricDataQueries`, and the indicator's required list is reported EMPTY rather than
-    // filled with a query this emulator cannot compute (the real service builds it from its
-    // own metric catalogue: a namespace, a dimension set and a query id). The row pins that
-    // documented decision, and that the record still round-trips through a read.
+    // A config that names only an Application Signals STANDARD metric — `MetricType` with no
+    // statistic of its own — carries no `MetricDataQueries`, and the indicator's required
+    // list is reported EMPTY rather than filled with a query this emulator cannot compute
+    // (the real service builds it from its own metric catalogue: a namespace, a dimension
+    // set and a query id). The row pins that documented decision, and that the record still
+    // round-trips through a read. A config that DOES state the metric's parts materialises
+    // them into the query list instead — see `tests/all/sli_metric_query.rs`.
     for (label, metric_config) in [
         (
-            "metric-name-statistic-and-period",
+            "metric-name-without-a-statistic",
             json!({
                 "KeyAttributes": { "Type": "Service", "Name": "checkout", "Environment": "prod" },
-                "MetricName": "Latency",
-                "Statistic": "p99",
-                "PeriodSeconds": 60
+                "MetricName": "Latency"
             }),
         ),
         (
@@ -1068,7 +1068,7 @@ async fn the_stored_sli_mirrors_the_config_with_its_documented_defaults() {
         assert_eq!(
             created["Slo"]["Sli"]["SliMetric"]["MetricDataQueries"],
             json!([]),
-            "case {label:?}: expected an empty MetricDataQueries rather than a synthesised query, got {:?}",
+            "case {label:?}: expected an empty MetricDataQueries where the config states no statistic, got {:?}",
             created["Slo"]["Sli"]["SliMetric"]["MetricDataQueries"]
         );
         let (status, fetched) = call(

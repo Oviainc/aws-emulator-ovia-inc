@@ -1005,9 +1005,12 @@
 //! keys registered to appear in scheduled event notifications
 //! ([`InstanceEventTagRegistration`]) — the registration
 //! `DescribeInstanceEventNotificationAttributes` reports "for resources in the current
-//! Region" and `RegisterInstanceEventNotificationAttributes` writes. It is keyed by the
-//! Region of the request ([`request_region`]) rather than by a resource id, because no
-//! resource owns it, and a Region with no entry has nothing registered.
+//! Region", `RegisterInstanceEventNotificationAttributes` writes and
+//! `DeregisterInstanceEventNotificationAttributes` takes keys back out of. It is keyed by
+//! the Region of the request ([`request_region`]) rather than by a resource id, because no
+//! resource owns it, and a Region with no entry has nothing registered — which is also
+//! where a registration whose last key is deregistered goes back to
+//! ([`ComAmazonawsEc2Amazonec2State::clear_instance_event_tag_registration`]).
 //!
 //! ## VM import tasks
 //!
@@ -6318,16 +6321,26 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 }
 
-/// Refuse a tag whose key or value is longer than EC2 documents.
-pub fn validate_tag_size<E>(
-    key: &str,
-    value: &str,
-) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+/// Refuse a tag key longer than EC2 documents ([`MAX_TAG_KEY_CHARS`]).
+///
+/// Split out of [`validate_tag_size`] so a caller that carries a KEY and no value — the
+/// scheduled event notification tag key registration names keys alone — checks exactly the
+/// key rule rather than passing a value it does not have.
+pub fn validate_tag_key<E>(key: &str) -> Result<(), crate::scaffolded::Scaffolded<E>> {
     if key.chars().count() > MAX_TAG_KEY_CHARS {
         return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
             "A tag key accepts at most {MAX_TAG_KEY_CHARS} characters"
         )));
     }
+    Ok(())
+}
+
+/// Refuse a tag whose key or value is longer than EC2 documents.
+pub fn validate_tag_size<E>(
+    key: &str,
+    value: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    validate_tag_key(key)?;
     if value.chars().count() > MAX_TAG_VALUE_CHARS {
         return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
             "The value of tag key '{key}' accepts at most {MAX_TAG_VALUE_CHARS} characters"
@@ -22552,6 +22565,61 @@ impl InstanceEventTagRegistration {
         }
     }
 
+    /// This registration with `keys` no longer registered: "Information about the tag keys
+    /// to deregister" (`DeregisterInstanceTagAttributeRequest$InstanceTagKeys`) are taken
+    /// OUT of the individually registered keys and every other key stays where it is — the
+    /// mirror of [`Self::registering`]. A key the registration does not hold is removed
+    /// without effect, since a set holds a key once or not at all.
+    ///
+    /// Naming keys says nothing about the include-all MODE, so the mode is left as it
+    /// stands: turning it off is what `IncludeAllTagsOfInstance` is for on this request
+    /// ([`Self::deregistering_all`]), exactly as the register turns it on.
+    pub fn deregistering(&self, keys: &[String]) -> Self {
+        let mut registered = self.instance_tag_keys.clone();
+        for key in keys {
+            registered.remove(key);
+        }
+        Self {
+            include_all_tags_of_instance: self.include_all_tags_of_instance,
+            instance_tag_keys: registered,
+        }
+    }
+
+    /// The registration with no tag key registered at all: "Indicates whether to deregister
+    /// all tag keys in the current Region. Specify `false` to deregister all tag keys"
+    /// (`DeregisterInstanceTagAttributeRequest$IncludeAllTagsOfInstance`) leaves neither the
+    /// include-all mode nor an individually registered key, which is
+    /// [`Self::default`] — what a Region nothing has registered in reports.
+    ///
+    /// An associated function for the same reason [`Self::registering_all`] is one: what it
+    /// answers does not depend on the registration it replaces.
+    pub fn deregistering_all() -> Self {
+        Self::default()
+    }
+
+    /// Whether this registration holds nothing: not the include-all mode and no
+    /// individually registered key — the registration a Region with no stored entry
+    /// reports, so a store holding it as an entry would charge for a fact it already
+    /// answers ([`ComAmazonawsEc2Amazonec2State::instance_event_tag_registration`]).
+    pub fn is_empty(&self) -> bool {
+        !self.include_all_tags_of_instance && self.instance_tag_keys.is_empty()
+    }
+
+    /// The attribute a deregister answers with: the tag keys that call took out of the
+    /// registration, beside the mode the registration is LEFT in.
+    ///
+    /// Not the registration as it now stands, which is what the register answers and what
+    /// the describe reports: the recorded wire answer to a deregister of the one key a
+    /// Region had registered carries THAT key, which the registration no longer holds, and
+    /// the API reference's own example of this operation answers the keys the request
+    /// named. So the keys a deregister reports are its own request's, as a set.
+    pub fn deregistered(keys: &[String], left: &Self) -> Self {
+        Self {
+            include_all_tags_of_instance: left.include_all_tags_of_instance,
+            instance_tag_keys: keys.iter().cloned().collect(),
+        }
+    }
+
     /// The caller-chosen bytes this registration holds: the registered keys themselves.
     /// The mode is one bit the service stores, so it is fixed-size.
     ///
@@ -22635,6 +22703,24 @@ impl ComAmazonawsEc2Amazonec2State {
         ));
         self.instance_event_tag_registrations
             .insert(region.to_string(), registration);
+    }
+
+    /// Drop `region`'s registration, giving its bytes back: a Region whose last registered
+    /// tag key has been deregistered is one nothing has registered in, which is exactly
+    /// what [`Self::instance_event_tag_registration`] answers for a Region with no entry —
+    /// so keeping an emptied entry would charge the store for a fact it already reports.
+    ///
+    /// A no-op for a Region that has no entry, which is what makes a deregister against
+    /// such a Region store NOTHING.
+    pub fn clear_instance_event_tag_registration(&mut self, region: &str) {
+        let released = self.instance_event_registration_bytes(region);
+        if self
+            .instance_event_tag_registrations
+            .remove(region)
+            .is_some()
+        {
+            self.release_stored_bytes(released);
+        }
     }
 }
 

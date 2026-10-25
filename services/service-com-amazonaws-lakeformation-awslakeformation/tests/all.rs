@@ -29,3 +29,5 @@ mod registered_resources;
 mod revoke_default_grant;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/table_column_scope.rs"]
+mod table_column_scope;

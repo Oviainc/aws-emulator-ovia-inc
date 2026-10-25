@@ -303,10 +303,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_implemented("DescribeType"));
         };
         let region = crate::state::request_region(ctx.parts());
-        // A pure report: nothing here writes. There is no `settle` call either, because a
-        // registry record carries no status the clock owes — the stack clock settles
-        // stacks and change sets, neither of which this read reports.
-        let store = state.lock();
+        // A pure report, but one that must not withhold a transition the clock already made
+        // due: `TestType` leaves a version's contract tests in progress and their conclusion
+        // due a moment later, and this read is what "monitor[s] the current test status".
+        // Settling materialises only that already-due conclusion — nothing is advanced
+        // because it was read.
+        let mut store = state.lock();
+        store.settle(::std::time::SystemTime::now());
 
         let stored = match identifier {
             Identifier::Arn { extension, .. } => store.extension_by_arn(&region, extension),
