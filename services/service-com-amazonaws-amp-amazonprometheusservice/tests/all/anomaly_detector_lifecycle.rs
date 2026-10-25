@@ -19,7 +19,16 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// `POST /workspaces/{workspaceId}/anomalydetectors`.
-async fn create_detector(amp: &Amp, region: &str, workspace_id: &str, body: &Value) -> Reply {
+///
+/// `pub(crate)`, with [`describe_detector`] and [`minimal_configuration`], so the other
+/// detector suites in this target seed and read a detector over the SAME request path
+/// rather than each spelling the route out again.
+pub(crate) async fn create_detector(
+    amp: &Amp,
+    region: &str,
+    workspace_id: &str,
+    body: &Value,
+) -> Reply {
     amp.call(
         "POST",
         &format!("/workspaces/{workspace_id}/anomalydetectors"),
@@ -30,7 +39,12 @@ async fn create_detector(amp: &Amp, region: &str, workspace_id: &str, body: &Val
 }
 
 /// `GET /workspaces/{workspaceId}/anomalydetectors/{anomalyDetectorId}`.
-async fn describe_detector(amp: &Amp, region: &str, workspace_id: &str, detector_id: &str) -> Reply {
+pub(crate) async fn describe_detector(
+    amp: &Amp,
+    region: &str,
+    workspace_id: &str,
+    detector_id: &str,
+) -> Reply {
     amp.call(
         "GET",
         &format!("/workspaces/{workspace_id}/anomalydetectors/{detector_id}"),
@@ -62,7 +76,7 @@ type Reply = super::workspace_lifecycle::Reply;
 
 /// A `randomCutForest` configuration carrying only the required `query`, so the
 /// response shows what the service filled in for the rest.
-fn minimal_configuration(query: &str) -> Value {
+pub(crate) fn minimal_configuration(query: &str) -> Value {
     json!({ "randomCutForest": { "query": query } })
 }
 
