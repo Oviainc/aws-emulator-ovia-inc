@@ -23,6 +23,8 @@ mod config_defaults_and_references;
 mod config_listing;
 #[path = "all/contact_cancellation.rs"]
 mod contact_cancellation;
+#[path = "all/contact_dataflows_and_pass_stages.rs"]
+mod contact_dataflows_and_pass_stages;
 #[path = "all/contact_version_listing.rs"]
 mod contact_version_listing;
 #[path = "all/contact_versions.rs"]

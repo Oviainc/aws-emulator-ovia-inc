@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDataTransformationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDataTransformationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDataTransformationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a data transformation job against the data transformation profile the
+//! request's required `ProfileId` names: it MINTS one job record in
+//! [`crate::state::ComAmazonawsHealthlakeHealthlakeState::transformation_jobs`]
+//! — the ONE map `DescribeDataTransformationJob` reads back — and answers the
+//! minted `JobId` with the `SUBMITTED` status that record holds.
+//!
+//! A `ProfileId` the service holds no profile for is the modelled
+//! `ResourceNotFoundException`. The profile's NAME and the VERSION the job runs
+//! against are resolved here and stored on the job, so a later read reports
+//! what the job was started with rather than re-deriving it from a profile that
+//! may since have changed. The start call carries no version, so the version is
+//! the profile's latest published one — the resolution
+//! `GetDataTransformationProfile` documents for an omitted version — or the
+//! DRAFT ([`crate::state::DRAFT_PROFILE_VERSION`]) while nothing has been
+//! published from it, that being the only version such a profile has.
+//!
+//! `ClientToken` is this operation's required idempotency token — "a unique,
+//! case-sensitive identifier to ensure that the operation completes no more
+//! than one time. If this token matches a previous request, the service ignores
+//! the request but does not return an error" — so a repeat of the SAME call is
+//! answered out of the job that token started instead of starting a second one,
+//! and a token reused with a DIFFERENT request is refused, exactly as the other
+//! operations in this crate that honour a token do.
+//!
+//! RUNNING THE TRANSFORMATION means reading the source files from the input
+//! Amazon S3 location and writing the converted output to the destination
+//! bucket, and this emulator opens no connection and reaches no bucket, so the
+//! clock owes a started job the modelled `FAILED` status whose `Message`
+//! ([`crate::state::TRANSFORMATION_NOT_PERFORMED_MESSAGE`]) says why — and no
+//! `JobProgressReport`, because no file was scanned — rather than reporting a
+//! conversion nothing ran.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +197,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDataTransformationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDataTransformationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDataTransformationJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server(
+                "the HealthLake data transformation job registry is unavailable",
+            ));
+        };
+
+        let fingerprint = request_fingerprint(&input);
+        let mut store = state.lock();
+        // The job records must have caught up with the clock before any of them
+        // is read: an earlier job whose transition is already due would
+        // otherwise be answered under the status it has left.
+        store.settle_transformation_jobs();
+
+        // A repeat of the SAME call under a token already seen is answered out
+        // of the job that token started, so one token starts one job. A token
+        // reused with a DIFFERENT request is a different request, and is
+        // refused rather than answered with the earlier job — the
+        // `ValidationException` this operation models, a bad request, nothing
+        // here being a resource-state conflict.
+        if let Some(started) = store.transformation_job_for_client_token(&input.client_token) {
+            if started.request_fingerprint != fingerprint {
+                return Err(validation(
+                    "ClientToken was already used for a different \
+                     StartDataTransformationJob request",
+                ));
+            }
+            // Answered out of the STORED record, so a repeat cannot report a
+            // status the job has already left.
+            return Ok(StartDataTransformationJobOutput {
+                job_id: started.id.clone(),
+                job_status: started.status.as_wire().to_string(),
+            });
+        }
+
+        // The profile the conversion runs against, with the name and the
+        // version resolved as they stand NOW and stored on the job — see the
+        // module docs. A profile no record holds is this service's fixed
+        // not-found sentence, which quotes nothing from the request.
+        let Some(profile) = store.profiles.get(&input.profile_id) else {
+            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+        };
+        let profile_name = profile.name.clone();
+        let profile_version = profile
+            .latest_published()
+            .map_or(crate::state::DRAFT_PROFILE_VERSION, |version| {
+                version.version
+            });
+
+        // The store holds a bounded number of job records, and nothing reaps a
+        // transformation job, so a genuinely full store is refused with the
+        // quota-shaped error this operation models.
+        if store.transformation_jobs.len() >= crate::state::MAX_TRANSFORMATION_JOBS {
+            return Err(
+                StartDataTransformationJobErrorModeled::ThrottlingException(ThrottlingException {
+                    message: Some(format!(
+                        "The maximum number of data transformation jobs ({}) already exists",
+                        crate::state::MAX_TRANSFORMATION_JOBS
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let id = store.next_transformation_job_id(now);
+        let job = crate::state::TransformationJob {
+            id: id.clone(),
+            name: input.job_name,
+            // A job AWS answers in a non-terminal status owes the clock one
+            // transition. The due instant is stored on the record and
+            // materialised by whichever call reads it next; nothing sleeps.
+            status: crate::state::TransformationJobStatus::Submitted,
+            // The terminal status the work this emulator could actually do
+            // warrants, with the message that status comes with — see the
+            // module docs. It travels WITH the owed status, so the record
+            // cannot report failure text while it is still `SUBMITTED`.
+            pending: Some((
+                ::std::time::Instant::now() + crate::state::TRANSFORMATION_JOB_RUN,
+                crate::state::TransformationJobStatus::Failed,
+                Some(crate::state::TRANSFORMATION_NOT_PERFORMED_MESSAGE.to_string()),
+            )),
+            submitted_at: ::aws_smithy_types::DateTime::from(now),
+            ended_at: None,
+            input_data_config: input.input_data_config,
+            output_data_config: input.output_data_config,
+            data_access_role_arn: input.data_access_role_arn,
+            profile_id: Some(input.profile_id),
+            profile_name: Some(profile_name),
+            profile_version: Some(profile_version),
+            drift_detection_enabled: input.drift_detection_enabled,
+            // `ProvenanceEnabled` is modelled `required` with a default of
+            // true, so the boundary has already resolved what the request left
+            // out: the record holds what the job runs with either way.
+            provenance_enabled: Some(input.provenance_enabled),
+            // The `Message` and the `JobProgressReport` belong to the RUN, and
+            // nothing has run yet: the message travels with the status the
+            // clock owes, so a job still `SUBMITTED` cannot report why it
+            // ended.
+            message: None,
+            progress_report: None,
+            client_token: Some(input.client_token),
+            request_fingerprint: fingerprint,
+        };
+
+        let output = StartDataTransformationJobOutput {
+            job_id: job.id.clone(),
+            job_status: job.status.as_wire().to_string(),
+        };
+        store.transformation_jobs.insert(id, job);
+        Ok(output)
     }
+}
+
+/// This operation's 400 refusal, as the modelled `ValidationException` it
+/// declares.
+fn validation(message: impl Into<String>) -> StartDataTransformationJobError {
+    StartDataTransformationJobErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// This operation's 404, worded without quoting the requested identifier — the
+/// wording every not-found path in this crate uses.
+fn not_found(message: &str) -> StartDataTransformationJobError {
+    StartDataTransformationJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's 500, for a store the handler could not reach at all.
+fn internal_server(message: &str) -> StartDataTransformationJobError {
+    StartDataTransformationJobErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// A fingerprint of everything this request asks for, so one `ClientToken`
+/// resolves to the job it started only for a repeat of the SAME request.
+///
+/// Built from the members that define the job — never from the token itself —
+/// with presence of the optional members rendered explicitly. The
+/// length-prefixed folding itself lives in
+/// [`crate::state::request_fingerprint`], shared with the other operations here
+/// that honour an idempotency token.
+fn request_fingerprint(input: &StartDataTransformationJobInput) -> String {
+    crate::state::request_fingerprint([
+        input.profile_id.clone(),
+        input.data_access_role_arn.clone(),
+        crate::state::optional_field("JobName", input.job_name.as_deref()),
+        // Neither data configuration carries a map, so each one's derived
+        // `Debug` has a canonical form for a given value, which is all a
+        // fingerprint needs.
+        format!("{:?}", input.input_data_config),
+        format!("{:?}", input.output_data_config),
+        crate::state::optional_field(
+            "DriftDetectionEnabled",
+            input
+                .drift_detection_enabled
+                .map(|enabled| enabled.to_string())
+                .as_deref(),
+        ),
+        format!("ProvenanceEnabled={}", input.provenance_enabled),
+    ])
 }

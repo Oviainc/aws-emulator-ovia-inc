@@ -45,3 +45,5 @@ mod vpc_association_authorizations;
 mod vpc_associations;
 #[path = "all/vpc_authorization_deletion.rs"]
 mod vpc_authorization_deletion;
+#[path = "all/vpc_disassociation.rs"]
+mod vpc_disassociation;

@@ -6365,6 +6365,28 @@ impl<'a> InstanceTypeName<'a> {
                 .generation
                 .is_none_or(|generation| generation >= FIRST_NITRO_GENERATION)
     }
+
+    /// Does this instance type automatically encrypt in-transit traffic between
+    /// instances — the modelled `NetworkInfo$EncryptionInTransitSupported`?
+    ///
+    /// "Encryption in transit" in the Amazon EC2 User Guide: the traffic between two
+    /// instances built on the 4th version of the Nitro System and later is encrypted
+    /// automatically, which is every Nitro type from
+    /// [`FIRST_ENCRYPTING_INSTANCE_GENERATION`] on, plus the earlier types that page
+    /// names one by one ([`ENCRYPTING_INSTANCE_FAMILIES`]) and the high-memory family it
+    /// names as a whole ([`HIGH_MEMORY_ROOT`]).
+    ///
+    /// A family carrying no generation at all (`u-6tb1`, whose digits state a memory
+    /// size) is answered by those names alone, the way [`Self::nitro`] answers the
+    /// facts it cannot read off a generation.
+    pub fn encrypts_in_transit(&self) -> bool {
+        ENCRYPTING_INSTANCE_FAMILIES.contains(&self.family)
+            || self.root == HIGH_MEMORY_ROOT
+            || (self.nitro()
+                && self
+                    .generation
+                    .is_some_and(|generation| generation >= FIRST_ENCRYPTING_INSTANCE_GENERATION))
+    }
 }
 
 /// The first generation that runs on the AWS Nitro System: the fifth generation of each
@@ -7274,7 +7296,13 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
             efa_info: (efa_interfaces > 0).then_some(EfaInfo {
                 maximum_efa_interfaces: Some(efa_interfaces),
             }),
-            encryption_in_transit_supported: None,
+            // "Indicates whether the instance type automatically encrypts in-transit
+            // traffic between instances" (`NetworkInfo$EncryptionInTransitSupported`):
+            // the one site of that fact is `InstanceTypeName::encrypts_in_transit`, so
+            // this report and `GetVpcResourcesBlockingEncryptionEnforcement` — which asks
+            // which instances of a VPC cannot encrypt — cannot answer differently for one
+            // instance type.
+            encryption_in_transit_supported: Some(name.encrypts_in_transit()),
             ena_srd_supported: None,
             bandwidth_weightings: None,
             flexible_ena_queues_support: None,
@@ -12732,6 +12760,31 @@ pub fn decode_page_token(token: &str) -> Option<String> {
     (checksum == expected).then(|| start_at.to_string())
 }
 
+/// What separates the SCOPE a page cursor was minted for from the position inside that
+/// scope, in the cursor a scoped token carries: a character no resource id, Region or
+/// checksum of this service carries, so the two halves can never run together.
+pub const CURSOR_SCOPE_SEPARATOR: char = '#';
+
+/// Encode a cursor that is only valid inside `scope` — the report, search or VPC the page
+/// belongs to — as an opaque token.
+///
+/// A plain [`encode_page_token`] names a position and nothing else, so a token minted
+/// while paging one report resumes inside another report that happens to order its items
+/// the same way. A SCOPED token carries what it was minted for beside the position, and
+/// [`decode_scoped_page_token`] refuses it for any other scope.
+pub fn encode_scoped_page_token(scope: &str, position: &str) -> String {
+    encode_page_token(&format!("{scope}{CURSOR_SCOPE_SEPARATOR}{position}"))
+}
+
+/// The position inside `scope` that `token` names; `None` for anything else — a token this
+/// service did not mint ([`decode_page_token`]), one carrying no scope at all, or one
+/// minted for a different scope, which a caller must be refused rather than resumed from.
+pub fn decode_scoped_page_token(token: &str, scope: &str) -> Option<String> {
+    let cursor = decode_page_token(token)?;
+    let (carried, position) = cursor.split_once(CURSOR_SCOPE_SEPARATOR)?;
+    (carried == scope).then(|| position.to_string())
+}
+
 /// The checksum a token carries over its cursor.
 ///
 /// A token is only ever presented back to the process that minted it — pagination is
@@ -14055,18 +14108,33 @@ impl ComAmazonawsEc2Amazonec2State {
             if instance.state == InstanceStateName::Terminated {
                 continue;
             }
-            let in_vpc = instance.subnet_id.as_deref().is_some_and(|subnet_id| {
-                self.subnets
-                    .get(subnet_id)
-                    .and_then(|subnet| subnet.vpc_id.as_deref())
-                    == Some(vpc_id)
-            });
-            if in_vpc {
+            if self.instance_is_in_vpc(instance, vpc_id) {
                 found.push(instance.instance_id.clone());
             }
         }
         found.sort();
         found
+    }
+
+    /// Whether `instance` sits in the VPC `vpc_id`: its subnet is one of that VPC's.
+    ///
+    /// An instance record names the subnet it was launched into and nothing else about its
+    /// network, so the VPC is resolved through the subnet store. The ONE definition of
+    /// "this instance is in that VPC": [`Self::vpc_dependencies`] asks it to decide what a
+    /// `DeleteVpc` is blocked by, and `GetVpcResourcesBlockingEncryptionEnforcement` asks
+    /// it to decide whose instances a report covers, so the two cannot disagree about which
+    /// VPC holds an instance.
+    ///
+    /// The instance's STATE is not read here: which states still count as occupying the VPC
+    /// is the caller's question (a delete is blocked by an instance that is not terminated;
+    /// a report covers the same set), so each caller states it where it asks.
+    pub fn instance_is_in_vpc(&self, instance: &InstanceRecord, vpc_id: &str) -> bool {
+        instance.subnet_id.as_deref().is_some_and(|subnet_id| {
+            self.subnets
+                .get(subnet_id)
+                .and_then(|subnet| subnet.vpc_id.as_deref())
+                == Some(vpc_id)
+        })
     }
 
     /// Remove the subnet `subnet_id` and answer it as it was last reported, or `None` when
@@ -18035,6 +18103,61 @@ pub fn instance_type_is_modelled(instance_type: &str) -> bool {
     offered_instance_types().contains(&instance_type)
 }
 
+/// The instance families whose network adapters encrypt in-transit traffic even though
+/// their generation is older than the one from which every family does.
+///
+/// Source: "Encryption in transit" in the Amazon EC2 User Guide, which names them one by
+/// one beside the generations that all encrypt — C5a, C5ad, C5n, D3, D3en, G4 (the NVIDIA
+/// `g4dn` and the AMD `g4ad`), I3en, I4i, Im4gn, Is4gen, M5dn, M5n, M5zn, P3dn, P4d, R5dn,
+/// R5n, X2idn, X2iedn and X2iezn. The high-memory U family that page names as `U-*` is on
+/// the same list and is answered by [`HIGH_MEMORY_ROOT`] instead, because its names carry a
+/// memory size where every entry here carries a generation.
+///
+/// FAMILIES, not sizes: every size of a family carries the same network adapter, so an
+/// entry is compared against [`instance_family_of`] rather than against a whole instance
+/// type.
+pub const ENCRYPTING_INSTANCE_FAMILIES: [&str; 21] = [
+    "c5a", "c5ad", "c5n", "d3", "d3en", "g4ad", "g4dn", "i3en", "i4i", "im4gn", "is4gen",
+    "m5dn", "m5n", "m5zn", "p3dn", "p4d", "r5dn", "r5n", "x2idn", "x2iedn", "x2iezn",
+];
+
+/// The family root of the high-memory instance types — the `U-*` of the same published
+/// list, whose names state a memory size (`u-6tb1`, `u7i-12tb`) rather than a generation,
+/// so the whole family is named by its root instead of entry by entry.
+pub const HIGH_MEMORY_ROOT: &str = "u";
+
+/// The first instance generation every family of which encrypts in-transit traffic: the
+/// 6th, from which every family is built on the 4th version of the AWS Nitro System
+/// ("Encryption in transit", Amazon EC2 User Guide — traffic between instances is
+/// encrypted for instances built on that System, plus the earlier types
+/// [`ENCRYPTING_INSTANCE_FAMILIES`] names).
+pub const FIRST_ENCRYPTING_INSTANCE_GENERATION: u32 = 6;
+
+/// Whether `instance_type` automatically encrypts in-transit traffic between instances —
+/// the modelled `NetworkInfo$EncryptionInTransitSupported`, "indicates whether the
+/// instance type automatically encrypts in-transit traffic between instances".
+///
+/// A fact of the instance TYPE, not of a stored instance or of a request, so it is derived
+/// from the parts [`InstanceTypeName`] parses out of the name, like every other fact about
+/// an instance type this module answers: a type that runs on the Nitro System
+/// ([`InstanceTypeName::nitro`]) from [`FIRST_ENCRYPTING_INSTANCE_GENERATION`] on — the
+/// generation from which it is the 4th version of that System — or one of the earlier
+/// families [`ENCRYPTING_INSTANCE_FAMILIES`] names, or the high-memory family
+/// [`HIGH_MEMORY_ROOT`] names.
+///
+/// The ONE site of this fact: [`instance_type_info`] reports it as the modelled member, so
+/// `DescribeInstanceTypes` and `GetVpcResourcesBlockingEncryptionEnforcement` cannot
+/// answer differently for one instance type. [`ENCRYPTING_INSTANCE_FAMILIES`] is where a
+/// family AWS's list names below that generation belongs, with a test row of its own,
+/// rather than being inferred from the name.
+///
+/// A value that is not an instance type at all (no `<family>.<size>`) names nothing that
+/// encrypts.
+pub fn instance_type_encrypts_in_transit(instance_type: &str) -> bool {
+    InstanceTypeName::parse(instance_type)
+        .is_some_and(|name| name.encrypts_in_transit())
+}
+
 /// Whether `instance_family` is the family of at least one instance type the model
 /// declares, so that a host allocated for it could ever run an instance.
 pub fn instance_family_is_modelled(instance_family: &str) -> bool {
@@ -18820,6 +18943,22 @@ pub const TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTING: &str = "rejecting";
 /// An attachment the owner of the attached resource refused: the
 /// `TransitGatewayAttachmentState` enum's `rejected` member.
 pub const TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTED: &str = "rejected";
+
+/// An attachment whose removal is being carried out: the `TransitGatewayAttachmentState`
+/// enum's `deleting` member.
+pub const TRANSIT_GATEWAY_ATTACHMENT_STATE_DELETING: &str = "deleting";
+
+/// An attachment that is gone: the `TransitGatewayAttachmentState` enum's `deleted`
+/// member.
+pub const TRANSIT_GATEWAY_ATTACHMENT_STATE_DELETED: &str = "deleted";
+
+/// An attachment on its way to having failed: the `TransitGatewayAttachmentState` enum's
+/// `failing` member.
+pub const TRANSIT_GATEWAY_ATTACHMENT_STATE_FAILING: &str = "failing";
+
+/// An attachment that could not be made: the `TransitGatewayAttachmentState` enum's
+/// `failed` member.
+pub const TRANSIT_GATEWAY_ATTACHMENT_STATE_FAILED: &str = "failed";
 
 /// `pendingAcceptance` as the OTHER state enum spells it:
 /// `TransitGatewayClientVpnAttachment$State` targets `TransitGatewayAttachmentStatusType`,

@@ -57,6 +57,8 @@ mod disk_restore_snapshot_completeness;
 mod disk_snapshot;
 #[path = "all/disk_snapshot_delete.rs"]
 mod disk_snapshot_delete;
+#[path = "all/disk_snapshot_listing.rs"]
+mod disk_snapshot_listing;
 #[path = "all/distribution_cdn.rs"]
 mod distribution_cdn;
 #[path = "all/distribution_metric_data.rs"]

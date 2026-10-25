@@ -6,6 +6,11 @@
 //! client access tokens, all stored in [`crate::state`] so `DescribeTunnel`,
 //! `ListTunnels`, `RotateTunnelAccessToken` and `CloseTunnel` read the same record.
 //!
+//! A request whose `destinationConfig.services` names more streams than a
+//! tunnel is multiplexed over ([`crate::state::MAX_SERVICES_PER_TUNNEL`]) is
+//! refused with HTTP 400 `ValidationException` before anything is minted,
+//! stored or handed out.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -159,14 +164,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|config| config.max_lifetime_timeout_minutes)
             .unwrap_or(crate::state::DEFAULT_MAX_LIFETIME_TIMEOUT_MINUTES);
 
-        let destination_config =
-            input
-                .destination_config
-                .as_ref()
-                .map(|config| crate::state::StoredDestinationConfig {
-                    thing_name: config.thing_name.clone(),
-                    services: config.services.clone(),
-                });
+        // A tunnel carries at most `MAX_SERVICES_PER_TUNNEL` service names, the
+        // rule shared with the other writer of this field, so a longer list is
+        // refused here — before anything is minted, stored or handed out —
+        // rather than persisted as a tunnel the service could never run.
+        let destination_config = input
+            .destination_config
+            .as_ref()
+            .map(|config| crate::state::stored_destination_config("destinationConfig", config))
+            .transpose()
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let mut store = state.lock();
         // The store holds at most `MAX_TUNNELS` records, which is the limit the

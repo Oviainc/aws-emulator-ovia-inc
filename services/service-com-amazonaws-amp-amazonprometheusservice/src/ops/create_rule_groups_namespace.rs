@@ -346,6 +346,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             create_token: input.client_token,
             // Nothing has updated the namespace yet, so no update is in flight.
             update_token: None,
+            // Nothing has asked for the namespace to go away either.
+            delete_token: None,
         };
 
         let response = response_for(&namespace);

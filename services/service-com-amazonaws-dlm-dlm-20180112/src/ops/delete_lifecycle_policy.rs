@@ -128,7 +128,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteLifecyclePolicyErrorModeled::InternalServerException(
                 InternalServerException {
@@ -141,8 +140,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Removing the record removes the policy's tags with it, so a second
         // delete — and every later read — answers `ResourceNotFoundException`.
+        // Only the region the policy was created in holds it, so a delete signed
+        // for another region finds nothing to remove.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        if store.policies.remove(&input.policy_id).is_none() {
+        if store.remove_policy(&region, &input.policy_id).is_none() {
             return Err(
                 DeleteLifecyclePolicyErrorModeled::ResourceNotFoundException(
                     crate::state::policies_not_found(&[input.policy_id]),

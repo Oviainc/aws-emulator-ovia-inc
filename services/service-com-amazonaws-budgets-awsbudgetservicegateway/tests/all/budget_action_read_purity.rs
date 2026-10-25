@@ -43,8 +43,11 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
 use super::budget_lifecycle::{caller_account, call, is_error, router_with_engine, same};
 
 /// An `ExecutionRoleArn` satisfying `RoleArn`'s modelled `@pattern` and `@length(32, 618)`
-/// (`smithy_query(query="shape",shape="RoleArn")`).
-const EXECUTION_ROLE: &str = "arn:aws:iam::123456789012:role/budget-action-reader";
+/// (`smithy_query(query="shape",shape="RoleArn")`), in the account the action lives in:
+/// "roles and actions must be in the same account" (`Action$ExecutionRoleArn`).
+fn execution_role(account_id: &str) -> String {
+    format!("arn:aws:iam::{account_id}:role/budget-action-reader")
+}
 
 /// An `ActionId` of exactly the modelled shape
 /// (`smithy_query(query="shape",shape="ActionId")`:
@@ -79,7 +82,7 @@ fn create_body(account_id: &str, budget_name: &str) -> Value {
                 "Roles": ["BudgetRestrictedRole"]
             }
         },
-        "ExecutionRoleArn": EXECUTION_ROLE,
+        "ExecutionRoleArn": execution_role(account_id),
         "ApprovalModel": "MANUAL",
         "Subscribers": [{"SubscriptionType": "EMAIL", "Address": "budget-ops@example.com"}]
     })
