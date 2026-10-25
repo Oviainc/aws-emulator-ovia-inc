@@ -4116,6 +4116,31 @@ impl Bucket {
         self.metrics_configurations.get(id)
     }
 
+    /// Drop the metrics configuration the bucket carries under `id`, reporting whether one
+    /// was there to drop.
+    ///
+    /// Per-ID, like the put: a delete "specified by the metrics configuration ID" removes
+    /// THAT configuration and leaves every other id the bucket carries in place. `false`
+    /// means the bucket carried none under that id, which is what makes a delete answer
+    /// [`NO_SUCH_CONFIGURATION_CODE`] rather than report a removal it did not make.
+    pub fn delete_metrics_configuration(&mut self, id: &str) -> bool {
+        self.metrics_configurations.remove(id).is_some()
+    }
+
+    /// Every metrics configuration the bucket carries, in ascending id order — empty for a
+    /// bucket that carries none.
+    ///
+    /// The order is the store's own (a `BTreeMap` of ids), so two listings of an unchanged
+    /// bucket report the same sequence and a page can resume at the next id; the stored
+    /// containers themselves, so a listing reports what the puts recorded.
+    pub fn metrics_configurations(
+        &self,
+    ) -> impl Iterator<Item = (&str, &crate::ops::types::MetricsConfiguration)> + '_ {
+        self.metrics_configurations
+            .iter()
+            .map(|(id, configuration)| (id.as_str(), configuration))
+    }
+
     /// Associate `configuration` with the bucket under `id`, and report what that did.
     ///
     /// A full replacement of the configuration of that id, and of that one only: "If you're
