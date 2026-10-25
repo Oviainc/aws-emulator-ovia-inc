@@ -587,3 +587,100 @@ async fn delete_security_group_dry_run_reports_the_outcome_and_deletes_nothing()
         "case {case:?}: {group_id} must be gone after the real delete"
     );
 }
+
+/// RULE: a delete names its group by `GroupId` or by `GroupName` — "you can specify either
+/// the security group name or the security group ID"
+/// (`DeleteSecurityGroupRequest$GroupName`), a NAME naming a group of the DEFAULT VPC only
+/// ("for security groups in a nondefault VPC, you must specify the security group ID") —
+/// so a request naming neither is a `MissingParameter`, an id no group of the account is
+/// held under is `InvalidGroup.NotFound` whether or not a name accompanies it, and the two
+/// members together have to name the SAME group.
+///
+/// The rows differ along which members the request carries and how they disagree; the last
+/// one is the request that resolves, deleting a default-VPC group by name alone.
+#[tokio::test]
+async fn a_delete_names_its_group_by_id_or_by_name() {
+    let router = emulator();
+
+    // One group of the DEFAULT VPC, which is the VPC a name resolves in: created without a
+    // `VpcId`, the way a caller that names no VPC creates one.
+    let case = "the seed";
+    let body = ok(
+        case,
+        &router,
+        "CreateSecurityGroup",
+        &[
+            param("GroupName", "named-delete"),
+            param("GroupDescription", "a group the delete suite names by name"),
+        ],
+    )
+    .await;
+    let group_id = member(case, &body, "groupId");
+
+    // An id no group of the account has, in the long id form so it is well formed.
+    const UNKNOWN_ID: &str = "sg-0fedcba987654321f";
+
+    let refusals: [(&str, Vec<Param>, u16, &str); 4] = [
+        (
+            "neither member",
+            Vec::new(),
+            400,
+            "MissingParameter",
+        ),
+        (
+            "an unknown id on its own",
+            vec![param("GroupId", UNKNOWN_ID)],
+            400,
+            "InvalidGroup.NotFound",
+        ),
+        (
+            "an unknown id beside a name a group does answer to",
+            vec![param("GroupId", UNKNOWN_ID), param("GroupName", "named-delete")],
+            400,
+            "InvalidGroup.NotFound",
+        ),
+        (
+            "a held id beside a name that group is not called",
+            vec![param("GroupId", &group_id), param("GroupName", "another-name")],
+            400,
+            "InvalidParameterCombination",
+        ),
+    ];
+
+    for (case, params, status, code) in refusals {
+        let (actual_status, body) = call(&router, "DeleteSecurityGroup", &params).await;
+        assert_eq!(
+            actual_status, status,
+            "case {case:?}: expected HTTP {status}, got {actual_status} with body {body}"
+        );
+        let actual = error_code(&body);
+        assert_eq!(
+            actual, code,
+            "case {case:?}: expected {code}, got {actual:?} in body {body}"
+        );
+        assert!(
+            group_is_stored(case, &router, &group_id).await,
+            "case {case:?}: a refused delete must leave {group_id} stored"
+        );
+    }
+
+    // The request that resolves: the name alone, which the default VPC's group answers to,
+    // and the delete reports the id that name resolved to.
+    let case = "the name of a default-VPC group";
+    let body = ok(
+        case,
+        &router,
+        "DeleteSecurityGroup",
+        &[param("GroupName", "named-delete")],
+    )
+    .await;
+    let reported = member(case, &body, "groupId");
+    assert_eq!(
+        reported, group_id,
+        "case {case:?}: expected the delete to report {group_id}, got {reported:?}"
+    );
+    assert!(
+        !group_is_stored(case, &router, &group_id).await,
+        "case {case:?}: {group_id} must be gone after the delete by name"
+    );
+}

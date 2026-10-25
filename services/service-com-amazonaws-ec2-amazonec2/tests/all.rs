@@ -259,6 +259,8 @@ mod transit_gateway_multicast_domains;
 mod regions;
 #[path = "all/resource_specific_error_codes.rs"]
 mod resource_specific_error_codes;
+#[path = "all/revoke_security_group_ingress.rs"]
+mod revoke_security_group_ingress;
 #[path = "all/route_server_peers.rs"]
 mod route_server_peers;
 #[path = "all/route_servers.rs"]
