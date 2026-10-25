@@ -186,23 +186,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?),
         };
 
-        // The page size served. `maxResults` documents a minimum of 1 and a
-        // default of 25, so an explicit zero is refused and a request that names
-        // none is served the documented default — never every workspace.
-        // Whatever is asked for, the service serves at most
+        // The page size served, under the rule every paginated operation of this
+        // service shares (`crate::state::page_size`): THIS member documents a
+        // minimum of 1 and the service's default of 25, so an explicit zero is
+        // refused and a request that names none is served that default — never
+        // every workspace. Whatever is asked for, the service serves at most
         // `crate::state::MAX_PAGE_SIZE`.
-        let page_size = match input.max_results {
-            None => crate::state::DEFAULT_PAGE_SIZE,
-            Some(requested) if requested < 1 => {
-                return Err(invalid(
-                    "maxResults must be at least 1; omit it for the default of 25".to_string(),
-                )
-                .into())
-            }
-            Some(requested) => usize::try_from(requested)
-                .unwrap_or(crate::state::MAX_PAGE_SIZE)
-                .min(crate::state::MAX_PAGE_SIZE),
-        };
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::PageSizeRule::minimum_one(crate::state::DEFAULT_PAGE_SIZE),
+        )
+        .map_err(invalid)?;
 
         // `workspaces` is keyed by `workspaceId`, so iterating the map IS id
         // order and resuming is a `range` from the token's key: the page starts

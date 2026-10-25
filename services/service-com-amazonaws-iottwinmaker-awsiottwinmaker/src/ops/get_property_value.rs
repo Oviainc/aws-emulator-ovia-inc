@@ -200,7 +200,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "serving a request"
         );
         let _ = ctx;
-        let page_size = page_size(input.max_results)?;
+        // The page size served, under the rule every paginated operation of this
+        // service shares (`crate::state::page_size`): THIS member documents a
+        // minimum of 1 and the service's default of 25, so an explicit zero is
+        // refused and a request that names none is served that default; whatever
+        // is asked for, at most `crate::state::MAX_PAGE_SIZE` rows are built
+        // under the state lock.
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::PageSizeRule::minimum_one(crate::state::DEFAULT_PAGE_SIZE),
+        )
+        .map_err(invalid)?;
 
         // Everything either answer is computed from is read under the store's
         // lock, and the lock is RELEASED before a table is filtered and
@@ -287,25 +297,6 @@ fn not_found(message: String) -> GetPropertyValueError {
         message: Some(message),
     })
     .into()
-}
-
-/// The page size this call serves.
-///
-/// `maxResults` documents a minimum of 1 and a default of 25, so an explicit
-/// zero is refused and a request that names none is served the documented
-/// default; whatever is asked for, at most [`crate::state::MAX_PAGE_SIZE`] rows
-/// are built under the state lock. The same rule every paged operation of this
-/// service applies.
-fn page_size(max_results: Option<i32>) -> Result<usize, GetPropertyValueError> {
-    match max_results {
-        None => Ok(crate::state::DEFAULT_PAGE_SIZE),
-        Some(requested) if requested < 1 => Err(invalid(
-            "maxResults must be at least 1; omit it for the default of 25".to_string(),
-        )),
-        Some(requested) => Ok(usize::try_from(requested)
-            .unwrap_or(crate::state::MAX_PAGE_SIZE)
-            .min(crate::state::MAX_PAGE_SIZE)),
-    }
 }
 
 /// One component a query reads properties out of: where its stored properties

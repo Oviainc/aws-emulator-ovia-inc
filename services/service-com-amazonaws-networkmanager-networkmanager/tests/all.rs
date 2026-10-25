@@ -55,6 +55,8 @@ mod delete_connection;
 mod delete_dependency_refusal;
 #[path = "all/delete_device.rs"]
 mod delete_device;
+#[path = "all/delete_link.rs"]
+mod delete_link;
 #[path = "all/describe_global_networks_id_resolution.rs"]
 mod describe_global_networks_id_resolution;
 #[path = "all/device_lifecycle.rs"]

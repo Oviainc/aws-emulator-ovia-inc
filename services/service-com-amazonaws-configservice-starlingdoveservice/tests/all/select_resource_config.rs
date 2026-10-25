@@ -142,6 +142,7 @@ async fn emulator_holding_inventory() -> Emulator {
                         .collect(),
                     first_recorded_at: resource.configuration.map(|_| captured_at()),
                     last_recorded_at: resource.configuration.map(|_| captured_at()),
+                    ..DiscoveredResourceEntry::default()
                 },
             );
         }

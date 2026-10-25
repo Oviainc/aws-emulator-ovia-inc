@@ -62,6 +62,9 @@ mod metadata_transfer_job_listing;
 #[path = "all/metadata_transfer_job_read.rs"]
 mod metadata_transfer_job_read;
 
+#[path = "all/page_size_rule.rs"]
+mod page_size_rule;
+
 #[path = "all/pricing_plan.rs"]
 mod pricing_plan;
 

@@ -117,17 +117,11 @@ fn update_rejection(input: &UpdateConfigurationDefinitionInput) -> Option<String
     // A parameter set the request replaces also names where the definition is
     // deployed, so the targets it names are checked the way a create's are —
     // `crate::state` is the one place that rule lives.
-    if let Some(why) = input.parameters.as_ref().and_then(|parameters| {
-        crate::state::deployment_targets_rejection(
-            "Parameters",
-            parameters
-                .get(crate::state::PARAMETER_TARGET_REGIONS)
-                .map(String::as_str),
-            parameters
-                .get(crate::state::PARAMETER_TARGET_ACCOUNTS)
-                .map(String::as_str),
-        )
-    }) {
+    if let Some(why) = input
+        .parameters
+        .as_ref()
+        .and_then(|parameters| crate::state::deployment_targets_rejection("Parameters", parameters))
+    {
         return Some(why);
     }
     input
@@ -352,14 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deployment in an account or Region the definition no longer targets. `Type`
         // is not an input of this operation, so it is untouched.
         let targets = crate::state::deployment_targets(
-            definition
-                .parameters
-                .get(crate::state::PARAMETER_TARGET_REGIONS)
-                .map(String::as_str),
-            definition
-                .parameters
-                .get(crate::state::PARAMETER_TARGET_ACCOUNTS)
-                .map(String::as_str),
+            &definition.parameters,
             ::engine::emulator_account_id(),
             &manager_region,
         );

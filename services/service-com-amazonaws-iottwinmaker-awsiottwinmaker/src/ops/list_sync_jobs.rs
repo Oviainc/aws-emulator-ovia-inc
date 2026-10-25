@@ -217,34 +217,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        // The page size served: the documented default when the request names
-        // none, otherwise what it asks for, capped at the most this service ever
-        // serves. Unlike the listings whose `maxResults` documents a minimum of
-        // 1, THIS member documents a minimum of 0 (see [`DEFAULT_PAGE_SIZE`]),
-        // so a zero is a page of no rows — the maximum number of results to
-        // return at one time, literally — and not a refusal; the `nextToken`
-        // then still names where the listing stands, so a caller that asked for
-        // nothing can resume. Anything outside the member's modelled range is
-        // refused by the boundary validator before this handler runs. The token
-        // such a page answers names the position the call STARTED from — a page
-        // of no rows consumed none — so a generated paginator must not be driven
-        // at zero: it would ask again from the same place forever.
-        let page_size = match input.max_results {
-            None => DEFAULT_PAGE_SIZE,
-            // The conversion can only fail on a NEGATIVE value, which the
-            // modelled range refuses before this handler runs — so this arm is
-            // belt-and-braces. It fails CLOSED (the modelled refusal, naming
-            // the member and the published range) rather than falling back to
-            // the largest page, so a page size nothing could have asked for can
-            // never resolve to the most permissive answer.
-            Some(requested) => usize::try_from(requested)
-                .map_err(|_| {
-                    invalid(format!(
-                        "maxResults must be between 0 and {MODELLED_MAX_RESULTS}, got {requested}"
-                    ))
-                })?
-                .min(crate::state::MAX_PAGE_SIZE),
-        };
+        // The page size served, under the rule every paginated operation of this
+        // service shares (`crate::state::page_size`): the documented default
+        // when the request names none, otherwise what it asks for, capped at the
+        // most this service ever serves. Unlike the listings whose `maxResults`
+        // documents a minimum of 1, THIS member documents a minimum of 0 (see
+        // [`DEFAULT_PAGE_SIZE`]), so a zero is a page of no rows — the maximum
+        // number of results to return at one time, literally — and not a
+        // refusal; the `nextToken` then still names where the listing stands, so
+        // a caller that asked for nothing can resume. Anything outside the
+        // member's modelled range is refused by the boundary validator before
+        // this handler runs. The token such a page answers names the position the
+        // call STARTED from — a page of no rows consumed none — so a generated
+        // paginator must not be driven at zero: it would ask again from the same
+        // place forever.
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::PageSizeRule::minimum_zero(DEFAULT_PAGE_SIZE),
+        )
+        .map_err(invalid)?;
 
         // The clock, not this call, is what moves a sync job on: its outcome was
         // due at `settles_at`, so reporting the stored state without

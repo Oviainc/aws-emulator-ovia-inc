@@ -27,6 +27,8 @@ mod enable_baseline_validation;
 mod enable_control_persistence;
 #[path = "all/enable_control_validation.rs"]
 mod enable_control_validation;
+#[path = "all/enabled_baseline_drift.rs"]
+mod enabled_baseline_drift;
 #[path = "all/enabled_baseline_update.rs"]
 mod enabled_baseline_update;
 #[path = "all/enabled_control_lifecycle.rs"]
