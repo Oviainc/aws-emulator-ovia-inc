@@ -140,14 +140,20 @@ impl From<TagResourceErrorModeled> for TagResourceError {
 /// is the store's own (`crate::state::MAX_TAGS`, the most tags one configuration manager
 /// may carry), checked before the store lock is taken. An EMPTY map needs no refusal:
 /// assigning no pair is the same no-op as re-assigning a value a key already holds.
+///
+/// The key pattern admits `:`, so it also admits a key under the AWS-reserved prefix,
+/// which names a tag that is not the caller's to assign: that is refused here too, by
+/// `crate::state::reserved_tag_key_rejection` — the one place that rule lives, shared
+/// with every other member of this service that takes tag keys from the caller.
 fn tags_rejection(tags: &::std::collections::HashMap<String, String>) -> Option<String> {
-    (tags.len() > crate::state::MAX_TAGS).then(|| {
-        format!(
+    if tags.len() > crate::state::MAX_TAGS {
+        return Some(format!(
             "Tags carries {} entries, more than the {} this service accepts",
             tags.len(),
             crate::state::MAX_TAGS
-        )
-    })
+        ));
+    }
+    crate::state::reserved_tag_key_rejection("Tags", tags.keys().map(String::as_str))
 }
 
 /// The `TagResource` operation.

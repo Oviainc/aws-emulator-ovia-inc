@@ -141,8 +141,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in an Amazon Web Services Region" — so nothing here writes. `AccountUsage`
         // counts the stored functions and the storage their deployment packages
         // use; `AccountLimit` carries the account's quotas, with
-        // `UnreservedConcurrentExecutions` reduced by the concurrency those same
-        // functions reserve.
+        // `UnreservedConcurrentExecutions` reduced by every allocation those same
+        // functions have committed — what they reserve, and the provisioned
+        // concurrency of the ones reserving nothing.
         let store = state.lock();
         Ok(GetAccountSettingsOutput {
             account_limit: Some(store.account_limit()),

@@ -47,6 +47,39 @@ pub const PLAN_NOT_ACTIVE_MESSAGE: &str =
 /// shape, so nothing of the caller's values belongs in it.
 pub const DOCUMENT_BODY_REQUIRED_MESSAGE: &str = "Document must have a Body or TokenizedBody.";
 
+/// How this service states that a `Rescore` document gave ONE of its fields in BOTH of
+/// the two forms it may be given in, with `text_member` and `tokenized_member` the pair
+/// the document had to choose between.
+///
+/// The sentence is the model's own words for this rule ("You must choose to provide
+/// `Body` or `TokenizedBody`. You cannot provide both." — `Document$TokenizedBody`, and
+/// the same sentence for the title on `Document$TokenizedTitle`), and it is
+/// request-independent for the same reason [`DOCUMENT_BODY_REQUIRED_MESSAGE`] is: the
+/// rule is about the document's SHAPE, so the two member names are all it needs and
+/// nothing of the caller's values belongs in it. The member names come from the model,
+/// not from the request.
+pub fn document_member_choice_message(text_member: &str, tokenized_member: &str) -> String {
+    format!(
+        "You must choose to provide {text_member} or {tokenized_member}. \
+         You cannot provide both."
+    )
+}
+
+/// The modelled `ValidationException` a document carrying both forms of one field is
+/// refused with — the ONE place that message is built, so every such field pair is
+/// worded identically, exactly as [`plan_not_found`] does for the id-addressed lookups.
+pub fn document_member_choice(
+    text_member: &str,
+    tokenized_member: &str,
+) -> ValidationException {
+    ValidationException {
+        message: Some(document_member_choice_message(
+            text_member,
+            tokenized_member,
+        )),
+    }
+}
+
 /// The modelled `ResourceNotFoundException` for a plan id the store does not hold —
 /// the ONE place that message is built, so every plan-lookup path states it
 /// identically. It reaches the wire with this service's client-error status (see

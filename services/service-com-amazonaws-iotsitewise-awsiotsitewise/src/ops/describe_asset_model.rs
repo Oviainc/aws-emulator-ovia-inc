@@ -216,6 +216,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&id)
             .ok_or_else(|| not_found(&input.asset_model_id))?;
 
+        // `assetModelVersion` selects which version of the model to report: the
+        // LATEST one (the default) or the ACTIVE one, which is a DIFFERENT
+        // definition while a write the model already accepted is still settling.
+        // The selector is resolved on the record, so every operation that carries
+        // it answers from the same version, and a version the model does not have
+        // is the modelled 404 rather than another version under its name.
+        let record = record
+            .version_view(input.asset_model_version.as_deref(), now)
+            .ok_or_else(|| no_active_version(&id, record.state(now)))?;
+        let record = &*record;
+
         // `excludeProperties` asks for the model without its property definitions, so
         // it blanks a composite model's own properties as well as the top-level list:
         // a caller that asked not to be sent property definitions must not receive
@@ -295,6 +306,16 @@ fn not_found(label: &str) -> DescribeAssetModelError {
                 crate::state::RESOURCE_ASSET_MODEL,
                 label,
             ),
+        },
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` for a read scoped to the ACTIVE version
+/// of a model that has none, in this service's one wording for that absence.
+fn no_active_version(asset_model_id: &str, state: &str) -> DescribeAssetModelError {
+    DescribeAssetModelError::Modeled(DescribeAssetModelErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::no_active_version_message(asset_model_id, state),
         },
     ))
 }

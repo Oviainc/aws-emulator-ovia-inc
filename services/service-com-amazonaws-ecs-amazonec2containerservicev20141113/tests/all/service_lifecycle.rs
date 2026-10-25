@@ -19,8 +19,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    awsvpc_network_configuration, count, list, ok, refused, service, string, ACCOUNT,
-    SIGNED_REGION,
+    awsvpc_network_configuration, count, list, ok, refused, register_capacity, service, string,
+    ACCOUNT, SIGNED_REGION,
 };
 use crate::task_lifecycle::container;
 
@@ -150,6 +150,9 @@ async fn service_create_reads_back_with_the_task_set_its_scheduler_placed() {
         "setup",
     )
     .await;
+    // "The EC2 launch type runs your tasks on Amazon EC2 instances registered to your
+    // cluster", so the rows that place EC2 tasks need capacity registered to run on.
+    register_capacity(&router, "nodefault", "setup").await;
     let (arn_default, revision_default) = register(&router, "withdefaultfamily", "setup").await;
     let (arn_plain, revision_plain) = register(&router, "nodefaultfamily", "setup").await;
 
@@ -475,6 +478,7 @@ async fn update_service_moves_the_task_count_in_both_directions() {
         "setup",
     )
     .await;
+    register_capacity(&router, "scaling", "setup").await;
     let (_, _) = register(&router, "scalingfamily", "setup").await;
     let created = ok(
         &router,
@@ -582,6 +586,7 @@ async fn a_new_deployment_replaces_the_task_set_it_inherited() {
         "setup",
     )
     .await;
+    register_capacity(&router, "deploying", "setup").await;
     let (first_arn, _) = register(&router, "deployingfamily", "setup").await;
     let (second_arn, second_revision) = register(&router, "deployingfamily", "setup").await;
     assert_ne!(
@@ -694,6 +699,7 @@ async fn the_cluster_counts_the_services_and_tasks_it_holds() {
         "setup",
     )
     .await;
+    register_capacity(&router, "counted", "setup").await;
     register(&router, "countedfamily", "setup").await;
 
     // Each row adds one service, and the cluster's counters must follow.
@@ -1006,6 +1012,7 @@ async fn repeating_a_create_with_the_same_client_token_is_the_same_service() {
         "setup",
     )
     .await;
+    register_capacity(&router, "idempotent", "setup").await;
     register(&router, "idempotentfamily", "setup").await;
 
     let request = json!({

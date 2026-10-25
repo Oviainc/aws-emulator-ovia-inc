@@ -108,7 +108,7 @@
 use super::types::*;
 
 use crate::state::{
-    normalize_zone_id, resource_location, StoredDelegationSet,
+    hosted_zone_not_found, normalize_zone_id, resource_location, StoredDelegationSet,
     DELEGATION_SET_ALREADY_CREATED_MESSAGE, DELEGATION_SET_ALREADY_REUSABLE_MESSAGE,
     MAX_REUSABLE_DELEGATION_SETS,
 };
@@ -246,9 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // zone.
                 let zone = store.zones.get(normalize_zone_id(requested)).ok_or_else(|| {
                     CreateReusableDelegationSetErrorModeled::HostedZoneNotFound(
-                        HostedZoneNotFound {
-                            message: Some(format!("No hosted zone found with ID: {requested}")),
-                        },
+                        hosted_zone_not_found(requested),
                     )
                 })?;
                 // "You can't associate a reusable delegation set with a private

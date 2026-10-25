@@ -306,7 +306,7 @@ pub(crate) const VIEWER_REQUEST_CODE: &str = "function handler(event) {\n\
 ///
 /// `kvs_arn` is the ARN of a key value store this service holds, so the row that
 /// associates one names a store that really exists.
-fn create_table(kvs_arn: &str) -> Vec<Create> {
+pub(crate) fn create_table(kvs_arn: &str) -> Vec<Create> {
     vec![
         Create {
             case: "the shortest admissible name, the smallest admissible code",
@@ -361,7 +361,7 @@ fn create_table(kvs_arn: &str) -> Vec<Create> {
 // ---------------------------------------------------------------------------
 
 /// The text of one member of the `FunctionSummary` document, or a panic naming the case.
-fn member(summary: &Node, path: &str, case: &str, raw: &str) -> String {
+pub(crate) fn member(summary: &Node, path: &str, case: &str, raw: &str) -> String {
     summary
         .text_at(path)
         .unwrap_or_else(|| panic!("case {case}: the answer carries no {path}: {raw}"))

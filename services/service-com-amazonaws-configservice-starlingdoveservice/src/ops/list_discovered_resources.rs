@@ -282,9 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ListDiscoveredResourcesErrorModeled::InvalidNextTokenException(
                             InvalidNextTokenException {
                                 message: Some(
-                                    "the specified nextToken is not valid; use the nextToken a \
-                                     previous ListDiscoveredResources response returned"
-                                        .to_string(),
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                                 ),
                             },
                         )

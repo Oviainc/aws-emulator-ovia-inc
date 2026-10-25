@@ -3,6 +3,11 @@
 //! @op UntagResource
 //! Removes tags from the resource a resource ARN names.
 //!
+//! A key inside the namespace [`crate::state::RESERVED_TAG_KEY_PREFIX`] keeps (matched
+//! however it is cased) names a tag Amazon Web Services owns, which a caller can no more
+//! remove than create, so such a request is refused with `ValidationException` and the
+//! stored tags are left alone.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -158,6 +163,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A key in the `aws:` namespace names a tag Amazon Web Services created,
+        // which a caller can no more remove than create, so naming one is
+        // refused rather than quietly dropping a system tag. A rule about the
+        // REQUEST, judged before the store is read.
+        if let Some(reserved) =
+            crate::state::first_reserved_tag_key(input.tag_keys.iter().map(String::as_str))
+        {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                crate::state::reserved_tag_key("TagKeys", reserved),
+            )
+            .into());
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

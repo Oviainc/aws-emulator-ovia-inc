@@ -34,6 +34,11 @@
 //!    `maxResults` asks for, each published bound of `MaxResults` is accepted and
 //!    one past either end is refused, and a `nextToken` this service never issued
 //!    is refused naming the member at fault.
+//! 7. The designation is NOT owned by a detector: neither
+//!    `EnableOrganizationAdminAccount` nor `ListOrganizationAdminAccounts` names a
+//!    `DetectorId` (`smithy_query(operation="EnableOrganizationAdminAccount")`), so
+//!    a designation is made and reported whatever detectors the Region holds, it
+//!    mints none, and creating or deleting one leaves it where it is.
 
 use serde_json::{json, Value};
 
@@ -147,6 +152,62 @@ const ROWS: [(&str, &str, &str); 4] = [
 
 /// A Region no row designates anything through.
 const UNDESIGNATED_REGION: &str = "sa-east-1";
+
+/// The `DetectorId`s a Region's endpoint reports, read over the wire through
+/// `ListDetectors` (`GET /detector`), so the detector store a designation must be
+/// independent of is observed the way a client observes it.
+async fn detector_ids(router: &Router, region: &str, case: &str) -> Vec<String> {
+    let (status, body) = call_in(router, region, "GET", "/detector", None).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from the detector read, got {status} {body:?}"
+    );
+    body["detectorIds"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected detectorIds to be present, got {body:?}")
+        })
+        .iter()
+        .filter_map(|id| id.as_str().map(str::to_string))
+        .collect()
+}
+
+/// An enabled detector in `region` (`POST /detector`), failing the case if the
+/// create did not succeed.
+async fn create_detector_in(router: &Router, region: &str, case: &str) -> String {
+    let (status, body) = call_in(
+        router,
+        region,
+        "POST",
+        "/detector",
+        Some(json!({"enable": true})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from the detector create, got {status} {body:?}"
+    );
+    body["detectorId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a detectorId, got {body:?}"))
+        .to_string()
+}
+
+/// Delete `detector_id` through `region`'s endpoint (`DELETE /detector/{DetectorId}`).
+async fn delete_detector_in(router: &Router, region: &str, detector_id: &str, case: &str) {
+    let (status, body) = call_in(
+        router,
+        region,
+        "DELETE",
+        &format!("/detector/{detector_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from the detector delete, got {status} {body:?}"
+    );
+}
 
 #[tokio::test]
 async fn a_designation_is_reported_by_the_region_that_made_it_and_by_no_other() {
@@ -385,6 +446,87 @@ async fn a_removal_is_reported_in_progress_until_the_clock_owes_it() {
         "the next designation past the removal span: got {status} {body:?}"
     );
     assert_reports(&router, region, second, ENABLED, "the next designation").await;
+}
+
+/// Each row a designation made through a Region whose detector store is in a
+/// different state when the designation is made — none at all, or one enabled
+/// detector — and differing along the FORM of the account id as [`ROWS`] does.
+const DETECTOR_ROWS: [(&str, &str, &str, bool); 4] = [
+    ("no detector, an arbitrary account id", "us-west-1", "600000000001", false),
+    ("a detector, an arbitrary account id", "eu-north-1", "600000000002", true),
+    ("no detector, a leading-zero account id", "ap-east-1", "000000000002", false),
+    ("a detector, the highest account id", "me-south-1", "999999999998", true),
+];
+
+#[tokio::test]
+async fn a_designation_is_independent_of_the_regions_detectors() {
+    let router = new_router();
+
+    for (case, region, admin, detector_first) in DETECTOR_ROWS {
+        // The detector store starts empty, and holds the row's detector when the
+        // row asks for one.
+        let before = if detector_first {
+            vec![create_detector_in(&router, region, case).await]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            detector_ids(&router, region, case).await,
+            before,
+            "case {case:?}: expected the detector store the row asks for, before designating"
+        );
+
+        // The designation names no detector, so it is accepted either way.
+        let (status, body) = enable_admin(&router, region, admin).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from the designation, got {status} {body:?}"
+        );
+        assert_reports(&router, region, admin, ENABLED, case).await;
+
+        // And it minted no detector of its own: the store is exactly what it was.
+        let after = detector_ids(&router, region, case).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: the designation must mint no detector, got {after:?}"
+        );
+
+        // A detector's whole lifecycle runs under the designation: creating one
+        // where there was none, and deleting whichever one the Region holds,
+        // leaves the designation reported unchanged. `DeleteDetector` cascades to
+        // what the detector owns, and the designation is not one of those.
+        let detector_id = match before.first() {
+            Some(existing) => existing.clone(),
+            None => create_detector_in(&router, region, case).await,
+        };
+        assert_reports(&router, region, admin, ENABLED, case).await;
+
+        delete_detector_in(&router, region, &detector_id, case).await;
+        assert!(
+            detector_ids(&router, region, case).await.is_empty(),
+            "case {case:?}: expected the detector store to be empty after the delete"
+        );
+        assert_reports(&router, region, admin, ENABLED, case).await;
+
+        // With no detector left, the designation is still the one the Region
+        // holds: re-designating the same account still succeeds and changes
+        // nothing, and another account is still refused.
+        let (status, body) = enable_admin(&router, region, admin).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: re-designating with no detector left: got {status} {body:?}"
+        );
+        let (status, refused) = enable_admin(&router, region, "600000000009").await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: another account with no detector left: expected 400, got {status} {refused:?}"
+        );
+        assert_reports(&router, region, admin, ENABLED, case).await;
+    }
+
+    // Nothing any row did reached a Region of its own, and none of it designated
+    // anything in a Region that designated nothing.
+    assert_reports_none(&router, UNDESIGNATED_REGION, "a Region that designated nothing").await;
 }
 
 #[tokio::test]

@@ -194,7 +194,10 @@ async fn create_user(
 }
 
 /// Read one user back by id, asserting the describe itself succeeded.
-async fn describe_user(emulator: &Emulator, case: &str, id: &str) -> Reply {
+///
+/// `pub(crate)` so the suite about a request that states how a user authenticates twice
+/// reads its users back the same way rather than carrying a second copy of this.
+pub(crate) async fn describe_user(emulator: &Emulator, case: &str, id: &str) -> Reply {
     let described = emulator
         .call("DescribeUsers", &params(&[("UserId", id)]))
         .await;

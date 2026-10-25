@@ -358,22 +358,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "It must be unique and is case sensitive. Up to 36 ASCII characters in the
         // range of 33-126 (inclusive) are allowed."
-        if let Some(token) = input.client_token.as_deref() {
-            let legal = token.len() <= crate::state::MAX_CLIENT_TOKEN_LENGTH
-                && !token.is_empty()
-                && token.bytes().all(|byte| (33..=126).contains(&byte));
-            if !legal {
-                return Err(CreateServiceErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(format!(
-                            "clientToken must be up to {} ASCII characters in the range \
-                             33-126; got {token:?}",
-                            crate::state::MAX_CLIENT_TOKEN_LENGTH
-                        )),
-                    },
-                )
-                .into());
-            }
+        if let Some(message) = input
+            .client_token
+            .as_deref()
+            .and_then(crate::state::client_token_violation)
+        {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         // "The scheduling strategy to use for the service" — `REPLICA` when unspecified.

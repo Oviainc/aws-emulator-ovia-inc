@@ -207,9 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(SelectResourceConfigErrorModeled::InvalidNextTokenException(
                         InvalidNextTokenException {
                             message: Some(
-                                "the specified NextToken is not valid; use the NextToken a \
-                                 previous SelectResourceConfig response returned"
-                                    .to_string(),
+                                crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                             ),
                         },
                     )
@@ -220,13 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An expression that is not a Config query is refused BEFORE anything is read
         // out of the store: a malformed query is a different answer from a query that
-        // matched nothing, and a client has to be able to tell the two apart.
-        let query = crate::state::read_expression(&input.expression).map_err(|detail| {
+        // matched nothing, and a client has to be able to tell the two apart. The
+        // refusal carries its own message ([`crate::state::ExpressionRefusal`]) because
+        // this one error code stands for every rule of the query language.
+        let query = crate::state::read_expression(&input.expression).map_err(|refusal| {
             SelectResourceConfigErrorModeled::InvalidExpressionException(
                 InvalidExpressionException {
-                    message: Some(format!(
-                        "The expression is not a valid Config query: {detail}."
-                    )),
+                    message: Some(refusal.message()),
                 },
             )
         })?;
