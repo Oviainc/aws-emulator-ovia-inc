@@ -19,6 +19,8 @@ mod compositions;
 mod create_ingest_configuration_inputs;
 #[path = "all/delete_ingest_configuration.rs"]
 mod delete_ingest_configuration;
+#[path = "all/disconnect_participant.rs"]
+mod disconnect_participant;
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
 #[path = "all/encoder_configurations.rs"]
