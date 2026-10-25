@@ -29,9 +29,4 @@ pub struct OpenTunnelOutput {
     pub destination_access_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.iotsecuretunneling#LimitExceededException")]
-#[derive(Debug, Clone, Default)]
-pub struct LimitExceededException {
-    pub message: Option<String>,
-}
 

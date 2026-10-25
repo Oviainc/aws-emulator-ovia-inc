@@ -51,6 +51,29 @@ use std::sync::Arc;
 /// restated here because `override_refusal` replaces code and message together).
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
+/// What Control Catalog answers a lookup whose control ARN names no published control
+/// with.
+///
+/// A refusal this service decides for itself — one the framework's constraint walk
+/// cannot report, because nothing about the request's shape is wrong — is worded with
+/// ONE fixed sentence per refusal class: the sentence is a property of the class, not
+/// of the request, so the same text comes back whatever ARN, member or element count
+/// the caller sent. The service's error shapes carry a free-form `Message` (see
+/// `ResourceNotFoundException` / `ValidationException` in the model), which is where
+/// these sentences go.
+pub(crate) const CONTROL_NOT_FOUND_MESSAGE: &str =
+    "AWS Control Tower cannot find a control with the ControlArn value that you provided.";
+
+/// What Control Catalog answers a filter it will not accept with: an entry count the
+/// filter does not take, or an entry naming no resource.
+///
+/// One sentence for the whole class, by the rule on [`CONTROL_NOT_FOUND_MESSAGE`]: the
+/// filter member at fault and the number of entries the caller sent are both absent
+/// from it, so two operations refusing two different filter members answer with
+/// identical text.
+pub(crate) const INVALID_FILTER_MESSAGE: &str =
+    "The provided filter is not valid. Ensure that each part of the filter is valid, and try again.";
+
 /// Render one constraint violation the way Control Catalog states it: the member
 /// path and the violated constraint, and NOTHING of the value that was rejected.
 ///

@@ -2797,6 +2797,30 @@ impl Detector {
             .find(|set| !set.is_deleting())
     }
 
+    /// The ids of the LIVE trusted entity sets this detector holds, in
+    /// `TrustedEntitySetId` order (the id is the key they are stored under, so the
+    /// order is TOTAL — what makes a page token mean the same thing on the call
+    /// that handed it back).
+    ///
+    /// LIVE excludes a set whose delete has already been accepted
+    /// ([`EntitySetRecord::is_deleting`]): such a record is no longer one of the
+    /// detector's entity sets, so `ListTrustedEntitySets` stops naming it, even
+    /// though it is retained ([`DELETED_ENTITY_SETS_RETAINED`]) so
+    /// `GetTrustedEntitySet` can report the status the delete moved it to — the
+    /// same rule [`Self::live_threat_entity_set_ids`] follows for a threat set and
+    /// [`Self::live_ip_set_ids`] for a deleted IPSet.
+    ///
+    /// It reports a LIST and not the single [`Self::live_trusted_entity_set`]
+    /// because the one-at-a-time rule bounds what a create may add, not what the
+    /// listing is: the answer is every live record the map holds.
+    pub fn live_trusted_entity_set_ids(&self) -> Vec<String> {
+        self.trusted_entity_sets
+            .values()
+            .filter(|set| !set.is_deleting())
+            .map(|set| set.id.clone())
+            .collect()
+    }
+
     /// Accept the deletion of the trusted entity set `id` names.
     ///
     /// `None` when this detector holds no such set at all; `Some(true)` when this

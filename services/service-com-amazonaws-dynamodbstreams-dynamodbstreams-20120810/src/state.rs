@@ -149,6 +149,19 @@ pub const EVENT_SOURCE: &str = "aws:dynamodb";
 /// instead of by whatever a client sent.
 pub const MAX_ATTRIBUTE_NESTING_DEPTH: usize = 32;
 
+/// The most record bytes ONE stream retains, past which the oldest record is trimmed
+/// ([`StoredStream::trim_to_retained_budget`]).
+///
+/// The records of a stream grow with the item writes a caller makes to its table —
+/// one record per modification, each holding the images the stream captures — and the
+/// 24 hour retention alone would let a client that rewrites one item in a loop grow
+/// this store without end inside that window. AWS publishes no byte figure for a
+/// stream's retained data, so this ceiling is this emulator's own, chosen to hold the
+/// records of a busy table while keeping what one process can accumulate bounded; a
+/// record past it is TRIMMED, which is the same thing the documented 24 hours does to
+/// records that age out, and is reported the same way.
+pub const MAX_RETAINED_STREAM_BYTES: i64 = 64 * 1024 * 1024;
+
 /// The stream-record format version this emulator emits (`Record$eventVersion`).
 pub const EVENT_VERSION: &str = "1.1";
 
@@ -429,6 +442,12 @@ pub struct StoredStream {
     pub key_schema: Vec<KeySchemaElement>,
     /// Shards in creation order: a child shard always follows its parent.
     pub shards: Vec<StoredShard>,
+    /// The summed `SizeBytes` of every record this stream still retains.
+    ///
+    /// Tracked rather than summed per call, because it is read on EVERY append: it is
+    /// what [`MAX_RETAINED_STREAM_BYTES`] is measured against, so the retention a
+    /// stream enforces costs a comparison instead of a walk over what it holds.
+    pub retained_bytes: i64,
 }
 
 impl StoredStream {
@@ -449,6 +468,36 @@ impl StoredStream {
     #[must_use]
     pub fn shard(&self, shard_id: &str) -> Option<&StoredShard> {
         self.shards.iter().find(|shard| shard.shard_id == shard_id)
+    }
+
+    /// Trim the OLDEST records this stream retains until it is back inside
+    /// [`MAX_RETAINED_STREAM_BYTES`].
+    ///
+    /// The same mechanism the 24 hour retention uses, for the same reason: records
+    /// accumulate with the writes a caller makes to the table, and a client that
+    /// overwrites one item in a loop would otherwise grow this store without end
+    /// inside that window. A trimmed record is counted on its shard, so the shard's
+    /// `TRIM_HORIZON` moves with it and a consumer reading from a position that is
+    /// gone is answered with the modelled `TrimmedDataAccessException` rather than
+    /// with a gap.
+    fn trim_to_retained_budget(&mut self) {
+        while self.retained_bytes > MAX_RETAINED_STREAM_BYTES {
+            let Some(shard) = self
+                .shards
+                .iter_mut()
+                .find(|shard| !shard.records.is_empty())
+            else {
+                // Nothing is retained, so the figure is stale rather than the store
+                // being over budget: there is nothing left to trim.
+                self.retained_bytes = 0;
+                return;
+            };
+            let Some(trimmed) = shard.records.pop_front() else {
+                return;
+            };
+            shard.trimmed += 1;
+            self.retained_bytes = self.retained_bytes.saturating_sub(trimmed.size_bytes);
+        }
     }
 
     /// The shards a CONSUMER can read at `now`.
@@ -591,16 +640,19 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
                 .is_none_or(|due| !older_than(due, now, DISABLED_STREAM_RETENTION))
         });
         for stream in self.streams.values_mut() {
+            let mut reclaimed: i64 = 0;
             for shard in &mut stream.shards {
                 while shard
                     .records
                     .front()
                     .is_some_and(|record| older_than(record.approximate_creation_date_time, now, RECORD_RETENTION))
                 {
-                    shard.records.pop_front();
+                    reclaimed = reclaimed
+                        .saturating_add(shard.records.pop_front().map_or(0, |record| record.size_bytes));
                     shard.trimmed += 1;
                 }
             }
+            stream.retained_bytes = stream.retained_bytes.saturating_sub(reclaimed);
         }
         // An iterator past its lifetime stops standing at a position, but the fact
         // that this service minted it is kept: that is what makes it an EXPIRED
@@ -706,6 +758,7 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
                     aws_region: registration.region.clone(),
                     key_schema: registration.key_schema.clone(),
                     shards: vec![shard],
+                    retained_bytes: 0,
                 },
             );
             return Ok(stream_arn);
@@ -813,6 +866,11 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
             old_image,
             size_bytes,
         });
+        // What this stream retains is budgeted, like every other growth site here: the
+        // records grow with the writes a caller makes to the table, so the oldest give
+        // way once the stream holds more than its ceiling.
+        stream.retained_bytes = stream.retained_bytes.saturating_add(size_bytes);
+        stream.trim_to_retained_budget();
         self.next_sequence_number += 1;
         Ok(sequence_number)
     }

@@ -140,13 +140,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The account-global registry catalog record is written from ONE Region (see
-        // `crate::state::API_REGION`): this is the one Region-scoped ECR Public call, so a
-        // request signed for any other Region is refused with the service-common
-        // `UnsupportedCommandException` before the record is touched. The matching read
-        // (`GetRegistryCatalogData`), and the repository, image, layer, tag and policy
-        // surface, are served from every Region ECR Public publishes an endpoint in and
-        // run no such check.
+        // The account-global registry catalog record is written from the Region this
+        // instance serves as (see `crate::state::ENDPOINT_REGIONS` and
+        // `crate::state::configured_region`): this is the one Region-scoped ECR Public
+        // call, so a request that reaches this instance as a Region it does not serve as
+        // is refused with the service-common `UnsupportedCommandException` before the
+        // record is touched. The matching read (`GetRegistryCatalogData`), and the
+        // repository, image, layer, tag and policy surface, are served from every Region
+        // ECR Public publishes an endpoint in and run no such check.
         if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
             return Err(
                 PutRegistryCatalogDataErrorModeled::UnsupportedCommandException(unsupported)

@@ -41,6 +41,8 @@ mod guardrails;
 mod imported_models;
 #[path = "all/inference_profiles.rs"]
 mod inference_profiles;
+#[path = "all/marketplace_endpoint_deregistration.rs"]
+mod marketplace_endpoint_deregistration;
 #[path = "all/marketplace_model_endpoints.rs"]
 mod marketplace_model_endpoints;
 #[path = "all/model_customization_jobs.rs"]

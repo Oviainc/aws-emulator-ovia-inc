@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetReports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetReports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetReports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the report runs [`crate::state`] holds for the ARNs the request named, and
+//! refuses a value that is not a report ARN at all: this is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +132,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetReports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetReportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetReports"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this operation models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "BatchGetReports (this engine carries no CodeBuild state)",
+            ));
+        };
+        let _ = ctx;
+
+        // Every member of `reportArns` is typed `NonEmptyString`, so any non-empty text
+        // reaches this handler. A value that is not a report ARN of this service
+        // identifies no report at all — there is no account, region or store in which it
+        // could name one — so the whole call is refused with the operation's own input
+        // error rather than answered as a report that merely is not held, which is what
+        // `reportsNotFound` means. One malformed value refuses the request: the answer
+        // is positional, so a caller could not be told which half a value it cannot
+        // even address belongs in.
+        if input
+            .report_arns
+            .iter()
+            .any(|arn| crate::state::report_ids_from_arn(arn).is_none())
+        {
+            return Err(BatchGetReportsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INVALID_REPORT_ARN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A read, and only a read: it reports the report runs the store holds, in the
+        // order the request named them, and splits the ARNs it holds none for into
+        // `reportsNotFound`. A report is minted by a build whose buildspec declares one,
+        // never by this call, so nothing here writes.
+        let guard = state.lock();
+        let mut reports = Vec::new();
+        let mut not_found = Vec::new();
+        for arn in &input.report_arns {
+            match guard.report_by_arn(arn) {
+                Some(report) => reports.push(report.clone()),
+                None => not_found.push(arn.clone()),
+            }
+        }
+
+        // Both halves of the partition are always serialized, `[]` when a half is empty:
+        // the `@length(min: 1)` on `Reports` / `ReportArns` bounds what a request may
+        // carry, not whether the answer states its result, and a caller diffing the ARNs
+        // it asked for against `reportsNotFound` must read a list either way.
+        Ok(BatchGetReportsOutput {
+            reports: Some(reports),
+            reports_not_found: Some(not_found),
+        })
     }
 }

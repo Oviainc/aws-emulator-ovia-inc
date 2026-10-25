@@ -16,7 +16,7 @@
 //! `BatchDeleteBuilds` removes a build, and the reporting operations
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
 //! `BatchGetFleets`, `BatchGetSandboxes`, `BatchGetCommandExecutions`,
-//! `BatchGetReportGroups`, `ListProjects`, `ListSharedProjects`,
+//! `BatchGetReportGroups`, `BatchGetReports`, `ListProjects`, `ListSharedProjects`,
 //! `ListBuildsForProject`, `ListSandboxes`, `ListSandboxesForProject`,
 //! `ListSourceCredentials`) only read them.
 //!
@@ -33,8 +33,8 @@ use std::collections::BTreeMap;
 use crate::ops::types::{
     Build, BuildArtifacts, BuildBatch, BuildBatchPhase, BuildPhase, CommandExecution,
     EnvironmentVariable, Fleet, FleetStatus, PhaseContext, Project, ProjectArtifacts, ProjectCache,
-    ProjectEnvironment, ProjectSource, ReportGroup, Sandbox, SandboxSession, SandboxSessionPhase,
-    SourceCredentialsInfo,
+    ProjectEnvironment, ProjectSource, Report, ReportGroup, Sandbox, SandboxSession,
+    SandboxSessionPhase, SourceCredentialsInfo,
 };
 
 /// The ARN service segment for this service, as `emulator_arn`'s first argument
@@ -189,6 +189,15 @@ pub const MAX_REPORT_GROUPS: usize = 5_000;
 /// immediately, so it is `ACTIVE` from the call that made it: there is no
 /// non-terminal status for the clock to move it out of.
 pub const REPORT_GROUP_ACTIVE_STATUS: &str = "ACTIVE";
+
+/// What CodeBuild states as the reason a value handed to a report-addressing
+/// operation is not a report ARN, carried by the modelled `InvalidInputException`.
+///
+/// The sentence is wholly fixed: it quotes neither the rejected value, the member that
+/// carried it nor the ARN form that would be accepted, so every malformed value is
+/// refused with the same text and a client can key on it. Recorded behaviour — the
+/// model states no message for the error.
+pub const INVALID_REPORT_ARN_MESSAGE: &str = "Invalid report ARN";
 
 /// Build records this emulator retains, across every project.
 ///
@@ -480,6 +489,20 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     /// Report groups, keyed by report group name (names are unique per account,
     /// the same way project names are).
     pub report_groups: BTreeMap<String, StoredReportGroup>,
+    /// Test and code-coverage reports, keyed by the report's own ARN.
+    ///
+    /// Keyed by ARN because an ARN is the only way CodeBuild addresses a report —
+    /// `BatchGetReports$reportArns` and `DeleteReport$arn` take nothing else — and that
+    /// ARN carries both the report group the report belongs to and the report's own id,
+    /// so two reports of one group cannot collide. See [`report_arn`] for the form and
+    /// [`report_ids_from_arn`] for its inverse.
+    ///
+    /// A report is produced by a build whose buildspec declares one, so no operation
+    /// mints a report directly: nothing this emulator runs executes a buildspec, so an
+    /// account holds the reports written here and the report readers answer from them.
+    /// Bounded by the report groups and builds a report belongs to, which carry the
+    /// ceilings ([`MAX_REPORT_GROUPS`], [`MAX_BUILDS`]), so it needs none of its own.
+    pub reports: BTreeMap<String, Report>,
     /// Resource-based policies, keyed by the ARN of the project or report group
     /// each one is attached to.
     ///
@@ -1081,6 +1104,16 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         self.report_groups.remove(&name);
         self.resource_policies.remove(arn);
         true
+    }
+
+    /// The report `arn` names, if this account holds it.
+    ///
+    /// Reports are keyed by their own ARN, so this is a direct lookup rather than a
+    /// lookup plus a stored-ARN check the way [`Self::report_group_by_arn`] needs: the
+    /// key IS the ARN, so an ARN for another partition, region, account or resource type
+    /// is simply a key nothing is stored under and resolves to no local record.
+    pub fn report_by_arn(&self, arn: &str) -> Option<&Report> {
+        self.reports.get(arn)
     }
 
     /// Read a fleet, first materialising the transition the clock already owes
@@ -1980,6 +2013,48 @@ pub fn build_batch_arn(region: &str, id: &str) -> String {
 /// `arn:aws:codebuild:<region>:<account>:report-group/<name>`.
 pub fn report_group_arn(region: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("report-group/{name}"))
+}
+
+/// `arn:aws:codebuild:<region>:<account>:report/<reportGroupName>:<reportId>` — the ARN
+/// of one report run.
+///
+/// The resource segment is formed the way a build's is (`build/<project>:<uuid>`): the
+/// report group the report belongs to, then the report's own id, which is what makes a
+/// report ARN identify a report of exactly one group.
+pub fn report_arn(region: &str, report_group_name: &str, report_id: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("report/{report_group_name}:{report_id}"),
+    )
+}
+
+/// The report group name and the report id an
+/// `arn:<partition>:codebuild:<region>:<account>:report/<name>:<id>` ARN identifies, or
+/// `None` when the value is not a CodeBuild report ARN.
+///
+/// The inverse of [`report_arn`]'s resource segment, and the counterpart of
+/// [`report_group_name_from_arn`] for the other resource a report operation addresses by
+/// ARN alone. It answers the SYNTAX question only — whether the value is a report ARN of
+/// this service at all — so a caller that resolves a record still keeps it only if the
+/// stored record is the one that ARN is the key of.
+///
+/// The id is the LAST colon-separated part of the resource: `ReportGroupName` constrains
+/// only its length, so a group name may itself carry a colon, while a report id is one
+/// identifier and may not.
+pub fn report_ids_from_arn(arn: &str) -> Option<(&str, &str)> {
+    // Walked field by field rather than collected, so resolving an ARN allocates
+    // nothing.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" || fields.next()?.is_empty() || fields.next()? != ARN_NAMESPACE {
+        return None;
+    }
+    // The region and the account are not checked here, for the reason
+    // [`report_group_name_from_arn`] does not check them.
+    fields.next()?;
+    fields.next()?;
+    let (name, id) = fields.next()?.strip_prefix("report/")?.rsplit_once(':')?;
+    (!name.is_empty() && !id.is_empty()).then_some((name, id))
 }
 
 /// Longest request-derived value one audit field carries.
