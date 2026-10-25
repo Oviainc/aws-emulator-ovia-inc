@@ -41,6 +41,8 @@ mod distribution_tags;
 mod distribution_tenant_lifecycle;
 #[path = "all/distribution_web_acl_association.rs"]
 mod distribution_web_acl_association;
+#[path = "all/distributions_by_cache_policy_id.rs"]
+mod distributions_by_cache_policy_id;
 #[path = "all/distributions_by_connection_mode.rs"]
 mod distributions_by_connection_mode;
 #[path = "all/error_envelope.rs"]
