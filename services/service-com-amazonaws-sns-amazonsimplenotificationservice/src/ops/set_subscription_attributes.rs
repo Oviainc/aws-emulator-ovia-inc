@@ -227,16 +227,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // An attribute SNS documents for certain delivery protocols alone is refused on
-        // a subscription of any other: this one's protocol is what decides it.
+        // a subscription of any other: this one's protocol is what decides it. The
+        // refusal states SNS's own sentence whole, so it is not framed here.
         if let Some(value) = input.attribute_value.as_deref() {
-            if let Some(reason) = state::subscription_attribute_protocol_reason(
+            if let Some(message) = state::subscription_attribute_protocol_refusal(
                 &input.attribute_name,
                 value,
                 &subscription.protocol,
             ) {
-                return Err(invalid_parameter(format!(
-                    "Invalid parameter: Attributes Reason: {reason}"
-                )));
+                return Err(invalid_parameter(message));
             }
         }
 

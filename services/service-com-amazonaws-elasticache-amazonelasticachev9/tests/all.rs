@@ -141,6 +141,11 @@ mod modify_cache_parameter_group;
 #[path = "all/modify_user.rs"]
 mod modify_user;
 
+// Appended for the same reason: the `ResetCacheParameterGroup` suite, which
+// drives the writer through the `ModifyCacheParameterGroup` suite's helpers.
+#[path = "all/reset_cache_parameter_group.rs"]
+mod reset_cache_parameter_group;
+
 // Appended for the same reason: the `DeleteUser` suite about the user the service itself
 // owns.
 #[path = "all/delete_user_built_in_user.rs"]

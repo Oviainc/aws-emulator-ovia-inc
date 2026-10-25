@@ -25,8 +25,9 @@
 //! * every bound the service publishes for a parameter is accepted and one past it is
 //!   refused, over the whole published catalog rather than a chosen row;
 //! * a read changes nothing a later caller sees: two listings of the same store agree;
-//! * a listing pages over the whole set in name order for any `MaxResults`, and a page
-//!   size, token or group name that names nothing is the modelled error.
+//! * a listing pages over the whole set in name order for any `MaxResults` the service's
+//!   page-size window admits, and a page size, token or group name that names nothing is
+//!   the modelled error.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -733,9 +734,9 @@ async fn every_published_bound_is_accepted_and_one_past_it_is_refused() {
     }
 }
 
-/// The listing pages over the whole set in name order for ANY page size, a read changes
-/// nothing a later caller sees, and a page size or token that names no page is the
-/// modelled invalid-value error.
+/// The listing pages over the whole set in name order for every page size its window
+/// serves, a read changes nothing a later caller sees, and a page size or token that
+/// names no page is the modelled invalid-value error.
 #[tokio::test]
 async fn the_parameter_listing_pages_in_name_order() {
     let router = router();

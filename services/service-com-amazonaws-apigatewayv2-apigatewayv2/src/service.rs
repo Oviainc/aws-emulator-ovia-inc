@@ -40,22 +40,36 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! ## This service's other edited seam: the `execute-api` WebSocket data plane
+//! ## This service's other edited seams: the two `execute-api` data planes
 //!
 //! Beside its modelled `/v2/…` control plane, this service is addressed on the invoke
-//! endpoint of every WebSocket api it mints — `wss://{api-id}.execute-api.{region}.
-//! amazonaws.com/{stage}`, the URI `Api$ApiEndpoint` reports — where a client's FIRST
-//! request is the RFC 6455 opening handshake and not a modelled operation. [`websocket`]
-//! owns that half: which handshakes this service claims ([`websocket::claims_parts`], read
-//! by [`Service::can_handle`]) and what each is answered with
-//! ([`websocket::serve`], reached from [`Service::override_routing_error`]).
+//! endpoint of every api it mints — `{api-id}.execute-api.{region}.amazonaws.com`, the URI
+//! `Api$ApiEndpoint` reports — where a client's request is no modelled operation at all.
+//! Two modules own that half, one per `ProtocolType`, over the readings they share
+//! ([`data_plane`]):
+//!
+//! - [`websocket`] — the RFC 6455 opening handshake a WEBSOCKET api's stage is reached
+//!   with: which handshakes this service claims ([`websocket::claims_parts`]) and what each
+//!   is answered with ([`websocket::serve`], reached from [`Service::override_routing_error`]);
+//! - [`invoke`] — an ordinary HTTP request to a route of a deployed HTTP api stage: the
+//!   claim ([`invoke::claims_parts`]), and the serving ([`invoke::serve`]) from BOTH
+//!   serving seams — [`Service::override_routing_error`] for the invoke that presents no
+//!   credential, which the router reaches BEFORE authentication (so a route whose
+//!   `AuthorizationType` is `NONE` or `JWT` is reachable by a client holding no AWS
+//!   credential), and [`Service::override_operation`] for the invoke that DOES present a
+//!   SigV4 credential, through [`CredentialedDataPlane`], so the emulator's own signature
+//!   verification runs in front of an `AWS_IAM` route.
 
+mod data_plane;
+mod invoke;
+mod jwt;
 mod websocket;
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::{Violation, ViolationKind};
+use smithy_server_runtime::{
+    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
+};
 use std::sync::Arc;
 
 /// Whether this service serves the request these `parts` came from.
@@ -130,10 +144,15 @@ fn stated_violation(violation: &Violation) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The one shared engine, held here because the WebSocket data plane ([`websocket`])
-    /// is decided and served from seams the generated entry does not reach: a claim and a
-    /// routing-error answer, both of which read this service's own records.
+    /// The one shared engine, held here because the two data planes ([`websocket`],
+    /// [`invoke`]) are decided and served from seams the generated entry does not reach: a
+    /// claim, a routing-error answer and one operation of this file's own, all of which
+    /// read this service's own records.
     engine: Arc<Eng>,
+    /// The data-plane handler the router names as an OPERATION for an invoke that presents
+    /// a SigV4 credential, so the emulator authenticates it before anything is served. See
+    /// [`CredentialedDataPlane`].
+    credentialed_data_plane: CredentialedDataPlane<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -143,8 +162,56 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            credentialed_data_plane: CredentialedDataPlane {
+                engine: Arc::clone(&engine),
+            },
             engine,
         }
+    }
+}
+
+/// The auth schemes a credentialed `execute-api` invoke is verified under.
+///
+/// SigV4 is the only scheme this service's model declares (`aws.auth#sigv4` name
+/// `apigateway`), and it is the one a route whose `AuthorizationType` is `AWS_IAM` is
+/// reached with, so an invoke arrives either without an AWS credential — which the
+/// routing-error seam answers without the router authenticating anything — or with a SigV4
+/// credential, which this names so the router's own authenticator verifies it.
+const DATA_PLANE_AUTH_SCHEMES: &[&str] = &[::emulator_server::aws_credentials::SIGV4_SCHEME];
+
+/// The HTTP data plane for a request that PRESENTS a SigV4 credential, as an
+/// [`ErasedOperation`] so the router authenticates it.
+///
+/// It holds the SAME shared engine the generated entry threads into every operation, and
+/// serves the request through exactly the function the routing-error seam uses
+/// ([`invoke::serve`]), so the credentialed and the credential-less path cannot diverge in
+/// what they serve — only in whether a signature was verified on the way in.
+struct CredentialedDataPlane<Eng> {
+    engine: Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for CredentialedDataPlane<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        _ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            if invoke::claims_request(&*self.engine, req) {
+                return invoke::serve(&*self.engine, req);
+            }
+            // Unreachable: `override_operation` names this only for a request this data
+            // plane claims.
+            svc.definition().routing_error_response(req)
+        })
+    }
+
+    /// This is NOT a modelled operation, so there is no modelled operation for the router
+    /// to read schemes off: without this the router would find no scheme for an invoke and
+    /// could not verify the credential it carries.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        Some(DATA_PLANE_AUTH_SCHEMES)
     }
 }
 
@@ -177,26 +244,39 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if can_handle_parts(parts) {
             return true;
         }
-        // And the WEBSOCKET DATA plane: an RFC 6455 opening handshake addressed to a stage
-        // of a WebSocket api THIS service holds. Such a request carries no credential
-        // scope and its path is no `/v2/…` route, so the front door could resolve no
-        // target service for it and answered `404 UnknownService` — for the endpoint this
-        // service itself reported in `ApiEndpoint`. The claim is narrowed to an api this
-        // service HOLDS, read from the one shared store, so exactly one service claims the
-        // request; see [`websocket`] for the whole rule and for what each handshake is
-        // answered with.
-        websocket::claims_parts(&*self.engine, parts)
+        // And the two DATA planes: a request addressed to a stage of an api THIS service
+        // holds. Such a request carries no credential scope naming this service (or
+        // carries one while naming no `/v2/…` route), and its path is no modelled
+        // operation's, so the front door could resolve no target service for it and
+        // answered `404 UnknownService` — for the endpoint this service itself reported in
+        // `ApiEndpoint`. Each claim is narrowed to an api this service HOLDS, read from the
+        // one shared store, and to that api's own `ProtocolType`, so exactly one service
+        // and exactly one of these modules claims the request; see [`websocket`] and
+        // [`invoke`] for the whole rule and for what each request is answered with.
+        websocket::claims_parts(&*self.engine, parts) || invoke::claims_parts(&*self.engine, parts)
     }
 
     fn override_operation(
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // An invoke of an HTTP api's stage that PRESENTS a SigV4 credential is named as an
+        // operation, so the router verifies that credential's signature before anything is
+        // served — the router authenticates only what it names an operation for. An invoke
+        // carrying no credential is left unnamed on purpose: it is answered by
+        // `override_routing_error` below, which the router reaches before authentication,
+        // so a route whose `AuthorizationType` is `NONE` — or `JWT`, whose caller presents
+        // a bearer token and no AWS credential — is reachable, as it is on AWS.
+        //
+        // The predicate is [`invoke::carries_sigv4_credential`], the SAME one that admits
+        // an `AWS_IAM` route: a credential this names is verified by the router before the
+        // route is served, so the two cannot disagree about what counts as a credential (a
+        // presigned URL carries its scope in the query string, not in a header).
+        if invoke::claims_request(&*self.engine, req) && invoke::carries_sigv4_credential(req) {
+            return Some(&self.credentialed_data_plane);
+        }
+        // Otherwise the generated routing table resolves the request, as it does for every
+        // modelled operation of this service.
         None
     }
 
@@ -247,8 +327,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // rather than named as an operation because a handshake carries no credential
         // whose verification could change the answer — the refusals below are computed
         // from the api's and the stage's stored state alone.
+        //
+        // So is an invoke of an HTTP api's stage that carries no SigV4 credential, which is
+        // every invoke of a `NONE` or `JWT` route: reaching it BEFORE authentication is
+        // what lets a client holding only a bearer token be answered at all.
         if websocket::claims_request(&*self.engine, req) {
             return Some(websocket::serve(&*self.engine, req));
+        }
+        if invoke::claims_request(&*self.engine, req) {
+            return Some(invoke::serve(&*self.engine, req));
         }
         None
     }

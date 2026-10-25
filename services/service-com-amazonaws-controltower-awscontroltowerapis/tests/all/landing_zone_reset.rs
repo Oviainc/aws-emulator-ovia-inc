@@ -11,7 +11,7 @@
 //! The rules under test, each asserted over a TABLE of inputs rather than one case:
 //!
 //! * a reset starts an asynchronous `RESET` operation against the landing zone the
-//!   request names, in either identifier form, and returns a fresh `operationIdentifier`
+//!   request names by its ARN, and returns a fresh `operationIdentifier`
 //!   that resolves through `GetLandingZoneOperation` — `IN_PROGRESS` with no `endTime`
 //!   before the span, `SUCCEEDED` with a stable `endTime` after;
 //! * the reset re-deploys the configuration the landing zone already carries and changes
@@ -19,7 +19,7 @@
 //!   `latestAvailableVersion` read the same before, during and after the operation, while
 //!   `status` is `PROCESSING` until the clock makes the operation due and `ACTIVE` after,
 //!   with the landing zone `IN_SYNC` with its manifest;
-//! * an identifier no landing zone matches is `ResourceNotFoundException` (404), and
+//! * a landing zone ARN no landing zone matches is `ResourceNotFoundException` (404), and
 //!   nothing is persisted;
 //! * a reset against a landing zone with an operation already in flight is
 //!   `ConflictException` (409), and nothing is persisted.
@@ -118,9 +118,6 @@ struct ResetCase {
     /// (including the empty list, which `Manifest`'s `governedRegions` permits).
     governed_regions: &'static [&'static str],
     remediation_types: Option<&'static [&'static str]>,
-    /// Address the landing zone by the bare resource id its ARN ends in rather than by
-    /// the ARN itself; both forms resolve.
-    by_bare_id: bool,
     /// How many resets this row performs in a row, each waiting for its own operation.
     resets: usize,
 }
@@ -130,8 +127,7 @@ struct ResetCase {
 /// boundary, and the catalog's newest — from
 /// `state::CATALOG_LANDING_ZONE_VERSIONS`, the 2.0..3.3 line), the size and content of
 /// the manifest being re-deployed (one region, several, none), whether
-/// `remediationTypes` is deployed, which of the two identifier forms addresses the
-/// landing zone, and the number of successive resets.
+/// `remediationTypes` is deployed, and the number of successive resets.
 fn reset_cases() -> Vec<ResetCase> {
     vec![
         ResetCase {
@@ -139,15 +135,13 @@ fn reset_cases() -> Vec<ResetCase> {
             version: "3.3",
             governed_regions: &["us-west-2"],
             remediation_types: None,
-            by_bare_id: false,
             resets: 1,
         },
         ResetCase {
-            case: "the catalog's oldest version, by bare resource id",
+            case: "the catalog's oldest version",
             version: "2.0",
             governed_regions: &["eu-west-1"],
             remediation_types: None,
-            by_bare_id: true,
             resets: 1,
         },
         ResetCase {
@@ -155,7 +149,6 @@ fn reset_cases() -> Vec<ResetCase> {
             version: "2.4",
             governed_regions: &["us-east-1", "us-east-2", "ap-south-1"],
             remediation_types: None,
-            by_bare_id: false,
             resets: 2,
         },
         ResetCase {
@@ -163,7 +156,6 @@ fn reset_cases() -> Vec<ResetCase> {
             version: "3.0",
             governed_regions: &["ca-central-1", "eu-central-1"],
             remediation_types: Some(&["INHERITANCE_DRIFT"]),
-            by_bare_id: true,
             resets: 1,
         },
         ResetCase {
@@ -171,7 +163,6 @@ fn reset_cases() -> Vec<ResetCase> {
             version: "3.1",
             governed_regions: &[],
             remediation_types: None,
-            by_bare_id: false,
             resets: 3,
         },
     ]
@@ -194,14 +185,7 @@ async fn a_reset_redeploys_the_deployed_configuration_without_changing_it() {
             row.remediation_types,
         )
         .await;
-        let identifier = if row.by_bare_id {
-            arn.rsplit('/')
-                .next()
-                .expect("an ARN ends in its resource segment")
-                .to_string()
-        } else {
-            arn.clone()
-        };
+        let identifier = arn.clone();
 
         // The configuration as deployed, before any reset: every later read is compared
         // against this, so the assertion is "unchanged" rather than a copy of the row.
@@ -340,14 +324,17 @@ async fn a_reset_redeploys_the_deployed_configuration_without_changing_it() {
     }
 }
 
-/// RULE: a reset whose `landingZoneIdentifier` matches no landing zone is
-/// `ResourceNotFoundException` (404) and persists nothing.
+/// RULE: a reset whose `landingZoneIdentifier` is a landing zone ARN that matches no
+/// landing zone is `ResourceNotFoundException` (404) and persists nothing.
+///
+/// A value that is not a landing zone ARN at all is a malformed input rather than a
+/// missing resource; that rule is asserted in `landing_zone_identifier`.
 #[tokio::test]
 async fn a_reset_of_an_unknown_landing_zone_is_not_found() {
-    // Rows span the forms a client can hold: an identifier of the right shape that was
-    // never minted, a bare resource id, a plain name, an empty-ish free-form value, and
-    // the ARN of a landing zone this account did hold and deleted (the row whose literal
-    // is `None`).
+    // Rows span the landing zone ARNs a client can hold: one of the right shape that was
+    // never minted, one naming another account, one naming another region, one whose
+    // resource id is a single character, and the ARN of a landing zone this account did
+    // hold and deleted (the row whose literal is `None`).
     let cases: Vec<(&str, Option<&str>)> = vec![
         (
             "an ARN no call returned",
@@ -357,11 +344,17 @@ async fn a_reset_of_an_unknown_landing_zone_is_not_found() {
             ),
         ),
         (
-            "a bare resource id no call returned",
-            Some("11111111-2222-3333-4444-555555555555"),
+            "an ARN naming another account",
+            Some("arn:aws:controltower:us-west-2:000000000000:landingzone/absent"),
         ),
-        ("a plain name", Some("my-landing-zone")),
-        ("a single character", Some("x")),
+        (
+            "an ARN naming another region",
+            Some("arn:aws:controltower:eu-west-1:123456789012:landingzone/absent"),
+        ),
+        (
+            "an ARN whose resource id is a single character",
+            Some("arn:aws:controltower:us-west-2:123456789012:landingzone/x"),
+        ),
         ("the ARN of a landing zone that was deleted", None),
     ];
 

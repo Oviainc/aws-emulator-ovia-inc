@@ -8,9 +8,9 @@
 //! * a lookup by `ScalingPlanName` + `ScalingPlanVersion` that finds no stored plan is
 //!   refused with the request-derived sentence
 //!   `No scaling plan found for scaling plan name: <name>, version: <version>`, on every
-//!   operation that identifies ONE plan by those two members — in the not-found shape the
-//!   operation models where it models one, and in its generic `ValidationException` where
-//!   it does not;
+//!   MUTATING operation that identifies ONE plan by those two members, in the not-found
+//!   shape it models — while the reporting operations, which model no not-found error,
+//!   report the empty set instead and never carry that sentence;
 //! * a `DescribeScalingPlans` request that combines `ApplicationSources` with the
 //!   name-based selector (`ScalingPlanNames` and/or `ScalingPlanVersion`) is refused
 //!   with the fixed sentence
@@ -26,25 +26,24 @@ use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice
 };
 
 use crate::scaling_plan_lifecycle::{
-    error_code, error_message, simple_instructions, stack_source, Emulator,
+    error_code, error_message, now_secs, simple_instructions, stack_source, Emulator,
 };
 
 /// The operations that REFUSE a lookup by `ScalingPlanName` + `ScalingPlanVersion` that
 /// finds no plan, with the error shape each models that refusal in.
 ///
 /// Source: `smithy_query(query="operation",
-/// operation="DeleteScalingPlan,UpdateScalingPlan,DescribeScalingPlanResources")` — the
-/// two write paths bind `ObjectNotFoundException` (client, httpError 400), while
-/// `DescribeScalingPlanResources` binds no not-found shape at all, so its refusal travels
-/// in its generic client error `ValidationException` (client, httpError 400). Both halves
-/// of the lookup — the name and the version — are probed by the rows below.
-const LOOKUP_OPERATIONS: [(&str, &str); 3] = [
+/// operation="DeleteScalingPlan,UpdateScalingPlan")` — both write paths bind
+/// `ObjectNotFoundException` (client, httpError 400). Both halves of the lookup — the
+/// name and the version — are probed by the rows below. The reporting operations are
+/// deliberately absent: they bind no not-found shape, so a miss is an empty answer there
+/// (pinned by `crate::absent_plan_reads`), not a refusal to word.
+const LOOKUP_OPERATIONS: [(&str, &str); 2] = [
     ("DeleteScalingPlan", "ObjectNotFoundException"),
     ("UpdateScalingPlan", "ObjectNotFoundException"),
-    ("DescribeScalingPlanResources", "ValidationException"),
 ];
 
-/// The fourth operation that looks one plan up by name and version. It is driven apart
+/// The reporting operation that looks one plan up by name and version. It is driven apart
 /// from [`LOOKUP_OPERATIONS`] because its request carries five more required members, and
 /// because it checks `ScalingPlanVersion` against the single documented valid value
 /// BEFORE any lookup — so only rows at that version reach its lookup.
@@ -68,10 +67,7 @@ fn expected_not_found(name: &str, version: i64) -> String {
 /// The window is a valid one (an hour starting now, well inside the documented limits
 /// `crate::forecast_data` pins), so nothing but the plan lookup can refuse it.
 fn forecast_request(name: &str, version: i64) -> Value {
-    let start = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("a host clock at or after the epoch")
-        .as_secs() as i64;
+    let start = now_secs();
     json!({
         "ScalingPlanName": name,
         "ScalingPlanVersion": version,
@@ -163,26 +159,28 @@ async fn a_lookup_that_finds_no_plan_names_the_requested_name_and_version() {
             );
         }
 
-        // The same miss on the operation whose request also names a scalable resource.
+        // The same miss on the two reporting paths is not a refusal at all, so the
+        // sentence above must not travel in their answers.
         if version != ONLY_VERSION {
             continue;
         }
-        let (status, body) = emulator
-            .call(FORECAST_OPERATION, &forecast_request(&name, version))
-            .await;
-        assert_eq!(
-            (status, error_code(&body)),
-            (400, "ValidationException"),
-            "case {FORECAST_OPERATION}/{label}: expected a 400 ValidationException, \
-             got {status} with {body}"
-        );
-        let actual = error_message(&body);
-        assert_eq!(
-            actual,
-            expected_not_found(&name, version),
-            "case {FORECAST_OPERATION}/{label}: expected {:?}, got {actual:?}",
-            expected_not_found(&name, version)
-        );
+        for (operation, request) in [
+            (
+                "DescribeScalingPlanResources",
+                json!({ "ScalingPlanName": name, "ScalingPlanVersion": version }),
+            ),
+            (FORECAST_OPERATION, forecast_request(&name, version)),
+        ] {
+            let (status, body) = emulator.call(operation, &request).await;
+            assert_eq!(
+                status, 200,
+                "case {operation}/{label}: expected HTTP 200, got {status} with {body}"
+            );
+            assert!(
+                !body.to_string().contains("No scaling plan found"),
+                "case {operation}/{label}: expected no not-found sentence, got {body}"
+            );
+        }
     }
 
     // The control: the plan that IS stored, at the version it has, is not refused on any

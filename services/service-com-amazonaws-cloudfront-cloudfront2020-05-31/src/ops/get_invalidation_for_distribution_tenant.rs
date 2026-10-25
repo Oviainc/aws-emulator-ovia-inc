@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tenant) = store.distribution_tenant(&input.distribution_tenant_id) else {
             return Err(
                 GetInvalidationForDistributionTenantErrorModeled::EntityNotFound(
-                    crate::state::distribution_tenant_not_found(&input.distribution_tenant_id),
+                    crate::state::distribution_tenant_not_found(),
                 )
                 .into(),
             );

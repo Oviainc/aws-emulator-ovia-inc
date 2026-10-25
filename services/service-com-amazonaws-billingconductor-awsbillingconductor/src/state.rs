@@ -187,6 +187,53 @@ pub fn billing_period_range_covers(
     after_start && before_end
 }
 
+/// The billing period a comparable month count ([`billing_period_key`]) names, in the
+/// canonical `YYYY-MM` spelling [`billing_period_at`] renders.
+///
+/// The inverse of [`billing_period_key`], whose count is `year * 12 + month` with the
+/// month in `1..=12`, so the year is the count one month back divided by twelve and the
+/// month is what is left of it.
+fn billing_period_of_key(key: i64) -> String {
+    let year = (key - 1).div_euclid(12);
+    let month = key - year * 12;
+    format!("{year:04}-{month:02}")
+}
+
+/// The billing periods of the half-open range `[inclusive_start, exclusive_end)`, in
+/// ascending order and each in the canonical `YYYY-MM` spelling — the periods a report
+/// over that range covers.
+///
+/// The start is in the range and the end is not, as the member names of a
+/// `BillingPeriodRange` say. The periods are ENUMERATED from the range rather than read
+/// off a stored value, so their spelling is canonical however the request spelled the
+/// bounds, and the list is cut at [`MAX_BILLING_PERIODS_PER_RANGE`] so a caller cannot
+/// ask one read to walk an unbounded number of months. A bound that is not a billing
+/// period, or a range that covers none, enumerates nothing.
+pub fn billing_periods_in_range(inclusive_start: &str, exclusive_end: &str) -> Vec<String> {
+    let (Some(start), Some(end)) = (
+        billing_period_key(inclusive_start),
+        billing_period_key(exclusive_end),
+    ) else {
+        return Vec::new();
+    };
+    (start..end)
+        .take(MAX_BILLING_PERIODS_PER_RANGE)
+        .map(billing_period_of_key)
+        .collect()
+}
+
+/// How many billing periods one `BillingPeriodRange` may cover: "You can specify up to
+/// 12 months" (`GetBillingGroupCostReportInput.BillingPeriodRange`).
+pub const MAX_BILLING_PERIODS_PER_RANGE: usize = 12;
+
+/// How many billing periods the half-open range `[inclusive_start, exclusive_end)`
+/// covers, or `None` when either bound is not a billing period.
+pub fn billing_period_range_length(inclusive_start: &str, exclusive_end: &str) -> Option<i64> {
+    let start = billing_period_key(inclusive_start)?;
+    let end = billing_period_key(exclusive_end)?;
+    Some(end - start)
+}
+
 /// Does the half-open bound `start` come strictly before `end`? An absent `start` is
 /// the unbounded past and an absent `end` the unbounded future, so either one absent
 /// orders. Both bounds are the month counts [`billing_period_key`] returns.
@@ -275,22 +322,61 @@ impl BillingPeriodSpan {
     }
 }
 
-/// The `CurrencyCode` a custom line item's charge value is denominated in, DERIVED
-/// from the PARTITION of its ARN.
+/// The `CurrencyCode` a resource's charges are denominated in, DERIVED from the
+/// PARTITION of its ARN.
 ///
 /// `CurrencyCode` has exactly two values
 /// ([`crate::ops::types::CURRENCY_CODE_VALUES`]: `CNY`, `USD`) and the modelled charge
 /// value is documented "in USD" (`ListCustomLineItemFlatChargeDetails.ChargeValue`),
-/// while the only other partition the `CustomLineItemArn` pattern admits is China
+/// while the only other partition this service's ARN patterns admit is China
 /// (`arn:aws-cn`), which bills in CNY. So the partition the resource lives in decides,
-/// and nothing stores a currency beside the item.
-pub fn custom_line_item_currency_code(arn: &str) -> &'static str {
+/// and nothing stores a currency beside the resource.
+pub fn partition_currency_code(arn: &str) -> &'static str {
     if arn.starts_with("arn:aws-cn:") {
         "CNY"
     } else {
         "USD"
     }
 }
+
+/// The `CurrencyCode` a custom line item's charge value is denominated in — the
+/// currency of the partition it lives in, see [`partition_currency_code`].
+pub fn custom_line_item_currency_code(arn: &str) -> &'static str {
+    partition_currency_code(arn)
+}
+
+/// The product a custom line item's charges are presented under in the bill.
+///
+/// `PresentationDetails.Service` is "the service under which the custom line item
+/// charges will be presented", so an item that carries one is presented under it. An
+/// item that carries none is presented under the service that raises the charge, which
+/// is this one — the name its own model gives it
+/// (`smithy_query(query="service_info")`: `AWSBillingConductor`) — so the product of a
+/// charge is always known and never invented per request.
+pub fn custom_line_item_product_name(item: &CustomLineItemRecord) -> &str {
+    item.presentation_service
+        .as_deref()
+        .unwrap_or(BILLING_CONDUCTOR_PRODUCT_NAME)
+}
+
+/// The product name of this service's own charges — see
+/// [`custom_line_item_product_name`].
+pub const BILLING_CONDUCTOR_PRODUCT_NAME: &str = "AWSBillingConductor";
+
+/// The sign a `CustomLineItemChargeDetails.Type` gives a charge on a bill: a `FEE` adds
+/// to the bill and a `CREDIT` comes off it ("The type of the custom line item that
+/// indicates whether the charge is a fee or credit";
+/// [`crate::ops::types::CUSTOM_LINE_ITEM_TYPE_VALUES`] has exactly those two values).
+pub fn charge_sign(charge_type: &str) -> f64 {
+    if charge_type == CREDIT_CHARGE_TYPE {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
+/// The `CustomLineItemType` that takes its value OFF the bill rather than adding it.
+const CREDIT_CHARGE_TYPE: &str = "CREDIT";
 
 /// A `PricingPlanArn` as this service stores it. See [`normalize_billing_group_arn`].
 ///
@@ -1612,6 +1698,112 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
                 .map(|record| &mut record.tags),
         }
     }
+
+    /// What the custom line items of one billing group put on its PRO FORMA bill in
+    /// `billing_period`, summed per product and SIGNED by each item's charge type.
+    ///
+    /// A custom line item is an adjustment to what the billing group is charged — "a
+    /// one-time fixed charge that can be applied to a single billing group", either "a
+    /// fee or discount" — so it is part of the pro forma cost and of nothing else. Every
+    /// item of the group whose own billing period range covers the period contributes its
+    /// charge with the sign of its type ([`charge_sign`]), under the product it is
+    /// presented as ([`custom_line_item_product_name`]). An empty map is a billing group
+    /// with no item in effect in that period, so its pro forma cost there is its actual
+    /// cost.
+    ///
+    /// The charge of each item is computed at most ONCE per billing period, however the
+    /// associations between them are arranged, so the work of one period is bounded by the
+    /// store (at most [`MAX_CUSTOM_LINE_ITEMS`] items of at most
+    /// [`MAX_RESOURCES_PER_CUSTOM_LINE_ITEM`] associations each) rather than by the shape
+    /// of the associations a caller made.
+    pub fn proforma_custom_line_item_charges(
+        &self,
+        group_arn: &str,
+        billing_period: &str,
+    ) -> BTreeMap<String, f64> {
+        let mut charges: BTreeMap<String, f64> = BTreeMap::new();
+        let mut computed: BTreeMap<String, f64> = BTreeMap::new();
+        let mut being_computed: BTreeSet<String> = BTreeSet::new();
+        for item in self.custom_line_items.values() {
+            if item.billing_group_arn != group_arn || !item.covers(billing_period) {
+                continue;
+            }
+            let charge = charge_sign(&item.charge_type)
+                * self.custom_line_item_charge(
+                    item,
+                    billing_period,
+                    &mut computed,
+                    &mut being_computed,
+                );
+            *charges
+                .entry(custom_line_item_product_name(item).to_string())
+                .or_insert(0.0) += charge;
+        }
+        charges
+    }
+
+    /// The charge ONE custom line item carries in `billing_period`, as the UNSIGNED
+    /// amount its charge details describe — the item's type is what decides which way it
+    /// moves the bill.
+    ///
+    /// "It should contain only one of `Flat` or `Percentage`": a flat item's charge is its
+    /// `ChargeValue`, and a percentage item's is its `PercentageValue` "multiplied against
+    /// the combined value of its associated resources", counting only the resources whose
+    /// association is in effect in that period. An associated resource is another custom
+    /// line item, whose own charge it contributes, or a billing group, which contributes
+    /// the metered usage of its accounts — of which this emulator records none, as the
+    /// `AWSCost` its cost reports answer with says; an ARN naming neither contributes
+    /// nothing.
+    ///
+    /// `computed` carries the charges already worked out for this billing period, so an
+    /// item several others are associated to is computed once. `being_computed` carries
+    /// the items whose charge this walk is in the middle of: nothing stops two percentage
+    /// items from being associated to each other, and an item whose own value is not
+    /// settled yet has no value to lend, so it contributes nothing and that nothing is not
+    /// remembered — it is a property of the walk rather than of the item.
+    fn custom_line_item_charge(
+        &self,
+        item: &CustomLineItemRecord,
+        billing_period: &str,
+        computed: &mut BTreeMap<String, f64>,
+        being_computed: &mut BTreeSet<String>,
+    ) -> f64 {
+        if let Some(charge) = computed.get(&item.arn) {
+            return *charge;
+        }
+        let charge = if let Some(charge_value) = item.flat_charge_value {
+            charge_value
+        } else if let Some(percentage_value) = item.percentage_value {
+            if !being_computed.insert(item.arn.clone()) {
+                return 0.0;
+            }
+            let combined: f64 = item
+                .associated_resources
+                .iter()
+                .filter(|association| association.covers(billing_period))
+                .map(|association| {
+                    self.custom_line_items
+                        .get(&association.arn)
+                        .map_or(0.0, |associated| {
+                            self.custom_line_item_charge(
+                                associated,
+                                billing_period,
+                                computed,
+                                being_computed,
+                            )
+                        })
+                })
+                .sum();
+            being_computed.remove(&item.arn);
+            percentage_value / 100.0 * combined
+        } else {
+            // Neither charge member: an item no create of this service can leave behind,
+            // since exactly one of them is required.
+            0.0
+        };
+        computed.insert(item.arn.clone(), charge);
+        charge
+    }
 }
 
 /// The resource kinds this service's tagging surface addresses, as the resource
@@ -1978,11 +2170,29 @@ pub const DEFAULT_PAGE_SIZE: i32 = 100;
 /// rather than an offset: resuming skips every key below it. The page size is the
 /// request's `max_results` CLAMPED to 1..=[`DEFAULT_PAGE_SIZE`] — a request that
 /// names none, or names a value the modelled range does not allow, is served the
-/// default — so a page is bounded whatever reaches this helper.
+/// default — so a page is bounded whatever reaches this helper. An operation whose own
+/// `MaxResults` range reaches past that default pages through
+/// [`paginate_bounded`] instead.
 pub fn paginate<T>(
     items: Vec<(String, T)>,
     next_token: Option<&str>,
     max_results: Option<i32>,
+) -> (Vec<T>, Option<String>) {
+    paginate_bounded(items, next_token, max_results, DEFAULT_PAGE_SIZE)
+}
+
+/// [`paginate`], for an operation whose own `MaxResults` member models a range the
+/// default page size does not fit.
+///
+/// `page_size_bound` is the largest page that operation can be asked for — the maximum
+/// of its modelled `MaxResults` range — and is also the size the server picks when the
+/// request names none, so a caller that asks for a page the model allows is served it
+/// whole and one that asks for nothing still gets a bounded page.
+pub fn paginate_bounded<T>(
+    items: Vec<(String, T)>,
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+    page_size_bound: i32,
 ) -> (Vec<T>, Option<String>) {
     let start = next_token.unwrap_or("");
     let mut page: Vec<(String, T)> = items
@@ -1991,8 +2201,8 @@ pub fn paginate<T>(
         .collect();
     let requested = max_results
         .filter(|max| *max > 0)
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-        .min(DEFAULT_PAGE_SIZE);
+        .unwrap_or(page_size_bound)
+        .min(page_size_bound);
     let limit = usize::try_from(requested).unwrap_or(1);
     let token = page.get(limit).map(|(key, _)| key.clone());
     page.truncate(limit);
