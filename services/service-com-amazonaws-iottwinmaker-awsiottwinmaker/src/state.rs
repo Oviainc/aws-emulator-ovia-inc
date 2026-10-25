@@ -41,6 +41,14 @@
 //! (`MetadataTransferJob::settles_at`), the same way a component type carries
 //! its own — and so does a *sync job* (`SyncJob::settles_at`), which
 //! `CreateSyncJob` accepts in the non-terminal `CREATING` state.
+//!
+//! The account's *pricing plan* is the same shape of thing: a plan change the
+//! service bills from the start of the next cycle is held beside the plan in
+//! force (`RegionalState::pending_pricing_plan`) carrying the instant it falls
+//! due, and a reader materialises it rather than sleeps for it
+//! (`RegionalState::settle_pricing_plan`) — which is also where the tier a
+//! bundled plan is billed at follows the account's billable entity count across
+//! a band boundary.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -656,6 +664,84 @@ pub const UPDATE_REASON_PRICING_TIER_UPDATE: &str = "PRICING_TIER_UPDATE";
 /// overwritten and never becomes the plan in force. See
 /// [`UPDATE_REASON_PRICING_MODE_UPDATE`].
 pub const UPDATE_REASON_OVERWRITTEN: &str = "OVERWRITTEN";
+/// The `UpdateReason` a plan carries once the SERVICE itself has moved its tier,
+/// the account's billable entity count having crossed into another band
+/// ([`pricing_tier_for`]) — a change no caller asked for. See
+/// [`UPDATE_REASON_PRICING_MODE_UPDATE`].
+pub const UPDATE_REASON_ENTITY_COUNT_UPDATE: &str = "ENTITY_COUNT_UPDATE";
+
+/// How long a plan change that does NOT take effect at once stays pending
+/// before the clock makes it the plan in force.
+///
+/// AWS's IoT TwinMaker pricing documentation states the rule this stands in for:
+/// a switch away from a tiered-bundle plan to pay-as-you-go takes effect at the
+/// start of the account's next billing cycle, the bundle already bought covering
+/// the cycle the account is in — so the change is accepted now and applies later
+/// ([`pricing_change_is_deferred`]). That wait is the remainder of a billing
+/// cycle, a calendar quantity rather than a published duration, so the span here
+/// is CHOSEN by this emulator, exactly as the settle spans above are: it is
+/// deliberately non-zero, so a caller that reads the plan back in the same
+/// breath as the change still sees the change PENDING and the old plan still in
+/// force, and deliberately short, so a client that polls sees it land without a
+/// long wait. Nothing sleeps for it: the instant the change falls due is its own
+/// `effectiveDateTime` ([`PricingPlanRecord::effective_date_time`]) and a reader
+/// materialises what the clock already owed
+/// ([`RegionalState::settle_pricing_plan`]).
+pub const PRICING_PLAN_PENDING_SPAN: Duration = Duration::from_millis(500);
+
+/// The billable entity counts the modelled `PricingTier` bands end at: the
+/// largest count still in `TIER_1`, then in `TIER_2`, then in `TIER_3` — every
+/// count above the last of them being in the final tier
+/// (`ops::types::PRICING_TIER_VALUES` names four).
+///
+/// A bundled plan is billed by TIER, and the tier an account sits in follows how
+/// many billable entities it keeps: `TIER_1` is the smallest band and each
+/// further tier covers a larger count, the last one unbounded. That ORDERING is
+/// the rule; the thresholds themselves are not in this service's model, so the
+/// three below are CHOSEN by this emulator. They are spaced by powers of ten and
+/// placed inside this store's own ceilings ([`MAX_WORKSPACES`] ×
+/// [`MAX_ENTITIES_PER_WORKSPACE`]), so every modelled tier is reachable here
+/// rather than only the first.
+const PRICING_TIER_BAND_CEILINGS: [i64; 3] = [100, 1_000, 10_000];
+
+/// The `PricingTier` a billable entity count of `billable_entity_count` places
+/// the account in: the first band the count fits in
+/// ([`PRICING_TIER_BAND_CEILINGS`]), or the last modelled tier when it is above
+/// them all.
+///
+/// Total over every count, including zero (an account with no entity at all is
+/// in the smallest band), so a bundled plan always has a tier to report.
+pub fn pricing_tier_for(billable_entity_count: i64) -> &'static str {
+    let tiers = crate::ops::types::PRICING_TIER_VALUES;
+    for (band, ceiling) in PRICING_TIER_BAND_CEILINGS.iter().enumerate() {
+        if billable_entity_count <= *ceiling {
+            // The ceilings are declared alongside the tiers they end, so there
+            // is a tier for each; the fallback keeps this total if that ever
+            // stops holding.
+            return tiers.get(band).copied().unwrap_or("TIER_1");
+        }
+    }
+    tiers.last().copied().unwrap_or("TIER_1")
+}
+
+/// Whether a change from the plan in force (`pricing_mode_in_force`) to
+/// `requested_pricing_mode` is one the service accepts now and applies LATER,
+/// rather than one that takes effect at once.
+///
+/// Leaving a bundled plan for the pay-as-you-go mode is the deferred change: the
+/// bundle the account bought covers the billing cycle it is in, so the move off
+/// it is billed from the start of the next one — until then the bundled plan is
+/// still the plan in force and the change is reported as pending
+/// ([`RegionalState::pending_pricing_plan`]). Every other change — onto a
+/// bundled plan, between two bundled plans, or the pay-as-you-go plan re-set on
+/// itself — buys the account more than it had and takes effect at once.
+pub fn pricing_change_is_deferred(
+    pricing_mode_in_force: &str,
+    requested_pricing_mode: &str,
+) -> bool {
+    pricing_mode_is_bundled(pricing_mode_in_force)
+        && !pricing_mode_is_bundled(requested_pricing_mode)
+}
 
 /// Whether `pricing_mode` names a BUNDLED pricing plan — one whose billing is
 /// described by the bundles it was set with — rather than the pay-as-you-go
@@ -789,13 +875,14 @@ pub struct RegionalState {
     /// nothing is pending, which is what an account whose plan nobody has
     /// changed looks like.
     ///
-    /// Nothing in this emulator leaves a change pending: `UpdatePricingPlan`
-    /// applies one at once ([`Self::set_pricing_plan`]), so the only thing that
-    /// call does to this field is CLEAR it, superseding a change that had not
-    /// taken effect. The field stays because the plan in force and the plan
-    /// pending are two distinct members of the API's output, and a reader has
-    /// to report whichever the store holds rather than assume there is only
-    /// ever one.
+    /// A change the service applies LATER rather than at once lands here
+    /// ([`pricing_change_is_deferred`]), carrying the instant it falls due as
+    /// its own `effectiveDateTime`, while [`pricing_plan`](Self::pricing_plan)
+    /// keeps reporting the plan still in force. Nothing sleeps for that
+    /// instant: a reader materialises the change the clock has already made due
+    /// ([`Self::settle_pricing_plan`]), and a further change that arrives first
+    /// SUPERSEDES what is here, which is the change
+    /// [`UPDATE_REASON_OVERWRITTEN`] names.
     pub pending_pricing_plan: Option<PricingPlanRecord>,
     /// The metadata transfer jobs this account holds in this Region, keyed by
     /// `metadataTransferJobId`.
@@ -876,9 +963,16 @@ pub struct PricingPlanRecord {
     /// `BundleInformation::bundleNames` is `@required` and `@length(1..10)`, so
     /// an empty list is not a value the shape admits.
     pub bundle_names: Vec<String>,
-    /// The `PricingTier` the bundles place the account in
-    /// (`ops::types::PRICING_TIER_VALUES`), absent when the plan carries no
-    /// tier.
+    /// The `PricingTier` the account's billable entity count places this plan in
+    /// ([`pricing_tier_for`]), and `None` for a plan that names no bundle: a
+    /// tier is what a BUNDLED plan is billed by, and a plan without bundles
+    /// reports no `bundleInformation` to carry one.
+    ///
+    /// Stored rather than derived at report time, because a MOVE between bands
+    /// is itself a change to the plan — it is what
+    /// [`UPDATE_REASON_ENTITY_COUNT_UPDATE`] describes — so the tier the plan
+    /// was last billed at has to be there for the move to be noticed
+    /// ([`RegionalState::settle_pricing_plan`]).
     pub pricing_tier: Option<String>,
     /// When this plan takes (or took) effect.
     pub effective_date_time: SystemTime,
@@ -899,6 +993,20 @@ impl PricingPlanRecord {
             effective_date_time: at,
             update_date_time: at,
         }
+    }
+
+    /// The `PricingTier` this plan is billed at while the account holds
+    /// `billable_entity_count` billable entities, and `None` for a plan that
+    /// reports no tier at all.
+    ///
+    /// A tier is reported INSIDE `bundleInformation`, so a plan has one exactly
+    /// when it names bundles — the same condition
+    /// [`as_pricing_plan`](Self::as_pricing_plan) reports that structure under —
+    /// and which tier that is follows the account's billable entity count
+    /// ([`pricing_tier_for`]).
+    pub fn tier_at(&self, billable_entity_count: i64) -> Option<String> {
+        (!self.bundle_names.is_empty())
+            .then(|| pricing_tier_for(billable_entity_count).to_string())
     }
 
     /// This record as the modelled `PricingPlan`, reported with the account's
@@ -3061,16 +3169,28 @@ impl RegionalState {
     }
 
     /// Set the account's pricing plan to `pricing_mode` with `bundle_names` at
-    /// `now`, and hand back the plan that is now in force.
+    /// `now`.
     ///
-    /// The change takes effect AT ONCE: the new plan's `effectiveDateTime` is
-    /// the instant of the call that set it, the same instant as its
-    /// `updateDateTime`. The service publishes no rule for deferring an accepted
-    /// change to some later instant, so this emulator defers none — which also
-    /// means a change that was accepted but had not taken effect
-    /// ([`RegionalState::pending_pricing_plan`])
-    /// is SUPERSEDED here rather than left to land later, and after this call
-    /// nothing is pending.
+    /// WHEN the change takes effect is not the caller's to choose: a change that
+    /// buys the account at least what it already had takes effect at once, and a
+    /// change that leaves a bundled plan for the pay-as-you-go mode is billed
+    /// from the start of the next cycle ([`pricing_change_is_deferred`]). So the
+    /// plan this call records goes either into
+    /// [`pricing_plan`](Self::pricing_plan), with its `effectiveDateTime` at the
+    /// instant of the call, or into
+    /// [`pending_pricing_plan`](Self::pending_pricing_plan), with its
+    /// `effectiveDateTime` [`PRICING_PLAN_PENDING_SPAN`] later and the plan in
+    /// force left exactly as it was. Either way its `updateDateTime` is the
+    /// instant of the call, which is when the service accepted it, and the plan
+    /// is recorded WHOLE: it carries the requested mode and bundles, never a
+    /// member left over from the plan before it.
+    ///
+    /// Whatever the clock already owed lands FIRST
+    /// ([`settle_pricing_plan`](Self::settle_pricing_plan)), so this change is
+    /// read against the plan really in force and a pending change that had
+    /// already come due is applied rather than thrown away. A pending change
+    /// that had NOT come due is superseded here and never becomes the plan in
+    /// force.
     ///
     /// The `UpdateReason` recorded on the new plan says what this change was,
     /// read off the plan it replaces — never off the request alone:
@@ -3083,24 +3203,22 @@ impl RegionalState {
     ///   so the bundles — and the tier they place the account in — are all the
     ///   change can have moved.
     ///
-    /// The two remaining `UpdateReason` values are deliberately NOT produced
-    /// here, because neither describes a change a caller asked for:
-    /// [`UPDATE_REASON_DEFAULT`] marks the plan of an account nobody has
-    /// updated, and `ENTITY_COUNT_UPDATE` a tier the service moved on its own
-    /// when the account's entity count crossed a threshold.
+    /// The remaining two values describe changes no caller asked for, so neither
+    /// is recorded here: [`UPDATE_REASON_DEFAULT`] marks the plan of an account
+    /// nobody has updated, and [`UPDATE_REASON_ENTITY_COUNT_UPDATE`] the tier
+    /// move the service makes on its own
+    /// ([`settle_pricing_plan`](Self::settle_pricing_plan)).
     ///
-    /// `pricingTier` is left unset. The tier a bundled plan sits in is a
-    /// function of AWS's published tiered-bundle thresholds, which this
-    /// service's model does not carry; the member is optional precisely so a
-    /// plan whose tier is not determined is representable, so the plan is
-    /// reported without one rather than with a threshold table this emulator
-    /// would have invented.
+    /// `pricingTier` is recorded on a plan that names bundles, since that is the
+    /// plan billed by tier, and the tier is the band the account's billable
+    /// entity count falls in ([`PricingPlanRecord::tier_at`]).
     pub fn set_pricing_plan(
         &mut self,
         pricing_mode: String,
         bundle_names: Vec<String>,
         now: SystemTime,
-    ) -> &PricingPlanRecord {
+    ) {
+        self.settle_pricing_plan(now);
         let superseded_pending = self.pending_pricing_plan.take().is_some();
         let update_reason = if superseded_pending {
             UPDATE_REASON_OVERWRITTEN
@@ -3109,15 +3227,76 @@ impl RegionalState {
         } else {
             UPDATE_REASON_PRICING_TIER_UPDATE
         };
-        self.pricing_plan = PricingPlanRecord {
+        let deferred = pricing_change_is_deferred(&self.pricing_plan.pricing_mode, &pricing_mode);
+        let effective_date_time = if deferred {
+            now + PRICING_PLAN_PENDING_SPAN
+        } else {
+            now
+        };
+        let mut record = PricingPlanRecord {
             pricing_mode,
             update_reason: update_reason.to_string(),
             bundle_names,
             pricing_tier: None,
-            effective_date_time: now,
+            effective_date_time,
             update_date_time: now,
         };
-        &self.pricing_plan
+        record.pricing_tier = record.tier_at(self.billable_entity_count());
+        if deferred {
+            self.pending_pricing_plan = Some(record);
+        } else {
+            self.pricing_plan = record;
+        }
+    }
+
+    /// Whether the stored pricing plan has a change owed to it as of `now` that
+    /// nothing has applied yet — a pending change that has come due, or a tier
+    /// the account's billable entity count has moved out from under.
+    ///
+    /// A REPORTING caller asks this first and only reaches for the store
+    /// mutably when the answer is yes, so reading the plan of an account with
+    /// nothing owed materialises nothing at all.
+    pub fn pricing_plan_settlement_due(&self, now: SystemTime) -> bool {
+        if self
+            .pending_pricing_plan
+            .as_ref()
+            .is_some_and(|pending| now >= pending.effective_date_time)
+        {
+            return true;
+        }
+        self.pricing_plan.pricing_tier != self.pricing_plan.tier_at(self.billable_entity_count())
+    }
+
+    /// Apply everything that is already owed to the stored pricing plan as of
+    /// `now`, so what a caller is told is what was true before it called.
+    ///
+    /// Two things fall due without anybody asking:
+    ///
+    /// * a change accepted for a later instant becomes the plan in force once
+    ///   that instant has passed — it was due then whether or not anybody
+    ///   called, so its `effectiveDateTime` and `updateDateTime` are left as
+    ///   they were recorded and two reads of a landed change report the same
+    ///   instants;
+    /// * a plan billed by tier moves band when the account's billable entity
+    ///   count crosses a threshold ([`pricing_tier_for`]). The service makes
+    ///   that move itself, which is what [`UPDATE_REASON_ENTITY_COUNT_UPDATE`]
+    ///   records, so the plan keeps its mode and bundles and only its tier,
+    ///   reason and instants move. Idempotent: once the band is recorded,
+    ///   nothing further is owed until the count crosses again.
+    pub fn settle_pricing_plan(&mut self, now: SystemTime) {
+        if let Some(due) = self
+            .pending_pricing_plan
+            .take_if(|pending| now >= pending.effective_date_time)
+        {
+            self.pricing_plan = due;
+        }
+        let tier = self.pricing_plan.tier_at(self.billable_entity_count());
+        if self.pricing_plan.pricing_tier != tier {
+            self.pricing_plan.pricing_tier = tier;
+            self.pricing_plan.update_reason = UPDATE_REASON_ENTITY_COUNT_UPDATE.to_string();
+            self.pricing_plan.effective_date_time = now;
+            self.pricing_plan.update_date_time = now;
+        }
     }
 
     /// Resolve an `IdOrArn` input to a stored `workspaceId`.
