@@ -32,8 +32,12 @@ const ACCESS_STRING_RULE: &str = "The access-string is invalid.";
 
 /// The rule list the seeded user starts from, and the EXPANDED form the service stores for
 /// it — the list with its command baseline stated outright.
+///
+/// The stored form is `pub(crate)` for the same reason as the helpers below: the suite
+/// about the stored-length bound and what a user takes after a refusal starts from this
+/// same seeded user.
 const SEED_ACCESS_STRING: &str = "on ~app:* +@read";
-const STORED_ACCESS_STRING: &str = "on ~app:* -@all +@read";
+pub(crate) const STORED_ACCESS_STRING: &str = "on ~app:* -@all +@read";
 
 /// The lists that are NOT rule lists: the case name and the access string.
 ///
@@ -105,7 +109,11 @@ const RULE_LISTS: &[(&str, &str, &str)] = &[
 ];
 
 /// `CreateUser` for `id`, with `access_string` as the whole rule list.
-async fn create_user(emulator: &Emulator, id: &str, access_string: &str) -> Reply {
+///
+/// `pub(crate)`, like [`seed_user`] and [`assert_refused`] below, so the suite about the
+/// stored-length bound and the recovery after a refusal drives the same create, seed and
+/// refusal check rather than carrying a second copy of each.
+pub(crate) async fn create_user(emulator: &Emulator, id: &str, access_string: &str) -> Reply {
     emulator
         .call(
             "CreateUser",
@@ -122,7 +130,7 @@ async fn create_user(emulator: &Emulator, id: &str, access_string: &str) -> Repl
 
 /// Create the user the modify rows change, asserting it starts from
 /// [`STORED_ACCESS_STRING`].
-async fn seed_user(emulator: &Emulator, id: &str) {
+pub(crate) async fn seed_user(emulator: &Emulator, id: &str) {
     let created = create_user(emulator, id, SEED_ACCESS_STRING).await;
     assert_eq!(
         (created.status, created.text("AccessString")),
@@ -134,7 +142,7 @@ async fn seed_user(emulator: &Emulator, id: &str) {
 }
 
 /// Assert `reply` is the modelled access-string refusal, worded exactly.
-fn assert_refused(case: &str, entry: &str, reply: &Reply) {
+pub(crate) fn assert_refused(case: &str, entry: &str, reply: &Reply) {
     assert_eq!(
         (reply.status, reply.error_code()),
         (400, "InvalidParameterValue"),

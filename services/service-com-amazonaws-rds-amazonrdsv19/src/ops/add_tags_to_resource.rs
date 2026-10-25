@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddTagsToResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddTagsToResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddTagsToResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the request's tags on the Amazon RDS resource its `ResourceName` ARN names: a
+//! key the resource already carries takes the new value, a key it does not carry is added.
+//! The tags go on the resource's OWN stored record — the same list its create wrote, its
+//! describe reports and `ListTagsForResource` reads back — so the ARN is resolved through
+//! [`crate::state::tags`], where every tag operation of this service resolves it.
 //!
 //! ## Shape of an operation
 //!
@@ -121,28 +118,53 @@ impl ::aws_smithy_schema::serde::SerializableStruct for AddTagsToResourceOutput 
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `AddTagsToResourceError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.rds#AddTagsToResource")]
+// The operation's MODELED errors, widened with the not-found faults of the other
+// resource families whose ARNs `ResourceName` accepts.
+//
+// `ResourceName` takes the ARN of ANY taggable Amazon RDS resource, and an ARN naming a
+// resource that does not exist is that family's own not-found fault — the one the
+// family's describe and delete operations answer with. This operation's `errors` list
+// names only some of those families, so the rest are widened in here through
+// `extra_errors` rather than answered as some other code: every one is a shape THIS
+// SERVICE models (all declared in `types/shared_types.rs`), and the error code is what a
+// client branches on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.rds#AddTagsToResource",
+    extra_errors = [
+        "CustomDBEngineVersionNotFoundFault",
+        "DBClusterParameterGroupNotFoundFault",
+        "DBClusterSnapshotNotFoundFault",
+        "DBParameterGroupNotFoundFault",
+        "DBSubnetGroupNotFoundFault",
+        "GlobalClusterNotFoundFault",
+        "OptionGroupNotFoundFault",
+        "SubscriptionNotFoundFault"
+    ]
+)]
 #[derive(Debug)]
 pub enum AddTagsToResourceErrorModeled {
     BlueGreenDeploymentNotFoundFault(BlueGreenDeploymentNotFoundFault),
+    CustomDBEngineVersionNotFoundFault(CustomDBEngineVersionNotFoundFault),
     DBCapacityReservationNotFoundFault(DBCapacityReservationNotFoundFault),
     DBClusterNotFoundFault(DBClusterNotFoundFault),
+    DBClusterParameterGroupNotFoundFault(DBClusterParameterGroupNotFoundFault),
+    DBClusterSnapshotNotFoundFault(DBClusterSnapshotNotFoundFault),
     DBInstanceNotFoundFault(DBInstanceNotFoundFault),
+    DBParameterGroupNotFoundFault(DBParameterGroupNotFoundFault),
     DBProxyEndpointNotFoundFault(DBProxyEndpointNotFoundFault),
     DBProxyNotFoundFault(DBProxyNotFoundFault),
     DBProxyTargetGroupNotFoundFault(DBProxyTargetGroupNotFoundFault),
     DBShardGroupNotFoundFault(DBShardGroupNotFoundFault),
     DBSnapshotNotFoundFault(DBSnapshotNotFoundFault),
     DBSnapshotTenantDatabaseNotFoundFault(DBSnapshotTenantDatabaseNotFoundFault),
+    DBSubnetGroupNotFoundFault(DBSubnetGroupNotFoundFault),
+    GlobalClusterNotFoundFault(GlobalClusterNotFoundFault),
     IntegrationNotFoundFault(IntegrationNotFoundFault),
     InvalidDBClusterEndpointStateFault(InvalidDBClusterEndpointStateFault),
     InvalidDBClusterStateFault(InvalidDBClusterStateFault),
     InvalidDBInstanceStateFault(InvalidDBInstanceStateFault),
+    OptionGroupNotFoundFault(OptionGroupNotFoundFault),
+    SubscriptionNotFoundFault(SubscriptionNotFoundFault),
     TenantDatabaseNotFoundFault(TenantDatabaseNotFoundFault),
 }
 
@@ -197,18 +219,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddTagsToResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddTagsToResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddTagsToResource"))
+        let region =
+            crate::state::request_region(ctx).map_err(AddTagsToResourceError::validation)?;
+        // `ResourceName` is "the Amazon RDS resource that the tags are added to. This value
+        // is an Amazon Resource Name (ARN)".
+        // Resolved exactly as the request gave it: an ARN is an exact identifier, so a
+        // value that is not one — whitespace and all — is refused rather than repaired.
+        let resource_name = input.resource_name.as_str();
+        // Every tag is stored request data, so the published tag bounds are checked before
+        // the store is touched, together with the rules `Tag$Key` documents for a key a
+        // caller writes.
+        crate::state::check_tags_to_write(&input.tags)
+            .map_err(AddTagsToResourceError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot resolve the resource at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a success that persisted nothing.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due, so the resource this call resolves
+        // is in the state it is really in.
+        store.settle_due_transitions(&region);
+
+        let target = match store.resolve_tag_target(&region, resource_name) {
+            Ok(target) => target,
+            Err(miss) => {
+                return Err(crate::tag_target_refusal!(AddTagsToResourceErrorModeled, miss))
+            }
+        };
+
+        // A resource's tag list grows only by the keys it does not already carry, and is
+        // bounded by the published per-resource tag quota whatever sequence of calls
+        // arrives — the request's own list being bounded is not enough, because tags
+        // accumulate across calls.
+        let Some(stored) = store.tags_at(&target) else {
+            return Err(vanished(resource_name));
+        };
+        let (stored_count, added_count) = (
+            stored.len(),
+            crate::state::added_key_count(stored, &input.tags),
+        );
+        crate::state::check_tag_capacity(stored_count, added_count)
+            .map_err(AddTagsToResourceError::invalid_parameter_value)?;
+
+        let Some(tags) = store.tags_at_mut(&target) else {
+            return Err(vanished(resource_name));
+        };
+        crate::state::merge_tags(tags, &input.tags);
+
+        Ok(AddTagsToResourceOutput)
     }
+}
+
+/// The 500 this handler answers if the record it resolved under the state lock is gone by
+/// the time it writes — an invariant of this emulator's own store, which holding the one
+/// lock across both makes unreachable, and never anything the request carries.
+fn vanished(resource_name: &str) -> AddTagsToResourceError {
+    crate::scaffolded::Scaffolded::internal_failure(format!(
+        "the resource {resource_name} resolved under this service's state lock is no longer there"
+    ))
 }

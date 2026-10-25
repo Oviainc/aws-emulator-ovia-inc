@@ -1093,7 +1093,7 @@
 //! store holds no request text.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::Ipv6Addr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1122,7 +1122,7 @@ use crate::ops::types::{
     IpamResourceDiscovery, IpamResourceDiscoveryAssociation, IpamResourceTag,
     IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta, IpamScope,
     MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
-    InstanceState, InstanceTypeOffering, InterruptionInfo, IpPermission, IpRange,
+    InstanceState, InstanceTypeOffering, InterruptionInfo, IpPermission, IpRange, Ipv6Range,
     LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, NatGateway, NetworkInsightsAccessScope,
     NetworkInsightsAccessScopeAnalysis, NetworkInterface, NetworkInterfacePrivateIpAddress,
@@ -1130,7 +1130,8 @@ use crate::ops::types::{
     PlacementGroup, PrefixListId,
     PrivateDnsNameOptionsOnLaunch, ReferencedSecurityGroup, SecurityGroupRule,
     DnsEntry, PayerResponsibilityEntry, ProductCode,
-    Region, ReplaceRootVolumeTask, RequestLaunchTemplateData, RouteServer, RouteServerBfdStatus,
+    Region, ReplaceRootVolumeTask, RequestLaunchTemplateData, RevokedSecurityGroupRule,
+    RouteServer, RouteServerBfdStatus,
     RouteServerBgpOptions, RouteServerBgpStatus, RouteServerEndpoint, RouteServerPeer,
     RouteServerAssociation,
     RunInstancesOutput, SecondaryNetwork,
@@ -1161,16 +1162,21 @@ use crate::scaffolded::Scaffolded;
 mod image_recycle_bin;
 pub use image_recycle_bin::{RecycledImageRecord, recycled_image, require_recycled_image};
 
-// One shape a security group rule's aggregated view is made of, imported on its own line so
-// this file's one big `use crate::ops::types::{..}` list stays as it is.
-use crate::ops::types::Ipv6Range;
-
 /// The Traffic Mirror filter store's own primitives — the id prefix, the bounds, the byte
 /// charge and the error channel `CreateTrafficMirrorFilter` and
 /// `DescribeTrafficMirrorFilters` share. Re-exported, so a handler reaches them as
 /// `crate::state::<item>` like every other primitive of this module.
 pub mod traffic_mirror_filters;
 pub use traffic_mirror_filters::*;
+
+/// What `CreatePublicIpv4Pool` adds to the public IPv4 pool store below: the network border
+/// group a created pool is advertised from, and the refusal for a create the store has no
+/// room for. The pool record, its insert and its projection live in the "Public IPv4 address
+/// pools" section of this module, beside the BYOIP provision that also creates one.
+/// Re-exported, so a handler reaches them as `crate::state::<item>` like every other
+/// primitive here.
+pub mod public_ipv4_pools;
+pub use public_ipv4_pools::*;
 
 /// The `Reservation` shape, under the name the scaffold generated for it.
 ///
@@ -3441,10 +3447,15 @@ impl ComAmazonawsEc2Amazonec2State {
     /// out of, so the caller reads them off that association rather than this writer
     /// guessing them.
     ///
-    /// The caller-chosen bytes the block string retains are charged against the store's
-    /// byte budget HERE, which is what [`subnet_payload_bytes`] gives back on delete; a
-    /// writer still asks [`Self::would_exceed_stored_bytes`] first so it can refuse
-    /// instead of overshooting.
+    /// The bytes the association retains are charged against the store's byte budget HERE,
+    /// by the one definition of that charge ([`subnet_ipv6_association_payload_bytes`]),
+    /// which is what [`subnet_payload_bytes`] gives back on delete.
+    ///
+    /// `None`, with NOTHING written, for a subnet the store does not hold, for a subnet
+    /// already at [`MAX_IPV6_ASSOCIATIONS_PER_SUBNET`] association records, and when the
+    /// bytes the association would hold would cross [`MAX_STORED_BYTES`]. All three are
+    /// asked HERE, before the first write, the way [`Self::insert_coip_pool`] enforces its
+    /// own ceiling — so a caller that forgets to ask cannot grow the store without bound.
     pub fn associate_subnet_ipv6_cidr_block(
         &mut self,
         subnet_id: &str,
@@ -3455,8 +3466,13 @@ impl ComAmazonawsEc2Amazonec2State {
         if !self.subnets.contains_key(subnet_id) {
             return None;
         }
+        let charged_bytes = subnet_ipv6_association_payload_bytes(&ipv6_cidr_block);
+        if !self.has_subnet_ipv6_association_capacity(subnet_id)
+            || self.would_exceed_stored_bytes(charged_bytes)
+        {
+            return None;
+        }
         let association_id = self.next_id("subnet-cidr-assoc");
-        let charged_bytes = ipv6_cidr_block.len();
         let association = SubnetIpv6CidrBlockAssociation {
             association_id: Some(association_id),
             ipv6_cidr_block: Some(ipv6_cidr_block),
@@ -3476,6 +3492,22 @@ impl ComAmazonawsEc2Amazonec2State {
         self.subnet_ipv6_associated_at
             .insert(subnet_id.to_string(), Instant::now() + TRANSITION_DELAY);
         Some(association)
+    }
+
+    /// Whether another IPv6 CIDR block association fits inside the ceiling this store keeps
+    /// for ONE subnet ([`MAX_IPV6_ASSOCIATIONS_PER_SUBNET`]).
+    ///
+    /// The same contract as [`Self::has_subnet_capacity`]: a writer asks first so it can
+    /// refuse instead of overshooting. A subnet the store does not hold has no room for an
+    /// association either.
+    pub fn has_subnet_ipv6_association_capacity(&self, subnet_id: &str) -> bool {
+        self.subnets.get(subnet_id).is_some_and(|subnet| {
+            subnet
+                .ipv6_cidr_block_association_set
+                .as_deref()
+                .map_or(0, <[SubnetIpv6CidrBlockAssociation]>::len)
+                < MAX_IPV6_ASSOCIATIONS_PER_SUBNET
+        })
     }
 
     /// Whether another subnet CIDR reservation fits inside the store's ceiling
@@ -3804,7 +3836,7 @@ impl ComAmazonawsEc2Amazonec2State {
         if self.security_group_rules.len() >= MAX_SECURITY_GROUP_RULES {
             return None;
         }
-        let rule_id = self.next_id("sgr");
+        let rule_id = self.next_id(SECURITY_GROUP_RULE_ID_PREFIX);
         let stored = SecurityGroupRule {
             security_group_rule_id: Some(rule_id.clone()),
             security_group_rule_arn: Some(::engine::emulator_arn(
@@ -4181,6 +4213,99 @@ impl ComAmazonawsEc2Amazonec2State {
             })
             .and_then(|group| group.group_id.clone())
     }
+
+    /// The rules the group `group_id` holds in one direction, each beside the
+    /// `SecurityGroupRuleId` the store minted for it — the inbound rules when `is_egress` is
+    /// `false` and the outbound ones when it is `true`.
+    ///
+    /// The stored records read as the identities they stand for (see
+    /// [`SecurityGroupRuleAtom::of_stored_rule`]); the store itself is not touched, so two
+    /// reads of one group answer the same rules in the same order — id order, which is the
+    /// order [`Self::resync_security_group_permissions`] reports them in.
+    pub fn held_security_group_rules(
+        &self,
+        group_id: &str,
+        is_egress: bool,
+    ) -> Vec<(String, SecurityGroupRuleAtom)> {
+        self.security_group_rules
+            .iter()
+            .filter(|(_, record)| {
+                record.rule.group_id.as_deref() == Some(group_id)
+                    && record.rule.is_egress.unwrap_or(false) == is_egress
+            })
+            .filter_map(|(rule_id, record)| {
+                SecurityGroupRuleAtom::of_stored_rule(record).map(|atom| (rule_id.clone(), atom))
+            })
+            .collect()
+    }
+
+    /// What revoking `requested` from `group_id` would do, WITHOUT writing anything: see
+    /// [`SecurityGroupRevoke`] for why the decision has to come before the write.
+    ///
+    /// A rule the request names twice is revoked once, and reported as unknown once: a
+    /// request cannot remove one rule two times, and a repeat is not a second rule the
+    /// group fails to hold either.
+    ///
+    /// One hash lookup per requested rule, against the group's rules and against the rules
+    /// the request has already named, so a caller-sized batch costs time proportional to
+    /// the batch (see [`SecurityGroupRuleKey`]).
+    pub fn plan_security_group_revoke(
+        &self,
+        group_id: &str,
+        is_egress: bool,
+        requested: &[SecurityGroupRuleAtom],
+    ) -> SecurityGroupRevoke {
+        let held = self.held_security_group_rules(group_id, is_egress);
+        // The group's own rules by identity, each remembered by the id it is stored under.
+        // First one wins: a store that somehow held one rule twice still has one rule to
+        // revoke.
+        let mut by_identity: HashMap<SecurityGroupRuleKey, &str> =
+            HashMap::with_capacity(held.len());
+        for (rule_id, atom) in &held {
+            by_identity.entry(atom.identity()).or_insert(rule_id);
+        }
+        let mut named: HashSet<SecurityGroupRuleKey> = HashSet::with_capacity(requested.len());
+        let mut plan = SecurityGroupRevoke::default();
+        for want in requested {
+            let identity = want.identity();
+            if !named.insert(identity.clone()) {
+                continue;
+            }
+            match by_identity.get(&identity) {
+                Some(rule_id) => plan.revoked.push((*rule_id).to_string()),
+                None => plan.unknown.push(want.clone()),
+            }
+        }
+        plan
+    }
+
+    /// Remove the stored rules `rule_ids` names, and answer them as they were last reported.
+    ///
+    /// The rules are the resources, so a revoke removes the RECORDS, and the bytes each one
+    /// was charged go back to the store's budget on the terms they were taken on — the same
+    /// terms [`Self::remove_security_group`] releases a group's rules on. Every group a rule
+    /// was removed from is then resynced, so the aggregate `IpPermissions`
+    /// `DescribeSecurityGroups` reports cannot disagree with the rules that are left.
+    pub fn remove_security_group_rules(&mut self, rule_ids: &[String]) -> Vec<SecurityGroupRule> {
+        let mut removed: Vec<SecurityGroupRule> = Vec::with_capacity(rule_ids.len());
+        let mut groups: Vec<String> = Vec::new();
+        for rule_id in rule_ids {
+            let Some(record) = self.security_group_rules.remove(rule_id) else {
+                continue;
+            };
+            self.release_stored_bytes(record.payload_bytes);
+            if let Some(group_id) = record.rule.group_id.clone() {
+                if !groups.contains(&group_id) {
+                    groups.push(group_id);
+                }
+            }
+            removed.push(record.rule);
+        }
+        for group_id in &groups {
+            self.resync_security_group_permissions(group_id);
+        }
+        removed
+    }
 }
 
 /// The caller-chosen bytes one stored security group holds: its name, description and
@@ -4212,6 +4337,346 @@ pub fn allow_all_egress() -> IpPermission {
         ipv6_ranges: Some(Vec::new()),
         prefix_list_ids: Some(Vec::new()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Security group RULE IDENTITY
+// ---------------------------------------------------------------------------
+//
+// A group's rules are stored as RECORDS of their own ([`SecurityGroupRuleRecord`], keyed by
+// the `SecurityGroupRuleId` the store mints), while a group's `IpPermissions` lists are the
+// AGGREGATE view [`ComAmazonawsEc2Amazonec2State::resync_security_group_permissions`]
+// recomputes from them. One `IpPermission` therefore stands for SEVERAL rules: its
+// `IpRanges`, `Ipv6Ranges`, `PrefixListIds` and `UserIdGroupPairs` each name one SOURCE, and
+// AWS counts ONE RULE PER SOURCE — "each rule has a protocol, from and to ports, and source
+// (CIDR range, security group, or prefix list)" (`RevokeSecurityGroupIngress`).
+//
+// So a request that names rules by their PROPERTIES names them in the unit a stored record
+// holds: one rule, a [`SecurityGroupRuleAtom`]. The record is the stored form, the permission
+// is the reporting form, and the atom is the IDENTITY form — the one in which "the values
+// that you specify … must match the existing rule's values exactly" is a single comparison.
+// Keeping that translation here, once, is what stops the ingress and the egress path from
+// reading one stored rule two different ways.
+
+/// Where a security group rule's traffic comes from (an inbound rule) or goes to (an
+/// outbound rule): exactly ONE of the four sources an [`IpPermission`] can name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SecurityGroupRuleSource {
+    /// An IPv4 CIDR block (`IpRange$CidrIp`).
+    Ipv4(String),
+    /// An IPv6 CIDR block (`Ipv6Range$CidrIpv6`).
+    Ipv6(String),
+    /// A prefix list (`PrefixListId$PrefixListId`).
+    PrefixList(String),
+    /// Another security group: its id where one is known, and otherwise the name the
+    /// request or the stored pair carries — "for a security group in a nondefault VPC, use
+    /// the security group ID" (`UserIdGroupPair$GroupName`), so a name is the default-VPC
+    /// form of the same source and is resolved to an id before it is matched.
+    ReferencedGroup(String),
+}
+
+/// ONE security group rule: a protocol, a port range and exactly one source.
+///
+/// The form a request NAMES a rule in and the form a stored rule is matched in, so "the
+/// values that you specify … must match the existing rule's values exactly"
+/// (`RevokeSecurityGroupIngress`) is one comparison — of [`Self::identity`] — rather than a
+/// member-by-member walk at every call site. Deliberately NOT `PartialEq`: a rule's
+/// IDENTITY leaves the description out, so an `==` that compared it would be a second,
+/// quieter answer to the one question this type exists to answer.
+#[derive(Debug, Clone)]
+pub struct SecurityGroupRuleAtom {
+    /// The protocol, canonical: see [`canonical_ip_protocol`].
+    pub ip_protocol: String,
+    /// The start of the port range, for the protocols that carry one.
+    pub from_port: Option<i32>,
+    /// The end of the port range, for the protocols that carry one.
+    pub to_port: Option<i32>,
+    /// What the rule allows traffic from (inbound) or to (outbound).
+    pub source: SecurityGroupRuleSource,
+    /// The rule's description, which is NOT part of its identity (see
+    /// [`SecurityGroupRuleKey`]).
+    pub description: Option<String>,
+}
+
+impl SecurityGroupRuleAtom {
+    /// One rule, with its protocol and its source read into the canonical form a stored rule
+    /// carries them in ([`canonical_ip_protocol`], [`canonical_rule_source`]), so a request
+    /// that spells either differently still names the same rule.
+    ///
+    /// The port range is kept exactly as given — a rule's ports are values a request "must
+    /// match … exactly" (`RevokeSecurityGroupIngress`), so neither end is dropped or
+    /// defaulted for any protocol.
+    pub fn new(
+        ip_protocol: Option<&str>,
+        from_port: Option<i32>,
+        to_port: Option<i32>,
+        source: SecurityGroupRuleSource,
+        description: Option<String>,
+    ) -> Self {
+        let ip_protocol = canonical_ip_protocol(ip_protocol.unwrap_or(ALL_IP_PROTOCOLS).trim());
+        Self {
+            ip_protocol,
+            from_port,
+            to_port,
+            source: canonical_rule_source(source),
+            description,
+        }
+    }
+
+    /// The rule a stored record holds, as the atom its identity is read in.
+    ///
+    /// The one translation from the STORED form to the identity form: a stored rule names
+    /// exactly one source, and a referenced group is named by the id the rule carries where
+    /// there is one and otherwise by the name its grant used
+    /// (`SecurityGroupRuleRecord::referenced_group_name`), the two spellings of one source.
+    pub fn of_stored_rule(record: &SecurityGroupRuleRecord) -> Option<Self> {
+        let rule = &record.rule;
+        let source = if let Some(cidr) = rule.cidr_ipv4.as_deref().filter(|it| !it.is_empty()) {
+            SecurityGroupRuleSource::Ipv4(cidr.to_string())
+        } else if let Some(cidr) = rule.cidr_ipv6.as_deref().filter(|it| !it.is_empty()) {
+            SecurityGroupRuleSource::Ipv6(cidr.to_string())
+        } else if let Some(prefix_list_id) = rule
+            .prefix_list_id
+            .as_deref()
+            .filter(|it| !it.is_empty())
+        {
+            SecurityGroupRuleSource::PrefixList(prefix_list_id.to_string())
+        } else {
+            let named = rule
+                .referenced_group_info
+                .as_ref()
+                .and_then(|referenced| referenced.group_id.as_deref())
+                .or(record.referenced_group_name.as_deref())
+                .filter(|named| !named.is_empty())?;
+            SecurityGroupRuleSource::ReferencedGroup(named.to_string())
+        };
+        Some(Self::new(
+            rule.ip_protocol.as_deref(),
+            rule.from_port,
+            rule.to_port,
+            source,
+            rule.description.clone(),
+        ))
+    }
+
+    /// This rule's IDENTITY as a hashable key: see [`SecurityGroupRuleKey`]. The ONE way
+    /// to ask whether two rules are the same rule — `left.identity() == right.identity()`
+    /// — so there is no second, quieter comparison beside it.
+    ///
+    /// The description is deliberately left out — "if the security group rule has a
+    /// description, you do not need to specify the description to revoke the rule"
+    /// (`RevokeSecurityGroupIngress`).
+    pub fn identity(&self) -> SecurityGroupRuleKey {
+        SecurityGroupRuleKey {
+            ip_protocol: self.ip_protocol.clone(),
+            from_port: self.from_port,
+            to_port: self.to_port,
+            source: self.source.clone(),
+        }
+    }
+}
+
+/// What makes one security group rule the rule it is: its protocol, its port range and its
+/// source — and NOT its description, which "you do not need to specify … to revoke the
+/// rule" (`RevokeSecurityGroupIngress`).
+///
+/// A KEY rather than a predicate so a request's rules can be matched against a group's by
+/// hash lookup: the work a request of N rules costs then grows with N rather than with
+/// N times the rules the group holds, which is what keeps a caller-sized batch from costing
+/// quadratic time (the batch itself is capped by the handler, at
+/// [`MAX_RESOURCE_IDS`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SecurityGroupRuleKey {
+    ip_protocol: String,
+    from_port: Option<i32>,
+    to_port: Option<i32>,
+    source: SecurityGroupRuleSource,
+}
+
+/// `source` in the form a stored rule carries it: a CIDR block with its host bits cleared
+/// and rendered the one way the standard library renders an address — the form
+/// [`canonical_security_group_cidr`] stores a grant's range in — so two spellings of one
+/// block are one source. A value that is not a CIDR block at all is kept as given: it
+/// matches no stored rule, which is the answer a request naming it has earned.
+fn canonical_rule_source(source: SecurityGroupRuleSource) -> SecurityGroupRuleSource {
+    match source {
+        SecurityGroupRuleSource::Ipv4(cidr) => SecurityGroupRuleSource::Ipv4(
+            canonical_security_group_cidr(&cidr).unwrap_or_else(|_| cidr.trim().to_string()),
+        ),
+        SecurityGroupRuleSource::Ipv6(cidr) => SecurityGroupRuleSource::Ipv6(
+            canonical_ipv6_cidr(&cidr)
+                .unwrap_or_else(|_| cidr.trim().to_string())
+                .to_ascii_lowercase(),
+        ),
+        other => other,
+    }
+}
+
+/// The rules one [`IpPermission`] names — one per source — whether it came off a stored
+/// group or out of a request.
+///
+/// A permission that names no source at all names no rule, so it yields nothing: every
+/// security group rule has a source.
+pub fn security_group_rule_atoms(permission: &IpPermission) -> Vec<SecurityGroupRuleAtom> {
+    let protocol = permission.ip_protocol.as_deref();
+    let from_port = permission.from_port;
+    let to_port = permission.to_port;
+    let mut atoms = Vec::new();
+    let mut push = |source: SecurityGroupRuleSource, description: Option<String>| {
+        atoms.push(SecurityGroupRuleAtom::new(
+            protocol,
+            from_port,
+            to_port,
+            source,
+            description,
+        ));
+    };
+    for range in permission.ip_ranges.iter().flatten() {
+        if let Some(cidr) = range.cidr_ip.as_deref() {
+            push(
+                SecurityGroupRuleSource::Ipv4(cidr.to_string()),
+                range.description.clone(),
+            );
+        }
+    }
+    for range in permission.ipv6_ranges.iter().flatten() {
+        if let Some(cidr) = range.cidr_ipv6.as_deref() {
+            push(
+                SecurityGroupRuleSource::Ipv6(cidr.to_string()),
+                range.description.clone(),
+            );
+        }
+    }
+    for entry in permission.prefix_list_ids.iter().flatten() {
+        if let Some(prefix_list_id) = entry.prefix_list_id.as_deref() {
+            push(
+                SecurityGroupRuleSource::PrefixList(prefix_list_id.to_string()),
+                entry.description.clone(),
+            );
+        }
+    }
+    for pair in permission.user_id_group_pairs.iter().flatten() {
+        // The id where the pair carries one, the name otherwise: the two are the
+        // nondefault-VPC and the default-VPC way of naming one group
+        // (`UserIdGroupPair$GroupName`).
+        let named = pair
+            .group_id
+            .as_deref()
+            .or(pair.group_name.as_deref())
+            .filter(|named| !named.is_empty());
+        if let Some(named) = named {
+            push(
+                SecurityGroupRuleSource::ReferencedGroup(named.to_string()),
+                pair.description.clone(),
+            );
+        }
+    }
+    atoms
+}
+
+/// The resource-id prefix a security group rule id carries, as the API Reference's own
+/// rule ids read (`sgr-0123456789abcdef0`): the prefix alone, without the separator, which
+/// is what [`prefixed_id_is_well_formed`] and [`require_well_formed_id`] read an id against
+/// ([`ROUTE_SERVER_ID_PREFIX`] is spelled the same way). The same prefix
+/// [`ComAmazonawsEc2Amazonec2State::insert_security_group_rule`] mints a stored rule's id
+/// under, so an id a request names is read against the form the store issues.
+pub const SECURITY_GROUP_RULE_ID_PREFIX: &str = "sgr";
+
+/// A stored rule as the [`RevokedSecurityGroupRule`] a revoke reports it with: "details
+/// about the revoked security group rules" (`RevokeSecurityGroupIngressResult`).
+///
+/// Every member is the STORED rule's own — including the id the store minted for it — so a
+/// revoke reports the rule it removed rather than a reading of the request that named it.
+pub fn revoked_security_group_rule(rule: &SecurityGroupRule) -> RevokedSecurityGroupRule {
+    RevokedSecurityGroupRule {
+        security_group_rule_id: rule.security_group_rule_id.clone(),
+        group_id: rule.group_id.clone(),
+        is_egress: rule.is_egress,
+        ip_protocol: rule.ip_protocol.clone(),
+        from_port: rule.from_port,
+        to_port: rule.to_port,
+        description: rule.description.clone(),
+        cidr_ipv4: rule.cidr_ipv4.clone(),
+        cidr_ipv6: rule.cidr_ipv6.clone(),
+        prefix_list_id: rule.prefix_list_id.clone(),
+        referenced_group_id: rule
+            .referenced_group_info
+            .as_ref()
+            .and_then(|referenced| referenced.group_id.clone()),
+    }
+}
+
+/// The rule `atom` as an [`IpPermission`] of its own — one rule, one source — which is how
+/// a revoke reports the rules it did not find: "in some cases, `unknownIpPermissionSet`
+/// might be in a different format from the request parameter"
+/// (`RevokeSecurityGroupIngressResult$UnknownIpPermissions`).
+pub fn ip_permission_for_rule(atom: &SecurityGroupRuleAtom) -> IpPermission {
+    let mut permission = IpPermission {
+        ip_protocol: Some(atom.ip_protocol.clone()),
+        from_port: atom.from_port,
+        to_port: atom.to_port,
+        user_id_group_pairs: Some(Vec::new()),
+        ip_ranges: Some(Vec::new()),
+        ipv6_ranges: Some(Vec::new()),
+        prefix_list_ids: Some(Vec::new()),
+    };
+    match &atom.source {
+        SecurityGroupRuleSource::Ipv4(cidr) => {
+            permission.ip_ranges = Some(vec![IpRange {
+                description: atom.description.clone(),
+                cidr_ip: Some(cidr.clone()),
+            }]);
+        }
+        SecurityGroupRuleSource::Ipv6(cidr) => {
+            permission.ipv6_ranges = Some(vec![Ipv6Range {
+                description: atom.description.clone(),
+                cidr_ipv6: Some(cidr.clone()),
+            }]);
+        }
+        SecurityGroupRuleSource::PrefixList(prefix_list_id) => {
+            permission.prefix_list_ids = Some(vec![PrefixListId {
+                description: atom.description.clone(),
+                prefix_list_id: Some(prefix_list_id.clone()),
+            }]);
+        }
+        SecurityGroupRuleSource::ReferencedGroup(named) => {
+            // A source group is named by id where the request named one or the name
+            // resolved to one, and by NAME where it did not — "[Default VPC] The name of
+            // the source security group" (`UserIdGroupPair$GroupName`) is the member for
+            // that, so an unresolved name is reported there rather than as an id no group
+            // of the account answers to.
+            let by_id = security_group_id_is_well_formed(named);
+            permission.user_id_group_pairs = Some(vec![UserIdGroupPair {
+                description: atom.description.clone(),
+                user_id: Some(::engine::emulator_account_id().to_string()),
+                group_name: (!by_id).then(|| named.clone()),
+                group_id: by_id.then(|| named.clone()),
+                vpc_id: None,
+                vpc_peering_connection_id: None,
+                peering_status: None,
+            }]);
+        }
+    }
+    permission
+}
+
+/// What revoking a set of rules from one security group would do: the stored rules the
+/// request named, and the rules the group does not hold.
+///
+/// Answered BEFORE anything is written, because the two kinds of VPC part company on the
+/// second list: "for a default VPC, if the values you specify do not match the existing
+/// rule's values, no error is returned, and the output describes the security group rules
+/// that were not revoked. For a non-default VPC … an `InvalidPermission.NotFound` client
+/// error is returned, and no rules are revoked" (`RevokeSecurityGroupIngress`).
+#[derive(Debug, Clone, Default)]
+pub struct SecurityGroupRevoke {
+    /// The `SecurityGroupRuleId` of each rule the group holds and the request named, in the
+    /// order the request named them — the ids
+    /// [`ComAmazonawsEc2Amazonec2State::remove_security_group_rules`] takes, so what gets
+    /// reported is the STORED rule rather than a reading of the request.
+    pub revoked: Vec<String>,
+    /// The rules the request named that the group does not hold.
+    pub unknown: Vec<SecurityGroupRuleAtom>,
 }
 
 /// One stored security group rule: the modelled [`SecurityGroupRule`] every operation that
@@ -12371,6 +12836,20 @@ pub const MAX_SUBNETS: usize = 4_096;
 /// codes).
 pub const SUBNET_LIMIT_EXCEEDED: &str = "SubnetLimitExceeded";
 
+/// The largest number of IPv6 CIDR block association records this store keeps for ONE
+/// subnet.
+///
+/// A capacity bound in the style of [`MAX_SUBNETS`], not an AWS quota. "You can only
+/// associate a single IPv6 CIDR block with your subnet" (`AssociateSubnetCidrBlock`), so a
+/// subnet HOLDS one block at a time and this ceiling is never the rule a well-formed
+/// request meets; it bounds the association RECORDS one subnet's set can grow to — a block
+/// it still holds, plus any a later disassociation leaves behind to be reported — so a
+/// caller looping over the associate cannot grow one subnet's record without bound even if
+/// a writer forgets to ask.
+/// [`ComAmazonawsEc2Amazonec2State::has_subnet_ipv6_association_capacity`] is the predicate
+/// a writer asks before associating.
+pub const MAX_IPV6_ASSOCIATIONS_PER_SUBNET: usize = 4;
+
 /// The largest number of DHCP option sets this in-memory store holds.
 ///
 /// A capacity bound in the style of [`MAX_VPCS`], not an AWS quota: this store mints one
@@ -14760,6 +15239,91 @@ pub fn security_group_limit_exceeded<E>() -> Scaffolded<E> {
     )
 }
 
+/// The id of the security group a request names, whether it named it by `GroupId` or by
+/// `GroupName`.
+///
+/// The ONE place the rule every operation that accepts both members follows is written:
+/// "you can specify either the security group name or the security group ID"
+/// (`DeleteSecurityGroupRequest$GroupName`), and a NAME only names a group of the DEFAULT
+/// VPC — "for security groups in a nondefault VPC, you must specify the security group ID"
+/// — because a name is unique per VPC and not per account. Both members together have to
+/// name the SAME group: honouring the id and ignoring a name that disagrees would act on a
+/// group the request did not ask for.
+///
+/// Whether the account still HOLDS a group named by id ALONE is the caller's question to
+/// ask, so such an id is returned unchecked: an operation that needs the group refuses an
+/// unknown one with [`invalid_group_not_found`] itself. An id given BESIDE a name is looked
+/// up here, because the two can only be checked against each other through the stored
+/// group, and an id no group answers to is "no such group" rather than a complaint about
+/// the parameter pair.
+pub fn resolve_security_group_id<E>(
+    store: &mut ComAmazonawsEc2Amazonec2State,
+    region: &str,
+    group_id: Option<&str>,
+    group_name: Option<&str>,
+) -> Result<String, Scaffolded<E>> {
+    match (group_id, group_name) {
+        (None, None) => Err(missing_parameter(
+            "The request must contain either the parameter GroupId or GroupName",
+        )),
+        (Some(group_id), None) => Ok(group_id.to_string()),
+        (None, Some(group_name)) => {
+            // The Region's ambient default network is the account's whatever it has
+            // created, so it is materialised before a name is resolved in that VPC.
+            store.ensure_default_network(region);
+            let default_vpc = store
+                .default_vpc_id(region)
+                .ok_or_else(|| invalid_group_not_found(group_name))?;
+            store
+                .security_group_id_for_name(&default_vpc, group_name)
+                .ok_or_else(|| invalid_group_not_found(group_name))
+        }
+        (Some(group_id), Some(group_name)) => {
+            let Some(group) = store.security_groups.get(group_id) else {
+                // An id this account holds no group for is "no such group", whatever name
+                // the request put beside it: a caller that named a group that is gone has
+                // to read that, not a complaint about its parameters.
+                return Err(invalid_group_not_found(group_id));
+            };
+            if !group
+                .group_name
+                .as_deref()
+                .is_some_and(|held| held.eq_ignore_ascii_case(group_name))
+            {
+                return Err(invalid_parameter_combination(format!(
+                    "The security group '{group_id}' is not named '{group_name}'"
+                )));
+            }
+            Ok(group_id.to_string())
+        }
+    }
+}
+
+/// EC2's error code for a security group rule a request named that the group does not
+/// hold: "InvalidPermission.NotFound — The specified permission does not exist" (EC2 API
+/// error codes).
+pub const INVALID_PERMISSION_NOT_FOUND: &str = "InvalidPermission.NotFound";
+
+/// Refuse a revoke whose rule the group does not hold: HTTP 400
+/// [`INVALID_PERMISSION_NOT_FOUND`], and nothing is revoked.
+///
+/// "For a non-default VPC, if the values you specify do not match the existing rule's
+/// values, an `InvalidPermission.NotFound` client error is returned, and no rules are
+/// revoked" (`RevokeSecurityGroupIngress`). The message names no rule of the request: the
+/// refusal is about the group's rule SET, and the documented wording for this code is "the
+/// specified rule does not exist in this security group".
+pub fn invalid_permission_not_found<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PERMISSION_NOT_FOUND,
+        400,
+        "The specified rule does not exist in this security group.",
+    )
+}
+
+/// EC2's error code for a value that is not a security group rule id at all (EC2 API error
+/// codes, "InvalidSecurityGroupRuleId.Malformed").
+pub const INVALID_SECURITY_GROUP_RULE_ID_MALFORMED: &str = "InvalidSecurityGroupRuleId.Malformed";
+
 // ---------------------------------------------------------------------------
 // Security group rules
 // ---------------------------------------------------------------------------
@@ -14907,9 +15471,23 @@ pub fn vpc_payload_bytes(vpc: &Vpc) -> usize {
     tag_list_bytes(vpc.tags.as_deref().unwrap_or_default()).saturating_add(ipv6_bytes)
 }
 
+/// What ONE of a subnet's IPv6 CIDR block associations costs the store's byte budget: the
+/// fixed [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, plus the block string
+/// the caller chose.
+///
+/// The ONE definition of that charge, so the writer that takes it
+/// ([`ComAmazonawsEc2Amazonec2State::associate_subnet_ipv6_cidr_block`]) and
+/// [`subnet_payload_bytes`], which gives it back, cannot disagree — and so a loop of
+/// associate calls carrying a short block cannot be nearly free against
+/// [`MAX_STORED_BYTES`] while each stored association, its minted id and its state retain
+/// far more.
+pub fn subnet_ipv6_association_payload_bytes(ipv6_cidr_block: &str) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES.saturating_add(ipv6_cidr_block.len())
+}
+
 /// The caller-chosen bytes a stored subnet retains: its tags, which is what
-/// [`ComAmazonawsEc2Amazonec2State::insert_subnet`] charged, plus the IPv6 block an
-/// association holds, which is what
+/// [`ComAmazonawsEc2Amazonec2State::insert_subnet`] charged, plus what each IPv6
+/// association costs ([`subnet_ipv6_association_payload_bytes`]), which is what
 /// [`ComAmazonawsEc2Amazonec2State::associate_subnet_ipv6_cidr_block`] charged — so
 /// [`ComAmazonawsEc2Amazonec2State::remove_subnet`] gives back exactly what was taken,
 /// the same arrangement [`vpc_payload_bytes`] has for a VPC.
@@ -14918,7 +15496,11 @@ pub fn subnet_payload_bytes(subnet: &Subnet) -> usize {
         .ipv6_cidr_block_association_set
         .iter()
         .flatten()
-        .map(|association| association.ipv6_cidr_block.as_deref().map_or(0, str::len))
+        .map(|association| {
+            subnet_ipv6_association_payload_bytes(
+                association.ipv6_cidr_block.as_deref().unwrap_or_default(),
+            )
+        })
         .sum();
     tag_list_bytes(subnet.tags.as_deref().unwrap_or_default()).saturating_add(ipv6_bytes)
 }

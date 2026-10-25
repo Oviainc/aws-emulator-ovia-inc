@@ -32,36 +32,13 @@
 //!   which reaches a LIST's elements as constrained leaves.
 
 use crate::harness::{
-    call, create_tagged_resource, expected_tags, pair, past_the_transition_span, percent_encode,
-    read_resource, router, tags_of, tags_path, unresolvable_arns, TAGGABLE_KINDS,
+    call, create_tagged_resource, expected_tags, pair, past_the_transition_span, read_resource,
+    router, tags_of, unresolvable_arns, untag_resource, TAGGABLE_KINDS,
 };
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
     reserved_tag_key_message, NOT_FOUND_MESSAGE, RESERVED_TAG_KEY_PREFIX, TAG_KEY_MAX_LENGTH,
 };
-use smithy_server_runtime::MultiServiceRouter;
-
-/// `DELETE /v1/tags/{resourceArn}?tagKeys=…`.
-///
-/// `tagKeys` is an `@httpQuery` bound to a list, so a client repeats the parameter once
-/// per key, each value percent-encoded.
-async fn untag_resource(
-    router: &MultiServiceRouter,
-    resource_arn: &str,
-    tag_keys: &[String],
-) -> (u16, Value) {
-    assert!(
-        !tag_keys.is_empty(),
-        "tagKeys is @required, so every request under test names at least one key"
-    );
-    let query = tag_keys
-        .iter()
-        .map(|key| format!("tagKeys={}", percent_encode(key)))
-        .collect::<Vec<String>>()
-        .join("&");
-    let uri = format!("{}?{query}", tags_path(resource_arn));
-    call(router, "DELETE", &uri, None).await
-}
 
 /// The keys of a tag set, for a row that deletes every key a resource holds.
 fn keys_of(tags: &[(String, String)]) -> Vec<String> {

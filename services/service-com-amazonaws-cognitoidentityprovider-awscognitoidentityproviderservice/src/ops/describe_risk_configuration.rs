@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRiskConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRiskConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRiskConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the threat-protection (risk) configuration stored at the level the
+//! request names — one user pool, or one app client of it — rendered from what is
+//! stored, and refuses a pool that carries no threat-protection surface at all. A
+//! read: this operation writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +164,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRiskConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRiskConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRiskConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // A read: this handler takes the lock to READ and writes nothing.
+        let guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // Threat protection is a surface the pool's add-ons carry: this operation
+        // describes the risk configuration "given an app client or user pool ID
+        // where threat protection is configured", and it models
+        // `UserPoolAddOnNotEnabledException` for the pool where it is not. A pool
+        // whose add-ons are off has no threat-protection surface to report, so it
+        // is refused rather than answered with an empty configuration. Asked AFTER
+        // the lookup, so a request that names no pool is a 404 whatever the pool it
+        // named would have reported.
+        if !pool.add_ons_enabled() {
+            return Err(add_ons_not_enabled());
+        }
+
+        // "Specify ClientId to inspect client-level configuration, or UserPoolId
+        // to inspect pool-level configuration": what is reported is the
+        // configuration stored at the level the request names. A level nothing
+        // has configured holds no setting and no modification instant, so it is
+        // reported as itself alone — `RiskConfiguration` is a modelled REQUIRED
+        // member of this response, so the level is always named.
+        let stored = match input.client_id.as_deref() {
+            Some(client_id) => {
+                let client = pool
+                    .clients
+                    .get(client_id)
+                    .ok_or_else(|| client_not_found(client_id))?;
+                match client.risk_configuration.as_ref() {
+                    Some(configuration) => configuration
+                        .to_risk_configuration_type(&input.user_pool_id, Some(client_id)),
+                    None => crate::state::unconfigured_risk_configuration_type(
+                        &input.user_pool_id,
+                        Some(client_id),
+                    ),
+                }
+            }
+            None => match pool.risk_configuration.as_ref() {
+                Some(configuration) => {
+                    configuration.to_risk_configuration_type(&input.user_pool_id, None)
+                }
+                None => {
+                    crate::state::unconfigured_risk_configuration_type(&input.user_pool_id, None)
+                }
+            },
+        };
+
+        Ok(DescribeRiskConfigurationOutput {
+            risk_configuration: stored,
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> DescribeRiskConfigurationError {
+    DescribeRiskConfigurationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an app client the named pool
+/// does not hold.
+fn client_not_found(client_id: &str) -> DescribeRiskConfigurationError {
+    DescribeRiskConfigurationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's refusal on a pool whose user pool add-ons are off, so it
+/// carries no threat-protection surface to describe.
+fn add_ons_not_enabled() -> DescribeRiskConfigurationError {
+    DescribeRiskConfigurationErrorModeled::UserPoolAddOnNotEnabledException(
+        UserPoolAddOnNotEnabledException {
+            message: Some(crate::state::USER_POOL_ADD_ONS_NOT_ENABLED_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> DescribeRiskConfigurationError {
+    DescribeRiskConfigurationErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

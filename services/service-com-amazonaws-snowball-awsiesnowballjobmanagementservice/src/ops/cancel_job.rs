@@ -4,7 +4,8 @@
 //!
 //! Moves a stored job to `JobState` `Cancelled`, which a later `DescribeJob` or
 //! `ListJobs` observes. Cancelling the main job of an export order cancels its job parts
-//! with it.
+//! with it, and cancelling a cluster's node job leaves that cluster one node short of the
+//! quorum it ships with, which a later `DescribeCluster` observes.
 //!
 //! ## Shape of an operation
 //!
@@ -183,12 +184,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let order: Vec<String> = ::std::iter::once(input.job_id.clone())
             .chain(job.job_part_ids.iter().cloned())
             .collect();
+        let mut cancelled_clusters: Vec<String> = Vec::new();
         for job_id in order {
             if let Some(job) = store.jobs.get_mut(&job_id) {
                 if job.job_state.is_cancellable() {
                     job.job_state = crate::state::JobState::Cancelled;
+                    if let Some(cluster_id) = job.cluster_id.clone() {
+                        if !cancelled_clusters.contains(&cluster_id) {
+                            cancelled_clusters.push(cluster_id);
+                        }
+                    }
                 }
             }
+        }
+
+        // A cancelled node is not a node its cluster will ship with: "Each cluster
+        // supports five nodes … The cluster does not ship until these five node jobs have
+        // been created" (`CreateCluster`), and `ClusterLimitExceededException` names the
+        // replacement — "If you have fewer than five nodes for your cluster and you have
+        // more nodes to create for this cluster, try again and create jobs until your
+        // cluster has exactly five nodes". So the cluster is a node short again: its
+        // quorum-driven state goes back to awaiting the node it lost, which is what makes
+        // the replacement `CreateJob` the error describes possible.
+        for cluster_id in cancelled_clusters {
+            store.refresh_cluster_quorum_state(&cluster_id);
         }
 
         Ok(CancelJobOutput {})

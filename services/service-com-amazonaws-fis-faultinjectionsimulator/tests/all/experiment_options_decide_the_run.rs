@@ -85,10 +85,13 @@ const ACCOUNT_ID: &str = "000000000000";
 const ACTIVE_EXPERIMENTS_QUOTA: usize = 5;
 
 /// A target identified by ARN: this emulator resolves it to the resource it names.
+///
+/// `aws:iam:role` is the resource type the api-fault family of actions takes under its
+/// `Roles` target key, so this is a target those actions may name.
 fn named_target() -> Value {
     json!({
-        "resourceType": "aws:ec2:instance",
-        "resourceArns": ["arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0"],
+        "resourceType": "aws:iam:role",
+        "resourceArns": ["arn:aws:iam::000000000000:role/fis-targeted"],
         "selectionMode": "ALL"
     })
 }
@@ -98,7 +101,7 @@ fn named_target() -> Value {
 /// `emptyTargetResolutionMode` decides about.
 fn tagged_target() -> Value {
     json!({
-        "resourceType": "aws:ec2:instance",
+        "resourceType": "aws:iam:role",
         "resourceTags": { "Stage": "test" },
         "selectionMode": "ALL"
     })

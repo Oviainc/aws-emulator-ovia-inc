@@ -98,6 +98,8 @@ fn object(body: &[u8]) -> Object {
         version_id: None,
         // A write places no Object Lock retention; `PutObjectRetention` is what does.
         retention: None,
+        // Nor a legal hold; `PutObjectLegalHold` is what applies one.
+        legal_hold: None,
         // A write initiates no restore either; `RestoreObject` is what does.
         restore: None,
         // And it attaches no annotation; `PutObjectAnnotation` is what does.

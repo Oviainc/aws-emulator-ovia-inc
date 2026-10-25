@@ -486,6 +486,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // The lens reviews the created workload carries: one per associated lens, each
+        // against the version that lens's content is published as right now, exactly as a
+        // review template's lens reviews are pinned when a lens is applied to it. Resolved
+        // from the one place that rule lives
+        // (`crate::state::applied_workload_lens_reviews`), as of the same instant the
+        // lenses were resolved against the catalog above.
+        let lens_reviews = store.applied_workload_lens_reviews(&lenses, now);
+
         let workload_id = store.mint_workload_id();
         let record = crate::state::WorkloadRecord {
             workload_arn: ::engine::emulator_arn(
@@ -497,7 +505,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workload_name: input.workload_name,
             description: input.description,
             environment: input.environment,
-            updated_at: std::time::SystemTime::now(),
+            updated_at: now,
             account_ids,
             aws_regions,
             non_aws_regions,
@@ -525,10 +533,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new workload's lens reviews carry no answers yet: every question of
             // every attached lens is UNANSWERED until one is recorded.
             answers: std::collections::BTreeMap::new(),
-            // Nor has anything been written to those reviews: a review carries the notes
-            // and the Jira question selection `UpdateLensReview` records, and no caller
-            // has recorded any against a workload being created.
-            lens_review_records: std::collections::BTreeMap::new(),
+            // One review per associated lens, each against the version of that lens the
+            // association pinned above and with nothing written to it yet: a review also
+            // carries the notes and the Jira question selection `UpdateLensReview`
+            // records, and no caller has recorded any against a workload being created.
+            lens_review_records: lens_reviews,
             // The profiles the workload is reviewed against: the associations the
             // request's `ProfileArns` resolved to above, each pinned at the version its
             // profile is at. Which lens questions a profile PRIORITISES is decided by the

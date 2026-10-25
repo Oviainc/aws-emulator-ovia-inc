@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags stored on the Amazon RDS resource its `ResourceName` ARN names — the
+//! resource's OWN tag list, the one its create wrote and `AddTagsToResource` and
+//! `RemoveTagsFromResource` write, resolved through [`crate::state::tags`]. A resource
+//! carrying no tags reports an EMPTY list; an ARN naming nothing stored is that resource
+//! family's not-found fault, which is what lets a caller branch on "no such resource".
 //!
 //! ## Shape of an operation
 //!
@@ -99,25 +96,45 @@ use super::types::*;
 // `ListTagsForResourceError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-rds-amazonrdsv19.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.rds#ListTagsForResource")]
+// The operation's MODELED errors, widened with the not-found faults of the other
+// resource families whose ARNs `ResourceName` accepts — for the reason
+// `AddTagsToResource` widens the same eight in: an ARN naming a resource that does not
+// exist is that family's own not-found fault, and this operation's `errors` list names
+// only some of the families it resolves. Every one is a shape THIS SERVICE models.
+#[smithy_macros::operation_error(
+    "com.amazonaws.rds#ListTagsForResource",
+    extra_errors = [
+        "CustomDBEngineVersionNotFoundFault",
+        "DBClusterParameterGroupNotFoundFault",
+        "DBClusterSnapshotNotFoundFault",
+        "DBParameterGroupNotFoundFault",
+        "DBSubnetGroupNotFoundFault",
+        "GlobalClusterNotFoundFault",
+        "OptionGroupNotFoundFault",
+        "SubscriptionNotFoundFault"
+    ]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
     BlueGreenDeploymentNotFoundFault(BlueGreenDeploymentNotFoundFault),
+    CustomDBEngineVersionNotFoundFault(CustomDBEngineVersionNotFoundFault),
     DBCapacityReservationNotFoundFault(DBCapacityReservationNotFoundFault),
     DBClusterNotFoundFault(DBClusterNotFoundFault),
+    DBClusterParameterGroupNotFoundFault(DBClusterParameterGroupNotFoundFault),
+    DBClusterSnapshotNotFoundFault(DBClusterSnapshotNotFoundFault),
     DBInstanceNotFoundFault(DBInstanceNotFoundFault),
+    DBParameterGroupNotFoundFault(DBParameterGroupNotFoundFault),
     DBProxyEndpointNotFoundFault(DBProxyEndpointNotFoundFault),
     DBProxyNotFoundFault(DBProxyNotFoundFault),
     DBProxyTargetGroupNotFoundFault(DBProxyTargetGroupNotFoundFault),
     DBShardGroupNotFoundFault(DBShardGroupNotFoundFault),
     DBSnapshotNotFoundFault(DBSnapshotNotFoundFault),
     DBSnapshotTenantDatabaseNotFoundFault(DBSnapshotTenantDatabaseNotFoundFault),
+    DBSubnetGroupNotFoundFault(DBSubnetGroupNotFoundFault),
+    GlobalClusterNotFoundFault(GlobalClusterNotFoundFault),
     IntegrationNotFoundFault(IntegrationNotFoundFault),
+    OptionGroupNotFoundFault(OptionGroupNotFoundFault),
+    SubscriptionNotFoundFault(SubscriptionNotFoundFault),
     TenantDatabaseNotFoundFault(TenantDatabaseNotFoundFault),
 }
 
@@ -172,18 +189,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let region =
+            crate::state::request_region(ctx).map_err(ListTagsForResourceError::validation)?;
+        // `ResourceName` is "the Amazon RDS resource with tags to be listed. This value is
+        // an Amazon Resource Name (ARN)".
+        // Resolved exactly as the request gave it: an ARN is an exact identifier, so a
+        // value that is not one — whitespace and all — is refused rather than repaired.
+        let resource_name = input.resource_name.as_str();
+        // `Filters`: "This parameter isn't currently supported." — refused rather than
+        // ignored: silently dropping a filter would report tags the caller excluded.
+        if input
+            .filters
+            .as_ref()
+            .is_some_and(|filters| !filters.is_empty())
+        {
+            return Err(ListTagsForResourceError::validation(
+                "Filters isn't currently supported by ListTagsForResource",
+            ));
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot resolve the resource at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a fabricated empty tag list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — the only writing this report does,
+        // and one that was owed at this instant whether or not anybody asked.
+        store.settle_due_transitions(&region);
+
+        let target = match store.resolve_tag_target(&region, resource_name) {
+            Ok(target) => target,
+            Err(miss) => {
+                return Err(crate::tag_target_refusal!(
+                    ListTagsForResourceErrorModeled,
+                    miss
+                ))
+            }
+        };
+        let Some(tags) = store.tags_at(&target) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(format!(
+                "the resource {resource_name} resolved under this service's state lock is no \
+                 longer there"
+            )));
+        };
+
+        // "List of tags returned by the ListTagsForResource operation": what the resource
+        // really carries, in the order it carries them, and an empty list when it carries
+        // none.
+        Ok(ListTagsForResourceOutput {
+            tag_list: Some(tags.clone()),
+        })
     }
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutGroupPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutGroupPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutGroupPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +177,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutGroupPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutGroupPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutGroupPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutGroupPolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The document is embedded in "the specified IAM group", so a group the
+        // account does not hold embeds nothing.
+        let key = crate::state::name_key(&input.group_name);
+        if !store.groups.contains_key(&key) {
+            return Err(PutGroupPolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The group with name {} cannot be found.",
+                        input.group_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An IAM policy document is a JSON object whose top-level elements are
+        // `Version` and `Id` (both optional) and `Statement` (required) — the IAM
+        // JSON policy grammar. The rule itself, and the note on how far it checks,
+        // live on `crate::state::is_policy_document`, which every operation taking
+        // a policy document shares.
+        if !crate::state::is_policy_document(&input.policy_document) {
+            return Err(PutGroupPolicyErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(
+                        "Syntax errors in policy: the policy document must be a JSON object \
+                         carrying a Statement element"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The inline policies embedded in one group have a bounded aggregate size,
+        // so a caller cannot grow a group's policy set without limit. A put of an
+        // existing name replaces that document, so the one being replaced does not
+        // count toward the quota the new document has to fit inside.
+        let policy_key = crate::state::name_key(&input.policy_name);
+        let already_embedded = store.group_inline_policy_characters(&key, &policy_key);
+        let would_embed = already_embedded + input.policy_document.chars().count();
+        if would_embed > crate::state::MAX_GROUP_INLINE_POLICY_CHARACTERS {
+            return Err(PutGroupPolicyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Maximum policy size of {} characters exceeded for group {}",
+                        crate::state::MAX_GROUP_INLINE_POLICY_CHARACTERS, input.group_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Stored verbatim and keyed by the case-folded policy name, so a repeat put
+        // of that name replaces the policy rather than adding a second one.
+        store
+            .group_inline_policies
+            .entry(key)
+            .or_default()
+            .insert(
+                policy_key,
+                crate::state::InlinePolicy {
+                    policy_name: input.policy_name,
+                    policy_document: input.policy_document,
+                },
+            );
+        Ok(PutGroupPolicyOutput)
     }
 }

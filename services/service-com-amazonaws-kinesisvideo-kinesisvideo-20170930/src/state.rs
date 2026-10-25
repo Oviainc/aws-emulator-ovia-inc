@@ -9,7 +9,11 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{ChannelInfo, MediaStorageConfiguration, SingleMasterConfiguration, StreamInfo};
+use crate::ops::types::{
+    ChannelInfo, EdgeConfig, ImageGenerationConfiguration, MappedResourceConfigurationListItem,
+    MediaStorageConfiguration, NotificationConfiguration, SingleMasterConfiguration, StreamInfo,
+    StreamStorageConfiguration,
+};
 
 /// The region used when a request carries no SigV4 credential scope to read one
 /// from (an anonymous or host-routed call).
@@ -22,6 +26,32 @@ pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`STATUS_CREATING`].
 pub const STATUS_UPDATING: &str = "UPDATING";
+
+/// The `DefaultStorageTier` a stream carries when the create call named no
+/// `StreamStorageConfiguration`: `HOT`, the tier `DefaultStorageTier`'s docs describe as
+/// "Optimized for frequent access with the lowest latency and highest performance", from
+/// [`crate::ops::types::DEFAULT_STORAGE_TIER_VALUES`].
+pub const DEFAULT_STORAGE_TIER: &str = "HOT";
+
+/// `SyncStatus` values, from `smithy_query(query="shape", shape="SyncStatus")` via
+/// [`crate::ops::types::SYNC_STATUS_VALUES`]. `StartEdgeConfigurationUpdate` documents
+/// the pair this emulator moves between: "a new edge configuration will be created for
+/// the stream, and the sync status will be set to `SYNCING`. You will have to wait for
+/// the sync status to reach a terminal state such as: `IN_SYNC`, or `SYNC_FAILED`".
+pub const SYNC_STATUS_SYNCING: &str = "SYNCING";
+/// See [`SYNC_STATUS_SYNCING`].
+pub const SYNC_STATUS_IN_SYNC: &str = "IN_SYNC";
+
+/// How long a just-submitted edge configuration reports `SYNCING` before the clock owes
+/// it `IN_SYNC`.
+///
+/// `StartEdgeConfigurationUpdate` is "an asynchronous API" whose sync "time to sync can
+/// vary and depends on the connectivity of the Hub Device", so the configuration is left
+/// in a non-terminal sync status and the move to the terminal one is owed by the clock
+/// rather than performed by whoever reads it next. AWS publishes no duration for it, so
+/// this span is CHOSEN — deliberately non-zero, so a caller that describes the
+/// configuration immediately still observes `SYNCING` and the refusal it carries.
+pub const EDGE_SYNC_SPAN: Duration = Duration::from_millis(500);
 
 /// The `ChannelType` a `CreateSignalingChannel` call that names none gets: "Currently,
 /// `SINGLE_MASTER` is the only supported channel type" (`ChannelType`'s docs on
@@ -97,6 +127,34 @@ pub const MAX_SIGNALING_CHANNELS: usize = 2_500;
 /// carries is its code and its HTTP 404, and the message is an example.
 pub const CHANNEL_NOT_FOUND_MESSAGE: &str = "The requested channel is not found or not active.";
 
+/// How this service words a `ResourceNotFoundException` for a stream.
+///
+/// The stream-shaped companion of [`CHANNEL_NOT_FOUND_MESSAGE`], stated once so every
+/// stream operation words one failure one way. It is the text the real service uses,
+/// which the model does not pin: the REQUIREMENT this failure carries is its code and
+/// its HTTP 404, and the message is an example.
+pub const STREAM_NOT_FOUND_MESSAGE: &str = "The requested stream is not found or not active.";
+
+/// How this service words the `InvalidArgumentException` for a request that named
+/// NEITHER identifier of the stream it addresses. Every stream operation accepts the
+/// `StreamName`/`StreamARN` pair ("You must specify either the StreamName or the
+/// StreamARN"), so the refusal is stated once here.
+pub const STREAM_IDENTIFIER_REQUIRED_MESSAGE: &str =
+    "Either StreamName or StreamARN must be specified.";
+
+/// How this service words the `InvalidArgumentException` for a request whose
+/// `StreamName` and `StreamARN` name two different streams. The companion of
+/// [`STREAM_IDENTIFIER_REQUIRED_MESSAGE`].
+pub const STREAM_IDENTIFIER_MISMATCH_MESSAGE: &str =
+    "StreamName and StreamARN refer to different streams.";
+
+/// How this service words a `StreamEdgeConfigurationNotFoundException`: the stream
+/// exists, but no edge configuration has ever been submitted for it, which is the
+/// failure the shape is documented for ("The Exception rendered when the Amazon Kinesis
+/// Video Stream can't find a stream's edge configuration that you specified"). The
+/// requirement is the code and its HTTP 404; the message is an example.
+pub const EDGE_CONFIGURATION_NOT_FOUND_MESSAGE: &str = "No edge configuration exist for the stream";
+
 /// One Kinesis video stream, as this service persists it.
 #[derive(Debug, Clone)]
 pub struct Stream {
@@ -120,6 +178,37 @@ pub struct Stream {
     /// When the clock owes this stream the move out of `CREATING`; `None` once
     /// the status is terminal.
     pub activates_at: Option<Instant>,
+    /// The stream's notification configuration, `None` while it has none —
+    /// `UpdateNotificationConfiguration` sets it, and passing no structure "will be
+    /// deleted from the stream", i.e. puts it back to `None`.
+    pub notification_configuration: Option<NotificationConfiguration>,
+    /// The stream's image-generation configuration, under the same rule as
+    /// [`Self::notification_configuration`]: "If null, the configuration will be deleted
+    /// from the stream" (`ImageGenerationConfiguration` docs).
+    pub image_generation_configuration: Option<ImageGenerationConfiguration>,
+    /// The stream's edge configuration, `None` until a `StartEdgeConfigurationUpdate`
+    /// creates one — the state `DescribeEdgeConfiguration` reports, and whose absence is
+    /// what makes that read a `StreamEdgeConfigurationNotFoundException`.
+    pub edge: Option<EdgeConfiguration>,
+}
+
+/// One stream's edge configuration, as this service persists it.
+#[derive(Debug, Clone)]
+pub struct EdgeConfiguration {
+    /// The configuration the caller submitted, reported back unchanged.
+    pub config: EdgeConfig,
+    /// When the FIRST `StartEdgeConfigurationUpdate` created it, as Unix epoch
+    /// milliseconds; stable across later updates of the same configuration.
+    pub creation_time_millis: i64,
+    /// When the latest `StartEdgeConfigurationUpdate` rewrote it, as Unix epoch
+    /// milliseconds.
+    pub last_updated_time_millis: i64,
+    /// A `SyncStatus` value — [`SYNC_STATUS_SYNCING`] until the clock owes
+    /// [`SYNC_STATUS_IN_SYNC`].
+    pub sync_status: String,
+    /// When the clock owes this configuration the move out of `SYNCING`; `None` once the
+    /// sync status is terminal.
+    pub synced_at: Option<Instant>,
 }
 
 impl Stream {
@@ -137,6 +226,20 @@ impl Stream {
                 self.creation_time_millis,
             )),
             data_retention_in_hours: Some(self.data_retention_in_hours),
+        }
+    }
+
+    /// This record's storage half, as `DescribeStreamStorageConfiguration` reports it.
+    ///
+    /// `StreamStorageConfiguration.DefaultStorageTier` is modeled `@required`, so a
+    /// stream created without one still reports a tier: the default,
+    /// [`DEFAULT_STORAGE_TIER`].
+    pub fn to_stream_storage_configuration(&self) -> StreamStorageConfiguration {
+        StreamStorageConfiguration {
+            default_storage_tier: self
+                .default_storage_tier
+                .clone()
+                .unwrap_or_else(|| DEFAULT_STORAGE_TIER.to_string()),
         }
     }
 }
@@ -314,6 +417,12 @@ impl ComAmazonawsKinesisvideoKinesisvideo20170930State {
                 stream.activates_at = None;
                 stream.status = STATUS_ACTIVE.to_string();
             }
+            if let Some(edge) = stream.edge.as_mut() {
+                if edge.synced_at.is_some_and(|due| now >= due) {
+                    edge.synced_at = None;
+                    edge.sync_status = SYNC_STATUS_IN_SYNC.to_string();
+                }
+            }
         }
         for channel in self.signaling_channels.values_mut() {
             if channel.activates_at.is_some_and(|due| now >= due) {
@@ -321,6 +430,36 @@ impl ComAmazonawsKinesisvideoKinesisvideo20170930State {
                 channel.status = STATUS_ACTIVE.to_string();
             }
         }
+    }
+
+    /// The resources mapped to the stream `stream_arn`, as
+    /// `DescribeMappedResourceConfiguration` reports them, in sorted ARN order so a
+    /// page token resolves against a stable sequence.
+    ///
+    /// A mapping exists in exactly one direction and is held once: a signaling channel's
+    /// media-storage configuration names the stream its data is stored in ("If
+    /// `StorageStatus` is enabled, the data will be stored in the `StreamARN`
+    /// provided"), so the resources mapped TO a stream are the channels whose enabled
+    /// configuration points at it — the same records
+    /// `DescribeMediaStorageConfiguration` reports from the channel's side.
+    pub fn mapped_resources(&self, stream_arn: &str) -> Vec<MappedResourceConfigurationListItem> {
+        let mut items: Vec<MappedResourceConfigurationListItem> = self
+            .signaling_channels
+            .values()
+            .filter(|channel| channel.media_storage_status == MEDIA_STORAGE_ENABLED)
+            .filter(|channel| {
+                channel
+                    .media_storage_stream_arn
+                    .as_deref()
+                    .is_some_and(|mapped| mapped == stream_arn)
+            })
+            .map(|channel| MappedResourceConfigurationListItem {
+                r#type: arn_resource_type(&channel.channel_arn),
+                arn: Some(channel.channel_arn.clone()),
+            })
+            .collect();
+        items.sort_by(|left, right| left.arn.cmp(&right.arn));
+        items
     }
 
     /// A fresh opaque `Version` token: alphanumeric, 1..64 characters, per
@@ -504,6 +643,19 @@ pub fn stream_arn(region: &str, stream_name: &str, creation_time_millis: i64) ->
         region,
         &format!("stream/{stream_name}/{creation_time_millis}"),
     )
+}
+
+/// The resource TYPE an ARN names: the first segment of its resource field, upper-cased
+/// — `channel/<name>/<millis>` is a `CHANNEL`, `stream/<name>/<millis>` a `STREAM`.
+///
+/// `MappedResourceConfigurationListItem.Type` is modeled as a plain string ("The type of
+/// the associated resource for the kinesis video stream") with no enumerated values, so
+/// the type reported for a mapped resource is READ OFF that resource's own ARN rather
+/// than chosen per operation. `None` for a string that carries no resource field.
+fn arn_resource_type(arn: &str) -> Option<String> {
+    let resource = arn.splitn(6, ':').nth(5)?;
+    let kind = resource.split('/').next()?;
+    (!kind.is_empty()).then(|| kind.to_ascii_uppercase())
 }
 
 /// The `ChannelARN` of a signaling channel, in the one form the modeled `@pattern`

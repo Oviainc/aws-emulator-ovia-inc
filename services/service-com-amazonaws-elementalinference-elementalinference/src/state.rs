@@ -1519,11 +1519,18 @@ pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
 /// Whether `key` lies in the namespace [`RESERVED_TAG_KEY_PREFIX`] reserves.
 ///
-/// The prefix is reserved at the START of a key, and a tag key is case-sensitive, so a
-/// key that merely contains the prefix further along, or carries it in another case, is
-/// a key of the caller's own namespace and is stored like any other.
+/// The prefix is reserved at the START of a key and the namespace is claimed whatever
+/// LETTER CASE the prefix arrives in, so a key whose leading characters are that prefix
+/// ignoring case asks for an AWS-generated tag and is refused. A key that merely
+/// contains the prefix further along, or begins with its letters without the separator,
+/// is a key of the caller's own namespace and is stored like any other.
+///
+/// Case is ignored only in deciding WHICH namespace a key claims: a tag key is still
+/// case-sensitive as an identifier, so two keys differing in case remain two keys.
 pub fn is_reserved_tag_key(key: &str) -> bool {
-    key.starts_with(RESERVED_TAG_KEY_PREFIX)
+    key.as_bytes()
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
 }
 
 /// The refusal a tag key in the reserved namespace earns.

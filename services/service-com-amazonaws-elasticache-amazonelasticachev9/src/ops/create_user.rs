@@ -214,12 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The access string is the engine's own ACL rule list; one that names
         // something that is not a rule is refused rather than stored as a
         // permission set no engine could apply.
-        if let Some(message) =
-            crate::state::access_string_rejection("AccessString", &input.access_string)
-        {
+        if let Some(message) = crate::state::access_string_rejection(&input.access_string) {
             return Err(CreateUserErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
-                    message: Some(message),
+                    message: Some(message.to_string()),
                 },
             )
             .into());

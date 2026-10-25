@@ -168,11 +168,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // The lens as the request named it resolves to ONE ARN (the one place this service
-        // resolves a lens's ARN); read before the workload is borrowed for writing, so the
-        // review and the ARN come from one view of the store.
-        let lens_arn =
-            store.lens_arn_of(&input.lens_alias, &crate::state::request_region(ctx.parts()));
+        // What the lens catalog says about the version this review is against, resolved
+        // from the one place that rule lives (`reviewed_lens_at`) before the workload is
+        // borrowed for writing, so the review and the lens come from one view of the
+        // store. Nothing this operation writes moves the version a review is against, so
+        // what it reports afterwards is what it resolved here.
+        let pinned = store
+            .workloads
+            .get(&input.workload_id)
+            .and_then(|workload| workload.lens_review_version(&input.lens_alias))
+            .map(str::to_string);
+        let reviewed = store.reviewed_lens_at(
+            &input.lens_alias,
+            pinned.as_deref(),
+            &crate::state::request_region(ctx.parts()),
+        );
 
         // The resource is resolved BEFORE the request's values are judged, so a request
         // that names a workload or a lens review that does not exist is answered with that
@@ -277,9 +287,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(UpdateLensReviewOutput {
             // The workload as STORED, which is the resource this lens review belongs to,
-            // and the lens as the REQUEST named it, beside the ARN it resolves to.
+            // and the lens as the REQUEST named it, beside what the catalog says about the
+            // version the review is against.
             workload_id: Some(workload.workload_id.clone()),
-            lens_review: Some(workload.to_lens_review(&input.lens_alias, lens_arn)),
+            lens_review: Some(workload.to_lens_review(&input.lens_alias, &reviewed)),
         })
     }
 }

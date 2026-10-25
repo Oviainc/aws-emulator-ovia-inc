@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMappedResourceConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMappedResourceConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMappedResourceConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the resources mapped to the stored stream a `StreamName`/`StreamARN`
+//! pair names — empty while nothing is mapped to it. Reporting only: the single write it
+//! performs is
+//! [`crate::state::ComAmazonawsKinesisvideoKinesisvideo20170930State::settle_clock`],
+//! which materialises status moves the clock already owed.
 //!
 //! ## Shape of an operation
 //!
@@ -143,7 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DescribeMappedResourceConfiguration<Eng>
 {
     type Input = DescribeMappedResourceConfigurationInput;
-    type Output = DescribeMappedResourceConfigurationOutput;
+    type Output = Report<DescribeMappedResourceConfigurationOutput>;
     type Error = DescribeMappedResourceConfigurationError;
 
     const NAME: &'static str = "DescribeMappedResourceConfiguration";
@@ -156,18 +152,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMappedResourceConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMappedResourceConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMappedResourceConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeMappedResourceConfigurationErrorModeled::ClientLimitExceededException(
+                    ClientLimitExceededException {
+                        message: Some(
+                            "The stream store is unavailable. Try again later.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `MappedResourceConfigurationListLimit` is modeled `@range(min: 1, max: 1)` and
+        // `MappedResourceConfigurationList` `@length(min: 0, max: 1)`, so one page
+        // carries at most one item whether or not the caller named a `MaxResults`.
+        let page_size = input
+            .max_results
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // An empty token is the modeled "start from the beginning" value (`NextToken`
+        // has a minimum length of 0); anything else must decode.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(decode_token(token).ok_or_else(|| {
+                DescribeMappedResourceConfigurationError::from(
+                    DescribeMappedResourceConfigurationErrorModeled::InvalidArgumentException(
+                        InvalidArgumentException {
+                            message: Some("The NextToken provided is not valid.".to_string()),
+                        },
+                    ),
+                )
+            })?),
+        };
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        let stream_arn = store
+            .resolve(input.stream_name.as_deref(), input.stream_arn.as_deref())
+            .map_err(lookup_error)?
+            .stream_arn
+            .clone();
+
+        // The mapped resources are ordered by ARN, so the token resolves against the
+        // live set rather than a snapshot copy: a mapping dropped between pages simply
+        // is not there.
+        let mut matching = store
+            .mapped_resources(&stream_arn)
+            .into_iter()
+            .filter(|item| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| item.arn.as_deref().is_some_and(|arn| arn > after))
+            })
+            .peekable();
+
+        let page: Vec<MappedResourceConfigurationListItem> =
+            matching.by_ref().take(page_size).collect();
+        // The token is emitted only when a mapping is actually left over, so the last
+        // page carries none.
+        let next_token = matching.peek().and_then(|_| {
+            page.last()
+                .and_then(|last| last.arn.as_deref())
+                .map(encode_token)
+        });
+
+        Ok(Report::of(DescribeMappedResourceConfigurationOutput {
+            mapped_resource_configuration_list: Some(page),
+            // Absent on the last page, where it reaches the wire as JSON `null` (see
+            // [`Report`]) rather than as a missing key.
+            next_token,
+        }))
     }
+}
+
+/// The most items one page of this listing carries: `MappedResourceConfigurationList`'s
+/// modeled `@length` maximum, which is also `MappedResourceConfigurationListLimit`'s
+/// `@range` maximum, from `smithy_query(query="operation",
+/// operation="DescribeMappedResourceConfiguration")`.
+const MAX_PAGE_SIZE: usize = 1;
+
+/// The marker every `NextToken` this listing mints carries, before the resume key.
+/// It is what makes a token verifiable: a string that merely happens to be base64 is
+/// not a resume point.
+const PAGE_TOKEN_PREFIX: &str = "kinesisvideo/mappedresources/v1/";
+
+/// Encode the last-returned mapped-resource ARN as an opaque `NextToken`.
+///
+/// Base64 because `NextToken`'s modeled `@pattern` is `^[a-zA-Z0-9+/=]*$` — exactly
+/// the standard base64 alphabet — so an encoded ARN of any shape satisfies it. The
+/// codec is `aws_smithy_types::base64`, already in this crate's dependency tree and
+/// what the sibling listings mint their tokens with.
+fn encode_token(arn: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!("{PAGE_TOKEN_PREFIX}{arn}"))
+}
+
+/// The ARN an opaque `NextToken` carries, or `None` when it is not one this listing
+/// issued.
+fn decode_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(PAGE_TOKEN_PREFIX).map(str::to_string)
+}
+
+/// State the failure to resolve a `StreamName`/`StreamARN` pair as this service's
+/// own modeled error: absent or contradictory identifiers are a bad argument (400),
+/// a well-formed identifier for no stored stream is a missing resource (404).
+fn lookup_error(error: crate::state::LookupError) -> DescribeMappedResourceConfigurationError {
+    match error {
+        crate::state::LookupError::NoIdentifier => {
+            DescribeMappedResourceConfigurationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+        }
+        crate::state::LookupError::Mismatch => {
+            DescribeMappedResourceConfigurationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string()),
+                },
+            )
+        }
+        crate::state::LookupError::NotFound => {
+            DescribeMappedResourceConfigurationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::STREAM_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+        }
+    }
+    .into()
 }

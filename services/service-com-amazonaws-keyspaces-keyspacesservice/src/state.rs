@@ -2135,7 +2135,8 @@ pub fn cdc_specification_summary(stream: &CdcStreamEntry) -> CdcSpecificationSum
 }
 
 /// Check that the schema's roles and columns agree: every key and static column
-/// is a column the schema declares, and no column is named twice.
+/// is a column the schema declares, no column is named twice, and a static column
+/// has a partition to share its value across.
 ///
 /// `partitionKeys`, `clusteringKeys` and `staticColumns` each name "the columns
 /// ... of the table" (`SchemaDefinition`), so a name that `allColumns` does not
@@ -2144,6 +2145,15 @@ pub fn cdc_specification_summary(stream: &CdcStreamEntry) -> CdcSpecificationSum
 /// column — the storage engine has no row shape in which a column is two of
 /// those, nor one in which `allColumns` declares a name twice. The model
 /// expresses only that each list is non-empty, not that the lists agree.
+///
+/// A static column is one whose values "are shared by all rows in the same partition"
+/// (`SchemaDefinition$staticColumns`), and what divides a partition into rows is its
+/// clustering columns ("the optional clustering column portion of your primary key
+/// determines how the data is clustered and sorted within each partition",
+/// `ClusteringKey`). A schema with no clustering column therefore holds one row per
+/// partition, leaving a static column nothing to share and no storage distinct from an
+/// ordinary column: the CQL storage model this service implements has no such table, so
+/// such a schema is an invalid definition rather than a table with a redundant column.
 pub fn validate_schema(schema: &SchemaDefinition) -> Result<(), String> {
     let mut declared: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
     for column in &schema.all_columns {
@@ -2182,6 +2192,15 @@ pub fn validate_schema(schema: &SchemaDefinition) -> Result<(), String> {
         if !assigned.insert(name) {
             return Err(format!(
                 "schemaDefinition.{member} names column '{name}', which the schema already gives another role"
+            ));
+        }
+    }
+    if schema.clustering_keys.iter().flatten().next().is_none() {
+        if let Some(first_static) = schema.static_columns.iter().flatten().next() {
+            return Err(format!(
+                "schemaDefinition.staticColumns names column '{}', but static columns are only \
+                 useful (and thus allowed) if the table has at least one clustering column",
+                first_static.name
             ));
         }
     }

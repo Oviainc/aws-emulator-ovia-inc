@@ -270,71 +270,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The name of the milestone in a workload": a request that names one asks for the
         // review AS IT STANDS to be kept before the upgrade changes which profile version
-        // it is against, so the milestone is checked and recorded BEFORE the move, under
-        // exactly the rules `CreateMilestone` records one by — "milestone names must be
-        // unique within a workload" (`smithy_query(query="shape", shape="MilestoneName")`),
-        // compared the way this service compares a name it meters for uniqueness
-        // (`crate::state::normalize_unique_name`), and the milestone ceiling of one
-        // workload, answered with the modelled `ServiceQuotaExceededException` this
-        // operation declares. Both are resolved before anything is written, so a refused
-        // request upgrades nothing.
+        // it is against, so the milestone is recorded BEFORE the move, through the one
+        // place a milestone is recorded (`crate::state::record_milestone`) — the same
+        // rules, and the same refusals, `CreateMilestone` records one by. Every refusal is
+        // decided before anything is written, so a refused request upgrades nothing.
         if let Some(milestone_name) = input.milestone_name.clone() {
-            if let Some(existing) = store.milestone_holding_name(&input.workload_id, &milestone_name)
-            {
-                return Err(UpgradeProfileVersionErrorModeled::ConflictException(
-                    crate::state::milestone_name_conflict(
-                        &existing.milestone_name,
-                        &input.workload_id,
-                        existing.milestone_number,
-                    ),
-                )
-                .into());
-            }
-            let milestone_number = store.next_milestone_number(&input.workload_id);
-            if milestone_number > crate::state::MAX_MILESTONES_PER_WORKLOAD {
-                return Err(
-                    UpgradeProfileVersionErrorModeled::ServiceQuotaExceededException(
-                        ServiceQuotaExceededException {
-                            message: format!(
-                                "The workload with ID {} already holds the maximum of {} \
-                                 milestones",
-                                input.workload_id,
-                                crate::state::MAX_MILESTONES_PER_WORKLOAD
-                            ),
-                            resource_id: Some(input.workload_id.clone()),
-                            resource_type: Some(crate::state::WORKLOAD_RESOURCE_TYPE.to_string()),
-                            // The model publishes no numeric Service Quotas code for this
-                            // quota, so it is named by what it meters; the service code is
-                            // this service's own signing name.
-                            quota_code: "MilestonesPerWorkload".to_string(),
-                            service_code: crate::state::ARN_NAMESPACE.to_string(),
-                        },
-                    )
-                    .into(),
-                );
-            }
-            // A milestone records the workload BY VALUE, so this copy is the workload as
-            // it stood against the profile version it is about to leave: a later read of
-            // the milestone reports that review, not the upgraded one.
-            let Some(before_upgrade) = store.workloads.get(&input.workload_id).cloned() else {
-                return Err(UpgradeProfileVersionErrorModeled::ResourceNotFoundException(
-                    crate::state::workload_not_found(&input.workload_id),
-                )
-                .into());
-            };
             store
-                .milestones
-                .entry(input.workload_id.clone())
-                .or_default()
-                .insert(
-                    milestone_number,
-                    crate::state::MilestoneRecord {
-                        milestone_number,
-                        milestone_name,
-                        recorded_at: now,
-                        workload: before_upgrade,
-                    },
-                );
+                .record_milestone(&input.workload_id, milestone_name, now)
+                .map_err(|refusal| match refusal {
+                    crate::state::MilestoneRefusal::NotFound(exception) => {
+                        UpgradeProfileVersionErrorModeled::ResourceNotFoundException(exception)
+                    }
+                    crate::state::MilestoneRefusal::NameTaken(exception) => {
+                        UpgradeProfileVersionErrorModeled::ConflictException(exception)
+                    }
+                    crate::state::MilestoneRefusal::QuotaExceeded(exception) => {
+                        UpgradeProfileVersionErrorModeled::ServiceQuotaExceededException(exception)
+                    }
+                })?;
         }
 
         // The move itself: the association is re-pinned at the version the profile is at.

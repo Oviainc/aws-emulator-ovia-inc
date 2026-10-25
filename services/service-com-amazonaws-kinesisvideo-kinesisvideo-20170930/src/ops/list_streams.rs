@@ -132,7 +132,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for ListStreams<Eng>
 {
     type Input = ListStreamsInput;
-    type Output = ListStreamsOutput;
+    type Output = Report<ListStreamsOutput>;
     type Error = ListStreamsError;
 
     const NAME: &'static str = "ListStreams";
@@ -226,10 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(encode_token)
         });
 
-        Ok(ListStreamsOutput {
+        Ok(Report::of(ListStreamsOutput {
             stream_info_list: Some(page),
+            // Absent on the last page, where it reaches the wire as JSON `null` (see
+            // [`Report`]) rather than as a missing key.
             next_token,
-        })
+        }))
     }
 }
 

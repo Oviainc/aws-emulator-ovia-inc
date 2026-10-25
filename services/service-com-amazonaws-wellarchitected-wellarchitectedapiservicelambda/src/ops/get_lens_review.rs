@@ -195,13 +195,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Echoed only when the request scoped the read to a milestone: a read of the
             // live review is not a read of any milestone.
             milestone_number: input.milestone_number,
-            // The lens as the request named it, beside the ARN it resolves to. The review
-            // itself is projected from the workload by the one place that builds this
-            // shape (`WorkloadRecord::to_lens_review`), shared with `UpdateLensReview`, so
-            // a write and the read that follows it cannot disagree.
+            // The lens as the request named it, beside what the catalog says about the
+            // version this review is against. The review itself is projected from the
+            // workload by the one place that builds this shape
+            // (`WorkloadRecord::to_lens_review`), shared with `UpdateLensReview`, so a
+            // write and the read that follows it cannot disagree.
             lens_review: Some(workload.to_lens_review(
                 &input.lens_alias,
-                store.lens_arn_of(&input.lens_alias, &crate::state::request_region(ctx.parts())),
+                &store.reviewed_lens_at(
+                    &input.lens_alias,
+                    workload.lens_review_version(&input.lens_alias),
+                    &crate::state::request_region(ctx.parts()),
+                ),
             )),
         })
     }

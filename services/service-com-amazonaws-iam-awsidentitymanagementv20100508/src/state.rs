@@ -184,6 +184,12 @@ pub const MAX_USER_INLINE_POLICY_CHARACTERS: usize = 2_048;
 /// with `LimitExceededException`.
 pub const MAX_ROLE_INLINE_POLICY_CHARACTERS: usize = 10_240;
 
+/// The aggregate size, in characters, of all inline policies embedded in one IAM
+/// group. AWS's "IAM and STS quotas" page gives the quota "Group policy size
+/// cannot exceed 5,120 characters"; a put that would carry the group past it is
+/// refused with `LimitExceededException`.
+pub const MAX_GROUP_INLINE_POLICY_CHARACTERS: usize = 5_120;
+
 /// How many sets of service-specific credentials one IAM user may hold for one
 /// supported service. `CreateServiceSpecificCredential`'s documentation: "You can
 /// have a maximum of two sets of service-specific credentials for each supported
@@ -803,6 +809,13 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// reason: "user, group, role, and policy names must be unique within the
     /// account. Names are not distinguished by case."
     pub role_inline_policies: BTreeMap<String, BTreeMap<String, InlinePolicy>>,
+    /// Inline group policies: [`name_key`] of the group name -> [`name_key`] of the
+    /// policy name -> the policy. Keyed exactly as
+    /// [`user_inline_policies`](Self::user_inline_policies) is, and for the same
+    /// reason: "user, group, role, and policy names must be unique within the
+    /// account. Names are not distinguished by case." `PutGroupPolicy` fills this
+    /// map and `GetGroupPolicy` reads it.
+    pub group_inline_policies: BTreeMap<String, BTreeMap<String, InlinePolicy>>,
     /// Access key id -> the key's record, including [`name_key`] of the user that
     /// owns it. `GetUser` with no `UserName` resolves the caller through this map,
     /// and `CreateAccessKey` is what populates it.
@@ -1234,9 +1247,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         let embedded = match source.kind {
             EntityKind::User => &self.user_inline_policies,
             EntityKind::Role => &self.role_inline_policies,
-            // `PutGroupPolicy` is still scaffolded, so a group embeds no inline
-            // policy; when it is implemented its map joins this collection.
-            EntityKind::Group => &EMPTY_INLINE_POLICIES,
+            EntityKind::Group => &self.group_inline_policies,
         };
         let attached: Vec<String> = match source.kind {
             EntityKind::User => {
@@ -1324,6 +1335,12 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// size quota ([`MAX_ROLE_INLINE_POLICY_CHARACTERS`]) is taken against.
     pub fn role_inline_policy_characters(&self, role_key: &str, replacing: &str) -> usize {
         inline_policy_characters(&self.role_inline_policies, role_key, replacing)
+    }
+
+    /// The same measure for the group keyed by `group_key`, the one IAM's group
+    /// policy size quota ([`MAX_GROUP_INLINE_POLICY_CHARACTERS`]) is taken against.
+    pub fn group_inline_policy_characters(&self, group_key: &str, replacing: &str) -> usize {
+        inline_policy_characters(&self.group_inline_policies, group_key, replacing)
     }
 
     /// The instance profile keyed by `profile_key` as a reader must report it: the
@@ -2192,10 +2209,6 @@ pub struct SourcedPolicy {
     /// an attached managed policy.
     pub document: Option<String>,
 }
-
-/// The embedding map of an identity kind that embeds no inline policy yet — read in
-/// place of one so the collection has a single shape for every identity kind.
-static EMPTY_INLINE_POLICIES: BTreeMap<String, BTreeMap<String, InlinePolicy>> = BTreeMap::new();
 
 /// Every condition context key the IAM policy documents in `documents` reference,
 /// folded to one entry per key and ordered.

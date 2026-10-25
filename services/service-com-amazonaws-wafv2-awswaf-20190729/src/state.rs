@@ -23,12 +23,14 @@ use ::aws_smithy_schema_server::constraints::{
 
 use crate::ops::types::{
     BlockAction, ChallengeAction, CountAction, IPSet, LabelSummary, ManagedProductDescriptor,
-    OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleAction, RuleGroup, RuleSummary,
-    Statement, Tag, WAFAssociatedItemException, WAFDuplicateItemException,
-    WAFExpiredManagedRuleGroupVersionException, WAFFeatureNotIncludedInPricingPlanException,
-    WAFInvalidOperationException, WAFInvalidParameterException, WAFInvalidPermissionPolicyException,
-    WAFLimitsExceededException, WAFNonexistentItemException, WAFOptimisticLockException,
-    WAFUnsupportedAggregateKeyTypeException, WebACL,
+    MonetizationFilter, OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleAction, RuleGroup,
+    RuleSummary, SettlementRecord, Statement, Tag, TimeWindow, WAFAssociatedItemException,
+    WAFDuplicateItemException, WAFExpiredManagedRuleGroupVersionException,
+    WAFFeatureNotIncludedInPricingPlanException, WAFInvalidOperationException,
+    WAFInvalidParameterException, WAFInvalidPermissionPolicyException, WAFLimitsExceededException,
+    WAFNonexistentItemException, WAFOptimisticLockException,
+    WAFUnsupportedAggregateKeyTypeException, WebACL, BLOCKCHAIN_CHAIN_VALUES,
+    CURRENCY_MODE_VALUES, CURRENCY_VALUES, SETTLEMENT_STATUS_VALUES,
 };
 
 /// The `Scope` values the model declares
@@ -347,22 +349,31 @@ pub struct ApiKeyEntry {
     pub cursor: String,
 }
 
-/// The width an API-key pagination cursor is zero-padded to: the 20 digits
-/// `u64::MAX` takes, so every cursor is the same length and comparing two as
-/// strings orders them by creation.
-const API_KEY_CURSOR_WIDTH: usize = 20;
+/// The width a pagination cursor is zero-padded to: the 20 digits `u64::MAX`
+/// takes, so every cursor is the same length and comparing two as strings orders
+/// them by position.
+const CURSOR_WIDTH: usize = 20;
+
+/// The cursor naming position `sequence` in a listing: a decimal position
+/// zero-padded to [`CURSOR_WIDTH`].
+///
+/// A `NextMarker` is opaque to a client — the model gives it no form beyond
+/// `length 1..256` and `pattern \S` — so this service mints one from the position
+/// a page resumes at, padded so the lexicographic comparison a resume does is the
+/// numeric one.
+pub fn listing_cursor(sequence: u64) -> String {
+    format!("{sequence:0width$}", width = CURSOR_WIDTH)
+}
 
 /// The listing cursor of the `sequence`-th API key this service minted.
 ///
 /// `ListAPIKeys`' marker is opaque to a client — the model gives `NextMarker` no
 /// form beyond `length 1..256` and `pattern \S`, and an API key is up to 2048
 /// characters long, so the key value itself cannot be one. This service mints the
-/// cursor from the key's creation sequence instead, zero-padded to
-/// [`API_KEY_CURSOR_WIDTH`] so the lexicographic comparison a resume does is the
-/// numeric one, and so a listing enumerates a scope's keys in the order they were
-/// created.
+/// cursor from the key's creation sequence instead, through [`listing_cursor`], so
+/// a listing enumerates a scope's keys in the order they were created.
 pub fn api_key_cursor(sequence: u64) -> String {
-    format!("{sequence:0width$}", width = API_KEY_CURSOR_WIDTH)
+    listing_cursor(sequence)
 }
 
 /// How many characters a well-formed API key value carries: the 256 bits of the
@@ -445,6 +456,300 @@ pub struct BotRequestRecord {
     pub bot_organization: String,
 }
 
+// ---------------------------------------------------------------------------
+// The monetization ledger: the settlement transactions a scope has recorded.
+// ---------------------------------------------------------------------------
+
+/// One settlement transaction, as WAF's monetization recorded it: the modelled
+/// `SettlementRecord` a listing reports, plus the few filterable fields the
+/// record itself does not carry.
+///
+/// A record is minted when a rule's `Monetize` action settles a payment for a
+/// request a web ACL evaluated — WAF's DATA plane. This emulator serves the WAFv2
+/// control plane only, so nothing appends to
+/// [`ComAmazonawsWafv2Awswaf20190729State::settlement_records`] and every window
+/// reports no transaction, which is the answer WAF gives for an account whose
+/// window settled none. The selection is still the whole answer: a ledger that
+/// holds transactions reports exactly those that fall in the window and satisfy
+/// the request's filters.
+#[derive(Debug, Clone)]
+pub struct SettlementRecordEntry {
+    /// The transaction as a listing reports it.
+    pub record: SettlementRecord,
+    /// `TerminatingRuleName`: "the name of the WAF rule that triggered the
+    /// Monetize action" — a filter field that is not a member of
+    /// `SettlementRecord` (`MonetizationFilter$Name`).
+    pub terminating_rule_name: Option<String>,
+    /// `HttpSourceName`: which Amazon Web Services service fronted the request.
+    /// See [`HTTP_SOURCE_NAMES`].
+    pub http_source_name: Option<String>,
+    /// `HttpSourceId`: "the identifier of the Amazon Web Services resource
+    /// associated with the web ACL (for example, CloudFront distribution ID)".
+    pub http_source_id: Option<String>,
+}
+
+/// `CurrencyMode`'s `REAL` value: payments settled on a production blockchain
+/// network (`smithy_query(query="shape",shape="CurrencyMode")`).
+pub const CURRENCY_MODE_REAL: &str = "REAL";
+
+/// `CurrencyMode`'s `TEST` value: payments settled on a testnet network. See
+/// [`CURRENCY_MODE_REAL`].
+pub const CURRENCY_MODE_TEST: &str = "TEST";
+
+/// The `BlockchainChain` values that are testnets: `MonetizationConfig$CurrencyMode`
+/// documents `TEST` as settling "on testnet networks (Base Sepolia, Solana Devnet)"
+/// and `REAL` as settling "on production blockchain networks (Base, Solana)", so a
+/// transaction's network is what puts it in one mode or the other.
+pub const TEST_BLOCKCHAIN_CHAINS: &[&str] = &["BASE_SEPOLIA", "SOLANA_DEVNET"];
+
+/// The `CurrencyMode` a settlement on `chain` belongs to. A transaction that names
+/// no network is a production one, which is also the mode a query defaults to.
+/// See [`TEST_BLOCKCHAIN_CHAINS`].
+pub fn currency_mode_of_chain(chain: Option<&str>) -> &'static str {
+    match chain {
+        Some(chain) if TEST_BLOCKCHAIN_CHAINS.contains(&chain) => CURRENCY_MODE_TEST,
+        _ => CURRENCY_MODE_REAL,
+    }
+}
+
+/// The `HttpSourceName` values a monetization filter accepts, as
+/// `MonetizationFilter$Name` lists them (`CF`, `ALB`, `APIGW`, `APPRUNNER`,
+/// `COGNITO`, `VERIFIED_ACCESS`) — the member is a free string in the model, and
+/// the documented list is the vocabulary, so it is written out here.
+pub const HTTP_SOURCE_NAMES: &[&str] = &[
+    "CF",
+    "ALB",
+    "APIGW",
+    "APPRUNNER",
+    "COGNITO",
+    "VERIFIED_ACCESS",
+];
+
+/// The `MonetizationFilter$Name` values this service accepts, in the order the
+/// member's own documentation lists them: the enum-restricted names, the
+/// ARN-validated one, then the free-text ones.
+///
+/// Every monetization query (settlement records and the revenue statistics over
+/// the same ledger) takes `Filters`, so the vocabulary, its validation
+/// ([`validate_monetization_filters`]) and its matching
+/// ([`monetization_filters_select`]) live here rather than in one operation.
+pub const MONETIZATION_FILTER_NAMES: &[&str] = &[
+    FILTER_CURRENCY_MODE,
+    FILTER_CHAIN_NAME,
+    FILTER_SETTLEMENT_STATUS,
+    FILTER_HTTP_SOURCE_NAME,
+    FILTER_WEB_ACL_ARN,
+    FILTER_SOURCE_NAME,
+    FILTER_SOURCE_CATEGORY,
+    FILTER_INTENT,
+    FILTER_ORGANIZATION,
+    FILTER_URI_PATH_PREFIX,
+    FILTER_REQUEST_ID,
+    FILTER_TRANSACTION_ID,
+    FILTER_TERMINATING_RULE_NAME,
+    FILTER_PAYER_ADDRESS,
+    FILTER_HTTP_SOURCE_ID,
+];
+
+/// `CurrencyMode`, restricted to [`CURRENCY_MODE_VALUES`].
+pub const FILTER_CURRENCY_MODE: &str = "CurrencyMode";
+/// `ChainName`, restricted to [`BLOCKCHAIN_CHAIN_VALUES`].
+pub const FILTER_CHAIN_NAME: &str = "ChainName";
+/// `SettlementStatus`, restricted to [`SETTLEMENT_STATUS_VALUES`].
+pub const FILTER_SETTLEMENT_STATUS: &str = "SettlementStatus";
+/// `HttpSourceName`, restricted to [`HTTP_SOURCE_NAMES`].
+pub const FILTER_HTTP_SOURCE_NAME: &str = "HttpSourceName";
+/// `WebACLArn`, which takes a web ACL ARN.
+pub const FILTER_WEB_ACL_ARN: &str = "WebACLArn";
+/// `SourceName`: "the name of the bot".
+pub const FILTER_SOURCE_NAME: &str = "SourceName";
+/// `SourceCategory`: "the category classification of the bot".
+pub const FILTER_SOURCE_CATEGORY: &str = "SourceCategory";
+/// `Intent`: "the declared intent of the bot request".
+pub const FILTER_INTENT: &str = "Intent";
+/// `Organization`: "the organization operating the bot".
+pub const FILTER_ORGANIZATION: &str = "Organization";
+/// `UriPathPrefix`: "the URI path of the request that was monetized", matched as
+/// the prefix its name says it is.
+pub const FILTER_URI_PATH_PREFIX: &str = "UriPathPrefix";
+/// `RequestId`: "the WAF request ID associated with the transaction".
+pub const FILTER_REQUEST_ID: &str = "RequestId";
+/// `TransactionId`: "the blockchain transaction identifier".
+pub const FILTER_TRANSACTION_ID: &str = "TransactionId";
+/// `TerminatingRuleName`: "the name of the WAF rule that triggered the Monetize
+/// action".
+pub const FILTER_TERMINATING_RULE_NAME: &str = "TerminatingRuleName";
+/// `PayerAddress`: "the blockchain wallet address of the paying client".
+pub const FILTER_PAYER_ADDRESS: &str = "PayerAddress";
+/// `HttpSourceId`: the Amazon Web Services resource fronting the web ACL.
+pub const FILTER_HTTP_SOURCE_ID: &str = "HttpSourceId";
+
+/// The values a filter named `name` accepts, for the names
+/// `MonetizationFilter$Name` calls "enum-restricted (invalid values rejected)" —
+/// `None` for a name whose values are free text or an ARN.
+pub fn monetization_filter_values(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        FILTER_CURRENCY_MODE => Some(CURRENCY_MODE_VALUES),
+        FILTER_CHAIN_NAME => Some(BLOCKCHAIN_CHAIN_VALUES),
+        FILTER_SETTLEMENT_STATUS => Some(SETTLEMENT_STATUS_VALUES),
+        FILTER_HTTP_SOURCE_NAME => Some(HTTP_SOURCE_NAMES),
+        _ => None,
+    }
+}
+
+/// Refuse a `Filters` list that names a filter this service does not have, or
+/// gives an enum-restricted filter a value outside its vocabulary, or gives the
+/// ARN-validated filter something that is not a web ACL ARN.
+///
+/// The refusal is the modelled `WAFInvalidParameterException`: `Parameter` carries
+/// the value that was rejected, so a client reads which filter to correct.
+pub fn validate_monetization_filters(
+    filters: &[MonetizationFilter],
+) -> Result<(), WAFInvalidParameterException> {
+    for filter in filters {
+        if !MONETIZATION_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(invalid_parameter_exception_without_field(
+                &filter.name,
+                "the filter name is not one this operation filters by",
+            ));
+        }
+        if let Some(allowed) = monetization_filter_values(&filter.name) {
+            if let Some(value) = filter
+                .values
+                .iter()
+                .find(|value| !allowed.contains(&value.as_str()))
+            {
+                return Err(invalid_parameter_exception_without_field(
+                    value,
+                    &format!("{} takes one of {}", filter.name, allowed.join(", ")),
+                ));
+            }
+        }
+        if filter.name == FILTER_WEB_ACL_ARN {
+            if let Some(value) = filter
+                .values
+                .iter()
+                .find(|value| arn_resource_kind(value) != Some(WEB_ACL_ARN_KIND))
+            {
+                return Err(invalid_arn_exception(value));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `entry` satisfies every filter in `filters`.
+///
+/// A filter holds a NAME and a list of values, so a transaction satisfies one when
+/// its own value for that field is among the filter's values, and satisfies the
+/// list when it satisfies every filter in it. `UriPathPrefix` is the one name
+/// matched as a prefix of the field rather than against the whole of it.
+///
+/// Absent a `CurrencyMode` filter the selection is the production one: "when no
+/// CurrencyMode filter is provided, results default to REAL" (every monetization
+/// operation's own documentation), so a testnet transaction is reported only to a
+/// query that asks for it.
+pub fn monetization_filters_select(
+    entry: &SettlementRecordEntry,
+    filters: &[MonetizationFilter],
+) -> bool {
+    let mut currency_mode_filtered = false;
+    for filter in filters {
+        if filter.name == FILTER_CURRENCY_MODE {
+            currency_mode_filtered = true;
+        }
+        let value = monetization_filter_field(entry, &filter.name);
+        let matched = match (filter.name.as_str(), value) {
+            (_, None) => false,
+            (FILTER_URI_PATH_PREFIX, Some(field)) => filter
+                .values
+                .iter()
+                .any(|value| field.starts_with(value.as_str())),
+            (_, Some(field)) => filter.values.iter().any(|value| value == field),
+        };
+        if !matched {
+            return false;
+        }
+    }
+    currency_mode_filtered
+        || monetization_filter_field(entry, FILTER_CURRENCY_MODE) == Some(CURRENCY_MODE_REAL)
+}
+
+/// The value of `entry` a filter named `name` compares against, or `None` when the
+/// transaction carries none — a transaction with no value for a field satisfies no
+/// filter on it.
+fn monetization_filter_field<'a>(entry: &'a SettlementRecordEntry, name: &str) -> Option<&'a str> {
+    let record = &entry.record;
+    match name {
+        FILTER_CURRENCY_MODE => Some(currency_mode_of_chain(record.network.as_deref())),
+        FILTER_CHAIN_NAME => record.network.as_deref(),
+        FILTER_SETTLEMENT_STATUS => Some(record.status.as_str()),
+        FILTER_HTTP_SOURCE_NAME => entry.http_source_name.as_deref(),
+        FILTER_WEB_ACL_ARN => record.web_acl_arn.as_deref(),
+        FILTER_SOURCE_NAME => record.source_name.as_deref(),
+        FILTER_SOURCE_CATEGORY => record.source_category.as_deref(),
+        FILTER_INTENT => record.intent.as_deref(),
+        FILTER_ORGANIZATION => record.organization.as_deref(),
+        FILTER_URI_PATH_PREFIX => record.content_path.as_deref(),
+        FILTER_REQUEST_ID => record.request_id.as_deref(),
+        FILTER_TRANSACTION_ID => record.transaction_id.as_deref(),
+        FILTER_TERMINATING_RULE_NAME => entry.terminating_rule_name.as_deref(),
+        FILTER_PAYER_ADDRESS => record.payer_address.as_deref(),
+        FILTER_HTTP_SOURCE_ID => entry.http_source_id.as_deref(),
+        _ => None,
+    }
+}
+
+/// The widest span a monetization query may cover: "the maximum supported time
+/// window is 90 days", which every monetization operation documents.
+pub const MAX_MONETIZATION_WINDOW_DAYS: i64 = 90;
+
+/// [`MAX_MONETIZATION_WINDOW_DAYS`] in milliseconds, the unit a window is compared
+/// in.
+const MAX_MONETIZATION_WINDOW_MILLIS: i64 = MAX_MONETIZATION_WINDOW_DAYS * 24 * 60 * 60 * 1_000;
+
+/// The instants a monetization query covers, in milliseconds since the Unix epoch,
+/// or the modelled refusal for a window wider than the maximum supported one.
+///
+/// The refusal names the MEMBER in `Parameter` rather than a value: what is at
+/// fault is the span between the window's two timestamps, which is not one of the
+/// values the request carries, so `TimeWindow` is the most precise thing a client
+/// can be pointed at (the `Reason` states the bound it broke).
+///
+/// A window whose end precedes its start holds no instant, so it selects no
+/// transaction: the model names no error for one, and the window is a filter.
+pub fn monetization_window(
+    window: &TimeWindow,
+) -> Result<::std::ops::RangeInclusive<i64>, WAFInvalidParameterException> {
+    let start = date_time_millis(&window.start_time);
+    let end = date_time_millis(&window.end_time);
+    if end.saturating_sub(start) > MAX_MONETIZATION_WINDOW_MILLIS {
+        return Err(invalid_parameter_exception_without_field(
+            "TimeWindow",
+            &format!(
+                "the maximum supported time window is {MAX_MONETIZATION_WINDOW_DAYS} days"
+            ),
+        ));
+    }
+    Ok(start..=end)
+}
+
+/// What this service sorts a settlement listing by when the request names no
+/// `SortBy`.
+///
+/// THIS EMULATOR'S CHOICE, not a modelled default: the model documents a default
+/// for neither `SortBy` nor `SortOrder`. A settlement listing is a transaction
+/// log, so the newest transaction is reported first — `TIMESTAMP`, descending.
+pub const DEFAULT_SETTLEMENT_SORT_BY: &str = "TIMESTAMP";
+
+/// `SortOrder`'s descending value
+/// (`smithy_query(query="shape",shape="SortOrder")` → `ASC`, `DESC`).
+pub const SORT_ORDER_DESC: &str = "DESC";
+
+/// The direction this service sorts a settlement listing in when the request
+/// names none — its own choice, like [`DEFAULT_SETTLEMENT_SORT_BY`].
+pub const DEFAULT_SETTLEMENT_SORT_ORDER: &str = SORT_ORDER_DESC;
+
 /// What an ARN in [`ComAmazonawsWafv2Awswaf20190729State::arn_index`] resolves to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceRef {
@@ -521,6 +826,12 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
     /// The requests each web ACL has evaluated, by `(Scope, Id)`: the log
     /// `GetTopPathStatisticsByTraffic` aggregates. See [`BotRequestRecord`].
     pub bot_requests: HashMap<(String, String), Vec<BotRequestRecord>>,
+    /// The settlement transactions recorded in each scope, in the order they were
+    /// settled: the ledger a monetization query reads. A transaction belongs to a
+    /// SCOPE rather than to one web ACL — the web ACL it was settled for is a
+    /// member of the record and a filter over it — so the ledger is keyed by scope
+    /// alone. See [`SettlementRecordEntry`].
+    pub settlement_records: HashMap<String, Vec<SettlementRecordEntry>>,
     /// The live web ACL association of every protected resource: the resource's
     /// own ARN → the ARN of the web ACL that is in front of it.
     ///
@@ -627,6 +938,16 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     pub fn bot_requests(&self, scope: &str, id: &str) -> &[BotRequestRecord] {
         self.bot_requests
             .get(&(scope.to_string(), id.to_string()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The settlement transactions recorded in `scope`, in the order they were
+    /// settled — the order a pagination marker names a position in. Empty for a
+    /// scope that settled none, which is every scope this emulator holds (see
+    /// [`SettlementRecordEntry`]).
+    pub fn settlement_records(&self, scope: &str) -> &[SettlementRecordEntry] {
+        self.settlement_records
+            .get(scope)
             .map_or(&[], Vec::as_slice)
     }
 
@@ -3296,14 +3617,36 @@ pub const KEY_FORMAT_NOT_VALID_REASON: &str = "The parameter contains formatting
 /// by every operation that takes one, and is a different failure from a well-formed
 /// key naming nothing stored, which is [`nonexistent_item_exception`].
 pub fn invalid_key_format_exception(api_key: &str) -> WAFInvalidParameterException {
+    invalid_parameter_exception_without_field(api_key, KEY_FORMAT_NOT_VALID_REASON)
+}
+
+/// [`invalid_parameter_exception`] for a parameter `ParameterExceptionField`
+/// declares no value for: the rejected value as `Parameter`, `reason` as `Reason`
+/// and NO `Field`, which the message renders as `field: null`.
+///
+/// The model's `ParameterExceptionField` enum names the SETTINGS a parameter lives
+/// in, and not every parameter has one (`smithy_query(query="shape",shape="ParameterExceptionField")`),
+/// so WAF leaves the member out rather than reporting a field the parameter is not
+/// in.
+pub fn invalid_parameter_exception_without_field(
+    parameter: &str,
+    reason: &str,
+) -> WAFInvalidParameterException {
     WAFInvalidParameterException {
         message: Some(format!(
-            "Error reason: {KEY_FORMAT_NOT_VALID_REASON}, field: null, parameter: {api_key}"
+            "Error reason: {reason}, field: null, parameter: {parameter}"
         )),
         field: None,
-        parameter: Some(api_key.to_string()),
-        reason: Some(KEY_FORMAT_NOT_VALID_REASON.to_string()),
+        parameter: Some(parameter.to_string()),
+        reason: Some(reason.to_string()),
     }
+}
+
+/// `true` when `value` is one of the currencies the model declares
+/// (`smithy_query(query="shape",shape="Currency")`), the denominations a
+/// monetization query may ask its amounts in.
+pub fn is_known_currency(value: &str) -> bool {
+    CURRENCY_VALUES.contains(&value)
 }
 
 /// The largest page a paginated WAFv2 list answers with when the request names no

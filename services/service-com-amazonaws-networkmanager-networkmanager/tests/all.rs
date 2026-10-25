@@ -77,6 +77,8 @@ mod filter_id_list_maximum;
 mod get_connect_attachment;
 #[path = "all/get_connections.rs"]
 mod get_connections;
+#[path = "all/get_core_network_policy_selection.rs"]
+mod get_core_network_policy_selection;
 #[path = "all/global_network_lifecycle.rs"]
 mod global_network_lifecycle;
 #[path = "all/link_association_lifecycle.rs"]
@@ -105,6 +107,8 @@ mod resource_policy_lifecycle;
 mod resource_tagging;
 #[path = "all/route_analysis.rs"]
 mod route_analysis;
+#[path = "all/site_ids_filter_maximum.rs"]
+mod site_ids_filter_maximum;
 #[path = "all/site_to_site_vpn_attachment_lifecycle.rs"]
 mod site_to_site_vpn_attachment_lifecycle;
 #[path = "all/state_roundtrip.rs"]

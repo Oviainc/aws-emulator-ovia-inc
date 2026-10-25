@@ -167,8 +167,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let (page, next_token) =
-            crate::state::page(&api.routes, input.next_token.as_deref(), max_results);
+        let (page, next_token) = crate::state::page(
+            &api.routes,
+            &crate::state::page_scope(&["apis", &input.api_id, "routes"]),
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(|message| -> Self::Error {
+            GetRoutesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        })?;
 
         Ok(GetRoutesOutput {
             items: Some(page.into_iter().map(crate::state::Route::to_wire).collect()),
