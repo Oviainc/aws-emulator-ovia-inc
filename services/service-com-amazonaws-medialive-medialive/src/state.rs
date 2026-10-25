@@ -146,8 +146,11 @@
 //! [`ComAmazonawsMedialiveMedialiveState::remove_resource_tags`] (writing), so a
 //! tag written by `CreateTags` is the tag that resource's own describe reports.
 //! The two writers own the per-resource tag bounds ([`MAX_RESOURCE_TAGS`],
-//! [`MAX_TAG_KEY_LEN`], [`MAX_TAG_VALUE_LEN`]), which is why the map itself is
-//! only ever handed out mutably inside this module.
+//! [`MAX_TAG_KEY_LEN`], [`MAX_TAG_VALUE_LEN`]) and the reserved key namespace
+//! ([`RESERVED_TAG_KEY_PREFIX`]), which is why the map itself is only ever
+//! handed out mutably inside this module. An operation that stores a tag map a
+//! request carried without going through them (a create, an update) refuses the
+//! reserved namespace with [`reserved_tag_key_in`] before it writes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -864,6 +867,63 @@ pub const MAX_TAG_KEY_LEN: usize = 128;
 /// ("Maximum value length — 256 Unicode characters"), unbounded by the model for
 /// the same reason as [`MAX_TAG_KEY_LEN`].
 pub const MAX_TAG_VALUE_LEN: usize = 256;
+
+/// The tag-key prefix AWS keeps for its own, system-applied tags.
+///
+/// The same AWS tag restrictions reserve it ("Do not use the aws: prefix in your
+/// tag names or values because it is reserved for AWS use. You can't edit or
+/// delete tag names or values with this prefix"), so a tag key carrying it is
+/// not a key a caller owns: a request asking to create, change or remove one is
+/// refused and the resource's stored tags are left as they were.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+///
+/// The prefix is matched without regard to case, so the namespace cannot be
+/// reached through a differently cased spelling of it.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    let mut characters = key.chars();
+    RESERVED_TAG_KEY_PREFIX.chars().all(|expected| {
+        characters
+            .next()
+            .is_some_and(|got| got.eq_ignore_ascii_case(&expected))
+    })
+}
+
+/// The reserved key among `keys`, when they carry one.
+///
+/// The SMALLEST such key, so a request naming several is refused with the same
+/// message however the map it came out of happened to be iterated.
+pub fn first_reserved_tag_key<'k, I>(keys: I) -> Option<&'k str>
+where
+    I: IntoIterator<Item = &'k String>,
+{
+    keys.into_iter()
+        .map(String::as_str)
+        .filter(|key| is_reserved_tag_key(key))
+        .min()
+}
+
+/// The reserved key a request's `Tags` member carries, when it carries one.
+///
+/// What an operation that stores a caller's whole tag map itself — a create, an
+/// update — checks before it writes, so the reserved namespace is refused
+/// wherever a tag key reaches the store and not only on the tag operations.
+pub fn reserved_tag_key_in(tags: Option<&HashMap<String, String>>) -> Option<&str> {
+    first_reserved_tag_key(tags.into_iter().flat_map(HashMap::keys))
+}
+
+/// What to tell a caller that named a key in the reserved namespace.
+///
+/// One wording for every operation that can be handed such a key, so the tag
+/// operations and the creates cannot drift into several readings of one
+/// restriction.
+pub fn reserved_tag_key_message(key: &str) -> String {
+    format!(
+        "Tag key '{key}' cannot start with '{RESERVED_TAG_KEY_PREFIX}'. \
+         That prefix is reserved for AWS use."
+    )
+}
 
 /// The page size a list operation (`ListChannels`, `ListSdiSources`) uses when
 /// the request names no `MaxResults`, and the ceiling it clamps a larger
@@ -3556,17 +3616,23 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// Add `tags` to the resource `arn` names, bounded.
     ///
-    /// The bounds live here rather than in the handler, so no caller-driven
-    /// write can grow a resource's tag map past them: every refusal is checked
-    /// BEFORE the first insert, and a refused request leaves the stored tags
-    /// exactly as they were.
+    /// The bounds and the reserved key namespace live here rather than in the
+    /// handler, so no caller-driven write can grow a resource's tag map past
+    /// them or plant a system tag in it: every refusal is checked BEFORE the
+    /// first insert, and a refused request leaves the stored tags exactly as
+    /// they were.
     pub fn insert_resource_tags(
         &mut self,
         arn: &str,
         tags: HashMap<String, String>,
     ) -> Result<(), TagRefusal> {
-        // Request shape first — a key or value past its length is refused
-        // whatever resource it was aimed at.
+        // Request shape first — a key a caller may not name at all, or a key or
+        // value past its length, is refused whatever resource it was aimed at.
+        if let Some(key) = first_reserved_tag_key(tags.keys()) {
+            return Err(TagRefusal::ReservedKeyPrefix {
+                key: key.to_string(),
+            });
+        }
         for (key, value) in &tags {
             if key.chars().count() > MAX_TAG_KEY_LEN {
                 return Err(TagRefusal::KeyTooLong {
@@ -3607,13 +3673,22 @@ impl ComAmazonawsMedialiveMedialiveState {
     ///
     /// Only ever shrinks a tag map, so it needs no bound of its own; a key the
     /// resource does not carry leaves it in the state the caller asked for, so
-    /// naming one is not a refusal. The only refusal is an ARN this store holds
-    /// no resource for.
+    /// naming one is not a refusal. What it does refuse is a key in the
+    /// reserved [`RESERVED_TAG_KEY_PREFIX`] namespace, which is not the
+    /// caller's to remove, and an ARN this store holds no resource for.
     pub fn remove_resource_tags(
         &mut self,
         arn: &str,
         keys: &[String],
     ) -> Result<(), TagRefusal> {
+        // A system tag is not the caller's to remove either, so the reserved
+        // namespace is refused here exactly as it is on the write path —
+        // before resolution, and before anything is removed.
+        if let Some(key) = first_reserved_tag_key(keys.iter()) {
+            return Err(TagRefusal::ReservedKeyPrefix {
+                key: key.to_string(),
+            });
+        }
         let stored = self
             .resource_tags_mut(arn)
             .ok_or(TagRefusal::NoSuchResource)?;
@@ -3630,6 +3705,10 @@ impl ComAmazonawsMedialiveMedialiveState {
 pub enum TagRefusal {
     /// No resource in this store carries that ARN.
     NoSuchResource,
+    /// A tag key lies in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace, so
+    /// it is not a key a caller may create, change or remove. Carries the key,
+    /// so the refusal names it.
+    ReservedKeyPrefix { key: String },
     /// The merged tag set would push the resource past
     /// [`MAX_RESOURCE_TAGS`]. Carries the count it would have reached.
     TooManyTags { merged: usize },

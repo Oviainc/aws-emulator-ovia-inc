@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateHostedZoneFeatures
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateHostedZoneFeatures`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateHostedZoneFeatures::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +68,31 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::Instant;
+
+use crate::state::{
+    no_such_hosted_zone, normalize_zone_id, AcceleratedRecovery, ACCELERATED_RECOVERY_PROPAGATION,
+};
+
+/// How the service words the refusal of a request that carries no setting for
+/// the one feature this operation configures.
+const NO_SETTING_REFUSAL: &str = "The request must specify EnableAcceleratedRecovery";
+
+/// How the service words the refusal of an enable against a private hosted
+/// zone: accelerated recovery serves a PUBLIC zone's records, so a private zone
+/// cannot have it turned on.
+const PRIVATE_ZONE_REFUSAL: &str = "Private hosted zones cannot enable accelerated recovery";
+
+/// How the service words the refusal of an enable for a zone that already has
+/// accelerated recovery on.
+const ALREADY_ENABLED_REFUSAL: &str =
+    "Accelerated recovery is already enabled for this hosted zone";
+
+/// How the service words the refusal of a disable for a zone whose accelerated
+/// recovery is already off.
+const ALREADY_DISABLED_REFUSAL: &str =
+    "Accelerated recovery is already disabled for this hosted zone";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -147,20 +163,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateHostedZoneFeatures` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateHostedZoneFeaturesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateHostedZoneFeatures"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            UpdateHostedZoneFeaturesErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The caller may pass the bare id or the `/hostedzone/`-prefixed `Id` a
+        // HostedZone handed it back; both name the same zone.
+        let id = normalize_zone_id(&input.hosted_zone_id);
+        let mut store = state.lock();
+        // A zone id that names no zone is refused through the ONE place this
+        // service words that refusal, so this operation reports a missing zone
+        // in exactly the request-derived form every other zone-addressed
+        // operation reports it in.
+        let zone = store.zones.get_mut(id).ok_or_else(|| {
+            UpdateHostedZoneFeaturesErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                &input.hosted_zone_id,
+            ))
+        })?;
+
+        // Accelerated recovery is the only feature this operation configures, so
+        // a request that carries no setting for it asks for no change at all.
+        let enable = input.enable_accelerated_recovery.ok_or_else(|| {
+            UpdateHostedZoneFeaturesErrorModeled::InvalidInput(InvalidInput {
+                message: Some(NO_SETTING_REFUSAL.to_string()),
+            })
+        })?;
+
+        // Accelerated recovery lets a caller "update DNS records in your public
+        // hosted zone even when the us-east-1 region is unavailable" (this
+        // operation's own documentation), so it is a feature of a PUBLIC zone
+        // and cannot be turned on for a private one.
+        if enable && zone.private_zone {
+            return Err(UpdateHostedZoneFeaturesErrorModeled::InvalidInput(
+                InvalidInput {
+                    message: Some(PRIVATE_ZONE_REFUSAL.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A features update asks the zone to CHANGE a feature's setting, so
+        // asking for the setting the zone already holds — or is already moving
+        // to — asks for nothing and is not a valid request. This is what makes a
+        // disable on a zone whose accelerated recovery is off a refusal rather
+        // than a no-op success.
+        if zone.accelerated_recovery_enabled() == enable {
+            return Err(UpdateHostedZoneFeaturesErrorModeled::InvalidInput(
+                InvalidInput {
+                    message: Some(
+                        if enable {
+                            ALREADY_ENABLED_REFUSAL
+                        } else {
+                            ALREADY_DISABLED_REFUSAL
+                        }
+                        .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The write this operation exists for. The zone starts MOVING to the
+        // requested setting (`ENABLING`/`DISABLING`) and reaches it
+        // (`ENABLED`/`DISABLED`) once the propagation span is up, so a caller
+        // that reads the zone straight back sees the transition it started.
+        zone.accelerated_recovery = Some(AcceleratedRecovery {
+            enabled: enable,
+            settles_at: Instant::now() + ACCELERATED_RECOVERY_PROPAGATION,
+        });
+
+        // `UpdateHostedZoneFeaturesResponse` models no members: what the update
+        // left is read back through a hosted-zone read's `Features`.
+        Ok(UpdateHostedZoneFeaturesOutput {})
     }
 }
