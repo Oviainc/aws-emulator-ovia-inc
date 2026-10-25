@@ -398,6 +398,62 @@ pub fn validate_action_definition(action_type: &str, definition: &Definition) ->
     ))
 }
 
+/// The account field of an ARN — the fifth of the six colon-separated fields an ARN is
+/// written in (`arn:<partition>:<service>:<region>:<account>:<resource>`), answered only
+/// when it is the twelve-digit id an AWS account is named by (`AccountId`: len 12..12,
+/// `^\d{12}$`).
+///
+/// The ARN itself is read with the one shared parse ([`::service_common::arn::parse`])
+/// rather than split again here. `None` for anything else, which a member carrying a
+/// modelled ARN `@pattern` whose account field is `\d{12}` cannot be once request
+/// validation has run.
+fn arn_account(arn: &str) -> Option<&str> {
+    let account = ::service_common::arn::parse(arn)?.account;
+    (account.len() == ACCOUNT_ID_LEN && account.chars().all(|c| c.is_ascii_digit()))
+        .then_some(account)
+}
+
+/// The width of an account id: "it's a 12-digit number" (`AccountId`, `@length(12, 12)`
+/// and `^\d{12}$`).
+const ACCOUNT_ID_LEN: usize = 12;
+
+/// The cross-member rule `Action$ExecutionRoleArn` documents, checked over the role an
+/// action is written with: "the role passed for action execution and reversion. Roles and
+/// actions must be in the same account" — so the account field of the role's ARN has to
+/// be the account the action lives in (`AccountId`). The modelled `@pattern` fixes the
+/// ARN's SHAPE only (`arn:aws…:iam::\d{12}:role/…`); no constraint trait can tie those
+/// twelve digits to another member of the request, so this is the handler's to enforce on
+/// every path that writes the member.
+///
+/// Fails CLOSED: a string whose account field is not an account id at all names no
+/// account to be in the same one as, so it is refused here too rather than passed
+/// through. Such a value cannot reach a handler through the modelled member (request
+/// validation refuses it first), so the refusal is what this rule means when the helper
+/// is reached by any other caller.
+///
+/// `Err` carries the sentence that goes in `InvalidParameterException$Message` ("An error
+/// on the client occurred. Typically, the cause is an invalid input value."), built from
+/// the request's own two values.
+pub fn validate_execution_role_account(
+    account_id: &str,
+    execution_role_arn: &str,
+) -> Result<(), String> {
+    let Some(role_account) = arn_account(execution_role_arn) else {
+        return Err(format!(
+            "Unable to create/update budget action: ExecutionRoleArn must be the ARN of an IAM \
+             role in account {account_id}, and {execution_role_arn} names no account."
+        ));
+    };
+    if role_account == account_id {
+        return Ok(());
+    }
+    Err(format!(
+        "Unable to create/update budget action: ExecutionRoleArn names a role in account \
+         {role_account}, and the role of an action in account {account_id} must be in that \
+         same account."
+    ))
+}
+
 /// `HealthStatusValue$HEALTHY` — the only state a budget in this emulator can be in:
 /// every budget here derives from a billing view this emulator always serves, so
 /// nothing can make it `UNHEALTHY` (which is why no `StatusReason` is reported either:

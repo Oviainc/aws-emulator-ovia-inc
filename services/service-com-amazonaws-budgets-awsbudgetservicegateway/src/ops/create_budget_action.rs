@@ -6,11 +6,13 @@
 //! operation mints for it, and leaves it in `ActionStatus$STANDBY` — armed, waiting for
 //! its threshold. `Action$ActionType` determines which member of `Definition` describes
 //! the work, so a mismatch is an `InvalidParameterException`
-//! ([`crate::state::validate_action_definition`]); a subscriber set past the documented
-//! per-type split is the subscriber limit `CreationLimitExceededException` names
-//! ([`crate::state::subscriber_limit_violation`]); a budget this account does not hold
-//! is a `NotFoundException`. The call is recorded as the action's `CREATE_ACTION` event,
-//! which `DescribeBudgetActionHistories` reports.
+//! ([`crate::state::validate_action_definition`]); an `ExecutionRoleArn` naming a role
+//! outside the account the action is created in is another
+//! ([`crate::state::validate_execution_role_account`]); a subscriber set past the
+//! documented per-type split is the subscriber limit `CreationLimitExceededException`
+//! names ([`crate::state::subscriber_limit_violation`]); a budget this account does not
+//! hold is a `NotFoundException`. The call is recorded as the action's `CREATE_ACTION`
+//! event, which `DescribeBudgetActionHistories` reports.
 //!
 //! Nothing here applies the action's `Definition` to IAM, Organizations or Systems
 //! Manager: that work belongs to other services and no request in this emulator runs
@@ -236,6 +238,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             },
         )?;
+
+        // "Roles and actions must be in the same account" (`Action$ExecutionRoleArn`) —
+        // a rule over two members of the request, which no constraint trait can express:
+        // the modelled `@pattern` fixes the ARN's shape only. Checked before the budget
+        // is looked up, for the same reason as the pairing above.
+        crate::state::validate_execution_role_account(&input.account_id, &input.execution_role_arn)
+            .map_err(|message| {
+                CreateBudgetActionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+            })?;
 
         // "A notification can have one SNS subscriber and up to 10 email subscribers,
         // for a total of 11 subscribers" — the PER-TYPE halves of the subscriber set
