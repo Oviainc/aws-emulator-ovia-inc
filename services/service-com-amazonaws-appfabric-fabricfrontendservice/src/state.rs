@@ -30,6 +30,11 @@ pub const ARN_SERVICE: &str = "appfabric";
 /// scope to read one from — the region every generated emulator defaults to.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The DNS suffix of the partition this emulator serves, which the model's
+/// endpoint rule set leaves as the `aws` partition's
+/// (`https://appfabric.{Region}.{PartitionResult#dnsSuffix}`).
+pub const DNS_SUFFIX: &str = "amazonaws.com";
+
 /// The two values the model's `IngestionState` enum carries
 /// (`INGESTION_STATE_VALUES` in the generated types): an ingestion is created
 /// `disabled`, `StartIngestion` enables it and `StopIngestion` disables it again.
@@ -80,6 +85,17 @@ pub const APP_AUTHORIZATION_STATUS_PENDING_CONNECT: &str = "PendingConnect";
 /// enum: "`Connected`: The app authorization is connected to the application,
 /// and is ready to be used."
 pub const APP_AUTHORIZATION_STATUS_CONNECTED: &str = "Connected";
+
+/// The `AuthType` whose credential is an API key, from the model's `AuthType`
+/// enum (`shared_types::AUTH_TYPE_VALUES` = `apiKey` | `oauth2`). An
+/// authorization of this type is authorized by the key the create call carried,
+/// so it has no consent step to report a URL for.
+pub const AUTH_TYPE_API_KEY: &str = "apiKey";
+
+/// The other `AuthType` from the same enum: the one whose authorization is
+/// granted through an OAuth consent step, which is what
+/// [`AppAuthorizationRecord::auth_url`] reports a URL for.
+pub const AUTH_TYPE_OAUTH2: &str = "oauth2";
 
 /// The user persona every app authorization carries, from the model's doc on
 /// `AppAuthorization$persona`: "This field should always be `admin`." One of the
@@ -325,6 +341,15 @@ pub struct AppAuthorizationRecord {
     pub id: String,
     pub arn: String,
     pub app_bundle_arn: String,
+    /// The bare UUID of the app bundle that owns this authorization — the key
+    /// the bundle is stored under, and the form of `appBundleIdentifier` the
+    /// authorization's own URLs are built with (see
+    /// [`AppAuthorizationRecord::auth_url`]).
+    pub app_bundle_id: String,
+    /// The Region the create call was signed for: the Region this authorization
+    /// lives in, the one its [`arn`](Self::arn) carries, and the one whose
+    /// service endpoint its URLs name.
+    pub region: String,
     pub app: String,
     pub tenant_identifier: String,
     pub tenant_display_name: String,
@@ -348,6 +373,24 @@ impl AppAuthorizationRecord {
         }
     }
 
+    /// The URL this authorization reports as its `authUrl` ("The application URL
+    /// for the OAuth flow"), or `None` when its `authType` has no OAuth flow to
+    /// report one for.
+    ///
+    /// An `oauth2` authorization is granted through a consent step, and the code
+    /// that step hands back is what `ConnectAppAuthorization` takes in its
+    /// `authRequest` ("after permission is granted in the application OAuth
+    /// page"), so the URL this reports is where that flow continues — see
+    /// [`oauth_flow_url`]. An `apiKey` authorization carries its credential
+    /// already and has no consent step, so it reports no URL.
+    pub fn auth_url(&self) -> Option<String> {
+        if self.auth_type == AUTH_TYPE_OAUTH2 {
+            Some(oauth_flow_url(&self.region, &self.app_bundle_id, &self.id))
+        } else {
+            None
+        }
+    }
+
     /// The modelled `AppAuthorization` for this record.
     pub fn to_app_authorization(&self) -> AppAuthorization {
         AppAuthorization {
@@ -360,11 +403,7 @@ impl AppAuthorizationRecord {
             created_at: ::aws_smithy_types::DateTime::from(self.created_at),
             updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
             persona: Some(APP_AUTHORIZATION_PERSONA_ADMIN.to_string()),
-            // `authUrl` is the application's own OAuth page. This emulator makes
-            // no outbound connection and serves no application, so there is no
-            // such URL to report; the member is optional and stays absent rather
-            // than carrying a URL nothing is served at.
-            auth_url: None,
+            auth_url: self.auth_url(),
         }
     }
 
@@ -1045,6 +1084,31 @@ pub fn appfabric_arn(region: &str, resource: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, resource)
 }
 
+/// The service endpoint host for `region`, as the model's own endpoint rule set
+/// renders it (`https://appfabric.{Region}.{PartitionResult#dnsSuffix}`) in the
+/// `aws` partition — the host a caller addresses this service at.
+pub fn endpoint_host(region: &str) -> String {
+    format!("{ARN_SERVICE}.{region}.{DNS_SUFFIX}")
+}
+
+/// The URL the OAuth flow of ONE app authorization continues at.
+///
+/// Built from the two halves the model states: the service endpoint for the
+/// authorization's Region ([`endpoint_host`]) and the `ConnectAppAuthorization`
+/// HTTP URI the model binds
+/// (`/appbundles/{appBundleIdentifier}/appauthorizations/{appAuthorizationIdentifier}/connect`),
+/// over the bare UUIDs the bundle and the authorization are stored under. It is
+/// therefore derived from stored state rather than from the request, stable
+/// across reads for as long as the authorization exists, and a URL this emulator
+/// itself answers rather than one no endpoint serves. It carries no credential
+/// material: the consent step's own secrets are the caller's.
+pub fn oauth_flow_url(region: &str, app_bundle_id: &str, authorization_id: &str) -> String {
+    format!(
+        "https://{}/appbundles/{app_bundle_id}/appauthorizations/{authorization_id}/connect",
+        endpoint_host(region)
+    )
+}
+
 /// The KMS key ARN a `customerManagedKeyIdentifier` denotes.
 ///
 /// The member takes a key ARN *or* a bare key id, while the response member is
@@ -1384,7 +1448,7 @@ pub fn credential_kind(credential: &Credential) -> &'static str {
 /// already refused anything else, so the `oauth2` arm is the only remaining
 /// alternative to `apiKey`.
 pub fn credential_kind_for_auth_type(auth_type: &str) -> &'static str {
-    if auth_type == "apiKey" {
+    if auth_type == AUTH_TYPE_API_KEY {
         "apiKeyCredential"
     } else {
         "oauth2Credential"

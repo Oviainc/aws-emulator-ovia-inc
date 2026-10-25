@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChannelFlows
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChannelFlows`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChannelFlows::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the channel flows [`crate::state`] holds under the `AppInstanceArn` the
+//! request names, ordered by their ARN so successive pages agree, paginated the way
+//! `ListChannels` paginates channels. Reporting only — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +149,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChannelFlows` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChannelFlowsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChannelFlows"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListChannelFlowsErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        // `MaxResults` is modelled `range 1..50`; an omitted page size takes that
+        // maximum, so a caller that asks for no size still gets a bounded page.
+        let requested = input.max_results.unwrap_or(MAX_RESULTS_MAX);
+        if !(1..=MAX_RESULTS_MAX).contains(&requested) {
+            return Err(bad_request(format!(
+                "MaxResults must be between 1 and {MAX_RESULTS_MAX}; got {requested}"
+            )));
+        }
+        let page_size = usize::try_from(requested).unwrap_or(0);
+
+        let store = state.lock();
+        // One stable ordered view of the app instance's channel flows: a `HashMap` has no
+        // order of its own, so the ARN — unique per channel flow — is what makes
+        // successive pages agree.
+        let mut view: Vec<&crate::state::ChannelFlowRecord> = store
+            .channel_flows
+            .values()
+            .filter(|flow| flow.app_instance_arn == input.app_instance_arn)
+            .collect();
+        view.sort_by(|left, right| left.arn.cmp(&right.arn));
+
+        // A `NextToken` names the last channel flow of the previous page, so this page
+        // resumes at the one after it in THIS ordered view.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let cursor = crate::state::decode_next_token(token).ok_or_else(|| {
+                    bad_request("NextToken is not a token this service issued".to_string())
+                })?;
+                view.iter()
+                    .position(|flow| flow.arn == cursor)
+                    .ok_or_else(|| {
+                        bad_request(
+                            "NextToken does not resume this view: the channel flow it names is no longer in it"
+                                .to_string(),
+                        )
+                    })?
+                    + 1
+            }
+        };
+
+        let page: Vec<&crate::state::ChannelFlowRecord> =
+            view.iter().skip(start).take(page_size).copied().collect();
+        let next_token = (start + page.len() < view.len())
+            .then(|| {
+                page.last()
+                    .map(|flow| crate::state::encode_next_token(&flow.arn))
+            })
+            .flatten();
+
+        Ok(ListChannelFlowsOutput {
+            channel_flows: Some(page.iter().map(|flow| flow.to_summary()).collect()),
+            next_token,
+        })
     }
+}
+
+/// `MaxResults`'s modelled upper bound for this operation (`range 1..50`).
+const MAX_RESULTS_MAX: i32 = 50;
+
+/// Refuse the request with this service's own client-input error, HTTP 400.
+fn bad_request(message: String) -> ListChannelFlowsError {
+    ListChannelFlowsErrorModeled::BadRequestException(BadRequestException {
+        code: Some("BadRequest".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

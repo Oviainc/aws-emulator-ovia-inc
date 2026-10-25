@@ -27,6 +27,8 @@ mod job_flow_role;
 mod managed_scaling_policy;
 #[path = "all/notebook_executions.rs"]
 mod notebook_executions;
+#[path = "all/persistent_app_ui.rs"]
+mod persistent_app_ui;
 #[path = "all/release_label_catalog.rs"]
 mod release_label_catalog;
 #[path = "all/release_labels.rs"]

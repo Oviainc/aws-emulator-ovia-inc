@@ -46,7 +46,7 @@ const ACCOUNT_ID: &str = "000000000000";
 
 /// A `CustomColors` value: every member is required
 /// (`smithy_query(query="shape", shape="CustomColors")`).
-fn custom_colors() -> Value {
+pub(crate) fn custom_colors() -> Value {
     json!({
         "accentColor": "#ff9900",
         "backgroundColor": "#ffffff",
@@ -59,7 +59,7 @@ fn custom_colors() -> Value {
 
 /// A minimal `PortalContent`: `DisplayName` and `Theme` are required, `Description` is
 /// not.
-fn portal_content(display_name: &str) -> Value {
+pub(crate) fn portal_content(display_name: &str) -> Value {
     json!({ "displayName": display_name, "theme": { "customColors": custom_colors() } })
 }
 

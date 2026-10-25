@@ -14,6 +14,16 @@
 //! an account with no ACTIVE one is refused with the modelled `ValidationException`
 //! (HTTP 400) and nothing is minted or written.
 //!
+//! `Plan` is required, and a plan NAMES resources: each target's `ContactChannelId` or
+//! `ContactId` and each `RotationIds` entry is an `SsmContactsArn`, i.e. a reference this
+//! store has to resolve. A plan naming something the account does not hold is refused with
+//! the same modelled `ValidationException` — `CreateContact` models no
+//! `ResourceNotFoundException` — and nothing is written
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::resolve_plan`]). A contact's
+//! own channels cannot exist yet at this point (a channel is created UNDER a stored
+//! contact), so a create's plan names rotations, other contacts' channels, or nothing; the
+//! contact's own channels are attached afterwards with `UpdateContact`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -202,6 +212,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // boundary validator enforces length/pattern/range, not an enum's value set.
         check_enum("type", &input.r#type, CONTACT_TYPE_VALUES).map_err(validation)?;
 
+        // The contact's ARN is derived from its caller-chosen `Alias`, so it is known before
+        // anything is written — which is what lets the plan be resolved against the contact
+        // it is being created FOR.
+        let arn = contact_arn(&crate::state::request_region(ctx.parts()), &input.alias);
+
+        // `Plan` is required here, and a plan is a graph of references: every ARN it names
+        // must resolve to a resource this account holds. `CreateContact` models no
+        // `ResourceNotFoundException` at all, so an unresolvable reference is refused with
+        // the `ValidationException` it does model — the same refusal `UpdateContact`
+        // answers, since both store a plan.
+        state.resolve_plan(&arn, &input.plan).map_err(validation)?;
+
         // A retried create carrying the token its first call carried is the SAME call:
         // "a token ensuring that the operation is called only once with the specified
         // details". It answers with the ARN already minted rather than a second contact —
@@ -246,7 +268,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let arn = contact_arn(&crate::state::request_region(ctx.parts()), &input.alias);
         let record = ContactRecord {
             arn: arn.clone(),
             alias: input.alias.clone(),

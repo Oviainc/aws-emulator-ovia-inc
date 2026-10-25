@@ -21,6 +21,10 @@
 //! `crate::ops::describe_db_engine_versions`, so this answer and that report cannot
 //! disagree about one record.
 //!
+//! The create is accepted BEFORE the media it names has been imported, so it answers with
+//! the CEV still in the `creating` status; the CEV reaches `available` on its own a moment
+//! later, and only then can `ModifyCustomDBEngineVersion` change it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -488,9 +492,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &engine_version,
         );
         let mint = store.next_mint();
-        // A CEV is usable as soon as it is created: the create answers with it already in
-        // the status an RDS Custom DB instance can be created from, so nothing about it is
-        // owed later.
+        // A CEV is not usable the instant it is created: RDS imports the media the account
+        // supplied after accepting this call, so the create answers with the CEV still
+        // being created and this service owes it the move to the status an RDS Custom DB
+        // instance can be created from. The due instant is stored on the record and
+        // materialised by the next call — nothing sleeps.
         let record = crate::state::CustomDbEngineVersionRecord {
             engine,
             engine_version,
@@ -527,7 +533,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 installation_files
             },
-            status: crate::state::CUSTOM_ENGINE_VERSION_STATUS_AVAILABLE.to_string(),
+            status: crate::state::CUSTOM_ENGINE_VERSION_STATUS_CREATING.to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::CUSTOM_ENGINE_VERSION_STATUS_AVAILABLE,
+            )),
             create_time: crate::state::now_as_wire_timestamp(),
             tags,
         };
