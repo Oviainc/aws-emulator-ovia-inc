@@ -171,6 +171,16 @@ pub(crate) fn identity_document(instance_id: &str) -> String {
     .to_string()
 }
 
+/// The signature of an EC2 instance identity document, as the agent reads it from
+/// `http://169.254.169.254/latest/dynamic/instance-identity/signature/`: base64 text,
+/// which a registration presents BESIDE the document — the document alone identifies no
+/// machine. 350 characters, because the signature of a document under a 2048-bit key is
+/// 256 bytes and base64 spells those in 344. Nothing here signs anything: what a
+/// signature is OF cannot be checked without the key that produced it.
+pub(crate) fn identity_document_signature() -> String {
+    "ZXhhbXBsZQ".repeat(35)
+}
+
 /// Register one container instance into `cluster` through the agent's own operation and
 /// return its ARN.
 pub(crate) async fn register_instance(
@@ -185,6 +195,7 @@ pub(crate) async fn register_instance(
         json!({
             "cluster": cluster,
             "instanceIdentityDocument": identity_document(instance_id),
+            "instanceIdentityDocumentSignature": identity_document_signature(),
         }),
         case,
     )

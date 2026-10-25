@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterContainerInstance
-//! Registers an EC2 or external instance into a cluster and PERSISTS it, so the cluster
-//! afterwards reports its capacity through `ListContainerInstances`,
-//! `DescribeContainerInstances` and `Cluster$registeredContainerInstancesCount`.
+//! Registers the EC2 instance its identity document and that document's signature vouch
+//! for, and PERSISTS it, so the cluster afterwards reports its capacity through
+//! `ListContainerInstances`, `DescribeContainerInstances` and
+//! `Cluster$registeredContainerInstancesCount`.
 //!
 //! ## Shape of an operation
 //!
@@ -109,12 +110,64 @@ const IDENTITY_DOCUMENT_ACCOUNT_ID: &str = "accountId";
 /// The member of the same document that carries the instance id.
 const IDENTITY_DOCUMENT_INSTANCE_ID: &str = "instanceId";
 
+/// The member of the same document that names the Region the instance runs in.
+const IDENTITY_DOCUMENT_REGION: &str = "region";
+
 /// The members of an identity document a registration must carry, IN THE ORDER they are
 /// validated: a document that leaves more than one blank is reported on the first of
 /// them. `accountId` comes first, which is the member Amazon ECS names for a document it
 /// cannot read at all.
 const IDENTITY_DOCUMENT_REQUIRED_MEMBERS: [&str; 2] =
     [IDENTITY_DOCUMENT_ACCOUNT_ID, IDENTITY_DOCUMENT_INSTANCE_ID];
+
+/// What Amazon ECS says when the identity document a registration presents and the
+/// signature presented with it are not the pair that vouches for one EC2 instance: the
+/// value is not the JSON document the instance metadata publishes, or no signature of
+/// that document accompanies it.
+const IDENTITY_NOT_VALID: &str =
+    "The identity document and identity document signature were not valid.";
+
+/// The characters the instance identity document SIGNATURE is spelled with. The member's
+/// doc reads it from `http://169.254.169.254/latest/dynamic/instance-identity/signature/`,
+/// which publishes the signature of the document as base64 text, so a value carrying
+/// anything else is not a signature of anything. Whitespace is allowed: the published
+/// text is line-wrapped.
+fn is_signature_text(signature: &str) -> bool {
+    signature.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(character, '+' | '/' | '=')
+            || character.is_whitespace()
+    })
+}
+
+/// How many characters the signature of an identity document is, at the fewest: the
+/// document is signed with a 2048-bit key, so its signature is 256 bytes, which base64
+/// spells in 344 characters. A shorter value is too small to be a signature of anything,
+/// whatever characters it is spelled with.
+const MIN_SIGNATURE_LENGTH: usize = 344;
+
+/// Whether `signature` is a signature a registration can present for its identity
+/// document: base64 text ([`is_signature_text`]) of at least a signature's length. What
+/// that signature is OF cannot be checked here — verifying it needs the Amazon Web
+/// Services key that signed the document — so a registration presenting one of the right
+/// form is taken at its word.
+fn is_presented_signature(signature: Option<&str>) -> bool {
+    signature.map(str::trim).is_some_and(|signature| {
+        signature.len() >= MIN_SIGNATURE_LENGTH && is_signature_text(signature)
+    })
+}
+
+/// Whether `document` is the identity document of an instance THIS caller could be
+/// registering: one the metadata of a machine in the caller's own account
+/// ([`::engine::EMULATOR_ACCOUNT_ID`]) and in the Region the request was signed for
+/// publishes. A document naming another account or another Region is not one Amazon Web
+/// Services signed for this caller, however well formed it is.
+fn describes_this_caller(document: &::serde_json::Value, region: &str) -> bool {
+    identity_document_member(document, IDENTITY_DOCUMENT_ACCOUNT_ID)
+        .is_some_and(|account| account == ::engine::EMULATOR_ACCOUNT_ID)
+        && identity_document_member(document, IDENTITY_DOCUMENT_REGION)
+            .is_some_and(|documented| documented == region)
+}
 
 /// The value a member of an identity document carries, or `None` when the document is
 /// not a JSON object, does not carry that member, or leaves it blank. A member that is
@@ -209,33 +262,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
 
-        // "The instance identity document for the EC2 instance to register." When the
-        // agent sends one, that document is what identifies the machine, so every member
-        // it has to carry is validated before anything is stored. The refusal names the
-        // MEMBER OF THE DOCUMENT that is blank — the first one in
-        // [`IDENTITY_DOCUMENT_REQUIRED_MEMBERS`] — and nothing else about the request; a
-        // document that is not JSON at all leaves every member blank, so it is reported
-        // on the first one too.
-        let documented_instance_id = match input.instance_identity_document.as_deref() {
-            Some(document) => {
-                let parsed = ::serde_json::from_str::<::serde_json::Value>(document)
-                    .unwrap_or(::serde_json::Value::Null);
-                for member in IDENTITY_DOCUMENT_REQUIRED_MEMBERS {
-                    if identity_document_member(&parsed, member).is_none() {
-                        return Err(
-                            RegisterContainerInstanceErrorModeled::InvalidParameterException(
-                                InvalidParameterException {
-                                    message: Some(format!("{member} cannot be blank.")),
-                                },
-                            )
-                            .into(),
-                        );
-                    }
-                }
-                identity_document_member(&parsed, IDENTITY_DOCUMENT_INSTANCE_ID)
-            }
-            None => None,
+        // "The instance identity document for the EC2 instance to register", and "the
+        // instance identity document signature for the EC2 instance to register": the two
+        // together are what identifies the machine a registration is about, so a
+        // registration presents BOTH. A document whose members a registration must carry
+        // is read first, and a blank one is reported by name — the first of
+        // [`IDENTITY_DOCUMENT_REQUIRED_MEMBERS`], and nothing else about the request.
+        //
+        // What is not read here is the machine itself: a document that is absent, that
+        // describes an instance of another account or Region, or that comes without a
+        // signature of the published form vouches for no machine this caller could be
+        // registering, so the pair is refused and no instance is registered for it.
+        let Some(document) = input.instance_identity_document.as_deref() else {
+            return Err(
+                RegisterContainerInstanceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(IDENTITY_NOT_VALID.to_string()),
+                    },
+                )
+                .into(),
+            );
         };
+        let parsed =
+            ::serde_json::from_str::<::serde_json::Value>(document).unwrap_or(::serde_json::Value::Null);
+        for member in IDENTITY_DOCUMENT_REQUIRED_MEMBERS {
+            if identity_document_member(&parsed, member).is_none() {
+                return Err(
+                    RegisterContainerInstanceErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!("{member} cannot be blank.")),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        if !describes_this_caller(&parsed, &region)
+            || !is_presented_signature(input.instance_identity_document_signature.as_deref())
+        {
+            return Err(
+                RegisterContainerInstanceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(IDENTITY_NOT_VALID.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        let documented_instance_id =
+            match identity_document_member(&parsed, IDENTITY_DOCUMENT_INSTANCE_ID) {
+                Some(instance_id) => instance_id,
+                // Not reachable: the loop above has already refused a document whose
+                // `instanceId` is blank. Answered rather than asserted, so no request can
+                // make this operation panic.
+                None => {
+                    return Err(
+                        RegisterContainerInstanceErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(IDENTITY_NOT_VALID.to_string()),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            };
 
         // A caller-supplied tag may not write into the namespace Amazon Web Services keeps
         // for its own tags, whichever operation carries the `tags` list.
@@ -297,16 +387,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     );
                 }
             }
-            None => documented_instance_id.as_deref().and_then(|instance_id| {
-                guard
-                    .container_instances
-                    .values()
-                    .find(|instance| {
-                        instance.cluster_name == cluster_name
-                            && instance.ec2_instance_id == instance_id
-                    })
-                    .map(|instance| instance.arn.clone())
-            }),
+            None => guard
+                .container_instances
+                .values()
+                .find(|instance| {
+                    instance.cluster_name == cluster_name
+                        && instance.ec2_instance_id == documented_instance_id
+                })
+                .map(|instance| instance.arn.clone()),
         };
 
         let version_info = input.version_info.clone();
@@ -324,9 +412,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .container_instances
                 .get_mut(&arn)
                 .expect("the ARN was just read out of the map under this lock");
-            if let Some(instance_id) = documented_instance_id {
-                instance.ec2_instance_id = instance_id;
-            }
+            instance.ec2_instance_id = documented_instance_id;
             instance.status = crate::state::CONTAINER_INSTANCE_ACTIVE.to_string();
             instance.status_reason = None;
             instance.agent_connected = true;
@@ -360,13 +446,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let instance_id = guard.next_container_instance_id();
-        // "For Amazon EC2 instances, this value is the Amazon EC2 instance ID. For
-        // external instances, this value is the ... Systems Manager managed instance ID"
-        // — an instance that registers without an identity document is an external one.
-        let ec2_instance_id = match documented_instance_id {
-            Some(instance_id) => instance_id,
-            None => guard.next_managed_instance_id(),
-        };
+        // "For Amazon EC2 instances, this value is the Amazon EC2 instance ID" — the id
+        // the identity document this registration presented names.
+        let ec2_instance_id = documented_instance_id;
         let record = crate::state::ContainerInstanceRecord {
             arn: crate::state::container_instance_arn(&region, &cluster_name, &instance_id),
             instance_id,

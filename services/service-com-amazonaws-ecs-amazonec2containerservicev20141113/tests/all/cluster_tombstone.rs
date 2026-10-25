@@ -974,6 +974,8 @@ async fn a_tombstoned_cluster_is_no_longer_a_cluster_an_operation_can_work_in() 
             json!({
                 "cluster": cluster,
                 "instanceIdentityDocument": identity_document("i-0a1b2c3d4e5f60718"),
+                "instanceIdentityDocumentSignature":
+                    crate::ecs_wire::identity_document_signature(),
             })
         }),
         ("ListContainerInstances", |cluster| {

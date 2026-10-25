@@ -26,7 +26,7 @@ use crate::ops::types::{
     ItemCollectionMetrics, KeySchemaElement, LocalSecondaryIndexDescription,
     LocalSecondaryIndexInfo,
     PointInTimeRecoveryDescription, Projection,
-    ProvisionedThroughput, ProvisionedThroughputDescription, SourceTableDetails,
+    ProvisionedThroughput, ProvisionedThroughputDescription, RestoreSummary, SourceTableDetails,
     OnDemandThroughput,
     SourceTableFeatureDetails, StreamSpecification, Tag,
     TableClassSummary, TableDescription, TableThroughputModeSummary,
@@ -2065,6 +2065,22 @@ pub const BACKUP_TYPE_FILTER_ALL: &str = "ALL";
 /// records here can never outnumber `MAX_REGIONS * MAX_BACKUPS_PER_REGION`.
 pub const MAX_BACKUPS_PER_REGION: usize = MAX_TABLES;
 
+/// How many bytes of ITEM DATA the whole backup catalogue may hold.
+///
+/// A backup keeps the items its source table held at the instant it was taken — that is
+/// what a restore writes into the new table — so the catalogue is a growth site of its
+/// own, beside the tables themselves. AWS states no ceiling here either, so this is the
+/// table store's own budget over again ([`MAX_STORE_SIZE_BYTES`]): a `CreateBackup` that
+/// would push the catalogue past it answers the modelled `LimitExceededException`
+/// instead of growing the process without end.
+pub const MAX_BACKUP_CATALOGUE_BYTES: i64 = MAX_STORE_SIZE_BYTES;
+
+/// How many restores may be in flight at once: "Any number of users can execute up to 50
+/// concurrent restores (any type of restore) in a given account" (the
+/// `RestoreTableFromBackup` doc, repeated on `RestoreTableToPointInTime`). A restore past
+/// it answers the modelled `LimitExceededException`.
+pub const MAX_CONCURRENT_RESTORES: usize = 50;
+
 /// Whether a stored `BackupType` is one a request's `BackupTypeFilter` selects.
 ///
 /// One rule for every filter value the model declares: `ALL` spans the on-demand types
@@ -2196,8 +2212,20 @@ pub struct Backup {
     /// own member (`BackupDetails$BackupExpiryDateTime`). A backup a caller asked for
     /// does not expire, so this is `None` for every backup this API catalogues.
     pub expires_at: Option<SystemTime>,
+    /// When the restore in flight from this backup finishes, while one is: a backup "is
+    /// either being created, deleted or restored to a table" (`BackupInUseException`),
+    /// so for that span the backup is in use and no second backup control-plane call may
+    /// have it. `None` once no restore is in flight; whether the span has elapsed is
+    /// derived from the clock on every read, so nothing sleeps.
+    pub restored_until: Option<SystemTime>,
     /// The source table as it stood when the backup was requested.
     pub source: SourceTableSnapshot,
+    /// The ITEMS the source table held at the instant the backup was requested, which is
+    /// the data this backup holds: "the entire table data is backed up" (the
+    /// `CreateBackup` doc). Copied HERE rather than read off the table later, because a
+    /// backup outlives the table it was taken from — and they are what
+    /// `RestoreTableFromBackup` writes into the table it creates.
+    pub items: BTreeMap<ItemKey, Item>,
 }
 
 /// The source table as a backup records it: the configuration and figures
@@ -2207,6 +2235,10 @@ pub struct Backup {
 #[derive(Debug, Clone)]
 pub struct SourceTableSnapshot {
     pub key_schema: Vec<KeySchemaElement>,
+    /// The attribute definitions the source table declared. No backup reader reports
+    /// them — `SourceTableDetails` carries none — but they are part of the table's
+    /// schema, so a table restored from this backup declares the same ones.
+    pub attribute_definitions: Vec<AttributeDefinition>,
     pub table_creation_date_time: SystemTime,
     pub billing_mode: String,
     /// The capacity the table was provisioned for, as a description reports it: zeroes
@@ -2239,7 +2271,9 @@ impl Backup {
             created_at,
             available_at: now + STATUS_TRANSITION,
             expires_at: None,
+            restored_until: None,
             source: table.backup_snapshot(),
+            items: table.items.clone(),
         }
     }
 
@@ -2256,6 +2290,32 @@ impl Backup {
     /// transition, which is what a conflicting backup operation on the table is.
     pub fn still_creating(&self, now: SystemTime) -> bool {
         now < self.available_at
+    }
+
+    /// Whether a restore from this backup is still in flight at `now`.
+    pub fn still_restoring(&self, now: SystemTime) -> bool {
+        self.restored_until.is_some_and(|until| now < until)
+    }
+
+    /// Whether another backup control-plane operation still has this backup, so a call
+    /// that needs it to itself is refused: "The backup is either being created, deleted
+    /// or restored to a table" (`BackupInUseException`).
+    pub fn in_use(&self, now: SystemTime) -> bool {
+        self.still_creating(now) || self.still_restoring(now)
+    }
+
+    /// How a backup another operation still has is refused, naming the operation that
+    /// has it — ONE sentence per in-flight operation, so the two callers that report
+    /// `BackupInUseException` cannot word the same conflict differently. A backup that is
+    /// in use for neither reason has nothing to report.
+    pub fn in_use_message(&self, now: SystemTime) -> Option<String> {
+        if self.still_creating(now) {
+            return Some(format!("Backup is being created: {}", self.arn));
+        }
+        if self.still_restoring(now) {
+            return Some(format!("Backup is being used to restore table: {}", self.arn));
+        }
+        None
     }
 
     /// Project this backup into the `BackupDetails` every backup operation reports,
@@ -2463,6 +2523,32 @@ pub struct Table {
     /// operations wrote and report it ([`ContributorInsights`]). Its indexes carry
     /// their own.
     pub contributor_insights: ContributorInsights,
+    /// What this table was RESTORED from, for a table a restore created, or `None` for a
+    /// table `CreateTable` created: "Contains details for the restore"
+    /// (`TableDescription$RestoreSummary`), which is what every description of a restored
+    /// table reports ([`TableRestore`]).
+    pub restore: Option<TableRestore>,
+}
+
+/// Where a restored table came from, as `RestoreSummary` reports it: the backup it was
+/// restored from, the table that backup was taken of, and when the restore was asked
+/// for.
+///
+/// Written ONCE, by the restore that created the table, and never changed after — so
+/// every later description reports the same three values. Whether the restore is still
+/// in progress is NOT stored here: it is the table's own `CREATING` span, derived from
+/// the clock like every other transient status ([`Table::status`]).
+#[derive(Debug, Clone)]
+pub struct TableRestore {
+    /// "The Amazon Resource Name (ARN) of the backup from which the table was restored"
+    /// (`RestoreSummary$SourceBackupArn`) — `None` for a restore that was not from a
+    /// backup.
+    pub source_backup_arn: Option<String>,
+    /// "The ARN of the source table of the backup that is being restored"
+    /// (`RestoreSummary$SourceTableArn`).
+    pub source_table_arn: Option<String>,
+    /// "Point in time or source backup time" (`RestoreSummary$RestoreDateTime`).
+    pub restore_date_time: SystemTime,
 }
 
 impl Table {
@@ -2857,6 +2943,17 @@ impl Table {
         if !self.reported_counters.refresh_due(now) {
             return;
         }
+        self.meter_counters(now);
+    }
+
+    /// Meter this table's figures and every index's, at `now`, whatever the schedule.
+    ///
+    /// The walk [`Self::refresh_due_counters`] performs when the clock has made a refresh
+    /// due, reached directly by the one caller whose table ALREADY HOLDS data when it is
+    /// created — a table a restore wrote the backup's items into, whose figures at
+    /// creation are those of that data rather than zeroes. Nothing else may call it: a
+    /// write never moves what `ItemCount`/`TableSizeBytes` report.
+    pub fn meter_counters(&mut self, now: SystemTime) {
         let item_count = self.live_item_count();
         let size_bytes = self.live_table_size_bytes();
         self.reported_counters.refresh(now, item_count, size_bytes);
@@ -3267,6 +3364,17 @@ impl Table {
             }),
             latest_stream_arn: self.stream.as_ref().map(|stream| stream.arn.clone()),
             latest_stream_label: self.stream.as_ref().map(|stream| stream.label.clone()),
+            // "Contains details for the restore": reported only for a table a restore
+            // created, which is what DescribeTable does for a table `CreateTable`
+            // created. `RestoreInProgress` is the table's own transient status — the
+            // restore is what is creating it — so the one stored span answers both
+            // members and they cannot disagree.
+            restore_summary: self.restore.as_ref().map(|restore| RestoreSummary {
+                source_backup_arn: restore.source_backup_arn.clone(),
+                source_table_arn: restore.source_table_arn.clone(),
+                restore_date_time: ::aws_smithy_types::DateTime::from(restore.restore_date_time),
+                restore_in_progress: self.status(now) == TableStatus::Creating,
+            }),
             ..TableDescription::default()
         }
     }
@@ -3282,6 +3390,7 @@ impl Table {
     pub fn backup_snapshot(&self) -> SourceTableSnapshot {
         SourceTableSnapshot {
             key_schema: self.key_schema.clone(),
+            attribute_definitions: self.attribute_definitions.clone(),
             table_creation_date_time: self.creation_date_time,
             billing_mode: self.billing_mode.clone(),
             provisioned_throughput: reported_capacity(self.provisioned_throughput.as_ref()),
@@ -3619,6 +3728,39 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     /// Catalogue a new backup under the ARN minted for it.
     pub fn insert_backup(&mut self, backup: Backup) {
         self.backups.insert(backup.arn.clone(), backup);
+    }
+
+    /// The backup that `BackupArn` names, mutably, for the operation that takes it for a
+    /// restore. The same lookup and the same miss as [`Self::backup`].
+    pub fn backup_mut(&mut self, region: &str, backup_arn: &str) -> Result<&mut Backup, RequestError> {
+        self.backups
+            .get_mut(backup_arn)
+            .filter(|backup| backup.region == region)
+            .ok_or_else(|| backup_not_found(backup_arn))
+    }
+
+    /// The bytes of item data the whole catalogue holds — the figure
+    /// [`MAX_BACKUP_CATALOGUE_BYTES`] is measured against. O(backups), because each
+    /// record carries the size of the data it holds.
+    pub fn backup_bytes(&self) -> i64 {
+        self.backups
+            .values()
+            .map(|backup| backup.size_bytes)
+            .fold(0, i64::saturating_add)
+    }
+
+    /// How many restores are still in flight in `region` at `now` — the figure
+    /// [`MAX_CONCURRENT_RESTORES`] is measured against. A restore is in flight while the
+    /// table it is creating is still `CREATING`.
+    pub fn restores_in_progress(&self, region: &str, now: SystemTime) -> usize {
+        self.tables_in(region).map_or(0, |tables| {
+            tables
+                .values()
+                .filter(|table| {
+                    table.restore.is_some() && table.status(now) == TableStatus::Creating
+                })
+                .count()
+        })
     }
 
     /// How many backups that region already holds — what [`MAX_BACKUPS_PER_REGION`] is

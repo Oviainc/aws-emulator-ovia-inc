@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutObjectAnnotation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutObjectAnnotation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutObjectAnnotation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches an annotation — "a named payload of 1 byte to 1 MiB that you can associate
+//! with a specific object or object version" — to the stored object version this request
+//! addresses, and reports the entity tag of the payload it recorded.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -231,17 +226,238 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutObjectAnnotation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutObjectAnnotationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutObjectAnnotation"))
+        // request metadata only, and this write needs nothing from it.
+        let _ = ctx;
+
+        // "If the bucket is owned by a different account, the request fails with an HTTP
+        // 403 (Access Denied) error" (`PutObjectAnnotationRequest$ExpectedBucketOwner`),
+        // judged the way every other handler here judges it: this emulator serves one
+        // account, so the owner of every bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // `ContentMD5` is "the Base64-encoded MD5 digest of the message", so when the
+        // request carries it, it is CHECKED against the payload actually received: a
+        // mismatch means the body is not the body the client hashed. S3 answers `BadDigest`
+        // (400), which this model carries no shape for, so it goes out through the
+        // unmodelled channel with the code and the published text — the way `UploadPart`
+        // answers the same header.
+        if let Some(declared) = input.content_md5.as_deref() {
+            if declared != crate::state::content_md5(&input.annotation_payload) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::BAD_DIGEST_CODE,
+                    crate::state::BAD_DIGEST_STATUS,
+                    crate::state::BAD_DIGEST_MESSAGE,
+                ));
+            }
+        }
+
+        // The NAME, judged against its own documented bounds before anything else about
+        // the request is: `AnnotationName` carries no `length` trait in the model, so
+        // nothing refused an over-long or empty one at the boundary. Each rejection has its
+        // own modelled error — a name past 512 bytes is `AnnotationNameTooLong`, and a name
+        // that is empty or starts with a prefix S3 reserves is `InvalidAnnotationName`.
+        match crate::state::annotation_name_rejection(&input.annotation_name) {
+            None => {}
+            Some(crate::state::AnnotationNameRejection::TooLong { .. }) => {
+                return Err(PutObjectAnnotationErrorModeled::AnnotationNameTooLong(
+                    AnnotationNameTooLong {},
+                )
+                .into())
+            }
+            Some(
+                crate::state::AnnotationNameRejection::Empty
+                | crate::state::AnnotationNameRejection::ReservedPrefix { .. },
+            ) => {
+                return Err(PutObjectAnnotationErrorModeled::InvalidAnnotationName(
+                    InvalidAnnotationName {},
+                )
+                .into())
+            }
+        }
+
+        // "must be valid UTF-8 encoded text. If the payload contains invalid UTF-8 bytes,
+        // the request fails with HTTP 415 (Unsupported Media Type). To store binary data,
+        // encode the payload using Base64 before uploading"
+        // (`PutObjectAnnotationRequest$AnnotationPayload`) — which is exactly what the
+        // modelled `UnsupportedMediaType` reports.
+        if ::std::str::from_utf8(&input.annotation_payload).is_err() {
+            return Err(
+                PutObjectAnnotationErrorModeled::UnsupportedMediaType(UnsupportedMediaType {})
+                    .into(),
+            );
+        }
+
+        // "Must be between 1 byte and 1 MiB in size" (same member). A payload outside that
+        // range is a parameter that is not valid for this request, which is what the
+        // modelled `InvalidRequest` reports; the size is not expressed in the model, so
+        // nothing refused it at the boundary either.
+        let size = input.annotation_payload.len();
+        if !(crate::state::MIN_ANNOTATION_PAYLOAD_BYTES
+            ..=crate::state::MAX_ANNOTATION_PAYLOAD_BYTES)
+            .contains(&size)
+        {
+            return Err(PutObjectAnnotationErrorModeled::InvalidRequest(InvalidRequest {}).into());
+        }
+
+        // A `versionId` that is not SHAPED like one cannot name a version of anything, so
+        // it is a malformed argument rather than an absent version — the way `GetObject`
+        // and `CopyObject` answer the same argument.
+        if let Some(version_id) = input.version_id.as_deref() {
+            if !crate::state::version_id_is_well_formed(version_id) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    crate::state::INVALID_VERSION_ID_MESSAGE,
+                ));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the annotation cannot be recorded at all, and none of the
+            // modelled errors says that, so the scaffold's 501 carries what is true: this
+            // emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutObjectAnnotation",
+            ));
+        };
+        let mut store = state.lock();
+
+        // The ADDRESS is resolved first, so a request naming a bucket, a key or a version
+        // this emulator does not hold answers that rather than reporting whatever else is
+        // wrong with a request no object could have served. "The version ID of the object
+        // to attach the annotation to" (`PutObjectAnnotationRequest$VersionId`), and with
+        // none the key's current object — what every reader naming no version answers from.
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(PutObjectAnnotationErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let Some(object) = bucket.addressed_object(&input.key, input.version_id.as_deref()) else {
+            // A well-formed `versionId` that names no stored version is `NoSuchVersion`
+            // (404), which this model carries no shape for; a request naming no version at
+            // all is the modelled `NoSuchKey`.
+            return Err(match input.version_id.as_deref() {
+                Some(_) => crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_VERSION_CODE,
+                    404,
+                    crate::state::NO_SUCH_VERSION_MESSAGE,
+                ),
+                None => PutObjectAnnotationErrorModeled::NoSuchKey(NoSuchKey {}).into(),
+            });
+        };
+
+        // "If specified, the operation only succeeds if the object's ETag matches the
+        // provided value" (`PutObjectAnnotationRequest$ObjectIfMatch`) — judged against the
+        // entity tag of the version just addressed, and before anything is written, so a
+        // request whose precondition does not hold leaves the object's annotations exactly
+        // as they were. S3 answers a precondition that does not hold `PreconditionFailed`
+        // (412), a code this model carries no shape for.
+        if input
+            .object_if_match
+            .as_deref()
+            .is_some_and(|expected| expected != object.etag)
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::PRECONDITION_FAILED_CODE,
+                crate::state::PRECONDITION_FAILED_STATUS,
+                crate::state::PRECONDITION_FAILED_MESSAGE,
+            ));
+        }
+
+        // "Annotations inherit the encryption of their parent object" (this operation's own
+        // documentation), so what this write reports as the encryption of the annotation is
+        // the configuration the object it hangs on was stored under — read off that object
+        // rather than invented, and the version id likewise.
+        let server_side_encryption = object.encryption.sse_algorithm.clone();
+        let object_version_id = object.version_id.clone();
+
+        let annotation =
+            crate::state::Annotation::new(input.annotation_payload, ::std::time::SystemTime::now());
+        let etag = annotation.etag.clone();
+
+        // Recorded through the one place an annotation is ever recorded, because it is the
+        // only one that sees the per-object ceiling and the byte budgets an annotation is
+        // retained inside. A second write under the same name replaces that annotation's
+        // payload and leaves every other annotation of the object where it was.
+        let outcome = store.put_object_annotation(
+            &input.bucket,
+            &input.key,
+            input.version_id.as_deref(),
+            &input.annotation_name,
+            annotation,
+        );
+        match outcome {
+            Some(crate::state::AnnotationWrite::Applied) => {}
+            // Unreachable through this handler (the address was just resolved under the
+            // same lock), and answered rather than asserted so a future caller of this
+            // state seam cannot turn a vanished address into a panic.
+            None => {
+                return Err(PutObjectAnnotationErrorModeled::NoSuchBucket(NoSuchBucket {}).into())
+            }
+            Some(crate::state::AnnotationWrite::NoSuchObject) => {
+                return Err(PutObjectAnnotationErrorModeled::NoSuchKey(NoSuchKey {}).into())
+            }
+            // "Each object can have up to 1,000 annotations", and past it "the request
+            // would exceed the maximum number of annotations allowed per object" — the
+            // modelled `AnnotationLimitExceeded` (400), which is what this ceiling is.
+            Some(crate::state::AnnotationWrite::LimitReached) => {
+                return Err(PutObjectAnnotationErrorModeled::AnnotationLimitExceeded(
+                    AnnotationLimitExceeded {},
+                )
+                .into())
+            }
+            // The emulator's own ceilings, not AWS limits, so no AWS error code describes
+            // them: they go out through the framework's 400 `ValidationException` channel,
+            // the same channel `PutObject` uses for the same two budgets.
+            Some(crate::state::AnnotationWrite::ByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "annotating {:?} would leave the bucket {:?} holding {would_hold} bytes \
+                     of objects, past the {} bytes this emulator keeps per bucket",
+                    input.key,
+                    input.bucket,
+                    crate::state::MAX_OBJECT_BYTES_PER_BUCKET
+                )))
+            }
+            Some(crate::state::AnnotationWrite::TotalByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "annotating {:?} would leave this emulator holding {would_hold} bytes \
+                     of objects across every bucket, past the {} bytes it keeps in total",
+                    input.key,
+                    crate::state::MAX_OBJECT_BYTES_TOTAL
+                )))
+            }
+        }
+
+        Ok(PutObjectAnnotationOutput {
+            // "The name of the annotation" and "The object key" the annotation was attached
+            // to: the address the write resolved, so a client reads back what it wrote.
+            annotation_name: Some(input.annotation_name),
+            key: Some(input.key),
+            // "The version ID of the object that the annotation was attached to" — read off
+            // that stored version, so it is reported exactly when the version has an id of
+            // its own (a write into a versioning-enabled bucket) and never invented.
+            object_version_id,
+            // "The entity tag of the annotation": the digest of the payload just recorded,
+            // computed the one way every entity tag here is.
+            e_tag: Some(etag),
+            // "The server-side encryption algorithm used to encrypt the annotation", which
+            // is the parent object's, reported only when that object carries one.
+            server_side_encryption,
+            // Everything else this output can carry describes something no stored
+            // annotation here has, so none of it is reported rather than being invented:
+            // the `Checksum*` members and `ChecksumType` need a checksum this handler
+            // neither computed nor verified (the request's own checksum headers are not
+            // echoed back as if they had been checked), and `RequestCharged` reports a
+            // Requester Pays charge this emulator does not model.
+            ..PutObjectAnnotationOutput::default()
+        })
     }
 }

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListManagedMicrovmImages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListManagedMicrovmImages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListManagedMicrovmImages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves the AWS-MANAGED base-image catalogue this service publishes — the one set
+//! `CreateMicrovmImage$baseImageArn` is resolved against, read through
+//! [`crate::state::ComAmazonawsLambdamicrovmsLambdamicrovmsState::managed_base_images`]
+//! so a listing and a create cannot disagree about which base images exist. The entries
+//! are AWS-owned and regional, so each ARN carries `aws` in its account field and the
+//! region the request was signed for.
+//!
+//! A pure report: nothing here writes, so a later caller sees exactly what this one saw.
+//! The `@paginated` contract is honoured as `ListMicrovms` honours it — `maxResults`
+//! caps the page, a `nextToken` is issued (and accepted) only while entries remain, and
+//! a token this service did not mint is the modelled 400 rather than a silent restart.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +153,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListManagedMicrovmImages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListManagedMicrovmImagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListManagedMicrovmImages"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListManagedMicrovmImagesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the managed MicroVM image catalogue is unavailable".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_token(token)?),
+            None => None,
+        };
+        // `maxResults` carries `@range(min: 1, max: 50)`, which the boundary validator
+        // has already enforced; the clamp is a second line of defence, so a page size
+        // can never be zero or unbounded however the value arrived.
+        let page_size = input
+            .max_results
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(crate::state::MAX_LIST_PAGE)
+            .clamp(1, crate::state::MAX_LIST_PAGE);
+
+        // A managed image is an AWS-owned, REGIONAL resource, so the catalogue is
+        // projected into the region this request was signed for — the same region the
+        // ARNs of this account's own resources carry.
+        let catalogue = state
+            .lock()
+            .managed_base_images(&crate::state::request_region(ctx));
+
+        // The catalogue ids enumerate in a stable order, so "after this id" is a cursor
+        // that stays valid even when another entry is published between two pages.
+        let mut remaining = catalogue.iter().filter(|entry| {
+            after
+                .as_deref()
+                .is_none_or(|cursor| entry.image_id.as_str() > cursor)
+        });
+        let page: Vec<&crate::state::ManagedBaseImage> =
+            remaining.by_ref().take(page_size).collect();
+
+        // A `nextToken` is issued only when the page did not exhaust the catalogue.
+        let next_token = match (page.last(), remaining.next()) {
+            (Some(last), Some(_)) => Some(encode_token(&last.image_id)),
+            _ => None,
+        };
+
+        Ok(ListManagedMicrovmImagesOutput {
+            next_token,
+            // `items` is `@required`, so it is always projected — an empty page included.
+            items: page
+                .into_iter()
+                .map(|entry| ManagedMicrovmImageSummary {
+                    image_arn: entry.image_arn.clone(),
+                    created_at: entry.created_at,
+                    updated_at: entry.updated_at,
+                })
+                .collect(),
+        })
     }
+}
+
+/// The marker every `nextToken` this operation issues carries, so a token the service
+/// did not mint is refused rather than silently positioning the listing.
+const TOKEN_MARKER: &str = "ListManagedMicrovmImages/1:";
+
+/// The opaque `nextToken` for a cursor: the catalogue id of the last entry served.
+fn encode_token(image_id: &str) -> String {
+    ::hex::encode(format!("{TOKEN_MARKER}{image_id}").as_bytes())
+}
+
+/// The cursor a `nextToken` carries. A token this service did not mint is refused
+/// with the modelled 400 rather than silently restarting or skipping the listing.
+fn decode_token(token: &str) -> Result<String, ListManagedMicrovmImagesError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|decoded| {
+            decoded
+                .strip_prefix(TOKEN_MARKER)
+                .map(::std::string::ToString::to_string)
+        })
+        .ok_or_else(|| {
+            ListManagedMicrovmImagesErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "nextToken is not a pagination token this service issued".to_string(),
+                ),
+            })
+            .into()
+        })
 }

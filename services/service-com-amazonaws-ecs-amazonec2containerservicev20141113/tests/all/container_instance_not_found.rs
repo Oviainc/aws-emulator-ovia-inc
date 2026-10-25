@@ -22,7 +22,8 @@
 use serde_json::{json, Value};
 
 use crate::ecs_wire::{
-    create_cluster, ok, refusal, register_instance, service, string, ACCOUNT, SIGNED_REGION,
+    create_cluster, identity_document, identity_document_signature, ok, refusal, register_instance,
+    service, string, ACCOUNT, SIGNED_REGION,
 };
 
 /// The cluster every row names, so a refusal is reached by naming a container instance
@@ -62,8 +63,15 @@ const REQUESTS: [OperationRow; 3] = [
     ("ListTasks", |reference| {
         json!({ "cluster": CLUSTER, "containerInstance": reference })
     }),
+    // A registration presents the identity document and its signature whatever else it
+    // names, so this row's refusal is reached by the reference it cannot resolve.
     ("RegisterContainerInstance", |reference| {
-        json!({ "cluster": CLUSTER, "containerInstanceArn": reference })
+        json!({
+            "cluster": CLUSTER,
+            "containerInstanceArn": reference,
+            "instanceIdentityDocument": identity_document("i-0d0d0d0d0d0d0d0d0"),
+            "instanceIdentityDocumentSignature": identity_document_signature(),
+        })
     }),
 ];
 

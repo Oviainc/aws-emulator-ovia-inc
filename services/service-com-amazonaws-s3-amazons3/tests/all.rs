@@ -87,6 +87,8 @@ mod multipart_upload_listing;
 mod object_and_policy;
 #[path = "all/object_and_tagging_roundtrip.rs"]
 mod object_and_tagging_roundtrip;
+#[path = "all/object_annotations.rs"]
+mod object_annotations;
 #[path = "all/object_batch_deletion.rs"]
 mod object_batch_deletion;
 #[path = "all/object_copy.rs"]

@@ -27,6 +27,8 @@ mod cw_log_delivery;
 mod list_app_monitors_page_size;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/metric_definition_validation.rs"]
+mod metric_definition_validation;
 #[path = "all/metric_definitions.rs"]
 mod metric_definitions;
 #[path = "all/metric_destination_summary_members.rs"]

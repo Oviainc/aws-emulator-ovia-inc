@@ -159,13 +159,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `TraceIdList` carries no modelled bound, so the request is bounded
-        // here, by the same cap `BatchGetTraces` puts on a requested-id list.
+        // here, by the same cap `BatchGetTraces` puts on a requested-id list,
+        // and refused with the same phrase, which is where that limit is stated.
         if input.trace_ids.len() > crate::state::MAX_TRACE_IDS_PER_CALL {
-            return Err(refuse(format!(
-                "TraceIds carries {} ids; at most {} are accepted in one call",
-                input.trace_ids.len(),
-                crate::state::MAX_TRACE_IDS_PER_CALL
-            )));
+            return Err(refuse(
+                crate::state::exceeding_maximum_query_size_message(),
+            ));
+        }
+
+        // An id that is not of the documented trace-id form names no trace this
+        // service could ever hold, so it is refused for its FORM — the same
+        // refusal every reader of a trace id gives — before the lookup that
+        // would otherwise report it as merely absent.
+        if let Some(malformed) = input
+            .trace_ids
+            .iter()
+            .find(|trace_id| !crate::state::is_trace_id(trace_id))
+        {
+            return Err(refuse(crate::state::malformed_trace_id_message(malformed)));
         }
 
         // The derivation is linear in the stored segments of the named traces

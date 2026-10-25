@@ -212,7 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|task| task.cluster_name == cluster_name)
             {
                 Some(task) => tasks.push(task.view(include_tags)),
-                None => failures.push(crate::state::missing_failure(&arn)),
+                // A `tasks` entry that resolves to no stored task is reported under the
+                // identifier the request sent, NOT under the cluster-qualified ARN a
+                // stored task of that id would carry.
+                None => failures.push(crate::state::unresolved_failure(
+                    &region,
+                    crate::state::TASK_RESOURCE_TYPE,
+                    reference,
+                )),
             }
         }
 
