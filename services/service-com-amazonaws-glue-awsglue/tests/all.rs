@@ -47,5 +47,7 @@ mod schema_registry;
 mod state_roundtrip;
 #[path = "all/store_capacity.rs"]
 mod store_capacity;
+#[path = "all/table_versions.rs"]
+mod table_versions;
 #[path = "all/wire.rs"]
 mod wire;

@@ -5,7 +5,10 @@
 //! The Data Catalog is the service's primary resource tree: a catalog (keyed by
 //! `CatalogId`, which defaults to the request's account id) holds databases, and a
 //! database holds tables. Every handler reads and writes THIS store, so a
-//! `CreateTable` in one request is visible to a `GetTable` in the next.
+//! `CreateTable` in one request is visible to a `GetTable` in the next. A stored table
+//! carries its own version history beside its live definition
+//! ([`TableEntry::archived_versions`]), so a read of one version serves the definition
+//! that version was written with and not what a later write replaced it by.
 //!
 //! Beside the catalog the store holds the two account-level resources an ETL client
 //! registers: JOB DEFINITIONS (`CreateJob` writes one, `GetJob` reads it back) and, inside
@@ -49,8 +52,7 @@ use crate::ops::types::{
     FederatedDatabase, FederatedTable, Job, JobCommand, JobRun, LakeFormationConfiguration,
     LineageConfiguration, NotificationProperty, PrincipalPermissions, RLSProperties, RecrawlPolicy,
     RegistryId, Schedule, SchemaChangePolicy, SchemaId, SourceControlDetails, StartJobRunInput,
-    StorageDescriptor, Table,
-    TableIdentifier, TableInput,
+    StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -69,6 +71,20 @@ pub const MAX_TABLES_PER_DATABASE: usize = 1_000;
 /// Bounds the product of the two per-container ceilings, which on its own would still
 /// let a caller grow the store far past what one process should hold.
 pub const MAX_STORED_TABLES: usize = 10_000;
+
+/// Ceiling on the versions of ONE table the store keeps archived, for the same reason
+/// as [`MAX_DATABASES_PER_CATALOG`]: every update archives the definition it replaces,
+/// and the update is reachable by any caller, so the number of archived definitions one
+/// process will hold is bounded here. An update that would archive past the ceiling is
+/// refused with the operation's modelled `ResourceNumberLimitExceededException` rather
+/// than applied.
+pub const MAX_ARCHIVED_TABLE_VERSIONS_PER_TABLE: usize = 1_000;
+
+/// Ceiling on the archived table versions the whole store may hold, across every
+/// catalog, database and table. Bounds the PRODUCT of
+/// [`MAX_ARCHIVED_TABLE_VERSIONS_PER_TABLE`] and [`MAX_STORED_TABLES`], which on its own
+/// would still let a caller grow the store far past what one process should hold.
+pub const MAX_STORED_ARCHIVED_TABLE_VERSIONS: usize = 100_000;
 
 /// Ceiling on the connection definitions one catalog may hold, for the same reason as
 /// [`MAX_JOBS`].
@@ -382,6 +398,30 @@ impl ComAmazonawsGlueAwsglueState {
     /// [`MAX_STORED_TABLES`].
     pub fn can_store_table(&self) -> bool {
         self.stored_tables() < MAX_STORED_TABLES
+    }
+
+    /// How many archived table versions the whole store holds. Bounded the same way
+    /// [`Self::stored_tables`] is, over at most [`MAX_STORED_TABLES`] tables.
+    pub fn stored_archived_table_versions(&self) -> usize {
+        self.stored_in_catalogs(|catalog| {
+            catalog
+                .databases
+                .values()
+                .map(|database| {
+                    database
+                        .tables
+                        .values()
+                        .map(|table| table.archived_versions.len())
+                        .sum::<usize>()
+                })
+                .sum()
+        })
+    }
+
+    /// Whether the store as a whole can archive another table version, i.e. is below
+    /// [`MAX_STORED_ARCHIVED_TABLE_VERSIONS`].
+    pub fn can_archive_table_version(&self) -> bool {
+        self.stored_archived_table_versions() < MAX_STORED_ARCHIVED_TABLE_VERSIONS
     }
 
     /// How many databases the whole store holds, across every catalog. Bounded by
@@ -771,6 +811,30 @@ pub struct TableEntry {
     pub version_id: String,
     /// Server-set: the principal that issued the create.
     pub created_by: Option<String>,
+    /// The versions of this table the catalog has ARCHIVED, keyed by the counter of the
+    /// `VersionId` each one was current under.
+    ///
+    /// "By default, `UpdateTable` always creates an archived version of the table before
+    /// updating it" (`UpdateTableRequest$SkipArchive`), so a write that moves
+    /// [`Self::version_id`] leaves the definition it replaced in here. The CURRENT
+    /// version is NOT in this map — it is the live definition above, which is itself the
+    /// version [`Self::version_id`] names — so a table that has never been updated has
+    /// exactly one version and an empty archive.
+    pub archived_versions: BTreeMap<u64, ArchivedTableVersion>,
+}
+
+/// One ARCHIVED version of a table: the definition the table carried at an earlier
+/// `VersionId`, kept so a version read can still serve it once the live definition has
+/// moved on.
+#[derive(Debug, Clone)]
+pub struct ArchivedTableVersion {
+    /// The client-settable definition that was current at this version, in the shape a
+    /// client submits it in — so a version read rebuilds exactly what that write stored
+    /// and nothing a later write changed.
+    pub definition: TableInput,
+    /// The instant that definition became current: the `UpdateTime` this version
+    /// reports.
+    pub update_time: SystemTime,
 }
 
 impl TableEntry {
@@ -805,7 +869,87 @@ impl TableEntry {
             update_time: now,
             version_id: FIRST_TABLE_VERSION_ID.to_string(),
             created_by,
+            // A create archives nothing: it replaced no definition, and the one it
+            // writes is the current version.
+            archived_versions: BTreeMap::new(),
         }
+    }
+
+    /// This table's client-settable definition, in the `TableInput` shape a client
+    /// submits it in — the inverse of [`Self::from_input`], and what archiving a version
+    /// keeps of the definition a write is about to replace.
+    ///
+    /// `ViewDefinition` is absent because no stored table carries one: `CreateTable` and
+    /// `UpdateTable` refuse a view definition rather than storing it.
+    pub fn to_table_input(&self) -> TableInput {
+        TableInput {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            owner: self.owner.clone(),
+            last_access_time: self.last_access_time,
+            last_analyzed_time: self.last_analyzed_time,
+            retention: self.retention,
+            storage_descriptor: self.storage_descriptor.clone(),
+            partition_keys: self.partition_keys.clone(),
+            view_original_text: self.view_original_text.clone(),
+            view_expanded_text: self.view_expanded_text.clone(),
+            table_type: self.table_type.clone(),
+            parameters: self.parameters.clone(),
+            target_table: self.target_table.clone(),
+            federated_table: self.federated_table.clone(),
+            view_definition: None,
+        }
+    }
+
+    /// Whether this table can archive another version, i.e. holds fewer than
+    /// [`MAX_ARCHIVED_TABLE_VERSIONS_PER_TABLE`].
+    pub fn can_archive_version(&self) -> bool {
+        self.archived_versions.len() < MAX_ARCHIVED_TABLE_VERSIONS_PER_TABLE
+    }
+
+    /// This table as of one of its versions, as the modelled `TableVersion` shape, or
+    /// `None` when the catalog holds no such version of it.
+    ///
+    /// `version` is the counter a request named, or `None` for a request that named no
+    /// version, which addresses the table's current one. The current definition IS a
+    /// version — the one [`Self::version_id`] names — so a version read of a table that
+    /// has never been updated reports exactly what a plain read of the table reports.
+    /// Every earlier version comes from [`Self::archived_versions`] and is projected
+    /// through the same `Table` builder: the definition that was current then, with the
+    /// members that belong to the table rather than to one of its versions
+    /// (`CreateTime`, `CreatedBy`, `CatalogId`, `DatabaseName`) as they stand, and
+    /// `UpdateTime` the instant that version became current.
+    pub fn table_version(&self, version: Option<u64>, database_id: &str) -> Option<TableVersion> {
+        // A request that names no version, or names the one the live definition is
+        // under, addresses the current version.
+        let archived_version = match version {
+            None => None,
+            Some(wanted) if Some(wanted) == parse_version_counter(&self.version_id) => None,
+            Some(wanted) => Some(wanted),
+        };
+        let Some(wanted) = archived_version else {
+            return Some(TableVersion {
+                table: Some(self.to_table(database_id)),
+                version_id: Some(self.version_id.clone()),
+            });
+        };
+        let archived = self.archived_versions.get(&wanted)?;
+        let mut historical = Self::from_input(
+            &archived.definition,
+            &self.database_name,
+            &self.catalog_id,
+            self.created_by.clone(),
+            archived.update_time,
+        );
+        // `from_input` dates a FRESH table, so `CreateTime` — which belongs to the
+        // table and not to one of its versions — is restored from the live record, and
+        // the version id is the one this archived definition is keyed by.
+        historical.create_time = self.create_time;
+        historical.version_id = wanted.to_string();
+        Some(TableVersion {
+            table: Some(historical.to_table(database_id)),
+            version_id: Some(wanted.to_string()),
+        })
     }
 
     /// Overwrite this table's definition with the one the client submitted.
@@ -828,7 +972,22 @@ impl TableEntry {
     /// [`DatabaseEntry::tables`] stays correct. A caller that ever applies an input
     /// under a different name must relocate the entry under its new key, the way
     /// `UpdateDatabase` does for [`DatabaseEntry::apply_input`].
-    pub fn apply_input(&mut self, input: &TableInput, now: SystemTime) {
+    ///
+    /// `archive_previous` keeps the definition this write replaces as the version it was
+    /// current under ([`Self::archived_versions`]), which is what a later version read
+    /// serves; the caller passes `false` for a write that asks not to archive it.
+    pub fn apply_input(&mut self, input: &TableInput, now: SystemTime, archive_previous: bool) {
+        if archive_previous {
+            if let Some(current) = parse_version_counter(&self.version_id) {
+                self.archived_versions.insert(
+                    current,
+                    ArchivedTableVersion {
+                        definition: self.to_table_input(),
+                        update_time: self.update_time,
+                    },
+                );
+            }
+        }
         self.name = fold_name(&input.name);
         self.description = input.description.clone();
         self.owner = input.owner.clone();
@@ -2379,6 +2538,17 @@ pub fn to_timestamp_string(at: SystemTime) -> String {
         .unwrap_or_default()
 }
 
+/// The counter a stored or requested `VersionId` spells, or `None` when it spells no
+/// version counter.
+///
+/// "A `VersionId` is a string representation of an integer. Each version is incremented
+/// by 1" (`GetTableVersionRequest$VersionId`), and only the server ever writes one — as
+/// a decimal counter — so a value that spells no such integer names no version of any
+/// table.
+pub fn parse_version_counter(version_id: &str) -> Option<u64> {
+    version_id.parse::<u64>().ok()
+}
+
 /// The `VersionId` that follows `current`: the stored counter plus one.
 ///
 /// Only the server ever writes a `VersionId`, and it writes a decimal counter, so a
@@ -2387,8 +2557,7 @@ pub fn to_timestamp_string(at: SystemTime) -> String {
 /// rather than carried forward unchanged — a version must always move when the table
 /// does.
 pub fn next_version_id(current: &str) -> String {
-    current
-        .parse::<u64>()
+    parse_version_counter(current)
         // Explicitly the version before the first one, not a general-purpose default.
         .unwrap_or(0)
         .saturating_add(1)
@@ -2467,6 +2636,13 @@ pub mod messages {
     /// inferred from the recorded `CreateDatabase` duplicate, like
     /// [`CRAWLER_ALREADY_EXISTS`].
     pub const TABLE_ALREADY_EXISTS: &str = "Table already exists.";
+
+    /// A version read (`GetTableVersion`) for a version the addressed table's history
+    /// does not hold. NOT recorded: the wording follows [`table_not_found`], the
+    /// refusal for the resource one step up, and carries only the request's `VersionId`.
+    pub fn table_version_not_found(version_id: &str) -> String {
+        format!("Table version {version_id} not found.")
+    }
 
     /// Any schema-registry operation whose `RegistryId` resolves to a registry this
     /// endpoint holds none of — the parent-registry miss of a schema create, and the miss
