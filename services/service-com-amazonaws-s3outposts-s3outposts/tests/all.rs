@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/endpoint_lifecycle.rs"]
 mod endpoint_lifecycle;
+#[path = "all/endpoint_paging.rs"]
+mod endpoint_paging;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
 #[path = "all/shared_endpoint_listing.rs"]

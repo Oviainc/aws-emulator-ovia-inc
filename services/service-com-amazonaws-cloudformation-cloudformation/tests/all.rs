@@ -53,6 +53,8 @@ mod generated_templates;
 mod hook_result_invocations;
 #[path = "all/iam_capability_gate.rs"]
 mod iam_capability_gate;
+#[path = "all/list_change_sets.rs"]
+mod list_change_sets;
 #[path = "all/list_stack_resources.rs"]
 mod list_stack_resources;
 #[path = "all/nested_resource_outputs.rs"]

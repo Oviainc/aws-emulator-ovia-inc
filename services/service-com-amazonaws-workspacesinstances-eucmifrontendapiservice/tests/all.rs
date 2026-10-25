@@ -17,6 +17,8 @@ mod catalog_fidelity;
 mod create_tag_specifications;
 #[path = "all/idempotency_token_reuse.rs"]
 mod idempotency_token_reuse;
+#[path = "all/instance_configuration_validation.rs"]
+mod instance_configuration_validation;
 #[path = "all/instance_deletion_lifecycle.rs"]
 mod instance_deletion_lifecycle;
 #[path = "all/instance_token_parameter_mismatch.rs"]

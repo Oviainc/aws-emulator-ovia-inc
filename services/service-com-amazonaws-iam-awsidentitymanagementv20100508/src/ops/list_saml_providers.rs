@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSAMLProviders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSAMLProviders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSAMLProviders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every SAML provider resource object the account holds, each as the subset of
+//! its attributes `SAMLProviderListEntry` carries: the ARN that names it and its two
+//! instants. A pure read — the records `CreateSAMLProvider` persisted are what it reports,
+//! and it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +132,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSAMLProviders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSAMLProvidersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The request carries no members at all and `ctx` only metadata, so the whole
+        // answer is read out of the account's state: the model declares an empty input for
+        // this operation (`smithy_query(query="operation",
+        // operation="ListSAMLProviders")`), so there is nothing to filter or page by.
+        let _ = (&input, ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSAMLProvidersErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A read: it reports the providers the account persists and writes nothing, so a
+        // later caller sees exactly what this one did. The providers are keyed by the ARN
+        // `CreateSAMLProvider` derived from each name, so enumerating the map reports every
+        // held provider exactly once in a total, stable order.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSAMLProviders"))
+        // "IAM resource-listing operations return a subset of the available attributes for
+        // the resource. For example, this operation does not return tags": the subset is
+        // what `SAMLProviderListEntry` declares (`smithy_query(query="shape",
+        // shape="SAMLProviderListEntry")`) — the ARN, the expiration and the creation
+        // instant — and each is taken from the stored record, so it agrees with what
+        // `GetSAMLProvider` reports for the same provider.
+        let store = state.lock();
+        let saml_provider_list: Vec<SAMLProviderListEntry> = store
+            .saml_providers
+            .iter()
+            .map(|(arn, provider)| SAMLProviderListEntry {
+                arn: Some(arn.clone()),
+                // Reported only when the provider HAS an expiration, which is the one the
+                // metadata document it was created with states.
+                valid_until: provider.valid_until,
+                create_date: Some(provider.create_date),
+            })
+            .collect();
+
+        // The list is this operation's whole answer, so an account holding no provider is
+        // reported as an EMPTY list rather than an absent member.
+        Ok(ListSAMLProvidersOutput {
+            saml_provider_list: Some(saml_provider_list),
+        })
     }
 }

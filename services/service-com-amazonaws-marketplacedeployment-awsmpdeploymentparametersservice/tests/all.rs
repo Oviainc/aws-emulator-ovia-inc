@@ -17,6 +17,8 @@ mod catalog_allowed_values;
 mod deployment_parameter_expiry;
 #[path = "all/deployment_parameters.rs"]
 mod deployment_parameters;
+#[path = "all/expiration_date_wire_form.rs"]
+mod expiration_date_wire_form;
 #[path = "all/front_door_forbidden.rs"]
 mod front_door_forbidden;
 #[path = "all/not_found_error_code.rs"]

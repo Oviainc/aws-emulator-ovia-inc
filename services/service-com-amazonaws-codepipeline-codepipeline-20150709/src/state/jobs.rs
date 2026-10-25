@@ -212,23 +212,18 @@ pub fn record_success(
         );
     }
 
-    let namespace = state
-        .pipelines
-        .get(&pipeline_name_of(state, &execution_id))
-        .and_then(|pipeline| {
-            let version = state
-                .executions
-                .get(&execution_id)
-                .map(|record| record.pipeline_version)?;
-            pipeline
-                .declaration_at(Some(version))?
-                .stages
-                .get(stage)?
-                .actions
-                .get(action)?
-                .namespace
-                .clone()
-        });
+    // The namespace the action publishes its output variables under is the DECLARED
+    // one, read from the stage of the pinned declaration the execution's plan names.
+    let namespace = state.executions.get(&execution_id).and_then(|record| {
+        let declaration = state
+            .pipelines
+            .get(&record.pipeline_name)?
+            .declaration_at(Some(record.pipeline_version))?;
+        let run = record.stages.get(stage)?;
+        super::execution::declared_action(declaration, run, action)?
+            .namespace
+            .clone()
+    });
 
     let Some(record) = state.executions.get_mut(&execution_id) else {
         return Err(JobProblem::NotFound(super::job_not_found_message(job_id)));
@@ -316,16 +311,6 @@ fn job_mut<'a>(
         .flatten()
         .find(|job| job.job_id == job_id)
         .ok_or_else(|| JobProblem::NotFound(super::job_not_found_message(job_id)))
-}
-
-/// The pipeline the execution `execution_id` belongs to, or an empty name when the store
-/// no longer holds it.
-fn pipeline_name_of(state: &State, execution_id: &str) -> String {
-    state
-        .executions
-        .get(execution_id)
-        .map(|record| record.pipeline_name.clone())
-        .unwrap_or_default()
 }
 
 /// Why a job cannot take a result: it is not one a worker holds and has still to

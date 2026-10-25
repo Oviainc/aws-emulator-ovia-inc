@@ -116,6 +116,128 @@ impl From<CreateWorkspaceInstanceErrorModeled> for CreateWorkspaceInstanceError 
     }
 }
 
+/// The launch rules this service applies to a `ManagedInstance`, which this service's
+/// model cannot express — so they are this handler's to apply.
+///
+/// A WorkSpace Instance IS an EC2 launch of a published WorkSpaces Instance type
+/// ("Launches a new WorkSpace Instance with specified configuration parameters"), and
+/// every member of `ManagedInstanceRequest` is optional in the model
+/// (`smithy_query(query="shape",shape="ManagedInstanceRequest")`), so nothing but
+/// handler logic can keep a configuration the service could never launch out of the
+/// store. Each rule below is about whether the members describe ONE launch this
+/// service can carry out:
+///
+/// * a launch needs the image it boots and the hardware it runs on, so `ImageId` and
+///   `InstanceType` must be present — the EC2 launch this call makes has no other
+///   source for either, and this service publishes no default instance type;
+/// * `InstanceType` must be one the service's own catalog publishes
+///   ([`crate::state::instance_type_spec`], the rows `ListInstanceTypes` reports):
+///   the modelled `^([a-z0-9-]+)\.([a-z0-9]+)$` admits any `<family>.<size>` name,
+///   including families and sizes AWS offers nowhere. The whole member is looked up as
+///   one key, so nothing here splits, indexes or counts a caller value;
+/// * the configuration asked for must be one that instance type publishes
+///   (`SupportedInstanceConfigurations` — "the complete set of configuration options
+///   available for this instance type"): the tenancy `Placement` asks for, and the
+///   billing mode the call chose or defaulted to, must appear among the combinations
+///   the catalogued row supports;
+/// * a subnet is named EITHER on the instance or inside the network interfaces, never
+///   both ("If you specify a network interface, you must specify any subnets as part
+///   of the network interface", Amazon EC2 `RunInstances$SubnetId`).
+///
+/// Every member is read through its `Option` with no value of the caller's reached
+/// unchecked, and the function neither reaches the store nor is called while its guard
+/// is held: the handler runs it before `service_state`, so a refusal cannot be
+/// ordered behind a lock or leave a half-written record.
+///
+/// The caller tags the same request carries are checked by the handler before this
+/// runs ([`crate::state::reject_reserved_tag_keys`] over both members that carry
+/// them), so this function is about the launch alone.
+///
+/// Returns the modelled `ValidationException` (HTTP 400) naming the ONE member the
+/// request is refused for, in `FieldList` as well as in the wording, and echoes no
+/// submitted value ([`crate::state::field_validation_failed`]).
+fn validate_launch_configuration(
+    input: &CreateWorkspaceInstanceInput,
+) -> Result<(), ValidationException> {
+    use crate::state::{
+        configuration_tenancy, field_validation_failed, instance_type_spec, DEFAULT_BILLING_MODE,
+        PLACEMENT_TENANCY_DEFAULT,
+    };
+
+    let managed_instance = &input.managed_instance;
+
+    if managed_instance.image_id.is_none() {
+        return Err(field_validation_failed(
+            "ManagedInstance.ImageId",
+            "ManagedInstance.ImageId must name the Amazon Machine Image the instance \
+             boots: a WorkSpace Instance cannot be launched without one",
+        ));
+    }
+
+    let Some(instance_type) = managed_instance.instance_type.as_deref() else {
+        return Err(field_validation_failed(
+            "ManagedInstance.InstanceType",
+            "ManagedInstance.InstanceType must name the WorkSpace Instance type to \
+             launch: this service publishes no default instance type",
+        ));
+    };
+    let Some(spec) = instance_type_spec(instance_type) else {
+        return Err(field_validation_failed(
+            "ManagedInstance.InstanceType",
+            "ManagedInstance.InstanceType must name an instance type this service \
+             publishes through ListInstanceTypes",
+        ));
+    };
+
+    // Both at once describes two different placements for one instance.
+    let names_interface_subnet = managed_instance
+        .network_interfaces
+        .iter()
+        .flatten()
+        .any(|interface| interface.subnet_id.is_some());
+    if managed_instance.subnet_id.is_some() && names_interface_subnet {
+        return Err(field_validation_failed(
+            "ManagedInstance.SubnetId",
+            "ManagedInstance.SubnetId must not be specified together with a subnet on \
+             ManagedInstance.NetworkInterfaces: a launch names its subnet in one place",
+        ));
+    }
+
+    // The tenancy the placement asks for, which is shared hardware when the request
+    // names none, and the billing mode the call chose or the documented default.
+    let tenancy = configuration_tenancy(
+        managed_instance
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.tenancy.as_deref())
+            .unwrap_or(PLACEMENT_TENANCY_DEFAULT),
+    );
+    if !spec.supports_tenancy(tenancy) {
+        return Err(field_validation_failed(
+            "ManagedInstance.Placement.Tenancy",
+            "ManagedInstance.Placement.Tenancy must be a tenancy the named instance \
+             type publishes a supported configuration for",
+        ));
+    }
+
+    let billing_mode = input
+        .billing_configuration
+        .as_ref()
+        .map_or(DEFAULT_BILLING_MODE, |configuration| {
+            configuration.billing_mode.as_str()
+        });
+    if !spec.supports_billing_mode(billing_mode, tenancy) {
+        return Err(field_validation_failed(
+            "BillingConfiguration.BillingMode",
+            "BillingConfiguration.BillingMode must be a billing mode the named \
+             instance type publishes a supported configuration for under the \
+             requested tenancy",
+        ));
+    }
+
+    Ok(())
+}
+
 /// The `CreateWorkspaceInstance` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -227,6 +349,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // The launch configuration is checked BEFORE the store is reached too, so a
+        // launch this service could not carry out is refused whatever the store holds:
+        // the request neither replays an idempotency token nor is charged against the
+        // quota, nothing is written for a request that is going to be refused, and no
+        // store guard is held while the request is inspected.
+        validate_launch_configuration(&input)
+            .map_err(CreateWorkspaceInstanceErrorModeled::ValidationException)?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateWorkspaceInstanceErrorModeled::InternalServerException(

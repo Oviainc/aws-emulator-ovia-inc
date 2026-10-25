@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/archive_and_api_destination.rs"]
 mod archive_and_api_destination;
+#[path = "all/archive_replay.rs"]
+mod archive_replay;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
 #[path = "all/entry_level_semantics.rs"]
