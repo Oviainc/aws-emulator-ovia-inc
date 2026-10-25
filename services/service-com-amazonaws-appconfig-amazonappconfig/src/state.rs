@@ -444,17 +444,21 @@ pub fn first_tag_key_rejection(tags: &HashMap<String, String>) -> Option<String>
 /// can't be marked `Required`"
 /// (`smithy_query(query="doc",shape="Parameter",member="Dynamic")`). Every operation that
 /// writes a `ParameterMap` refuses through this one function, so the create side and the
-/// update side cannot drift apart. The names are sorted, so a request carrying two
-/// unacceptable parameters is refused with the same wording whichever order the map
-/// happened to iterate in.
-pub fn first_parameter_rejection(parameters: &HashMap<String, Parameter>) -> Option<String> {
-    let mut names: Vec<&String> = parameters.keys().collect();
-    names.sort();
-    names.into_iter().find_map(|name| {
-        let parameter = parameters.get(name)?;
-        (parameter.dynamic && parameter.required).then(|| {
-            format!("Parameter {name} is Dynamic, so it cannot also be marked Required.")
-        })
+/// update side cannot drift apart. The refusal NAMES the parameters that broke the rule,
+/// sorted, so a request carrying two unacceptable parameters is refused with the same
+/// wording whichever order the map happened to iterate in.
+pub fn parameter_rejection(parameters: &HashMap<String, Parameter>) -> Option<String> {
+    let mut offending: Vec<&str> = parameters
+        .iter()
+        .filter(|(_, parameter)| parameter.dynamic && parameter.required)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    offending.sort_unstable();
+    (!offending.is_empty()).then(|| {
+        format!(
+            "Extension parameters {} can not be both required and dynamic",
+            offending.join(",")
+        )
     })
 }
 
@@ -2570,6 +2574,25 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         }
         extension.versions.insert(version.version_number, version);
         true
+    }
+
+    /// The stored version `version_number` of the extension `extension_id` names, for a
+    /// caller that EDITS that version in place rather than appending another one.
+    ///
+    /// `UpdateExtension` is the caller this exists for: it updates the extension version
+    /// a request names, so the version number, the ARN that names it and the tags it
+    /// carries all stay as they are and only the definition members the request carried
+    /// change. Answers `None` when no extension answers to `extension_id` or it holds no
+    /// such version.
+    pub fn extension_version_mut(
+        &mut self,
+        extension_id: &str,
+        version_number: i32,
+    ) -> Option<&mut ExtensionVersion> {
+        self.extensions
+            .get_mut(extension_id)?
+            .versions
+            .get_mut(&version_number)
     }
 
     /// Forget an extension this account created, with every version it holds.

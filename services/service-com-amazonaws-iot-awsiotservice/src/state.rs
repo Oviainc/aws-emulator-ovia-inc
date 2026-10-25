@@ -2145,6 +2145,25 @@ pub const MAX_PACKAGE_VERSIONS: usize = 100;
 /// nothing else does.
 pub const NEW_PACKAGE_VERSION_STATUS: &str = "DRAFT";
 
+/// The status an `UpdatePackageVersion$action` assigns a package version, or `None`
+/// for a value that names no action.
+///
+/// `action` is "The status that the package version should be assigned"
+/// (`smithy_query(query="doc",shape="UpdatePackageVersionRequest",member="action")`),
+/// so each value of `PackageVersionAction`
+/// ([`crate::ops::types::PACKAGE_VERSION_ACTION_VALUES`]) names one of the statuses in
+/// [`crate::ops::types::PACKAGE_VERSION_STATUS_VALUES`]: publishing a version assigns
+/// `PUBLISHED` and deprecating it assigns `DEPRECATED`. No action assigns
+/// [`NEW_PACKAGE_VERSION_STATUS`] — a version enters the lifecycle there on create and
+/// an action is what moves it on.
+pub fn package_version_status_for_action(action: &str) -> Option<&'static str> {
+    match action {
+        "PUBLISH" => Some("PUBLISHED"),
+        "DEPRECATE" => Some("DEPRECATED"),
+        _ => None,
+    }
+}
+
 /// One version of a software package, as this service persists it.
 ///
 /// A version is the pair `(packageName, versionName)` — its identity, bound as the two

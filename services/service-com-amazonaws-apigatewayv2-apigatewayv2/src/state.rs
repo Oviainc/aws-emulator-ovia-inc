@@ -2911,7 +2911,8 @@ pub fn portal_domain_hosted_zone_id(region: &str) -> String {
     format!("Z{mixed}")
 }
 
-/// Resolve a portal's requested domain configuration into the one the readers report.
+/// Resolve a portal's requested domain configuration into the one the readers report,
+/// generating the default domain of a portal with this id in this Region.
 ///
 /// The request names either a domain the account owns together with its ACM certificate
 /// (`AcmManaged`) or API Gateway's default domain (`None`); either way the response
@@ -2920,6 +2921,27 @@ pub fn portal_domain_hosted_zone_id(region: &str) -> String {
 pub fn resolve_portal_endpoint_configuration(
     portal_id: &str,
     region: &str,
+    requested: &wire::EndpointConfigurationRequest,
+) -> wire::EndpointConfigurationResponse {
+    portal_endpoint_configuration(
+        portal_default_domain_name(portal_id, region),
+        portal_domain_hosted_zone_id(region),
+        requested,
+    )
+}
+
+/// Resolve a requested domain configuration onto a default domain the service has
+/// ALREADY generated for the portal.
+///
+/// Which domain the account brought is the request's to say, while the default domain
+/// name and its hosted zone id are generated from the portal's id and the Region the
+/// portal lives in — so a later write to a portal's domain configuration carries those
+/// two over rather than rebuilding them from whatever Region the writing request was
+/// signed for. [`resolve_portal_endpoint_configuration`] is this with the pair generated
+/// for a given id and Region.
+pub fn portal_endpoint_configuration(
+    portal_default_domain_name: String,
+    portal_domain_hosted_zone_id: String,
     requested: &wire::EndpointConfigurationRequest,
 ) -> wire::EndpointConfigurationResponse {
     wire::EndpointConfigurationResponse {
@@ -2931,8 +2953,8 @@ pub fn resolve_portal_endpoint_configuration(
             .acm_managed
             .as_ref()
             .map(|managed| managed.domain_name.clone()),
-        portal_default_domain_name: portal_default_domain_name(portal_id, region),
-        portal_domain_hosted_zone_id: portal_domain_hosted_zone_id(region),
+        portal_default_domain_name,
+        portal_domain_hosted_zone_id,
     }
 }
 

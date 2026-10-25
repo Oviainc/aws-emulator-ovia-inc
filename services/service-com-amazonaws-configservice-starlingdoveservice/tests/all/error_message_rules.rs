@@ -202,51 +202,63 @@ async fn a_blocked_delivery_channel_delete_quotes_the_channel_it_refused() {
     }
 }
 
-/// `NoSuchConfigurationRecorderException` carries ONE fixed text: the message quotes
-/// nothing from the request, so every operation that fails to find a recorder — by
-/// name or by ARN — answers with it.
+/// `NoSuchConfigurationRecorderException` names the MEMBER the request selected the
+/// recorder by: a lookup by name is refused with the name-variant sentence, a lookup by
+/// ARN with the arn-variant one, so the caller is told to verify the input it actually
+/// sent — which for a service-linked recorder, addressable only by ARN or by service
+/// principal, is the only guidance there is.
 #[tokio::test]
-async fn an_absent_configuration_recorder_carries_the_fixed_message() {
-    const EXPECTED: &str = "The name of the configuration recorder you entered cannot be \
-                            found. Verify the configuration recorder name, and try again.";
+async fn an_absent_configuration_recorder_names_the_selector_the_request_used() {
+    const BY_NAME: &str = "The name of the configuration recorder you entered cannot be \
+                           found. Verify the configuration recorder name, and try again.";
+    const BY_ARN: &str = "The arn of the configuration recorder you entered cannot be found. \
+                          Verify the configuration recorder arn, and try again. ";
+    const ABSENT_ARN: &str = "arn:aws:config:us-east-1:000000000000:configuration-recorder/x/y";
 
-    // (case, operation, body) — every operation that looks a recorder up, including
-    // the two that can look one up by ARN.
-    for (case, operation, body) in [
+    // (case, operation, body, the message expected) — every operation that looks a
+    // recorder up through a member that names ONE recorder among several selectors.
+    for (case, operation, body, expected) in [
         (
             "start by name",
             "StartConfigurationRecorder",
             json!({ "ConfigurationRecorderName": "absent-recorder" }),
+            BY_NAME,
         ),
         (
             "stop by name",
             "StopConfigurationRecorder",
             json!({ "ConfigurationRecorderName": "absent-recorder" }),
+            BY_NAME,
         ),
         (
             "delete by name",
             "DeleteConfigurationRecorder",
             json!({ "ConfigurationRecorderName": "absent-recorder" }),
+            BY_NAME,
         ),
         (
             "describe by name",
             "DescribeConfigurationRecorders",
             json!({ "ConfigurationRecorderNames": ["absent-recorder"] }),
+            BY_NAME,
         ),
         (
             "describe status by name",
             "DescribeConfigurationRecorderStatus",
             json!({ "ConfigurationRecorderNames": ["absent-recorder"] }),
+            BY_NAME,
         ),
         (
             "describe by ARN",
             "DescribeConfigurationRecorders",
-            json!({ "Arn": "arn:aws:config:us-east-1:000000000000:configuration-recorder/x/y" }),
+            json!({ "Arn": ABSENT_ARN }),
+            BY_ARN,
         ),
         (
             "describe status by ARN",
             "DescribeConfigurationRecorderStatus",
-            json!({ "Arn": "arn:aws:config:us-east-1:000000000000:configuration-recorder/x/y" }),
+            json!({ "Arn": ABSENT_ARN }),
+            BY_ARN,
         ),
     ] {
         let emulator = Emulator::new();
@@ -258,8 +270,44 @@ async fn an_absent_configuration_recorder_carries_the_fixed_message() {
         )
         .await;
         assert_eq!(
-            message, EXPECTED,
-            "case {case:?}: expected {EXPECTED:?}, got {message:?}"
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+
+    // The service-linked delete resolves ONE recorder of ONE account from the selector
+    // it was given, and states what it looked for: the account and that selector's own
+    // value, naming the member it came from.
+    let account = emulator_server::emulator_account_id();
+    for (case, body, expected) in [
+        (
+            "service-linked delete by ARN",
+            json!({ "Arn": ABSENT_ARN }),
+            format!(
+                "Configuration recorder (AccountId: {account}, RecorderArn: {ABSENT_ARN}) \
+                 cannot be found"
+            ),
+        ),
+        (
+            "service-linked delete by service principal",
+            json!({ "ServicePrincipal": "observabilityadmin.amazonaws.com" }),
+            format!(
+                "Configuration recorder (AccountId: {account}, ServicePrincipal: \
+                 observabilityadmin.amazonaws.com) cannot be found"
+            ),
+        ),
+    ] {
+        let emulator = Emulator::new();
+        let message = refusal(
+            &emulator,
+            "DeleteServiceLinkedConfigurationRecorder",
+            &body,
+            "NoSuchConfigurationRecorderException",
+        )
+        .await;
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
     }
 }

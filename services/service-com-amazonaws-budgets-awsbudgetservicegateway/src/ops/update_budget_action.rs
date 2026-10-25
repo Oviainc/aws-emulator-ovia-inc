@@ -314,7 +314,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             action.approval_model = approval_model;
         }
         if let Some(subscribers) = input.subscribers {
-            action.subscribers = subscribers;
+            // A replacement set is still a set: a repeat names a subscriber it already
+            // holds, collapsed into it before it is stored.
+            action.subscribers = crate::state::distinct_subscribers(subscribers);
         }
         let new_action = held.action.clone();
         crate::state::record_action_event(

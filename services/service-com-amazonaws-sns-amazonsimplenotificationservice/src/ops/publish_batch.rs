@@ -433,10 +433,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let published = ::std::sync::Arc::new(PublishedMessage {
                     message_id: message_id.clone(),
                     topic_arn: topic.arn.clone(),
-                    message: entry.message,
+                    message: ::std::sync::Arc::from(entry.message),
                     subject: entry.subject,
                     message_structure: entry.message_structure,
-                    message_attributes: entry.message_attributes.unwrap_or_default(),
+                    message_attributes: ::std::sync::Arc::new(
+                        entry.message_attributes.unwrap_or_default(),
+                    ),
                     message_group_id: entry.message_group_id,
                     message_deduplication_id,
                     sequence_number: sequence_number.clone(),

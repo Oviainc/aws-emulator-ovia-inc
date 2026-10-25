@@ -34,6 +34,12 @@
 //! (`CustomEntityType$Name`), and every operation that addresses one names it by name
 //! alone, with no `CatalogId` member.
 //!
+//! FORM TYPES — the metadata schemas `PutFormType` registers — sit in such a per-account
+//! namespace too, keyed by form type name, because a put names its form type by `Name`
+//! alone and no `CatalogId`. They are ADDRESSED by the opaque `FormTypeId` the first put
+//! under a name mints, which is the shape every operation that reads, deletes or attaches
+//! to one takes.
+//!
 //! Database and table names are folded to lowercase on the way in — the model says
 //! so for both `DatabaseInput$Name` ("For Hive compatibility, this is folded to
 //! lowercase when it is stored") and `TableInput$Name` — and every lookup folds the
@@ -156,6 +162,14 @@ pub const MAX_JOBS: usize = 1_000;
 /// modelled `ResourceNumberLimitExceededException`.
 pub const MAX_CUSTOM_ENTITY_TYPES: usize = 1_000;
 
+/// Ceiling on the form types this emulator will hold, for the same reason as
+/// [`MAX_CRAWLERS`]: `PutFormType` writes a record any caller can reach, and each one
+/// carries a schema of up to the modelled 100000 characters, so the number of records one
+/// process will hold is bounded here. A put that would add one past the ceiling is
+/// refused rather than stored; `PutFormType` models no limit error, so the refusal is
+/// the closest client error it does model (`InvalidInputException`).
+pub const MAX_FORM_TYPES: usize = 1_000;
+
 /// The `CrawlerState` of a crawler with no run in progress — the state a crawler is in
 /// the moment `CreateCrawler` returns, and the only one this emulator stores until
 /// `StartCrawler`/`StopCrawler` are implemented. One of the modelled `CrawlerState`
@@ -270,26 +284,52 @@ static MINTED_DATABASE_IDS: AtomicU64 = AtomicU64::new(0);
 /// created.
 ///
 /// 32 lowercase hexadecimal characters, i.e. 128 bits, which is the shape a
-/// catalog-assigned Data Catalog id has on the wire. The bits come from three sources:
-/// the OS-seeded randomness a `RandomState` draws, the system clock in nanoseconds, and
-/// [`MINTED_DATABASE_IDS`] — so two creates in the same nanosecond cannot be minted from
-/// the same input. It is minted once, at create, and stored on the [`DatabaseEntry`], so
+/// catalog-assigned Data Catalog id has on the wire. The bits come from [`mint_hex_id`],
+/// drawn against [`MINTED_DATABASE_IDS`] — so two creates in the same nanosecond cannot be
+/// minted from the same input. It is minted once, at create, and stored on the
+/// [`DatabaseEntry`], so
 /// every later read of that database — and every table in it — reports the same id, and
 /// two databases never share one.
 ///
 /// This names a RESOURCE, not a credential: a credential would come from the credential
 /// store, never from here.
 pub fn new_database_id() -> String {
+    mint_hex_id(&MINTED_DATABASE_IDS, CATALOG_ID_WORDS)
+}
+
+/// How many 64-bit words a catalog-assigned Data Catalog id carries: two, i.e. 128 bits
+/// rendered as 32 lowercase hexadecimal characters. The width of a database id and of a
+/// form type id alike — both are ids the catalog assigns a resource.
+const CATALOG_ID_WORDS: usize = 2;
+
+/// `words` 64-bit draws rendered as lowercase hexadecimal: the one place this crate mints
+/// an opaque id from, so every id-minting function below agrees on where the bits come
+/// from and how they are spelled.
+///
+/// The bits come from three sources: the OS-seeded randomness a `RandomState` draws, the
+/// system clock in nanoseconds, and `minted`, the caller's own count of how many ids it
+/// has handed out — so two ids minted in the same nanosecond cannot come from the same
+/// input. Each caller passes its OWN counter, so one kind of id running ahead cannot skew
+/// another's.
+///
+/// This mints a RESOURCE id, not a credential: a credential would come from the credential
+/// store, never from here.
+fn mint_hex_id(minted: &AtomicU64, words: usize) -> String {
     use std::collections::hash_map::RandomState;
+    use std::fmt::Write;
     use std::hash::BuildHasher;
 
-    let sequence = MINTED_DATABASE_IDS.fetch_add(1, Ordering::Relaxed);
+    let sequence = minted.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
-    let high = RandomState::new().hash_one((sequence, nanos));
-    let low = RandomState::new().hash_one((nanos, sequence));
-    format!("{high:016x}{low:016x}")
+    let mut id = String::with_capacity(words * 16);
+    for word in 0..words {
+        let draw = RandomState::new().hash_one((sequence, nanos, word));
+        // Writing into the pre-sized buffer; `write!` to a `String` cannot fail.
+        let _ = write!(id, "{draw:016x}");
+    }
+    id
 }
 
 /// Per-service state for com-amazonaws-glue-awsglue. A handler reaches it through [`service_state`].
@@ -336,6 +376,19 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// so `ListCustomEntityTypes` has one deterministic order to page over. The key is
     /// the name exactly as sent — the model documents no case fold for it.
     pub custom_entity_types: BTreeMap<String, CustomEntityTypeEntry>,
+    /// Every metadata form type this emulator holds, keyed by `FormTypeName`.
+    ///
+    /// Per account, like crawlers and job definitions: `PutFormType` names a form type by
+    /// `Name` alone, with no `CatalogId` member, and that name is what decides whether a
+    /// put creates a form type or updates the one already stored. Ordered, so
+    /// `ListFormTypes` has one deterministic order to page over. The key is the name
+    /// exactly as sent — the model documents no case fold for `FormTypeName`, whose
+    /// pattern (`^[A-Z]\w*$`) already fixes the first character's case.
+    ///
+    /// A form type is ADDRESSED by its id rather than by its name: `GetFormType` and
+    /// `DeleteFormType` take an `Identifier` targeting `FormTypeId`, the same shape
+    /// `PutFormType`'s `Id` carries. [`Self::form_type_by_id`] is that resolution.
+    pub form_types: BTreeMap<String, FormTypeEntry>,
 }
 
 impl ComAmazonawsGlueAwsglueState {
@@ -516,6 +569,25 @@ impl ComAmazonawsGlueAwsglueState {
     /// [`MAX_CUSTOM_ENTITY_TYPES`].
     pub fn can_store_custom_entity_type(&self) -> bool {
         self.custom_entity_types.len() < MAX_CUSTOM_ENTITY_TYPES
+    }
+
+    /// Whether the store can hold another form type, i.e. is below [`MAX_FORM_TYPES`].
+    pub fn can_store_form_type(&self) -> bool {
+        self.form_types.len() < MAX_FORM_TYPES
+    }
+
+    /// The stored form type whose `Id` is `id`, or `None` when this store holds no form
+    /// type under that id.
+    ///
+    /// Every operation that ADDRESSES a form type does so by a `FormTypeId`
+    /// (`GetFormType$Identifier`, `DeleteFormType$Identifier`, `PutAttachment$FormTypeId`
+    /// all target that shape), while the records are keyed by the name a put addresses
+    /// them by — so the id resolution is a walk, bounded by [`MAX_FORM_TYPES`]. One copy,
+    /// shared, so no two operations can disagree about which record an id names.
+    pub fn form_type_by_id(&self, id: &str) -> Option<&FormTypeEntry> {
+        self.form_types
+            .values()
+            .find(|form_type| form_type.id == id)
     }
 
     /// The tag set of the resource `resource` names, or `None` when this store holds no
@@ -1242,6 +1314,59 @@ impl CustomEntityTypeEntry {
     }
 }
 
+/// How many form type ids this process has minted. A nonce source for
+/// [`new_form_type_id`], exactly as [`MINTED_DATABASE_IDS`] is for a database id.
+static MINTED_FORM_TYPE_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh `FormTypeId`: the opaque identifier the Data Catalog assigns a form type when
+/// `PutFormType` first stores it under a name.
+///
+/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is the shape a
+/// catalog-assigned Data Catalog id has and is inside `FormTypeId`'s `length 1..256`. The
+/// bits come from [`mint_hex_id`], as a database id's do, so two puts landing
+/// in the same nanosecond cannot be given the same id. It is minted ONCE, when the name
+/// is first stored, and kept on the [`FormTypeEntry`] through every later update, so
+/// every read of that form type reports the same id and two form types never share one.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_form_type_id() -> String {
+    mint_hex_id(&MINTED_FORM_TYPE_IDS, CATALOG_ID_WORDS)
+}
+
+/// A stored form type: the schema for structured metadata `PutFormType` registers in the
+/// Data Catalog.
+///
+/// Every member of the modelled form type is held here — its id, its name and its schema
+/// — and nothing else: the model gives a form type no status, owner or timestamp. The
+/// name and the schema come from the request; the id is the one server-set member, minted
+/// by [`new_form_type_id`] when the name is first stored.
+#[derive(Debug, Clone)]
+pub struct FormTypeEntry {
+    /// `FormTypeId`, minted by [`new_form_type_id`] at the first put under this name and
+    /// unchanged by every later one, so a caller that kept the id from an earlier put can
+    /// still address the form type after it has been updated.
+    pub id: String,
+    /// The form type's name, which is also its key in
+    /// [`ComAmazonawsGlueAwsglueState::form_types`].
+    pub name: String,
+    /// "The Smithy IDL schema definition for the form type", stored exactly as sent: the
+    /// catalog reports back the schema text the client wrote, not a re-rendering of it.
+    pub schema: String,
+}
+
+impl FormTypeEntry {
+    /// The record a put stores for a name this store does not hold yet: the request's
+    /// name and schema, under a freshly minted id.
+    pub fn new(name: String, schema: String) -> Self {
+        Self {
+            id: new_form_type_id(),
+            name,
+            schema,
+        }
+    }
+}
+
 /// `JobCommand$Name` values the model documents: "For an Apache Spark ETL job, this
 /// must be `glueetl`. For a Python shell job, it must be `pythonshell`. For an Apache
 /// Spark streaming ETL job, this must be `gluestreaming`. For a Ray job, this must be
@@ -1711,32 +1836,22 @@ static MINTED_JOB_RUN_IDS: AtomicU64 = AtomicU64::new(0);
 ///
 /// [`JOB_RUN_ID_PREFIX`] followed by 64 lowercase hexadecimal characters, i.e. 256 bits,
 /// which is the shape a Glue job run id has on the wire and is inside `IdString`'s
-/// `length 1..255`. The bits are minted the way [`new_database_id`] mints a database id,
+/// `length 1..255`. The bits come from [`mint_hex_id`], as a database id's do,
 /// so two runs started in the same nanosecond cannot be given the same id. It is stored
 /// on the run, so every later read of that run reports the same id.
 ///
 /// This names a RESOURCE, not a credential: a credential would come from the credential
 /// store, never from here.
 pub fn new_job_run_id() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::BuildHasher;
-
-    let sequence = MINTED_JOB_RUN_IDS.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let words = [
-        RandomState::new().hash_one((sequence, nanos)),
-        RandomState::new().hash_one((nanos, sequence)),
-        RandomState::new().hash_one((sequence, sequence, nanos)),
-        RandomState::new().hash_one((nanos, nanos, sequence)),
-    ];
-    let mut id = String::from(JOB_RUN_ID_PREFIX);
-    for word in words {
-        id.push_str(&format!("{word:016x}"));
-    }
-    id
+    format!(
+        "{JOB_RUN_ID_PREFIX}{}",
+        mint_hex_id(&MINTED_JOB_RUN_IDS, JOB_RUN_ID_WORDS)
+    )
 }
+
+/// How many 64-bit words a Glue job run id carries: four, i.e. 256 bits rendered as 64
+/// lowercase hexadecimal characters.
+const JOB_RUN_ID_WORDS: usize = 4;
 
 /// One run of a job definition, as `StartJobRun` recorded it.
 ///

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDaemonTaskDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDaemonTaskDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDaemonTaskDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the daemon task-definition revisions this account holds, narrowed by the
+//! filters the request sets, ordered by family name and revision, and paged with an
+//! opaque token. Every entry summarises a revision `RegisterDaemonTaskDefinition` stored.
 //!
 //! ## Shape of an operation
 //!
@@ -179,20 +173,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDaemonTaskDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDaemonTaskDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDaemonTaskDefinitions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDaemonTaskDefinitionsErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "This value can be between 1 and 100."
+        if let Some(max_results) = input.max_results {
+            if !(1..=crate::state::MAX_LIST_PAGE_SIZE).contains(&max_results) {
+                return Err(
+                    ListDaemonTaskDefinitionsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "maxResults must be between 1 and {}; got {max_results}",
+                                crate::state::MAX_LIST_PAGE_SIZE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "By default, only ACTIVE daemon task definitions are listed. If you set this
+        // parameter to DELETE_IN_PROGRESS, only daemon task definitions that are in the
+        // process of being deleted are listed. If you set this parameter to ALL, all
+        // daemon task definitions are listed regardless of status" — `ALL` narrows
+        // nothing, and every other value of the filter is a status a stored revision
+        // carries.
+        let wanted_status = match input.status.as_deref() {
+            None => Some(crate::state::DAEMON_TASK_DEFINITION_ACTIVE),
+            Some(crate::state::DAEMON_TASK_DEFINITION_STATUS_FILTER_ALL) => None,
+            Some(status) => Some(status),
+        };
+
+        // "By default (ASC), daemon task definitions are listed in ascending order by
+        // family name and revision number" — and `DESC` reverses that one order.
+        let descending = input.sort.as_deref() == Some(crate::state::SORT_ORDER_DESC);
+
+        let guard = state.lock();
+
+        // `nextToken`: "This token should be treated as an opaque identifier that is only
+        // used to retrieve the next items in a list and not for other programmatic
+        // purposes." It is minted as the `family:revision` of the revision the next page
+        // starts at, so a value that names no revision this account holds is an identifier
+        // that names no page — a `ClientException`, the error for a request "specifying an
+        // identifier that isn't valid" — rather than being read as some insertion point in
+        // the sequence. The revision only has to be STORED, in any status, so a token
+        // minted mid-walk still resumes after the revision it names has left the filtered
+        // listing.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::parse_daemon_task_definition_reference(token) {
+                Some((family, Some(revision)))
+                    if guard
+                        .daemon_task_definitions
+                        .contains_key(&(family.clone(), revision)) =>
+                {
+                    Some((family, revision))
+                }
+                _ => {
+                    return Err(ListDaemonTaskDefinitionsErrorModeled::ClientException(
+                        ClientException {
+                            message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // "Returns a list of daemon task definitions that are registered to your account.
+        // You can filter the results by family name, status, or both" — every stored
+        // revision, narrowed by the filters the request sets. Each entry carries the sort
+        // key (family, revision) beside the summary the listing reports, so the order and
+        // the token are computed from the same stored values.
+        let mut matching: Vec<(String, i32, DaemonTaskDefinitionSummary)> = guard
+            .daemon_task_definitions
+            .values()
+            .filter(|record| wanted_status.is_none_or(|status| record.status == status))
+            // "The exact name of the daemon task definition family to filter results
+            // with": the WHOLE name.
+            .filter(|record| {
+                input
+                    .family
+                    .as_deref()
+                    .is_none_or(|family| record.family == family)
+            })
+            // "Specifying a familyPrefix limits the listed daemon task definitions to
+            // daemon task definition families that start with the familyPrefix string": a
+            // LEADING FRAGMENT of a name, not the whole name.
+            .filter(|record| {
+                input
+                    .family_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| record.family.starts_with(prefix))
+            })
+            .map(|record| (record.family.clone(), record.revision, record.summary()))
+            .collect();
+
+        // "Specify LAST_REGISTERED to return only the last registered revision for each
+        // daemon task definition family" — the highest revision of each family among the
+        // revisions the other filters left, since every filter narrows the same listing.
+        if input.revision.as_deref() == Some(crate::state::DAEMON_REVISION_FILTER_LAST_REGISTERED) {
+            let mut last: ::std::collections::HashMap<String, i32> =
+                ::std::collections::HashMap::new();
+            for (family, revision, _) in &matching {
+                last.entry(family.clone())
+                    .and_modify(|seen| *seen = (*seen).max(*revision))
+                    .or_insert(*revision);
+            }
+            matching.retain(|(family, revision, _)| last.get(family) == Some(revision));
+        }
+
+        matching.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+        if descending {
+            matching.reverse();
+        }
+
+        // "If this parameter isn't used, then ListDaemonTaskDefinitions returns up to 100
+        // results and a nextToken value if applicable."
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
+        // The token names the revision the next page starts at, so a page is unaffected by
+        // revisions registered or deleted before it — and it resumes the walk in whichever
+        // direction this request's `sort` runs.
+        let start = match resume_at.as_ref() {
+            Some((family, revision)) => matching.partition_point(|(entry_family, entry, _)| {
+                let entry = (entry_family.as_str(), *entry);
+                let resume = (family.as_str(), *revision);
+                if descending {
+                    entry > resume
+                } else {
+                    entry < resume
+                }
+            }),
+            None => 0,
+        };
+        // `start` is either 0 or a `partition_point` result, so it never exceeds the
+        // length and the slice below is always in range.
+        let end = start.saturating_add(page_size).min(matching.len());
+        let daemon_task_definitions: Vec<DaemonTaskDefinitionSummary> = matching[start..end]
+            .iter()
+            .map(|(_, _, summary)| summary.clone())
+            .collect();
+        // The token is absent once the walk has reported every matching revision.
+        let next_token = matching
+            .get(end)
+            .map(|(family, revision, _)| format!("{family}:{revision}"));
+
+        Ok(ListDaemonTaskDefinitionsOutput {
+            daemon_task_definitions: Some(daemon_task_definitions),
+            next_token,
+        })
     }
 }
