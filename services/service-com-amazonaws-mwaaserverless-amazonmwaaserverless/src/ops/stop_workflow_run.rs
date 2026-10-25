@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopWorkflowRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopWorkflowRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopWorkflowRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +95,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -178,31 +170,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (ctx, &self.engine);
+        // The endpoint this request was signed for: a regional endpoint resolves only
+        // the workflows created through it.
+        let region = crate::state::request_region(ctx.parts());
 
-        // A member value that fails the constraint its model declares is refused
-        // first, with the modelled `ValidationException` — `Message`,
-        // `Reason: fieldValidationFailed` and a `FieldList` entry naming each
-        // offending member. A well-formed request still reaches the 501 below:
-        // the operation itself is not implemented yet.
+        // Every member whose declared constraint this operation's input struct
+        // hands over (`skip_validation`) is checked here, so a bad value is
+        // refused with the modelled `ValidationException` — `Message`,
+        // `Reason: fieldValidationFailed` and a `FieldList` entry per offending
+        // member — rather than the framework's generic 400.
         validate_input(&input).map_err(|refusal| {
             StopWorkflowRunError::from(StopWorkflowRunErrorModeled::ValidationException(refusal))
         })?;
 
-        // Implement `StopWorkflowRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopWorkflowRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". The members listed in `skip_validation` on
-        // `StopWorkflowRunInput` are checked by `validate_input` below; every other
-        // modeled constraint is refused BEFORE this handler runs.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopWorkflowRun"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        // Finish every workflow teardown the clock already made due, so a run of a
+        // workflow past its `DELETING` span is gone with it and is not stoppable here.
+        store.reap_deleted_workflows(now);
+
+        // The run is what this operation resolves: a workflow the store does not hold
+        // — including one of ANOTHER region, which this endpoint does not serve — holds
+        // no run either, so both misses are the same failure to the caller.
+        let unresolved_run = || {
+            crate::state::lookup_miss(StopWorkflowRunErrorModeled::ResourceNotFoundException(
+                crate::state::unresolved(
+                    crate::state::UnresolvedEntity::WorkflowRun,
+                    &input.run_id,
+                ),
+            ))
+        };
+        let run = store
+            .workflow_in_mut(&region, &input.workflow_arn)
+            .ok_or_else(unresolved_run)?
+            .runs
+            .get_mut(&input.run_id)
+            .ok_or_else(unresolved_run)?;
+
+        // Apply every change the clock already owed BEFORE stopping, so a run that had
+        // already finished on its own is stopped as the finished run it is rather than
+        // as the state it was last written in.
+        run.settle(now);
+
+        // The stop itself: an unfinished run moves to `STOPPING` and reaches `STOPPED`
+        // when the shutdown's span is up. A run that already finished, or one already
+        // stopping, is left exactly as it is — the operation is `@idempotent` and models
+        // no conflict for a run there is nothing further to stop.
+        run.begin_stop(now);
+
+        // Answer from the stored run, never from the values just computed.
+        Ok(StopWorkflowRunOutput {
+            workflow_arn: Some(run.workflow_arn.clone()),
+            workflow_version: Some(run.workflow_version.clone()),
+            run_id: Some(run.run_id.clone()),
+            // "The status of the workflow run after the stop operation" — the status the
+            // store now holds, which is `STOPPING` for a run this call stopped and the
+            // terminal status it already had for one that had finished.
+            status: Some(run.status.clone()),
+        })
     }
+}
+
+/// The modelled server error for a store this handler could not reach.
+fn unavailable() -> StopWorkflowRunError {
+    StopWorkflowRunErrorModeled::InternalServerException(InternalServerException {
+        message: "the com.amazonaws.mwaaserverless workflow store is unavailable".to_string(),
+        retry_after_seconds: None,
+    })
+    .into()
 }
 
 /// Check every `StopWorkflowRun` input member whose modelled constraint this

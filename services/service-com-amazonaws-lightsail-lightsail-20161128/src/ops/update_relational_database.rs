@@ -372,19 +372,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // The members no `pendingModifiedValues` entry can report are
             // written straight away: the model carries no way to say they are
-            // waiting, so they are not deferred.
+            // waiting, so they are not deferred. Each is written only where the
+            // request asked for a value the database does not already carry, so
+            // the event the change leaves in the database's log names what
+            // really changed.
             let (backup_window, maintenance_window) = windows;
-            if let Some(window) = backup_window {
+            let mut changed: Vec<&'static str> = Vec::new();
+            if let Some(window) =
+                backup_window.filter(|window| *window != database.preferred_backup_window)
+            {
                 database.preferred_backup_window = window;
+                changed.push("preferredBackupWindow");
             }
-            if let Some(window) = maintenance_window {
+            if let Some(window) =
+                maintenance_window.filter(|window| *window != database.preferred_maintenance_window)
+            {
                 database.preferred_maintenance_window = window;
+                changed.push("preferredMaintenanceWindow");
             }
-            if let Some(publicly_accessible) = input.publicly_accessible {
+            if let Some(publicly_accessible) = input
+                .publicly_accessible
+                .filter(|wanted| *wanted != database.publicly_accessible)
+            {
                 database.publicly_accessible = publicly_accessible;
+                changed.push("publiclyAccessible");
             }
-            if let Some(identifier) = ca_certificate_identifier {
+            if let Some(identifier) = ca_certificate_identifier
+                .filter(|identifier| *identifier != database.ca_certificate_identifier)
+            {
                 database.ca_certificate_identifier = identifier.to_string();
+                changed.push("caCertificateIdentifier");
+            }
+            // One entry for the members this call changed at once; the three it
+            // can leave waiting are logged by `modify` when they reach the
+            // database, which may be at its maintenance window rather than now.
+            if !changed.is_empty() {
+                database.record_event(
+                    now,
+                    format!(
+                        "{}: {}",
+                        crate::state::RELATIONAL_DATABASE_EVENT_MODIFICATION_APPLIED,
+                        changed.join(", ")
+                    ),
+                    &[crate::state::RELATIONAL_DATABASE_EVENT_CATEGORY_CONFIGURATION_CHANGE],
+                );
             }
 
             // The three the model CAN report pending: applied now when the

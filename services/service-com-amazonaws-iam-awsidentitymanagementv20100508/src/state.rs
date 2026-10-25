@@ -369,6 +369,12 @@ pub const MARKER_SCOPE_SERVICE_SPECIFIC_CREDENTIALS: &str = "service-specific-cr
 /// user selects within the order rather than changing it.
 pub const MARKER_SCOPE_ACCESS_KEYS: &str = "access-keys";
 
+/// The marker scope of the tag set of ONE tagged entity, which IAM's tag-listing
+/// operations page over. The entity's handle follows it, so a marker issued while
+/// paging one entity's tags names no position in another entity's tag set — and no
+/// position in any other collection: see [`entity_tags_marker_scope`].
+pub const MARKER_SCOPE_ENTITY_TAGS: &str = "entity-tags";
+
 /// The alphabet the suffix is drawn from: RFC 4648 base32, every character of
 /// which is an uppercase alphanumeric and so inside `idType`'s `^[\w]+$`.
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -1651,6 +1657,13 @@ pub fn entities_for_policy_marker_scope(policy_arn: &str) -> String {
     format!("{MARKER_SCOPE_ENTITIES_FOR_POLICY}:{policy_arn}")
 }
 
+/// The marker scope of the tag set of the entity `entity_handle` names — an ARN or
+/// an entity key, whichever handle the tag-listing operation takes. See
+/// [`MARKER_SCOPE_ENTITY_TAGS`].
+pub fn entity_tags_marker_scope(entity_handle: &str) -> String {
+    format!("{MARKER_SCOPE_ENTITY_TAGS}:{entity_handle}")
+}
+
 /// The page key of ONE entity in the order `ListEntitiesForPolicy` enumerates the
 /// entities a managed policy relates to: the entity's TYPE tag followed by
 /// [`name_key`] of its name.
@@ -2302,6 +2315,67 @@ pub fn merge_tags(held: Option<&Vec<Tag>>, incoming: Vec<Tag>) -> Option<Vec<Tag
         }
     }
     (merged.len() <= MAX_TAGS_PER_ENTITY).then_some(merged)
+}
+
+/// One PAGE of a tagged entity's tags, as an IAM tag-listing operation reports it:
+/// the tags themselves, whether more remain, and the token that resumes after them.
+#[derive(Debug)]
+pub struct TagPage {
+    /// The tags this page reports, sorted by tag key. Empty when the entity holds
+    /// none, because "if no tags are attached to the specified resource, the response
+    /// contains an empty list" (`ListSAMLProviderTags$Tags`).
+    pub tags: Vec<Tag>,
+    /// Whether "there are more items to return" (`$IsTruncated`).
+    pub is_truncated: bool,
+    /// The `Marker` to resume from, present only when the page is truncated: "when
+    /// IsTruncated is true, this element is present" (`$Marker`).
+    pub marker: Option<String>,
+}
+
+/// The page of the `held` tag set that follows `resume_after`, at most `page_size`
+/// tags long, with markers minted in `scope`.
+///
+/// The rule every IAM tag-listing operation follows, in one place: "the returned list
+/// of tags is sorted by tag key" (`ListSAMLProviderTags`), so the tag KEY is the page
+/// order whatever order the entity's record holds its tags in, and a `Marker` names
+/// the last key the previous page reported. The next page resumes STRICTLY after that
+/// key, which stays well defined when the tag it named has been removed since: paging
+/// resumes from the position, and the removed tag is simply no longer in the range.
+pub fn tag_page(
+    held: Option<&Vec<Tag>>,
+    scope: &str,
+    resume_after: Option<&str>,
+    page_size: usize,
+) -> TagPage {
+    // A page holds at least one tag, so a truncated page always carries the key a
+    // `Marker` can resume after: "when IsTruncated is true, this element is present"
+    // (`$Marker`) cannot be honoured by a page of nothing. `maxItemsType`'s range floor
+    // is 1, so no request reaches here asking for a smaller page.
+    let page_size = page_size.max(1);
+    let mut sorted: Vec<Tag> = held.cloned().unwrap_or_default();
+    sorted.sort_by(|left, right| left.key.cmp(&right.key));
+
+    let mut tags: Vec<Tag> = Vec::new();
+    let mut is_truncated = false;
+    for tag in sorted
+        .into_iter()
+        .filter(|tag| resume_after.is_none_or(|after| tag.key.as_str() > after))
+    {
+        if tags.len() == page_size {
+            // At least one more tag follows, so the caller needs another page to see it.
+            is_truncated = true;
+            break;
+        }
+        tags.push(tag);
+    }
+    let marker = is_truncated
+        .then(|| tags.last().map(|tag| encode_marker(scope, &tag.key)))
+        .flatten();
+    TagPage {
+        tags,
+        is_truncated,
+        marker,
+    }
 }
 
 /// Whether `document` is an IAM policy document.

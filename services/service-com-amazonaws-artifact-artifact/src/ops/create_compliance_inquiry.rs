@@ -46,6 +46,11 @@
 //!   ([`crate::state::support_mode_available_for`]). The inquiry therefore only ever
 //!   stores — and every read only ever reports — a support mode its queries really were
 //!   reviewed under.
+//! * A tag the request carries is written onto the inquiry it creates, under the same rule
+//!   the tag write enforces: a key in the reserved `aws:` namespace
+//!   ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is Amazon Web Services' own, so such a
+//!   request is refused with the modelled 400 `ValidationException` naming `tags` and no
+//!   inquiry is created.
 //! * The inquiry's RESPONSES are model-generated compliance answers, and no such engine
 //!   runs in this emulator. Nothing is synthesised to look generated: no query ever
 //!   carries a `response`, and that absence is the signal — a query is reported under the
@@ -229,6 +234,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let tags: ::std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
+        // The same reserved-namespace rule the tag write enforces
+        // ([`crate::state::RESERVED_TAG_KEY_PREFIX`]): a key AWS owns may not be created
+        // through this path either, so the inquiry is not minted and the request is refused
+        // as a field validation failure naming the member that carried the key.
+        if crate::state::reserved_tag_key(tags.keys().map(String::as_str)).is_some() {
+            return Err(CreateComplianceInquiryErrorModeled::ValidationException(
+                crate::state::reserved_tag_keys("tags"),
+            )
+            .into());
+        }
         let fingerprint = request_fingerprint(&input.name, &support_mode, &content, &tags);
         let queries = enumerate_queries(&input.name, &support_mode, &content, now);
 

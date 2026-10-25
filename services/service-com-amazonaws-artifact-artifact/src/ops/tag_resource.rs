@@ -10,6 +10,11 @@
 //! added, so repeating one request changes nothing the second time, and keys the request
 //! does not name are left alone (removing one is `UntagResource`'s job).
 //!
+//! The `aws:` tag-key namespace is Amazon Web Services' own
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`]): a request naming a key under it is refused
+//! with the modelled 400 `ValidationException` and writes nothing, so a caller-created tag
+//! set never carries one.
+//!
 //! The resource is named by its ARN, and the only resource an account owns in this service
 //! is a compliance inquiry — see
 //! [`crate::state::ComAmazonawsArtifactArtifactState::tagged_resource`]. An ARN that
@@ -158,6 +163,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The reserved tag-key namespace is AWS's own
+        // ([`crate::state::RESERVED_TAG_KEY_PREFIX`]): a key under it may not be created or
+        // changed through this API, so the request is refused as a field validation failure
+        // naming the member that carried the key. Decided from the REQUEST alone, before the
+        // ARN is resolved, so the refusal neither depends on nor discloses whether the
+        // account holds the resource, and nothing is written either way.
+        if crate::state::reserved_tag_key(input.tags.keys().map(String::as_str)).is_some() {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::reserved_tag_keys("tags"),
+            )
+            .into());
+        }
 
         let mut store = state.lock();
         let Some(resource) = store.tagged_resource_mut(&input.resource_arn) else {

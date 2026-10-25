@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The list is applied in the order the request carries it, so an
             // entry that names a parameter an earlier entry already set wins.
             for update in updates {
-                database.set_parameter(update);
+                database.set_parameter(update, now);
             }
 
             // `operations` is a list because other Lightsail calls act on

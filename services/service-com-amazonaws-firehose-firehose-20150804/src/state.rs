@@ -21,6 +21,8 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
+pub mod delivery;
+
 use crate::ops::types::{
     AmazonOpenSearchServerlessDestinationConfiguration,
     AmazonopensearchserviceDestinationConfiguration, DeliveryStreamEncryptionConfiguration,
@@ -40,11 +42,13 @@ use crate::ops::types::{
 /// call still observes the transient status the real service shows.
 pub const TRANSITION_DELAY: Duration = Duration::from_millis(600);
 
-/// How long an ingested record stays in a stream's buffer.
+/// How long an ingested record stays in a stream's buffer WITHOUT being delivered.
 ///
 /// Documented, not chosen: "Data records sent to Firehose are stored for 24 hours from
 /// the time they are added to a Firehose stream as it tries to send the records to the
-/// destination" (`PutRecord`).
+/// destination" (`PutRecord`). A record the stream delivers leaves the buffer when it is
+/// delivered ([`delivery`]); this is how long one the destination cannot take is kept
+/// while that is retried.
 pub const RECORD_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The default per-Region stream quota: "By default, you can create up to 5,000 Firehose
@@ -290,6 +294,11 @@ pub struct DeliveryStream {
     pub buffered_bytes: usize,
     /// The ordinal the next destination of this stream gets.
     pub next_destination_id: u64,
+    /// The instant before which no further delivery of this stream's buffer is attempted,
+    /// set when a delivery could not be made at all (the destination bucket is not there,
+    /// or the object store refused the write) so the retry does not spin — see
+    /// [`delivery::DELIVERY_RETRY_SPAN`]. `None` once a delivery succeeds.
+    pub delivery_retry_at: Option<SystemTime>,
 }
 
 impl DeliveryStream {
@@ -453,6 +462,15 @@ pub struct ComAmazonawsFirehoseFirehose20150804State {
     /// The bytes every stream's buffer holds together, kept as a running total so a put
     /// checks the service-wide budget without walking the register.
     pub buffered_bytes: usize,
+    /// Whether a delivery pump already runs against this store, so at most one does — see
+    /// [`delivery::drive_delivery_clock`].
+    pub(crate) delivery_pump_running: bool,
+    /// Which claim on the delivery pump is the current one, so a pump releases its OWN
+    /// claim and never a later pump's.
+    pub(crate) delivery_pump_generation: u64,
+    /// The running delivery pump's task handle, kept so the pump it replaces is aborted
+    /// rather than merely forgotten.
+    pub(crate) delivery_pump: Option<::tokio::task::JoinHandle<()>>,
 }
 
 impl ComAmazonawsFirehoseFirehose20150804State {

@@ -129,6 +129,21 @@ impl Node {
         }
         self.children.iter().find_map(|child| child.find_text(name))
     }
+
+    /// The first descendant element called `name`, depth first.
+    ///
+    /// The same walk [`Node::find_text`] makes, answering with the ELEMENT rather than its
+    /// text, so a suite that has to read several members of a nested element (the
+    /// `RealtimeLogConfig` an operation's result wraps, say) locates it through this one
+    /// walk rather than carrying its own copy.
+    pub(crate) fn descendant(&self, name: &str) -> Option<&Node> {
+        if self.name == name {
+            return Some(self);
+        }
+        self.children
+            .iter()
+            .find_map(|child| child.descendant(name))
+    }
 }
 
 /// Parse a restXml document into its element tree.

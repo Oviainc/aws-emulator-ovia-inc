@@ -454,9 +454,7 @@ fn resolve_parent(
     match (&tip, parent_commit_id) {
         (Some(_), None) => Err(CreateCommitErrorModeled::ParentCommitIdRequiredException(
             ParentCommitIdRequiredException {
-                message: Some(format!(
-                    "a parent commit id is required to commit to the branch {branch_name}"
-                )),
+                message: Some(crate::state::PARENT_COMMIT_ID_REQUIRED_MESSAGE.to_string()),
             },
         )
         .into()),
@@ -473,10 +471,9 @@ fn resolve_parent(
                 return if repository.commits.contains_key(parent) {
                     Err(CreateCommitErrorModeled::ParentCommitIdOutdatedException(
                         ParentCommitIdOutdatedException {
-                            message: Some(format!(
-                                "the parent commit id {parent} is not the tip of the branch \
-                                 {branch_name}"
-                            )),
+                            message: Some(
+                                crate::state::PARENT_COMMIT_ID_OUTDATED_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into())
@@ -820,10 +817,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tree_id = crate::state::tree_id(&files);
         if tree_id.is_some() && tree_id == base_tree_id {
             return Err(CreateCommitErrorModeled::NoChangeException(NoChangeException {
-                message: Some(
-                    "the commit cannot be created because it makes no change to the repository"
-                        .to_string(),
-                ),
+                message: Some(crate::state::NO_CHANGE_MESSAGE.to_string()),
             })
             .into());
         }
