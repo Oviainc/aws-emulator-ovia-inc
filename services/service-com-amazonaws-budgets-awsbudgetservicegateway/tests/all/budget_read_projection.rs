@@ -51,7 +51,10 @@ const DEFAULT_END_CIVIL: &str = "2087-06-15T00:00:00Z";
 const DAY_SECS: i64 = 86_400;
 
 /// Now, in epoch seconds.
-fn now_secs() -> i64 {
+///
+/// `pub(crate)` so the sibling suites in this test target read the clock through the one
+/// helper rather than copying it.
+pub(crate) fn now_secs() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -63,7 +66,10 @@ fn now_secs() -> i64 {
 
 /// `secs` rendered as `YYYY-MM-DDThh:mm:ssZ`, which is what the calendar assertions
 /// below read dates off.
-fn civil(secs: i64) -> String {
+///
+/// `pub(crate)` so the sibling suites in this test target render an instant through the
+/// one helper rather than copying it.
+pub(crate) fn civil(secs: i64) -> String {
     DateTime::from_secs(secs)
         .fmt(Format::DateTime)
         .unwrap_or_else(|error| panic!("{secs} must render as a date-time: {error}"))

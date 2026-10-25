@@ -220,15 +220,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .into());
                 }
-                // Map runs are not implemented in this emulator (`DescribeMapRun`,
-                // `ListMapRuns` and `UpdateMapRun` all still answer 501) and no state
-                // this emulator executes starts one, so an ARN naming one names
-                // nothing that exists.
-                return Err(ListExecutionsErrorModeled::ResourceNotFound(ResourceNotFound {
-                    message: Some(format!("map run {map_run} does not exist")),
-                    resource_name: Some(map_run.to_string()),
-                })
-                .into());
+                // The page token is judged on this branch too, so one request is
+                // refused for the same defect whichever selector it names.
+                if crate::state::page_offset(input.next_token.as_deref()).is_none() {
+                    return Err(ListExecutionsErrorModeled::InvalidToken(InvalidToken {
+                        message: Some(crate::state::invalid_token_message()),
+                    })
+                    .into());
+                }
+                let mut store = state.lock();
+                store.settle(crate::state::now());
+                if !store.map_runs.contains_key(map_run) {
+                    return Err(ListExecutionsErrorModeled::ResourceNotFound(
+                        ResourceNotFound {
+                            message: Some(format!("map run {map_run} does not exist")),
+                            resource_name: Some(map_run.to_string()),
+                        },
+                    )
+                    .into());
+                }
+                // A Map Run that EXISTS reports the child workflow executions it
+                // started. This emulator interprets a Distributed Map's items in the
+                // parent execution's own walk rather than starting child executions,
+                // so the store holds no execution RECORD that names a map run and
+                // this page is empty — `DescribeMapRun` counts the items that ran,
+                // which is what this emulator does know about them. The child
+                // execution records are their own issue's work.
+                return Ok(ListExecutionsOutput {
+                    executions: Vec::new(),
+                    next_token: None,
+                });
             }
             (None, None) => {
                 return Err(ListExecutionsErrorModeled::ValidationException(
@@ -272,7 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
             return Err(ListExecutionsErrorModeled::InvalidToken(InvalidToken {
-                message: Some("nextToken is not a token this service issued".to_string()),
+                message: Some(crate::state::invalid_token_message()),
             })
             .into());
         };

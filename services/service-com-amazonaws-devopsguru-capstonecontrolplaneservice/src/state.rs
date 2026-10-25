@@ -1741,20 +1741,23 @@ impl ResourceCoverage {
     /// Whether this collection and `other` name a resource in common — a covered stack
     /// name, or an (app-boundary key, tag value) pair, that both hold.
     ///
-    /// The two halves are OR-ed because a collection is the SET of the resources it
-    /// names: "the two types of Amazon Web Services resource collections supported are
-    /// Amazon Web Services CloudFormation stacks and Amazon Web Services resources that
-    /// contain the same Amazon Web Services tag", so naming both names their union.
+    /// The ANY-entry form of [`Self::selects_stack`] and [`Self::selects_tagged`], which
+    /// decide one entry each: an intersection is one entry of this collection selecting
+    /// a resource `other` records. The two halves are OR-ed because a collection is the
+    /// SET of the resources it names: "the two types of Amazon Web Services resource
+    /// collections supported are Amazon Web Services CloudFormation stacks and Amazon
+    /// Web Services resources that contain the same Amazon Web Services tag", so naming
+    /// both names their union.
     pub fn intersects(&self, other: &Self) -> bool {
         self.cloudformation_stack_names
             .iter()
-            .any(|stack_name| other.cloudformation_stack_names.contains(stack_name))
-            || self.tag_collections.iter().any(|(key, values)| {
-                other
-                    .tag_collections
-                    .get(key)
-                    .is_some_and(|held| values.iter().any(|value| held.contains(value)))
-            })
+            .any(|stack_name| other.selects_stack(stack_name))
+            || self
+                .tag_collections
+                .iter()
+                .any(|(app_boundary_key, tag_values)| {
+                    other.selects_tagged(app_boundary_key, tag_values)
+                })
     }
 
     /// This collection as a page-token scope fragment, so a cursor issued for a search
@@ -1798,6 +1801,44 @@ impl ResourceCoverage {
                     .collect()
             }),
         }
+    }
+
+    /// Whether this coverage records a CloudFormation stack that one entry of a
+    /// resource-collection scope, naming `stack_name`, selects.
+    ///
+    /// The per-ENTRY form of [`Self::intersects`], for the caller that has to say WHICH
+    /// entry selected nothing, and comparing values exactly for the same reason that
+    /// one does: a collection names the resources it names, and this store expands no
+    /// value into others.
+    pub fn selects_stack(&self, stack_name: &str) -> bool {
+        self.cloudformation_stack_names.contains(stack_name)
+    }
+
+    /// Whether this coverage records a tagged resource that one entry of a
+    /// resource-collection scope, naming `app_boundary_key` and `tag_values`, selects.
+    ///
+    /// The per-entry form of [`Self::intersects`] for the tag half, with the same exact
+    /// comparison: a tag key and a tag value are both case-sensitive
+    /// (`smithy_query(query="doc",shape="TagCostEstimationResourceCollectionFilter",member="AppBoundaryKey")`),
+    /// and a value is a VALUE even when it is the empty string — "omitting the tag value
+    /// is the same as using an empty string"
+    /// (`smithy_query(query="doc",shape="TagCostEstimationResourceCollectionFilter",member="TagValues")`)
+    /// — so an entry naming no value at all selects nothing, exactly as
+    /// [`Self::names_no_resource`] reads such an entry.
+    ///
+    /// `tag_values` is any iterable of values, so one wire entry's list and one stored
+    /// key's value set are both read through this one rule.
+    pub fn selects_tagged<'a>(
+        &self,
+        app_boundary_key: &str,
+        tag_values: impl IntoIterator<Item = &'a String>,
+    ) -> bool {
+        let Some(recorded) = self.tag_collections.get(app_boundary_key) else {
+            return false;
+        };
+        tag_values
+            .into_iter()
+            .any(|value| recorded.contains(value))
     }
 
     /// How many resources this coverage puts under DevOps Guru analysis.

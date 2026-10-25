@@ -191,6 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
+        // The store is first brought up to whatever the clock already made due, so a
+        // provider whose own removal was already owed is gone before this call looks for
+        // the name: creating under that name is creating a provider this account no
+        // longer holds one of.
+        store.materialize_all(now);
 
         // A provider name identifies at most one provider, so a second create of the
         // same name conflicts rather than replacing the first: an already existing
@@ -249,6 +254,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // here.
             state: crate::state::CAPACITY_PROVIDER_STATE_PENDING.to_string(),
             active_due: now + crate::state::CAPACITY_PROVIDER_ACTIVATION_DELAY,
+            // Nobody has asked for this provider's removal, so the clock owes none.
+            removal_due: None,
             last_modified: crate::state::iso8601(now),
         };
         store.capacity_providers.insert(name.clone(), record);

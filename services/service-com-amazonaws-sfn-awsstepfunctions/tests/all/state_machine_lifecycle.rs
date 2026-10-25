@@ -1583,7 +1583,7 @@ async fn execution_operations_refuse_what_was_never_stored() {
         );
     }
 
-    // A Map Run ARN names a resource this emulator never creates, which is a 404.
+    // A Map Run ARN the store holds no record for is a 404.
     let (status, code) = emulator
         .err(
             "ListExecutions",

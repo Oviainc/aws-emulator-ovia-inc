@@ -213,3 +213,10 @@ mod update_asset;
 #[path = "all/update_asset_model.rs"]
 mod update_asset_model;
 
+// Declared at the very END of this file, after the sorted list, rather than in
+// either of the two stretches above: both are where every concurrent iotsitewise
+// change inserts a declaration of its own, and each insertion there collided with
+// this one. Fold it into the sorted list once the churn settles.
+#[path = "all/application_lifecycle.rs"]
+mod application_lifecycle;
+

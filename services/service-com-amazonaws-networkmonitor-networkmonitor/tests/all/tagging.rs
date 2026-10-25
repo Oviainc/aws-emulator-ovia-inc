@@ -9,8 +9,10 @@
 //! `UntagResource`'s cases; this suite reuses that harness rather than building
 //! a second one, and asserts what the other read paths report:
 //!
-//! * `TagResource` answers 200 with the modelled EMPTY output (`TagResourceOutput`
-//!   declares no members), not a payload and not the scaffold's 501;
+//! * `TagResource` answers the no-content status with the modelled EMPTY output
+//!   (`TagResourceOutput` declares no members), not a payload and not the
+//!   scaffold's 501 — the status rule itself is pinned in
+//!   `tag_mutation_no_content.rs`;
 //! * `GetMonitor`'s `tags`, its `probes[].tags` and `ListMonitors`' summary
 //!   `tags` are all views of the SAME stored map, so a write through one ARN is
 //!   reported identically by each of them;
@@ -20,7 +22,9 @@
 use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::resource_tags::{call, fixture, get_monitor, only_probe, router, tag_resource};
+use crate::resource_tags::{
+    call, fixture, get_monitor, only_probe, router, tag_resource, TAG_MUTATION_STATUS,
+};
 
 async fn list_monitors(router: &MultiServiceRouter) -> (u16, Value) {
     call(router, "GET", "/monitors", None).await
@@ -77,8 +81,8 @@ async fn a_tag_write_is_reported_by_every_read_path_of_the_resource_it_named() {
     for (case, resource_arn, written) in writes {
         let (status, body) = tag_resource(&router, resource_arn, &written).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected TagResource 200, got {status} {body:?}"
+            status, TAG_MUTATION_STATUS,
+            "case {case:?}: expected TagResource {TAG_MUTATION_STATUS}, got {status} {body:?}"
         );
         // `TagResourceOutput` declares no members, so the answer carries no
         // payload members — an empty body or an empty object, never a 501.

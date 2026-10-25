@@ -24,9 +24,9 @@
 //! a new file under `src/ops/` would be picked up by `build.rs` as an operation.
 
 use crate::ops::types::{
-    Action, ActionHistory, ActionHistoryDetails, Budget, CalculatedSpend, CostTypes, Definition,
-    HealthStatus, Notification, NotificationWithSubscribers, ResourceTag, Spend, Subscriber,
-    TimePeriod,
+    Action, ActionHistory, ActionHistoryDetails, Budget, BudgetedAndActualAmounts, CalculatedSpend,
+    CostTypes, Definition, HealthStatus, Notification, NotificationWithSubscribers, ResourceTag,
+    Spend, Subscriber, TimePeriod,
 };
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -1455,6 +1455,11 @@ pub fn time_period_ordered(period: &TimePeriod) -> bool {
 /// by: "The period of time that's covered ... has a start date and an end date"
 /// (`TimePeriod`). A bound the caller left out does not restrict that side, and the
 /// bounds themselves are covered by the period they delimit.
+///
+/// This is the rule for ONE INSTANT — a record stamped with a timestamp. A read that
+/// filters whole periods rather than instants uses [`period_overlaps`], which treats a
+/// period as half-open so consecutive periods do not each claim the boundary between
+/// them.
 pub fn within_time_period(at: &::aws_smithy_types::DateTime, period: &TimePeriod) -> bool {
     let at = instant(at);
     period
@@ -1462,6 +1467,164 @@ pub fn within_time_period(at: &::aws_smithy_types::DateTime, period: &TimePeriod
         .as_ref()
         .is_none_or(|start| instant(start) <= at)
         && period.end.as_ref().is_none_or(|end| at <= instant(end))
+}
+
+/// Whether `period` and `window` have any instant in common — the rule a read follows
+/// to decide whether a budget period belongs in the window it was asked about.
+///
+/// Both are treated as half-open, running from `Start` up to but not including `End`, so
+/// two periods that merely touch (one ending exactly where the next begins) do not
+/// overlap: that is what makes a series of consecutive budget periods a partition of the
+/// time it covers rather than a set of periods that each share a boundary instant with
+/// the next. A bound either side leaves out does not restrict that side (`TimePeriod`:
+/// "There are no restrictions on the end date").
+pub fn period_overlaps(period: &TimePeriod, window: &TimePeriod) -> bool {
+    let strictly_before = |left: &Option<::aws_smithy_types::DateTime>,
+                           right: &Option<::aws_smithy_types::DateTime>| {
+        match (left, right) {
+            (Some(left), Some(right)) => instant(left) < instant(right),
+            _ => true,
+        }
+    };
+    strictly_before(&period.start, &window.end) && strictly_before(&window.start, &period.end)
+}
+
+/// `TimeUnit$ANNUALLY` — the one time unit that has no performance history: "Describes
+/// the history for DAILY, MONTHLY, and QUARTERLY budgets. Budget history isn't available
+/// for ANNUAL budgets" (`DescribeBudgetPerformanceHistory`).
+pub const TIME_UNIT_ANNUALLY: &str = "ANNUALLY";
+
+/// `TimeUnit$CUSTOM` — the time unit that names no repeating period: such a budget covers
+/// the one `TimePeriod` its caller chose, so that period is its whole history.
+pub const TIME_UNIT_CUSTOM: &str = "CUSTOM";
+
+/// How many periods of each `TimeUnit` a budget's performance history retains, from the
+/// documentation of the history itself: "For DAILY budgets, the history saves the state
+/// of the budget for the last 60 days. For MONTHLY budgets, the history saves the state
+/// of the budget for the current month plus the last 12 months. For QUARTERLY budgets,
+/// the history saves the state of the budget for the last four quarters"
+/// (`DescribeBudgetPerformanceHistoryResponse$BudgetPerformanceHistory`).
+///
+/// Each count includes the period IN PROGRESS, which is the period those sentences count
+/// from — "the current month plus the last 12 months" is thirteen entries.
+const RETAINED_PERIODS: [(&str, i64); 3] = [("DAILY", 60), ("MONTHLY", 13), ("QUARTERLY", 4)];
+
+/// Seconds in a UTC day — the length of every `DAILY` period on the calendar the
+/// runtime's own `DateTime` implements, so stepping whole days from a midnight boundary
+/// lands on a midnight boundary with no date arithmetic written here.
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+
+/// Months in a year, and in a calendar quarter: the two step lengths the `MONTHLY` and
+/// `QUARTERLY` boundaries are counted in.
+const MONTHS_PER_YEAR: i64 = 12;
+const MONTHS_PER_QUARTER: i64 = 3;
+
+/// The midnight-UTC first of the month `months` whole months from `from`, which is itself
+/// the first of a month.
+///
+/// A month is not a fixed number of seconds, so the shift is counted on the civil
+/// calendar — year and month read off the runtime's own rendering of `from` — and the
+/// shifted boundary is turned back into an instant by the runtime's own parser.
+///
+/// `None` when that boundary is no date the calendar renders.
+fn month_start_shifted(
+    from: ::aws_smithy_types::DateTime,
+    months: i64,
+) -> Option<::aws_smithy_types::DateTime> {
+    let (year, month, _) = civil_date(instant_at(from.secs())?)?;
+    let total = year
+        .checked_mul(MONTHS_PER_YEAR)?
+        .checked_add(i64::from(month).checked_sub(1)?)?
+        .checked_add(months)?;
+    let year = total.div_euclid(MONTHS_PER_YEAR);
+    let month = total.rem_euclid(MONTHS_PER_YEAR) + 1;
+    if year < 0 {
+        return None;
+    }
+    midnight_at(&format!("{year:04}-{month:02}-01T00:00:00Z"))
+}
+
+/// The start of the period of `time_unit` that lies `shift` periods from the period
+/// containing `now`: `0` is that period, `-1` the period before it, `1` the one after.
+///
+/// `None` for a `time_unit` that names no repeating period, and for a boundary the
+/// calendar does not render.
+fn period_start_shifted(
+    time_unit: &str,
+    now: SystemTime,
+    shift: i64,
+) -> Option<::aws_smithy_types::DateTime> {
+    let current = default_time_period_start(time_unit, now);
+    match time_unit {
+        "DAILY" => {
+            let secs = current
+                .secs()
+                .checked_add(shift.checked_mul(SECONDS_PER_DAY)?)?;
+            Some(::aws_smithy_types::DateTime::from_secs(secs))
+        }
+        "MONTHLY" => month_start_shifted(current, shift),
+        "QUARTERLY" => month_start_shifted(current, shift.checked_mul(MONTHS_PER_QUARTER)?),
+        _ => None,
+    }
+}
+
+/// The periods of `time_unit` a budget's performance history retains as of `now`, OLDEST
+/// FIRST and ending with the period in progress — the window [`RETAINED_PERIODS`] states
+/// for that unit. Each period runs from its own midnight-UTC boundary up to the boundary
+/// of the period after it, so consecutive entries abut without overlapping.
+///
+/// EMPTY for a time unit with no repeating period ([`TIME_UNIT_ANNUALLY`],
+/// [`TIME_UNIT_CUSTOM`]) or one this emulator does not know: there is no series to count
+/// back over.
+pub fn retained_periods(time_unit: &str, now: SystemTime) -> Vec<TimePeriod> {
+    let Some((_, count)) = RETAINED_PERIODS.iter().find(|(unit, _)| *unit == time_unit) else {
+        return Vec::new();
+    };
+    (0..*count)
+        .rev()
+        .filter_map(|back| {
+            Some(TimePeriod {
+                start: Some(period_start_shifted(time_unit, now, -back)?),
+                end: Some(period_start_shifted(time_unit, now, 1 - back)?),
+            })
+        })
+        .collect()
+}
+
+/// The budgeted and actual amounts `stored` reports for one `period` it covers — "the
+/// amount of cost or usage that you created the budget for, compared to your actual costs
+/// or usage" (`BudgetedAndActualAmounts`).
+///
+/// Both figures are the ones a read of the budget reports AS OF that period
+/// ([`project_budget`]), so a performance history cannot disagree with `DescribeBudget`:
+///
+/// * `BudgetedAmount` is "the amount of cost or usage that you created the budget for" —
+///   the limit in force while the period ran, which for a `PlannedBudgetLimits` budget is
+///   the planned entry that period started under ([`planned_limit_in_force`]) and for
+///   every other budget is its one `BudgetLimit`.
+/// * `ActualAmount` is "your actual costs or usage for a budget period": the cost or usage
+///   this emulator has attributed to the budget ([`ATTRIBUTED_SPEND_AMOUNT`]), measured in
+///   the unit that limit names.
+///
+/// Neither is reported for a budget whose read reports no limit at all (the auto-adjusting
+/// budget of [`calculated_spend`]): nothing in such a record names a unit of measurement,
+/// and `Spend$Unit` is `@required`.
+pub fn amounts_in_period(stored: &StoredBudget, period: &TimePeriod) -> BudgetedAndActualAmounts {
+    let projected = period
+        .start
+        .as_ref()
+        .and_then(|start| instant_at(start.secs()))
+        .map(|at| project_budget(stored, at));
+    BudgetedAndActualAmounts {
+        budgeted_amount: projected
+            .as_ref()
+            .and_then(|budget| budget.budget_limit.clone()),
+        actual_amount: projected
+            .as_ref()
+            .and_then(|budget| budget.calculated_spend.as_ref())
+            .map(|spend| spend.actual_spend.clone()),
+        time_period: Some(period.clone()),
+    }
 }
 
 /// `EventType$CREATE_ACTION` — the event a `CreateBudgetAction` call records.

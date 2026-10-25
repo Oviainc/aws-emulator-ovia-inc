@@ -622,7 +622,8 @@ async fn max_records_is_bounded_and_the_marker_resumes_the_report() {
     let router = emulator();
 
     // "Constraints: Minimum 20, maximum 100" — each published bound, and one step past
-    // each.
+    // each. A value outside the window is one the parameter does not accept, so it is
+    // refused with `InvalidParameterValue`.
     for (case, value, expected) in [
         ("one below the published minimum", "19", 400),
         ("the published minimum", "20", 200),
@@ -633,7 +634,7 @@ async fn max_records_is_bounded_and_the_marker_resumes_the_report() {
         if expected == 200 {
             expect_ok(case, response);
         } else {
-            expect_error(case, response, 400, "ValidationException");
+            expect_error(case, response, 400, "InvalidParameterValue");
         }
     }
 

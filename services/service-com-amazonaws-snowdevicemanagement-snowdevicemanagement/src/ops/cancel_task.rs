@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelTask
-//! Moves the stored task `taskId` names to `CANCELED`, bumps its `lastUpdatedAt` and
-//! cancels every execution of it that has not reached a terminal state yet, so a
-//! following `DescribeTask` / `ListExecutions` observes the change. A `taskId` naming no
-//! task is answered with the modelled `ResourceNotFoundException`.
+//! Stops the work of the stored task `taskId` names that no device has started yet:
+//! every execution of it still `QUEUED` becomes `CANCELED`, and the task moves to
+//! `CANCELED` with a bumped `lastUpdatedAt` only when the call had such an execution to
+//! stop. An execution a device has already begun stays `IN_PROGRESS` and still runs to
+//! its own outcome, so a following `DescribeTask` / `ListExecutions` /
+//! `DescribeExecution` observes exactly that. A `taskId` naming no task is answered with
+//! the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -181,23 +184,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A task that already finished or was already cancelled has nothing left
         // to stop; its record keeps the state and the instant it reached it.
-        let cancellable = task.state == "IN_PROGRESS";
-        if cancellable {
-            // The writes stay in the partition the lookup above resolved: both
-            // reach their records through the Region-scoped accessors, so a
-            // request can only ever change what its own Region holds.
-            if let Some(task) = store.task_in_mut(&region, &input.task_id) {
-                task.state = "CANCELED".to_string();
-                task.last_updated_at = now;
-            }
+        let task_running = task.state == "IN_PROGRESS";
+
+        // Only the executions no device has started yet can be stopped: a cancel
+        // that lands after the command was dispatched is too late for that
+        // execution, which keeps running and reports its own outcome.
+        //
+        // The writes stay in the partition the lookup above resolved: both reach
+        // their records through the Region-scoped accessors, so a request can only
+        // ever change what its own Region holds.
+        let mut cancelled_any = false;
+        if task_running {
             for execution in store.executions_in_mut(&region, &input.task_id) {
-                if execution.is_terminal() {
+                if !execution.is_cancellable() {
                     continue;
                 }
                 execution.state = "CANCELED".to_string();
                 execution.last_updated_at = now;
                 // The clock owes a cancelled execution nothing more.
                 execution.due = None;
+                cancelled_any = true;
+            }
+        }
+
+        // The task reports CANCELED only when this call actually cancelled work;
+        // a task whose every execution was already running or finished keeps the
+        // state its executions carry it to.
+        if cancelled_any {
+            if let Some(task) = store.task_in_mut(&region, &input.task_id) {
+                task.state = "CANCELED".to_string();
+                task.last_updated_at = now;
             }
         }
 

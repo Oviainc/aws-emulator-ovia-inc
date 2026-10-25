@@ -5,10 +5,15 @@
 //!
 //! A cost estimate prices the resources the collection THIS request submits selects,
 //! which is why the operation takes its own `CostEstimationResourceCollectionFilter`
-//! instead of reading the analysis coverage `UpdateResourceCollection` maintains: the
-//! estimate exists so a customer can price analysis of resources BEFORE enabling
-//! analysis for them, so a collection outside the account's coverage is estimated
-//! exactly like one inside it. The estimate is created asynchronously — it
+//! instead of reporting the price of the analysis coverage `UpdateResourceCollection`
+//! maintains. What a scope entry selects, though, is RESOURCES: an entry selecting
+//! none of the resources the account holds names nothing to price, which is the
+//! `ResourceNotFoundException` below, answered before anything is stored. This
+//! emulator performs none of AWS's own per-service resource discovery, so the
+//! resources it knows an account holds are the ones its own state records — the
+//! entries `ListMonitoredResources` reports
+//! ([`crate::state::ResourceCoverage::monitored_resources`]) — and a scope is
+//! resolved against those. The estimate is created asynchronously — it
 //! is due [`crate::state::COST_ESTIMATION_DURATION`] after this call, and
 //! `GetCostEstimation` reports `ONGOING` until then — so a second start while one is
 //! still running is a `ConflictException`, except for a retry under the same
@@ -213,18 +218,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
 
+        // IDEMPOTENT REPLAY, FIRST. `ClientToken` is an `@idempotencyToken`: a retry of
+        // a request that was already accepted is answered from the estimation that
+        // token already started, so it is decided before the scope is resolved below —
+        // the request the token names was accepted when the account's resources were
+        // what they were then, and a retry of it must answer the same thing rather than
+        // changing its answer because the account has taken on or given up resources
+        // since. It starts nothing and writes nothing.
+        if guard.cost_estimation.as_ref().is_some_and(|existing| {
+            existing.has_token(input.client_token.as_deref())
+                && existing.covers_same_collection(stack_names.as_ref(), tags.as_ref())
+        }) {
+            return Ok(StartCostEstimationOutput::default());
+        }
+
+        // RESOLUTION. A cost estimate is of the cost to analyse RESOURCES, so every
+        // entry of the submitted collection has to select at least one resource this
+        // account holds: one that selects none names nothing to price, and is refused
+        // with the modelled `ResourceNotFoundException` naming the resource that was
+        // not found. Decided before the account's estimation is written, so a refused
+        // scope leaves no record a later `GetCostEstimation` could report.
+        let coverage = &guard.resource_collection;
+        if let Some(stack_name) = stack_names
+            .iter()
+            .flatten()
+            .find(|stack_name| !coverage.selects_stack(stack_name))
+        {
+            return Err(unknown_resource(
+                UNRESOLVED_STACK_NOUN,
+                crate::state::MONITORED_STACK_RESOURCE_TYPE,
+                stack_name.clone(),
+            ));
+        }
+        if let Some((app_boundary_key, tag_values)) = tags.iter().flatten().find(
+            |(app_boundary_key, tag_values)| !coverage.selects_tagged(app_boundary_key, tag_values),
+        ) {
+            return Err(unknown_resource(
+                UNRESOLVED_TAG_NOUN,
+                crate::state::MONITORED_TAG_RESOURCE_TYPE,
+                named_tag_pairs(app_boundary_key, tag_values),
+            ));
+        }
+
         if let Some(existing) = guard.cost_estimation.as_ref() {
             // Only an estimation that is still being created holds the account: a
             // finished one is replaced by a new start.
             let ongoing = existing.status(now) == crate::state::COST_ESTIMATION_STATUS_ONGOING;
             if existing.has_token(input.client_token.as_deref()) {
-                // `ClientToken` is an `@idempotencyToken`: a retry of the same request
-                // names the estimation that token already started, so it is answered
-                // from that estimation rather than starting a second one or restarting
-                // a finished one.
-                if existing.covers_same_collection(stack_names.as_ref(), tags.as_ref()) {
-                    return Ok(StartCostEstimationOutput::default());
-                }
                 // The same token with a DIFFERENT collection is two requests sharing
                 // one token, which is the conflict the token exists to detect — while
                 // the estimation it started is still running. Once that estimation has
@@ -246,14 +286,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // What the estimate prices: the resource boundaries the SUBMITTED collection
-        // names — never the account's analysis coverage, which this operation does not
-        // read. The estimate is the price of analysing what the collection selects,
-        // whether or not analysis has been enabled for it, so a pre-onboarding start
-        // (`StartCostEstimation` → `GetCostEstimation` → `UpdateResourceCollection`)
-        // prices the same collection an onboarded one does. This emulator performs
-        // none of AWS's own per-service resource discovery, so the countable unit is
-        // the boundary entry the request names: one CloudFormation stack, one
-        // app-boundary tag value.
+        // names, every entry of which the resolution above has found a resource for —
+        // not a rewrite of them into the account's whole coverage, which may hold
+        // resources this collection never named. This emulator performs none of AWS's
+        // own per-service resource discovery, so the countable unit is the boundary
+        // entry the request names: one CloudFormation stack, one app-boundary tag
+        // value — the sizes `CostEstimationStackNames` and `CostEstimationTagValues`
+        // are both fixed at one item by the model.
         let mut costs: Vec<crate::state::ResourceCostRecord> = Vec::new();
 
         if let Some(count) = stack_names
@@ -289,11 +328,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-// `ResourceNotFoundException` (HTTP 404) stays modelled for this operation but is
-// never answered here: AWS reserves it for a collection whose named resources do not
-// exist at all, and this emulator holds no cross-service resource inventory to decide
-// that. It is NOT the answer to a collection outside the account's analysis coverage,
-// which this operation does not consult.
+/// What the refusal below calls the half of the collection whose tag entry selected no
+/// resource.
+const UNRESOLVED_TAG_NOUN: &str = "tag";
+
+/// The same for the half whose CloudFormation entry selected none.
+const UNRESOLVED_STACK_NOUN: &str = "stack name";
+
+/// A `ResourceNotFoundException` (HTTP 404) refusing a scope entry that selects no
+/// resource this account holds.
+///
+/// The message says WHICH part of the request could not be resolved — the `noun` for
+/// the half the entry belongs to — and the modelled members carry the resource that
+/// was not found: `resource_id` is the value the entry named it by, `resource_type` the
+/// type of resource that value names ([`crate::state::MONITORED_STACK_RESOURCE_TYPE`]
+/// or [`crate::state::MONITORED_TAG_RESOURCE_TYPE`], the same types a cost line and
+/// `ListMonitoredResources` report).
+fn unknown_resource(
+    noun: &str,
+    resource_type: &str,
+    resource_id: String,
+) -> StartCostEstimationError {
+    StartCostEstimationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("Invalid {noun} in the request"),
+        resource_id,
+        resource_type: resource_type.to_string(),
+    })
+    .into()
+}
+
+/// The key/value pairs a tag scope entry names, as the model's own documentation
+/// spells a tag pair (`Devops-Guru-production-application/RDS`).
+///
+/// `CostEstimationTagValues` is fixed at one item by the model, so an entry carries
+/// exactly one pair by the time a request reaches this handler; an entry carrying no
+/// value, which the boundary validator refuses before that, is named by its key alone
+/// rather than by an empty id.
+fn named_tag_pairs(app_boundary_key: &str, tag_values: &[String]) -> String {
+    if tag_values.is_empty() {
+        return app_boundary_key.to_string();
+    }
+    tag_values
+        .iter()
+        .map(|tag_value| format!("{app_boundary_key}/{tag_value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// A `ValidationException` (HTTP 400) refusing a resource collection no estimate can
 /// be made for, naming the member and the rule it broke.

@@ -7,9 +7,9 @@
 //! `ValidationException` (HTTP 400) BEFORE any product or agreement is resolved,
 //! however well-formed the value is and whatever else the request carries — so a
 //! wrong catalog is a permanent 400-class input error and nothing is written for
-//! it, while a product and an agreement inside a catalog this service serves are
-//! written against whether or not anything recorded them first (the
-//! `put_deployment_parameter_target` suite owns that rule).
+//! it, and it never becomes the 404 an unresolved product or agreement inside a
+//! catalog this service DOES serve gets (the `put_deployment_parameter_target`
+//! suite owns that rule).
 //!
 //! Where the set comes from: `PutDeploymentParameterRequest$catalog` is documented
 //! as "The catalog related to the request. Fixed value: `AWSMarketplace`"

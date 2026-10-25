@@ -907,9 +907,9 @@ async fn a_declaration_fis_refuses_fails_the_stack() {
     let body = create_and_settle(&router, case, stack_name, &template, &[]).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
-        Some("CREATE_FAILED"),
-        "case {case:?}: expected the stack to fail rather than publish an id FIS never \
-         minted, got {body}"
+        Some("ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the failed create to be rolled back rather than publish \
+         an id FIS never minted, got {body}"
     );
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
     assert!(

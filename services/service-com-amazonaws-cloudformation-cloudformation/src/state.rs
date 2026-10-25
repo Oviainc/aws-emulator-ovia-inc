@@ -14,6 +14,18 @@
 //! days after the stack has been deleted"), so the single `stacks` vector carries
 //! live and deleted stacks alike and `StoredStack::is_live` is what separates them.
 //!
+//! ## One namespace per Region
+//!
+//! A stack belongs to the Region the call that created it was signed for
+//! (`StoredStack::region`), and the store is read THROUGH that Region: a stack name is
+//! "unique in the Region in which you are creating the stack", so the same name in a second
+//! Region is a second stack and both coexist, while a read signed for one Region resolves
+//! nothing another Region holds. Everything that resolves a stack goes through
+//! [`ComAmazonawsCloudformationCloudformationState::resolve`] /
+//! [`ComAmazonawsCloudformationCloudformationState::live_stacks`] /
+//! [`ComAmazonawsCloudformationCloudformationState::stacks_in`], which all take that Region,
+//! so no operation can read across it by accident.
+//!
 //! Beside the stacks it holds every CHANGE SET, which is a persisted plan for one stack:
 //! `CreateChangeSet` writes the template and configuration it would apply plus the
 //! resource-level change list it computed, `DescribeChangeSet` / `GetTemplate` read them
@@ -25,8 +37,9 @@
 //! ## Bounds
 //!
 //! Every growth site in this store is bounded, because a caller chooses both how many
-//! records it writes and how big each one is: [`MAX_STACKS`] live stacks (past which
-//! `CreateStack` answers the modelled `LimitExceededException`),
+//! records it writes and how big each one is: [`MAX_STACKS`] live stacks per Region and
+//! [`MAX_LIVE_STACKS`] across every Region (past either `CreateStack` answers the modelled
+//! `LimitExceededException`),
 //! [`MAX_DELETED_STACKS_RETAINED`] completed deletions (the oldest deletion is reclaimed
 //! past that, which is this emulator's stand-in for CloudFormation's 90-day retention of
 //! deleted-stack summaries), [`MAX_EVENTS_PER_STACK`] events per stack (oldest-first),
@@ -234,6 +247,24 @@ pub const DEPLOYMENT_MODE_STANDARD: &str = "STANDARD";
 /// log per live stack.
 pub const MAX_STACKS: usize = 2_000;
 
+/// The most LIVE stacks this store holds across EVERY Region together.
+///
+/// [`MAX_STACKS`] is the documented quota, and it is metered per Region — and the Region a
+/// request is served in comes from its own credential scope, so the Region is a value the
+/// CALLER chooses. A per-Region quota alone would therefore bound only one factor of the
+/// store's growth: a caller signing for one Region string after another could keep creating
+/// stacks indefinitely. This is the ceiling on the PRODUCT, past which `CreateStack` answers
+/// the same modelled `LimitExceededException`.
+///
+/// It is deliberately a FLAT count that does not mention the Region: whatever a caller signs
+/// for, and however many distinct Region strings it invents, this store holds at most this
+/// many live stacks — one record, one bounded template body
+/// ([`TEMPLATE_BODY_MAX_BYTES`]) and one bounded event log ([`MAX_EVENTS_PER_STACK`])
+/// each — so the Region cannot multiply anything. Chosen, like every count here: a small
+/// multiple of the per-Region quota, so no single Region's documented quota is cut short, and
+/// far above any client workflow.
+pub const MAX_LIVE_STACKS: usize = 5 * MAX_STACKS;
+
 /// The most stacks in `DELETE_COMPLETE` this emulator keeps.
 ///
 /// CloudFormation keeps a deleted stack's summary, template and events addressable by
@@ -330,6 +361,16 @@ pub mod status {
     pub const DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
     pub const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
     pub const DELETE_FAILED: &str = "DELETE_FAILED";
+    /// The status a stack takes while the resources of a create that FAILED are being
+    /// removed again, which is what CloudFormation does unless the request asked it not to
+    /// (`CreateStackInput$OnFailure`: "ROLLBACK — Roll back the stack creation. This is the
+    /// default").
+    pub const ROLLBACK_IN_PROGRESS: &str = "ROLLBACK_IN_PROGRESS";
+    /// The terminal status of a create that was rolled back.
+    pub const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
+    /// The terminal status of a rollback that could not remove what the failed create had
+    /// already made.
+    pub const ROLLBACK_FAILED: &str = "ROLLBACK_FAILED";
     /// The status of a stack a `CREATE` change set brought into existence and nothing has
     /// executed yet (`CreateChangeSetInput$ChangeSetType`: "If you create a change set for
     /// a new stack, CloudFormation creates a stack with a unique stack ID, but no template
@@ -1054,6 +1095,13 @@ impl StoredStack {
             }
             self.outputs.clear();
             self.pending_deployment = None;
+        } else if self.status == status::ROLLBACK_COMPLETE {
+            // The create was ROLLED BACK: the template it was deploying never came into
+            // force, and the resources it had made were removed again, so nothing is
+            // installed and no output resolves — the stack reports what it really has,
+            // which is nothing.
+            self.pending_deployment = None;
+            self.outputs.clear();
         } else if let Some(deployed) = self.pending_deployment.take() {
             // The create or update completed: the template it deployed is what the stack
             // reports resources and outputs for from here on.
@@ -1206,6 +1254,49 @@ impl StoredStack {
             pending.as_ref().and_then(|p| p.operation_id.clone()),
             pending.and_then(|p| p.client_request_token),
         );
+    }
+
+    /// Open the ROLLBACK a failed create owes: the stack moves to `ROLLBACK_IN_PROGRESS`
+    /// carrying the reason the create failed, and `ROLLBACK_COMPLETE` becomes due one
+    /// [`STATUS_TRANSITION_DELAY`] later.
+    ///
+    /// "ROLLBACK — Roll back the stack creation. This is the default"
+    /// (`CreateStackInput$OnFailure`), so a create whose resources an owning service
+    /// refused does not stop at `CREATE_FAILED`: CloudFormation removes what the create
+    /// had made and the stack reports the rolled-back status. A request that asked for the
+    /// failed state to be kept (`DisableRollback`, `OnFailure=DO_NOTHING`) never reaches
+    /// here — the caller said what it wanted left behind.
+    ///
+    /// Called AFTER [`Self::fail_transition`] recorded the create's own failure, so the
+    /// event log carries the failure and then the rollback, in that order. The operation
+    /// this rollback belongs to is the create's, which is what the stack already reports as
+    /// its last operation, and REMOVING the resources is the caller's to drive
+    /// ([`provisioning::delete`]) before the terminal status falls due.
+    pub fn begin_rollback(&mut self, now: SystemTime, reason: String) {
+        self.status = status::ROLLBACK_IN_PROGRESS.to_string();
+        self.status_reason = Some(reason.clone());
+        let operation_id = self
+            .last_operation
+            .as_ref()
+            .map(|operation| operation.operation_id.clone());
+        let client_request_token = self.client_request_token.clone();
+        self.record_event(
+            now,
+            status::ROLLBACK_IN_PROGRESS,
+            Some(reason.clone()),
+            operation_id.clone(),
+            client_request_token.clone(),
+        );
+        self.pending = Some(PendingStatus {
+            // The rolled-back stack keeps the reason its create failed for: that is what
+            // the stack is in this status for, and a client reading it afterwards has
+            // nothing else to go on.
+            status: status::ROLLBACK_COMPLETE.to_string(),
+            status_reason: Some(reason),
+            due_at: now + STATUS_TRANSITION_DELAY,
+            operation_id,
+            client_request_token,
+        });
     }
 }
 
@@ -1689,27 +1780,34 @@ impl ComAmazonawsCloudformationCloudformationState {
     /// Resolve the `ChangeSetName` input member, which CloudFormation accepts as either a
     /// change set name or its ARN: an ARN names the change set on its own, while a name is
     /// resolved among the change sets of the stack the request names.
+    ///
+    /// Scoped to the Region the request was signed for, like the stacks the change sets
+    /// belong to ([`Self::resolve`]): a change set of another Region's stack names nothing
+    /// here.
     pub fn resolve_change_set(
         &self,
+        region: &str,
         name_or_id: &str,
         stack_name_or_id: Option<&str>,
     ) -> Option<&StoredChangeSet> {
-        self.change_set_position(name_or_id, stack_name_or_id)
+        self.change_set_position(region, name_or_id, stack_name_or_id)
             .map(|index| &self.change_sets[index])
     }
 
     /// [`Self::resolve_change_set`], for a caller that mutates the change set it resolved.
     pub fn resolve_change_set_mut(
         &mut self,
+        region: &str,
         name_or_id: &str,
         stack_name_or_id: Option<&str>,
     ) -> Option<&mut StoredChangeSet> {
-        self.change_set_position(name_or_id, stack_name_or_id)
+        self.change_set_position(region, name_or_id, stack_name_or_id)
             .map(|index| &mut self.change_sets[index])
     }
 
     fn change_set_position(
         &self,
+        region: &str,
         name_or_id: &str,
         stack_name_or_id: Option<&str>,
     ) -> Option<usize> {
@@ -1721,6 +1819,9 @@ impl ComAmazonawsCloudformationCloudformationState {
             .position(|change_set| change_set.change_set_id == name_or_id)
         {
             let change_set = &self.change_sets[index];
+            // The change set is this Region's only where the stack it plans changes for
+            // is.
+            self.resolve(region, &change_set.stack_id)?;
             let stack_matches = stack_name_or_id.is_none_or(|stack| {
                 stack == change_set.stack_id || stack == change_set.stack_name
             });
@@ -1729,7 +1830,7 @@ impl ComAmazonawsCloudformationCloudformationState {
         // A bare name is resolved within one stack ("If you specify the name of a change
         // set, you must also specify the stack name").
         let stack_name_or_id = stack_name_or_id?;
-        let stack_id = self.resolve(stack_name_or_id)?.stack_id.clone();
+        let stack_id = self.resolve(region, stack_name_or_id)?.stack_id.clone();
         self.change_sets.iter().position(|change_set| {
             change_set.stack_id == stack_id && change_set.change_set_name == name_or_id
         })
@@ -1773,20 +1874,44 @@ impl ComAmazonawsCloudformationCloudformationState {
     /// Resolve the `StackName` input member, which CloudFormation accepts as either a
     /// stack name or a stack id: a stack id matches any stack, live or deleted, while a
     /// name matches only a live one.
-    pub fn resolve(&self, name_or_id: &str) -> Option<&StoredStack> {
-        self.position_of(name_or_id).map(|i| &self.stacks[i])
+    ///
+    /// `region` is the Region the request was signed for, and nothing OUTSIDE it is
+    /// resolved: a stack lives "in the Region in which you are creating the stack", so the
+    /// same name in another Region is another stack, and a stack id — which carries its own
+    /// Region — names no stack HERE when that Region is not this one.
+    pub fn resolve(&self, region: &str, name_or_id: &str) -> Option<&StoredStack> {
+        self.position_of(region, name_or_id).map(|i| &self.stacks[i])
     }
 
     /// [`Self::resolve`], for a caller that mutates the stack it resolved.
-    pub fn resolve_mut(&mut self, name_or_id: &str) -> Option<&mut StoredStack> {
-        self.position_of(name_or_id).map(|i| &mut self.stacks[i])
+    pub fn resolve_mut(&mut self, region: &str, name_or_id: &str) -> Option<&mut StoredStack> {
+        self.position_of(region, name_or_id)
+            .map(|i| &mut self.stacks[i])
     }
 
-    /// The live stacks, in creation order: what `DescribeStacks` reports when no
-    /// `StackName` is given ("Deleted stacks don't show up in DescribeStacks if the
-    /// deletion has been completed successfully").
-    pub fn live_stacks(&self) -> impl Iterator<Item = &StoredStack> {
-        self.stacks.iter().filter(|stack| stack.is_live())
+    /// The live stacks of one Region, in creation order: what `DescribeStacks` reports when
+    /// no `StackName` is given ("Deleted stacks don't show up in DescribeStacks if the
+    /// deletion has been completed successfully"), and the set a stack NAME has to be
+    /// unique within.
+    pub fn live_stacks<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a StoredStack> {
+        self.stacks
+            .iter()
+            .filter(move |stack| stack.is_live() && stack.region == region)
+    }
+
+    /// Every stack of one Region, live or deleted, in creation order: the set a read that
+    /// reports deleted stacks too (`ListStacks`) answers from.
+    pub fn stacks_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a StoredStack> {
+        self.stacks
+            .iter()
+            .filter(move |stack| stack.region == region)
+    }
+
+    /// How many live stacks this store holds across every Region: what
+    /// [`MAX_LIVE_STACKS`] bounds, since the per-Region quota is metered on a Region the
+    /// caller chooses.
+    pub fn live_stack_count(&self) -> usize {
+        self.stacks.iter().filter(|stack| stack.is_live()).count()
     }
 
     /// The stack a resource with this physical id belongs to, which is what
@@ -1794,23 +1919,30 @@ impl ComAmazonawsCloudformationCloudformationState {
     /// the EC2 InstanceId to DescribeStackResources to find which stack the instance
     /// belongs to and what other resources are part of the stack").
     ///
-    /// Searched over every stack, live or deleted, in creation order: a deleted stack's
-    /// resources stay addressable for as long as the stack does. The first stack carrying
-    /// the id wins, and this emulator derives a generated physical id from the stack id, so
-    /// two stacks collide only where their templates NAME the same resource.
-    pub fn stack_of_physical_resource(&self, physical_resource_id: &str) -> Option<&StoredStack> {
+    /// Searched over every stack of the request's Region, live or deleted, in creation
+    /// order: a deleted stack's resources stay addressable for as long as the stack does.
+    /// The first stack carrying the id wins, and this emulator derives a generated physical
+    /// id from the stack id, so two stacks collide only where their templates NAME the same
+    /// resource.
+    pub fn stack_of_physical_resource(
+        &self,
+        region: &str,
+        physical_resource_id: &str,
+    ) -> Option<&StoredStack> {
         if physical_resource_id.is_empty() {
             // A resource that was never created carries no physical id, so nothing is
             // addressable by one: the empty string must not resolve to the first stack
             // holding such a resource.
             return None;
         }
-        self.stacks.iter().find(|stack| {
-            stack
-                .resources
-                .iter()
-                .any(|deployed| deployed.resource.physical_resource_id == physical_resource_id)
-        })
+        self.stacks
+            .iter()
+            .filter(|stack| stack.region == region)
+            .find(|stack| {
+                stack.resources.iter().any(|deployed| {
+                    deployed.resource.physical_resource_id == physical_resource_id
+                })
+            })
     }
 
     /// The registry record a `Type`-and-`TypeName` request names, in the Region the
@@ -1840,14 +1972,14 @@ impl ComAmazonawsCloudformationCloudformationState {
             .find(|extension| extension.region == region && extension.arn == arn)
     }
 
-    fn position_of(&self, name_or_id: &str) -> Option<usize> {
+    fn position_of(&self, region: &str, name_or_id: &str) -> Option<usize> {
         self.stacks
             .iter()
-            .position(|stack| stack.stack_id == name_or_id)
+            .position(|stack| stack.region == region && stack.stack_id == name_or_id)
             .or_else(|| {
-                self.stacks
-                    .iter()
-                    .position(|stack| stack.stack_name == name_or_id && stack.is_live())
+                self.stacks.iter().position(|stack| {
+                    stack.region == region && stack.stack_name == name_or_id && stack.is_live()
+                })
             })
     }
 }

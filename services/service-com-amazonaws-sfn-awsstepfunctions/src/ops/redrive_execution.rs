@@ -204,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Phase 1, under the lock: resolve the execution, refuse what cannot be
         // redriven, and read what the re-run needs. The lock is released before the
         // walk, so no other request waits on an interpretation.
-        let (definition, execution_input, previous_event_id, context) = {
+        let (definition, execution_input, previous_event_id, machine_arn, machine_name, context) = {
             let mut store = state.lock();
             // Settle first: an execution whose terminal status the clock already owed
             // is terminal when this call decides whether it can be redriven.
@@ -306,6 +306,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 definition,
                 execution.input.clone(),
                 execution.last_event_id(),
+                machine.arn.clone(),
+                machine.name.clone(),
                 context,
             )
         };
@@ -380,13 +382,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let task_bytes = waiting
             .as_ref()
             .map_or(0, crate::state::PlannedActivityTask::measure);
+        let map_runs = planned.map_runs;
+        let map_run_bytes = crate::state::planned_map_run_bytes(&map_runs);
         match store.redrive_execution(
             &input.execution_arn,
             now,
             input.client_token.as_deref(),
             planned.opening,
             planned.pending,
-            task_bytes,
+            task_bytes + map_run_bytes,
         ) {
             Ok(redrive_date) => {
                 // The re-run reached an activity task: it is queued for a worker to
@@ -394,6 +398,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if let Some(waiting) = waiting {
                     store.schedule_activity_task(&input.execution_arn, waiting);
                 }
+                // The re-run re-entered this execution's Distributed Map states, so
+                // each one's Map Run runs again: the record it already has moves,
+                // keeping the ARN a client may be holding.
+                store.record_map_runs(
+                    &input.execution_arn,
+                    &machine_arn,
+                    &machine_name,
+                    &crate::state::arn_region(&machine_arn),
+                    map_runs,
+                );
                 Ok(RedriveExecutionOutput {
                     redrive_date: crate::state::to_date_time(redrive_date),
                 })
