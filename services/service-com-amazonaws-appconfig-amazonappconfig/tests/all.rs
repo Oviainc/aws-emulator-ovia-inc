@@ -79,3 +79,5 @@ mod update_configuration_profile;
 mod update_deployment_strategy;
 #[path = "all/update_experiment_definition.rs"]
 mod update_experiment_definition;
+#[path = "all/update_extension.rs"]
+mod update_extension;

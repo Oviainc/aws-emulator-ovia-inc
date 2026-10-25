@@ -108,6 +108,10 @@ fn seed_frames(
             ImageFrame {
                 image_frame_id: frame_id.clone(),
                 transfer_syntax_uid: None,
+                // This suite is about the pixel data going with the deletion, which is
+                // reached by its image frame id alone, so no case records the instance
+                // it came from.
+                sop_instance_uid: None,
                 pixel_data: vec![(index as u8).wrapping_add(1); 8 * (index + 1)],
             },
         );

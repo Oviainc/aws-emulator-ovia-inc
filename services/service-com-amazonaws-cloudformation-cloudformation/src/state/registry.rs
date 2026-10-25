@@ -407,6 +407,20 @@ pub fn aws_published(region: &str, type_kind: &str, type_name: &str) -> Option<S
     Some(aws_published_record(region, type_name))
 }
 
+/// Every Amazon-Web-Services-published public extension the registry of this Region holds,
+/// in the order the catalogue carries them.
+///
+/// The same records [`aws_published`] answers one at a time, for a read that reports what
+/// the registry HOLDS rather than one extension a request named: both are built by
+/// [`aws_published_record`], so the listing and the single read cannot disagree about one
+/// of them.
+pub fn aws_published_all(region: &str) -> Vec<StoredExtension> {
+    crate::state::template::IMPLEMENTED_RESOURCE_TYPES
+        .iter()
+        .map(|type_name| aws_published_record(region, type_name))
+        .collect()
+}
+
 /// [`aws_published`], for a request that named the extension by ARN.
 ///
 /// A public extension's ARN carries no account id and spells its name with `-` separators,
