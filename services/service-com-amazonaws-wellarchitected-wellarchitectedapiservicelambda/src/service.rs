@@ -141,6 +141,7 @@ fn modelled_validation_table<Eng: Send + Sync + 'static>(
     );
     register::<crate::ops::get_answer::GetAnswer<Eng>>(&mut refusals);
     register::<crate::ops::get_consolidated_report::GetConsolidatedReport<Eng>>(&mut refusals);
+    register::<crate::ops::get_global_settings::GetGlobalSettings<Eng>>(&mut refusals);
     register::<crate::ops::get_lens::GetLens<Eng>>(&mut refusals);
     register::<crate::ops::get_lens_review::GetLensReview<Eng>>(&mut refusals);
     register::<crate::ops::get_lens_review_report::GetLensReviewReport<Eng>>(&mut refusals);

@@ -29,10 +29,14 @@ mod datastore_transition_conflict_sentence;
 mod datastore_update_not_active;
 #[path = "all/datastore_update_transition.rs"]
 mod datastore_update_transition;
+#[path = "all/delete_data_transformation_profile.rs"]
+mod delete_data_transformation_profile;
 #[path = "all/error_envelopes.rs"]
 mod error_envelopes;
 #[path = "all/fhir_datastore_lifecycle.rs"]
 mod fhir_datastore_lifecycle;
+#[path = "all/fhir_export_job_describe.rs"]
+mod fhir_export_job_describe;
 #[path = "all/fhir_export_job_listing.rs"]
 mod fhir_export_job_listing;
 #[path = "all/fhir_export_job_start.rs"]

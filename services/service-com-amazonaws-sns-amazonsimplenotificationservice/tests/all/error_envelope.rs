@@ -144,7 +144,7 @@ async fn every_awsquery_error_document_carries_a_request_id() {
         },
         ErrorCase {
             case: "an operation that is still scaffolded",
-            action: "ListSubscriptions",
+            action: "ListOriginationNumbers",
             params: vec![],
             status: 501,
             code: "NotImplemented",

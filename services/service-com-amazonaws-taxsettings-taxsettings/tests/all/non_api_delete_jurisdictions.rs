@@ -125,8 +125,10 @@ fn addressed(row: &Row) -> String {
 }
 
 /// A `TaxRegistrationEntry` of `registration_type` whose legal address is held in
-/// `country_code`. Only the members every entry needs are filled in: no country
-/// in these rows has a documented per-country requirement
+/// `country_code`. Only the members every entry needs are filled in, plus
+/// `stateOrRegion`, which the documented rule of one of these rows (a Brazilian
+/// CPF registration) requires and which every other country admits as optional;
+/// no other country in these rows has a documented per-country requirement
 /// (`crate::state::COUNTRY_RULES`), which `tests/all/country_requirements.rs`
 /// covers for the ones that do.
 fn entry(registration_type: &str, country_code: &str) -> Value {
@@ -136,6 +138,7 @@ fn entry(registration_type: &str, country_code: &str) -> Value {
         "legalName": "Example Holdings",
         "legalAddress": {
             "city": "Example City",
+            "stateOrRegion": "Example Region",
             "postalCode": "01001-000",
             "countryCode": country_code,
         },

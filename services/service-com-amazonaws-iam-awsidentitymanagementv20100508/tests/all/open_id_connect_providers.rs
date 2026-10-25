@@ -143,7 +143,7 @@ fn issuer_of(url: &str) -> &str {
 /// `ClientIDList` and `ThumbprintList` both serialize their entries as `<member>`, so a
 /// scan of the whole body cannot tell them apart: this narrows to the named list's
 /// content first. A list the response omits (or reports empty) has no entries.
-fn list_members(body: &str, tag: &str) -> Vec<String> {
+pub(crate) fn list_members(body: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     match body.find(&open) {

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveClientIDFromOpenIDConnectProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveClientIDFromOpenIDConnectProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveClientIDFromOpenIDConnectProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes one client ID out of the `ClientIDList` the named OIDC provider holds, so a
+//! later `GetOpenIDConnectProvider` no longer reports it while every other registered
+//! client ID keeps its position. The call is IDEMPOTENT: a client ID the provider does
+//! not hold is a success that changes nothing. A value that is not an ARN is an
+//! `InvalidInputException`; an ARN the account holds no provider for is a
+//! `NoSuchEntityException`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +167,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveClientIDFromOpenIDConnectProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveClientIDFromOpenIDConnectProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveClientIDFromOpenIDConnectProvider"))
+        // `ctx` carries request metadata only; nothing here depends on it — IAM is global
+        // and the provider is named by the ARN the request carries.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                RemoveClientIDFromOpenIDConnectProviderErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The provider is named by an ARN, so the modelled `InvalidInputException` is the
+        // refusal of a value that is not one: an ARN "begins with arn:" (Amazon Resource
+        // Names, Amazon Web Services General Reference). A well-formed ARN naming no held
+        // provider is a different answer — the entity does not exist — which is the split
+        // this crate's `GetOpenIDConnectProvider` makes on the very same member.
+        if !input.open_id_connect_provider_arn.starts_with("arn:") {
+            return Err(
+                RemoveClientIDFromOpenIDConnectProviderErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "Invalid OpenIDConnectProviderArn {}: the value is not an ARN",
+                            input.open_id_connect_provider_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The provider is keyed by the ARN `CreateOpenIDConnectProvider` derived from its
+        // URL, which is the handle this request names it by; an ARN the account holds no
+        // provider for "referenced a resource entity that does not exist", and "the error
+        // message describes the resource" (`NoSuchEntityException`) — IAM describes a
+        // missing OIDC provider by the ARN the request named it with, the wording this
+        // crate's `GetOpenIDConnectProvider` reports for the same lookup.
+        let mut store = state.lock();
+        let Some(provider) = store
+            .open_id_connect_providers
+            .get_mut(&input.open_id_connect_provider_arn)
+        else {
+            return Err(
+                RemoveClientIDFromOpenIDConnectProviderErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(format!(
+                            "OpenIDConnect Provider not found for arn {}",
+                            input.open_id_connect_provider_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Removes the specified client ID (also known as audience) from the list of client
+        // IDs registered for the specified IAM OIDC provider resource object. This
+        // operation is idempotent; it does not fail or return an error if you try to remove
+        // a client ID that does not exist." Dropping the named entry leaves every other
+        // registered client ID in the order it was registered — the order
+        // `GetOpenIDConnectProvider` reports them in — and a client ID the provider never
+        // held removes nothing and still succeeds.
+        provider
+            .client_id_list
+            .retain(|held| *held != input.client_id);
+
+        Ok(RemoveClientIDFromOpenIDConnectProviderOutput)
     }
 }

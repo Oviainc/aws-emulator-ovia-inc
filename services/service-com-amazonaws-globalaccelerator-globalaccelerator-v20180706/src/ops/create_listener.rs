@@ -194,9 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.accelerators.contains_key(&input.accelerator_arn) {
             return Err(CreateListenerErrorModeled::AcceleratorNotFoundException(
                 AcceleratorNotFoundException {
-                    message: Some(crate::state::accelerator_not_found_message(
-                        &input.accelerator_arn,
-                    )),
+                    message: Some(crate::state::create_parent_accelerator_not_found_message()),
                 },
             )
             .into());

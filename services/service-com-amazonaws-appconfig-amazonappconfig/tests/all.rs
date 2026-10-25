@@ -89,3 +89,5 @@ mod update_experiment_definition;
 mod update_experiment_run;
 #[path = "all/update_extension.rs"]
 mod update_extension;
+#[path = "all/update_extension_association.rs"]
+mod update_extension_association;

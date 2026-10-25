@@ -16,7 +16,8 @@ use ::aws_smithy_types::base64;
 
 use crate::ops::types::{
     AccountMetaData, AdditionalInfoRequest, AdditionalInfoResponse, Address, Authority,
-    CaseCreationLimitExceededException, ConflictException, IndonesiaAdditionalInfo,
+    CanadaAdditionalInfo, CaseCreationLimitExceededException, ConflictException,
+    IndonesiaAdditionalInfo,
     InternalServerException, Jurisdiction, ResourceNotFoundException, SupplementalTaxRegistration,
     SupplementalTaxRegistrationEntry, TaxDocumentMetadata, TaxExemption, TaxExemptionDetails,
     TaxExemptionType, TaxRegistration, TaxRegistrationEntry, TaxRegistrationWithJurisdiction,
@@ -1393,6 +1394,49 @@ pub const SPAIN_REGISTRATION_TYPE_NEEDING_DOCUMENT: &str = "Local";
 /// for which `taxOffice` is therefore not required either.
 pub const TURKEY_SECTOR_WITHOUT_TAX_OFFICE: &str = "Individual";
 
+/// The Brazilian `TaxRegistrationType` whose address must name a state, region or
+/// province — "Brazil (CPF)" in the documentation of `Address$stateOrRegion`
+/// (see [`COUNTRY_RULES`]). A Brazilian registration of any other type carries
+/// the member only if the caller chooses to.
+pub const BRAZIL_STATE_OR_REGION_TYPE: &str = "CPF";
+
+/// The Canadian provinces for whose TRN a provincial sales tax ID is a reseller
+/// claim, each as its subdivision code and as the province's name.
+///
+/// `CanadaAdditionalInfo$isResellerAccount` is documented as "The value for this
+/// parameter must be `true` if the `provincialSalesTaxId` value is provided for a
+/// TRN in British Columbia, Saskatchewan, or Manitoba provinces"
+/// (`smithy_query(query="shape",shape="com.amazonaws.taxsettings#CanadaAdditionalInfo")`),
+/// so these three provinces are the ones that rule turns on — Quebec, the fourth
+/// province whose number `provincialSalesTaxId` may carry, is not one of them.
+/// Each row carries the subdivision code beside the name because the province is
+/// read off free text — see [`canada_reseller_province`].
+pub const CANADA_RESELLER_PROVINCES: &[(&str, &str)] = &[
+    ("BC", "British Columbia"),
+    ("SK", "Saskatchewan"),
+    ("MB", "Manitoba"),
+];
+
+/// The province of [`CANADA_RESELLER_PROVINCES`] that `state_or_region` names, by
+/// its subdivision code or by its name, or `None` for any other value.
+///
+/// `Address$stateOrRegion` is free text the model constrains only in length and
+/// non-blankness ("use the same name as shown on the Tax Settings page"), so the
+/// match is case-insensitive and ignores surrounding space and admits either
+/// spelling. A value this cannot place names no province of the set, so a rule
+/// keyed off it has nothing to say about the entry: the match is what makes a
+/// rule APPLY, never what satisfies one, so an unfamiliar spelling cannot turn
+/// into a refusal of an entry the service accepts.
+pub fn canada_reseller_province(state_or_region: &str) -> Option<&'static str> {
+    let value = state_or_region.trim();
+    CANADA_RESELLER_PROVINCES
+        .iter()
+        .find(|(code, province)| {
+            value.eq_ignore_ascii_case(code) || value.eq_ignore_ascii_case(province)
+        })
+        .map(|(_, province)| *province)
+}
+
 /// One per-country business rule `PutTaxRegistration` documents for
 /// `taxRegistrationEntry`.
 ///
@@ -1521,10 +1565,58 @@ fn turkey_sector_is_individual(entry: &TaxRegistrationEntry) -> bool {
     sector(entry).is_some_and(|value| value == TURKEY_SECTOR_WITHOUT_TAX_OFFICE)
 }
 
+/// Whether `entry` submitted a legal address of its own.
+///
+/// What makes every rule about an ADDRESS member apply: an entry that carries no
+/// address either had it refused already (the member its jurisdiction requires
+/// and it omits) or has it filled in from the tax number
+/// ([`derived_legal_address`]), and in neither case is an address member the
+/// caller's to supply.
+fn submitted_legal_address(entry: &TaxRegistrationEntry) -> bool {
+    entry.legal_address.is_some()
+}
+
+/// Whether the legal address `entry` submitted names a state, region or
+/// province.
+fn legal_address_has_state_or_region(entry: &TaxRegistrationEntry) -> bool {
+    entry
+        .legal_address
+        .as_ref()
+        .is_some_and(|address| address.state_or_region.is_some())
+}
+
+/// The entry's `canadaAdditionalInfo` block, if it carries one.
+fn canada_info(entry: &TaxRegistrationEntry) -> Option<&CanadaAdditionalInfo> {
+    additional_info(entry).and_then(|info| info.canada_additional_info.as_ref())
+}
+
+/// Whether `entry` claims a provincial sales tax ID for a TRN held in one of the
+/// provinces where that claim is a reseller claim
+/// ([`CANADA_RESELLER_PROVINCES`]).
+fn canada_claims_provincial_sales_tax_id(entry: &TaxRegistrationEntry) -> bool {
+    canada_info(entry).is_some_and(|canada| canada.provincial_sales_tax_id.is_some())
+        && entry
+            .legal_address
+            .as_ref()
+            .and_then(|address| address.state_or_region.as_deref())
+            .and_then(canada_reseller_province)
+            .is_some()
+}
+
+/// Whether `entry` confirms that purchases made under it are for resale.
+fn canada_is_reseller_account(entry: &TaxRegistrationEntry) -> bool {
+    canada_info(entry).is_some_and(|canada| canada.is_reseller_account == Some(true))
+}
+
 /// Every per-country business rule `PutTaxRegistration`'s model documentation
 /// states for `taxRegistrationEntry`, in the order that documentation lists the
 /// countries
-/// (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#PutTaxRegistration")`).
+/// (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#PutTaxRegistration")`),
+/// followed by the per-country requirements the model states on the entry's own
+/// MEMBERS rather than in that list (`Address$stateOrRegion`,
+/// `CanadaAdditionalInfo$isResellerAccount`): a member a shape cannot constrain,
+/// because every country shares the shape, is a per-country rule of this table
+/// like any other.
 ///
 /// Two documented rules are deliberately NOT rows here, because the fact they
 /// turn on is not in the request and this service models no API that supplies
@@ -1891,6 +1983,79 @@ pub const COUNTRY_RULES: &[CountryRule] = &[
         satisfied: |entry: &TaxRegistrationEntry| {
             additional_info(entry).is_some_and(|info| info.monaco_additional_info.is_some())
         },
+    },
+    // The rows above are the operation's own country-by-country list. The rows
+    // below state the per-country requirements the model documents on the
+    // MEMBERS of the entry instead, which are rules of exactly the same kind:
+    // a member one country's registration must carry, or must carry a given
+    // value, which no constraint on the shape can express because the shape is
+    // shared by every country.
+    //
+    // `Address$stateOrRegion`: "This field is only required for Canada, India,
+    // United Arab Emirates, Romania, and Brazil (CPF). It is optional for all
+    // other countries."
+    // (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#Address",member="stateOrRegion")`)
+    // One row per country of that sentence, because each states its own
+    // jurisdiction in its refusal.
+    CountryRule {
+        country_code: "CA",
+        member_path: "taxRegistrationEntry.legalAddress.stateOrRegion",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A tax registration in Canada must specify legalAddress.stateOrRegion.",
+        applies: submitted_legal_address,
+        satisfied: legal_address_has_state_or_region,
+    },
+    CountryRule {
+        country_code: "IN",
+        member_path: "taxRegistrationEntry.legalAddress.stateOrRegion",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A tax registration in India must specify legalAddress.stateOrRegion.",
+        applies: submitted_legal_address,
+        satisfied: legal_address_has_state_or_region,
+    },
+    CountryRule {
+        country_code: "AE",
+        member_path: "taxRegistrationEntry.legalAddress.stateOrRegion",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A tax registration in the United Arab Emirates must specify \
+                  legalAddress.stateOrRegion.",
+        applies: submitted_legal_address,
+        satisfied: legal_address_has_state_or_region,
+    },
+    CountryRule {
+        country_code: "RO",
+        member_path: "taxRegistrationEntry.legalAddress.stateOrRegion",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A tax registration in Romania must specify legalAddress.stateOrRegion.",
+        applies: submitted_legal_address,
+        satisfied: legal_address_has_state_or_region,
+    },
+    // Brazil is in that sentence for ONE registration type — see
+    // [`BRAZIL_STATE_OR_REGION_TYPE`] — so the row is conditional on the type,
+    // and a Brazilian registration of any other type is left alone.
+    CountryRule {
+        country_code: "BR",
+        member_path: "taxRegistrationEntry.legalAddress.stateOrRegion",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A CPF tax registration in Brazil must specify legalAddress.stateOrRegion.",
+        applies: |entry: &TaxRegistrationEntry| {
+            submitted_legal_address(entry) && entry.registration_type == BRAZIL_STATE_OR_REGION_TYPE
+        },
+        satisfied: legal_address_has_state_or_region,
+    },
+    // `CanadaAdditionalInfo$isResellerAccount`: "The value for this parameter
+    // must be true if the provincialSalesTaxId value is provided for a TRN in
+    // British Columbia, Saskatchewan, or Manitoba provinces." The province the
+    // TRN is held in is the address's own `stateOrRegion` — see
+    // [`CANADA_RESELLER_PROVINCES`] — which the Canadian row above has already
+    // required, so this rule is reached with the province stated.
+    CountryRule {
+        country_code: "CA",
+        member_path: "additionalTaxInformation.canadaAdditionalInfo.isResellerAccount",
+        error_code: ERROR_CODE_FIELD_VALIDATION_FAILED,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: canada_claims_provincial_sales_tax_id,
+        satisfied: canada_is_reseller_account,
     },
 ];
 

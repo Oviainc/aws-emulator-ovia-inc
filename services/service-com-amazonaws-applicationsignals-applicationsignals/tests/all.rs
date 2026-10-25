@@ -57,6 +57,8 @@ mod list_service_states;
 mod list_services;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/max_results_range.rs"]
+mod max_results_range;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/service_dependency_metrics.rs"]

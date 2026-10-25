@@ -14,6 +14,9 @@
 #[path = "all/account_configuration.rs"]
 mod account_configuration;
 
+#[path = "all/account_configuration_reads.rs"]
+mod account_configuration_reads;
+
 #[path = "all/batch_delete.rs"]
 mod batch_delete;
 

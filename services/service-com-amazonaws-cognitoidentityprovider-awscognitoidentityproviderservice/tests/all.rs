@@ -19,6 +19,8 @@ mod admin_group_listing;
 mod admin_remove_user_from_group;
 #[path = "all/admin_respond_to_auth_challenge.rs"]
 mod admin_respond_to_auth_challenge;
+#[path = "all/admin_user_enabled_state.rs"]
+mod admin_user_enabled_state;
 #[path = "all/admin_user_pool_lifecycle.rs"]
 mod admin_user_pool_lifecycle;
 #[path = "all/clock_dependent_state.rs"]
@@ -85,5 +87,7 @@ mod user_attribute_verification_code;
 mod user_import_job_lifecycle;
 #[path = "all/user_pool_domain.rs"]
 mod user_pool_domain;
+#[path = "all/user_pool_mfa_config.rs"]
+mod user_pool_mfa_config;
 #[path = "all/verification_code_pipeline.rs"]
 mod verification_code_pipeline;

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOfferings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOfferings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOfferings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the offerings this account may buy in the Region the request was signed for,
+//! a page at a time: the catalogue this service publishes
+//! ([`crate::state::published_offerings`]) — unless the account already holds an active
+//! reservation, which makes it eligible for none of them.
 //!
 //! ## Shape of an operation
 //!
@@ -93,6 +89,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page ListOfferings returns: the maximum of the modelled `MaxResults`
+/// range (1..1000).
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// The page size ListOfferings uses when the request names none: "If MaxResults is not
+/// included in the request, the service defaults to pagination with a maximum of 10
+/// results per page"
+/// (`smithy_query(query="doc",shape="ListOfferingsRequest",member="MaxResults")`).
+const DEFAULT_PAGE_SIZE: i32 = 10;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +170,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOfferings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOfferingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOfferings"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListOfferingsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect offering store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `NextToken` is the offering ARN this listing resumes at, so a token the service
+        // never minted is a semantic error, not a key to page from. The check is on the
+        // token's FORM, so a token naming an entry this catalogue does not hold still
+        // pages from that key.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_mintable_offering_arn(token) {
+                return Err(ListOfferingsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: crate::state::validation_failed_message(&format!(
+                            "Invalid NextToken {token:?}. A pagination token must be one this \
+                             service issued."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Defence in depth: the modelled `MaxResults` range (1..1000) is already enforced
+        // at the boundary, so an out-of-range value is refused with a 400 before this
+        // handler runs and the clamp below never fires on a real request.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(DEFAULT_PAGE_SIZE)
+                .clamp(1, MAX_PAGE_SIZE),
+        )
+        .unwrap_or(1);
+
+        // Eligibility is the one thing the account's own state decides here: "if you have
+        // an active reservation ... your account isn't eligible for other offerings", so an
+        // account holding one is offered nothing. This read WRITES NOTHING — not even the
+        // reservation states the clock owes — because whether a reservation is running is
+        // read from the instants it runs between (see
+        // `ComAmazonawsMediaconnectMediaconnectState::holds_active_reservation`).
+        let eligible = !state
+            .lock()
+            .holds_active_reservation(::std::time::SystemTime::now());
+
+        // The catalogue is the Region's: an offering's ARN carries the Region, and "the
+        // current Amazon Web Services Region" is the one this request was signed for.
+        let catalogue = if eligible {
+            crate::state::published_offerings(&crate::state::request_region(ctx.parts()))
+        } else {
+            Vec::new()
+        };
+
+        // The token is the ARN of the first offering of the NEXT page, so paging resumes at
+        // that key. With no token the walk starts before every ARN, which is what the empty
+        // key is.
+        let resume_at = input.next_token.unwrap_or_default();
+        let mut offerings: Vec<Offering> = Vec::new();
+        let mut next_token: Option<String> = None;
+        for offering in catalogue
+            .into_iter()
+            .filter(|offering| offering.offering_arn >= resume_at)
+        {
+            if offerings.len() == page_size {
+                next_token = Some(offering.offering_arn);
+                break;
+            }
+            offerings.push(offering);
+        }
+
+        Ok(ListOfferingsOutput {
+            offerings: Some(offerings),
+            next_token,
+        })
     }
 }

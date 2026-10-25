@@ -2080,6 +2080,22 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         Some(activity)
     }
 
+    /// The activities of one region, in ARN order.
+    ///
+    /// A regional endpoint reports only its own region's resources, and every
+    /// activity ARN begins with [`activity_arn_prefix`] for its region, so the
+    /// `BTreeMap` holds one region's records contiguously and this is a range scan
+    /// rather than a filter over the whole store — exactly as
+    /// [`Self::state_machines_in_region`] reads the other ARN-keyed resource.
+    pub fn activities_in_region(&self, region: &str) -> Vec<&Activity> {
+        let prefix = activity_arn_prefix(region);
+        self.activities
+            .range(prefix.clone()..)
+            .take_while(|(arn, _)| arn.starts_with(&prefix))
+            .map(|(_, activity)| activity)
+            .collect()
+    }
+
     /// Why the store cannot take one more activity of `bytes`, or `None` when it
     /// can. The caps are on the WHOLE store, like every other cap here.
     pub fn activity_rejection(&self, bytes: usize) -> Option<String> {
@@ -4079,6 +4095,12 @@ pub fn activity_arn(region: &str, name: &str) -> String {
 /// name, which no state machine can take (`name` is modelled 1..80).
 pub fn state_machine_arn_prefix(region: &str) -> String {
     state_machine_arn(region, "")
+}
+
+/// The prefix every activity ARN of `region` begins with: the ARN of the empty
+/// name, which no activity can take (`name` is modelled 1..80).
+pub fn activity_arn_prefix(region: &str) -> String {
+    activity_arn(region, "")
 }
 
 /// The ARN of version `version` of the state machine `state_machine_arn` names.

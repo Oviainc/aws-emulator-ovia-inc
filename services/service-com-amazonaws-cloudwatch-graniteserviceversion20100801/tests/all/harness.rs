@@ -138,8 +138,16 @@ pub async fn rpc(
     parsed
 }
 
-/// One awsQuery form call against SNS, the protocol that service serves.
+/// One awsQuery form call against SNS, the protocol that service serves, requiring a 200.
 pub async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
+    let (status, text) = sns_call(emulator, action, params).await;
+    assert_eq!(status, 200, "{action}: expected HTTP 200, got {status} / {text}");
+    text
+}
+
+/// The same call with its HTTP status and body as answered — the seam for a suite that drives
+/// SNS into a REFUSAL and reads what it said.
+pub async fn sns_call(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-03-31");
     for (name, value) in params {
         body.push('&');
@@ -171,8 +179,7 @@ pub async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> 
     let response = emulator.router.dispatch(request).await;
     let status = response.status().as_u16();
     let text = String::from_utf8_lossy(response.body()).to_string();
-    assert_eq!(status, 200, "{action}: expected HTTP 200, got {status} / {text}");
-    text
+    (status, text)
 }
 
 /// The text of the first `<tag>…</tag>` element of an awsQuery response.

@@ -160,8 +160,9 @@ async fn store_arn(router: &MultiServiceRouter, store_id: &str) -> String {
         .to_string()
 }
 
-/// Every not-found path this service serves answers ONE constant message, with
-/// the identity of the missing resource in `resourceId`/`resourceType`.
+/// Every CONTROL-PLANE not-found path this service serves answers ONE constant
+/// message, with the identity of the missing resource in
+/// `resourceId`/`resourceType`.
 ///
 /// The rows differ along the operation, the FORM of the reference that resolves
 /// to nothing (a store id, a 200-character id, an id carrying every punctuation
@@ -169,8 +170,13 @@ async fn store_arn(router: &MultiServiceRouter, store_id: &str) -> String {
 /// policy id, a `name/` reference, a policy-store ARN, another service's ARN),
 /// and the TYPE of resource that is missing (`POLICY_STORE`, `POLICY`,
 /// `POLICY_TEMPLATE`, `POLICY_STORE_ALIAS`, `IDENTITY_SOURCE`).
+///
+/// The AUTHORIZATION calls are the other half of this API and word their own
+/// not-found, naming the resource the request referenced; that half of the rule —
+/// and that the two halves stay apart — is pinned in
+/// [`super::response_fidelity`].
 #[tokio::test]
-async fn every_not_found_path_answers_the_same_constant_message() {
+async fn every_control_plane_not_found_path_answers_the_same_constant_message() {
     let router = router();
 
     // A live store with one policy in it, so a row can miss the POLICY inside a
@@ -351,19 +357,6 @@ async fn every_not_found_path_answers_the_same_constant_message() {
             resource_type: "POLICY_STORE",
         },
         NotFound {
-            case: "IsAuthorized, unknown store",
-            operation: "IsAuthorized",
-            request: json!({
-                "policyStoreId": unknown_store,
-                "principal": { "entityType": "PhotoApp::User", "entityId": "alice" },
-                "action": { "actionType": "PhotoApp::Action", "actionId": "view" },
-                "resource": { "entityType": "PhotoApp::Photo", "entityId": "vacation" },
-            }),
-            reference: unknown_store.clone(),
-            resource_id: unknown_store.clone(),
-            resource_type: "POLICY_STORE",
-        },
-        NotFound {
             case: "CreatePolicyStoreAlias, unknown store",
             operation: "CreatePolicyStoreAlias",
             request: json!({
@@ -429,21 +422,6 @@ async fn every_not_found_path_answers_the_same_constant_message() {
             reference: pending_alias.clone(),
             resource_id: "pending-deletion".to_string(),
             resource_type: "POLICY_STORE_ALIAS",
-        },
-        NotFound {
-            case: "BatchIsAuthorized, unknown store",
-            operation: "BatchIsAuthorized",
-            request: json!({
-                "policyStoreId": unknown_store,
-                "requests": [{
-                    "principal": { "entityType": "PhotoApp::User", "entityId": "alice" },
-                    "action": { "actionType": "PhotoApp::Action", "actionId": "view" },
-                    "resource": { "entityType": "PhotoApp::Photo", "entityId": "vacation" },
-                }],
-            }),
-            reference: unknown_store.clone(),
-            resource_id: unknown_store.clone(),
-            resource_type: "POLICY_STORE",
         },
         NotFound {
             case: "CreateIdentitySource, unknown store",

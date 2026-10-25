@@ -456,15 +456,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     (solution_stack_name.clone(), platform_arn.clone())
                 }
             };
-        let resolved_stack = crate::state::configuration_platform(
+        let resolved_stack = crate::state::named_platform_version(
             &region,
             requested_stack.as_deref(),
             requested_platform_arn.as_deref(),
         );
         let platform_arn = requested_platform_arn
-            .or_else(|| resolved_stack.map(|stack| stack.platform_arn(&region)));
+            .or_else(|| resolved_stack.as_ref().map(|stack| stack.platform_arn(&region)));
         let solution_stack_name =
-            requested_stack.or_else(|| resolved_stack.map(|stack| stack.name()));
+            requested_stack.or_else(|| resolved_stack.as_ref().map(|stack| stack.name()));
 
         // Everything the request named resolved, so the update is written to the
         // one stored record every reader of this environment reads.

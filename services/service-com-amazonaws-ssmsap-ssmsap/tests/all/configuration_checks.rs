@@ -29,7 +29,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::CONFIGURATION_CHECK_TYPE_VALUES;
 use service_com_amazonaws_ssmsap_ssmsap::state::{
-    application_not_found_message, CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE,
+    application_not_found_message, configuration_check_entry,
     MAX_CONFIGURATION_CHECKS_PER_REQUEST, TRANSITION_SPAN,
 };
 
@@ -48,9 +48,9 @@ const CONFLICT: &str = "ConflictException";
 /// `OperationStatus$INPROGRESS`, as the model spells it.
 const INPROGRESS: &str = "INPROGRESS";
 
-/// `OperationStatus$ERROR`, as the model spells it — the terminal status a check that
-/// evaluated no rule ends in.
-const ERROR: &str = "ERROR";
+/// `OperationStatus$SUCCESS`, as the model spells it — the terminal status a check whose
+/// rules were evaluated ends in.
+const SUCCESS: &str = "SUCCESS";
 
 /// Wait out the terminal status the clock owes a freshly started check: comfortably
 /// longer than [`TRANSITION_SPAN`]. The emulator never sleeps; this is the test waiting
@@ -275,21 +275,24 @@ async fn a_start_files_one_readable_operation_per_requested_check() {
             }
         }
 
-        // And the terminal status the clock owes falls due: the check ends, in the
-        // model's failure status, saying why no rule result was produced.
+        // And the terminal status the clock owes falls due: the check ends in SUCCESS,
+        // with the tally of the rule results its check's rules produced and nothing to
+        // explain.
         settle().await;
-        for id in &ids {
+        for (operation, id) in operations.iter().zip(&ids) {
+            let check = string_field(operation, "ConfigurationCheckId");
+            let catalogued = configuration_check_entry(&check)
+                .unwrap_or_else(|| panic!("case {label:?}: the service catalogues {check:?}"));
             let fetched = emulator.get_check(id).await;
             let done = read_record(&fetched);
             assert_eq!(
                 string_field(&done, "Status"),
-                ERROR,
+                SUCCESS,
                 "case {label:?}: expected the terminal status once due, got {done:?}"
             );
-            assert_eq!(
-                string_field(&done, "StatusMessage"),
-                CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE,
-                "case {label:?}: expected the terminal status to say why, got {done:?}"
+            assert!(
+                field(&done, "StatusMessage").is_none(),
+                "case {label:?}: a check whose rules ran has nothing to explain, got {done:?}"
             );
             let start = field(&done, "StartTime")
                 .and_then(Value::as_f64)
@@ -301,9 +304,39 @@ async fn a_start_files_one_readable_operation_per_requested_check() {
                 end >= start,
                 "case {label:?}: expected EndTime at or after StartTime, got {done:?}"
             );
-            assert!(
-                field(&done, "RuleStatusCounts").is_none(),
-                "case {label:?}: no rule ran, so there is nothing to count, got {done:?}"
+            // The counts are the tally of the rule results the run produced, so they add
+            // up to the number of rules the catalogued check evaluates.
+            let counts = field(&done, "RuleStatusCounts").unwrap_or_else(|| {
+                panic!("case {label:?}: expected RuleStatusCounts once the rules ran, got {done:?}")
+            });
+            let total: i64 = ["Passed", "Failed", "Warning", "Info", "Unknown"]
+                .iter()
+                .map(|bucket| {
+                    counts
+                        .get(bucket)
+                        .and_then(Value::as_i64)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "case {label:?}: expected a {bucket} count, got {counts:?}"
+                            )
+                        })
+                })
+                .sum();
+            assert_eq!(
+                total,
+                catalogued.rule_count() as i64,
+                "case {label:?}: the counts must tally every rule of {check:?}, got {counts:?}"
+            );
+            // The record names the check it performed with the catalogue's own prose.
+            assert_eq!(
+                string_field(&done, "ConfigurationCheckName"),
+                catalogued.name,
+                "case {label:?}: expected the catalogued name of {check:?}, got {done:?}"
+            );
+            assert_eq!(
+                string_field(&done, "ConfigurationCheckDescription"),
+                catalogued.description,
+                "case {label:?}: expected the catalogued description of {check:?}, got {done:?}"
             );
         }
     }
@@ -396,7 +429,7 @@ async fn a_check_still_running_cannot_be_started_again_until_it_ends() {
     let done = emulator.get_check(&running_id).await;
     assert_eq!(
         string_field(&read_record(&done), "Status"),
-        ERROR,
+        SUCCESS,
         "expected the first check to have ended, got {done:?}"
     );
 

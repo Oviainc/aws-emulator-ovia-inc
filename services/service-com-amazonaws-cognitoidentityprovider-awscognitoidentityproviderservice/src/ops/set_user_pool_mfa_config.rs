@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetUserPoolMfaConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetUserPoolMfaConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetUserPoolMfaConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the MFA and passkey configuration of one user pool and answers the
+//! configuration the pool holds afterwards, read back from what was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -225,18 +219,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetUserPoolMfaConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetUserPoolMfaConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetUserPoolMfaConfig"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // The mode this call leaves the pool in. `MfaConfiguration` is optional and
+        // `UserPoolMfaType` has no "unset" value, so a request that carries none
+        // leaves MFA `OFF` — the same default a create or an update applies.
+        let mfa_configuration = crate::state::effective_mfa_configuration(input.mfa_configuration);
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // SMS codes are delivered through the Amazon SNS caller that
+        // `SmsConfiguration` names, so a pool that offers SMS as an MFA factor needs
+        // one: configuring `SmsMfaConfiguration` without it while MFA is on or
+        // optional is refused rather than stored as a factor nothing could deliver.
+        // Asked AFTER the lookup, so a request that names no pool is a 404 whatever
+        // else it carries.
+        if mfa_configuration != crate::state::MFA_OFF
+            && input
+                .sms_mfa_configuration
+                .as_ref()
+                .is_some_and(|sms| sms.sms_configuration.is_none())
+        {
+            return Err(sms_configuration_required());
+        }
+
+        pool.mfa_configuration = mfa_configuration;
+
+        // This call SETS the pool's MFA and passkey configuration, so each factor's
+        // own configuration is REPLACED: the request's value when it carries one, and
+        // cleared when it does not — a factor the request leaves out is a factor the
+        // pool no longer offers.
+        pool.software_token_mfa_configuration = input.software_token_mfa_configuration;
+        pool.email_mfa_configuration = input.email_mfa_configuration;
+        pool.web_authn_configuration = input.web_authn_configuration;
+
+        // `SmsMfaConfiguration` is the exception, because its two members are the
+        // pool's OWN SMS settings rather than MFA-only ones: `SmsConfiguration` is
+        // "user pool configuration for delivery of SMS messages" that you "can set in
+        // `CreateUserPool` and `UpdateUserPool`, or in `SetUserPoolMfaConfig`", and
+        // `SmsAuthenticationMessage` is a member of the pool itself. The pool keeps
+        // ONE copy of each, and a pool-level setting is not cleared by an MFA call
+        // that says nothing about it, so each is written only where the request
+        // carries it — leaving the settings the pool's other SMS messages are
+        // delivered with alone.
+        if let Some(sms) = input.sms_mfa_configuration {
+            if sms.sms_authentication_message.is_some() {
+                pool.sms_authentication_message = sms.sms_authentication_message;
+            }
+            if sms.sms_configuration.is_some() {
+                pool.sms_configuration = sms.sms_configuration;
+            }
+        }
+
+        // The pool's configuration changed, so its last-modified instant advances.
+        pool.last_modified_date = now;
+
+        // The response renders the STORED configuration, which is also what
+        // `GetUserPoolMfaConfig` reads back.
+        let stored = pool.to_mfa_config();
+        Ok(SetUserPoolMfaConfigOutput {
+            sms_mfa_configuration: stored.sms_mfa_configuration,
+            software_token_mfa_configuration: stored.software_token_mfa_configuration,
+            email_mfa_configuration: stored.email_mfa_configuration,
+            mfa_configuration: Some(stored.mfa_configuration),
+            web_authn_configuration: stored.web_authn_configuration,
+        })
     }
+}
+
+/// The refusal for an SMS MFA factor with no Amazon SNS caller configuration.
+fn sms_configuration_required() -> SetUserPoolMfaConfigError {
+    SetUserPoolMfaConfigErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(
+            "[SmsConfiguration] is a required member of [SmsMfaConfiguration].".to_string(),
+        ),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> SetUserPoolMfaConfigError {
+    SetUserPoolMfaConfigErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> SetUserPoolMfaConfigError {
+    SetUserPoolMfaConfigErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
