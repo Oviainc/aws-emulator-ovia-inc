@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The MediaLive Anywhere node lifecycle — `CreateNode`, `DescribeNode` and
-//! `DeleteNode` — end to end over the restJson1 wire.
+//! The MediaLive Anywhere node lifecycle — `CreateNode`, `DescribeNode`,
+//! `UpdateNodeState` and `DeleteNode` — end to end over the restJson1 wire.
 //!
 //! Every test drives the service the way a client does — through
 //! `MultiServiceRouter::dispatch` with real HTTP requests — so what is asserted
@@ -15,7 +15,9 @@
 //! takes no node at all (asserted below).
 
 use serde_json::{json, Value};
-use service_com_amazonaws_medialive_medialive::state::{MAX_NODES, MAX_NODE_INTERFACE_MAPPINGS};
+use service_com_amazonaws_medialive_medialive::state::{
+    node_state, MAX_NODES, MAX_NODE_INTERFACE_MAPPINGS,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
@@ -29,6 +31,15 @@ const ROLES: [&str; 2] = ["ACTIVE", "BACKUP"];
 /// Every value `NetworkInterfaceMode` accepts, from
 /// `smithy_query(query="shape", shape="NetworkInterfaceMode")`.
 const INTERFACE_MODES: [&str; 2] = ["NAT", "BRIDGE"];
+
+/// Every value `UpdateNodeState`'s `State` accepts, from
+/// `smithy_query(query="shape", shape="UpdateNodeStateShape")` — named through
+/// the service's own constants, so the suite and the store read one source.
+const REQUESTABLE_STATES: [&str; 2] = [node_state::ACTIVE, node_state::DRAINING];
+
+/// The `NodeState` a created node starts in, from
+/// `smithy_query(query="shape", shape="NodeState")`.
+const CREATED_STATE: &str = node_state::CREATED;
 
 /// One cluster created through `CreateCluster`, answering the `Id` it minted.
 ///
@@ -96,6 +107,48 @@ async fn describe_node(router: &MultiServiceRouter, cluster: &str, node: &str) -
 
 pub(crate) async fn delete_node(router: &MultiServiceRouter, cluster: &str, node: &str) -> (u16, Value) {
     call(router, "DELETE", &node_uri(cluster, node), None).await
+}
+
+/// The state sub-resource of one node, which `UpdateNodeState` is bound to
+/// (`smithy_query(query="operation", operation="UpdateNodeState")`: `PUT
+/// /prod/clusters/{ClusterId}/nodes/{NodeId}/state`).
+fn node_state_uri(cluster: &str, node: &str) -> String {
+    format!("/prod/clusters/{cluster}/nodes/{node}/state")
+}
+
+/// `UpdateNodeState` asking for `state` \u2014 or, when it is `None`, a request that
+/// names no `State` member at all, which the model allows.
+async fn update_node_state(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    node: &str,
+    state: Option<&str>,
+) -> (u16, Value) {
+    let body = match state {
+        Some(state) => json!({ "state": state }),
+        None => json!({}),
+    };
+    call(router, "PUT", &node_state_uri(cluster, node), Some(body)).await
+}
+
+/// One node, put into `state` through `UpdateNodeState` with the call asserted
+/// to have succeeded.
+///
+/// `201 Created` is the status the model gives this operation
+/// (`smithy_query(query="operation", operation="UpdateNodeState")`: code 201).
+async fn state_updated(
+    router: &MultiServiceRouter,
+    case: &str,
+    cluster: &str,
+    node: &str,
+    state: Option<&str>,
+) -> Value {
+    let (status, body) = update_node_state(router, cluster, node, state).await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: UpdateNodeState({state:?}): expected 201, got {status}: {body}"
+    );
+    body
 }
 
 /// One node, read back through `DescribeNode` with the read asserted to have
@@ -997,4 +1050,283 @@ async fn a_nodes_placement_groups_are_the_groups_that_name_it() {
         json!([group_ids[0].clone()]),
         "expected the deregistering node to still report its group"
     );
+}
+
+/// The members of a node-shaped response that `UpdateNodeState` must leave
+/// exactly as it found them: everything the node carries except its `State`.
+const MEMBERS_BESIDE_STATE: [&str; 9] = [
+    "id",
+    "arn",
+    "clusterId",
+    "name",
+    "role",
+    "nodeInterfaceMappings",
+    "sdiSourceMappings",
+    "channelPlacementGroups",
+    "connectionState",
+];
+
+/// Rule: `UpdateNodeState` puts the node its path names into the `NodeState` its
+/// `State` member asks for — either of the two values the member accepts
+/// ([`REQUESTABLE_STATES`]) — stores that state and reports the stored node, so
+/// `DescribeNode` reports the same state from then on and the clock owes nothing
+/// after the call; a request that names no `State` changes nothing; and no other
+/// member of that node, and no other node, moves.
+///
+/// The rows differ along the state asked for, along how many states are asked
+/// for in a row (so the node moves back and forth, and is asked for the state it
+/// is already in), along the request that names no state at all, and along what
+/// the node carries, because that is what the rule generalises over.
+#[tokio::test]
+async fn a_node_is_put_into_the_state_update_node_state_asks_for() {
+    // (case, the body the node is created with, the states asked for in order)
+    let rows: Vec<(&str, Value, Vec<Option<&str>>)> = vec![
+        (
+            "commission a bare node",
+            json!({}),
+            vec![Some(REQUESTABLE_STATES[0])],
+        ),
+        (
+            "isolate a bare node",
+            json!({}),
+            vec![Some(REQUESTABLE_STATES[1])],
+        ),
+        (
+            "commission, isolate, then commission again",
+            json!({
+                "name": "worker",
+                "role": ROLES[0],
+                "nodeInterfaceMappings": [mapping("my-inputs", "eth1", INTERFACE_MODES[0])],
+            }),
+            vec![
+                Some(REQUESTABLE_STATES[0]),
+                Some(REQUESTABLE_STATES[1]),
+                Some(REQUESTABLE_STATES[0]),
+            ],
+        ),
+        (
+            "the state the node is already in, twice",
+            json!({ "name": "idle", "role": ROLES[1] }),
+            vec![Some(REQUESTABLE_STATES[1]), Some(REQUESTABLE_STATES[1])],
+        ),
+        ("no state member at all", json!({ "name": "unasked" }), vec![None]),
+        (
+            "a state, then a request that names none",
+            json!({
+                "name": "two-interfaces",
+                "nodeInterfaceMappings": [
+                    mapping("my-inputs", "eth1", INTERFACE_MODES[0]),
+                    mapping("my-outputs", "ENO1234EXAMPLE", INTERFACE_MODES[1]),
+                ],
+            }),
+            vec![Some(REQUESTABLE_STATES[0]), None],
+        ),
+    ];
+
+    for (case, body, sequence) in rows {
+        let router = medialive();
+        let cluster_id = cluster(&router, "commissioning-cluster").await;
+        let node = created(&router, case, &cluster_id, body).await;
+        let id = node_id(case, &node);
+        // A bystander, so what the update touches is the node it names.
+        let bystander = created(&router, case, &cluster_id, json!({ "name": "bystander" })).await;
+        let bystander_id = node_id(case, &bystander);
+
+        let mut expected = CREATED_STATE.to_string();
+        for requested in sequence {
+            let updated = state_updated(&router, case, &cluster_id, &id, requested).await;
+            // A request that names no state asks for no change.
+            expected = requested.map_or(expected, str::to_string);
+
+            assert_eq!(
+                updated["state"],
+                json!(expected),
+                "case {case:?}: asked for {requested:?}: expected state {expected:?}, got {:?}",
+                updated["state"]
+            );
+            for member in MEMBERS_BESIDE_STATE {
+                assert_eq!(
+                    updated[member], node[member],
+                    "case {case:?}: asked for {requested:?}: expected {member:?} untouched, got {:?}",
+                    updated[member]
+                );
+            }
+
+            // The write landed in the STORE, not just in the response.
+            assert_eq!(
+                described(&router, case, &cluster_id, &id).await,
+                updated,
+                "case {case:?}: asked for {requested:?}: expected DescribeNode to report the stored node"
+            );
+
+            // And the state the caller asked for is the node's current one: the
+            // clock owes no step after this call.
+            wait_for_the_clock();
+            assert_eq!(
+                described(&router, case, &cluster_id, &id).await,
+                updated,
+                "case {case:?}: asked for {requested:?}: expected the clock to owe nothing"
+            );
+        }
+
+        assert_eq!(
+            described(&router, case, &cluster_id, &bystander_id).await,
+            bystander,
+            "case {case:?}: expected the bystander node {bystander_id} to be untouched"
+        );
+    }
+}
+
+/// Rule: `UpdateNodeState` changes a node that EXISTS and that a caller may
+/// still change, so a cluster/node pair naming no node of the account — and a
+/// node whose deregistration `DeleteNode` has already accepted, which names no
+/// node a caller may still change — is answered with `NotFoundException` (404,
+/// the error `DescribeNode` and `DeleteNode` model for the same node) and writes
+/// nothing.
+///
+/// The rows differ along why the pair resolves to nothing — an id no node ever
+/// had, a live node addressed under another cluster, a node inside its
+/// deregistering window and one the clock has settled — and along the state
+/// asked for, because the refusal is about the node and not about the state.
+#[tokio::test]
+async fn update_node_state_refuses_a_node_it_cannot_change() {
+    // (case, whether the id names a live node of another cluster, how far the
+    // node's own deregistration has got: none / accepted / settled)
+    let rows: [(&str, bool, Option<bool>); 4] = [
+        ("an id no node ever had", false, None),
+        ("a node of another cluster", true, None),
+        ("inside the deregistering window", false, Some(false)),
+        ("once deregistered", false, Some(true)),
+    ];
+
+    for (case, under_another_cluster, deregistration) in rows {
+        for requested in [Some(REQUESTABLE_STATES[0]), Some(REQUESTABLE_STATES[1]), None] {
+            let router = medialive();
+            let home = cluster(&router, "refusing-cluster").await;
+            let elsewhere = cluster(&router, "other-refusing-cluster").await;
+            let node = created(&router, case, &home, json!({ "name": "homed" })).await;
+            let id = node_id(case, &node);
+
+            // The pair the refused request names, and the message it must carry.
+            let (cluster_id, node_id_asked, expected_message) = if under_another_cluster {
+                (
+                    elsewhere.clone(),
+                    id.clone(),
+                    format!("Node {id} not found"),
+                )
+            } else if deregistration.is_some() {
+                (home.clone(), id.clone(), format!("Node {id} already deleted"))
+            } else {
+                // A well-formed node id no `CreateNode` minted.
+                let unknown = "9999999".to_string();
+                (
+                    home.clone(),
+                    unknown.clone(),
+                    format!("Node {unknown} not found"),
+                )
+            };
+
+            if let Some(settle) = deregistration {
+                let (status, body) = delete_node(&router, &home, &id).await;
+                assert_eq!(
+                    status, 202,
+                    "case {case:?}: DeleteNode: expected 202, got {status}: {body}"
+                );
+                if settle {
+                    wait_for_the_clock();
+                }
+            }
+
+            let before = described(&router, case, &home, &id).await;
+
+            let (status, refusal) =
+                update_node_state(&router, &cluster_id, &node_id_asked, requested).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: UpdateNodeState({requested:?}): expected 404, got {status}: {refusal}"
+            );
+            assert_eq!(
+                error_code(status, &refusal),
+                "NotFoundException",
+                "case {case:?}: expected NotFoundException, got {refusal}"
+            );
+            assert_eq!(
+                error_message(&refusal),
+                expected_message,
+                "case {case:?}: expected the refusal to name the node it was given, got {refusal}"
+            );
+
+            // The refusal wrote nothing: the node is exactly as it was.
+            assert_eq!(
+                described(&router, case, &home, &id).await,
+                before,
+                "case {case:?}: expected the refused update to leave the node as it was"
+            );
+        }
+    }
+}
+
+/// Rule: `State` targets an `enum` shape, so only the values that shape declares
+/// ([`REQUESTABLE_STATES`]) reach the node: any other string — including a
+/// `NodeState` value only the node's own registration could reach — is refused
+/// as a client error and the node keeps the state it had.
+///
+/// The rows span a `NodeState` value the member does not accept, a lower-case
+/// spelling of one it does, and the empty string, because that is the class the
+/// enum's membership rules out.
+#[tokio::test]
+async fn a_state_outside_the_enum_is_refused_and_writes_nothing() {
+    // Values `UpdateNodeStateShape` does not declare; the first three are
+    // `NodeState` values a node can be in but no caller can ask for
+    // (`smithy_query(query="shape", shape="NodeState")`).
+    let strays = [
+        "READY",
+        "IN_USE",
+        node_state::DEREGISTERED,
+        "active",
+        "",
+        "NOT_A_MODELLED_VALUE",
+    ];
+
+    for stray in strays {
+        let case = format!("state = {stray:?}");
+        let router = medialive();
+        let cluster_id = cluster(&router, "stray-state-cluster").await;
+        let node = created(&router, &case, &cluster_id, json!({ "name": "strayed" })).await;
+        let id = node_id(&case, &node);
+
+        let (status, body) = update_node_state(&router, &cluster_id, &id, Some(stray)).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected an unmodelled state to be refused, got {status}: {body}"
+        );
+        let code = error_code(status, &body);
+        assert!(
+            code == "BadRequestException" || code == "ValidationException",
+            "case {case:?}: expected a client error, got {code} ({body})"
+        );
+
+        // The refused request wrote nothing.
+        let after = described(&router, &case, &cluster_id, &id).await;
+        assert_eq!(
+            after, node,
+            "case {case:?}: expected the refused update to leave the node as it was, got {after}"
+        );
+
+        // And a value the enum DOES declare still reaches the same node.
+        let updated = state_updated(
+            &router,
+            &case,
+            &cluster_id,
+            &id,
+            Some(REQUESTABLE_STATES[0]),
+        )
+        .await;
+        assert_eq!(
+            updated["state"],
+            json!(REQUESTABLE_STATES[0]),
+            "case {case:?}: expected the modelled value to be accepted, got {:?}",
+            updated["state"]
+        );
+    }
 }
