@@ -83,7 +83,7 @@ pub struct CreateOutput {
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.elementalinference#OutputConfig")]
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputConfig {
     Cropping(CroppingConfig),
     Clipping(ClippingConfig),
@@ -92,33 +92,33 @@ pub enum OutputConfig {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elementalinference#CroppingConfig")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CroppingConfig {
     pub template_groups: Option<Vec<TemplateGroup>>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elementalinference#TemplateGroup")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TemplateGroup {
     pub name: String,
     pub template_uris: Vec<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elementalinference#ClippingConfig")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClippingConfig {
     pub callback_metadata: Option<String>,
     pub data_source_configuration: Option<DataSourceConfiguration>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elementalinference#DataSourceConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DataSourceConfiguration {
     pub fixture_id: String,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elementalinference#SubtitlingConfig")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SubtitlingConfig {
     pub language: String,
     pub aspect_ratio: Option<AspectRatio>,
@@ -127,14 +127,14 @@ pub struct SubtitlingConfig {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elementalinference#AspectRatio")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AspectRatio {
     pub width: i32,
     pub height: i32,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elementalinference#ContextualMetadataConfig")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextualMetadataConfig {
     pub summary_generation: Option<String>,
     pub extended_analysis: Option<String>,
