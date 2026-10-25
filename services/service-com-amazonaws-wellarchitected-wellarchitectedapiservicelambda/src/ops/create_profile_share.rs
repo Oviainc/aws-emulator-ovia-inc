@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProfileShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProfileShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProfileShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: grants one principal access to one Well-Architected Tool profile and
+//! persists the share in [`crate::state`], so `ListProfileShares` reads it back. A profile
+//! is shared BY its owning account — the caller — so a request whose `SharedWith` names
+//! that same principal is refused with `ValidationException` (400) and records nothing;
+//! the path `ProfileArn` is resolved by lookup (`ResourceNotFoundException`, 404), a
+//! principal the profile is already shared with is `ConflictException` (409), and the
+//! share beyond this emulator's per-profile ceiling is `ServiceQuotaExceededException`
+//! (402).
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +165,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProfileShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProfileShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProfileShare"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateProfileShareErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool profile store is unavailable".to_string(),
+            })
+        })?;
+
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "ProfileArn": &input.profile_arn,
+            "SharedWith": &input.shared_with,
+        }));
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the same token with the same parameters returns the
+        // share the original request created instead of creating a second one.
+        if let Some(token) = store
+            .create_profile_share_tokens
+            .get(&input.client_request_token)
+        {
+            if token.fingerprint != fingerprint {
+                let share_id = token.share_id.clone();
+                return Err(CreateProfileShareErrorModeled::ConflictException(
+                    crate::state::idempotency_token_conflict(
+                        crate::state::PROFILE_SHARE_RESOURCE_TYPE,
+                        share_id,
+                        &input.client_request_token,
+                    ),
+                )
+                .into());
+            }
+            if let Some(recorded) = store.profile_share(&token.profile_arn, &token.share_id) {
+                return Ok(CreateProfileShareOutput {
+                    profile_arn: Some(recorded.profile_arn.clone()),
+                    share_id: Some(recorded.share_id.clone()),
+                });
+            }
+            // The token names a share that is no longer stored, so there is no original
+            // result to return: forget the token and let this request share afresh, which
+            // is what the caller asked for — the same fall-through `CreateProfile` makes
+            // for a profile its token no longer resolves to. (Unreachable while
+            // `DeleteProfileShare` is a stub; handled here so the create stays well
+            // defined once it lands.)
+            store
+                .create_profile_share_tokens
+                .forget(&input.client_request_token);
+        }
+
+        // The profile being shared is resolved by this lookup, so a `ProfileArn` no stored
+        // profile answers to is the lookup's 404 whatever its syntax, and the account that
+        // owns the profile (`Profile$Owner`) is the principal doing the sharing.
+        let Some(shared_by) = store
+            .profiles
+            .get(&input.profile_arn)
+            .map(|profile| profile.owner.clone())
+        else {
+            return Err(CreateProfileShareErrorModeled::ResourceNotFoundException(
+                crate::state::profile_not_found(&input.profile_arn),
+            )
+            .into());
+        };
+
+        // A share GRANTS access to a principal that does not have it: the sharer already
+        // has it, so sharing with the sharer's own principal is not a share at all. The
+        // comparison is against the identity that shares the profile — the owning account
+        // this request is attributed to — never against a literal account id, and the
+        // refusal states the PRINCIPAL RELATIONSHIP that was refused rather than a
+        // constraint on the member's value, so it discloses no account id
+        // (`crate::state::SELF_SHARE_MESSAGE`).
+        if input.shared_with == shared_by {
+            return Err(CreateProfileShareErrorModeled::ValidationException(
+                crate::state::self_share_exception(),
+            )
+            .into());
+        }
+
+        // One principal holds at most one share of one profile: the access a second share
+        // would grant belongs to the share that already exists, which `DeleteProfileShare`
+        // revokes.
+        if let Some(existing) = store.profile_share_with(&input.profile_arn, &input.shared_with) {
+            let conflict = crate::state::profile_share_conflict(existing);
+            return Err(CreateProfileShareErrorModeled::ConflictException(conflict).into());
+        }
+
+        // Shares are metered per profile, and this operation models
+        // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps
+        // the store bounded: a share and its create token are both 1:1 with a live grant.
+        if store.profile_shares_of(&input.profile_arn).len() >= crate::state::MAX_SHARES_PER_PROFILE
+        {
+            return Err(CreateProfileShareErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The profile with ARN {} already holds the maximum of {} shares",
+                        input.profile_arn,
+                        crate::state::MAX_SHARES_PER_PROFILE
+                    ),
+                    resource_id: Some(input.profile_arn.clone()),
+                    resource_type: Some(crate::state::PROFILE_SHARE_RESOURCE_TYPE.to_string()),
+                    // The model publishes no numeric Service Quotas code for this quota,
+                    // so it is named by what it meters; the service code is this service's
+                    // own signing name.
+                    quota_code: "SharesPerProfile".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let share_id = store.mint_share_id();
+        // Creating the share is what raises the invitation the recipient has to answer, so
+        // the invitation exists from here. It is a resource of its own, named by its own
+        // `ShareInvitationId` rather than by this share's `ShareId`, and it is what
+        // `ListShareInvitations` reports to the principal offered the share.
+        let share_invitation_id = store.mint_share_invitation_id();
+        let record = crate::state::ProfileShareRecord {
+            share_id: share_id.clone(),
+            share_invitation_id,
+            profile_arn: input.profile_arn.clone(),
+            shared_by,
+            shared_with: input.shared_with,
+            // A new share waits on the invitation the principal it was offered to has to
+            // answer; nothing this operation does accepts it on their behalf.
+            status: crate::state::DEFAULT_SHARE_STATUS.to_string(),
+            status_message: None,
+        };
+        store
+            .profile_shares
+            .entry(input.profile_arn.clone())
+            .or_default()
+            .insert(share_id.clone(), record);
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        store.create_profile_share_tokens.remember(
+            input.client_request_token,
+            crate::state::CreateProfileShareToken {
+                profile_arn: input.profile_arn.clone(),
+                share_id: share_id.clone(),
+                fingerprint,
+            },
+        );
+
+        Ok(CreateProfileShareOutput {
+            profile_arn: Some(input.profile_arn),
+            share_id: Some(share_id),
+        })
     }
 }
