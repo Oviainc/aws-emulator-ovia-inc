@@ -877,11 +877,11 @@ async fn a_change_that_cannot_be_made_is_refused_with_its_own_modelled_error() {
             "InvalidParameterException",
         ),
         (
-            "a connected cluster, which has no control plane configuration",
+            "a connected cluster, which EKS does not manage a control plane for",
             "refuse-connected",
             serde_json::json!({ "deletionProtection": true }),
             400,
-            "InvalidRequestException",
+            "ClientException",
         ),
     ];
 

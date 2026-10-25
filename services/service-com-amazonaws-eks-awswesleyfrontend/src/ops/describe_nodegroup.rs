@@ -172,12 +172,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // identity member is serialized ([`crate::state::resource_not_found`]); the
         // cluster is still checked first, because a node group name means nothing
         // without the cluster that holds it.
-        if !guard
+        let Some(cluster) = guard
             .clusters
-            .contains_key(&(region.clone(), input.cluster_name.clone()))
-        {
+            .get(&(region.clone(), input.cluster_name.clone()))
+        else {
             return Err(DescribeNodegroupErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),
+            )
+            .into());
+        };
+
+        // A managed node group is a resource of the Amazon EKS-managed plane, which a
+        // cluster `RegisterCluster` connected has none of: EKS does not manage its
+        // nodes, so this operation does not apply to it. The gate is a fact about the
+        // CLUSTER, so it precedes resolving the node group.
+        if cluster.is_connected() {
+            return Err(DescribeNodegroupErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&input.cluster_name),
             )
             .into());
         }

@@ -359,15 +359,15 @@ pub(crate) fn statement_nodes_message() -> String {
 ///   value outside the set is not a value of the type, so there is nothing to compare
 ///   a certificate against. The modelled value sets ARE in the model, and the boundary
 ///   validator enforces them for a value sitting on a STRUCTURE member — a
-///   `ComparisonOperator`, say, is already refused with `Value of the input at
+///   `ComparisonOperator`, say, is already refused with `Value 'NOPE' at
 ///   'filterStatement.filter.x509AttributeFilter.subject.commonName.comparisonOperator'
 ///   failed to satisfy constraint: Member must satisfy enum value set: [CONTAINS,
 ///   EQUALS]` — but NOT for one sitting directly on a UNION member, which its walk
 ///   does not descend into. Those are the values checked here, through the same
 ///   message builder ([`crate::service::enum_value_refusal`]) and the same 400
 ///   `ValidationException`, so the two refusals read as one sentence: the same
-///   envelope, the same subject, the same requirement, and the submitted value
-///   withheld by both. The two list the value SET in the order their own generated
+///   envelope, the same subject, the same requirement, and the same choice of
+///   whether the value is stated. The two list the value SET in the order their own generated
 ///   source gives (the schema's trait keeps the model's declaration order, this
 ///   crate's wire-value lists are alphabetical), which is no part of the
 ///   requirement.
@@ -494,9 +494,9 @@ fn validate_filter(filter: &CertificateFilter) -> Result<(), SearchCertificatesE
 ///
 /// The message is the one this service states for any constraint violation
 /// ([`crate::service::enum_value_refusal`]): the AWS envelope over a clause naming
-/// the member the value sat on and the set it had to be in, with the submitted value
-/// withheld — the same envelope, subject and requirement the boundary refusal
-/// renders, so one violation class reads as one sentence at either seam.
+/// the value submitted, the member it sat on and the set it had to be in — the same
+/// envelope, subject and requirement the boundary refusal renders, so one violation
+/// class reads as one sentence at either seam.
 fn validate_enum(
     path: &str,
     value: &str,
@@ -506,7 +506,7 @@ fn validate_enum(
         return Ok(());
     }
     Err(validation_exception(crate::service::enum_value_refusal(
-        path, allowed,
+        path, value, allowed,
     )))
 }
 

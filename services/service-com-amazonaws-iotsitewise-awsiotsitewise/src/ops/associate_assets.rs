@@ -247,7 +247,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?
             .hierarchies
             .iter()
-            .find(|hierarchy| matches_label(hierarchy, &input.hierarchy_id))
+            // A `CustomID` label names a hierarchy by its raw id or by
+            // `externalId:` + its external id; that comparison has ONE definition in
+            // `crate::state`, the same one `DisassociateAssets` resolves through, so
+            // associate and disassociate cannot address different hierarchies.
+            .find(|hierarchy| {
+                crate::state::matches_id_label(
+                    hierarchy.id.as_deref(),
+                    hierarchy.external_id.as_deref(),
+                    &input.hierarchy_id,
+                )
+            })
             .ok_or_else(|| {
                 not_found(crate::state::hierarchy_not_found_message(
                     &input.hierarchy_id,
@@ -375,15 +385,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.associate_child(&parent_id, &hierarchy_id, &child_id, now);
 
         Ok(AssociateAssetsOutput)
-    }
-}
-
-/// Whether `hierarchy` is the one a `CustomID` label names: the raw hierarchy id, or
-/// `externalId:` followed by the hierarchy's external id.
-fn matches_label(hierarchy: &AssetModelHierarchy, label: &str) -> bool {
-    match label.strip_prefix(crate::state::EXTERNAL_ID_PREFIX) {
-        Some(external) => hierarchy.external_id.as_deref() == Some(external),
-        None => hierarchy.id.as_deref() == Some(label),
     }
 }
 

@@ -151,12 +151,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read addresses ONE resource — the `(cluster, add-on)` pair — so neither half
         // is named and no identity member is serialized
         // ([`crate::state::resource_not_found`]).
-        if !guard
+        let Some(cluster) = guard
             .clusters
-            .contains_key(&(region.clone(), input.cluster_name.clone()))
-        {
+            .get(&(region.clone(), input.cluster_name.clone()))
+        else {
             return Err(DescribeAddonErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),
+            )
+            .into());
+        };
+
+        // An add-on is a piece of software Amazon EKS manages inside the cluster, and a
+        // cluster `RegisterCluster` connected has no EKS-managed plane for one to live
+        // in: the operation does not apply to it, which the connected-cluster gate
+        // reports. It is a fact about the CLUSTER, so it precedes resolving the add-on.
+        if cluster.is_connected() {
+            return Err(DescribeAddonErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&input.cluster_name),
             )
             .into());
         }

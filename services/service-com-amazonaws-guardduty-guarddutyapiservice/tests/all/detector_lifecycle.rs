@@ -168,6 +168,31 @@ pub(crate) async fn enabled_detector(router: &Router) -> String {
         .to_string()
 }
 
+/// The `RuleId`s GuardDuty publishes, read over the wire through
+/// `ListCustomDetectionRules` (`POST /custom-detection-rule/rule` —
+/// `smithy_query(operation="ListCustomDetectionRules")`), so a suite spanning the
+/// catalogue cannot drift from it. Lives beside [`call`] because more than one suite
+/// needs the same read.
+pub(crate) async fn published_rule_ids(router: &Router) -> Vec<String> {
+    let (status, body) = call(router, "POST", "/custom-detection-rule/rule", Some(json!({}))).await;
+    assert_eq!(
+        status, 200,
+        "list-custom-detection-rules: expected 200, got {status} {body:?}"
+    );
+    let ids: Vec<String> = body["rules"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|rule| rule["ruleId"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        ids.len() > 2,
+        "list-custom-detection-rules: expected a catalogue of more than two rules, got {ids:?}"
+    );
+    ids
+}
+
 // ---------------------------------------------------------------------------
 // Rule 1 + 2: create -> read -> update -> read -> delete -> read.
 // ---------------------------------------------------------------------------

@@ -314,8 +314,9 @@ pub(crate) async fn start_engagement(emulator: &Emulator, contact: &str, case: &
 
 /// The pages the store holds for `engagement_arn`, in the order the plan engaged them.
 ///
-/// The store is read directly because `ListPagesByEngagement` is a stub of its own: this
-/// suite is about the pages themselves, not about listing them.
+/// The store is read directly because this suite is about the pages themselves — the accept
+/// code among them, which no listing reports — rather than about listing them; what
+/// `ListPagesByEngagement` reports is `tests/all/engagement_pages.rs`'s subject.
 pub(crate) fn pages_of(emulator: &Emulator, engagement_arn: &str) -> Vec<PageRecord> {
     let state = service_state(&*emulator.engine).expect("the engine holds this service's state");
     let state = state.lock();

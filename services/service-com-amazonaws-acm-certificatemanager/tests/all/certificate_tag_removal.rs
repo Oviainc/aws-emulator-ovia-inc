@@ -457,7 +457,8 @@ async fn a_refused_removal_leaves_the_stored_tags_alone() {
             arn.clone(),
             json!([{ "Key": "aws:reserved" }]),
             "InvalidTagException",
-            "tag aws:reserved is reserved: neither a tag key nor its value may begin with aws:"
+            "Invalid Tag Key: \"aws:reserved\". AWS internal tags cannot be changed with this \
+             API."
                 .to_string(),
         ),
         (
@@ -465,7 +466,9 @@ async fn a_refused_removal_leaves_the_stored_tags_alone() {
             arn.clone(),
             json!([{ "Key": "env" }, { "Key": "team", "Value": "aws:platform" }]),
             "InvalidTagException",
-            "tag team is reserved: neither a tag key nor its value may begin with aws:".to_string(),
+            "Invalid Tag Value: \"aws:platform\". AWS internal tags cannot be changed with this \
+             API."
+                .to_string(),
         ),
     ];
 

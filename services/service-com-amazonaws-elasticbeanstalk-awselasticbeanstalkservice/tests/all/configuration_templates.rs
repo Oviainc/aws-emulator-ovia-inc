@@ -20,6 +20,12 @@
 //!   ones, or names a resource the store does not hold is refused with this
 //!   service's own error code for that class.
 //!
+//! What a configuration set REPORTS is the resolved set — the platform version's
+//! published option catalogue at its defaults with the configuration's own
+//! settings over them, which `all/configuration_resolution.rs` is the suite for
+//! — so the rows below read the settings a write put in force through
+//! [`overridden_options`] rather than restating that catalogue.
+//!
 //! Each table row is a different point in those classes — which source the
 //! configuration came from, how many option settings it carries, whether an
 //! option is overridden, whether a description or tags were supplied — not a
@@ -58,7 +64,12 @@ pub(crate) fn as_params(params: &[(String, String)]) -> Vec<(&str, &str)> {
 /// The awsQuery form parameters that send `settings` as the request's
 /// `OptionSettings` list (`OptionSettings.member.<n>.<Member>`: the list's
 /// member is unnamed in the model, so it serializes as `member`).
-pub(crate) fn option_params(settings: &[Option4]) -> Vec<(String, String)> {
+///
+/// Takes a slice of plain string tuples rather than [`Option4`] itself, so a
+/// suite whose row derives a value at run time (from the catalogue the service
+/// publishes, say) sends it through this encoder too; a `&[Option4]` is accepted
+/// unchanged.
+pub(crate) fn option_params(settings: &[(&str, &str, &str, &str)]) -> Vec<(String, String)> {
     let mut params = Vec::new();
     for (index, (namespace, option_name, value, resource_name)) in settings.iter().enumerate() {
         let position = index + 1;
@@ -77,6 +88,36 @@ pub(crate) fn option_params(settings: &[Option4]) -> Vec<(String, String)> {
         if !resource_name.is_empty() {
             params.push((
                 format!("OptionSettings.member.{position}.ResourceName"),
+                (*resource_name).to_string(),
+            ));
+        }
+    }
+    params
+}
+
+/// The awsQuery form parameters that send `options` as a request's
+/// `OptionsToRemove` list: `(Namespace, OptionName, ResourceName)`, the three
+/// members `OptionSpecification` names one option by, with an empty
+/// `ResourceName` left off the request.
+///
+/// `pub(crate)` beside [`option_params`]: `UpdateEnvironment` and
+/// `UpdateConfigurationTemplate` both take the list, and the suites for them
+/// send it through this one encoder.
+pub(crate) fn remove_params(options: &[(&str, &str, &str)]) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    for (index, (namespace, option_name, resource_name)) in options.iter().enumerate() {
+        let at = index + 1;
+        params.push((
+            format!("OptionsToRemove.member.{at}.Namespace"),
+            (*namespace).to_string(),
+        ));
+        params.push((
+            format!("OptionsToRemove.member.{at}.OptionName"),
+            (*option_name).to_string(),
+        ));
+        if !resource_name.is_empty() {
+            params.push((
+                format!("OptionsToRemove.member.{at}.ResourceName"),
                 (*resource_name).to_string(),
             ));
         }
@@ -103,9 +144,14 @@ pub(crate) fn reported_options(answer: &Answer) -> Vec<(String, String, String, 
         .collect()
 }
 
-/// `settings` in the same shape [`reported_options`] returns.
-pub(crate) fn expected_options(settings: &[Option4]) -> Vec<(String, String, String, String)> {
-    settings
+/// `settings` in the same shape [`reported_options`] returns, SORTED by the key
+/// an option is identified by — the order [`overridden_options`] answers in,
+/// because a resolved configuration set lists the platform catalogue's options
+/// in the catalogue's own order rather than in the order a request wrote them.
+pub(crate) fn expected_options(
+    settings: &[(&str, &str, &str, &str)],
+) -> Vec<(String, String, String, String)> {
+    let mut expected: Vec<(String, String, String, String)> = settings
         .iter()
         .map(|(namespace, option_name, value, resource_name)| {
             (
@@ -115,7 +161,53 @@ pub(crate) fn expected_options(settings: &[Option4]) -> Vec<(String, String, Str
                 (*resource_name).to_string(),
             )
         })
-        .collect()
+        .collect();
+    expected.sort();
+    expected
+}
+
+/// The option settings `answer` reports that OVERRIDE the platform version's
+/// published defaults: the resolved configuration set with every option still
+/// sitting at the `DefaultValue` that version's catalogue gives for it taken
+/// out, sorted like [`expected_options`].
+///
+/// A read of a configuration set reports the RESOLVED settings — the platform
+/// version's option catalogue at its defaults with the configuration's own
+/// settings over them, which `all/configuration_resolution.rs` is the suite for
+/// — so a suite about what a write put IN FORCE reads the options whose value is
+/// not the inherited default, rather than restating a catalogue of a hundred
+/// options in every row. An option the catalogue does not define (an application
+/// environment variable the caller names) is never a default, so it always
+/// counts as an override, and neither is a setting that names a `ResourceName`
+/// of its own.
+///
+/// WHICH catalogue is read is taken from the description itself: every
+/// configuration set reports the platform version it is for, so a row that moves
+/// a set to another platform version is filtered against THAT version's defaults
+/// and needs to say nothing here. A setting written at exactly its platform's
+/// default is not an override by this measure and so is invisible to it — the
+/// resolution suite asserts the whole resolved set, which is where that case is
+/// covered.
+pub(crate) fn overridden_options(answer: &Answer) -> Vec<(String, String, String, String)> {
+    let stack = answer
+        .value("SolutionStackName")
+        .and_then(eb::state::solution_stack_named);
+    // Worker-tier options included, so an option is recognised at its default
+    // whichever tier the configuration set is for.
+    let catalog = eb::state::published_configuration_options(stack, true);
+    let mut overrides: Vec<(String, String, String, String)> = reported_options(answer)
+        .into_iter()
+        .filter(|(namespace, option_name, value, resource_name)| {
+            !resource_name.is_empty()
+                || !catalog.iter().any(|option| {
+                    option.namespace == namespace.as_str()
+                        && option.name == option_name.as_str()
+                        && option.default_value == value.as_str()
+                })
+        })
+        .collect();
+    overrides.sort();
+    overrides
 }
 
 /// The service's own published solution stack at `index` — the catalogue
@@ -214,13 +306,13 @@ async fn created_configuration_templates_are_derived_from_the_request_and_persis
                 ("Description".to_string(), "the base settings".to_string()),
             ],
             settings: vec![
-                ("aws:autoscaling:asg", "MinSize", "1", ""),
-                ("aws:autoscaling:asg", "MaxSize", "4", ""),
+                ("aws:autoscaling:asg", "MinSize", "3", ""),
+                ("aws:autoscaling:asg", "MaxSize", "6", ""),
                 ("aws:autoscaling:scheduledaction", "MinSize", "3", "nightly"),
             ],
             expected_settings: vec![
-                ("aws:autoscaling:asg", "MinSize", "1", ""),
-                ("aws:autoscaling:asg", "MaxSize", "4", ""),
+                ("aws:autoscaling:asg", "MinSize", "3", ""),
+                ("aws:autoscaling:asg", "MaxSize", "6", ""),
                 ("aws:autoscaling:scheduledaction", "MinSize", "3", "nightly"),
             ],
             expected_solution_stack: Some(base_stack.name()),
@@ -264,10 +356,10 @@ async fn created_configuration_templates_are_derived_from_the_request_and_persis
                 ("aws:elasticbeanstalk:application:environment", "STAGE", "prod", ""),
             ],
             expected_settings: vec![
-                // The inherited list, in its own order, with the overridden
-                // value replaced in place and the new option appended.
+                // The inherited settings, with the overridden value replaced
+                // and the new option added.
                 ("aws:autoscaling:asg", "MinSize", "2", ""),
-                ("aws:autoscaling:asg", "MaxSize", "4", ""),
+                ("aws:autoscaling:asg", "MaxSize", "6", ""),
                 ("aws:autoscaling:scheduledaction", "MinSize", "3", "nightly"),
                 ("aws:elasticbeanstalk:application:environment", "STAGE", "prod", ""),
             ],
@@ -412,12 +504,25 @@ fn assert_template(answer: &Answer, case: &TemplateCase, operation: &str) {
         "case {label:?}: unexpected Description in {}",
         answer.body
     );
+    // The settings the configuration PUT IN FORCE, read out of the resolved set
+    // the answer reports.
     assert_eq!(
-        reported_options(answer),
+        overridden_options(answer),
         expected_options(&case.expected_settings),
         "case {label:?}: unexpected OptionSettings in {}",
         answer.body
     );
+    // And each of them is in the WHOLE reported set at that value, so a setting
+    // whose value happens to equal its platform default — invisible to the
+    // override view above — is checked here too.
+    let reported = reported_options(answer);
+    for expected in expected_options(&case.expected_settings) {
+        assert!(
+            reported.contains(&expected),
+            "case {label:?}: expected the setting {expected:?} in {}",
+            answer.body
+        );
+    }
     // "Templates aren't associated with any environment. The EnvironmentName
     // response element is always null."
     assert_eq!(
@@ -499,7 +604,7 @@ async fn an_environments_configuration_set_is_reported_as_the_deployed_one() {
         described.body
     );
     assert_eq!(
-        reported_options(&described),
+        overridden_options(&described),
         expected_options(&settings),
         "case {case:?}: the environment's own option settings must be reported, got {}",
         described.body
@@ -948,6 +1053,19 @@ async fn the_option_setting_bound_is_enforced_on_the_request_and_on_the_merged_r
         params
     };
 
+    // The namespace the generated settings are written in: the one holding an
+    // application's environment variables, which the caller names and the
+    // published catalogue therefore defines no option of. Counting the reported
+    // settings in THIS namespace is independent of what the catalogue's
+    // defaults are.
+    let generated_namespace = "aws:elasticbeanstalk:application:environment";
+    let generated_count = |answer: &Answer| -> usize {
+        reported_options(answer)
+            .into_iter()
+            .filter(|(namespace, _, _, _)| namespace == generated_namespace)
+            .count()
+    };
+
     // At the bound: accepted, and every setting stored.
     let mut at_bound: Vec<(String, String)> = vec![
         ("ApplicationName".to_string(), APPLICATION.to_string()),
@@ -962,10 +1080,10 @@ async fn the_option_setting_bound_is_enforced_on_the_request_and_on_the_merged_r
     )
     .await;
     assert_eq!(
-        accepted.elements_at("OptionSettings/member").len(),
+        generated_count(&accepted),
         bound,
-        "case \"at the bound\": every option setting must be stored, got {} of {bound}",
-        accepted.elements_at("OptionSettings/member").len()
+        "case \"at the bound\": every option setting must be stored, got {}",
+        accepted.body
     );
 
     // One past it: refused, and nothing stored.
@@ -1004,7 +1122,7 @@ async fn the_option_setting_bound_is_enforced_on_the_request_and_on_the_merged_r
     )
     .await;
     assert_eq!(
-        overridden.elements_at("OptionSettings/member").len(),
+        generated_count(&overridden),
         bound,
         "case \"inherit and override\": an overridden option is the same option, got {}",
         overridden.body

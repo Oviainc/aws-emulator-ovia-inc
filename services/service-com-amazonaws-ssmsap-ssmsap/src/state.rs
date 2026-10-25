@@ -344,11 +344,16 @@ pub struct StoredApplication {
     /// An `ApplicationType` value (`HANA` | `SAP_ABAP`), exactly as registered.
     pub app_type: String,
     pub arn: String,
-    /// The AWS Service Catalog AppRegistry ARN this application is registered under.
-    /// `RegisterApplication` takes no AppRegistry application, so an application
-    /// registered through this slice has none — but `GetApplication` resolves by this
-    /// member, so it is stored rather than assumed.
-    pub app_registry_arn: Option<String>,
+    /// The ARN of the AWS Service Catalog AppRegistry application that records this
+    /// registration ([`app_registry_arn`]).
+    ///
+    /// The service records every registered application in AppRegistry, so the ARN is
+    /// assigned when the application is registered and held for as long as it exists:
+    /// it is reported in `Application$AppRegistryArn` and is one of the references
+    /// `GetApplication` resolves an application by
+    /// ([`RegionState::resolve_application_id`]). Not optional, because there is no
+    /// registered application without one.
+    pub app_registry_arn: String,
     /// An `ApplicationStatus` value; see the `APPLICATION_STATUS_*` constants.
     pub status: String,
     /// An `ApplicationDiscoveryStatus` value; see the `DISCOVERY_STATUS_*` constants.
@@ -423,7 +428,7 @@ impl StoredApplication {
             id: Some(self.id.clone()),
             r#type: Some(self.app_type.clone()),
             arn: Some(self.arn.clone()),
-            app_registry_arn: self.app_registry_arn.clone(),
+            app_registry_arn: Some(self.app_registry_arn.clone()),
             status: Some(self.status.clone()),
             discovery_status: Some(self.discovery_status.clone()),
             components: Some(self.components.iter().map(|c| c.id.clone()).collect()),
@@ -1259,13 +1264,13 @@ impl RegionState {
                 .map(|app| app.id.clone());
         }
         if let Some(arn) = app_registry_arn {
-            // Nothing in this slice registers an application through AppRegistry, so no
-            // stored application carries an `AppRegistryArn` to match — the lookup is
-            // here so adding one later needs no new resolution path.
+            // The AppRegistry application a registration is recorded in is assigned to
+            // that application alone ([`StoredApplication::app_registry_arn`]), so its
+            // ARN names exactly one application of this Region.
             return self
                 .applications
                 .values()
-                .find(|app| app.app_registry_arn.as_deref() == Some(arn))
+                .find(|app| app.app_registry_arn == arn)
                 .map(|app| app.id.clone());
         }
         None
@@ -1667,6 +1672,37 @@ pub fn application_arn(region: &str, application_id: &str) -> String {
         region,
         &format!("application/{application_id}"),
     )
+}
+
+/// The ARN namespace of an AWS Service Catalog AppRegistry application — an
+/// AppRegistry application is a Service Catalog resource, which is why the model's
+/// `AppRegistryArn` pattern (`^arn:aws:servicecatalog:[a-z0-9:\/-]+$`) admits only
+/// ARNs of this service.
+pub const APP_REGISTRY_ARN_SERVICE: &str = "servicecatalog";
+
+/// The ARN of the AppRegistry application `app_registry_application_id` in `region`:
+/// `arn:aws:servicecatalog:<region>:<account>:/applications/<AppRegistryApplicationId>`.
+///
+/// The account segment comes from the core's single source of truth, never a literal,
+/// exactly as in [`application_arn`].
+pub fn app_registry_arn(region: &str, app_registry_application_id: &str) -> String {
+    ::engine::emulator_arn(
+        APP_REGISTRY_ARN_SERVICE,
+        region,
+        &format!("/applications/{app_registry_application_id}"),
+    )
+}
+
+/// A fresh AppRegistry application id: the id of the AppRegistry application the
+/// service records a registration in, which no request carries, so it is assigned
+/// rather than echoed.
+///
+/// A v4 UUID written without its separators, which makes the id — and therefore the
+/// ARN built from it ([`app_registry_arn`]) — lowercase alphanumeric, the only form
+/// the modelled `AppRegistryArn` pattern (`^arn:aws:servicecatalog:[a-z0-9:\/-]+$`)
+/// admits, and unique per registration.
+pub fn new_app_registry_application_id() -> String {
+    ::uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// The id of the component a registration declared with `sid` and `component_type`.

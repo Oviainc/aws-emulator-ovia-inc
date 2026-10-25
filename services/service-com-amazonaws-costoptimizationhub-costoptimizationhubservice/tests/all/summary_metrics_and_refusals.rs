@@ -39,8 +39,8 @@ use service_com_amazonaws_costoptimizationhub_costoptimizationhubservice as cost
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cost_optimization_hub::{
-    call, enrolled_router, error_code, fields, ok, router, FIELD_VALIDATION_FAILED,
-    FIELD_VALIDATION_SUMMARY,
+    call, enrolled_router, enrolled_router_with_discounts_visible, error_code, fields, ok, router,
+    FIELD_VALIDATION_FAILED, FIELD_VALIDATION_SUMMARY,
 };
 
 /// Every `SavingsEstimationMode` the model declares, read from the generated
@@ -126,9 +126,14 @@ fn reported_metric(payload: &Value) -> String {
 /// resources' spend where the metric is supported, and the description of why no
 /// figure is reported where it is not — whichever of the two conditions makes it
 /// unsupported, and whatever dimension the view is grouped by.
+///
+/// The discounted mode is reachable only where the organization has made its
+/// member accounts' discounts visible, so the account here is the
+/// organization's management account with that preference set
+/// (`preference_gates` owns the rule).
 #[tokio::test]
 async fn savings_percentage_is_a_figure_only_where_the_metric_is_supported() {
-    let router = enrolled_router().await;
+    let router = enrolled_router_with_discounts_visible().await;
 
     // (case, the mode to store first — `None` is the account that has stated no
     // preference, read under the default the service applies). Every value the
@@ -268,7 +273,7 @@ async fn savings_percentage_is_a_figure_only_where_the_metric_is_supported() {
 /// effect that decides and not the absence of one.
 #[tokio::test]
 async fn an_account_that_stated_no_preference_is_served_before_discounts() {
-    let router = enrolled_router().await;
+    let router = enrolled_router_with_discounts_visible().await;
     let request = json!({"groupBy": "Region", "metrics": ["SavingsPercentage"]});
 
     assert_eq!(
@@ -303,7 +308,7 @@ async fn an_account_that_stated_no_preference_is_served_before_discounts() {
 /// `metrics` member carries no `metrics` object at all, under either preference.
 #[tokio::test]
 async fn no_metric_is_reported_where_none_was_asked_for() {
-    let router = enrolled_router().await;
+    let router = enrolled_router_with_discounts_visible().await;
 
     for mode in SAVINGS_ESTIMATION_MODE_VALUES {
         set_mode(&router, mode).await;

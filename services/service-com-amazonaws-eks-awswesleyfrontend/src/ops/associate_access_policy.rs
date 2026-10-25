@@ -81,9 +81,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `AssociateAccessPolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#AssociateAccessPolicy")]
+//
+// `ClientException` is widened in through `extra_errors`: this SERVICE models that
+// shape and many of its operations declare it, but this one does not list it — and it
+// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
+// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#AssociateAccessPolicy",
+    extra_errors = ["ClientException"]
+)]
 #[derive(Debug)]
 pub enum AssociateAccessPolicyErrorModeled {
+    ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     InvalidRequestException(InvalidRequestException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -201,6 +210,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(not_found());
         };
+        // Access entries are part of the Amazon EKS-managed plane, which a cluster
+        // `RegisterCluster` connected has none of: EKS grants no Kubernetes access on
+        // it, so this operation does not apply to it. The gate is a fact about the
+        // CLUSTER, so it precedes resolving the entry and judging the body.
+        if cluster.is_connected() {
+            return Err(AssociateAccessPolicyErrorModeled::ClientException(
+                state::connected_cluster_refusal(&input.cluster_name),
+            )
+            .into());
+        }
         let Some(entry) = cluster.access_entries.get_mut(&input.principal_arn) else {
             return Err(not_found());
         };

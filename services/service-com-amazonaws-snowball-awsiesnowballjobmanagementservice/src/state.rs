@@ -336,6 +336,16 @@ pub const UNLOCK_CODE_GROUP_LEN: usize = 5;
 /// characters `GetJobUnlockCode` documents.
 pub const UNLOCK_CODE_LEN: usize = UNLOCK_CODE_GROUPS * UNLOCK_CODE_GROUP_LEN + UNLOCK_CODE_GROUPS - 1;
 
+/// The account's Snow device service limit, as `GetSnowballUsage` reports it.
+///
+/// `GetSnowballUsageResult$SnowballLimit` is "the service limit for number of Snow devices
+/// this account can have at once. The default service limit is 1 (one)", and the operation
+/// documents the only way it moves: "If you want to increase your service limit, contact
+/// Amazon Web Services Support." No operation of this API raises or lowers it, so it is
+/// not something a caller's request can change and the store holds nothing to move: this
+/// emulator reports the documented default every account starts at.
+pub const SNOWBALL_SERVICE_LIMIT: i32 = 1;
+
 /// The lifecycle states a job can be in: the whole `JobState` enum
 /// (`shared_types::JOB_STATE_VALUES`), so the cancellation rule below is expressed
 /// over the modelled set rather than over the two states this slice can reach.
@@ -445,6 +455,21 @@ impl JobState {
     /// are released from.
     pub fn releases_device_credentials(self) -> bool {
         matches!(self, Self::WithCustomer)
+    }
+
+    /// Whether a job in this state has a Snow device allocated to the account.
+    ///
+    /// `GetSnowballUsage` reports "the number of Snow devices that this account is
+    /// currently using", so a job counts while its order still holds a device. Two
+    /// `JobState` values leave an order holding none: `Cancelled`, from which no appliance
+    /// is ever prepared ("You can only cancel a job before its `JobState` value changes to
+    /// `PreparingAppliance`", `CancelJob`), and `Complete`, the state an order has finished
+    /// in, with its device back at Amazon Web Services and free for another order. From
+    /// every other state the order is live and a device is allocated to it — being
+    /// prepared, in transit either way, with the customer, or back at Amazon Web Services
+    /// with the job not yet finished.
+    pub fn holds_device(self) -> bool {
+        !matches!(self, Self::Cancelled | Self::Complete)
     }
 
     /// This state, read back from the wire value [`Self::as_wire`] spells it as, or `None`
@@ -1476,6 +1501,20 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
             .iter()
             .filter_map(|job_id| self.jobs.get(job_id))
             .collect()
+    }
+
+    /// How many Snow devices this account currently has in use.
+    ///
+    /// One device per stored job that has a device of its own and whose state has not
+    /// released it: a job that is the main job of an export order has none of its own
+    /// ([`StoredJob::is_master`]), and a state that holds no device
+    /// ([`JobState::holds_device`]) leaves the order with nothing allocated. Counted over
+    /// the whole store, so a cluster's node jobs count exactly as the devices they ordered.
+    pub fn snowball_devices_in_use(&self) -> usize {
+        self.jobs
+            .values()
+            .filter(|job| !job.is_master() && job.job_state.holds_device())
+            .count()
     }
 
     /// Issue a grant for one `file` of `job_id`, valid from `now` for that file's

@@ -118,9 +118,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `CreateAccessEntryError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#CreateAccessEntry")]
+//
+// `ClientException` is widened in through `extra_errors`: this SERVICE models that
+// shape and many of its operations declare it, but this one does not list it — and it
+// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
+// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#CreateAccessEntry",
+    extra_errors = ["ClientException"]
+)]
 #[derive(Debug)]
 pub enum CreateAccessEntryErrorModeled {
+    ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
@@ -223,6 +232,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // An access entry grants a principal access to the cluster's Kubernetes API
+        // through Amazon EKS, which a cluster `RegisterCluster` connected does not go
+        // through: EKS manages no access on it, so this operation does not apply to it.
+        // The gate is a fact about the CLUSTER, so it is answered as soon as the cluster
+        // is resolved, before anything in the body is judged against it.
+        if cluster.is_connected() {
+            return Err(CreateAccessEntryErrorModeled::ClientException(
+                state::connected_cluster_refusal(&input.cluster_name),
+            )
+            .into());
+        }
 
         // "If you don't specify a value, Amazon EKS sets the value to `STANDARD`", and the
         // set of values the member documents is the set this accepts — `type` is a

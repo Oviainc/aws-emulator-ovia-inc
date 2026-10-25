@@ -157,6 +157,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A cluster update is a change to an Amazon EKS-managed control plane, and a
+        // cluster `RegisterCluster` connected has none, so it has no update of this kind
+        // to report. The gate is a fact about the CLUSTER, so it precedes resolving the
+        // update id.
+        if record.is_connected() {
+            return Err(DescribeUpdateErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&input.name),
+            )
+            .into());
+        }
+
         // Each of these selects the updates of a resource INSIDE the cluster: "this
         // parameter is required if the update is a node group update", and the same for an
         // add-on or a capability. This service holds no nodegroup, add-on or capability at

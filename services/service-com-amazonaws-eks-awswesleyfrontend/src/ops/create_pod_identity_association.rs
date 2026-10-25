@@ -142,9 +142,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `CreatePodIdentityAssociationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#CreatePodIdentityAssociation")]
+//
+// `ClientException` is widened in through `extra_errors`: this SERVICE models that
+// shape and many of its operations declare it, but this one does not list it — and it
+// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
+// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#CreatePodIdentityAssociation",
+    extra_errors = ["ClientException"]
+)]
 #[derive(Debug)]
 pub enum CreatePodIdentityAssociationErrorModeled {
+    ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
@@ -279,16 +288,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An association is a child of a cluster, so the cluster is resolved
         // before anything is written: "You can view your available clusters with
         // ListClusters."
-        if !guard
+        let Some(cluster) = guard
             .clusters
-            .contains_key(&(region.clone(), input.cluster_name.clone()))
-        {
+            .get(&(region.clone(), input.cluster_name.clone()))
+        else {
             return Err(
                 CreatePodIdentityAssociationErrorModeled::ResourceNotFoundException(
                     crate::state::cluster_not_found(&input.cluster_name),
                 )
                 .into(),
             );
+        };
+
+        // EKS Pod Identity hands credentials to Pods through the Amazon EKS-managed
+        // plane, which a cluster `RegisterCluster` connected has none of: this operation
+        // does not apply to it. The gate is a fact about the CLUSTER, so it is answered
+        // as soon as the cluster is resolved, before anything is written.
+        if cluster.is_connected() {
+            return Err(CreatePodIdentityAssociationErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&input.cluster_name),
+            )
+            .into());
         }
 
         // One service account in one namespace can hold at most one association:

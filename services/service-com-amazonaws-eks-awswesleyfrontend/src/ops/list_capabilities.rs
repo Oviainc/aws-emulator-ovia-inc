@@ -89,10 +89,11 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // inventing a second one here.
 #[smithy_macros::operation_error(
     "com.amazonaws.eks#ListCapabilities",
-    extra_errors = ["ResourceNotFoundException"]
+    extra_errors = ["ResourceNotFoundException", "ClientException"]
 )]
 #[derive(Debug)]
 pub enum ListCapabilitiesErrorModeled {
+    ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServerException(ServerException),
@@ -189,12 +190,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // parent wins over anything else wrong with the request — a listing of a
         // cluster that does not exist is that 404 whether or not the token is also
         // malformed.
-        if !guard
+        let Some(cluster) = guard
             .clusters
-            .contains_key(&(region.clone(), input.cluster_name.clone()))
-        {
+            .get(&(region.clone(), input.cluster_name.clone()))
+        else {
             return Err(ListCapabilitiesErrorModeled::ResourceNotFoundException(
                 crate::state::cluster_not_found(&input.cluster_name),
+            )
+            .into());
+        };
+        // A managed capability is software Amazon EKS runs in the cluster's control
+        // plane, and a cluster `RegisterCluster` connected has none of that plane: this
+        // operation does not apply to it — which is a refusal, not an empty listing,
+        // because the listing itself is not something EKS keeps for that cluster.
+        if cluster.is_connected() {
+            return Err(ListCapabilitiesErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&input.cluster_name),
             )
             .into());
         }

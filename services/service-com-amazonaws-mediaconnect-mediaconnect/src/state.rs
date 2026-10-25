@@ -4536,6 +4536,42 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         ))
     }
 
+    /// Why `network_name` names no network the gateway `placement_arn` declares, or `None`
+    /// when that gateway declares one by that name. `member` is the request member that
+    /// named it, for the refusal detail.
+    ///
+    /// A bridge member that carries a gateway network name — `BridgeNetworkSource$NetworkName`
+    /// ("the network source's gateway network name") and `BridgeNetworkOutput$NetworkName`
+    /// ("the network output's gateway network name") — references a network of the ONE gateway
+    /// the bridge is placed on (`Bridge$PlacementArn`), and those names are declared per
+    /// gateway by CreateGateway: `GatewayNetwork$Name` "is used to reference the network and
+    /// must be unique among networks in this gateway". The valid set is therefore the
+    /// placement gateway's own [`StoredGateway::networks`], and a name outside it references
+    /// nothing — including every name when the store holds no gateway for `placement_arn`,
+    /// which declares no network at all. The detail is the sentence the refusal's envelope
+    /// carries ([`validation_failed_message`]), as for every other reference this store
+    /// resolves.
+    pub fn unknown_gateway_network_rejection(
+        &self,
+        member: &str,
+        placement_arn: &str,
+        network_name: &str,
+    ) -> Option<String> {
+        let declared = self.gateways.get(placement_arn).is_some_and(|gateway| {
+            gateway
+                .networks
+                .iter()
+                .any(|network| network.name == network_name)
+        });
+        if declared {
+            return None;
+        }
+        Some(format!(
+            "{member} {network_name:?} does not name a network the gateway {placement_arn:?} \
+             the bridge is placed on declares."
+        ))
+    }
+
     /// Why the router input configuration `configuration` cannot be stored because a
     /// resource of THIS service it names does not exist, or `None` when every such
     /// reference resolves.
