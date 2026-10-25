@@ -917,7 +917,7 @@ type Refusal<'a> = (&'a str, Vec<(&'a str, &'a str)>, u16, &'a str);
 async fn publish_refuses_a_request_it_cannot_deliver() {
     let sns = Sns::new();
     let topic = sns.topic("refusal-topic").await;
-    let long_subject = "s".repeat(100);
+    let long_subject = "s".repeat(101);
     let cases: Vec<Refusal> = vec![
         ("no destination", vec![("Message", "m")], 400, "InvalidParameter"),
         (
@@ -992,7 +992,7 @@ async fn publish_refuses_a_request_it_cannot_deliver() {
             "InvalidParameter",
         ),
         (
-            "a subject at the 100 character bound",
+            "a subject one character past the bound",
             vec![
                 ("Message", "m"),
                 ("TopicArn", topic.as_str()),

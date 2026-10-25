@@ -164,22 +164,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         // The rule the model cannot express: a `FindingCriteria.Criterion` key must
-        // NAME a finding attribute. The model types the criterion as a map keyed by a
+        // NAME a FIELD OF A FINDING. The model types the criterion as a map keyed by a
         // plain string, so the boundary validator accepts any key at all, and a filter
-        // whose criterion names no attribute would select nothing. The catalogue is
-        // the one `ListFindings`/`GetFindings` evaluate against and `CreateFilter`
-        // already refuses an unknown key by, so an update cannot smuggle into a saved
-        // filter a criterion a create would have refused.
+        // whose criterion names no field would select nothing. The check is the one
+        // `ListFindings`/`GetFindings` apply and `CreateFilter` already refuses an
+        // unknown key by, so an update cannot smuggle into a saved filter a criterion a
+        // create would have refused.
         //
         // Validated before the store is touched, so a refused update changes nothing.
-        crate::state::validate_finding_criteria(input.finding_criteria.as_ref()).map_err(
-            |path| {
-                bad_request(format!(
-                    "findingCriteria.criterion: '{path}' is not a finding attribute this service can filter on. Supported attributes are {}.",
-                    crate::state::FINDING_ATTRIBUTES.join(", ")
-                ))
-            },
-        )?;
+        crate::state::validate_finding_criteria(input.finding_criteria.as_ref())
+            .map_err(|rejection| bad_request(rejection.message(FINDING_CRITERIA_MEMBER)))?;
 
         // The modelled constraints — `Rank` range 1..100, `Description` len 0..512,
         // `Action` within `FilterAction` — are refused BEFORE this handler runs, as
@@ -261,3 +255,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn bad_request(message: impl Into<String>) -> UpdateFilterError {
     crate::scaffolded::Scaffolded::invalid_input(message)
 }
+
+/// The wire path of the criterion map a refusal names: `FindingCriteria` has
+/// `jsonName` `findingCriteria` and carries the keys under `criterion`
+/// (`smithy_query(operation="UpdateFilter")`).
+const FINDING_CRITERIA_MEMBER: &str = "findingCriteria.criterion";

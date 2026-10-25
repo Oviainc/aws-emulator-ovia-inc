@@ -4,11 +4,13 @@
 //!
 //! RULE under test: `Keywords` LIMITS the named registry's schemas to those indexed
 //! under every requested keyword, matched case-insensitively as a substring; what a
-//! schema is indexed under is its NAME plus the event source and detail type its
-//! document declares (an EventBridge document's `x-amazon-events-source` /
-//! `x-amazon-events-detail-type` extensions). A schema that declares no event is still
-//! indexed under its name, a value carrying no keyword limits nothing (so it reports
-//! the whole registry), and the rest of a document's text is not searched.
+//! schema is indexed under is the event source and detail type its document declares
+//! (an EventBridge document's `x-amazon-events-source` /
+//! `x-amazon-events-detail-type` extensions) — not its name and not the rest of its
+//! text. A schema that declares no event is indexed under nothing, so no keyword
+//! selects it, while a value carrying no keyword limits nothing and so reports the
+//! whole registry. The keyword index itself is pinned over a wider table in
+//! `tests/all/search_keyword_index.rs`.
 //!
 //! Every case drives the real wire path: a signed `restJson1` request through
 //! `MultiServiceRouter::dispatch`, exactly as the production router serves it. The
@@ -32,17 +34,18 @@ const REGISTRY: &str = "search-registry";
 ///
 /// Rows differ along everything the keyword rule generalises over: which of the two
 /// extensions carries the keyword, where in the document they sit (an `OpenApi3`
-/// component, a draft-04 document's own root), the case of the declared text, whether
-/// the schema declares any event keyword at all, and whether the keyword that selects
-/// it comes from its name or from its declared event.
+/// component, a draft-04 document's own root), the case of the declared text, and
+/// whether the schema declares any event keyword at all.
 struct Stored {
-    /// The schema's name — one of the values the schema is indexed under.
+    /// The schema's name — which is how it is ADDRESSED, not something it is indexed
+    /// under.
     name: &'static str,
     /// A member of `TYPE_VALUES`.
     schema_type: &'static str,
     content: &'static str,
-    /// One keyword that selects exactly this row, for the summary assertions.
-    selector: &'static str,
+    /// One keyword that selects exactly this row, for the summary assertions, or `None`
+    /// for a row no keyword selects because its document declares no event.
+    selector: Option<&'static str>,
 }
 
 /// The schemas every case below searches over.
@@ -53,7 +56,7 @@ const STORED: &[Stored] = &[
         name: "orders.placed",
         schema_type: "OpenApi3",
         content: r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"OrderPlaced"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-detail-type":"Order Placed v1","x-amazon-events-source":"my.orders","properties":{"detail":{"$ref":"#/components/schemas/OrderPlaced"}}},"OrderPlaced":{"type":"object","properties":{"id":{"type":"string"}}}}}}"##,
-        selector: "placed",
+        selector: Some("placed"),
     },
     // Declares the same source at the root of a draft-04 document: the extensions are
     // a property of the component that describes the event, wherever it sits.
@@ -61,28 +64,28 @@ const STORED: &[Stored] = &[
         name: "orders.cancelled",
         schema_type: "JSONSchemaDraft4",
         content: r##"{"$schema":"http://json-schema.org/draft-04/schema#","title":"OrderCancelled","x-amazon-events-source":"my.orders","x-amazon-events-detail-type":"Order Cancelled","type":"object"}"##,
-        selector: "cancelled",
+        selector: Some("cancelled"),
     },
     Stored {
         name: "payments",
         schema_type: "OpenApi3",
         content: r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"PaymentReceived"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-source":"my.payments","x-amazon-events-detail-type":"Payment Received","properties":{}}}}}"#,
-        selector: "received",
+        selector: Some("received"),
     },
     // Declares its event in upper case, and is selected by a lower-case keyword.
     Stored {
         name: "MiXeD-case",
         schema_type: "OpenApi3",
         content: r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Mixed"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-source":"my.MIXED","x-amazon-events-detail-type":"Case SHIFTED","properties":{}}}}}"#,
-        selector: "shifted",
+        selector: Some("shifted"),
     },
-    // Declares NO event: a document a caller wrote by hand. It is indexed under its
-    // name alone, so a keyword of that name — and only of that name — selects it.
+    // Declares NO event: a document a caller wrote by hand. It is indexed under
+    // nothing, so no keyword selects it — not even one of its own name.
     Stored {
         name: "orders-report",
         schema_type: "OpenApi3",
         content: r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Orders report"},"paths":{},"components":{"schemas":{"Report":{"type":"object","properties":{"orders":{"type":"array","items":{"type":"string"}}}}}}}"#,
-        selector: "report",
+        selector: None,
     },
     // A draft-04 document with no EventBridge extension either, whose name shares no
     // substring with any other row: the ordinary `CreateSchema` case.
@@ -90,7 +93,7 @@ const STORED: &[Stored] = &[
         name: "invoice-v2",
         schema_type: "JSONSchemaDraft4",
         content: r##"{"$schema":"http://json-schema.org/draft-04/schema#","title":"Invoice","type":"object","properties":{"total":{"type":"number"}}}"##,
-        selector: "invoice",
+        selector: None,
     },
 ];
 
@@ -123,8 +126,8 @@ async fn seed(emulator: &Emulator) {
 }
 
 /// RULE: a search reports exactly the schemas of the named registry indexed under
-/// EVERY keyword the request names — their name and their declared event source and
-/// detail type, matched as case-insensitive substrings — and a request that names no
+/// EVERY keyword the request names — the event source and detail type their documents
+/// declare, matched as case-insensitive substrings — and a request that names no
 /// keyword limits nothing.
 #[tokio::test]
 async fn keywords_select_exactly_the_schemas_indexed_under_them() {
@@ -145,11 +148,11 @@ async fn keywords_select_exactly_the_schemas_indexed_under_them() {
     for (keywords, expected) in [
         // The whole declared source, and a substring of it.
         ("my.orders", vec!["orders.cancelled", "orders.placed"]),
-        // One keyword reaching two rows through their declared source and a third
-        // through its name alone.
-        ("orders", vec!["orders.cancelled", "orders.placed", "orders-report"]),
+        // One keyword reaching the two rows that declare it as their source; the third
+        // row carrying it in its NAME is not reached, because a name is not indexed.
+        ("orders", vec!["orders.cancelled", "orders.placed"]),
         // Matching is case-insensitive on both sides.
-        ("ORDERS", vec!["orders.cancelled", "orders.placed", "orders-report"]),
+        ("ORDERS", vec!["orders.cancelled", "orders.placed"]),
         ("mixed", vec!["MiXeD-case"]),
         ("SHIFTED", vec!["MiXeD-case"]),
         // A keyword of the declared detail type rather than of the source.
@@ -160,15 +163,17 @@ async fn keywords_select_exactly_the_schemas_indexed_under_them() {
         ("orders placed", vec!["orders.placed"]),
         ("my,cancelled", vec!["orders.cancelled"]),
         ("orders zzz", vec![]),
-        // A schema's NAME selects it, whole or in part, whatever (or nothing) its
-        // document declares: these two rows declare no event at all.
-        ("report", vec!["orders-report"]),
-        ("orders-report", vec!["orders-report"]),
-        ("INVOICE", vec!["invoice-v2"]),
-        ("invoice-v2", vec!["invoice-v2"]),
-        // A keyword that is a name substring of one row and a declared-detail-type
-        // substring of another selects each on its own.
-        ("v2", vec!["invoice-v2"]),
+        // A schema's NAME selects nothing — whole or in part, and whether or not its
+        // document declares an event: these keywords occur in a stored name and
+        // nowhere a schema is indexed under.
+        ("report", vec![]),
+        ("orders-report", vec![]),
+        ("INVOICE", vec![]),
+        ("invoice-v2", vec![]),
+        ("v2", vec![]),
+        ("orders.placed", vec![]),
+        // A keyword of a DECLARED detail type still selects, even where it also looks
+        // like a name fragment.
         ("V1", vec!["orders.placed"]),
         // The rest of the document is NOT searched: every row's text carries
         // "openapi"/"3.0.0" or a `total` property, and none is indexed under them.
@@ -211,8 +216,12 @@ async fn a_match_reports_the_stored_schema_and_its_versions() {
     seed(&emulator).await;
 
     for stored in STORED {
-        let selector = stored.selector;
         let name = stored.name;
+        // A row its document makes searchable is read back through the keyword that
+        // selects it; a row that declares no event is indexed under nothing, so it is
+        // read back through the search that names no keyword and therefore limits
+        // nothing — the only search that reports it.
+        let selector = stored.selector.unwrap_or("");
         let answer = emulator
             .call("GET", &search_uri(REGISTRY, selector), None)
             .await;
@@ -224,12 +233,26 @@ async fn a_match_reports_the_stored_schema_and_its_versions() {
         let matches = answer.body["Schemas"]
             .as_array()
             .unwrap_or_else(|| panic!("case {name:?}: expected a Schemas array in {:?}", answer.body));
-        assert_eq!(
-            matches.len(),
-            1,
-            "case {name:?}: only this schema is indexed under {selector:?}, got {matches:?}"
-        );
-        let summary = &matches[0];
+        if stored.selector.is_some() {
+            assert_eq!(
+                matches.len(),
+                1,
+                "case {name:?}: only this schema is indexed under {selector:?}, got {matches:?}"
+            );
+        } else {
+            assert_eq!(
+                matches.len(),
+                STORED.len(),
+                "case {name:?}: a search naming no keyword reports the whole registry, \
+                 got {matches:?}"
+            );
+        }
+        let summary = matches
+            .iter()
+            .find(|item| item["SchemaName"].as_str() == Some(name))
+            .unwrap_or_else(|| {
+                panic!("case {name:?}: expected it among the matches of {selector:?}, got {matches:?}")
+            });
 
         assert_eq!(
             summary["RegistryName"].as_str(),
@@ -295,8 +318,15 @@ async fn a_match_reports_the_stored_schema_and_its_versions() {
         let again = emulator
             .call("GET", &search_uri(REGISTRY, selector), None)
             .await;
+        let again_summary = again.body["Schemas"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {name:?}: expected a Schemas array in {:?}", again.body))
+            .iter()
+            .find(|item| item["SchemaName"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("case {name:?}: the second search must report it too"))
+            .clone();
         assert_eq!(
-            again.body["Schemas"][0]["SchemaVersions"][0]["CreatedDate"],
+            again_summary["SchemaVersions"][0]["CreatedDate"],
             versions[0]["CreatedDate"],
             "case {name:?}: CreatedDate must not change between searches"
         );
@@ -403,7 +433,7 @@ async fn a_token_or_limit_a_search_cannot_serve_is_refused() {
         .body
         .get("NextToken")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("three schemas are indexed under this keyword, so page 1 carries a token: {:?}", first.body))
+        .unwrap_or_else(|| panic!("two schemas are indexed under this keyword, so page 1 carries a token: {:?}", first.body))
         .to_string();
 
     // Rows: the token's own search resumes; every other selection, and an unusable

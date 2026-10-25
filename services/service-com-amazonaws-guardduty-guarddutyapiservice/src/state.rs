@@ -1847,6 +1847,15 @@ pub fn malware_protection_plan_arn(region: &str, id: &str) -> String {
 /// from `smithy_query(query="service_info")`.
 const GUARDDUTY_ARN_SERVICE: &str = "guardduty";
 
+/// The value `Service.ServiceName` carries on every finding: "The name of the Amazon
+/// Web Services service (GuardDuty) that generated a finding"
+/// (`smithy_query(shape="Service")`).
+///
+/// Held beside the finding record because both the reported finding and the criterion
+/// resolver read it, so a filter on `service.serviceName` cannot disagree with the
+/// value a findings read reports.
+pub const GUARDDUTY_SERVICE_NAME: &str = "guardduty";
+
 /// The wire name of the filter-name member on the operations that carry it as a
 /// URI label — `GetFilter`, `UpdateFilter` and `DeleteFilter` bind
 /// `FilterName` to `/detector/{DetectorId}/filter/{FilterName}`
@@ -4517,11 +4526,16 @@ pub fn finding_type_threat_family(finding_type: &str) -> &str {
     finding_type.rsplit('/').next().unwrap_or("")
 }
 
-/// The finding attribute paths this emulator can filter and sort on, as the
-/// `Finding` shape's `jsonName`s name them
-/// (`smithy_query(shape="Finding")`), plus the nested paths GuardDuty's own filter
-/// documentation uses.
-pub const FINDING_ATTRIBUTES: [&str; 16] = [
+/// The finding fields a STORED record populates, so the ones a criterion or a sort
+/// actually discriminates on, as the `Finding`, `Resource` and `Service` shapes'
+/// `jsonName`s name them (`smithy_query(shape="Finding")`,
+/// `smithy_query(shape="Resource")`, `smithy_query(shape="Service")`).
+///
+/// This is NOT the set a criterion key may name — that is every field of a finding
+/// ([`is_finding_field`]). A field a finding may carry but this emulator's records do
+/// not populate selects no finding rather than refusing the request, exactly as a
+/// finding without a value for it behaves on the real service.
+pub const FINDING_ATTRIBUTES: [&str; 23] = [
     "accountId",
     "arn",
     "confidence",
@@ -4532,27 +4546,203 @@ pub const FINDING_ATTRIBUTES: [&str; 16] = [
     "region",
     "resource.resourceType",
     "schemaVersion",
+    "service.additionalInfo.sample",
     "service.archived",
+    "service.count",
     "service.detectorId",
+    "service.eventFirstSeen",
+    "service.eventLastSeen",
+    "service.resourceRole",
+    "service.serviceName",
+    "service.userFeedback",
     "severity",
     "title",
     "type",
     "updatedAt",
 ];
 
-/// Can this emulator evaluate `path` as a finding attribute? Decided from the
-/// catalogue rather than from a sample record, so an empty result set refuses an
-/// attribute path exactly as a populated one does.
-pub fn supports_attribute(path: &str) -> bool {
-    FINDING_ATTRIBUTES.contains(&path)
+/// The subset of [`FINDING_ATTRIBUTES`] that resolves to a NUMBER, so the subset an
+/// ordering condition can compare. The timestamps are compared as epoch milliseconds
+/// and reported as ISO-8601 text, which is how GuardDuty's own filters treat them
+/// ("Type: Timestamp in Unix Epoch millisecond format",
+/// `smithy_query(query="doc",shape="CreateFilterRequest",member="FindingCriteria")`).
+const NUMERIC_FINDING_ATTRIBUTES: [&str; 7] = [
+    "confidence",
+    "createdAt",
+    "service.count",
+    "service.eventFirstSeen",
+    "service.eventLastSeen",
+    "severity",
+    "updatedAt",
+];
+
+/// The `Finding` members that carry a SCALAR, by `jsonName`
+/// (`smithy_query(shape="Finding")`): a criterion key or a sort attribute names one
+/// of these on its own, with nothing beneath it.
+const FINDING_SCALAR_FIELDS: [&str; 15] = [
+    "accountId",
+    "arn",
+    "associatedAttackSequenceArn",
+    "confidence",
+    "createdAt",
+    "customDetectionRuleName",
+    "description",
+    "id",
+    "partition",
+    "region",
+    "schemaVersion",
+    "severity",
+    "title",
+    "type",
+    "updatedAt",
+];
+
+/// The `jsonName` of the `Finding` member carrying the affected resource, and of the
+/// one carrying what the service observed (`smithy_query(shape="Finding")`). A
+/// criterion key reaches BELOW the top level only through these two.
+const RESOURCE_FIELD: &str = "resource";
+/// See [`RESOURCE_FIELD`].
+const SERVICE_FIELD: &str = "service";
+
+/// The `Resource` members that carry a scalar, by `jsonName`
+/// (`smithy_query(shape="Resource")`).
+const RESOURCE_SCALAR_FIELDS: [&str; 1] = ["resourceType"];
+
+/// The `Resource` members that carry a nested detail document, by `jsonName`
+/// (`smithy_query(shape="Resource")`): the fields of that document are what the
+/// remaining segments of a criterion key address.
+const RESOURCE_DOCUMENT_FIELDS: [&str; 17] = [
+    "accessKeyDetails",
+    "bedrockGuardrailDetails",
+    "containerDetails",
+    "ebsSnapshotDetails",
+    "ebsVolumeDetails",
+    "ec2ImageDetails",
+    "ecsClusterDetails",
+    "eksClusterDetails",
+    "instanceDetails",
+    "kubernetesDetails",
+    "lambdaDetails",
+    "modelDetails",
+    "rdsDbInstanceDetails",
+    "rdsDbUserDetails",
+    "rdsLimitlessDbDetails",
+    "recoveryPointDetails",
+    "s3BucketDetails",
+];
+
+/// The `Service` members that carry a scalar, by `jsonName`
+/// (`smithy_query(shape="Service")`).
+const SERVICE_SCALAR_FIELDS: [&str; 9] = [
+    "archived",
+    "count",
+    "detectorId",
+    "eventFirstSeen",
+    "eventLastSeen",
+    "featureName",
+    "resourceRole",
+    "serviceName",
+    "userFeedback",
+];
+
+/// The `Service` members that carry a nested document, by `jsonName`
+/// (`smithy_query(shape="Service")`). See [`RESOURCE_DOCUMENT_FIELDS`].
+const SERVICE_DOCUMENT_FIELDS: [&str; 7] = [
+    "action",
+    "additionalInfo",
+    "detection",
+    "ebsVolumeScanDetails",
+    "evidence",
+    "malwareScanDetails",
+    "runtimeDetails",
+];
+
+/// Is `path` a FIELD OF A FINDING — a name a `FindingCriteria.Criterion` key or a
+/// `SortCriteria.AttributeName` may carry?
+///
+/// Decided from the finding's own shape rather than from what this emulator happens to
+/// store, and before any finding is looked at, so the answer does not depend on how
+/// many findings exist: the first segment must be a `Finding` member's `jsonName`, and
+/// a path that continues must continue through the `resource` or `service`
+/// sub-document, whose next segment must be a member of that shape. A member carrying
+/// a scalar ENDS the path — there is nothing beneath it to name — while a member
+/// carrying a nested detail document takes at least one further segment, naming a field
+/// of that document the way the model's list of fields available for filtering does
+/// (`smithy_query(query="doc",shape="CreateFilterRequest",member="FindingCriteria")`).
+pub fn is_finding_field(path: &str) -> bool {
+    let mut segments = path.split('.');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    let rest: Vec<&str> = segments.collect();
+    match first {
+        RESOURCE_FIELD => {
+            sub_document_field(&rest, &RESOURCE_SCALAR_FIELDS, &RESOURCE_DOCUMENT_FIELDS)
+        }
+        SERVICE_FIELD => sub_document_field(&rest, &SERVICE_SCALAR_FIELDS, &SERVICE_DOCUMENT_FIELDS),
+        _ => rest.is_empty() && FINDING_SCALAR_FIELDS.contains(&first),
+    }
 }
 
-/// Resolve one finding attribute by its wire path, or `None` when this emulator
-/// does not model that path.
+/// Do the segments BELOW `resource` or `service` name a field of that sub-document?
+///
+/// `scalars` are its members that end a path and `documents` those that take one, so
+/// the two shapes are checked by the same rule and cannot drift apart.
+fn sub_document_field(rest: &[&str], scalars: &[&str], documents: &[&str]) -> bool {
+    let Some((member, deeper)) = rest.split_first() else {
+        // The sub-document itself is not a field: there is no value to compare.
+        return false;
+    };
+    if scalars.contains(member) {
+        return deeper.is_empty();
+    }
+    documents.contains(member) && !deeper.is_empty() && deeper.iter().all(|s| is_field_name(s))
+}
+
+/// Is `segment` a well-formed field name — the lower camel-case run of ASCII letters
+/// and digits every field name in the model's filterable-field list is?
+fn is_field_name(segment: &str) -> bool {
+    segment.starts_with(|c: char| c.is_ascii_lowercase())
+        && segment.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Why a criterion key or a sort attribute was refused, with the message that says so.
+///
+/// One type for every operation that accepts a `FindingCriteria` or a `SortCriteria`,
+/// so all of them answer an unacceptable name with the same words under their own
+/// member name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CriterionRejection {
+    /// The name is not a field of a finding at all, so nothing could ever be selected
+    /// or ordered by it.
+    UnknownField(String),
+    /// It names a field, but not one an ordering condition can compare.
+    NotOrderable(String),
+}
+
+impl CriterionRejection {
+    /// The refusal message, naming the request `member` that carried the name.
+    pub fn message(&self, member: &str) -> String {
+        match self {
+            Self::UnknownField(path) => format!(
+                "{member}: '{path}' is not a field of a GuardDuty finding, so no finding can be selected or ordered by it."
+            ),
+            Self::NotOrderable(path) => format!(
+                "{member}: '{path}' is not a finding field an ordering condition can compare: it has no numeric form."
+            ),
+        }
+    }
+}
+
+/// Resolve one finding attribute by its wire path, or `None` when the finding carries
+/// NO VALUE for that field — either because the field is one this emulator's records do
+/// not populate, or because this record has not got it (no feedback submitted, not a
+/// generated sample).
 ///
 /// `updatedAt` is accepted as well as `createdAt`; both are compared as epoch
 /// milliseconds by the ordering conditions and as ISO-8601 text by the equality
-/// ones, which is how GuardDuty's own filters treat them.
+/// ones, which is how GuardDuty's own filters treat them, and the service document's
+/// two activity timestamps follow the same convention.
 pub fn finding_attribute(finding: &FindingRecord, path: &str) -> Option<Attribute> {
     let attr = match path {
         "accountId" => Attribute::Text(finding.account_id.clone()),
@@ -4566,8 +4756,19 @@ pub fn finding_attribute(finding: &FindingRecord, path: &str) -> Option<Attribut
         "region" => Attribute::Text(finding.region.clone()),
         "resource.resourceType" => Attribute::Text(finding.resource_type.clone()),
         "schemaVersion" => Attribute::Text(finding.schema_version.clone()),
+        // The additional-information document carries the `sample` marker on a
+        // generated sample finding and nothing at all on anything else, so the field
+        // is absent rather than false on a finding that is not a sample.
+        "service.additionalInfo.sample" if finding.sample => Attribute::Text(true.to_string()),
         "service.archived" => Attribute::Text(finding.archived.to_string()),
+        "service.count" => Attribute::Number(f64::from(finding.count)),
         "service.detectorId" => Attribute::Text(finding.detector_id.clone()),
+        "service.eventFirstSeen" => Attribute::Number(finding.created_at_millis as f64),
+        "service.eventLastSeen" => Attribute::Number(finding.event_last_seen_millis as f64),
+        "service.resourceRole" => Attribute::Text(finding.resource_role.clone()),
+        "service.serviceName" => Attribute::Text(GUARDDUTY_SERVICE_NAME.to_string()),
+        // Absent until an `UpdateFindingsFeedback` call records one.
+        "service.userFeedback" => Attribute::Text(finding.user_feedback.clone()?),
         "severity" => Attribute::Number(finding.severity),
         "title" => Attribute::Text(finding.title.clone().unwrap_or_default()),
         "type" => Attribute::Text(finding.r#type.clone()),
@@ -4576,41 +4777,46 @@ pub fn finding_attribute(finding: &FindingRecord, path: &str) -> Option<Attribut
     Some(attr)
 }
 
-/// A finding attribute rendered for EQUALITY comparison. `createdAt` /
-/// `updatedAt` compare as their ISO-8601 text, every other attribute as its own
-/// textual form.
+/// A finding attribute rendered for EQUALITY comparison. A timestamp compares as its
+/// ISO-8601 text — the form the finding reports it in — and every other attribute as
+/// its own textual form.
 fn equality_text(finding: &FindingRecord, path: &str) -> Option<String> {
     match path {
-        "createdAt" => Some(iso8601(finding.created_at_millis)),
+        "createdAt" | "service.eventFirstSeen" => Some(iso8601(finding.created_at_millis)),
         "updatedAt" => Some(iso8601(finding.updated_at_millis)),
+        "service.eventLastSeen" => Some(iso8601(finding.event_last_seen_millis)),
         _ => finding_attribute(finding, path).map(|a| a.as_text()),
     }
 }
 
 /// Does `finding` satisfy one `Condition` on `path`?
 ///
-/// `Err(path)` means the emulator does not model that attribute path, which the
-/// caller turns into a refusal rather than silently returning every finding.
+/// `Err` means `path` names no field of a finding, which the caller turns into a
+/// refusal rather than silently returning every finding. A finding that carries NO
+/// VALUE for a field it could have satisfies only the negative conditions on it: an
+/// absent value equals nothing and matches no pattern, so it cannot be selected by an
+/// equality, a pattern or an ordering, and cannot be excluded by a negation.
 /// Within one condition every populated operator must hold, which is how
 /// GuardDuty composes a criterion.
 pub fn condition_matches(
     finding: &FindingRecord,
     path: &str,
     condition: &crate::ops::types::Condition,
-) -> Result<bool, String> {
-    if !supports_attribute(path) {
-        return Err(path.to_string());
+) -> Result<bool, CriterionRejection> {
+    if !is_finding_field(path) {
+        return Err(CriterionRejection::UnknownField(path.to_string()));
     }
-    let Some(attr) = finding_attribute(finding, path) else {
-        return Err(path.to_string());
-    };
-    let text = equality_text(finding, path).unwrap_or_else(|| attr.as_text());
+    let resolved = finding_attribute(finding, path);
+    let text = equality_text(finding, path);
 
     // `Equals`/`NotEquals` and the deprecated `Eq`/`Neq` are the same comparison;
     // a list holds alternatives, so `Equals` passes when ANY entry matches and
     // `NotEquals` passes only when NONE does.
     for list in [condition.equals.as_ref(), condition.eq.as_ref()].into_iter().flatten() {
-        if !list.is_empty() && !list.contains(&text) {
+        if list.is_empty() {
+            continue;
+        }
+        if !text.as_ref().is_some_and(|value| list.contains(value)) {
             return Ok(false);
         }
     }
@@ -4618,7 +4824,7 @@ pub fn condition_matches(
         .into_iter()
         .flatten()
     {
-        if list.contains(&text) {
+        if text.as_ref().is_some_and(|value| list.contains(value)) {
             return Ok(false);
         }
     }
@@ -4636,8 +4842,12 @@ pub fn condition_matches(
     ];
     for (bound, ordering) in bounds {
         let Some(bound) = bound else { continue };
-        let Some(value) = attr.as_number() else {
-            return Err(path.to_string());
+        let Some(value) = resolved.as_ref().and_then(Attribute::as_number) else {
+            if !attribute_is_orderable(path) {
+                return Err(CriterionRejection::NotOrderable(path.to_string()));
+            }
+            // A field with no value to order selects nothing.
+            return Ok(false);
         };
         let holds = match ordering {
             Ordering::Gt => value > bound,
@@ -4654,12 +4864,18 @@ pub fn condition_matches(
     // `*` stands for any run of characters; like the equality lists, a list holds
     // alternatives.
     if let Some(patterns) = condition.matches.as_ref() {
-        if !patterns.is_empty() && !patterns.iter().any(|p| wildcard_matches(p, &text)) {
+        let selected = text
+            .as_ref()
+            .is_some_and(|value| patterns.iter().any(|p| wildcard_matches(p, value)));
+        if !patterns.is_empty() && !selected {
             return Ok(false);
         }
     }
     if let Some(patterns) = condition.not_matches.as_ref() {
-        if patterns.iter().any(|p| wildcard_matches(p, &text)) {
+        let excluded = text
+            .as_ref()
+            .is_some_and(|value| patterns.iter().any(|p| wildcard_matches(p, value)));
+        if excluded {
             return Ok(false);
         }
     }
@@ -4704,7 +4920,7 @@ enum Ordering {
 pub fn finding_matches(
     finding: &FindingRecord,
     criteria: Option<&crate::ops::types::FindingCriteria>,
-) -> Result<bool, String> {
+) -> Result<bool, CriterionRejection> {
     let Some(criterion) = criteria.and_then(|c| c.criterion.as_ref()) else {
         return Ok(true);
     };
@@ -4716,21 +4932,20 @@ pub fn finding_matches(
     Ok(true)
 }
 
-/// Refuse a `FindingCriteria` this emulator cannot evaluate, naming the attribute
-/// path.
+/// Refuse a `FindingCriteria` this service cannot answer, naming the field path.
 ///
 /// Checked BEFORE any finding is looked at, so whether a criterion is refused does
 /// not depend on how many findings happen to be stored: a detector with none must
 /// answer an unevaluable criterion exactly as a populated one does.
 pub fn validate_finding_criteria(
     criteria: Option<&crate::ops::types::FindingCriteria>,
-) -> Result<(), String> {
+) -> Result<(), CriterionRejection> {
     let Some(criterion) = criteria.and_then(|c| c.criterion.as_ref()) else {
         return Ok(());
     };
     for (path, condition) in criterion {
-        if !supports_attribute(path) {
-            return Err(path.clone());
+        if !is_finding_field(path) {
+            return Err(CriterionRejection::UnknownField(path.clone()));
         }
         let orders_numerically = condition.greater_than.is_some()
             || condition.greater_than_or_equal.is_some()
@@ -4740,29 +4955,35 @@ pub fn validate_finding_criteria(
             || condition.gte.is_some()
             || condition.lt.is_some()
             || condition.lte.is_some();
-        if orders_numerically && !attribute_is_numeric(path) {
-            return Err(path.clone());
+        if orders_numerically && !attribute_is_orderable(path) {
+            return Err(CriterionRejection::NotOrderable(path.clone()));
         }
     }
     Ok(())
 }
 
-/// Which finding attributes an ordering condition can compare. `createdAt` /
-/// `updatedAt` order as epoch milliseconds, the way GuardDuty's own filters compare
-/// them.
-fn attribute_is_numeric(path: &str) -> bool {
-    matches!(path, "confidence" | "createdAt" | "severity" | "updatedAt")
+/// Can an ordering condition compare the field at `path`?
+///
+/// A field this service resolves from a stored record has a KNOWN form, so an ordering
+/// condition on one it resolves as text is refused rather than quietly selecting
+/// nothing. A field a finding may carry but a stored record does not populate has no
+/// form here to contradict, so an ordering condition on it is accepted and simply
+/// selects no finding.
+fn attribute_is_orderable(path: &str) -> bool {
+    NUMERIC_FINDING_ATTRIBUTES.contains(&path) || !FINDING_ATTRIBUTES.contains(&path)
 }
 
 /// Order `findings` for `ListFindings` / `GetFindings`.
 ///
 /// With no `SortCriteria` the newest finding comes first, with the finding id
-/// breaking ties so the order is total and a page token stays meaningful.
-/// `Err(attribute)` means the emulator does not model that sort attribute.
+/// breaking ties so the order is total and a page token stays meaningful. A sort
+/// attribute that names no field of a finding is refused; one that names a field no
+/// stored record populates leaves every record equal, so the tiebreaker alone orders
+/// them.
 pub fn sort_findings(
     findings: &mut [&FindingRecord],
     sort: Option<&crate::ops::types::SortCriteria>,
-) -> Result<(), String> {
+) -> Result<(), CriterionRejection> {
     let attribute = sort
         .and_then(|s| s.attribute_name.as_deref())
         .filter(|a| !a.is_empty());
@@ -4774,8 +4995,8 @@ pub fn sort_findings(
         _ => attribute.is_none(),
     };
     let attribute = attribute.unwrap_or("createdAt");
-    if !supports_attribute(attribute) {
-        return Err(attribute.to_string());
+    if !is_finding_field(attribute) {
+        return Err(CriterionRejection::UnknownField(attribute.to_string()));
     }
 
     findings.sort_by(|a, b| {

@@ -141,6 +141,23 @@ const MAX_ENTRY_ID_CHARS: usize = 80;
 /// fails on its own, inside a request the batch still answers 200 for.
 const INVALID_PARAMETER_CODE: &str = "InvalidParameter";
 
+/// The sentence SNS refuses a batch of more than [`MAX_BATCH_ENTRIES`] entries with:
+/// the condition alone, with neither the count sent nor the maximum in it.
+const TOO_MANY_ENTRIES_REFUSAL: &str = "The batch request contains more entries than permissible.";
+
+/// The sentence SNS refuses a batch whose combined size is past the topic's ceiling
+/// with: the condition alone, with neither the combined size nor the ceiling in it.
+const BATCH_TOO_LONG_REFUSAL: &str =
+    "The length of all the messages put together is more than the limit.";
+
+/// The sentence SNS refuses an entry `Id` that is not 1 to [`MAX_ENTRY_ID_CHARS`]
+/// alphanumerics, hyphens or underscores with: the condition, whichever half of the
+/// rule the id broke, and never the id the caller sent — "The `Id` of a batch entry in
+/// a batch request doesn't abide by the specification"
+/// (`InvalidBatchEntryIdException` doc).
+const INVALID_ENTRY_ID_REFUSAL: &str =
+    "The Id of a batch entry in a batch request doesn't abide by the specification.";
+
 /// Whether a batch entry's `Id` abides by the rule its doc states: 1 to 80
 /// characters, each an ASCII alphanumeric, a hyphen or an underscore.
 fn entry_id_is_valid(id: &str) -> bool {
@@ -285,11 +302,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PublishBatchErrorModeled::TooManyEntriesInBatchRequestException(
                     TooManyEntriesInBatchRequestException {
-                        message: Some(format!(
-                            "The batch request contains more entries than permissible: \
-                             {} entries were sent, and the maximum is {MAX_BATCH_ENTRIES}.",
-                            entries.len()
-                        )),
+                        message: Some(TOO_MANY_ENTRIES_REFUSAL.to_string()),
                     },
                 )
                 .into(),
@@ -298,15 +311,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every entry is identified before any of them is published: the id is how the
         // response reports an entry's own result, so a batch SNS could not report on
         // fails as a whole rather than entry by entry.
-        if let Some(entry) = entries.iter().find(|entry| !entry_id_is_valid(&entry.id)) {
+        if entries.iter().any(|entry| !entry_id_is_valid(&entry.id)) {
             return Err(PublishBatchErrorModeled::InvalidBatchEntryIdException(
                 InvalidBatchEntryIdException {
-                    message: Some(format!(
-                        "The Id of a batch entry in a batch request doesn't abide by the \
-                         specification: an Id has 1 to {MAX_ENTRY_ID_CHARS} alphanumeric, \
-                         hyphen or underscore characters, and this one has {}.",
-                        entry.id.chars().count()
-                    )),
+                    message: Some(INVALID_ENTRY_ID_REFUSAL.to_string()),
                 },
             )
             .into());
@@ -353,11 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if combined > ceiling {
                 return Err(PublishBatchErrorModeled::BatchRequestTooLongException(
                     BatchRequestTooLongException {
-                        message: Some(format!(
-                            "The length of all the batch messages put together is more than \
-                             the limit: {combined} bytes exceeds the topic's limit of \
-                             {ceiling} bytes."
-                        )),
+                        message: Some(BATCH_TOO_LONG_REFUSAL.to_string()),
                     },
                 )
                 .into());
@@ -425,7 +429,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // doc).
                 let sequence_number = topic.is_fifo.then(|| store.next_sequence_number());
                 let message_id = store.next_unique_id();
-                let published = PublishedMessage {
+                // ONE record per entry, SHARED by every subscription that receives it.
+                let published = ::std::sync::Arc::new(PublishedMessage {
                     message_id: message_id.clone(),
                     topic_arn: topic.arn.clone(),
                     message: entry.message,
@@ -436,13 +441,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message_deduplication_id,
                     sequence_number: sequence_number.clone(),
                     published_at: std::time::SystemTime::now(),
-                };
+                });
                 // The deliveries this entry owes to the SQS queues subscribed to the topic,
                 // built through `Publish`'s one definition of the envelope, within the
                 // batch's shared budget, and performed below with the lock released.
                 deliveries.extend(queue_deliveries(&recipients, &published, &mut budget));
                 for recipient in &recipients {
-                    store.record_delivery(&recipient.arn, published.clone());
+                    store.record_delivery(&recipient.arn, ::std::sync::Arc::clone(&published));
                 }
 
                 successful.push(PublishBatchResultEntry {

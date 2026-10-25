@@ -207,13 +207,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Validated up front, so a detector with no findings refuses an unevaluable
         // criterion exactly as a populated one does.
         crate::state::validate_finding_criteria(input.finding_criteria.as_ref())
-            .map_err(|path| unsupported_attribute(&path))?;
+            .map_err(|rejection| refusal(&rejection))?;
         let mut matched: Vec<&crate::state::FindingRecord> = Vec::new();
         for finding in detector.findings.values() {
             match crate::state::finding_matches(finding, input.finding_criteria.as_ref()) {
                 Ok(true) => matched.push(finding),
                 Ok(false) => {}
-                Err(path) => return Err(unsupported_attribute(&path)),
+                Err(rejection) => return Err(refusal(&rejection)),
             }
         }
 
@@ -312,14 +312,11 @@ fn bad_request(message: impl Into<String>) -> GetFindingsStatisticsError {
     crate::scaffolded::Scaffolded::invalid_input(message)
 }
 
-/// Refuse a finding attribute path this emulator does not model, naming the member and
-/// the paths it does support. Silently ignoring a criterion would count findings the
-/// caller asked to exclude.
-fn unsupported_attribute(path: &str) -> GetFindingsStatisticsError {
-    bad_request(format!(
-        "{FINDING_CRITERIA_MEMBER}: '{path}' is not a finding attribute this service can filter on. Supported attributes are {}.",
-        crate::state::FINDING_ATTRIBUTES.join(", ")
-    ))
+/// Refuse a criterion key this service cannot answer, naming the member it arrived
+/// under. Silently ignoring a criterion would count findings the caller asked to
+/// exclude.
+fn refusal(rejection: &crate::state::CriterionRejection) -> GetFindingsStatisticsError {
+    bad_request(rejection.message(FINDING_CRITERIA_MEMBER))
 }
 
 /// A count of findings per severity: the deprecated `COUNT_BY_SEVERITY` answer.

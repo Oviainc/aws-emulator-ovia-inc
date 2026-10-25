@@ -76,8 +76,10 @@ fn ghost_arn(region: &str, account: &str, name_and_suffix: &str) -> String {
 ///
 /// `pub(crate)` so every suite that needs an ARN no store ever held draws from one set.
 pub(crate) fn ghost_arns() -> Vec<String> {
-    // 244 name characters + '-' + 10 suffix characters = the 255-character maximum the
-    // `WorkflowArn` resource segment allows.
+    // 244 name characters + '-' + 10 suffix characters: a long resource segment, though
+    // not the longest the pattern admits (its name segment is
+    // `[a-zA-Z0-9][a-zA-Z0-9\.\-_]{0,254}`, so up to 255 characters before the suffix —
+    // `child_listing_absent_parent_walk` is the suite that pushes that bound).
     let longest = format!("{}-0123456789", "n".repeat(244));
     vec![
         ghost_arn("us-west-2", "000000000000", "a-0123456789"),

@@ -42,6 +42,7 @@ use std::time::SystemTime;
 // The owning service crates, aliased to the role they play here. Each is
 // declared `{ workspace = true }` in this crate's `Cargo.toml`, so the path the
 // workspace resolves them at stays in one place.
+use service_com_amazonaws_apigateway_backplanecontrolservice as owner_apigateway;
 use service_com_amazonaws_ecs_amazonec2containerservicev20141113 as owner_ecs;
 use service_com_amazonaws_eventbridge_awsevents as owner_events;
 use service_com_amazonaws_glue_awsglue as owner_glue;
@@ -121,8 +122,16 @@ impl Change<'_> {
 /// code and its own message, with the 400 the tagging API reports for a
 /// resource-level client fault.
 fn absent(code: &str, message: String) -> Resolution {
+    absent_with_status(400, code, message)
+}
+
+/// The same per-resource failure for an owning service whose error for this fault
+/// carries another HTTP status: `FailureInfo` reports "the HTTP status code of the
+/// common error" beside "any valid error code returned by the … service that hosts
+/// the resource", so both fields are that service's own.
+fn absent_with_status(status_code: i32, code: &str, message: String) -> Resolution {
     Resolution::Absent(FailureInfo {
-        status_code: 400,
+        status_code,
         error_code: Some(code.to_string()),
         error_message: Some(message),
     })
@@ -199,6 +208,7 @@ pub fn visit<Eng: Send + Sync + 'static>(
     change: Option<&Change<'_>>,
 ) -> Resolution {
     match arn.service.as_str() {
+        "apigateway" => apigateway(engine, arn, change),
         "sqs" => sqs(engine, arn, change),
         "ecs" => ecs(engine, arn, change),
         "events" => events(engine, arn, change),
@@ -213,8 +223,9 @@ pub fn visit<Eng: Send + Sync + 'static>(
 /// Every resource an owning service itself holds tags for, as `(ARN, tags)`.
 ///
 /// Only resources carrying at least one tag: "`GetResources` does not return
-/// untagged resources." `region` is the serving region, needed for the one
-/// resource whose ARN is derived rather than stored (an EventBridge event bus).
+/// untagged resources." `region` is the serving region, needed by every owner
+/// whose records carry no region of their own, so their ARNs are derived rather
+/// than stored.
 pub fn tagged_resources<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
@@ -225,6 +236,13 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
             found.push((arn, tags));
         }
     };
+
+    if let Some(state) = owner_apigateway::state::service_state(engine) {
+        for (arn, tags) in owner_apigateway::state::tag_index::tagged_resources(&state.lock(), region)
+        {
+            record(arn, tags);
+        }
+    }
 
     if let Some(state) = owner_sqs::state::service_state(engine) {
         for queue in state.lock().queues.values() {
@@ -301,6 +319,64 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
         }
     }
     found
+}
+
+/// Amazon API Gateway: every record of the service that carries a tag collection — a
+/// REST API, a stage of one, an API key, a VPC link, a usage plan, a custom domain name
+/// — addressed by the path-style, account-less ARN that service reports for it. The tags
+/// are the record's own, so a key created with tags is in this API's answers at once and
+/// a deleted one is out of them with no untag.
+fn apigateway<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arn: &ParsedArn,
+    change: Option<&Change<'_>>,
+) -> Resolution {
+    let Some(state) = owner_apigateway::state::service_state(engine) else {
+        return Resolution::Unowned;
+    };
+    // The ARN is read by the owning service's OWN parse of a `resourceArn`, so this API
+    // addresses exactly the records that service's `TagResource` does. `None` divides in
+    // two: an ARN of a kind that service addresses but does not tag is a bad request TO
+    // IT, while the `apigateway` namespace is SHARED — API Gateway V2's resources carry
+    // it as well — so an ARN naming another service's resource is left `Unowned`, the
+    // answer every namespace no linked owner serves gets, and this crate's own store
+    // stays its tag home.
+    let Some(resource) = owner_apigateway::state::parse_tagged_resource(&arn.arn) else {
+        return if owner_apigateway::state::tag_index::addresses_own_resource(&arn.arn) {
+            absent(
+                "BadRequestException",
+                owner_apigateway::state::invalid_arn(&arn.arn),
+            )
+        } else {
+            Resolution::Unowned
+        };
+    };
+    let mut state = state.lock();
+    // `NotFoundException`, 404 (`smithy_query(query="shape", shape="NotFoundException")`
+    // on the API Gateway model), carrying that service's own message for the identifier
+    // it could not resolve.
+    let not_found = |message: String| absent_with_status(404, "NotFoundException", message);
+    // A resolution with no change is a READ, so it goes through the owning service's
+    // read accessor and borrows nothing mutably; only a tag write reaches for the
+    // record's tag map itself.
+    let Some(change) = change else {
+        return match state.tags_of(&resource) {
+            Ok(tags) => Resolution::Present {
+                tags: Some(tags.clone()),
+            },
+            Err(message) => not_found(message),
+        };
+    };
+    let tags = match state.tags_of_mut(&resource) {
+        Ok(tags) => tags,
+        Err(message) => return not_found(message),
+    };
+    if let Err(would_hold) = change.apply(tags) {
+        return Resolution::TooManyTags(would_hold);
+    }
+    Resolution::Present {
+        tags: Some(tags.clone()),
+    }
 }
 
 /// Amazon SQS: a queue, whose tags are the queue's own cost-allocation tags.

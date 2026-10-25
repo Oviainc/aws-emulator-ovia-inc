@@ -51,6 +51,8 @@ mod resource_tags;
 mod schema_name_collation;
 #[path = "all/schema_version_deletion.rs"]
 mod schema_version_deletion;
+#[path = "all/search_keyword_index.rs"]
+mod search_keyword_index;
 #[path = "all/search_schemas.rs"]
 mod search_schemas;
 #[path = "all/state_roundtrip.rs"]

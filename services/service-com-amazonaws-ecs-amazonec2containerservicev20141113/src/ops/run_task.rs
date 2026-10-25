@@ -370,6 +370,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
+        // A caller-supplied tag may not write into the namespace Amazon Web Services keeps
+        // for its own tags, whichever operation carries the `tags` list.
+        if let Some(message) =
+            crate::state::reserved_tag_prefix_violation(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -389,10 +402,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // task definition to run new tasks."
         let definition = match guard.usable_revision(&family, requested_revision) {
             Ok(definition) => definition.clone(),
-            Err(message) => {
-                return Err(RunTaskErrorModeled::ClientException(ClientException {
-                    message: Some(message.to_string()),
-                })
+            Err(refusal) => {
+                // An INACTIVE revision is one this store HOLDS in a status this call
+                // cannot accept, so it is the bad parameter it is; a reference that
+                // resolves to nothing names an identifier the store knows nothing about,
+                // which stays a client fault.
+                let message = Some(refusal.message().to_string());
+                return Err(match refusal {
+                    crate::state::TaskDefinitionRefusal::Inactive => {
+                        RunTaskErrorModeled::InvalidParameterException(InvalidParameterException {
+                            message,
+                        })
+                    }
+                    crate::state::TaskDefinitionRefusal::NotFound => {
+                        RunTaskErrorModeled::ClientException(ClientException { message })
+                    }
+                }
                 .into());
             }
         };

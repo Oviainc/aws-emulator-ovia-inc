@@ -549,18 +549,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 let definition = match guard.usable_revision(&family, revision) {
                     Ok(definition) => definition.clone(),
-                    Err(message) => {
+                    Err(refusal) => {
                         // "You can't update an existing service to reference an INACTIVE
-                        // task definition", and a reference that resolves to nothing is
-                        // the same refusal it always is. The service's OWN revision is
-                        // untouched by this: the `None` arm below keeps the key it
-                        // stored, so a service whose revision was deregistered can still
-                        // be scaled.
-                        return Err(UpdateServiceErrorModeled::ClientException(
-                            ClientException {
-                                message: Some(message.to_string()),
-                            },
-                        )
+                        // task definition" names a revision this store HOLDS in a status
+                        // this call cannot accept, so it is the bad parameter it is; a
+                        // reference that resolves to nothing names an identifier the
+                        // store knows nothing about, which stays a client fault. The
+                        // service's OWN revision is untouched by this: the `None` arm
+                        // below keeps the key it stored, so a service whose revision was
+                        // deregistered can still be scaled.
+                        let message = Some(refusal.message().to_string());
+                        return Err(match refusal {
+                            crate::state::TaskDefinitionRefusal::Inactive => {
+                                UpdateServiceErrorModeled::InvalidParameterException(
+                                    InvalidParameterException { message },
+                                )
+                            }
+                            crate::state::TaskDefinitionRefusal::NotFound => {
+                                UpdateServiceErrorModeled::ClientException(ClientException {
+                                    message,
+                                })
+                            }
+                        }
                         .into());
                     }
                 };
