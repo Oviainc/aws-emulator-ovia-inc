@@ -63,6 +63,8 @@ mod service_derived_members;
 mod service_lifecycle;
 #[path = "all/service_listing.rs"]
 mod service_listing;
+#[path = "all/service_load_balancer_cross_field.rs"]
+mod service_load_balancer_cross_field;
 #[path = "all/service_projection.rs"]
 mod service_projection;
 #[path = "all/service_validation.rs"]
