@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/raw_message_content.rs"]
 mod raw_message_content;
+#[path = "all/regional_message_namespace.rs"]
+mod regional_message_namespace;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -290,7 +290,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state::ipam_routing_policy_registration_not_found(association_id, &cidr)
             })?;
         // A registration a delete has already been asked for has no authorization left to
-        // withdraw, so a second delete is refused rather than minting a second delta.
+        // withdraw, so a second delete is refused rather than minting a second delta. A
+        // registration is named by its association AND its prefix, so the message names the
+        // prefix rather than taking the shared one-id wording.
         if registration.is_deleting() {
             return Err(state::incorrect_state(format!(
                 "The routing policy registration for the CIDR ({cidr}) is in state \

@@ -205,6 +205,11 @@ async fn a_deleted_custom_line_item_takes_its_tags_with_it() {
     // leaves a narrower item behind; one that names no range at all removes the record.
     // (`DeleteCustomLineItem`: "Deletes the custom line item identified by the given
     // ARN".)
+    //
+    // That delete may only act "in the current, or previous billing period", so the
+    // span it names starts at the current one, which the service's own clock decides.
+    let current_billing_period =
+        service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
     struct DeleteCase<'a> {
         label: &'a str,
         name: &'a str,
@@ -243,8 +248,10 @@ async fn a_deleted_custom_line_item_takes_its_tags_with_it() {
             created: vec![("stage", "test")],
             by_bare_id: false,
             range: json!({
-                "InclusiveStartBillingPeriod": "2999-1",
-                "ExclusiveEndBillingPeriod": "2999-2",
+                // The item applies to every period, so a span starting at the current
+                // one leaves it applying to the periods before it — record and tags
+                // included.
+                "InclusiveStartBillingPeriod": current_billing_period,
             }),
             survives: true,
         },

@@ -6,8 +6,10 @@
 //! application owns environments and configuration profiles, a profile owns the
 //! hosted configuration versions written into it, and an environment owns the
 //! deployments started into it. Extensions sit beside that tree, owned by the account
-//! rather than by any application, each one holding its own version history. Every
-//! value an operation answers is read back out of
+//! rather than by any application, each one holding its own version history. An
+//! extension association sits beside both, binding one extension version to one
+//! application, environment or configuration profile. Every value an
+//! operation answers is read back out of
 //! this tree rather than computed from the request that asked for it.
 //!
 //! A deployment is the one resource here with a lifetime of its own: AppConfig rolls

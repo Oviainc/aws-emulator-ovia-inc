@@ -25,6 +25,8 @@ mod fidelity_rules;
 mod listing_page_bounds;
 #[path = "all/missing_resource_errors.rs"]
 mod missing_resource_errors;
+#[path = "all/non_api_delete_jurisdictions.rs"]
+mod non_api_delete_jurisdictions;
 #[path = "all/pending_trn_conflict.rs"]
 mod pending_trn_conflict;
 #[path = "all/put_tax_exemption_state.rs"]

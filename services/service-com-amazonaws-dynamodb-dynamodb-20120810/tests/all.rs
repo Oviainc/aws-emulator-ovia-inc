@@ -23,6 +23,8 @@ mod collection_cap_constraint_reports;
 mod continuous_backups;
 #[path = "all/emulator.rs"]
 mod emulator;
+#[path = "all/endpoint_discovery.rs"]
+mod endpoint_discovery;
 #[path = "all/global_secondary_indexes.rs"]
 mod global_secondary_indexes;
 #[path = "all/index_capacity_and_item_collections.rs"]

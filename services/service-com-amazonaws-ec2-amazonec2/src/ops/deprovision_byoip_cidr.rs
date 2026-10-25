@@ -215,12 +215,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // "Before you can release an address range, you must stop advertising it" — and a
         // range part way through another move is not the caller's to release yet either.
+        // Worded the one way this crate words a refusal keyed on the state of the resource
+        // the request names ([`crate::state::incorrect_state_of`]).
         if !state::byoip_cidr_state_is_releasable(record.state()) {
-            return Err(state::incorrect_state(format!(
-                "The address range '{cidr}' is in state '{current}', \
-                 which is not a state it can be released from",
-                current = record.state(),
-            )));
+            return Err(state::incorrect_state_of(
+                "Address range",
+                &cidr,
+                record.state(),
+            ));
         }
 
         // "... and you must not have any IP addresses allocated from its address range".

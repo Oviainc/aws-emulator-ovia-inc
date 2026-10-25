@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the stored Well-Architected Tool profiles the request's
+//! `ProfileNamePrefix` and `ProfileOwnerType` select, projected to `ProfileSummary`.
+//! Reporting only — the `NextToken` it emits carries the whole cursor, so listing never
+//! writes to state.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +142,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProfiles"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListProfilesErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`; a request that omits it asks
+        // for a full page, so the modelled maximum is the default.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // Classified `CANNOT_PARSE` like every other cursor in this service: a caller
+        // cannot correct a token it did not compose, only start the pagination again — and
+        // the finding still names the member whose value could not be decoded.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_profile_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListProfilesErrorModeled::ValidationException(
+                        crate::state::cannot_parse_exception(
+                            crate::state::NEXT_TOKEN_MEMBER,
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // This emulator serves one account, so the caller is that account and it is the
+        // account a `ProfileOwnerType` is resolved against.
+        let caller = ::engine::emulator_account_id();
+        let store = state.lock();
+        let order = store.profile_order();
+        // The cursor is start-EXCLUSIVE: the page resumes just past the ARN already
+        // served, so every profile is enumerated exactly once across the pages, and a
+        // profile created or deleted between two pages moves nothing already served.
+        let start = match &cursor {
+            Some(profile_arn) => order.partition_point(|candidate| candidate <= profile_arn),
+            None => 0,
+        };
+
+        let matching: Vec<&crate::state::ProfileRecord> = order[start..]
+            .iter()
+            .filter_map(|profile_arn| store.profiles.get(profile_arn))
+            .filter(|record| {
+                // "An optional string added to the beginning of each profile name returned
+                // in the results": the member selects the profiles whose name BEGINS with
+                // it, and a request that carries no prefix asks for no filtering.
+                input
+                    .profile_name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| record.profile_name.starts_with(prefix))
+            })
+            .filter(|record| {
+                // "Profile owner type": `SELF` selects the profiles the calling account
+                // owns and `SHARED` the ones another account owns and shared with it; a
+                // request that names neither asks for both. Nothing else reaches the last
+                // arm — `ProfileOwnerType` publishes exactly two members and the boundary
+                // refuses any other value before this handler runs.
+                match input.profile_owner_type.as_deref() {
+                    Some(crate::state::PROFILE_OWNER_TYPE_SELF) => record.owned_by(caller),
+                    Some(crate::state::PROFILE_OWNER_TYPE_SHARED) => !record.owned_by(caller),
+                    _ => true,
+                }
+            })
+            .collect();
+
+        let page = &matching[..matching.len().min(page_size)];
+        // A cursor is issued only when the selection did NOT fit in this page, so the last
+        // page omits `NextToken` and a caller following it terminates.
+        let next_token = match page.last() {
+            Some(record) if matching.len() > page.len() => {
+                Some(crate::state::encode_profile_next_token(&record.profile_arn))
+            }
+            _ => None,
+        };
+
+        Ok(ListProfilesOutput {
+            profile_summaries: Some(
+                page.iter()
+                    .map(|record| record.to_summary())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

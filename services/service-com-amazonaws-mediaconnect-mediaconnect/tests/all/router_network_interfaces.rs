@@ -864,7 +864,11 @@ async fn association_counts_come_from_the_inputs_and_outputs_that_name_the_inter
     );
 
     // A configuration that takes its content from another AWS resource names no interface,
-    // so it is counted against none.
+    // so it is counted against none. The flow it names is one the account HOLDS, minted over
+    // the wire, because the create resolves every reference of this service against the
+    // store.
+    let (flow_arn, _) =
+        crate::router_outputs::minted_flow_source(&emulator, "flow-rni-assoc").await;
     create_router_input(
         &emulator,
         "rni-assoc-flow",
@@ -872,7 +876,7 @@ async fn association_counts_come_from_the_inputs_and_outputs_that_name_the_inter
             "MediaConnectFlow",
             "mediaConnectFlow",
             json!({
-                "flowArn": FLOW_ARN,
+                "flowArn": flow_arn,
                 "sourceTransitDecryption": {
                     "encryptionKeyType": "AUTOMATIC",
                     "encryptionKeyConfiguration": union("Automatic", "automatic", json!({})),

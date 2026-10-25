@@ -7,15 +7,29 @@
 //! "Detaches an EBS volume from an instance": there is something to detach only while the
 //! volume HAS an attachment, so a volume nothing holds — one in the `available` state — is
 //! refused with `IncorrectState`, the code EC2 answers when the resource exists but is not
-//! in a state that admits the request, and so is a volume attached to some instance other
-//! than the one the request named. A detach that is admitted puts the attachment into the
-//! non-terminal `detaching` state and the clock owes it `detached`
+//! in a state that admits the request. THAT refusal carries EC2's wording for the code —
+//! the kind of resource, the id the request named and the state it is in, and nothing more
+//! ([`crate::state::incorrect_state_of`]). A volume attached to some instance other than
+//! the one the request named is refused with the same code but a message about the
+//! attachment rather than the state: the volume IS in a state that admits a detach, and
+//! what is missing is the attachment the request asked about, so the message names that
+//! instead. A detach that is admitted puts the attachment into the non-terminal
+//! `detaching` state and the clock owes it `detached`
 //! ([`crate::state::VolumeRecord::detaching_at`]), at which point the volume holds no
-//! attachment and is `available` again — which is what `DescribeVolumes` then reports.
+//! attachment and is `available` again — which is what `DescribeVolumes` then reports. That
+//! instant is owed by the call that STARTED the move, so a second detach of an attachment
+//! already on its way down reports it without postponing its completion.
 //!
 //! The refusals in order: a malformed volume or instance id (`InvalidVolumeID.Malformed` /
 //! `InvalidInstanceID.Malformed`), then `DryRun` (`DryRunOperation`), then an id the account
-//! holds no volume for (`InvalidVolume.NotFound`), then the state (`IncorrectState`).
+//! holds no volume for (`InvalidVolume.NotFound`), then the state (`IncorrectState`), then
+//! an attachment that is not the account's to take down (`UnsupportedOperation`).
+//!
+//! "You can't detach or force detach volumes that are attached to Amazon Web
+//! Services-managed resources": such an attachment is the one whose `AssociatedResource` /
+//! `InstanceOwningService` is set ([`crate::state::VolumeRecord::managed_resource_of`]), and
+//! it is refused for every state it can be in and whatever `Force` says, which is
+//! `UnsupportedOperation` rather than `IncorrectState`.
 //!
 //! `Force` "forces detachment if the previous detachment attempt did not occur cleanly": an
 //! attachment is only ever stuck because a file system inside a running instance holds the
@@ -186,9 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            TRANSITION_DELAY, VOLUME_ATTACHMENT_STATE_DETACHING, VolumeRecord, dry_run_operation,
-            incorrect_state, instance_id_is_well_formed, invalid_volume_id_malformed,
-            invalid_volume_id_not_found, require_service_state, volume_id_is_well_formed,
+            TRANSITION_DELAY, VOLUME_ATTACHMENT_STATE_DETACHING, VolumeRecord,
+            dry_run_operation, incorrect_state, incorrect_state_of, instance_id_is_well_formed,
+            invalid_volume_id_malformed, invalid_volume_id_not_found, require_service_state,
+            unsupported_operation, volume_id_is_well_formed,
         };
 
         // A volume carries its own Availability Zone, so nothing here depends on the Region
@@ -235,12 +250,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock already made due is gone, so it cannot be detached a second time.
         let held = record.attachments_at(now);
         if held.is_empty() {
-            return Err(incorrect_state(format!(
-                "Volume '{}' is in the '{}' state, which is not a state it can be detached \
-                 from",
-                input.volume_id,
-                record.state_at(now)
-            )));
+            return Err(incorrect_state_of(
+                "Volume",
+                &input.volume_id,
+                record.state_at(now),
+            ));
         }
         // The attachments the request names: an instance and a device each narrow the set,
         // and a request naming neither names every attachment the volume holds.
@@ -272,6 +286,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // there is no single one to take down and the request has to narrow it. The members
         // are each optional and each valid, and it is the COMBINATION the request gave that
         // cannot select one attachment, which is `InvalidParameterCombination`.
+        //
+        // This is asked BEFORE the managed-resource refusal below, so a request that selects
+        // several attachments — among them one to a managed resource — is told to name the
+        // one it means rather than told about a resource it may not have been asking about.
+        // The managed refusal is a fact of ONE attachment, so it can only be answered once
+        // the request has selected one.
         if named.len() > 1 {
             return Err(Scaffolded::invalid_parameter_combination(format!(
                 "Volume '{}' holds {} attachments that the request names, so instanceId and \
@@ -280,27 +300,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 named.len()
             )));
         }
+        // "You can't detach or force detach volumes that are attached to Amazon Web
+        // Services-managed resources. Attempting to do this results in the
+        // UnsupportedOperationException exception": the attachment the request selected is
+        // not the account's to take down, whatever state it is in and whatever `Force` says
+        // — so this is `UnsupportedOperation` rather than `IncorrectState`, and it is asked
+        // BEFORE the write so nothing moves. The refusal and the resource its message names
+        // read the SAME marker (`VolumeRecord::managed_resource_of`), so they cannot
+        // disagree about which one is set.
+        if let Some(managed_resource) = VolumeRecord::managed_resource_of(&attachment) {
+            return Err(unsupported_operation(format!(
+                "Volume '{}' is attached to the Amazon Web Services-managed resource '{}', \
+                 which this account cannot detach it from",
+                input.volume_id, managed_resource
+            )));
+        }
         // The detach is a write: the attachment moves to `detaching` now, and the clock owes
         // it `detached` — the same span, read off the same monotonic clock, as a volume's
         // `creating` -> `available` move — at which point the volume holds it no more.
+        //
+        // One reading of which attachment is this one: `VolumeRecord::attachment_key`, the
+        // same key the owed instant below is stored under, so the write and the clock cannot
+        // identify the attachment two ways.
+        let key = VolumeRecord::attachment_key(&attachment);
         for stored in record.view.attachments.iter_mut().flatten() {
-            if stored.instance_id == attachment.instance_id
-                && stored.device == attachment.device
-            {
+            if VolumeRecord::attachment_key(stored) == key {
                 stored.state = Some(VOLUME_ATTACHMENT_STATE_DETACHING.to_string());
             }
         }
-        record.detaching_at.insert(
-            VolumeRecord::attachment_key(&attachment),
-            now + TRANSITION_DELAY,
-        );
+        // The instant `detached` falls due is owed by the call that STARTED the move, so a
+        // detach of an attachment already on its way down reports it as it stands without
+        // pushing its completion further out: the instant is written only when none is owed
+        // yet. Overwriting would let a caller that polls with a detach postpone the move for
+        // as long as it keeps asking.
+        if !record.detaching_at.contains_key(&key) {
+            record
+                .detaching_at
+                .insert(key.clone(), now + TRANSITION_DELAY);
+        }
 
         // Read the answer back OUT of the store, so the caller is told what a later
         // `DescribeVolumes` will report rather than the request object.
         record
             .attachments_at(now)
             .into_iter()
-            .find(|held| held.instance_id == attachment.instance_id && held.device == attachment.device)
+            .find(|held| VolumeRecord::attachment_key(held) == key)
             .map(|held| DetachVolumeOutput {
                 volume_id: held.volume_id,
                 instance_id: held.instance_id,

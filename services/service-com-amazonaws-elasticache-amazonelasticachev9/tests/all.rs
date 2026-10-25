@@ -140,3 +140,8 @@ mod modify_cache_parameter_group;
 // Appended for the same reason: the `ModifyUser` suite.
 #[path = "all/modify_user.rs"]
 mod modify_user;
+
+// Appended for the same reason: the `DeleteUser` suite about the user the service itself
+// owns.
+#[path = "all/delete_user_built_in_user.rs"]
+mod delete_user_built_in_user;
