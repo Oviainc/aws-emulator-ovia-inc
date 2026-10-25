@@ -3,9 +3,9 @@
 //! Engine state for the com-amazonaws-sesv2-simpleemailservice-v2 service.
 //!
 //! Everything the implemented operations answer with is computed from the records
-//! below: the email-identity table, the outbound-message log and the per-account
-//! send counters. Nothing here is per-request scratch — the whole struct lives in
-//! the one shared engine (see [`service_state`]).
+//! below: the email-identity table, the contact-list table, the outbound-message log
+//! and the per-account send counters. Nothing here is per-request scratch — the whole
+//! struct lives in the one shared engine (see [`service_state`]).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -57,6 +57,20 @@ pub const MAX_SENT_MESSAGES: usize = 1_000;
 /// length bound), so the retained log is bounded by entries times this.
 pub const MAX_STORED_BODY_CHARS: usize = 8 * 1024;
 
+/// Contact lists the account may hold.
+///
+/// A CHOSEN bound, not an AWS one: a contact list is created by a request, so a
+/// long-lived emulator must not grow without limit while serving them. It is far
+/// above what a client exercising the contact API needs, and `CreateContactList`
+/// refuses past it with the `LimitExceededException` its model binds.
+pub const MAX_CONTACT_LISTS: usize = 1_000;
+
+/// Contacts one contact list may hold.
+///
+/// CHOSEN for the same reason, and for the same growth: one record per accepted
+/// `CreateContact`.
+pub const MAX_CONTACTS_PER_LIST: usize = 10_000;
+
 /// Per-service state for com-amazonaws-sesv2-simpleemailservice-v2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
@@ -64,6 +78,10 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// were created with. Ordered, so `ListEmailIdentities` enumerates and pages
     /// deterministically.
     pub identities: BTreeMap<String, EmailIdentityRecord>,
+    /// Contact lists, keyed by the `ContactListName` they were created with — an
+    /// opaque name the API echoes back as given, so it is keyed exactly as supplied.
+    /// Ordered, so `ListContactLists` enumerates and pages deterministically.
+    pub contact_lists: BTreeMap<String, ContactListRecord>,
     /// The outbound-message log, oldest first: one entry per accepted `SendEmail`.
     pub sent_messages: Vec<SentMessage>,
     /// Per-account send counters, bumped by `SendEmail`.
@@ -398,6 +416,162 @@ impl EmailIdentityRecord {
     }
 }
 
+/// One contact list: the topics it publishes, its description and tags, and the
+/// contacts subscribed to it.
+///
+/// The contacts live ON the list rather than in a table beside it: a contact is
+/// identified by its list and its address together (every contact operation binds
+/// both as path labels), and deleting the list takes its contacts with it.
+#[derive(Debug, Clone)]
+pub struct ContactListRecord {
+    /// The `ContactListName` this record is keyed by, as the request spelled it.
+    pub name: String,
+    /// `Topics`: the interest groups the list publishes, in the order supplied.
+    pub topics: Vec<crate::ops::types::Topic>,
+    /// `Description`.
+    pub description: Option<String>,
+    /// Tags, in the order they were supplied.
+    pub tags: Vec<(String, String)>,
+    /// When the list was created.
+    pub created_at: SystemTime,
+    /// When the list was last changed.
+    pub last_updated_at: SystemTime,
+    /// The contacts on this list, keyed by [`identity_key`] of their address so a
+    /// listing enumerates and pages deterministically.
+    pub contacts: BTreeMap<String, ContactRecord>,
+}
+
+impl ContactListRecord {
+    /// A list as `CreateContactList` stores it.
+    pub fn new(name: &str, now: SystemTime) -> Self {
+        Self {
+            name: name.to_string(),
+            topics: Vec::new(),
+            description: None,
+            tags: Vec::new(),
+            created_at: now,
+            last_updated_at: now,
+            contacts: BTreeMap::new(),
+        }
+    }
+
+    /// Whether the list publishes a topic called `topic_name`.
+    pub fn publishes_topic(&self, topic_name: &str) -> bool {
+        self.topics.iter().any(|topic| topic.topic_name == topic_name)
+    }
+
+    /// The default preference the list's own topics give a contact that has stated
+    /// none: one `TopicPreference` per topic, carrying that topic's
+    /// `DefaultSubscriptionStatus`.
+    ///
+    /// `Contact$TopicDefaultPreferences` is "the default topic preferences applied to
+    /// the contact", which is exactly this projection of the list's topics, so every
+    /// operation that reports it computes it here.
+    pub fn topic_default_preferences(&self) -> Vec<crate::ops::types::TopicPreference> {
+        self.topics
+            .iter()
+            .map(|topic| crate::ops::types::TopicPreference {
+                topic_name: topic.topic_name.clone(),
+                subscription_status: topic.default_subscription_status.clone(),
+            })
+            .collect()
+    }
+
+    /// The modelled `ContactList` view of this record, as `ListContactLists` reports
+    /// it.
+    pub fn summary(&self) -> crate::ops::types::ContactList {
+        crate::ops::types::ContactList {
+            contact_list_name: Some(self.name.clone()),
+            last_updated_timestamp: Some(::aws_smithy_types::DateTime::from(self.last_updated_at)),
+        }
+    }
+
+    /// The modelled `TagList` view of this record's tags.
+    pub fn tag_list(&self) -> Vec<crate::ops::types::Tag> {
+        self.tags
+            .iter()
+            .map(|(key, value)| crate::ops::types::Tag {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+}
+
+/// One contact on a contact list.
+#[derive(Debug, Clone)]
+pub struct ContactRecord {
+    /// The `EmailAddress` this contact was created with, as the request spelled it.
+    pub email_address: String,
+    /// `TopicPreferences`: the preferences the contact has stated, in the order
+    /// supplied. A topic the contact has stated no preference for is answered from
+    /// the list's own default instead
+    /// ([`ContactListRecord::topic_default_preferences`]).
+    pub topic_preferences: Vec<crate::ops::types::TopicPreference>,
+    /// `UnsubscribeAll`: the contact is unsubscribed from every topic of the list.
+    pub unsubscribe_all: bool,
+    /// `AttributesData`: the caller's own JSON document about this contact, kept as
+    /// supplied.
+    pub attributes_data: Option<String>,
+    /// When the contact was created.
+    pub created_at: SystemTime,
+    /// When the contact was last changed.
+    pub last_updated_at: SystemTime,
+}
+
+impl ContactRecord {
+    /// A contact as `CreateContact` stores it.
+    pub fn new(email_address: &str, now: SystemTime) -> Self {
+        Self {
+            email_address: email_address.to_string(),
+            topic_preferences: Vec::new(),
+            unsubscribe_all: false,
+            attributes_data: None,
+            created_at: now,
+            last_updated_at: now,
+        }
+    }
+
+    /// The contact's preference for `topic_name`, when it has stated one.
+    pub fn stated_preference(&self, topic_name: &str) -> Option<&str> {
+        self.topic_preferences
+            .iter()
+            .find(|preference| preference.topic_name == topic_name)
+            .map(|preference| preference.subscription_status.as_str())
+    }
+
+    /// The modelled `Contact` view of this record, as `ListContacts` reports it.
+    ///
+    /// `list` is the list this contact is on, which supplies the default preferences.
+    pub fn summary(&self, list: &ContactListRecord) -> crate::ops::types::Contact {
+        crate::ops::types::Contact {
+            email_address: Some(self.email_address.clone()),
+            topic_preferences: Some(self.topic_preferences.clone()),
+            topic_default_preferences: Some(list.topic_default_preferences()),
+            unsubscribe_all: self.unsubscribe_all,
+            last_updated_timestamp: Some(::aws_smithy_types::DateTime::from(self.last_updated_at)),
+        }
+    }
+}
+
+/// How this service words `NotFoundException` for a contact list it does not hold.
+///
+/// One wording for every operation that takes a `ContactListName` — the reads, the
+/// writes and the contact operations nested under the list — so a client sees the same
+/// sentence whichever call first tells it the list is gone.
+pub fn contact_list_not_found(contact_list_name: &str) -> String {
+    format!("List with name: {contact_list_name} doesn't exist.")
+}
+
+/// How this service words `NotFoundException` for a contact the named list does not
+/// hold, stated once for every contact operation.
+pub fn contact_not_found(contact_list_name: &str, email_address: &str) -> String {
+    format!(
+        "Contact with email address: {email_address} doesn't exist in list: \
+         {contact_list_name}."
+    )
+}
+
 /// One accepted outbound message.
 #[derive(Debug, Clone)]
 pub struct SentMessage {
@@ -533,21 +707,37 @@ pub fn easy_dkim_tokens(domain: &str) -> Vec<String> {
 /// not a position in this listing.
 const PAGE_TOKEN_TAG: &str = "sesv2:email-identities:";
 
-/// Encode a `NextToken` that resumes a listing after `last_returned`.
+/// The tag `ListContactLists`'s own tokens carry.
+pub const CONTACT_LISTS_PAGE_TOKEN_TAG: &str = "sesv2:contact-lists:";
+
+/// The tag `ListContacts`'s own tokens carry.
+pub const CONTACTS_PAGE_TOKEN_TAG: &str = "sesv2:contacts:";
+
+/// Encode a `NextToken` that resumes the listing tagged `tag` after `last_returned`.
 ///
-/// The token is opaque to the caller: it is this operation's tag and the last key
-/// returned, base64'd — decodable by [`decode_page_token`] and by nothing else.
+/// The token is opaque to the caller: it is the listing's tag and the last key
+/// returned, base64'd — decodable by [`decode_tagged_page_token`] under the same tag
+/// and by nothing else, so one listing's token is not a position in another's.
+pub fn encode_tagged_page_token(tag: &str, last_returned: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!("{tag}{last_returned}"))
+}
+
+/// Decode a `NextToken` produced by [`encode_tagged_page_token`] under `tag`. `None`
+/// when the caller made the token up, or when it belongs to another listing.
+pub fn decode_tagged_page_token(tag: &str, token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(tag).map(ToString::to_string)
+}
+
+/// Encode a `ListEmailIdentities` `NextToken` that resumes after `last_returned`.
 pub fn encode_page_token(last_returned: &str) -> String {
-    ::aws_smithy_types::base64::encode(format!("{PAGE_TOKEN_TAG}{last_returned}"))
+    encode_tagged_page_token(PAGE_TOKEN_TAG, last_returned)
 }
 
 /// Decode a `NextToken` produced by [`encode_page_token`]. `None` when the caller
 /// made the token up.
 pub fn decode_page_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
-    decoded
-        .strip_prefix(PAGE_TOKEN_TAG)
-        .map(ToString::to_string)
+    decode_tagged_page_token(PAGE_TOKEN_TAG, token)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

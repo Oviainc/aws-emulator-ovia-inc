@@ -45,6 +45,12 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// This service's endpoint prefix, as its model gives it
+/// (`smithy_query(query="service_info")`: `awsService.endpointPrefix` `email`) — the name
+/// a host-addressed request resolves to, beside the SigV4 signing name (`ses`) the
+/// generated identity carries.
+pub const ENDPOINT_PREFIX: &str = "email";
+
 /// The `com-amazonaws-sesv2-simpleemailservice-v2` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +80,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `ses` — a signing name it SHARES with three other
+        // emulated services: SES v1 (`awsQuery`, endpoint `email`), Pinpoint Email
+        // (`restJson1`, endpoint `email`) and MailManager (`awsJson1_0` + `rpcv2Cbor`,
+        // endpoint `mail-manager`). The router resolves a request's routing key from the
+        // SigV4 credential scope first, so all four see the SAME key, and claiming on the
+        // signing name alone makes all four claim every request — which the router
+        // answers `500 AmbiguousService` for, a code no AWS model carries and an SDK
+        // retries to its ceiling instead of surfacing.
+        //
+        // So the claim is narrowed the way the framework narrows every other
+        // signing-name collision: the routing key must name this endpoint (its signing
+        // name, or its own endpoint prefix for a host-addressed request) AND the request
+        // must address this service's own modelled URI path space, which for SESv2 is the
+        // `/v2/…` space its 116 operations bind (the generated
+        // `crate::ROUTE_PATH_SEGMENTS`). Pinpoint Email's `/v1/…`, SES v1's awsQuery
+        // `POST /` and MailManager's RPC form are then each claimed by their own service.
+        service_common::routes_to_any(
+            parts,
+            &[self.entry.identity().signing_name(), ENDPOINT_PREFIX],
+        ) && service_common::claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)
     }
 
     fn override_operation(

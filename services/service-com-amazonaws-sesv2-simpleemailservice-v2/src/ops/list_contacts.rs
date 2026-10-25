@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListContacts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListContacts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListContacts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the contacts on the stored contact list the request names, honouring
+//! `Filter`, `PageSize` and the opaque `NextToken` this operation hands back. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +75,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{ContactListRecord, ContactRecord};
+
+/// The `SubscriptionStatus` value a contact unsubscribed from everything resolves to,
+/// as the model's own enum spells it (`SUBSCRIPTION_STATUS_VALUES` is `["OPT_IN",
+/// "OPT_OUT"]`).
+const OPTED_OUT: &str = "OPT_OUT";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +152,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListContacts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListContactsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListContacts"))
+        // Request metadata is not needed: the listing covers one list of the one
+        // emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListContacts without the shared emulator state",
+            ));
+        };
+
+        // "The number of contacts that may be returned at once": as for the contact
+        // lists, the model puts no bound on `MaxItems`, so only a positive count
+        // truncates a page and a non-positive one is read as no truncation.
+        let page_size = usize::try_from(input.page_size.unwrap_or_default())
+            .ok()
+            .filter(|size| *size > 0);
+
+        // The token is this operation's own: it names the last contact the previous page
+        // returned, so the next page resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_tagged_page_token(crate::state::CONTACTS_PAGE_TOKEN_TAG, token)
+                    .ok_or_else(|| {
+                        bad_request("NextToken is not a token returned by ListContacts.")
+                    })?,
+            ),
+        };
+
+        let list_name = input.contact_list_name;
+        let store = state.lock();
+        let Some(list) = store.contact_lists.get(&list_name) else {
+            return Err(ListContactsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::contact_list_not_found(&list_name)),
+            })
+            .into());
+        };
+
+        // `contacts` is ordered by storage key, so a page is a window over the matching
+        // contacts and the resume point is a position in that order — which keeps a token
+        // valid even if the contact it names has since been deleted.
+        let matching: Vec<(&String, &ContactRecord)> = list
+            .contacts
+            .iter()
+            .filter(|(_, contact)| matches_filter(list, contact, input.filter.as_ref()))
+            .collect();
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(last) => matching.partition_point(|(key, _)| key.as_str() <= last),
+        };
+        let remaining = &matching[start..];
+        let page = match page_size {
+            Some(size) => &remaining[..size.min(remaining.len())],
+            None => remaining,
+        };
+
+        let contacts: Vec<Contact> = page
+            .iter()
+            .map(|(_, contact)| contact.summary(list))
+            .collect();
+        // A token only when contacts remain behind this page, so a walk terminates.
+        let next_token = (page.len() < remaining.len())
+            .then(|| {
+                page.last().map(|(key, _)| {
+                    crate::state::encode_tagged_page_token(
+                        crate::state::CONTACTS_PAGE_TOKEN_TAG,
+                        key,
+                    )
+                })
+            })
+            .flatten();
+
+        Ok(ListContactsOutput {
+            contacts: Some(contacts),
+            next_token,
+        })
     }
+}
+
+/// Refuse the request with this service's input error.
+fn bad_request(message: impl Into<String>) -> ListContactsError {
+    ListContactsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Whether `contact` satisfies the request's `Filter`.
+///
+/// The filter is read as the model states it: `TopicFilter$TopicName` names the topic the
+/// preference is read for, `TopicFilter$UseDefaultIfPreferenceUnavailable` says "the
+/// default subscription status should be applied to a contact because the contact has not
+/// noted their preference for subscribing to a topic", and `FilteredStatus` is "the status
+/// by which you are filtering". So a contact matches when the status resolved for the
+/// named topic is the one filtered for; with no topic named, when ANY of the list's topics
+/// resolves to it — a filter on a status alone cannot mean less than "subscribed like this
+/// to something". A contact that has unsubscribed from everything resolves `OPT_OUT` for
+/// every topic, whatever it once stated.
+fn matches_filter(
+    list: &ContactListRecord,
+    contact: &ContactRecord,
+    filter: Option<&ListContactsFilter>,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let use_default = filter
+        .topic_filter
+        .as_ref()
+        .is_some_and(|topic| topic.use_default_if_preference_unavailable);
+    let named_topic = filter
+        .topic_filter
+        .as_ref()
+        .and_then(|topic| topic.topic_name.as_deref());
+
+    let topics: Vec<&str> = match named_topic {
+        Some(topic_name) => vec![topic_name],
+        None => list
+            .topics
+            .iter()
+            .map(|topic| topic.topic_name.as_str())
+            .collect(),
+    };
+    let resolved: Vec<&str> = topics
+        .iter()
+        .filter_map(|topic_name| resolved_status(list, contact, topic_name, use_default))
+        .collect();
+
+    match filter.filtered_status.as_deref() {
+        // A topic filter with no status to filter by selects the contacts that have a
+        // status for the topic at all.
+        None => named_topic.is_none() || !resolved.is_empty(),
+        Some(status) => resolved.contains(&status),
+    }
+}
+
+/// The subscription status in force for `contact` on `topic_name`: its own stated
+/// preference, or — when it has stated none and the filter asks for the default — the
+/// topic's `DefaultSubscriptionStatus`. `None` when neither applies.
+fn resolved_status<'list>(
+    list: &'list ContactListRecord,
+    contact: &'list ContactRecord,
+    topic_name: &str,
+    use_default: bool,
+) -> Option<&'list str> {
+    // "A boolean value status noting if the contact is unsubscribed from all contact list
+    // topics": that answer overrides every per-topic preference.
+    if contact.unsubscribe_all {
+        return Some(OPTED_OUT);
+    }
+    if let Some(stated) = contact.stated_preference(topic_name) {
+        return Some(stated);
+    }
+    if !use_default {
+        return None;
+    }
+    list.topics
+        .iter()
+        .find(|topic| topic.topic_name == topic_name)
+        .map(|topic| topic.default_subscription_status.as_str())
 }
