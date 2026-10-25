@@ -2223,6 +2223,15 @@ impl Portal {
 /// published portal-products quota.
 pub const MAX_PORTAL_PRODUCTS: usize = 300;
 
+/// The `PolicyDocument` a portal product's sharing policy reads as while the product
+/// holds no policy of its own: the empty JSON policy document.
+///
+/// Every portal product HAS a sharing policy to report — a product nothing has shared is
+/// one whose policy grants nothing, not one with no policy sub-resource — so a product
+/// created without one, and one whose policy `DeletePortalProductSharingPolicy` reset,
+/// reports a policy document carrying no statements rather than no document at all.
+pub const EMPTY_SHARING_POLICY: &str = "{}";
+
 /// A persisted `PortalProduct` resource.
 ///
 /// "Creates a new portal product" (`CreatePortalProduct`): an account-level resource,
@@ -2247,6 +2256,13 @@ pub struct PortalProduct {
     /// the record.
     pub last_modified: SystemTime,
     pub tags: BTreeMap<String, String>,
+    /// "The product sharing policy" (`PutPortalProductSharingPolicy$PolicyDocument`),
+    /// the policy document the product's own sharing-policy sub-resource
+    /// (`/v2/portalproducts/{PortalProductId}/sharingpolicy`) holds. `None` while the
+    /// product carries no sharing policy — the state a freshly created product is in and
+    /// the one `DeletePortalProductSharingPolicy` puts it back into, so the policy's
+    /// absence is a value of this member rather than the absence of the product.
+    pub sharing_policy: Option<String>,
     /// This product's product REST endpoint pages, keyed by
     /// `ProductRestEndpointPageId`. A page is addressed UNDER its product
     /// (`/v2/portalproducts/{PortalProductId}/productrestendpointpages/{id}`), so the
@@ -2276,6 +2292,14 @@ pub struct PortalProductView {
 }
 
 impl PortalProduct {
+    /// The `PolicyDocument` this product's sharing policy reports: the document stored
+    /// by its last `PutPortalProductSharingPolicy`, or [`EMPTY_SHARING_POLICY`] while the
+    /// product holds none.
+    pub fn sharing_policy_document(&self) -> String {
+        self.sharing_policy
+            .clone()
+            .unwrap_or_else(|| EMPTY_SHARING_POLICY.to_string())
+    }
     /// Mint a fresh `ProductRestEndpointPageId` for this product: ten lowercase
     /// alphanumerics, never one this product already minted. The member targets
     /// `__stringMin10Max30PatternAZ09` (len 10..30, pattern `^[a-z0-9]+$`), which
