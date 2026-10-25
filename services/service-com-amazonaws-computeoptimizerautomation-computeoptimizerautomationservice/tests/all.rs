@@ -39,6 +39,8 @@ mod enrollment_gate;
 mod enum_parameter_rejection;
 #[path = "all/error_payloads.rs"]
 mod error_payloads;
+#[path = "all/not_found_wording.rs"]
+mod not_found_wording;
 #[path = "all/recommended_action_summaries.rs"]
 mod recommended_action_summaries;
 #[path = "all/recommended_actions.rs"]
