@@ -258,7 +258,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::GraphqlApiRecord {
             seq,
             arn: ::engine::emulator_arn(ARN_SERVICE, &region, &format!("apis/{api_id}")),
-            dns: api_dns(&host_label, &region),
+            // The endpoint hostnames are built the same way for either kind of API
+            // (`crate::state::api_dns`); a GraphQL API publishes its HTTPS endpoint
+            // under the `GRAPHQL` key, which `uris` is derived from.
+            dns: crate::state::api_dns(&host_label, &region, crate::state::GRAPHQL_ENDPOINT),
             api_id: api_id.clone(),
             name: input.name,
             authentication_type: input.authentication_type,
@@ -327,20 +330,3 @@ const DEFAULT_VISIBILITY: &str = "GLOBAL";
 
 /// The model's documented value for `introspectionConfig` when the request omits it.
 const DEFAULT_INTROSPECTION_CONFIG: &str = crate::state::DEFAULT_INTROSPECTION_CONFIG;
-
-/// The DNS records AppSync publishes for a GraphQL API: one hostname per endpoint,
-/// keyed as it keys them, both on the API's own endpoint host label.
-/// `GraphqlApi$uris` is derived from these (see [`crate::state`]), so the two
-/// members always name the same hosts.
-fn api_dns(host_label: &str, region: &str) -> std::collections::BTreeMap<String, String> {
-    std::collections::BTreeMap::from([
-        (
-            crate::state::GRAPHQL_ENDPOINT.to_string(),
-            format!("{host_label}.appsync-api.{region}.amazonaws.com"),
-        ),
-        (
-            crate::state::REALTIME_ENDPOINT.to_string(),
-            format!("{host_label}.appsync-realtime-api.{region}.amazonaws.com"),
-        ),
-    ])
-}

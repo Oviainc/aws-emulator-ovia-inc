@@ -184,9 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // DIFFERENT request is not a replay — answering it with the first template would
         // silently drop the parameters this call asked for — so it is refused.
         let replayed = state
-            .replayed_idempotency(crate::state::CREATE_JOB_TEMPLATE_SCOPE, &input.client_token)
+            .replayed_idempotency(
+                &region,
+                crate::state::CREATE_JOB_TEMPLATE_SCOPE,
+                &input.client_token,
+            )
             .cloned();
-        if let Some(existing) = replayed.and_then(|id| state.job_templates.get(&id)) {
+        if let Some(existing) = replayed.and_then(|id| state.job_template(&region, &id)) {
             if existing.request_fingerprint != fingerprint {
                 return Err(CreateJobTemplateErrorModeled::ValidationException(
                     ValidationException {
@@ -233,6 +237,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // transition.
         let record = crate::state::JobTemplateRecord {
             id: id.clone(),
+            // The region this request was signed for: the template exists at that
+            // endpoint and nowhere else, which is what every later read resolves against.
+            region: region.clone(),
             name: input.name.clone(),
             arn: arn.clone(),
             created_at_millis,

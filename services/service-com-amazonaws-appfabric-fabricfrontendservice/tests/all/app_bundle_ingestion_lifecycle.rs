@@ -1383,31 +1383,23 @@ async fn an_unimplemented_operation_still_answers_501() {
         &emulator.create_app_bundle(json!({})).await.body,
         "appBundle",
     );
-    let ingestion = arn_of(
-        &emulator
-            .create_ingestion(
-                &bundle,
-                json!({"app": "SLACK", "tenantId": "t-1", "ingestionType": "auditLog"}),
-            )
-            .await
-            .body,
-        "ingestion",
-    );
 
+    // `DeleteAppAuthorization` is one of the operations still carrying the
+    // scaffold marker, so its 501 is what this rule is asserted on.
     let answer = emulator
         .call(
-            "POST",
+            "DELETE",
             &format!(
-                "/appbundles/{}/ingestions/{}/start",
+                "/appbundles/{}/appauthorizations/{}",
                 encode(&bundle),
-                encode(&ingestion)
+                encode(&unknown_uuid())
             ),
             None,
         )
         .await;
     assert_eq!(
         answer.status, 501,
-        "expected HTTP 501 from the still-scaffolded StartIngestion, got {} with body {}",
+        "expected HTTP 501 from the still-scaffolded DeleteAppAuthorization, got {} with body {}",
         answer.status, answer.body
     );
     // Naming the operation is what distinguishes the scaffold's 501 from the
@@ -1418,8 +1410,8 @@ async fn an_unimplemented_operation_still_answers_501() {
         .and_then(Value::as_str)
         .unwrap_or_default();
     assert!(
-        message.contains("StartIngestion"),
-        "expected the scaffold 501 to name StartIngestion, got {}",
+        message.contains("DeleteAppAuthorization"),
+        "expected the scaffold 501 to name DeleteAppAuthorization, got {}",
         answer.body
     );
 }

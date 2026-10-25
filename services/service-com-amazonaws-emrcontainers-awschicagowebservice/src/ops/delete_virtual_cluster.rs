@@ -146,13 +146,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         state.settle();
 
         // This operation models no not-found error, so a cluster that was never created
-        // and one whose teardown already started are both refused as invalid requests.
-        let Some(record) = state.virtual_clusters.get(&input.id) else {
+        // and one whose teardown already started are both refused as invalid requests. A
+        // cluster of another region is one that was never created HERE.
+        let Some(record) = state.virtual_cluster(&region, &input.id) else {
             return Err(DeleteVirtualClusterErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!("Virtual cluster {} was not found", input.id)),
@@ -174,6 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         state.move_virtual_cluster(
+            &region,
             &input.id,
             crate::state::CLUSTER_TERMINATING,
             crate::state::CLUSTER_TERMINATED,

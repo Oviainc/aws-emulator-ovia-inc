@@ -55,9 +55,6 @@ struct Probe {
 
 /// Every operation of this service that reaches a FEED by its bare `FeedId`, with the
 /// route the model binds it to (`OPERATIONS.md`, "Route").
-///
-/// `DeleteFeedPolicy` is left out: it is still scaffolded, so it answers 501 for every
-/// id and asserts nothing about which Region holds a feed.
 fn feed_probes(id: &str) -> Vec<Probe> {
     let replacement = json!({
         "name": "renamed-by-another-region",
@@ -107,6 +104,12 @@ fn feed_probes(id: &str) -> Vec<Probe> {
             method: "PUT",
             path: format!("/v1/feed/{id}/policy"),
             body: Some(json!({"policy": r#"{"Sid":"from-another-region"}"#})),
+        },
+        Probe {
+            label: "DeleteFeedPolicy",
+            method: "DELETE",
+            path: format!("/v1/feed/{id}/policy"),
+            body: None,
         },
     ]
 }

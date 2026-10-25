@@ -186,7 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below, on the same terms as `StartJobRun`: which requests this operation refuses
         // does not depend on whether one of them was retried.
         if let Some(configuration_id) = input.security_configuration_id.as_deref() {
-            if !state.security_configurations.contains_key(configuration_id) {
+            if state
+                .security_configuration(&region, configuration_id)
+                .is_none()
+            {
                 return Err(CreateVirtualClusterErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(format!(
@@ -200,10 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clientToken` is `@idempotencyToken`: the same token replayed names the
         // cluster the first call minted, so a retried create never doubles the resource.
+        // The token is remembered per region, because the cluster it names exists in one.
         let replayed = state
-            .replayed_idempotency(crate::state::CREATE_VIRTUAL_CLUSTER_SCOPE, &input.client_token)
+            .replayed_idempotency(
+                &region,
+                crate::state::CREATE_VIRTUAL_CLUSTER_SCOPE,
+                &input.client_token,
+            )
             .cloned();
-        if let Some(existing) = replayed.and_then(|id| state.virtual_clusters.get(&id)) {
+        if let Some(existing) = replayed.and_then(|id| state.virtual_cluster(&region, &id)) {
             return Ok(CreateVirtualClusterOutput {
                 id: Some(existing.id.clone()),
                 name: Some(existing.name.clone()),
@@ -214,13 +222,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A virtual cluster IS the registration of one Kubernetes namespace, and "a single
         // virtual cluster maps to a single Kubernetes namespace", so a namespace of a
         // container cluster that is already registered cannot be registered a second time.
-        // Checked AFTER the replay above, because a retried create names the very cluster
-        // that holds the namespace and must still be answered with it rather than refused
-        // by itself. A request whose `containerProvider` names no namespace claims none,
-        // so there is nothing for it to collide with.
+        // The container cluster is itself regional, so the mapping is resolved among this
+        // region's clusters. Checked AFTER the replay above, because a retried create names
+        // the very cluster that holds the namespace and must still be answered with it
+        // rather than refused by itself. A request whose `containerProvider` names no
+        // namespace claims none, so there is nothing for it to collide with.
         if let Some(namespace) = crate::state::provider_namespace(&input.container_provider) {
             if let Some(holder) = state
-                .cluster_mapped_to_namespace(&input.container_provider.id, namespace)
+                .cluster_mapped_to_namespace(&region, &input.container_provider.id, namespace)
                 .map(|record| record.id.clone())
             {
                 return Err(CreateVirtualClusterErrorModeled::ValidationException(
@@ -257,6 +266,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // once and owes no later transition.
         let record = crate::state::VirtualClusterRecord {
             id: id.clone(),
+            // The region this request was signed for: the cluster exists at that
+            // endpoint and nowhere else, which is what every later read resolves against.
+            region: region.clone(),
             name: input.name.clone(),
             arn: arn.clone(),
             state: crate::state::CLUSTER_RUNNING.to_string(),

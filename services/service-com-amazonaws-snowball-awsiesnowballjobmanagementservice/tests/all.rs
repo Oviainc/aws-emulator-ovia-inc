@@ -39,6 +39,8 @@ mod job_order_validation;
 mod job_unlock_code;
 #[path = "all/job_updates.rs"]
 mod job_updates;
+#[path = "all/page_size_rule.rs"]
+mod page_size_rule;
 #[path = "all/return_shipping_labels.rs"]
 mod return_shipping_labels;
 #[path = "all/service_versions.rs"]

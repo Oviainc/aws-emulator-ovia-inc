@@ -17,6 +17,8 @@ mod audit_findings;
 mod budget_reports;
 #[path = "all/discovered_metric_references.rs"]
 mod discovered_metric_references;
+#[path = "all/discovery_enablement.rs"]
+mod discovery_enablement;
 #[path = "all/entity_events.rs"]
 mod entity_events;
 #[path = "all/entity_identity.rs"]

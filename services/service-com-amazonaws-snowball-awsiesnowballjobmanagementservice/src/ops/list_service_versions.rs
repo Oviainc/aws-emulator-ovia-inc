@@ -357,16 +357,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // `MaxResults` is modelled `range 0..100` and is "the maximum number of
-        // ListServiceVersions objects to return". A page of zero entries with a
-        // continuation token would never advance the walk, so the only reading of 0 under
-        // which the walk terminates is "unspecified" — the same as omitting the member,
-        // which gets the largest page the member admits.
-        let page_size = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .filter(|max| *max > 0)
-            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS);
+        // The page size is the one every list operation of this service shares
+        // (`state::page_size`), so `ListServiceVersions` cannot drift from the job
+        // listings on how `MaxResults` — and the 0 the member admits — is read.
+        let page_size = crate::state::page_size(input.max_results);
 
         // A `NextToken` is one this service minted on an earlier page of THIS walk — the
         // same service and the same dependent-service pins — and it names the version

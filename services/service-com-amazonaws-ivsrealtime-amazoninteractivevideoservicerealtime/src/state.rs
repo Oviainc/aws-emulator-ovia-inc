@@ -257,6 +257,48 @@ pub fn resolved_recording_configuration(
     Ok(configuration)
 }
 
+/// The member that names the stage an ingest configuration is associated with, as the
+/// wire spells it — what a refusal of that member names.
+pub const INGEST_CONFIGURATION_STAGE_MEMBER: &str = "stageArn";
+
+/// The resource kind a stage reference names, as [`unresolved_reference_message`]
+/// states it.
+const STAGE_RESOURCE: &str = "stage";
+
+/// The stage an ingest configuration is associated with, given what its create or update
+/// request supplied AND the stages this account actually holds: the ONE place a supplied
+/// association is both defaulted and resolved, so a create and an update accept and
+/// refuse the same request.
+///
+/// A non-empty `stageArn` is a REFERENCE to a stage of this same service ("ARN of the
+/// stage with which the IngestConfiguration is associated"), so one this store holds no
+/// stage for is refused instead of being persisted: the association is what a publisher's
+/// ingest is routed into, so a configuration pointing at a stage that does not exist
+/// would report an association nothing can serve. `Err` is the sentence to put on the
+/// calling operation's `ValidationException`, worded by [`unresolved_reference_message`];
+/// `operation` is that operation's name. Called before anything is minted or written, so
+/// a refused request leaves the store as it was.
+///
+/// An absent member, and the empty string the modelled `IngestConfigurationStageArn`
+/// admits, both name no stage — [`NO_ASSOCIATED_STAGE_ARN`] — so they are resolved by
+/// nothing.
+pub fn resolved_stage_association(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    operation: &str,
+    requested: Option<String>,
+) -> Result<String, String> {
+    let stage_arn = requested.unwrap_or_else(|| NO_ASSOCIATED_STAGE_ARN.to_string());
+    if stage_arn != NO_ASSOCIATED_STAGE_ARN && !state.stages.contains_key(&stage_arn) {
+        return Err(unresolved_reference_message(
+            operation,
+            INGEST_CONFIGURATION_STAGE_MEMBER,
+            STAGE_RESOURCE,
+            &stage_arn,
+        ));
+    }
+    Ok(stage_arn)
+}
+
 // ---------------------------------------------------------------------------
 // A stage's data-plane endpoints
 //

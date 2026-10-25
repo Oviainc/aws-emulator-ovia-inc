@@ -31,6 +31,8 @@ mod rejection_codes;
 mod resource_policy_lifecycle;
 #[path = "all/rule_group_name_bound.rs"]
 mod rule_group_name_bound;
+#[path = "all/rule_groups_namespace_deletion.rs"]
+mod rule_groups_namespace_deletion;
 #[path = "all/rule_groups_namespace_lifecycle.rs"]
 mod rule_groups_namespace_lifecycle;
 #[path = "all/rule_groups_namespace_listing.rs"]
