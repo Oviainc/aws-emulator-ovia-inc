@@ -26,6 +26,10 @@
 //! * the compute nodes paginate: `maxResults` bounds a page, `nextToken` resumes
 //!   the same enumeration, and a token the operation never issued for that
 //!   execution is a refusal rather than an empty page;
+//! * `StartPipelineExecution` records a NEW execution of the pipeline's current
+//!   version under an id of its own, at the scheduling priority the request named
+//!   inside the member's modelled range (the documented default when it named
+//!   none), and a priority outside that range is refused rather than recorded;
 //! * a pipeline whose `computations` is not a DAG (a repeated node name, a
 //!   dependency on a node it does not declare, a cycle) is refused at create
 //!   time, and a create naming a workspace or task the store does not hold is the
@@ -37,6 +41,8 @@
 
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
+
+use service_com_amazonaws_iotsitewise_awsiotsitewise::state::FIRST_PIPELINE_VERSION;
 
 use super::asset_lifecycle::{call, error_code, hex_token, is_modelled_id, router, REGION};
 
@@ -1236,4 +1242,173 @@ async fn workspace_encryption_configuration_is_checked() {
         "ConflictingOperationException",
         "a repeated workspace name: got {body}"
     );
+}
+
+/// The published bounds of `executionPriority` — `@range(min: 0, max: 2)` on
+/// `StartPipelineExecution`'s input (smithy_query query="operation"
+/// operation="StartPipelineExecution").
+const PRIORITY_MIN: i64 = 0;
+const PRIORITY_MAX: i64 = 2;
+
+/// The priority an execution that names none runs at, from the member's own doc:
+/// "Defaults to 2 when not specified."
+const DEFAULT_PRIORITY: i64 = 2;
+
+#[tokio::test]
+async fn an_execution_records_the_priority_and_the_version_it_started_against() {
+    let router = router();
+    create_workspace(&router, WORKSPACE).await;
+    create_task(&router, WORKSPACE, "alpha", &[], &[]).await;
+    let (status, created) = create_pipeline(
+        &router,
+        WORKSPACE,
+        PIPELINE,
+        &[],
+        &[Node::new("one", "alpha")],
+    )
+    .await;
+    assert_eq!(status, 200, "create pipeline: got {status} {created}");
+    let first_version = FIRST_PIPELINE_VERSION.to_string();
+
+    // The rows differ in the priority the start names: none at all, each published
+    // bound of the modelled range, and the value between them. Each row starts its
+    // OWN execution of the SAME pipeline, so what a later read reports can only
+    // have come from that execution's stored record.
+    let cases: [(&str, Option<i64>, i64); 4] = [
+        ("no priority named", None, DEFAULT_PRIORITY),
+        ("the range minimum", Some(PRIORITY_MIN), PRIORITY_MIN),
+        (
+            "between the bounds",
+            Some(PRIORITY_MIN + 1),
+            PRIORITY_MIN + 1,
+        ),
+        ("the range maximum", Some(PRIORITY_MAX), PRIORITY_MAX),
+    ];
+    let mut started: Vec<(&str, String, i64)> = Vec::new();
+    for (case, requested, expected) in cases {
+        let body = match requested {
+            Some(priority) => json!({ "executionPriority": priority }),
+            None => json!({}),
+        };
+        let (status, answer) = start_execution(&router, WORKSPACE, PIPELINE, body).await;
+        assert_eq!(status, 202, "case {case:?}: start got {status} {answer}");
+        let id = answer["pipelineExecutionId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            is_modelled_id(&id),
+            "case {case:?}: expected a modelled execution id, got {id:?}"
+        );
+        assert!(
+            started.iter().all(|(_, earlier, _)| earlier != &id),
+            "case {case:?}: expected an id no earlier start minted, got {id:?}"
+        );
+        started.push((case, id, expected));
+    }
+
+    for (case, id, expected) in &started {
+        let (status, body) = describe_execution(&router, WORKSPACE, PIPELINE, id, "").await;
+        assert_eq!(status, 200, "case {case:?}: describe got {status} {body}");
+        assert_eq!(
+            body["executionPriority"].as_i64(),
+            Some(*expected),
+            "case {case:?}: expected priority {expected}, got {body}"
+        );
+        assert_eq!(
+            body["pipelineVersion"].as_str(),
+            Some(first_version.as_str()),
+            "case {case:?}: expected the pipeline version the start ran against \
+             ({first_version}), got {body}"
+        );
+        assert_eq!(
+            body["status"]["state"].as_str(),
+            Some("NOT_STARTED"),
+            "case {case:?}: nothing ran, so the execution is NOT_STARTED, got {body}"
+        );
+    }
+
+    // One step past each published bound is outside the modelled range, so the
+    // start is refused rather than recorded.
+    for (case, priority) in [
+        ("one below the range minimum", PRIORITY_MIN - 1),
+        ("one above the range maximum", PRIORITY_MAX + 1),
+    ] {
+        let (status, body) = start_execution(
+            &router,
+            WORKSPACE,
+            PIPELINE,
+            json!({ "executionPriority": priority }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a priority outside the modelled range must be refused, \
+             got {status} {body}"
+        );
+    }
+
+    // A refused start writes nothing, so every execution above still reports the
+    // priority it was started with.
+    for (case, id, expected) in &started {
+        let (status, body) = describe_execution(&router, WORKSPACE, PIPELINE, id, "").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: describe after the refusals got {status} {body}"
+        );
+        assert_eq!(
+            body["executionPriority"].as_i64(),
+            Some(*expected),
+            "case {case:?}: a refused start must not change a stored execution, got {body}"
+        );
+    }
+
+    // An execution runs against the pipeline's CURRENT version, so a start after an
+    // update records the version that update wrote, runs the DAG that version
+    // declares, and leaves every earlier execution on the version it started
+    // against.
+    let (status, updated) = call(
+        &router,
+        "PUT",
+        &format!("/workspaces/{WORKSPACE}/pipelines/{PIPELINE}"),
+        Some(json!({ "computations": [Node::new("two", "alpha").to_json()] })),
+    )
+    .await;
+    assert_eq!(status, 200, "update pipeline: got {status} {updated}");
+    let next_version = (FIRST_PIPELINE_VERSION + 1).to_string();
+    assert_eq!(
+        updated["version"].as_str(),
+        Some(next_version.as_str()),
+        "an update writes the next version, got {updated}"
+    );
+
+    let after_update = start_plain(&router, WORKSPACE, PIPELINE).await;
+    let (status, body) = describe_execution(&router, WORKSPACE, PIPELINE, &after_update, "").await;
+    assert_eq!(
+        status, 200,
+        "case \"after an update\": describe got {status} {body}"
+    );
+    assert_eq!(
+        body["pipelineVersion"].as_str(),
+        Some(next_version.as_str()),
+        "case \"after an update\": expected version {next_version}, got {body}"
+    );
+    assert_eq!(
+        reported_nodes(&body),
+        vec!["two".to_string()],
+        "case \"after an update\": the execution runs the updated DAG, got {body}"
+    );
+    for (case, id, _) in &started {
+        let (status, body) = describe_execution(&router, WORKSPACE, PIPELINE, id, "").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: describe after the update got {status} {body}"
+        );
+        assert_eq!(
+            body["pipelineVersion"].as_str(),
+            Some(first_version.as_str()),
+            "case {case:?}: an execution keeps the version it started against \
+             ({first_version}), got {body}"
+        );
+    }
 }

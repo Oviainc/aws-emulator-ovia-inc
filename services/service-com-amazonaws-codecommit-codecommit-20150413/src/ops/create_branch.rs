@@ -247,9 +247,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !repository.commits.contains_key(&input.commit_id) {
             return Err(CreateBranchErrorModeled::CommitDoesNotExistException(
                 CommitDoesNotExistException {
-                    message: Some(format!(
-                        "the commit {} does not exist in the repository {}",
-                        input.commit_id, input.repository_name
+                    message: Some(crate::state::commit_does_not_exist_message(
+                        &input.commit_id,
                     )),
                 },
             )
