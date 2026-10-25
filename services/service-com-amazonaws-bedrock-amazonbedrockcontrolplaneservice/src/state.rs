@@ -57,6 +57,11 @@
 //! `ops/list_foundation_models.rs` reports — which is seeded with the store and never
 //! written, because no operation of this service creates a foundation model.
 //!
+//! And it holds the resource policies `ops/put_resource_policy.rs` attaches and
+//! `ops/get_resource_policy.rs` reports, keyed by the [`TaggedResource`] each one is
+//! attached to — one of the resources above, resolved out of the very same maps, so a
+//! policy is attached to a RESOURCE rather than to one spelling of its ARN.
+//!
 //! Tagging adds NO store of its own: `ops/tag_resource.rs` writes, and
 //! `ops/list_tags_for_resource.rs` reports, the `tags` list of the record that already
 //! holds the resource a `resourceARN` names — the same list the create that minted the
@@ -1184,6 +1189,10 @@ pub struct EnforcedGuardrailConfiguration {
 /// * `foundation_models` is the PUBLISHED catalog, seeded once per store and never
 ///   written: no operation here creates or deletes a foundation model.
 ///
+/// * `resource_policies` holds at most one entry per live resource of the maps above: a
+///   policy is only ever attached to a resource this store HOLDS, and the attach drops
+///   the entries whose resource is gone ([`Self::attach_resource_policy`]).
+///
 /// * `use_case_for_model_access` is a single optional form, which a put replaces rather
 ///   than appends to, and whose size the model already caps
 ///   (`AcknowledgementFormDataBody` is 10..16384 bytes).
@@ -1333,6 +1342,16 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// A FIXED set, not a resource a caller creates: no operation of this service adds a
     /// row to it or takes one away, so it cannot grow the store either.
     pub foundation_models: FoundationModelCatalog,
+    /// Every resource policy in force, keyed by the RESOURCE it is attached to rather than
+    /// by one spelling of that resource's ARN — the document `PutResourcePolicy` last
+    /// stored for it and `GetResourcePolicy` reports back.
+    ///
+    /// Read through [`Self::resource_policy`] and written only by
+    /// [`Self::attach_resource_policy`], which attaches a policy only to a resource this
+    /// store HOLDS ([`Self::policy_resource`]) and drops the entries whose resource is
+    /// gone — so this map holds at most one entry per live resource of this account and a
+    /// create/delete cycle cannot grow it.
+    pub resource_policies: HashMap<TaggedResource, String>,
     /// The account's acknowledged use case for model access: the `formData` bytes
     /// `PutUseCaseForModelAccess` last submitted, or `None` while the account has
     /// submitted none.
@@ -1839,6 +1858,64 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         let resource = self.tagged_resource(resource_arn, region, now)?;
         self.tags_of_mut(&resource)
     }
+
+    /// The resource a resource-policy call's `resourceArn` names, or `None` when this
+    /// account holds no such resource.
+    ///
+    /// A resource-based policy is attached TO a resource, so the value is resolved through
+    /// [`Self::tagged_resource`] — the ONE resolution of a caller-supplied resource ARN in
+    /// this service, so a policy reaches exactly the resources a tagging call and that
+    /// resource's own reads reach, including the second ARN spelling two of the families
+    /// are addressable under. `ResourcePolicyResourceArn` is documented as "the ARN of the
+    /// Bedrock resource" (`smithy_query(query="operation",operation="PutResourcePolicy")`)
+    /// and declares no `@pattern`, so the ARN form is required HERE: a bare resource name,
+    /// which a tagging call admits, is no ARN of this service's namespace and names
+    /// nothing to attach a policy to.
+    pub fn policy_resource(
+        &mut self,
+        resource_arn: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<TaggedResource> {
+        ::service_common::arn::parse_of(resource_arn, ARN_NAMESPACE)?;
+        self.tagged_resource(resource_arn, region, now)
+    }
+
+    /// The resource policy attached to the resource a resource-policy call's `resourceArn`
+    /// names, or `None` when this account holds no such resource or that resource holds no
+    /// policy.
+    ///
+    /// The document is handed back EXACTLY as it was stored — a policy is a document the
+    /// caller wrote, not a shape this emulator re-renders.
+    pub fn resource_policy(
+        &mut self,
+        resource_arn: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<&str> {
+        let resource = self.policy_resource(resource_arn, region, now)?;
+        self.resource_policies.get(&resource).map(String::as_str)
+    }
+
+    /// Attach `document` to `resource`, REPLACING the policy that resource already holds —
+    /// a resource holds at most one resource policy, which is what makes the put
+    /// idempotent.
+    ///
+    /// Every entry whose resource this store no longer holds is dropped first (a resolved
+    /// resource's record is present exactly when the tags read off it are), so the map
+    /// stays bounded by the live resources however many attach and delete cycles run.
+    pub fn attach_resource_policy(&mut self, resource: TaggedResource, document: String) {
+        let gone: Vec<TaggedResource> = self
+            .resource_policies
+            .keys()
+            .filter(|attached| self.tags_of(attached).is_none())
+            .cloned()
+            .collect();
+        for attached in gone {
+            self.resource_policies.remove(&attached);
+        }
+        self.resource_policies.insert(resource, document);
+    }
 }
 
 /// A resource of this service that carries tags, as the record holding those tags is
@@ -1849,7 +1926,12 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
 /// operation then reaches the same record. Each variant carries the key its family's store
 /// is keyed by, which is why an imported model carries the ARN of the JOB that imports it:
 /// that job is where the model's tags live, as [`ModelImportJobRecord`] states.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Hash` and `Eq` are what let it key
+/// [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::resource_policies`]: a
+/// resource policy is attached to the RESOURCE this resolves to, so two spellings of one
+/// resource's ARN address the same policy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TaggedResource {
     /// A guardrail, by its `guardrailId`.
     Guardrail(String),

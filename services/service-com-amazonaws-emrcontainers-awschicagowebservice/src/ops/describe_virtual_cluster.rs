@@ -151,13 +151,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         // Reporting, but it materialises what the clock already owed: a TERMINATING
         // cluster reaches TERMINATED at its due instant whether or not anybody looked.
         state.settle();
 
-        let Some(view) = state.virtual_cluster_view(&input.id) else {
+        // Resolved in the region this request is signed for: a cluster created at another
+        // region's endpoint does not exist here.
+        let Some(view) = state.virtual_cluster_view(&region, &input.id) else {
             return Err(DescribeVirtualClusterErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!("Virtual cluster {} was not found", input.id)),

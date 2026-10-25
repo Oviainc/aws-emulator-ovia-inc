@@ -17,6 +17,8 @@ mod account_device_gate;
 mod create_task_tag_validation;
 #[path = "all/device_ec2_instances.rs"]
 mod device_ec2_instances;
+#[path = "all/device_region_gate.rs"]
+mod device_region_gate;
 #[path = "all/device_resources.rs"]
 mod device_resources;
 #[path = "all/device_task_lifecycle.rs"]

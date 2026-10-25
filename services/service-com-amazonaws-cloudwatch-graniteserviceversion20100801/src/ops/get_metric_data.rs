@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMetricData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMetricData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: answers each `MetricDataQuery` from the datapoints `PutMetricData` stored
+//! for the metric it names, aggregated into the query's `Period` windows by its `Stat`,
+//! inside the requested time range and ordered as `ScanBy` asks. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMetricData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A query carrying a metric math `Expression` is one part of the operation nobody has
+//! written yet: there is no evaluator for the metric math language here, so such a request
+//! answers HTTP 501 `NotImplemented` rather than a result nothing computed. So does a query
+//! asking for a statistic CloudWatch supports but this store does not fold out of its
+//! datapoints (the interquartile mean, the trimmed / Winsorized / percentile-rank families);
+//! a `Stat` outside the statistic grammar altogether is a bad parameter value.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +141,8 @@
 //!
 //! * `InvalidNextToken` (HTTP 400) — The next token specified is invalid.
 
+use std::collections::HashSet;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -153,10 +157,25 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `GetMetricDataError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#GetMetricData")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#GetMetricData",
+    // Widened in with `extra_errors`: this SERVICE models all three, the operation shape
+    // lists only `InvalidNextToken`. `InternalServiceFault` is the only honest answer when
+    // the shared store cannot be reached, and the two parameter faults are what every other
+    // metric-reading operation of this service refuses a bad `MetricDataQueries` /
+    // `StartTime` / `EndTime` with.
+    extra_errors = [
+        "InternalServiceFault",
+        "InvalidParameterValueException",
+        "InvalidParameterCombinationException"
+    ]
+)]
 #[derive(Debug)]
 pub enum GetMetricDataErrorModeled {
     InvalidNextToken(InvalidNextToken),
+    InternalServiceFault(InternalServiceFault),
+    InvalidParameterValueException(InvalidParameterValueException),
+    InvalidParameterCombinationException(InvalidParameterCombinationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -210,18 +229,457 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMetricData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMetricDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMetricData"))
+        // `ctx` carries only request metadata; this operation answers from the store.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMetricDataError::from(GetMetricDataErrorModeled::InternalServiceFault(
+                InternalServiceFault {
+                    message: Some("the CloudWatch metric store is unavailable".into()),
+                },
+            ))
+        })?;
+
+        // "A single GetMetricData call can include up to 500 MetricDataQuery structures."
+        if input.metric_data_queries.is_empty() {
+            return Err(invalid_value(
+                "MetricDataQueries must name at least one query".to_string(),
+            ));
+        }
+        if input.metric_data_queries.len() > MAX_QUERIES {
+            return Err(invalid_value(format!(
+                "MetricDataQueries carries {} queries; one call can include up to {MAX_QUERIES}",
+                input.metric_data_queries.len()
+            )));
+        }
+        // Every result is reported under the `Id` of the query it answers, so two queries
+        // sharing one id would make a result ambiguous.
+        let mut seen_ids: HashSet<&str> = HashSet::with_capacity(input.metric_data_queries.len());
+        for query in &input.metric_data_queries {
+            if !seen_ids.insert(query.id.as_str()) {
+                return Err(invalid_value(format!(
+                    "the Id {} is used by more than one query; each query carries its own Id",
+                    query.id
+                )));
+            }
+        }
+
+        // "The order in which data points should be returned" — "If you omit this parameter,
+        // the default of TimestampDescending is used."
+        let descending = match input.scan_by.as_deref() {
+            None | Some(SCAN_BY_DESCENDING) => true,
+            Some(SCAN_BY_ASCENDING) => false,
+            Some(other) => {
+                return Err(invalid_value(format!(
+                    "ScanBy {other} is not supported; the supported values are \
+                     {SCAN_BY_ASCENDING} | {SCAN_BY_DESCENDING}"
+                )))
+            }
+        };
+
+        // "The maximum number of data points the request should return before paginating. If
+        // you omit this, the default of 100,800 is used."
+        let max_datapoints = match input.max_datapoints {
+            None => DEFAULT_MAX_DATAPOINTS,
+            Some(requested) if requested >= 1 => usize::try_from(requested).unwrap_or(usize::MAX),
+            Some(requested) => {
+                return Err(invalid_value(format!(
+                    "MaxDatapoints must be at least 1; got {requested}"
+                )))
+            }
+        };
+
+        // "Include this value, if it was returned by the previous GetMetricData operation, to
+        // get the next set of data points": the cursor this operation mints carries how many
+        // of THIS request's data points the earlier pages already returned, together with the
+        // identity of the request it was minted for — so anything else is not a token this
+        // service handed out, and a token replayed against a different request is refused
+        // rather than silently skipping or repeating datapoints.
+        let identity = request_identity(&input);
+        let already_returned: usize = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let (returned, minted_for) = decode_cursor(token).ok_or_else(|| {
+                    invalid_next_token("NextToken is not a token this operation minted")
+                })?;
+                if minted_for != identity {
+                    return Err(invalid_next_token(
+                        "NextToken was issued for a different GetMetricData request",
+                    ));
+                }
+                returned
+            }
+        };
+
+        let requested_start = crate::state::from_timestamp(&input.start_time);
+        let end = crate::state::from_timestamp(&input.end_time);
+        if end <= requested_start {
+            return Err(invalid_value(format!(
+                "EndTime must be later than StartTime; got StartTime {requested_start} and \
+                 EndTime {end} (epoch seconds)"
+            )));
+        }
+        let now = crate::state::now_secs();
+
+        // Each query's series is folded under its OWN short acquisition of the store, and the
+        // walk yields between queries: one call can carry up to [`MAX_QUERIES`] of them, so
+        // neither the critical section nor the stretch between two yield points grows with
+        // how many queries the request asked for.
+        let mut series: Vec<Series> = Vec::with_capacity(input.metric_data_queries.len());
+        for (index, query) in input.metric_data_queries.iter().enumerate() {
+            let Some(stat) = query.metric_stat.as_ref() else {
+                // A query that is not a `MetricStat` is a metric math expression or a
+                // Metrics Insights query, and this emulator holds no evaluator for
+                // either: 501 says "not written yet" rather than answering with a series
+                // nothing computed.
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "GetMetricData over a metric math expression",
+                ));
+            };
+            let resolved = {
+                let store = state.lock();
+                resolve_series(&store, query, stat, requested_start, end, now)
+            }?;
+            series.push(resolved);
+            // A yield every `QUERY_YIELD_INTERVAL` queries, so a cancelled or timed-out
+            // request has somewhere to land mid-walk.
+            if index > 0 && index.is_multiple_of(QUERY_YIELD_INTERVAL) {
+                ::tokio::task::yield_now().await;
+            }
+        }
+
+        // One datapoint budget is spent across every result, in query order, and the cursor
+        // the response hands back is how many of them this and the earlier pages returned —
+        // so paging through a request's results never repeats or skips a datapoint.
+        let mut skipped = 0usize;
+        let mut returned = 0usize;
+        let mut truncated = false;
+        let mut results: Vec<MetricDataResult> = Vec::with_capacity(series.len());
+        for (query, computed) in input.metric_data_queries.iter().zip(series) {
+            // "If you are performing this call just to do math expressions and do not also
+            // need the raw data returned, you can specify false. If you omit this, the
+            // default of true is used." A query whose data is not returned contributes no
+            // result AND spends none of the datapoint budget: a page is cut short only by
+            // data a caller actually receives.
+            if !query.return_data.unwrap_or(true) {
+                continue;
+            }
+
+            let mut points: Vec<(f64, f64)> = computed.points;
+            // "TimestampDescending returns the newest data first […] TimestampAscending
+            // returns the oldest data first." The windows are built oldest first.
+            if descending {
+                points.reverse();
+            }
+
+            let mut timestamps = Vec::new();
+            let mut values = Vec::new();
+            let mut cut = false;
+            for (timestamp, value) in points {
+                if skipped < already_returned {
+                    skipped += 1;
+                    continue;
+                }
+                if returned >= max_datapoints {
+                    cut = true;
+                    truncated = true;
+                    break;
+                }
+                timestamps.push(crate::state::to_timestamp(timestamp));
+                values.push(value);
+                returned += 1;
+            }
+
+            results.push(MetricDataResult {
+                id: Some(query.id.clone()),
+                label: Some(computed.label),
+                timestamps: Some(timestamps),
+                values: Some(values),
+                // "Complete indicates that all data points in the requested time range were
+                // returned. PartialData means that an incomplete set of data points were
+                // returned."
+                status_code: Some(if cut {
+                    STATUS_PARTIAL_DATA.to_string()
+                } else {
+                    STATUS_COMPLETE.to_string()
+                }),
+                // A message here is about ONE metric, and nothing about a series this store
+                // answered in full needs reporting.
+                messages: Some(Vec::new()),
+            });
+        }
+
+        Ok(GetMetricDataOutput {
+            metric_data_results: Some(results),
+            // "A token that marks the next batch of returned results", minted only when the
+            // budget cut the data short, and only for THIS request.
+            next_token: truncated.then(|| {
+                encode_cursor(already_returned.saturating_add(returned), &identity)
+            }),
+            // "A message appears here only if it is related to the global GetMetricData
+            // operation."
+            messages: Some(Vec::new()),
+        })
     }
+}
+
+/// "A single GetMetricData call can include up to 500 MetricDataQuery structures."
+const MAX_QUERIES: usize = 500;
+
+/// "The maximum number of data points the request should return before paginating. If you
+/// omit this, the default of 100,800 is used." (`GetMetricDataInput$MaxDatapoints`)
+const DEFAULT_MAX_DATAPOINTS: usize = 100_800;
+
+/// `TimestampAscending`, one of the two values the `ScanBy` enum carries.
+const SCAN_BY_ASCENDING: &str = "TimestampAscending";
+
+/// `TimestampDescending`, the `ScanBy` value a request that names none is answered in.
+const SCAN_BY_DESCENDING: &str = "TimestampDescending";
+
+/// `Complete`, one of the modelled `StatusCode` values: "all data points in the requested
+/// time range were returned".
+const STATUS_COMPLETE: &str = "Complete";
+
+/// `PartialData`, one of the modelled `StatusCode` values: "an incomplete set of data points
+/// were returned".
+const STATUS_PARTIAL_DATA: &str = "PartialData";
+
+/// How many queries the walk folds between yields, so a cancelled or timed-out request has
+/// somewhere to land instead of folding every query of the request first.
+const QUERY_YIELD_INTERVAL: usize = 16;
+
+/// How long "start time less than 15 days ago" lasts, in seconds — the first of the three
+/// spans `GetMetricDataInput$StartTime` rounds the requested start time by.
+const FIFTEEN_DAYS_SECS: f64 = 15.0 * 24.0 * 60.0 * 60.0;
+
+/// How long "start time between 15 and 63 days ago" lasts, in seconds.
+const SIXTY_THREE_DAYS_SECS: f64 = 63.0 * 24.0 * 60.0 * 60.0;
+
+/// The sub-minute `Period` values a request that names one of them also rounds its start
+/// time to: "If you set Period to 5, 10, 20, or 30, the start time of your request is
+/// rounded down to the nearest time that corresponds to even 5-, 10-, 20-, or 30-second
+/// divisions of a minute." (`GetMetricDataInput$StartTime`) — which is four of the five
+/// sub-minute periods `crate::state::SUB_MINUTE_PERIODS` admits.
+const START_TIME_ROUNDING_PERIODS: [i32; 4] = [5, 10, 20, 30];
+
+/// One query's answer: its label and its windows, oldest first.
+struct Series {
+    /// The label the result carries.
+    label: String,
+    /// `(window start in epoch seconds, the window's value)`, oldest window first.
+    points: Vec<(f64, f64)>,
+}
+
+/// Refuse an out-of-range input value — "The value of an input parameter is bad or
+/// out-of-range."
+fn invalid_value(message: String) -> GetMetricDataError {
+    GetMetricDataErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse a `NextToken` that is not one of this operation's, or is one of another request's
+/// — "The next token specified is invalid."
+fn invalid_next_token(message: &str) -> GetMetricDataError {
+    GetMetricDataErrorModeled::InvalidNextToken(InvalidNextToken {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The kind tag this operation's pagination cursor carries, so a token minted by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "GetMetricData";
+
+/// The identity of the enumeration a cursor belongs to: everything about the request that
+/// decides which datapoints it reports and in what order, as a FIXED-SIZE digest. A token is
+/// only a POSITION within one such enumeration, so a continuation whose request differs is
+/// refused — and because the identity is hashed, a 500-query call's token is as small as a
+/// one-query call's.
+fn request_identity(input: &GetMetricDataInput) -> String {
+    let queries: Vec<::serde_json::Value> = input
+        .metric_data_queries
+        .iter()
+        .map(|query| {
+            ::serde_json::json!({
+                "Id": query.id,
+                "Period": query.period,
+                "ReturnData": query.return_data,
+                "Expression": query.expression,
+                "MetricStat": query.metric_stat.as_ref().map(|stat| ::serde_json::json!({
+                    "Namespace": stat.metric.namespace,
+                    "MetricName": stat.metric.metric_name,
+                    "Dimensions": crate::state::dimension_set(stat.metric.dimensions.as_deref()),
+                    "Period": stat.period,
+                    "Stat": stat.stat,
+                    "Unit": stat.unit,
+                })),
+            })
+        })
+        .collect();
+    let identity = ::serde_json::json!({
+        "StartTime": crate::state::from_timestamp(&input.start_time),
+        "EndTime": crate::state::from_timestamp(&input.end_time),
+        "ScanBy": input.scan_by,
+        "MaxDatapoints": input.max_datapoints,
+        "Queries": queries,
+    })
+    .to_string();
+    ::hex::encode(<::sha2::Sha256 as ::sha2::Digest>::digest(identity.as_bytes()))
+}
+
+/// Encode the cursor the next page resumes from: how many datapoints this and the earlier
+/// pages returned, and the request it was minted for.
+fn encode_cursor(returned: usize, identity: &str) -> String {
+    crate::state::encode_page_token(
+        &::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "returned": returned,
+            "identity": identity,
+        })
+        .to_string(),
+    )
+}
+
+/// Decode a cursor [`encode_cursor`] produced; `None` for anything else.
+fn decode_cursor(token: &str) -> Option<(usize, String)> {
+    let decoded = crate::state::decode_page_token(token)?;
+    let value: ::serde_json::Value = ::serde_json::from_str(&decoded).ok()?;
+    if value.get("kind")?.as_str()? != CURSOR_KIND {
+        return None;
+    }
+    let returned = usize::try_from(value.get("returned")?.as_u64()?).ok()?;
+    Some((returned, value.get("identity")?.as_str()?.to_string()))
+}
+
+/// Refuse members that cannot be used together — "Parameters were used together that cannot
+/// be used together."
+fn invalid_combination(message: String) -> GetMetricDataError {
+    GetMetricDataErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The start of the first window a request searches.
+///
+/// "CloudWatch rounds the specified time stamp as follows: Start time less than 15 days ago
+/// - Round down to the nearest whole minute. […] Start time between 15 and 63 days ago -
+/// Round down to the nearest 5-minute clock interval. […] Start time greater than 63 days
+/// ago - Round down to the nearest 1-hour clock interval. […] If you set Period to 5, 10,
+/// 20, or 30, the start time of your request is rounded down to the nearest time that
+/// corresponds to even 5-, 10-, 20-, or 30-second divisions of a minute."
+/// (`GetMetricDataInput$StartTime`)
+fn round_start(requested_start: f64, period: i32, now: f64) -> f64 {
+    let interval = if START_TIME_ROUNDING_PERIODS.contains(&period) {
+        f64::from(period)
+    } else {
+        let age = now - requested_start;
+        if age < FIFTEEN_DAYS_SECS {
+            60.0
+        } else if age < SIXTY_THREE_DAYS_SECS {
+            5.0 * 60.0
+        } else {
+            60.0 * 60.0
+        }
+    };
+    (requested_start / interval).floor() * interval
+}
+
+/// Refuse a `Period` the member does not document, in the words the one shared rule
+/// ([`crate::state::period_error`]) states it in.
+fn check_period(period: i32) -> Result<(), GetMetricDataError> {
+    match crate::state::period_error(period) {
+        Some(message) => Err(invalid_value(message)),
+        None => Ok(()),
+    }
+}
+
+/// Answer one `MetricStat` query from the store: the datapoints of the metric it names,
+/// inside `[start, end)`, folded into `Period` windows by its `Stat`.
+///
+/// A window holding no datapoint is not reported — CloudWatch returns a value only for the
+/// periods that have data — so the two lists a result carries stay in step.
+fn resolve_series(
+    store: &crate::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
+    query: &MetricDataQuery,
+    stat: &MetricStat,
+    requested_start: f64,
+    end: f64,
+    now: f64,
+) -> Result<Series, GetMetricDataError> {
+    // "MetricStat" names ONE metric, and "a metric is uniquely defined by a name, a
+    // namespace, and zero or more dimensions", so both halves of that identity are required
+    // for the query to name a series at all.
+    let (Some(namespace), Some(metric_name)) =
+        (stat.metric.namespace.as_ref(), stat.metric.metric_name.as_ref())
+    else {
+        return Err(invalid_combination(format!(
+            "the query {} must name both MetricStat.Metric.Namespace and \
+             MetricStat.Metric.MetricName",
+            query.id
+        )));
+    };
+
+    // "The statistic to return. It can include any CloudWatch statistic or extended
+    // statistic." (`MetricStat$Stat`) — an unconstrained string in the model, so no boundary
+    // validator refuses a name outside the statistic grammar before this handler: a name
+    // that is not a statistic at all is a bad parameter value.
+    if !crate::state::is_cloudwatch_statistic(&stat.stat) {
+        return Err(invalid_value(format!(
+            "{} is not a supported statistic",
+            stat.stat
+        )));
+    }
+    // A statistic CloudWatch supports that this store does not fold out of its datapoints —
+    // the interquartile mean and the trimmed / Winsorized / percentile-rank families — is
+    // answered "not written yet" rather than with an empty series the response would call
+    // `Complete`.
+    if !crate::state::computes_statistic(&stat.stat) {
+        return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+            "GetMetricData over the {} statistic",
+            stat.stat
+        )));
+    }
+
+    // "When used in GetMetricData, [Period] is the granularity, in seconds, of the returned
+    // data points": the query's own `Period` member overrides the one on its `MetricStat`.
+    let period_secs = query.period.unwrap_or(stat.period);
+    check_period(period_secs)?;
+    let period = f64::from(period_secs);
+
+    let start = round_start(requested_start, period_secs, now);
+    let key = crate::state::MetricKey {
+        namespace: namespace.clone(),
+        metric_name: metric_name.clone(),
+        dimensions: crate::state::dimension_set(stat.metric.dimensions.as_deref()),
+    };
+
+    // `StartTime` inclusive, `EndTime` exclusive; windows are `Period` seconds wide and
+    // anchored at the rounded start time, folded by the one shared helper every reader of a
+    // series uses ([`crate::state::windows_of`]).
+    let stored = store.metrics.get(&key).map_or(&[][..], Vec::as_slice);
+    let windows = crate::state::windows_of(stored, start, end, period, stat.unit.as_deref());
+
+    let mut points: Vec<(f64, f64)> = Vec::with_capacity(windows.len());
+    for (index, data) in windows {
+        // A statistic the span does not define — a percentile over an opaque aggregate, say —
+        // reports no value for that window rather than an invented one.
+        let Some(value) = crate::state::statistic_value(&data, &stat.stat) else {
+            continue;
+        };
+        points.push((crate::state::window_start(start, index, period), value));
+    }
+
+    // "If Label is omitted, CloudWatch generates a default": the metric and the statistic the
+    // query asked for, which is what identifies the series it answers.
+    let label = query
+        .label
+        .clone()
+        .unwrap_or_else(|| format!("{metric_name} {}", stat.stat));
+
+    Ok(Series { label, points })
 }

@@ -145,6 +145,8 @@ mod fpga_image_tasks_and_volume_io;
 mod get_password_data;
 #[path = "all/host_reservation_offerings.rs"]
 mod host_reservation_offerings;
+#[path = "all/image_references.rs"]
+mod image_references;
 #[path = "all/image_usage_reports.rs"]
 mod image_usage_reports;
 #[path = "all/images.rs"]

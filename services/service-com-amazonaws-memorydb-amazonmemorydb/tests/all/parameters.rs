@@ -31,6 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_memorydb_amazonmemorydb::state::{MAX_MAX_RESULTS, MIN_MAX_RESULTS};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{call, error_code, ok, router};
@@ -771,9 +772,14 @@ async fn the_parameter_listing_pages_in_name_order() {
         "repeat read"
     );
 
-    // Page sizes at 1, in the middle, at the set's size and one past it.
+    // At the bottom of the page-size window, one past it, and at the set's own size:
+    // the family publishes more parameters than the smallest page the service serves, so
+    // the low rows really walk several pages.
     let total = expected.len();
-    for page_size in [1, 2, 7, total, total + 1] {
+    let at_set_size = i32::try_from(total)
+        .unwrap_or(MAX_MAX_RESULTS)
+        .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+    for page_size in [MIN_MAX_RESULTS, MIN_MAX_RESULTS + 1, at_set_size] {
         let case = format!("MaxResults={page_size}");
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
@@ -786,7 +792,7 @@ async fn the_parameter_listing_pages_in_name_order() {
             let page = ok(&router, "DescribeParameters", &body, &case).await;
             let names = parameter_names(&page, &case);
             assert!(
-                names.len() <= page_size,
+                i32::try_from(names.len()).unwrap_or(i32::MAX) <= page_size,
                 "case {case:?}: a page must hold at most {page_size} parameters, got {page}"
             );
             seen.extend(names);
@@ -808,8 +814,8 @@ async fn the_parameter_listing_pages_in_name_order() {
         );
     }
 
-    // A page size below 1 names no page.
-    for max_results in [0, -1, -9] {
+    // A page size outside the service's window names no page.
+    for max_results in [0, -9, MIN_MAX_RESULTS - 1, MAX_MAX_RESULTS + 1] {
         let (status, refused) = call(
             &router,
             "DescribeParameters",
@@ -818,8 +824,8 @@ async fn the_parameter_listing_pages_in_name_order() {
         .await;
         assert_eq!(
             status, 400,
-            "case {max_results:?}: a page size below 1 must answer 400, got {status} with \
-             {refused}"
+            "case {max_results:?}: a page size outside the window must answer 400, got \
+             {status} with {refused}"
         );
         assert_eq!(
             error_code(&refused),

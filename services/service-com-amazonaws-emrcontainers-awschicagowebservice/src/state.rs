@@ -20,6 +20,11 @@
 //!   slot when its virtual cluster configures a `maxConcurrentJobRuns`, so the counts
 //!   [`ComAmazonawsEmrcontainersAwschicagowebserviceState::cluster_scheduler_status`]
 //!   reports never exceed the capacity the cluster was created with.
+//!
+//! Every record carries the region it was created in, and every lookup here takes that
+//! region: EMR on EKS is a regional service, so a resource exists only at the endpoint
+//! that minted it, and an id offered to another region's endpoint names nothing. The
+//! region a request is in is [`request_region`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -409,8 +414,9 @@ pub fn parse_tagged_resource_arn(arn: &str) -> Option<TaggedResource> {
     }
 }
 
-/// The region to build an ARN in for this request: the region of its SigV4 credential
-/// scope, so an ARN names the region the caller signed for.
+/// The region to build an ARN in and to resolve a resource in for this request: the
+/// region of its SigV4 credential scope, so an ARN names the region the caller signed
+/// for and an id resolves only among that region's resources.
 pub fn request_region(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
         .map(|scope| scope.region)
@@ -475,6 +481,11 @@ pub fn provider_namespace(provider: &ContainerProvider) -> Option<&str> {
 #[derive(Debug, Clone)]
 pub struct VirtualClusterRecord {
     pub id: String,
+    /// The region whose endpoint minted this cluster — the one its [`arn`](Self::arn)
+    /// carries. Every read and every mutate resolves an id only among the records of the
+    /// region the request is signed for, so a resource exists exactly where it was
+    /// created.
+    pub region: String,
     pub name: String,
     pub arn: String,
     pub state: String,
@@ -550,6 +561,11 @@ impl VirtualClusterRecord {
 #[derive(Debug, Clone)]
 pub struct JobRunRecord {
     pub id: String,
+    /// The region whose endpoint accepted this run, on the terms
+    /// [`VirtualClusterRecord::region`] states. It is the region of the cluster the run
+    /// was submitted to: a run can only be started through the endpoint that cluster
+    /// exists at.
+    pub region: String,
     pub name: Option<String>,
     pub virtual_cluster_id: String,
     pub arn: String,
@@ -807,6 +823,9 @@ pub fn job_template_fingerprint(
 #[derive(Debug, Clone)]
 pub struct JobTemplateRecord {
     pub id: String,
+    /// The region whose endpoint minted this template, on the terms
+    /// [`VirtualClusterRecord::region`] states.
+    pub region: String,
     pub name: String,
     pub arn: String,
     pub created_at_millis: i64,
@@ -853,6 +872,9 @@ impl JobTemplateRecord {
 #[derive(Debug, Clone)]
 pub struct SecurityConfigurationRecord {
     pub id: String,
+    /// The region whose endpoint minted this configuration, on the terms
+    /// [`VirtualClusterRecord::region`] states.
+    pub region: String,
     pub name: String,
     pub arn: String,
     pub created_at_millis: i64,
@@ -894,6 +916,10 @@ impl SecurityConfigurationRecord {
 #[derive(Debug, Clone)]
 pub struct ManagedEndpointRecord {
     pub id: String,
+    /// The region whose endpoint created this managed endpoint, on the terms
+    /// [`VirtualClusterRecord::region`] states. It is the region of the cluster it
+    /// gateways into.
+    pub region: String,
     pub name: String,
     pub virtual_cluster_id: String,
     pub arn: String,
@@ -988,6 +1014,11 @@ impl ManagedEndpointRecord {
 pub struct ComAmazonawsEmrcontainersAwschicagowebserviceState {
     /// Virtual clusters by `id`. A terminated cluster stays here while it has a slot: EMR
     /// on EKS keeps it describable rather than answering 404 once it is gone.
+    ///
+    /// Every record set below holds the resources of EVERY region this emulator has been
+    /// called for, each record carrying the region it was created in (`region`), and a
+    /// lookup is region-scoped: EMR on EKS is a regional service, so an id resolves only
+    /// against the records of the region the request is signed for.
     pub virtual_clusters: HashMap<String, VirtualClusterRecord>,
     /// Job runs by `id`.
     pub job_runs: HashMap<String, JobRunRecord>,
@@ -1002,11 +1033,14 @@ pub struct ComAmazonawsEmrcontainersAwschicagowebserviceState {
     /// Job templates by `id`. Capped by [`MAX_JOB_TEMPLATES`]; a template leaves only
     /// when `DeleteJobTemplate` removes it.
     pub job_templates: HashMap<String, JobTemplateRecord>,
-    /// `(idempotency scope, clientToken) -> minted resource id`, so a replayed
+    /// `(region, idempotency scope, clientToken) -> minted resource id`, so a replayed
     /// `@idempotencyToken` returns the resource the first call minted instead of a
-    /// second one. One entry per stored record, inserted and reclaimed with it, so this
-    /// map is bounded by the two caps above.
-    pub idempotency: HashMap<(String, String), String>,
+    /// second one. The region is part of the key because the resource a token names
+    /// lives in one region: the same token replayed against another region's endpoint is
+    /// a different request there, and mints that region's own resource. One entry per
+    /// stored record, inserted and reclaimed with it, so this map is bounded by the caps
+    /// above.
+    pub idempotency: HashMap<(String, String, String), String>,
     /// The ids of the clusters that owe the clock a transition, so [`Self::settle`] walks
     /// only those rather than the whole store.
     pub pending_clusters: HashSet<String>,
@@ -1216,15 +1250,24 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
                             .all(|run| job_state_is_terminal(&run.state))
                 })
                 .min_by_key(|record| (record.created_at_millis, record.id.clone()))
-                .map(|record| (record.id.clone(), record.client_token.clone()));
-            let Some((id, client_token)) = retired else {
+                .map(|record| {
+                    (
+                        record.id.clone(),
+                        record.region.clone(),
+                        record.client_token.clone(),
+                    )
+                });
+            let Some((id, region, client_token)) = retired else {
                 return false;
             };
             for run_id in self.job_runs_by_cluster.remove(&id).unwrap_or_default() {
                 self.pending_job_runs.remove(&run_id);
                 if let Some(run) = self.job_runs.remove(&run_id) {
-                    self.idempotency
-                        .remove(&(start_job_run_scope(&id), run.client_token));
+                    self.idempotency.remove(&(
+                        run.region,
+                        start_job_run_scope(&id),
+                        run.client_token,
+                    ));
                 }
             }
             // A managed endpoint lives UNDER a virtual cluster, so the cluster's endpoints
@@ -1237,6 +1280,7 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
                 self.pending_managed_endpoints.remove(&endpoint_id);
                 if let Some(endpoint) = self.managed_endpoints.remove(&endpoint_id) {
                     self.idempotency.remove(&(
+                        endpoint.region,
                         create_managed_endpoint_scope(&id),
                         endpoint.client_token,
                     ));
@@ -1244,8 +1288,11 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             }
             self.virtual_clusters.remove(&id);
             self.pending_clusters.remove(&id);
-            self.idempotency
-                .remove(&(CREATE_VIRTUAL_CLUSTER_SCOPE.to_string(), client_token));
+            self.idempotency.remove(&(
+                region,
+                CREATE_VIRTUAL_CLUSTER_SCOPE.to_string(),
+                client_token,
+            ));
         }
         true
     }
@@ -1264,11 +1311,12 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
                 .map(|record| {
                     (
                         record.id.clone(),
+                        record.region.clone(),
                         record.virtual_cluster_id.clone(),
                         record.client_token.clone(),
                     )
                 });
-            let Some((id, virtual_cluster_id, client_token)) = retired else {
+            let Some((id, region, virtual_cluster_id, client_token)) = retired else {
                 return false;
             };
             self.job_runs.remove(&id);
@@ -1276,8 +1324,11 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             if let Some(ids) = self.job_runs_by_cluster.get_mut(&virtual_cluster_id) {
                 ids.retain(|stored| stored != &id);
             }
-            self.idempotency
-                .remove(&(start_job_run_scope(&virtual_cluster_id), client_token));
+            self.idempotency.remove(&(
+                region,
+                start_job_run_scope(&virtual_cluster_id),
+                client_token,
+            ));
         }
         true
     }
@@ -1291,6 +1342,7 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
         }
         self.idempotency.insert(
             (
+                record.region.clone(),
                 CREATE_VIRTUAL_CLUSTER_SCOPE.to_string(),
                 record.client_token.clone(),
             ),
@@ -1311,6 +1363,7 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             .push(record.id.clone());
         self.idempotency.insert(
             (
+                record.region.clone(),
                 start_job_run_scope(&record.virtual_cluster_id),
                 record.client_token.clone(),
             ),
@@ -1335,11 +1388,12 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
                 .map(|record| {
                     (
                         record.id.clone(),
+                        record.region.clone(),
                         record.virtual_cluster_id.clone(),
                         record.client_token.clone(),
                     )
                 });
-            let Some((id, virtual_cluster_id, client_token)) = retired else {
+            let Some((id, region, virtual_cluster_id, client_token)) = retired else {
                 return false;
             };
             self.managed_endpoints.remove(&id);
@@ -1348,6 +1402,7 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
                 ids.retain(|stored| stored != &id);
             }
             self.idempotency.remove(&(
+                region,
                 create_managed_endpoint_scope(&virtual_cluster_id),
                 client_token,
             ));
@@ -1368,6 +1423,7 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             .push(record.id.clone());
         self.idempotency.insert(
             (
+                record.region.clone(),
                 create_managed_endpoint_scope(&record.virtual_cluster_id),
                 record.client_token.clone(),
             ),
@@ -1377,19 +1433,24 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     }
 
     /// The stored managed endpoint with this id, only when it really belongs to this
-    /// cluster: an endpoint id under the wrong virtual cluster is not found, not somebody
-    /// else's endpoint.
+    /// cluster IN this region: an endpoint id under the wrong virtual cluster, or one of
+    /// another region, is not found, not somebody else's endpoint.
     pub fn managed_endpoint(
         &self,
+        region: &str,
         virtual_cluster_id: &str,
         id: &str,
     ) -> Option<&ManagedEndpointRecord> {
-        self.managed_endpoints
-            .get(id)
-            .filter(|record| record.virtual_cluster_id == virtual_cluster_id)
+        self.managed_endpoints.get(id).filter(|record| {
+            record.region == region && record.virtual_cluster_id == virtual_cluster_id
+        })
     }
 
     /// This cluster's stored managed endpoints, in creation order.
+    ///
+    /// Keyed by the cluster alone: an endpoint is created through the endpoint of the
+    /// region its cluster exists in, so every id in a cluster's index names an endpoint
+    /// of that cluster's region. Callers resolve the cluster region-scoped first.
     pub fn cluster_managed_endpoints(
         &self,
         virtual_cluster_id: &str,
@@ -1416,6 +1477,7 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     pub fn insert_job_template(&mut self, record: JobTemplateRecord) {
         self.idempotency.insert(
             (
+                record.region.clone(),
                 CREATE_JOB_TEMPLATE_SCOPE.to_string(),
                 record.client_token.clone(),
             ),
@@ -1436,18 +1498,38 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     /// resource it named is not a modelled behaviour, and bounding the index is the
     /// emulator's own choice. While the template exists — the whole window the dedup
     /// contract is about — the token never mints a second one.
-    pub fn remove_job_template(&mut self, id: &str) -> Option<JobTemplateRecord> {
+    pub fn remove_job_template(&mut self, region: &str, id: &str) -> Option<JobTemplateRecord> {
+        self.job_template(region, id)?;
         let record = self.job_templates.remove(id)?;
         self.idempotency.remove(&(
+            record.region.clone(),
             CREATE_JOB_TEMPLATE_SCOPE.to_string(),
             record.client_token.clone(),
         ));
         Some(record)
     }
 
-    /// The modelled `JobTemplate` for this id.
-    pub fn job_template_view(&self, id: &str) -> Option<JobTemplate> {
-        Some(self.job_templates.get(id)?.to_job_template())
+    /// The stored job template with this id, only when it belongs to this region.
+    pub fn job_template(&self, region: &str, id: &str) -> Option<&JobTemplateRecord> {
+        self.job_templates
+            .get(id)
+            .filter(|record| record.region == region)
+    }
+
+    /// This region's stored job templates, in no particular order: what a
+    /// `ListJobTemplates` against this region's endpoint reports on.
+    pub fn region_job_templates<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a JobTemplateRecord> {
+        self.job_templates
+            .values()
+            .filter(move |record| record.region == region)
+    }
+
+    /// The modelled `JobTemplate` for this id in this region.
+    pub fn job_template_view(&self, region: &str, id: &str) -> Option<JobTemplate> {
+        Some(self.job_template(region, id)?.to_job_template())
     }
 
     /// Replace a stored virtual cluster's `schedulerConfiguration` with the one submitted,
@@ -1461,52 +1543,89 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     /// cluster with no scheduler limits (see [`configured_scheduler_limits`]).
     pub fn apply_scheduler_configuration(
         &mut self,
+        region: &str,
         id: &str,
         configuration: Option<SchedulerConfiguration>,
         client_token: &str,
     ) {
-        if let Some(record) = self.virtual_clusters.get_mut(id) {
+        if let Some(record) = self
+            .virtual_clusters
+            .get_mut(id)
+            .filter(|record| record.region == region)
+        {
             record.scheduler_configuration = configured_scheduler_limits(configuration);
             record.remember_update_token(client_token);
         }
     }
 
-    /// Move a stored virtual cluster into `now_state` with `next_state` owed to the
-    /// clock.
+    /// Move a stored virtual cluster of this region into `now_state` with `next_state`
+    /// owed to the clock.
     pub fn move_virtual_cluster(
         &mut self,
+        region: &str,
         id: &str,
         now_state: &'static str,
         next_state: &'static str,
     ) {
-        if let Some(record) = self.virtual_clusters.get_mut(id) {
+        if let Some(record) = self
+            .virtual_clusters
+            .get_mut(id)
+            .filter(|record| record.region == region)
+        {
             record.state = now_state.to_string();
             record.pending = Some(PendingTransition::due(next_state));
             self.pending_clusters.insert(id.to_string());
         }
     }
 
-    /// Move a stored job run into `now_state` with `next_state` owed to the clock.
-    pub fn move_job_run(&mut self, id: &str, now_state: &'static str, next_state: &'static str) {
-        if let Some(record) = self.job_runs.get_mut(id) {
+    /// Move a stored job run of this region into `now_state` with `next_state` owed to
+    /// the clock.
+    pub fn move_job_run(
+        &mut self,
+        region: &str,
+        id: &str,
+        now_state: &'static str,
+        next_state: &'static str,
+    ) {
+        if let Some(record) = self
+            .job_runs
+            .get_mut(id)
+            .filter(|record| record.region == region)
+        {
             record.state = now_state.to_string();
             record.pending = Some(PendingTransition::due(next_state));
             self.pending_job_runs.insert(id.to_string());
         }
     }
 
-    /// The stored job run with this id, only when it really belongs to this cluster: a
-    /// job-run id under the wrong virtual cluster is not found, not somebody else's run.
-    pub fn job_run(&self, virtual_cluster_id: &str, id: &str) -> Option<&JobRunRecord> {
-        self.job_runs
-            .get(id)
-            .filter(|record| record.virtual_cluster_id == virtual_cluster_id)
+    /// The stored job run with this id, only when it really belongs to this cluster IN
+    /// this region: a job-run id under the wrong virtual cluster, or one of another
+    /// region, is not found, not somebody else's run.
+    pub fn job_run(
+        &self,
+        region: &str,
+        virtual_cluster_id: &str,
+        id: &str,
+    ) -> Option<&JobRunRecord> {
+        self.job_runs.get(id).filter(|record| {
+            record.region == region && record.virtual_cluster_id == virtual_cluster_id
+        })
     }
 
-    /// The modelled `VirtualCluster` for this id, with its `schedulerStatus` counted out
-    /// of the cluster's stored job runs (see [`Self::cluster_scheduler_status`]).
-    pub fn virtual_cluster_view(&self, id: &str) -> Option<VirtualCluster> {
-        let record = self.virtual_clusters.get(id)?;
+    /// The stored virtual cluster with this id, only when it belongs to this region: EMR
+    /// on EKS is regional, so an id minted against one region's endpoint names no
+    /// resource at another's.
+    pub fn virtual_cluster(&self, region: &str, id: &str) -> Option<&VirtualClusterRecord> {
+        self.virtual_clusters
+            .get(id)
+            .filter(|record| record.region == region)
+    }
+
+    /// The modelled `VirtualCluster` for this id in this region, with its
+    /// `schedulerStatus` counted out of the cluster's stored job runs (see
+    /// [`Self::cluster_scheduler_status`]).
+    pub fn virtual_cluster_view(&self, region: &str, id: &str) -> Option<VirtualCluster> {
+        let record = self.virtual_cluster(region, id)?;
         Some(record.to_virtual_cluster(self.cluster_scheduler_status(id)))
     }
 
@@ -1525,38 +1644,41 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     /// disagree. The walk is bounded by [`MAX_VIRTUAL_CLUSTERS`].
     pub fn cluster_mapped_to_namespace(
         &self,
+        region: &str,
         container_provider_id: &str,
         namespace: &str,
     ) -> Option<&VirtualClusterRecord> {
         self.virtual_clusters.values().find(|record| {
-            record.state != CLUSTER_TERMINATED
+            record.region == region
+                && record.state != CLUSTER_TERMINATED
                 && record.container_provider.id == container_provider_id
                 && provider_namespace(&record.container_provider) == Some(namespace)
         })
     }
 
-    /// Whether this store holds the resource `arn` names.
+    /// Whether this store holds the resource `arn` names, for a request signed for
+    /// `region`.
     ///
-    /// The ARN is matched in FULL against the stored record's OWN `arn`, so one that
-    /// names another partition, region or account — a resource some other endpoint
-    /// holds — resolves to nothing rather than to this endpoint's resource of the same
-    /// id.
-    fn holds_tagged_resource(&self, resource: &TaggedResource, arn: &str) -> bool {
+    /// The ARN is matched in FULL against the stored record's OWN `arn`, and the record
+    /// has to belong to the region the request was signed for, so one that names another
+    /// partition, region or account — a resource some other endpoint holds — resolves to
+    /// nothing rather than to this endpoint's resource of the same id.
+    fn holds_tagged_resource(&self, region: &str, resource: &TaggedResource, arn: &str) -> bool {
         let stored = match resource {
-            TaggedResource::VirtualCluster { id } => {
-                self.virtual_clusters.get(id).map(|record| record.arn.as_str())
-            }
+            TaggedResource::VirtualCluster { id } => self
+                .virtual_cluster(region, id)
+                .map(|record| record.arn.as_str()),
             TaggedResource::JobRun {
                 virtual_cluster_id,
                 id,
             } => self
-                .job_run(virtual_cluster_id, id)
+                .job_run(region, virtual_cluster_id, id)
                 .map(|record| record.arn.as_str()),
             TaggedResource::ManagedEndpoint {
                 virtual_cluster_id,
                 id,
             } => self
-                .managed_endpoint(virtual_cluster_id, id)
+                .managed_endpoint(region, virtual_cluster_id, id)
                 .map(|record| record.arn.as_str()),
         };
         stored == Some(arn)
@@ -1570,16 +1692,18 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     /// [`Self::holds_tagged_resource`] states.
     pub fn resource_tags_mut(
         &mut self,
+        region: &str,
         resource: &TaggedResource,
         arn: &str,
     ) -> Option<&mut HashMap<String, String>> {
-        if !self.holds_tagged_resource(resource, arn) {
+        if !self.holds_tagged_resource(region, resource, arn) {
             return None;
         }
         match resource {
             TaggedResource::VirtualCluster { id } => self
                 .virtual_clusters
                 .get_mut(id)
+                .filter(|record| record.region == region)
                 .map(|record| &mut record.tags),
             TaggedResource::JobRun {
                 virtual_cluster_id,
@@ -1587,7 +1711,9 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             } => self
                 .job_runs
                 .get_mut(id)
-                .filter(|record| &record.virtual_cluster_id == virtual_cluster_id)
+                .filter(|record| {
+                    record.region == region && &record.virtual_cluster_id == virtual_cluster_id
+                })
                 .map(|record| &mut record.tags),
             TaggedResource::ManagedEndpoint {
                 virtual_cluster_id,
@@ -1595,7 +1721,9 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             } => self
                 .managed_endpoints
                 .get_mut(id)
-                .filter(|record| &record.virtual_cluster_id == virtual_cluster_id)
+                .filter(|record| {
+                    record.region == region && &record.virtual_cluster_id == virtual_cluster_id
+                })
                 .map(|record| &mut record.tags),
         }
     }
@@ -1608,36 +1736,38 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     /// [`Self::holds_tagged_resource`] states.
     pub fn resource_tags(
         &self,
+        region: &str,
         resource: &TaggedResource,
         arn: &str,
     ) -> Option<&HashMap<String, String>> {
-        if !self.holds_tagged_resource(resource, arn) {
+        if !self.holds_tagged_resource(region, resource, arn) {
             return None;
         }
         match resource {
-            TaggedResource::VirtualCluster { id } => {
-                self.virtual_clusters.get(id).map(|record| &record.tags)
-            }
+            TaggedResource::VirtualCluster { id } => self
+                .virtual_cluster(region, id)
+                .map(|record| &record.tags),
             TaggedResource::JobRun {
                 virtual_cluster_id,
                 id,
             } => self
-                .job_run(virtual_cluster_id, id)
+                .job_run(region, virtual_cluster_id, id)
                 .map(|record| &record.tags),
             TaggedResource::ManagedEndpoint {
                 virtual_cluster_id,
                 id,
             } => self
-                .managed_endpoint(virtual_cluster_id, id)
+                .managed_endpoint(region, virtual_cluster_id, id)
                 .map(|record| &record.tags),
         }
     }
 
     /// This cluster's stored job runs, in creation order.
-    pub fn cluster_job_runs(
-        &self,
-        virtual_cluster_id: &str,
-    ) -> impl Iterator<Item = &JobRunRecord> {
+    ///
+    /// Keyed by the cluster alone: a run is submitted through the endpoint of the region
+    /// its cluster exists in, so every id in a cluster's index names a run of that
+    /// cluster's region. Callers resolve the cluster region-scoped first.
+    pub fn cluster_job_runs(&self, virtual_cluster_id: &str) -> impl Iterator<Item = &JobRunRecord> {
         self.job_runs_by_cluster
             .get(virtual_cluster_id)
             .into_iter()
@@ -1660,6 +1790,7 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     pub fn insert_security_configuration(&mut self, record: SecurityConfigurationRecord) {
         self.idempotency.insert(
             (
+                record.region.clone(),
                 CREATE_SECURITY_CONFIGURATION_SCOPE.to_string(),
                 record.client_token.clone(),
             ),
@@ -1678,28 +1809,69 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     /// `clientToken` AFTER its configuration was deleted therefore mints a new one rather
     /// than replaying a record that no longer exists; while the configuration exists — the
     /// whole window the dedup contract is about — the token never mints a second one.
-    pub fn remove_security_configuration(&mut self, id: &str) -> Option<SecurityConfigurationRecord> {
+    pub fn remove_security_configuration(
+        &mut self,
+        region: &str,
+        id: &str,
+    ) -> Option<SecurityConfigurationRecord> {
+        self.security_configuration(region, id)?;
         let record = self.security_configurations.remove(id)?;
         self.idempotency.remove(&(
+            record.region.clone(),
             CREATE_SECURITY_CONFIGURATION_SCOPE.to_string(),
             record.client_token.clone(),
         ));
         Some(record)
     }
 
-    /// The modelled `SecurityConfiguration` for this id.
-    pub fn security_configuration_view(&self, id: &str) -> Option<SecurityConfiguration> {
+    /// The stored security configuration with this id, only when it belongs to this
+    /// region.
+    pub fn security_configuration(
+        &self,
+        region: &str,
+        id: &str,
+    ) -> Option<&SecurityConfigurationRecord> {
+        self.security_configurations
+            .get(id)
+            .filter(|record| record.region == region)
+    }
+
+    /// This region's stored security configurations, in no particular order: what a
+    /// `ListSecurityConfigurations` against this region's endpoint reports on.
+    pub fn region_security_configurations<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a SecurityConfigurationRecord> {
+        self.security_configurations
+            .values()
+            .filter(move |record| record.region == region)
+    }
+
+    /// The modelled `SecurityConfiguration` for this id in this region.
+    pub fn security_configuration_view(
+        &self,
+        region: &str,
+        id: &str,
+    ) -> Option<SecurityConfiguration> {
         Some(
-            self.security_configurations
-                .get(id)?
+            self.security_configuration(region, id)?
                 .to_security_configuration(),
         )
     }
 
-    /// The resource id `(scope, client_token)` already minted, if this token is a replay.
-    pub fn replayed_idempotency(&self, scope: &str, client_token: &str) -> Option<&String> {
-        self.idempotency
-            .get(&(scope.to_string(), client_token.to_string()))
+    /// The resource id `(region, scope, client_token)` already minted, if this token is a
+    /// replay of a request to this region.
+    pub fn replayed_idempotency(
+        &self,
+        region: &str,
+        scope: &str,
+        client_token: &str,
+    ) -> Option<&String> {
+        self.idempotency.get(&(
+            region.to_string(),
+            scope.to_string(),
+            client_token.to_string(),
+        ))
     }
 }
 

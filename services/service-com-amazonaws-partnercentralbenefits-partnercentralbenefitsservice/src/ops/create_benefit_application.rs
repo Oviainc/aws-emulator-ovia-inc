@@ -9,6 +9,14 @@
 //! application it created, so a retry of the same request answers with that first call's
 //! id, ARN and revision instead of creating a second application.
 //!
+//! The benefit the request names is READ from the catalog, not merely resolved: a benefit
+//! whose `BenefitStatus` is not `ACTIVE` is no longer offered, so an application for it is
+//! refused with the modelled `ValidationException` (HTTP 400) and nothing is created, and
+//! a supplied `BenefitApplicationDetails` document must satisfy the request schema that
+//! benefit's record declares — see [`crate::state::benefit_not_offered_refusal`] and
+//! [`crate::state::benefit_schema_refusal`], which the update and the amendment apply to
+//! the document they would store too.
+//!
 //! The create's own `Tags` are caller-supplied tag keys, so they go through the same
 //! reserved-namespace rule the tagging operations apply: a key in the AWS-reserved `aws:`
 //! namespace is refused with the modelled `ValidationException` (HTTP 400) and no
@@ -285,8 +293,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The application requests ONE benefit of this catalog, named either by its
             // bare `ben-...` id or by its ARN; anything the catalog does not hold is a
             // 404.
-            let Some(benefit_id) =
-                catalog.resolve_benefit_id(&input.catalog, &input.benefit_identifier)
+            let Some(benefit) = catalog
+                .resolve_benefit_id(&input.catalog, &input.benefit_identifier)
+                .and_then(|id| catalog.benefits.get(&id))
             else {
                 return Err(
                     CreateBenefitApplicationErrorModeled::ResourceNotFoundException(
@@ -300,6 +309,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             };
+
+            // The catalog's record of that benefit is what governs the application, not
+            // just its existence: a benefit the catalog no longer offers cannot be
+            // applied for, and the details document must satisfy the request schema the
+            // record declares.
+            if let Some(refusal) = crate::state::benefit_not_offered_refusal(
+                crate::state::BENEFIT_IDENTIFIER_MEMBER,
+                benefit,
+            ) {
+                return Err(
+                    CreateBenefitApplicationErrorModeled::ValidationException(refusal).into(),
+                );
+            }
+            if let Some(refusal) = crate::state::benefit_schema_refusal(
+                benefit.benefit_request_schema.as_ref(),
+                input.benefit_application_details.as_ref(),
+            ) {
+                return Err(
+                    CreateBenefitApplicationErrorModeled::ValidationException(refusal).into(),
+                );
+            }
+
+            // The programs an application belongs to are the programs of the benefit it
+            // requests: no input member carries them.
+            let (benefit_id, programs) = (benefit.id.clone(), benefit.programs.clone());
 
             // The store is finite: a create that would take this catalog past its cap is
             // refused rather than growing it, the way the service refuses one past its
@@ -317,13 +351,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            // The programs an application belongs to are the programs of the benefit it
-            // requests: no input member carries them.
-            let programs = catalog
-                .benefits
-                .get(&benefit_id)
-                .map(|benefit| benefit.programs.clone())
-                .unwrap_or_default();
             (benefit_id, programs)
         };
 
