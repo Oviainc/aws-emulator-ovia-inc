@@ -11,7 +11,8 @@
 //! the one copy.
 //!
 //! Every value a cluster-shaped response carries is either stored verbatim from
-//! the request that created the cluster or derived from the stored state
+//! the request that created the cluster — or from the `UpdateCluster` that
+//! changed it since — or derived from the stored state
 //! ([`ComAmazonawsMedialiveMedialiveState::cluster_description`]) — no operation
 //! builds a cluster out of its own request. `ChannelIds` is the derived one:
 //! "An array of the IDs of the Channels that are associated with this Cluster"
@@ -48,7 +49,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     ClusterAlert, ClusterNetworkSettings, ClusterNetworkSettingsCreateRequest,
-    DescribeClusterSummary, InterfaceMapping,
+    ClusterNetworkSettingsUpdateRequest, DescribeClusterSummary, InterfaceMapping,
 };
 
 use super::{ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
@@ -135,6 +136,35 @@ pub const MAX_CLUSTER_TOKENS: usize = MAX_CLUSTERS;
 /// recent end of it is the useful one.
 pub const MAX_CLUSTER_ALERTS: usize = 100;
 
+/// Why [`ComAmazonawsMedialiveMedialiveState::apply_cluster_changes`] changed
+/// nothing. Each variant is one refusal `UpdateCluster` answers with, and each
+/// leaves the stored cluster exactly as it was.
+#[derive(Debug)]
+pub enum ClusterUpdateRefusal {
+    /// The `ClusterId` names no cluster this store holds — the same resolution a
+    /// read of the cluster performs.
+    NoSuchCluster,
+    /// Another cluster of the account already carries the new `Name`.
+    NameTaken,
+    /// The request named more `InterfaceMapping` entries than
+    /// [`MAX_CLUSTER_INTERFACE_MAPPINGS`]. Carries how many it named.
+    TooManyInterfaceMappings { count: usize },
+}
+
+/// What an `UpdateCluster` request asks to change.
+///
+/// Each member is `Some` only when the request carried it — "Include this
+/// parameter only if you want to change the current ..." on both of them — so an
+/// omitted member leaves that setting exactly as it was. One struct rather than
+/// two positional `Option`s on
+/// [`ComAmazonawsMedialiveMedialiveState::apply_cluster_changes`], so a handler
+/// cannot pass the name where the network settings belong.
+#[derive(Debug, Clone, Default)]
+pub struct ClusterChanges {
+    pub name: Option<String>,
+    pub network_settings: Option<ClusterNetworkSettingsUpdateRequest>,
+}
+
 /// Why [`ComAmazonawsMedialiveMedialiveState::insert_cluster`] stored nothing.
 /// Each variant is one refusal `CreateCluster` models.
 #[derive(Debug)]
@@ -208,8 +238,8 @@ impl ClusterAlertRecord {
     }
 }
 
-/// One created cluster, as `CreateCluster` stored it plus its lifecycle state
-/// and its alert log.
+/// One created cluster, as `CreateCluster` stored it, as `UpdateCluster` has
+/// changed it since, plus its lifecycle state and its alert log.
 ///
 /// The members mirror the model's `DescribeClusterSummary` shape minus the two
 /// it derives: `State` is the lifecycle below and `ChannelIds` comes from the
@@ -220,7 +250,9 @@ pub struct ClusterRecord {
     pub id: String,
     pub arn: String,
     /// "The name that you specified for the Cluster" — absent when the request
-    /// specified none, never invented.
+    /// specified none, never invented. `UpdateCluster`'s own `Name` is
+    /// documented "Include this parameter only if you want to change the current
+    /// name of the Cluster", so this is also what a rename writes.
     pub name: Option<String>,
     /// "The hardware type for the Cluster", as the request spelled it.
     pub cluster_type: Option<String>,
@@ -229,7 +261,8 @@ pub struct ClusterRecord {
     /// resolves nor validates the role beyond its ARN syntax.
     pub instance_role_arn: Option<String>,
     /// The network settings the request supplied, in the response shape
-    /// ([`described_cluster_network_settings`]).
+    /// ([`described_cluster_network_settings`]), member by member as the latest
+    /// `UpdateCluster` left them.
     pub network_settings: Option<ClusterNetworkSettings>,
     pub tags: HashMap<String, String>,
     /// The cluster's current `ClusterState`.
@@ -315,6 +348,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     ///
     /// Case-SENSITIVE, because `Name` documents "Names are case-sensitive", so
     /// two clusters whose names differ only in case are two different names.
+    ///
+    /// The uniqueness both the create and the UPDATE resolve against: a rename
+    /// is what `UpdateCluster$Name` is for, and this lookup is what tells it
+    /// apart from a clash with another cluster of the account (see
+    /// [`ComAmazonawsMedialiveMedialiveState::apply_cluster_changes`]).
     pub fn cluster_named(&self, name: &str) -> Option<&str> {
         self.clusters
             .values()
@@ -368,6 +406,72 @@ impl ComAmazonawsMedialiveMedialiveState {
             },
         );
         Ok(id)
+    }
+
+    /// Apply an `UpdateCluster` request's changes to the cluster `id` names, or
+    /// refuse.
+    ///
+    /// Every refusal is checked BEFORE the first write, so a refused update
+    /// leaves the stored cluster exactly as it was. A member the request omitted
+    /// is not changed ("Include this parameter only if you want to change the
+    /// current ..." on `Name`, on `NetworkSettings$DefaultRoute` and on
+    /// `NetworkSettings$InterfaceMappings`), and neither is a member no update
+    /// request carries at all: the hardware type, the instance role, the tags and
+    /// the ARN are not something this operation can move.
+    ///
+    /// The documented account-wide name uniqueness and the stored mapping bound
+    /// are the create's own rules, checked here too so the two cannot disagree
+    /// about what a stored cluster may look like. A rename is accepted: the
+    /// `Name` member exists on the update request to "change the current name of
+    /// the Cluster", and the "You can't change the name" sentence beside it is
+    /// the create's own wording carried over (see
+    /// `crate::ops::update_cluster`).
+    pub fn apply_cluster_changes(
+        &mut self,
+        id: &str,
+        changes: ClusterChanges,
+    ) -> Result<(), ClusterUpdateRefusal> {
+        if !self.clusters.contains_key(id) {
+            return Err(ClusterUpdateRefusal::NoSuchCluster);
+        }
+        // Bounded before anything is written, for the reason on
+        // [`MAX_CLUSTER_INTERFACE_MAPPINGS`]: it is the bound that keeps the
+        // network side's per-read derivation bounded too, so an update cannot
+        // grow a stored list past what a create may store.
+        if let Some(mappings) = changes
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.interface_mappings.as_ref())
+        {
+            if mappings.len() > MAX_CLUSTER_INTERFACE_MAPPINGS {
+                return Err(ClusterUpdateRefusal::TooManyInterfaceMappings {
+                    count: mappings.len(),
+                });
+            }
+        }
+        // A name another cluster of the account holds is refused, while
+        // re-sending the cluster's own name is not a collision with itself.
+        if let Some(name) = changes.name.as_deref() {
+            if self.cluster_named(name).is_some_and(|holder| holder != id) {
+                return Err(ClusterUpdateRefusal::NameTaken);
+            }
+        }
+
+        let cluster = self
+            .clusters
+            .get_mut(id)
+            .ok_or(ClusterUpdateRefusal::NoSuchCluster)?;
+        if let Some(name) = changes.name {
+            cluster.name = Some(name);
+        }
+        if let Some(settings) = changes.network_settings {
+            // A cluster created without network settings gains the ones this
+            // request carries, rather than dropping them: the members the
+            // request named are what it asked to be connected by.
+            let stored = cluster.network_settings.get_or_insert_with(Default::default);
+            update_cluster_network_settings(stored, settings);
+        }
+        Ok(())
     }
 
     /// Record `token` as having created the cluster `cluster_id`, evicting the
@@ -481,6 +585,38 @@ pub fn described_cluster_network_settings(
     }
 }
 
+/// Write a `ClusterNetworkSettingsUpdateRequest` onto the stored
+/// `ClusterNetworkSettings`, member by member.
+///
+/// Each member of the update request is documented "Include this parameter only
+/// if you want to change the current ...", so one the request omitted keeps the
+/// value the cluster already had, and one it carried REPLACES that value whole —
+/// `InterfaceMappings` is "an array of interfaceMapping objects for this
+/// Cluster", the list as it is to be from now on, not entries to add to it.
+///
+/// The per-entry move is the same request-to-response move
+/// [`described_cluster_network_settings`] makes for the create, so a mapping
+/// stored by an update is indistinguishable from one stored by a create.
+fn update_cluster_network_settings(
+    stored: &mut ClusterNetworkSettings,
+    changes: ClusterNetworkSettingsUpdateRequest,
+) {
+    if let Some(default_route) = changes.default_route {
+        stored.default_route = Some(default_route);
+    }
+    if let Some(mappings) = changes.interface_mappings {
+        stored.interface_mappings = Some(
+            mappings
+                .into_iter()
+                .map(|mapping| InterfaceMapping {
+                    logical_interface_name: mapping.logical_interface_name,
+                    network_id: mapping.network_id,
+                })
+                .collect(),
+        );
+    }
+}
+
 /// Project one stored [`ClusterAlertRecord`] onto the model's `ClusterAlert`.
 ///
 /// `State` is derived from the record ([`ClusterAlertRecord::state`]) and the
@@ -500,13 +636,19 @@ pub fn cluster_alert_output(alert: &ClusterAlertRecord) -> ClusterAlert {
 }
 
 /// Project a `DescribeClusterSummary` onto one of the structurally identical
-/// per-operation FLAT cluster output shapes (`CreateClusterOutput` and
-/// `DescribeClusterOutput` today; `UpdateClusterOutput` and `DeleteClusterOutput`
-/// when their own issues land).
+/// per-operation FLAT cluster output shapes (`CreateClusterOutput`,
+/// `DescribeClusterOutput` and `UpdateClusterOutput` today; `DeleteClusterOutput`
+/// when its own issue lands).
 ///
 /// One macro rather than a hand-written copy of the same eight-member move per
 /// operation, so the operations that report a cluster cannot drift from each
 /// other, and adding a member to the model cannot be defaulted in silently.
+///
+/// The second form is for an output shape the MODEL gives no `InstanceRoleArn`
+/// member (`smithy_query(query="operation", operation="UpdateCluster")`): the
+/// seven members it does declare are the same stored projection, and the role is
+/// dropped because that response does not carry it — not because the store
+/// forgot it.
 macro_rules! cluster_description_output {
     ($out:ident, $cluster:expr) => {{
         let cluster: $crate::ops::types::DescribeClusterSummary = $cluster;
@@ -516,6 +658,18 @@ macro_rules! cluster_description_output {
             cluster_type: cluster.cluster_type,
             id: cluster.id,
             instance_role_arn: cluster.instance_role_arn,
+            name: cluster.name,
+            network_settings: cluster.network_settings,
+            state: cluster.state,
+        }
+    }};
+    ($out:ident, $cluster:expr, without_instance_role_arn) => {{
+        let cluster: $crate::ops::types::DescribeClusterSummary = $cluster;
+        $out {
+            arn: cluster.arn,
+            channel_ids: cluster.channel_ids,
+            cluster_type: cluster.cluster_type,
+            id: cluster.id,
             name: cluster.name,
             network_settings: cluster.network_settings,
             state: cluster.state,

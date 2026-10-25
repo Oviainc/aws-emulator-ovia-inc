@@ -22,7 +22,9 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # Opaque, self-verifying pagination tokens: hex codec for the token body and SHA-256
-# for its integrity tag, rather than hand-rolled encoders or digests.
+# for its integrity tag, rather than hand-rolled encoders or digests. The same two
+# crates lay out the other opaque ids this service mints: an `ExecutionId`, and the
+# generated id segment of an `ExportArn` (`state::new_export_id`).
 hex = { workspace = true }
 sha2 = { workspace = true }
 # A real SQL parser for `DataQuery.QueryStatement`, so the tables a submitted query

@@ -351,9 +351,9 @@ pub mod clusters;
 
 pub use clusters::{
     cluster_alert_output, cluster_alert_state, cluster_state, described_cluster_network_settings,
-    ClusterAlertRecord, ClusterRecord, ClusterRefusal, NewCluster, CLUSTER_ALERT_FILTERS,
-    CLUSTER_ALERT_FILTER_ALL, MAX_CLUSTERS, MAX_CLUSTER_ALERTS, MAX_CLUSTER_INTERFACE_MAPPINGS,
-    MAX_CLUSTER_TOKENS,
+    ClusterAlertRecord, ClusterChanges, ClusterRecord, ClusterRefusal, ClusterUpdateRefusal,
+    NewCluster, CLUSTER_ALERT_FILTERS, CLUSTER_ALERT_FILTER_ALL, MAX_CLUSTERS, MAX_CLUSTER_ALERTS,
+    MAX_CLUSTER_INTERFACE_MAPPINGS, MAX_CLUSTER_TOKENS,
 };
 
 pub(crate) use clusters::cluster_description_output;

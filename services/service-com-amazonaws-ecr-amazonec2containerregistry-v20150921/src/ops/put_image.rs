@@ -257,6 +257,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The copies this push starts are decided by the registry's replication
+        // configuration, which spans every repository, so the rules are read before one
+        // repository is borrowed for writing.
+        let planned_replications = store.planned_replications(&input.repository_name, now);
+
         let repo = store
             .repository_mut(&input.repository_name)
             .map_err(fault_error)?;
@@ -367,9 +372,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // new tag keeps the record, and therefore the instant it was first pushed. What
         // the manifest states about itself — its media type, the artifact type its config
         // descriptor names and the content it references — is read out of the document
-        // here, once, so no read re-parses it.
+        // here, once, so no read re-parses it. The copies the registry's replication
+        // configuration asks for are started by the push that STORES the image, which is
+        // why they are set here and not on a later push of the same content: replication
+        // copies an image as it arrives.
         repo.images.entry(digest.clone()).or_insert_with(|| {
-            crate::state::ImageRecord::pushed(
+            let mut stored = crate::state::ImageRecord::pushed(
                 digest.clone(),
                 input.image_manifest.clone(),
                 input
@@ -377,7 +385,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .clone()
                     .or_else(|| crate::state::manifest_media_type(&input.image_manifest)),
                 now,
-            )
+            );
+            stored.replications = planned_replications;
+            stored
         });
 
         // Attaching the tag detaches it from whatever held it: the image it was taken

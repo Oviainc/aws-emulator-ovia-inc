@@ -1028,6 +1028,75 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         })
     }
 
+    /// The identity-based policies the IAM identity whose ARN is `arn` carries, or
+    /// `None` when `arn` names no identity the account holds.
+    ///
+    /// An identity's own permissions come from the policies attached to it: the
+    /// inline policies embedded in it, plus the DEFAULT version of each managed
+    /// policy attached to it — "the default version is the operative version …
+    /// the one that is in effect for the IAM users, groups, and roles to which the
+    /// policy is attached" (`SetDefaultPolicyVersion`). A resource-based policy is
+    /// not one of them, so a role's trust policy — which says who may assume the
+    /// role rather than what the role may do — is not collected.
+    ///
+    /// The stored identity answers only when its OWN ARN is the one asked for, the
+    /// identity test [`policy_by_arn`](Self::policy_by_arn) applies to a policy: an
+    /// ARN carrying another path, another account or another resource type names no
+    /// identity of this account's. The collection is read from the STORE alone, the
+    /// way every other report of the account's record of an identity's attachments
+    /// answers (see [`service_provisioned_role`]), and it writes nothing.
+    pub fn principal_policies(&self, arn: &str) -> Option<PrincipalPolicies> {
+        let source = parse_entity_arn(arn)?;
+        let key = name_key(&source.name);
+        let mut collected = PrincipalPolicies::default();
+        let attached: Vec<String> = match source.kind {
+            EntityKind::User => {
+                let user = self.users.get(&key)?;
+                if user.arn != arn {
+                    return None;
+                }
+                collected.documents = inline_documents(&self.user_inline_policies, &key);
+                // `AttachUserPolicy` and `AddUserToGroup` are still scaffolded, so
+                // no user carries a managed policy attachment or a group
+                // membership; when they are implemented, the attached policies and
+                // the policies of the groups the user belongs to join this
+                // collection, which is why nothing else caches it.
+                Vec::new()
+            }
+            EntityKind::Role => {
+                let role = self.roles.get(&key)?;
+                if role.arn != arn {
+                    return None;
+                }
+                collected.documents = inline_documents(&self.role_inline_policies, &key);
+                self.role_attached_policies
+                    .get(&key)
+                    .map(|attached| attached.iter().cloned().collect())
+                    .unwrap_or_default()
+            }
+            // `CreateGroup` is still scaffolded, so the account holds no group and
+            // a group's ARN names no identity it holds.
+            EntityKind::Group => return None,
+        };
+        for policy_arn in attached {
+            let document = self.resolve_policy(&policy_arn).and_then(|policy| {
+                let default = policy
+                    .policy
+                    .default_version_id
+                    .unwrap_or_else(|| FIRST_POLICY_VERSION_ID.to_string());
+                policy
+                    .versions
+                    .get(&default)
+                    .and_then(|version| version.document.clone())
+            });
+            match document {
+                Some(document) => collected.documents.push(document),
+                None => collected.uncarried.push(policy_arn),
+            }
+        }
+        Some(collected)
+    }
+
     /// The aggregate size, in characters, of the inline policies embedded in the
     /// user keyed by `user_key`, counting every policy except the one keyed by
     /// `replacing` (a put of an existing name replaces that document rather than
@@ -1625,6 +1694,24 @@ pub struct PolicyArn {
 /// Reference for). Path segments are non-empty, since `policyPathType`'s pattern
 /// (`^((/[A-Za-z0-9\.,\+@=_-]+)*)/$`) admits no empty one.
 pub fn parse_policy_arn(arn: &str) -> Option<PolicyArn> {
+    let (account, resource) = iam_arn_parts(arn)?;
+    let (path, policy_name) = split_path_and_name(resource.strip_prefix("policy/")?)?;
+    Some(PolicyArn {
+        account: account.to_string(),
+        path,
+        policy_name: policy_name.to_string(),
+    })
+}
+
+/// The account and resource segments of `arn` when it is an IAM resource's ARN, or
+/// `None` when it is not one.
+///
+/// Every IAM ARN is `arn:<partition>:iam::<account>:<resource>`: IAM is a global
+/// service, so the region segment is EMPTY, and the account segment names the
+/// account that holds the resource (or [`AWS_MANAGED_POLICY_ACCOUNT`] for a policy
+/// AWS itself owns). ONE reading of that envelope, shared by every parser of an IAM
+/// ARN in this crate, so no two of them can disagree about what an IAM ARN is.
+fn iam_arn_parts(arn: &str) -> Option<(&str, &str)> {
     let mut fields = arn.splitn(6, ':');
     if fields.next()? != "arn" {
         return None;
@@ -1642,11 +1729,20 @@ pub fn parse_policy_arn(arn: &str) -> Option<PolicyArn> {
     if account.is_empty() {
         return None;
     }
-    let resource = fields.next()?.strip_prefix("policy/")?;
-    // Everything before the LAST `/` is the policy's path, which is absent for a
-    // policy at the root. An empty path segment (`policy//Name`) is not a path the
-    // `policyPathType` pattern admits, so such an ARN names no policy.
-    let (path, policy_name) = match resource.rfind('/') {
+    Some((account, fields.next()?))
+}
+
+/// Split the body of an IAM resource's ARN — its path followed by its friendly name
+/// — into that path (beginning and ending with `/`) and that name, or `None` when
+/// `resource` is not such a body.
+///
+/// Everything before the LAST `/` is the path, which is absent for a resource at the
+/// account root ([`DEFAULT_PATH`]). An empty path segment (`//Name`) is not a path
+/// IAM's path patterns admit — `policyPathType`'s is
+/// `^((/[A-Za-z0-9\.,\+@=_-]+)*)/$` — and an empty name names nothing, so neither is
+/// a resource body.
+fn split_path_and_name(resource: &str) -> Option<(String, &str)> {
+    let (path, name) = match resource.rfind('/') {
         Some(last) => {
             let path_body = &resource[..last];
             if path_body.split('/').any(str::is_empty) {
@@ -1656,14 +1752,148 @@ pub fn parse_policy_arn(arn: &str) -> Option<PolicyArn> {
         }
         None => (DEFAULT_PATH.to_string(), resource),
     };
-    if policy_name.is_empty() {
-        return None;
+    (!name.is_empty()).then_some((path, name))
+}
+
+/// The kind of IAM identity an ARN names: one of the three a policy can be attached
+/// to — "an IAM user, group, or role"
+/// (`GetContextKeysForPrincipalPolicy$PolicySourceArn`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityKind {
+    /// An IAM user, whose ARN carries the `user` resource type.
+    User,
+    /// An IAM group, whose ARN carries the `group` resource type.
+    Group,
+    /// An IAM role, whose ARN carries the `role` resource type.
+    Role,
+}
+
+impl EntityKind {
+    /// Every kind, in the order the documentation lists them.
+    pub const ALL: &'static [Self] = &[Self::User, Self::Group, Self::Role];
+
+    /// The ARN resource type that names this kind of identity, which is also the
+    /// word a refusal naming such an identity uses.
+    pub fn resource_type(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Group => "group",
+            Self::Role => "role",
+        }
     }
-    Some(PolicyArn {
+}
+
+/// The parts of an IAM identity's ARN that an operation taking one reads.
+#[derive(Debug, Clone)]
+pub struct EntityArn {
+    /// Which of the three identities the ARN names.
+    pub kind: EntityKind,
+    /// The ARN's account segment: the account that holds the identity.
+    pub account: String,
+    /// The identity's path, beginning and ending with `/`.
+    pub path: String,
+    /// The identity's friendly name: the last segment of the ARN's resource.
+    pub name: String,
+}
+
+/// The parts of `arn` when it is the ARN of an IAM user, group or role, or `None`
+/// when it is not one — which is what makes an operation taking a principal's ARN
+/// refuse it as an "invalid … value … supplied for an input parameter" rather than
+/// report a missing entity.
+///
+/// Such an ARN is `arn:<partition>:iam::<account>:<type><path><name>`, read through
+/// the same [`iam_arn_parts`] envelope and [`split_path_and_name`] body as a managed
+/// policy's ([`parse_policy_arn`]); only the resource type differs.
+pub fn parse_entity_arn(arn: &str) -> Option<EntityArn> {
+    let (account, resource) = iam_arn_parts(arn)?;
+    let (kind, body) = EntityKind::ALL.iter().find_map(|kind| {
+        let body = resource.strip_prefix(kind.resource_type())?.strip_prefix('/')?;
+        Some((*kind, body))
+    })?;
+    let (path, name) = split_path_and_name(body)?;
+    Some(EntityArn {
+        kind,
         account: account.to_string(),
         path,
-        policy_name: policy_name.to_string(),
+        name: name.to_string(),
     })
+}
+
+/// The identity-based policies an IAM identity carries, as
+/// [`principal_policies`](ComAmazonawsIamAwsidentitymanagementv20100508State::principal_policies)
+/// collects them.
+#[derive(Debug, Clone, Default)]
+pub struct PrincipalPolicies {
+    /// The policy documents themselves: the identity's inline policies, then the
+    /// default version of each managed policy attached to it.
+    pub documents: Vec<String>,
+    /// The ARNs of the attached managed policies whose document this emulator does
+    /// not hold — an ARN in AWS's own namespace that [`AWS_MANAGED_POLICIES`] does
+    /// not carry, the only attachment that can resolve to no document, so nothing
+    /// can be reported about its content ([`uncarried_aws_managed_policy`]).
+    pub uncarried: Vec<String>,
+}
+
+/// The documents of the inline policies embedded in the entity keyed by `key`,
+/// ordered by policy name — the order the embedding map holds them in, so two reads
+/// collect them the same way.
+fn inline_documents(
+    embedded: &BTreeMap<String, BTreeMap<String, InlinePolicy>>,
+    key: &str,
+) -> Vec<String> {
+    embedded
+        .get(key)
+        .map(|policies| {
+            policies
+                .values()
+                .map(|policy| policy.policy_document.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every condition context key the IAM policy documents in `documents` reference,
+/// folded to one entry per key and ordered.
+///
+/// A policy references a context key by TESTING it: "context keys can be evaluated
+/// by testing against a value in an IAM policy"
+/// (`GetContextKeysForPrincipalPolicy`), and the place a statement tests one is its
+/// `Condition` element, whose every condition-operator block is a map from context
+/// key to the values that key is tested against — so the keys of those blocks are
+/// the keys the document references. A statement with no `Condition` tests none, and
+/// `Statement` is read both as the list and as the single statement the IAM policy
+/// grammar admits.
+///
+/// Context key names are not distinguished by case, so two spellings of one key are
+/// one key: the folded name is the identity and the first spelling seen is the one
+/// reported. A document that is not JSON contributes nothing — the operations taking
+/// a policy document refuse one ([`is_policy_document`]) before reaching here.
+pub fn context_keys_in_policies<'a, I: IntoIterator<Item = &'a str>>(documents: I) -> Vec<String> {
+    let mut keys: BTreeMap<String, String> = BTreeMap::new();
+    for document in documents {
+        let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
+            continue;
+        };
+        let Some(statement) = parsed.get("Statement") else {
+            continue;
+        };
+        let statements = match statement.as_array() {
+            Some(statements) => statements.as_slice(),
+            None => ::std::slice::from_ref(statement),
+        };
+        for statement in statements {
+            let Some(condition) = statement.get("Condition").and_then(|c| c.as_object()) else {
+                continue;
+            };
+            for tested in condition.values().filter_map(|block| block.as_object()) {
+                for key in tested.keys() {
+                    keys.entry(key.to_ascii_lowercase())
+                        .or_insert_with(|| key.clone());
+                }
+            }
+        }
+    }
+    keys.into_values().collect()
 }
 
 /// One entry of AWS's own catalog of managed policies — a policy AWS owns and

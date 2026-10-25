@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOriginRequestPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOriginRequestPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOriginRequestPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the origin request policies this account holds, one page at a time: the page
+//! is cut at `MaxItems` (bounded by this emulator's own ceiling), the order is the stored
+//! total order over policy ids, and `Marker` names the policy the previous page ended at,
+//! so walking the pages enumerates every policy exactly once.
+//!
+//! `Type` filters the page by where a policy came from: every record this store holds was
+//! put there by a `CreateOriginRequestPolicy` call in this account, so each one is a
+//! `custom` policy and a request asking only for the `managed` ones (the policies Amazon
+//! Web Services itself creates) lists none.
+//!
+//! A reporting operation: it reads the stored records and writes nothing beyond what the
+//! clock already owed the rest of this service's state.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +87,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::ops::Bound;
+use std::time::SystemTime;
+
+/// `OriginRequestPolicySummary$Type` for a policy this account created: "The type of origin
+/// request policy, either `managed` (created by Amazon Web Services) or `custom` (created in
+/// this Amazon Web Services account)" — one of the two values
+/// [`ORIGIN_REQUEST_POLICY_TYPE_VALUES`] admits. Every record this store holds was put there
+/// by a `CreateOriginRequestPolicy` call, so every summary reports this one.
+const TYPE_CUSTOM: &str = "custom";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,18 +167,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOriginRequestPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOriginRequestPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOriginRequestPolicies"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "You can optionally specify the maximum number of items to receive in the
+        // response" — a page holds at least one item, so a non-positive size names no page
+        // at all. The size served is bounded above by this emulator's own page ceiling, the
+        // same one every listing of this service is bounded by, so one request cannot serve
+        // the whole store in a single response. A value the parameter cannot take is
+        // refused with the one sentence this service states the constraint in, whether it
+        // is out of range here or unreadable as an integer at the request boundary (see
+        // `crate::service::envelope`).
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListOriginRequestPoliciesErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of this service's state, so
+        // one read never leaves another resource reporting a stale status.
+        store.settle(SystemTime::now());
+
+        // "To get the next page of the list, set this field's value to the value of
+        // NextMarker from the current page's response": the marker is a resume point this
+        // service handed out — an origin request policy id — so a value outside that shape
+        // was never one (`InvalidArgument`), and one that is but names no stored policy is a
+        // policy that does not exist, which is the resource this listing is about and the
+        // reason it models `NoSuchOriginRequestPolicy`.
+        if let Some(marker) = input.marker.as_deref() {
+            if !crate::state::is_minted_uuid(marker) {
+                return Err(ListOriginRequestPoliciesErrorModeled::InvalidArgument(
+                    InvalidArgument {
+                        message: Some(format!(
+                            "Marker {marker} is not an origin request policy id returned by \
+                             ListOriginRequestPolicies"
+                        )),
+                    },
+                )
+                .into());
+            }
+            if store.origin_request_policy(marker).is_none() {
+                return Err(
+                    ListOriginRequestPoliciesErrorModeled::NoSuchOriginRequestPolicy(
+                        crate::state::no_such_origin_request_policy(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "A filter to return only the specified kinds of origin request policies": a
+        // request naming no filter is about every kind, one naming `custom` is about the
+        // policies created in this account — which is every record this store holds — and
+        // one naming `managed` is about the policies Amazon Web Services creates, of which
+        // this account holds none. The value is one the model's enum admits by the time a
+        // request reaches here.
+        let serves_stored_policies = input
+            .r#type
+            .as_deref()
+            .is_none_or(|kind| kind == TYPE_CUSTOM);
+
+        // `Marker` names where the previous page ENDED, so this page starts after it:
+        // walking the pages enumerates every policy exactly once. The store is ordered by
+        // id, so the resume point is a range bound rather than a scan.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        let mut items: Vec<OriginRequestPolicySummary> = Vec::new();
+        let mut more_remain = false;
+        if serves_stored_policies {
+            for (_, stored) in store
+                .origin_request_policies
+                .range::<str, _>((start, Bound::Unbounded))
+            {
+                if items.len() >= page_size {
+                    more_remain = true;
+                    break;
+                }
+                items.push(OriginRequestPolicySummary {
+                    // Read from the stored record, never from the request being served.
+                    r#type: TYPE_CUSTOM.to_string(),
+                    origin_request_policy: stored.to_origin_request_policy(),
+                });
+            }
+        }
+
+        // "If there are more items in the list than are in this response, this element is
+        // present. It contains the value that you should use in the Marker field of a
+        // subsequent request to continue listing origin request policies where you left
+        // off": the id this page ended at, present exactly when policies remain.
+        let next_marker = if more_remain {
+            items
+                .last()
+                .map(|summary| summary.origin_request_policy.id.clone())
+        } else {
+            None
+        };
+
+        Ok(ListOriginRequestPoliciesOutput {
+            origin_request_policy_list: Some(OriginRequestPolicyList {
+                next_marker,
+                // "The maximum number of origin request policies requested."
+                max_items,
+                // "The total number of origin request policies returned in the response" —
+                // the length of `Items`, not the size of the whole collection.
+                quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+                // A page that lists nothing carries no `Items` element at all, rather than
+                // an empty one — as every other listing of this service answers.
+                items: if items.is_empty() { None } else { Some(items) },
+            }),
+        })
     }
 }

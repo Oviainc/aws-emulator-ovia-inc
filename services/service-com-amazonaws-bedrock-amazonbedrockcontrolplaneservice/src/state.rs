@@ -44,6 +44,11 @@
 //! `ops/delete_provisioned_model_throughput.rs` removes, together with the instant each
 //! one's non-terminal `status` is owed its move to `InService`.
 //!
+//! And it holds the custom models `ops/create_custom_model.rs` mints,
+//! `ops/get_custom_model.rs` reads back and `ops/list_custom_models.rs` reports,
+//! together with the instant each one's non-terminal `modelStatus` is owed its move to
+//! `Active`.
+//!
 //! And it holds the account's acknowledged use case for model access — the single form
 //! `ops/put_use_case_for_model_access.rs` submits and `ops/get_use_case_for_model_access.rs`
 //! reads back, so the form one request submits is the form the next request gets.
@@ -69,7 +74,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    EndpointConfig, EvaluationConfig, EvaluationInferenceConfig, EvaluationOutputDataConfig,
+    CustomModelDataSource, CustomModelSummary, EndpointConfig, EvaluationConfig,
+    EvaluationInferenceConfig, EvaluationOutputDataConfig,
     GuardrailAutomatedReasoningPolicy, GuardrailAutomatedReasoningPolicyConfig,
     GuardrailContentFilter, GuardrailContentFilterConfig, GuardrailContentFiltersTier,
     GuardrailContentFiltersTierConfig, GuardrailContentPolicy, GuardrailContentPolicyConfig,
@@ -438,6 +444,67 @@ pub fn commitment_term(commitment_duration: &str) -> Option<Duration> {
         _ => None,
     }
 }
+
+/// `ModelStatus` — a custom model that is still being validated and registered by the
+/// call that created it.
+///
+/// The enum is `[Active, Creating, Failed]`
+/// (`smithy_query(query="shape",shape="ModelStatus")`), and `CreateCustomModel` documents
+/// exactly that progression for the model it creates: "`Creating` - Initial state during
+/// validation and registration", "`Active` - Model is ready for use in inference",
+/// "`Failed` - Creation process encountered an error"
+/// (`smithy_query(query="doc",shape="CreateCustomModel")`).
+pub const CUSTOM_MODEL_STATUS_CREATING: &str = "Creating";
+
+/// `ModelStatus` once a custom model is ready for inference — the terminal status the
+/// non-terminal one above is owed its move to. See [`CUSTOM_MODEL_STATUS_CREATING`] for
+/// the value list.
+///
+/// `Failed` names a model whose creation did not finish; nothing here makes an accepted
+/// create fail, so no call mints it.
+pub const CUSTOM_MODEL_STATUS_ACTIVE: &str = "Active";
+
+/// How long after `CreateCustomModel` a custom model's non-terminal `modelStatus` is owed
+/// its move to [`CUSTOM_MODEL_STATUS_ACTIVE`].
+///
+/// CHOSEN, not documented: AWS publishes no duration for validating and registering model
+/// artifacts, so this is the emulator's span. It is non-zero, so a caller that reads the
+/// model straight after creating it still observes the `Creating` status the real service
+/// reports; and it is materialised from the stored due instant on the next call that
+/// touches the record rather than waited on, so no handler sleeps.
+pub const CUSTOM_MODEL_ACTIVE_AFTER: Duration = Duration::from_millis(500);
+
+/// `CustomizationType` — the customization a custom model created from model ARTIFACTS
+/// carries.
+///
+/// The enum is `[FINE_TUNING, CONTINUED_PRE_TRAINING, DISTILLATION,
+/// REINFORCEMENT_FINE_TUNING, IMPORTED]`
+/// (`smithy_query(query="shape",shape="CustomizationType")`), and `CreateCustomModel`
+/// documents that the model it creates "appears in `ListCustomModels` with a
+/// `customizationType` of `imported`"
+/// (`smithy_query(query="doc",shape="CreateCustomModel")`) — no training ran inside
+/// Amazon Bedrock for it, the artifacts were brought in.
+pub const CUSTOMIZATION_TYPE_IMPORTED: &str = "IMPORTED";
+
+/// The base-model segment a `CustomModelArn` carries for a custom model whose artifacts
+/// were brought in rather than customized from a foundation model.
+///
+/// `CustomModelArn` is
+/// `…:custom-model/(imported|<provider>.<model>…)/[a-z0-9]{12}`
+/// (`smithy_query(query="shape",shape="CustomModelSummary")`), so the ARN itself spells
+/// the base of such a model with this literal token: the create request names no
+/// foundation model, so none is invented for it.
+pub const CUSTOM_MODEL_IMPORTED_BASE: &str = "imported";
+
+/// The most custom models this account may hold at once, across every region it has
+/// created one in, past which a create is refused with `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota (AWS publishes quotas for
+/// concurrent customization jobs, not for the custom models an account may hold): without
+/// a server-side cap a caller could grow this part of the store with nothing but fresh
+/// model names, or with fresh regions, which is why the bound is over the whole store
+/// rather than per region.
+pub const MAX_CUSTOM_MODELS_PER_ACCOUNT: usize = 100;
 
 /// The number of base-36 digits each half of a minted resource id carries.
 ///
@@ -936,6 +1003,86 @@ impl ProvisionedModelThroughputRecord {
     }
 }
 
+/// One stored custom model: the identity `CreateCustomModel` minted, the data source and
+/// key that request carried, the base model it reports, and the status a read reports.
+///
+/// `status` and `customization_type` are `&'static str` for the same reason
+/// [`ModelImportJobRecord::status`] is: both are values this emulator derives
+/// ([`CUSTOM_MODEL_STATUS_CREATING`], [`CUSTOMIZATION_TYPE_IMPORTED`]) rather than
+/// anything a request names.
+#[derive(Debug, Clone)]
+pub struct CustomModelRecord {
+    /// The `CustomModelArn` this model is addressed by, minted by [`custom_model_arn`].
+    pub arn: String,
+    /// `modelName`, as the create request spelled it \u2014 the other spelling a
+    /// `ModelIdentifier` may carry.
+    pub name: String,
+    /// The region the create addressed, which [`Self::arn`] also carries. Kept beside it
+    /// so the name index is per region without re-parsing an ARN, exactly as
+    /// [`ProvisionedModelThroughputRecord::region`] is.
+    pub region: String,
+    /// `baseModelArn` \u2014 the model this one was customized from.
+    ///
+    /// For a model created from ARTIFACTS this is the model's OWN ARN: the create request
+    /// names no foundation model, and `ModelArn` admits a `custom-model` ARN here, so the
+    /// model is reported as its own base rather than attributed to a foundation model
+    /// nothing in the request named.
+    pub base_model_arn: String,
+    /// `baseModelName` \u2014 the base model's name, which for a model created from artifacts
+    /// is the base segment its own ARN carries ([`CUSTOM_MODEL_IMPORTED_BASE`]).
+    pub base_model_name: String,
+    /// The `FoundationModelArn` of the foundation model this custom model descends from,
+    /// or `None` when it descends from none \u2014 which is what `ListCustomModels`'
+    /// `foundationModelArnEquals` filters on, as distinct from `baseModelArnEquals`.
+    pub foundation_model_arn: Option<String>,
+    /// `CustomizationType`.
+    pub customization_type: &'static str,
+    /// `modelSourceConfig`, as the create request carried it (absent when the request
+    /// named the model package source instead).
+    pub model_source_config: Option<ModelDataSource>,
+    /// `customModelDataSource`, as the create request carried it (absent when the request
+    /// named the Amazon S3 source instead).
+    pub custom_model_data_source: Option<CustomModelDataSource>,
+    /// `modelKmsKeyArn`, as the create request carried it \u2014 already a `KmsKeyArn` there,
+    /// so it is stored and reported verbatim.
+    pub model_kms_key_arn: Option<String>,
+    /// `roleArn` \u2014 the service role Amazon Bedrock assumes to read the artifacts (absent
+    /// when the create carried none).
+    ///
+    /// Kept with the record because it is part of the request that minted it; no read
+    /// operation of this resource reports a role member.
+    pub role_arn: Option<String>,
+    /// `modelTags` \u2014 the tags the create request attached to the model.
+    ///
+    /// Kept for the reason [`ProvisionedModelThroughputRecord::tags`] is: it is part of
+    /// the request that minted the record, and nothing reads it back until
+    /// `ListTagsForResource` is implemented.
+    pub tags: Vec<Tag>,
+    /// `ModelStatus`.
+    pub status: &'static str,
+    /// When [`Self::status`] is owed its move to [`CUSTOM_MODEL_STATUS_ACTIVE`], or `None`
+    /// once it is terminal.
+    ///
+    /// The due INSTANT, not a timer, for the same reason
+    /// [`MarketplaceModelEndpointRecord::in_service_due_at`] is one.
+    pub active_due_at: Option<SystemTime>,
+    pub created_at: SystemTime,
+}
+
+impl CustomModelRecord {
+    /// Materialise the move to [`CUSTOM_MODEL_STATUS_ACTIVE`] the clock has already made
+    /// due at `now`.
+    ///
+    /// The only write a reporting operation on this resource makes: it was owed at the due
+    /// instant even if nobody had called.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.active_due_at.is_some_and(|due| now >= due) {
+            self.status = CUSTOM_MODEL_STATUS_ACTIVE;
+            self.active_due_at = None;
+        }
+    }
+}
+
 /// The account's enforced guardrail configuration: the guardrail revision every
 /// invocation in this account is guarded by, as `PutEnforcedGuardrailConfiguration` last
 /// installed it.
@@ -1028,6 +1175,11 @@ pub struct EnforcedGuardrailConfiguration {
 ///   holds at most one entry per live Provisioned Throughput for the same reason
 ///   `create_tokens` does — including across a delete, which drops the entries naming the
 ///   Provisioned Throughput it removed.
+///
+/// * `custom_models` and `custom_model_names` hold one entry per stored custom model,
+///   capped at [`MAX_CUSTOM_MODELS_PER_ACCOUNT`] by the quota `CreateCustomModel`
+///   enforces, and `custom_model_create_tokens` holds at most one entry per stored custom
+///   model for the same reason `create_tokens` does.
 ///
 /// * `foundation_models` is the PUBLISHED catalog, seeded once per store and never
 ///   written: no operation here creates or deletes a foundation model.
@@ -1158,6 +1310,23 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many Provisioned Throughput ids this store has minted; the uniqueness half of
     /// a minted id.
     pub minted_provisioned_models: u64,
+    /// Every stored custom model, keyed by its `CustomModelArn` — one of the two
+    /// spellings a `ModelIdentifier` carries.
+    pub custom_models: HashMap<String, CustomModelRecord>,
+    /// `(region, modelName)` -> `CustomModelArn`, so the other `ModelIdentifier`
+    /// spelling — the bare model name — resolves to the custom model it names, and a
+    /// second create of a live name is refused.
+    ///
+    /// Keyed by the region too because the ARN carries one, so the same name in another
+    /// region names another custom model.
+    pub custom_model_names: HashMap<(String, String), String>,
+    /// `CreateCustomModel` idempotency: `(region, clientRequestToken)` -> the `modelArn`
+    /// that token minted. Scoped to that one operation, and to the region the request
+    /// addressed, the way the Provisioned Throughput index is.
+    pub custom_model_create_tokens: HashMap<(String, String), String>,
+    /// How many custom model ids this store has minted; the uniqueness half of a minted
+    /// id.
+    pub minted_custom_models: u64,
     /// The foundation models this service offers, seeded from [`FOUNDATION_MODELS`] by
     /// [`FoundationModelCatalog::default`].
     ///
@@ -1424,6 +1593,61 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// `now` exactly as a read of that one record would.
     pub fn settle_provisioned_model_throughputs(&mut self, now: SystemTime) {
         for record in self.provisioned_model_throughputs.values_mut() {
+            record.settle(now);
+        }
+    }
+
+    /// Mint a fresh custom model id: the resource half of a `custom-model/<base>/<id>`
+    /// ARN, unique within this store.
+    ///
+    /// Built like a guardrail id, and for the same two reasons; `CustomModelArn` admits
+    /// exactly `[a-z0-9]{12}` there, which is what two [`ID_HALF_WIDTH`] base-36 halves
+    /// spell.
+    pub fn mint_custom_model_id(&mut self, now: SystemTime) -> String {
+        self.minted_custom_models += 1;
+        minted_id(self.minted_custom_models, now)
+    }
+
+    /// The `CustomModelArn` a `ModelIdentifier` names: the identifier itself when it is
+    /// the ARN of a stored custom model, otherwise the ARN the custom model of that NAME
+    /// in `region` carries.
+    ///
+    /// The identifier's pattern admits that ARN or a bare model name
+    /// (`smithy_query(query="operation",operation="GetCustomModel")`), so both spellings
+    /// address the same model.
+    /// Either spelling resolves only to a model of `region`: the ARN carries a region, so
+    /// one of another region names another account-region's model, exactly as the listing
+    /// reports only this region's.
+    #[must_use]
+    pub fn custom_model_arn_of(&self, identifier: &str, region: &str) -> Option<String> {
+        if let Some(record) = self.custom_models.get(identifier) {
+            return (record.region == region).then(|| identifier.to_string());
+        }
+        self.custom_model_names
+            .get(&(region.to_string(), identifier.to_string()))
+            .cloned()
+    }
+
+    /// The custom model a `ModelIdentifier` names, with any status transition the clock
+    /// has made due at `now` materialised first — so every caller reads the status the
+    /// model holds at `now`, whichever operation asked.
+    pub fn custom_model(
+        &mut self,
+        identifier: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<&mut CustomModelRecord> {
+        let arn = self.custom_model_arn_of(identifier, region)?;
+        let record = self.custom_models.get_mut(&arn)?;
+        record.settle(now);
+        Some(record)
+    }
+
+    /// Materialise every custom model status transition the clock has made due at `now`,
+    /// so a LISTING reports — and filters on — the status each record holds at `now`
+    /// exactly as a read of that one model would.
+    pub fn settle_custom_models(&mut self, now: SystemTime) {
+        for record in self.custom_models.values_mut() {
             record.settle(now);
         }
     }
@@ -1878,6 +2102,39 @@ pub fn provisioned_model_summary(
     }
 }
 
+/// The ARN of a custom model in `region`:
+/// `arn:aws:bedrock:<region>:<account>:custom-model/<base>/<id>`, as `CustomModelArn`
+/// (`^arn:aws(|-us-gov|-cn|-iso|-iso-b):bedrock:[a-z0-9-]{1,20}:[0-9]{12}:custom-model/(imported|…)/[a-z0-9]{12}$`)
+/// spells it.
+///
+/// `base` is the base-model segment that pattern carries before the id:
+/// [`CUSTOM_MODEL_IMPORTED_BASE`] for a model whose artifacts were brought in, and the
+/// base foundation model's `provider.model` name for one customized from a foundation
+/// model.
+pub fn custom_model_arn(region: &str, base: &str, id: &str) -> String {
+    ::engine::emulator_arn("bedrock", region, &format!("custom-model/{base}/{id}"))
+}
+
+/// The `CustomModelSummary` a listing reports for a stored custom model.
+///
+/// Lives here rather than in `ops/list_custom_models.rs` because every member it carries
+/// is also a member `GetCustomModel` reports, and the two must agree about them: a listed
+/// summary is the same record the read of that one model finds.
+pub fn custom_model_summary(record: &CustomModelRecord) -> CustomModelSummary {
+    CustomModelSummary {
+        model_arn: record.arn.clone(),
+        model_name: record.name.clone(),
+        creation_time: date_time(record.created_at),
+        base_model_arn: record.base_model_arn.clone(),
+        base_model_name: record.base_model_name.clone(),
+        customization_type: Some(record.customization_type.to_string()),
+        // "The unique identifier of the account that owns the model": every model this
+        // store holds was created by the one account the emulator presents.
+        owner_account_id: Some(::engine::emulator_account_id().to_string()),
+        model_status: Some(record.status.to_string()),
+    }
+}
+
 /// Lives here rather than in one operation's file because
 /// `Create`/`Get`/`UpdateMarketplaceModelEndpoint` all report this shape, and they must
 /// report it alike: what a create or update answers is exactly what the next read finds.
@@ -2082,6 +2339,58 @@ pub fn caller_principal(parts: &http::request::Parts) -> String {
 /// A `SystemTime` as the wire timestamp type the response shapes carry.
 pub fn date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
+}
+
+// =============================================================================
+// The cursor every creation-time listing of this service pages with
+// =============================================================================
+//
+// `ops/list_provisioned_model_throughputs.rs` and `ops/list_custom_models.rs` sort by the
+// one instant their `sortBy` admits and page with a `nextToken`, so they need the SAME
+// cursor: stated once here, because two renderings of it could drift and a token issued by
+// one shape would then not resume the listing it came from.
+
+/// The number of decimal digits a listing cursor's instant half carries.
+///
+/// Fixed-width so BYTE order over cursors IS the listing's order: nanoseconds since the
+/// epoch need 19 digits for any instant this emulator can mint, and 20 leaves the width
+/// stable past them.
+pub const CURSOR_INSTANT_DIGITS: usize = 20;
+
+/// The cursor of the row a listing resumes at: the instant the resource was created, then
+/// its ARN.
+///
+/// Rendered so byte order over cursors is the `(creationTime, arn)` order such a listing is
+/// sorted by — the instant half is fixed-width and `:` sorts below every character the rest
+/// of an ARN can carry after it — which is what lets a page resume at "the first row at or
+/// after this cursor" even when the row the previous page ended on has since been deleted.
+/// It carries no whitespace, as `PaginationToken` (`^\S*$`) requires.
+#[must_use]
+pub fn listing_cursor(created_at: SystemTime, arn: &str) -> String {
+    let nanos = created_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    format!("{nanos:0width$}:{arn}", width = CURSOR_INSTANT_DIGITS)
+}
+
+/// Whether `token` is a cursor [`listing_cursor`] renders, so a token from somewhere else
+/// is refused rather than silently read as an empty or wrong page.
+#[must_use]
+pub fn cursor_belongs(token: &str) -> bool {
+    let Some((instant, arn)) = token.split_once(':') else {
+        return false;
+    };
+    instant.len() == CURSOR_INSTANT_DIGITS
+        && instant.bytes().all(|byte| byte.is_ascii_digit())
+        && !arn.is_empty()
+}
+
+/// `at` as epoch seconds, the scale a `creationTime` filter carries on the wire
+/// (`@timestampFormat("date-time")`), so a filter and a record are compared on one scale.
+#[must_use]
+pub fn epoch_seconds(at: SystemTime) -> f64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_secs_f64())
 }
 
 /// The `kmsKeyArn` a response reports for a request's `kmsKeyId`.

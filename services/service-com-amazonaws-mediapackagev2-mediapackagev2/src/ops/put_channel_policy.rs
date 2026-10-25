@@ -215,10 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A multiview channel takes no resource policy of its own — it is served through
         // the channels it composites — which is the case the model's
-        // `MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED` validation type names.
-        // `MultiviewConfiguration` is present exactly when `InputType` is `MULTIVIEW`
-        // (its own doc says so), so it is what identifies such a channel.
-        if channel.multiview_configuration.is_some() {
+        // `MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED` validation type names. Which channels
+        // those are is decided in ONE place, `crate::state::Channel::is_multiview`, so
+        // every operation that has nothing to do on such a channel agrees on it.
+        if channel.is_multiview() {
             return Err(PutChannelPolicyErrorModeled::ValidationException(
                 crate::state::validation_failed(
                     "policy",

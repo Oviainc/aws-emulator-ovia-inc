@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLexicons
-//! Lists the lexicons stored in the Region the call was signed for, in name order, one
-//! page at a time.
+//! Lists the lexicons stored in the Region the call was signed for, in name order, all
+//! of them in one response.
+//!
+//! The model declares no page-size input for this operation and does not mark it
+//! `@paginated` (`ListSpeechSynthesisTasks` is the service's one paginated read), so the
+//! report is not truncated: a single call reports the Region's whole lexicon list and
+//! `NextToken` — documented as returned "only if the response is truncated" — is
+//! therefore never returned. The number of entries is bounded by the per-Region count
+//! quota [`crate::ops::put_lexicon::MAX_LEXICONS`], not by a page size.
 //!
 //! The store is a `BTreeMap` keyed by Region and then name, so one Region's entries are
-//! contiguous in name order and a page is "the next [`LEXICON_PAGE_SIZE`] names of this
-//! Region after the cursor". `NextToken` is present
-//! only when a further lexicon exists, and a token this service did not mint is
-//! `InvalidNextTokenException` (400) rather than a silent restart from the first page.
+//! contiguous in name order and the read is a range scan. The modelled `NextToken`
+//! input is still checked: a token this service could not have minted is
+//! `InvalidNextTokenException` (400) rather than a silently wrong list, and a
+//! well-formed one names the lexicon to resume after.
 //!
 //! ## Shape of an operation
 //!
@@ -106,14 +113,6 @@ impl From<ListLexiconsErrorModeled> for ListLexiconsError {
     }
 }
 
-/// How many lexicons one `ListLexicons` page carries.
-///
-/// CHOSEN: Amazon Polly documents `NextToken` on this operation but no page size, so
-/// this is the emulator's own, and it is the only thing that decides where a page
-/// ends. It is well under the number of lexicons a Region holds, so the paging path
-/// is the normal path rather than one only a huge store reaches.
-pub const LEXICON_PAGE_SIZE: usize = 20;
-
 /// The `ListLexicons` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,8 +149,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A token must be one this service minted; anything else is refused before
-        // any state is read, so a garbage token can never read as "first page".
+        // A token must be one this service could have minted; anything else is refused
+        // before any state is read, so a garbage token can never read as "the whole
+        // list". A well-formed one names the lexicon the listing resumes after.
         let after = match input.next_token.as_deref() {
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
                 ListLexiconsErrorModeled::InvalidNextTokenException(
@@ -169,29 +169,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let guard = state.lock();
         // "Returns a list of pronunciation lexicons stored in an Amazon Web Services
-        // Region": the page is this request's own Region, so a lexicon stored in
+        // Region": the list is this request's own Region, so a lexicon stored in
         // another one is not reported here.
         let region = crate::state::request_region(ctx.parts());
-        let mut remaining = guard.lexicons_in_region(&region, after.as_deref());
-        let page: Vec<LexiconDescription> = remaining
-            .by_ref()
-            .take(LEXICON_PAGE_SIZE)
+        let lexicons: Vec<LexiconDescription> = guard
+            .lexicons_in_region(&region, after.as_deref())
             .map(|stored| LexiconDescription {
                 name: Some(stored.name.clone()),
                 attributes: Some(crate::state::lexicon_attributes(stored)),
             })
             .collect();
-        // The token is minted only when the iterator still has an entry, so the last
-        // page omits it.
-        let next_token = remaining
-            .next()
-            .and(page.last())
-            .and_then(|last| last.name.as_deref())
-            .map(crate::state::encode_page_token);
 
         Ok(ListLexiconsOutput {
-            lexicons: Some(page),
-            next_token,
+            lexicons: Some(lexicons),
+            // The response carries the Region's whole list, so it is never truncated
+            // and no continuation token is owed.
+            next_token: None,
         })
     }
 }

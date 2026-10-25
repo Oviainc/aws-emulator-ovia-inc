@@ -15,13 +15,19 @@
 //! code). A `NextToken` this service did not issue is
 //! `InvalidPaginationTokenException`.
 //!
+//! `MaxResults` bounds what a CALLER may ask for, not what this listing serves when
+//! none is named: a caller that names no `MaxResults` is served the service's WHOLE
+//! default-quota set in one page with no `NextToken`
+//! ([`crate::state::UNASKED_PAGE_SIZE`]).
+//!
 //! The quotas come back in the order the catalog publishes them, and each entry's
 //! `QuotaArn` is the AWS-DEFAULT form, whose account segment is empty: a default
 //! quota is AWS's published value and belongs to no account.
 //!
 //! The listing is the service's WHOLE published default-quota list (the catalog
 //! seeded in [`crate::state`]), which for a service such as EC2 runs well past the
-//! largest page the model allows, so a walk takes many `NextToken`-chained pages.
+//! largest page the model allows, so a walk with a caller-named page size takes many
+//! `NextToken`-chained pages.
 //!
 //! ---
 //!

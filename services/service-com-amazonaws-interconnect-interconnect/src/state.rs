@@ -461,9 +461,31 @@ pub const ARN_RESOURCE_TYPE: &str = "connection";
 /// How many digits an ARN's account-id field has (`[0-9]{12}` in that pattern).
 const ARN_ACCOUNT_ID_DIGITS: usize = 12;
 
-/// The `ConnectionId` an `AmazonResourceName` names, for the operations that
-/// identify a connection by its ARN (`TagResource`, `UntagResource`,
-/// `ListTagsForResource`) rather than by its id.
+/// The partition every ARN this emulator mints carries.
+///
+/// `emulator_arn` builds `arn:aws:<service>:<region>:<account>:<resource>`, so `aws`
+/// is the partition the requests this emulator serves address, while the member's
+/// `aws[a-z-]*` pattern lets a caller SEND any partition.
+pub const ARN_PARTITION: &str = "aws";
+
+/// Every field an Interconnect connection ARN carries, plus the ARN itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionArn<'a> {
+    /// The ARN as the request carried it.
+    pub text: &'a str,
+    /// The partition field (`aws`, `aws-cn`, …).
+    pub partition: &'a str,
+    /// The Region field.
+    pub region: &'a str,
+    /// The twelve-digit account field.
+    pub account: &'a str,
+    /// The `ConnectionId` the resource field names.
+    pub id: &'a str,
+}
+
+/// The fields of an `AmazonResourceName`, for the operations that identify a
+/// connection by its ARN (`TagResource`, `UntagResource`, `ListTagsForResource`)
+/// rather than by its id.
 ///
 /// Parsed from the ARN's six colon-separated fields — `arn`, a partition the
 /// pattern writes `aws[a-z-]*`, this service's [`ARN_NAMESPACE`], a region, a
@@ -472,30 +494,70 @@ const ARN_ACCOUNT_ID_DIGITS: usize = 12;
 /// service's resource. The id itself is NOT re-checked against
 /// `^(mcc|lmcc)-[a-z0-9]{8}$` here: an id outside it simply matches no stored
 /// connection.
-pub fn connection_id_from_arn(arn: &str) -> Option<&str> {
+pub fn parse_connection_arn(arn: &str) -> Option<ConnectionArn<'_>> {
     let (qualifier, id) = arn.rsplit_once('/')?;
     let mut fields = qualifier.split(':');
-    let well_formed = fields.next() == Some("arn")
-        && fields.next().is_some_and(|partition| {
-            partition.starts_with("aws")
-                && partition[3..]
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c == '-')
-        })
-        && fields.next() == Some(ARN_NAMESPACE)
-        && fields.next().is_some_and(|region| !region.is_empty())
-        && fields.next().is_some_and(|account| {
-            account.len() == ARN_ACCOUNT_ID_DIGITS && account.chars().all(|c| c.is_ascii_digit())
-        })
-        && fields.next() == Some(ARN_RESOURCE_TYPE)
-        && fields.next().is_none();
-    well_formed.then_some(id).filter(|id| !id.is_empty())
+    if fields.next() != Some("arn") {
+        return None;
+    }
+    let partition = fields.next().filter(|partition| {
+        partition
+            .strip_prefix("aws")
+            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+    })?;
+    if fields.next() != Some(ARN_NAMESPACE) {
+        return None;
+    }
+    let region = fields.next().filter(|region| !region.is_empty())?;
+    let account = fields.next().filter(|account| {
+        account.len() == ARN_ACCOUNT_ID_DIGITS && account.chars().all(|c| c.is_ascii_digit())
+    })?;
+    if fields.next() != Some(ARN_RESOURCE_TYPE) || fields.next().is_some() || id.is_empty() {
+        return None;
+    }
+    Some(ConnectionArn {
+        text: arn,
+        partition,
+        region,
+        account,
+        id,
+    })
+}
+
+/// The `ConnectionId` an `AmazonResourceName` names — [`parse_connection_arn`]'s
+/// resource field, for the callers that need only the id.
+pub fn connection_id_from_arn(arn: &str) -> Option<&str> {
+    parse_connection_arn(arn).map(|parsed| parsed.id)
 }
 
 /// How the service words an `arn` that is not an Interconnect connection ARN at
 /// all, which is a fault in the request rather than a missing resource.
 pub fn not_a_connection_arn_message(arn: &str) -> String {
     format!("{REFUSAL_ENVELOPE}{arn} is not the ARN of an Interconnect {ARN_RESOURCE_TYPE}")
+}
+
+/// Why `parsed` does not address the scope the request it arrived on is for — or
+/// `None` when its partition, Region and account are all that scope's.
+///
+/// An ARN identifies a resource in FULL, so one whose partition, Region or account
+/// is not the one the request addresses names a resource outside the scope the
+/// caller is talking to: a fault in the REQUEST, not a resource this scope is
+/// missing. The message is built from the request — the field that differs, the
+/// value the ARN carried for it and the value this request is for — so a caller can
+/// see WHICH field put the ARN elsewhere.
+pub fn arn_scope_violation(parsed: &ConnectionArn<'_>, region: &str) -> Option<String> {
+    let account = ::emulator_server::emulator_account_id();
+    let (field, carried, addressed) = [
+        ("partition", parsed.partition, ARN_PARTITION),
+        ("region", parsed.region, region),
+        ("account", parsed.account, account),
+    ]
+    .into_iter()
+    .find(|(_, carried, addressed)| carried != addressed)?;
+    Some(format!(
+        "{REFUSAL_ENVELOPE}{} is in {field} {carried}, and this request is for {field} {addressed}",
+        parsed.text
+    ))
 }
 
 /// The shortest and longest a tag KEY may be: `TagKey` is modelled
