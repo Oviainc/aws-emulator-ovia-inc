@@ -23,6 +23,15 @@
 //! * A payload AWS would refuse — an `ObjectOwnership` outside the published value set, or
 //!   an `OwnershipControls` naming no `Rule` — is refused with HTTP 400 and leaves the
 //!   stored ownership controls untouched.
+//! * `DeleteBucketOwnershipControls` "removes OwnershipControls for an Amazon S3 bucket"
+//!   (the operation's own documentation): the named bucket's controls are withdrawn in
+//!   full, so a later `GetBucketOwnershipControls` reports none again, the call answers the
+//!   modelled 204 with an empty body whether or not the bucket carried any (its output is
+//!   `Unit` and it models no not-found, so it is idempotent), and nothing outside that one
+//!   bucket's ownership controls changes.
+//! * A bucket-owner mismatch in `x-amz-expected-bucket-owner` is refused with HTTP 403
+//!   `AccessDenied` and withdraws nothing
+//!   (`DeleteBucketOwnershipControlsRequest$ExpectedBucketOwner`).
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -30,6 +39,7 @@ use service_com_amazonaws_s3_amazons3::state::MAX_OWNERSHIP_CONTROLS_RULES;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{create_bucket, router, send, Answer};
+use super::bucket_tagging::{get_bucket_tagging, put_bucket_tagging, tag, tag_set_of};
 
 /// The XML namespace botocore puts on an S3 request payload.
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -84,6 +94,26 @@ async fn get_ownership_controls(router: &MultiServiceRouter, bucket: &str) -> An
         "GET",
         &format!("/{bucket}?ownershipControls"),
         &[],
+        "",
+    )
+    .await
+}
+
+/// `DELETE /<bucket>?ownershipControls` — `DeleteBucketOwnershipControls`, with the
+/// `ExpectedBucketOwner` header when one is named.
+async fn delete_ownership_controls(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    expected_owner: Option<&str>,
+) -> Answer {
+    let headers: Vec<(&str, &str)> = expected_owner
+        .map(|owner| vec![("x-amz-expected-bucket-owner", owner)])
+        .unwrap_or_default();
+    send(
+        router,
+        "DELETE",
+        &format!("/{bucket}?ownershipControls"),
+        &headers,
         "",
     )
     .await
@@ -426,5 +456,342 @@ async fn ownership_controls_on_a_bucket_this_emulator_does_not_hold_is_no_such_b
         vec!["ObjectWriter"],
         "the held bucket must report the controls it was given, got {:?}",
         reported_rules(&read)
+    );
+}
+
+#[tokio::test]
+async fn deleting_ownership_controls_withdraws_them_and_repeats_the_same_answer() {
+    let router = router();
+
+    // Every row of the round-trip table: whatever container the bucket carries — one rule
+    // or many, any published value, any order — the delete withdraws it in full, and the
+    // bucket reads back as one that never had ownership controls.
+    for (index, (case, rules)) in round_trip_rows().into_iter().enumerate() {
+        let bucket = format!("ownership-delete-{index}");
+        let created = create_bucket(&router, &bucket, None, None).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: the bucket must be created first, got {}",
+            created.status
+        );
+        let put = put_ownership_controls(&router, &bucket, &rules).await;
+        assert_eq!(
+            put.status, 200,
+            "case {case:?}: the setup put must succeed, got {} with body {:?}",
+            put.status,
+            String::from_utf8_lossy(&put.body)
+        );
+
+        // Three deletes in a row: the first withdraws a container that is there, the next
+        // two one that is not. The operation's output is `Unit` and it models no
+        // not-found, so all three answer the same modelled 204 with an empty body.
+        for attempt in 1..=3 {
+            let deleted = delete_ownership_controls(&router, &bucket, None).await;
+            assert_eq!(
+                deleted.status, 204,
+                "case {case:?}/delete #{attempt}: expected the modelled 204, got {} with \
+                 body {:?}",
+                deleted.status,
+                String::from_utf8_lossy(&deleted.body)
+            );
+            assert!(
+                deleted.body.is_empty(),
+                "case {case:?}/delete #{attempt}: the output is Unit, so the body must be \
+                 empty, got {:?}",
+                String::from_utf8_lossy(&deleted.body)
+            );
+
+            let read = get_ownership_controls(&router, &bucket).await;
+            assert_eq!(
+                read.status, 404,
+                "case {case:?}/delete #{attempt}: the bucket must report no ownership \
+                 controls afterwards, got {} with body {:?}",
+                read.status,
+                String::from_utf8_lossy(&read.body)
+            );
+            assert_eq!(
+                read.error_code(),
+                "OwnershipControlsNotFoundError",
+                "case {case:?}/delete #{attempt}: expected the documented error code, got \
+                 {:?}",
+                read.error_code()
+            );
+        }
+
+        // And the bucket still takes a put, so the delete withdrew the subresource rather
+        // than breaking the bucket.
+        let again = put_ownership_controls(&router, &bucket, &["BucketOwnerPreferred"]).await;
+        assert_eq!(
+            again.status, 200,
+            "case {case:?}: the bucket must accept ownership controls again, got {} with \
+             body {:?}",
+            again.status,
+            String::from_utf8_lossy(&again.body)
+        );
+        let read = get_ownership_controls(&router, &bucket).await;
+        assert_eq!(
+            reported_rules(&read),
+            vec!["BucketOwnerPreferred"],
+            "case {case:?}: the re-configured bucket must report what it was given, got {:?}",
+            reported_rules(&read)
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_ownership_controls_a_bucket_never_carried_still_succeeds() {
+    let router = router();
+
+    // Buckets that have never been configured, so the delete is asked for a state the
+    // bucket is already in. Two rows, one of them in a non-default Region, so the answer
+    // is about the absent subresource rather than about one bucket.
+    for (case, bucket, constraint) in [
+        (
+            "a bucket created with no location constraint",
+            "ownership-delete-absent-default",
+            None,
+        ),
+        (
+            "a bucket created in another Region",
+            "ownership-delete-absent-regional",
+            Some("eu-west-1"),
+        ),
+    ] {
+        let created = create_bucket(&router, bucket, constraint, None).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: the bucket must be created first, got {}",
+            created.status
+        );
+
+        let deleted = delete_ownership_controls(&router, bucket, None).await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {case:?}: expected the modelled 204 for a bucket that carried none, got \
+             {} with body {:?}",
+            deleted.status,
+            String::from_utf8_lossy(&deleted.body)
+        );
+        assert!(
+            deleted.body.is_empty(),
+            "case {case:?}: the output is Unit, so the body must be empty, got {:?}",
+            String::from_utf8_lossy(&deleted.body)
+        );
+
+        let read = get_ownership_controls(&router, bucket).await;
+        assert_eq!(
+            read.error_code(),
+            "OwnershipControlsNotFoundError",
+            "case {case:?}: the bucket must still report no ownership controls, got {:?}",
+            read.error_code()
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_ownership_controls_is_scoped_to_the_named_bucket() {
+    let router = router();
+
+    // (bucket, the controls it carries). Three buckets, each with a container of a
+    // different size and naming different values, so what survives the delete below is
+    // distinguishable per bucket.
+    let buckets: [(&str, Vec<&str>); 3] = [
+        ("ownership-scope-target", vec!["ObjectWriter"]),
+        (
+            "ownership-scope-neighbour",
+            vec!["BucketOwnerPreferred", "BucketOwnerEnforced"],
+        ),
+        (
+            "ownership-scope-other",
+            vec!["BucketOwnerEnforced", "ObjectWriter", "ObjectWriter"],
+        ),
+    ];
+
+    for (bucket, rules) in &buckets {
+        create_bucket(&router, bucket, None, None).await;
+        let put = put_ownership_controls(&router, bucket, rules).await;
+        assert_eq!(
+            put.status, 200,
+            "case {bucket:?}: the setup put must succeed, got {} with body {:?}",
+            put.status,
+            String::from_utf8_lossy(&put.body)
+        );
+        // A second subresource on the SAME bucket, so the delete below is shown to be
+        // scoped to the ownership controls rather than to the bucket's whole record.
+        let tagged = put_bucket_tagging(&router, bucket, &[tag("suite", bucket)]).await;
+        assert_eq!(
+            tagged.status, 200,
+            "case {bucket:?}: the setup tagging put must succeed, got {} with body {:?}",
+            tagged.status,
+            String::from_utf8_lossy(&tagged.body)
+        );
+    }
+
+    // Delete ONE bucket's controls, twice, to be sure the repeat does not reach further
+    // than the first call did.
+    for attempt in 1..=2 {
+        let deleted = delete_ownership_controls(&router, buckets[0].0, None).await;
+        assert_eq!(
+            deleted.status, 204,
+            "delete #{attempt}: expected the modelled 204, got {} with body {:?}",
+            deleted.status,
+            String::from_utf8_lossy(&deleted.body)
+        );
+    }
+
+    for (bucket, rules) in &buckets {
+        let read = get_ownership_controls(&router, bucket).await;
+        if *bucket == buckets[0].0 {
+            assert_eq!(
+                read.error_code(),
+                "OwnershipControlsNotFoundError",
+                "case {bucket:?}: the named bucket's controls must be withdrawn, got {:?}",
+                read.error_code()
+            );
+        } else {
+            assert_eq!(
+                reported_rules(&read),
+                *rules,
+                "case {bucket:?}: another bucket's controls must be untouched, got {:?}",
+                reported_rules(&read)
+            );
+        }
+
+        // The tag set of every bucket, the deleted one included, is exactly as it was.
+        let tags = get_bucket_tagging(&router, bucket).await;
+        assert_eq!(
+            tag_set_of(&tags),
+            vec![tag("suite", bucket)],
+            "case {bucket:?}: deleting ownership controls must leave the tag set alone, got \
+             {:?}",
+            tag_set_of(&tags)
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_ownership_controls_on_a_bucket_this_emulator_does_not_hold_is_no_such_bucket() {
+    let router = router();
+    create_bucket(&router, "ownership-delete-held", None, None).await;
+
+    // Names that are NOT the one bucket created above: a different name, a prefix of it,
+    // an extension of it, and one differing only in case (bucket names are
+    // case-sensitive). `NoSuchBucket` carries `httpError 404` in the model.
+    for bucket in [
+        "ownership-delete-absent",
+        "ownership-delete",
+        "ownership-delete-held-2",
+        "Ownership-Delete-Held",
+    ] {
+        let answer = delete_ownership_controls(&router, bucket, None).await;
+        assert_eq!(
+            answer.status, 404,
+            "case {bucket:?}: expected HTTP 404 for a bucket this emulator does not hold, \
+             got {} with body {:?}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.error_code(),
+            "NoSuchBucket",
+            "case {bucket:?}: expected the modelled error code, got {:?}",
+            answer.error_code()
+        );
+
+        // The refused delete created nothing: the bucket is still absent.
+        let read = get_ownership_controls(&router, bucket).await;
+        assert_eq!(
+            read.error_code(),
+            "NoSuchBucket",
+            "case {bucket:?}: a refused delete must not have created the bucket, got {:?}",
+            read.error_code()
+        );
+    }
+
+    // The bucket that IS held answers the modelled 204, so the rows above failed on the
+    // lookup rather than on the operation being unreachable.
+    let deleted = delete_ownership_controls(&router, "ownership-delete-held", None).await;
+    assert_eq!(
+        deleted.status, 204,
+        "the held bucket must answer the modelled 204, got {} with body {:?}",
+        deleted.status,
+        String::from_utf8_lossy(&deleted.body)
+    );
+}
+
+#[tokio::test]
+async fn deleting_ownership_controls_as_an_account_that_is_not_the_owner_is_access_denied() {
+    let router = router();
+    let bucket = "ownership-delete-expected-owner";
+    create_bucket(&router, bucket, None, None).await;
+
+    let owner = engine::emulator_account_id();
+    let stored = vec!["BucketOwnerPreferred", "ObjectWriter"];
+    let put = put_ownership_controls(&router, bucket, &stored).await;
+    assert_eq!(
+        put.status, 200,
+        "the setup put must succeed, got {} with body {:?}",
+        put.status,
+        String::from_utf8_lossy(&put.body)
+    );
+
+    // Account ids that are NOT this emulator's: another well-formed 12-digit id, the
+    // owner's id truncated, an empty one, and the owner's id with its last digit changed.
+    let mut mismatched: Vec<String> = vec![
+        "123456789012".to_string(),
+        owner[..owner.len() - 1].to_string(),
+        String::new(),
+    ];
+    let mut rotated: String = owner.to_string();
+    if let Some(last) = rotated.pop() {
+        rotated.push(if last == '9' { '0' } else { '9' });
+        mismatched.push(rotated);
+    }
+
+    for expected in &mismatched {
+        assert_ne!(
+            expected.as_str(),
+            owner,
+            "every row of this table must name an id that is NOT the bucket's owner"
+        );
+        let refused = delete_ownership_controls(&router, bucket, Some(expected)).await;
+        assert_eq!(
+            refused.status, 403,
+            "case {expected:?}: expected HTTP 403 for an account that is not the owner, got \
+             {} with body {:?}",
+            refused.status,
+            String::from_utf8_lossy(&refused.body)
+        );
+        assert_eq!(
+            refused.error_code(),
+            "AccessDenied",
+            "case {expected:?}: expected the published error code, got {:?}",
+            refused.error_code()
+        );
+
+        let read = get_ownership_controls(&router, bucket).await;
+        assert_eq!(
+            reported_rules(&read),
+            stored,
+            "case {expected:?}: a refused delete must leave the stored ownership controls \
+             untouched, got {:?}",
+            reported_rules(&read)
+        );
+    }
+
+    // The owner's own id is accepted, and withdraws the controls.
+    let deleted = delete_ownership_controls(&router, bucket, Some(owner)).await;
+    assert_eq!(
+        deleted.status, 204,
+        "the owner's own account id must be accepted, got {} with body {:?}",
+        deleted.status,
+        String::from_utf8_lossy(&deleted.body)
+    );
+    let read = get_ownership_controls(&router, bucket).await;
+    assert_eq!(
+        read.error_code(),
+        "OwnershipControlsNotFoundError",
+        "the owner's delete must withdraw the controls, got {:?}",
+        read.error_code()
     );
 }

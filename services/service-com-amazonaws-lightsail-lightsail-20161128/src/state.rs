@@ -840,6 +840,14 @@ pub const RELATIONAL_DATABASE_EVENT_PAGE_SIZE: usize = 10;
 /// the same way.
 pub const INSTANCE_SNAPSHOT_PAGE_SIZE: usize = 10;
 
+/// How many block storage disks one `GetDisks` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more disks remain. Matches
+/// [`INSTANCE_PAGE_SIZE`], so every stored-resource listing in this slice pages
+/// the same way.
+pub const DISK_PAGE_SIZE: usize = 10;
+
 /// How many disk snapshots one `GetDiskSnapshots` page carries.
 ///
 /// CHOSEN: Lightsail publishes no page size for this operation, only that the

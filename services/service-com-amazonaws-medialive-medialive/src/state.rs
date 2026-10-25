@@ -22,7 +22,8 @@
 //! The MediaLive Anywhere network lives here too: one [`NetworkRecord`] per
 //! created network, its own id counter and its own token map. A network's
 //! `State` is the one lifecycle member it owes the clock (`CREATING` until the
-//! creation comes due, then `ACTIVE`) and its `AssociatedClusterIds` are derived
+//! creation comes due, then `ACTIVE`; `DELETING` until an accepted delete comes
+//! due, then the terminal `DELETED`) and its `AssociatedClusterIds` are derived
 //! from the rest of the state on every read, never recorded at create time.
 //!
 //! The INPUT DEVICES this account has claimed live here as well: one
@@ -54,14 +55,14 @@
 //! DEREGISTRATION — the state its enum models — so a deleted node ends in
 //! `DEREGISTERED` rather than in a `DELETED` the model does not declare.
 //!
-//! A delete never drops a record: a deleted channel, input, input security group
-//! or SdiSource keeps its record in the terminal `DELETED` state its own state
-//! enum models, so a reader goes on reporting it there (which is what the SDK's
-//! `ChannelDeleted` / `InputDeleted` waiters poll for) instead of losing it. The
-//! `DELETING` step a channel's and an input's enum models is what the clock owes
-//! between the call and that terminal state, and a resource in `DELETED` is no
-//! longer *currently using* anything, so it leaves the derived `Inputs`,
-//! `Channels` and `AttachedChannels` lists.
+//! A delete never drops a record: a deleted channel, input, input security group,
+//! network or SdiSource keeps its record in the terminal `DELETED` state its own
+//! state enum models, so a reader goes on reporting it there (which is what the
+//! SDK's `ChannelDeleted` / `InputDeleted` waiters poll for) instead of losing
+//! it. The `DELETING` step a channel's, an input's and a network's enum models is
+//! what the clock owes between the call and that terminal state, and a resource in
+//! `DELETED` is no longer *currently using* anything, so it leaves the derived
+//! `Inputs`, `Channels` and `AttachedChannels` lists.
 //!
 //! A kept record is READABLE, not writable: once a delete has been accepted for
 //! an id, that id names no resource a caller may still change. Every MUTATION
@@ -419,23 +420,27 @@ pub mod sdi_source_state {
 /// CREATE_FAILED | ACTIVE | DELETING | IDLE | IN_USE | UPDATING | DELETE_FAILED |
 /// DELETED).
 ///
-/// Only the two the create lifecycle reaches are named here. `CreateNetwork` is
-/// asynchronous — `State` is documented "The current state of the Network. Only
-/// MediaLive Anywhere can change the state" — so a network starts `CREATING` and
-/// the clock owes it `ACTIVE`, the one state the enum names for a network that
-/// exists, has not failed and nothing has deleted. The rest belong to operations
-/// no handler implements yet: `UPDATING` to `UpdateNetwork`, `DELETING` and
-/// `DELETED` to `DeleteNetwork`, and the two `*_FAILED` states to failures this
-/// emulator does not inject. `IDLE` and `IN_USE` are the two the model documents
-/// nothing about for a network (`State` carries the one sentence above and no
-/// member says what puts a network in either), so this emulator never claims
-/// one: a network's attachments are reported through its
+/// Only the states the create and the delete lifecycles reach are named here.
+/// `CreateNetwork` is asynchronous — `State` is documented "The current state of
+/// the Network. Only MediaLive Anywhere can change the state" — so a network
+/// starts `CREATING` and the clock owes it `ACTIVE`, the one state the enum names
+/// for a network that exists, has not failed and nothing has deleted. The delete
+/// is asynchronous for the same reason, so an accepted `DeleteNetwork` puts the
+/// network in `DELETING` and the clock owes it the terminal `DELETED` the record
+/// then keeps ([`begin_delete_network`]). The rest belong to operations no
+/// handler implements yet: `UPDATING` to `UpdateNetwork`, and the two `*_FAILED`
+/// states to failures this emulator does not inject. `IDLE` and `IN_USE` are the
+/// two the model documents nothing about for a network (`State` carries the one
+/// sentence above and no member says what puts a network in either), so this
+/// emulator never claims one: a network's attachments are reported through its
 /// `AssociatedClusterIds`
 /// ([`ComAmazonawsMedialiveMedialiveState::clusters_using_network`]) rather than
 /// guessed at through its state.
 pub mod network_state {
     pub const CREATING: &str = "CREATING";
     pub const ACTIVE: &str = "ACTIVE";
+    pub const DELETING: &str = "DELETING";
+    pub const DELETED: &str = "DELETED";
 }
 
 /// The `ChannelClass` enum values (`smithy_query(query="shape",
@@ -1433,16 +1438,53 @@ pub struct NetworkRecord {
     /// The instant the creation becomes due, so `CREATING` settles into
     /// `ACTIVE`. Stored, never slept on.
     active_due: SystemTime,
+    /// The instant an accepted deletion becomes due, so `DELETING` settles into
+    /// the terminal `DELETED`. `None` until a delete is accepted, and `None`
+    /// again once that deletion has come due — [`Self::deleted`] is what records
+    /// it from then on. Stored, never slept on.
+    deletion_due: Option<SystemTime>,
+    /// Whether this network's deletion has come due, which is what puts it in
+    /// the terminal `DELETED` state it then keeps.
+    deleted: bool,
 }
 
 impl NetworkRecord {
-    /// Materialise the creation the clock has already made due. Owed at
-    /// `active_due` whether or not anybody called, so applying it in a reporting
-    /// operation changes nothing a later caller would have seen.
-    fn settle(&mut self, now: SystemTime) {
+    /// Whether a delete has been accepted for this network and the clock has not
+    /// made that deletion due yet.
+    pub fn is_deleting(&self) -> bool {
+        self.deletion_due.is_some()
+    }
+
+    /// Whether this network's deletion has come due, which is what puts it in
+    /// the terminal `DELETED` state.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted
+    }
+
+    /// Whether a delete has been accepted for this network, in either half of
+    /// the deletion lifecycle — so a repeated `DeleteNetwork` is idempotent
+    /// rather than restarting the clock, and a network on its way out no longer
+    /// holds the name it was created under
+    /// ([`ComAmazonawsMedialiveMedialiveState::network_named`]).
+    pub fn is_delete_accepted(&self) -> bool {
+        self.is_deleting() || self.is_deleted()
+    }
+
+    /// Materialise the creation or the deletion the clock has already made due,
+    /// answering whether THIS call is the one that settled the deletion. Each is
+    /// owed at its stored instant whether or not anybody called, so applying it
+    /// in a reporting operation changes nothing a later caller would have seen.
+    fn settle(&mut self, now: SystemTime) -> bool {
+        if self.deletion_due.is_some_and(|due| now >= due) {
+            self.deletion_due = None;
+            self.deleted = true;
+            self.state = network_state::DELETED.to_string();
+            return true;
+        }
         if self.state == network_state::CREATING && now >= self.active_due {
             self.state = network_state::ACTIVE.to_string();
         }
+        false
     }
 }
 
@@ -1540,13 +1582,35 @@ pub fn new_network(id: String, arn: String, now: SystemTime) -> NetworkRecord {
         tags: HashMap::new(),
         state: network_state::CREATING.to_string(),
         active_due: now + TRANSIENT_STATE_SPAN,
+        deletion_due: None,
+        deleted: false,
     }
+}
+
+/// Accept a delete for `network`: it moves into `DELETING` and owes the terminal
+/// `DELETED` once [`TRANSIENT_STATE_SPAN`] has passed.
+///
+/// Deleting a network is asynchronous — the model answers `DeleteNetwork` with
+/// `202 Accepted` and `State` is documented "The current state of the Network.
+/// Only MediaLive Anywhere can change the state" — so the caller polls
+/// `DescribeNetwork` for that terminal state. The record then stays in the
+/// account in it, so the readers go on reporting the network there rather than
+/// losing it.
+///
+/// Idempotent: a delete already accepted keeps the instant it was accepted at,
+/// so a repeated call neither restarts the clock nor revives a deleted network.
+pub fn begin_delete_network(network: &mut NetworkRecord, now: SystemTime) {
+    if network.is_delete_accepted() {
+        return;
+    }
+    network.deletion_due = Some(now + TRANSIENT_STATE_SPAN);
+    network.state = network_state::DELETING.to_string();
 }
 
 /// Project a [`DescribeNetworkSummary`] onto one of the structurally identical
 /// per-operation network output shapes (`CreateNetworkOutput`,
-/// `DescribeNetworkOutput`; `UpdateNetworkOutput` and `DeleteNetworkOutput`
-/// carry the same seven members, for when their own issues land).
+/// `DescribeNetworkOutput`, `DeleteNetworkOutput`; `UpdateNetworkOutput` carries
+/// the same seven members, for when its own issue lands).
 ///
 /// One macro rather than a hand-written copy of the same seven-member move per
 /// operation, so the operations that report a network cannot drift from each
@@ -1843,8 +1907,19 @@ impl ComAmazonawsMedialiveMedialiveState {
         for signal_map in self.signal_maps.values_mut() {
             signal_map.settle(now);
         }
-        for network in self.networks.values_mut() {
-            network.settle(now);
+        // Collected and forgotten on the same terms as the channel tokens
+        // above: only a network that settles into `DELETED` on THIS call is
+        // collected, and a token never outlives the network it minted, so a
+        // retried create mints a new network rather than answering with a
+        // deleted one.
+        let mut deleted_networks: Vec<String> = Vec::new();
+        for (id, network) in &mut self.networks {
+            if network.settle(now) {
+                deleted_networks.push(id.clone());
+            }
+        }
+        for id in deleted_networks {
+            self.network_tokens.forget(&id);
         }
         self.settle_multiplexes(now);
         self.settle_input_devices(now);
@@ -2139,15 +2214,22 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// account-wide (not per region), and it is what makes a second create under
     /// a name already taken the modelled `ConflictException` rather than a second
     /// network.
+    ///
+    /// A network whose delete this service has accepted is skipped: it is on its
+    /// way out of the account, so the name it was created under is free for the
+    /// next create even though its record stays readable.
     pub fn network_named(&self, name: &str) -> Option<&str> {
         self.networks
             .values()
-            .find(|network| network.name.as_deref() == Some(name))
+            .find(|network| {
+                network.name.as_deref() == Some(name) && !network.is_delete_accepted()
+            })
             .map(|network| network.id.as_str())
     }
 
     /// The ids of the clusters currently attached to the network `network_id` —
-    /// what `AssociatedClusterIds` reports. Derived from the cluster store on
+    /// what `AssociatedClusterIds` reports, and what `DeleteNetwork` refuses a
+    /// delete on when it is not empty. Derived from the cluster store on
     /// every read, so it tracks every later cluster create rather than being
     /// recorded at create time.
     ///
@@ -2191,7 +2273,8 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// when no network has that id.
     ///
     /// The ONE projection every operation that reports a network
-    /// (`CreateNetwork`, `DescribeNetwork`, `ListNetworks`) answers from, so none
+    /// (`CreateNetwork`, `DescribeNetwork`, `DeleteNetwork`, `ListNetworks`)
+    /// answers from, so none
     /// of them can drift from the others: the summary shape a listing reports
     /// carries exactly the members the flat describe output does
     /// (`smithy_query(query="shape", shape="DescribeNetworkSummary")`), and
@@ -3349,11 +3432,11 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .get_mut(&id)
                 .filter(|record| !record.is_deleted())
                 .map(|record| &mut record.tags),
-            // No delete filter: `DeleteNetwork` is still a scaffold, so no
-            // network in this store has had a delete accepted for it.
-            TaggedResource::Network(id) => {
-                self.networks.get_mut(&id).map(|record| &mut record.tags)
-            }
+            TaggedResource::Network(id) => self
+                .networks
+                .get_mut(&id)
+                .filter(|record| !record.is_delete_accepted())
+                .map(|record| &mut record.tags),
             TaggedResource::SignalMap(id) => self
                 .signal_maps
                 .get_mut(&id)

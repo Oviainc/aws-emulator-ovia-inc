@@ -99,6 +99,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::ResponseHeaderPolicy;
 
 /// The resource an ingest-configuration quota refusal names, as
 /// `crate::state::quota_exceeded_message` states it.
@@ -349,9 +350,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ingest_configuration = record.to_ingest_configuration(&store);
         store.ingest_configurations.insert(arn, record);
 
+        // Beside the configuration, the CORS/security restriction headers this output
+        // shape binds (`crate::state::ResponseHeaderPolicy`): they are the endpoint's
+        // answer policy, carried by every response of this service, not a fact about the
+        // configuration just created.
         Ok(CreateIngestConfigurationOutput {
             ingest_configuration: Some(ingest_configuration),
             ..Default::default()
-        })
+        }
+        .with_response_header_policy())
     }
 }

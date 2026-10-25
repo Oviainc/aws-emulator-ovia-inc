@@ -83,6 +83,17 @@ pub fn label(identifier: &str) -> String {
         .replace('/', "%2F")
 }
 
+/// The `FoundationModelArn` of the base model `model_id` in `region`: a foundation model is
+/// published by AWS rather than owned by the account reading it, so the ARN carries an
+/// EMPTY account field
+/// (`smithy_query(query="shape",shape="FoundationModelDetails")`).
+///
+/// Here rather than in one suite because three of them compare a response's ARN against
+/// it, and the spelling they compare against must be ONE spelling.
+pub fn foundation_model_arn(region: &str, model_id: &str) -> String {
+    format!("arn:aws:bedrock:{region}::foundation-model/{model_id}")
+}
+
 /// The bare error code out of an `__type` / `x-amzn-errortype` value, which may carry a
 /// namespace or a URL beside it.
 pub fn error_code(raw: &str) -> &str {

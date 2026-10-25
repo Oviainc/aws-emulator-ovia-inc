@@ -208,17 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `jobQueue` is "the name or the Amazon Resource Name (ARN) of the job queue".
         let Some(name) = state.job_queue_name(&input.job_queue) else {
             // The resolver's refusal names the ARN the identifier resolves to and nothing
-            // else ([`batch::does_not_exist_message`]). The job-queue resolver is recorded
-            // terminating that sentence with a period, which the other resolvers of this
-            // service do not.
+            // else, terminated the way the resolvers that close the sentence do
+            // ([`batch::does_not_exist_sentence`]).
             return Err(UpdateJobQueueErrorModeled::ClientException(batch::client_exception(
-                format!(
-                    "{}.",
-                    batch::does_not_exist_message(&batch::resolved_arn(
-                        &input.job_queue,
-                        |queue| batch::job_queue_arn(&region, queue),
-                    ))
-                ),
+                batch::does_not_exist_sentence(&batch::resolved_arn(&input.job_queue, |queue| {
+                    batch::job_queue_arn(&region, queue)
+                })),
             ))
             .into());
         };
@@ -295,6 +290,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })?,
             ),
         };
+        // The stored order is walked every time a service job of this queue is placed, so
+        // how many entries it keeps is bounded
+        // (`state::limits::MAX_SERVICE_ENVIRONMENT_ORDER_ENTRIES`).
+        if let Some(entries) = service_environment_order.as_deref() {
+            batch::validate_stored_list_length(
+                "serviceEnvironmentOrder",
+                entries.len(),
+                batch::limits::MAX_SERVICE_ENVIRONMENT_ORDER_ENTRIES,
+            )
+            .map_err(|detail| {
+                UpdateJobQueueError::from(UpdateJobQueueErrorModeled::ClientException(
+                    batch::client_exception(detail),
+                ))
+            })?;
+        }
 
         // `serviceEnvironmentOrder`'s own doc: "A job queue can't have both a
         // serviceEnvironmentOrder and a computeEnvironmentOrder field." Checked on the
@@ -365,8 +375,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(order) = compute_environment_order {
             queue.compute_environment_order = order;
         }
+        let mut service_environments_changed = false;
         if let Some(order) = service_environment_order {
             queue.service_environment_order = Some(order);
+            service_environments_changed = true;
         }
         if let Some(actions) = input.job_state_time_limit_actions {
             queue.job_state_time_limit_actions = Some(actions);
@@ -377,10 +389,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         queue.status = batch::STATUS_UPDATING.to_string();
         queue.status_reason = None;
         queue.status_due_at = Some(now + batch::JOB_PHASE_MILLIS);
-
-        Ok(UpdateJobQueueOutput {
+        let answered = UpdateJobQueueOutput {
             job_queue_name: Some(queue.name.clone()),
             job_queue_arn: Some(queue.arn.clone()),
-        })
+        };
+
+        // Which service environments this queue orders is what decides whether a service
+        // job of it can be placed, so a change to the order is — like a change to an
+        // environment's own capacity — what makes the next move of a job resting in
+        // `RUNNABLE` due.
+        if service_environments_changed {
+            state.rearm_resting_service_jobs(now);
+        }
+
+        Ok(answered)
     }
 }

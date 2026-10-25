@@ -15,6 +15,11 @@
 //! documentation — see [`resolve_content`] and [`validate_mime`], which also name
 //! the documented criteria this emulator does NOT decide.
 //!
+//! The message an update names is addressed by the region the request was made in
+//! together with the `messageId`, since this service is a regional data plane: an
+//! update signed for one region never reaches a message in transit in another, and
+//! answers `ResourceNotFoundException` instead.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -173,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store against every other request.
         let resolved = {
             let state = store.lock();
-            match eligibility(&state, &input.message_id) {
+            match eligibility(&state, &request_region, &input.message_id) {
                 Eligibility::Missing => {
                     return Err(refuse_missing(&akid, &input.message_id, &request_region))
                 }
@@ -238,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let content_octets = content.len();
         {
             let mut state = store.lock();
-            match eligibility(&state, &input.message_id) {
+            match eligibility(&state, &request_region, &input.message_id) {
                 Eligibility::Missing => {
                     return Err(refuse_missing(&akid, &input.message_id, &request_region))
                 }
@@ -250,7 +255,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The whole point of the operation: the store now holds the resolved
             // bytes, so the next `GetRawMessageContent` reports them and not the old
             // content.
-            state.replace_message_content(&input.message_id, content, reference.clone());
+            state.replace_message_content(
+                &request_region,
+                &input.message_id,
+                content,
+                reference.clone(),
+            );
         }
 
         // The one mutating operation this service models, recorded: who asked, which
@@ -277,7 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// Whether a message can take an update, as the two critical sections above ask it.
 enum Eligibility {
-    /// No message is stored under that id.
+    /// No message is stored under that id in that region.
     Missing,
     /// The message is stored but is no longer eligible for an update.
     Frozen,
@@ -285,12 +295,17 @@ enum Eligibility {
     Updatable,
 }
 
-/// The eligibility of `message_id` in `state`.
+/// The eligibility of `message_id` in the message flow of `region`, in `state`.
+///
+/// The region is half of the address: this service is a regional data plane, so a
+/// message in transit in another region's message flow is `Missing` here, exactly
+/// as an id nothing is in transit under is.
 fn eligibility(
     state: &crate::state::ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState,
+    region: &str,
     message_id: &str,
 ) -> Eligibility {
-    match state.messages.get(message_id) {
+    match state.message(region, message_id) {
         None => Eligibility::Missing,
         Some(message) if message.frozen => Eligibility::Frozen,
         Some(_) => Eligibility::Updatable,
@@ -305,7 +320,7 @@ fn refuse_missing(akid: &str, message_id: &str, region: &str) -> PutRawMessageCo
         message_id = %message_id,
         region = %region,
         outcome = "ResourceNotFoundException",
-        "refused an update to a message that is not in transit"
+        "refused an update to a message that is not in transit in the request's region"
     );
     // The text is the service's own rule — the fixed prefix plus the rejected id —
     // and both operations render it from the one place that states it,

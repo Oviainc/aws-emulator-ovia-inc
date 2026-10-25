@@ -177,6 +177,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(now);
 
+        // `capacityLimits` is stored and walked every time a service job of a queue over
+        // this environment is weighed against it, so how many entries are kept is bounded
+        // (`state::limits::MAX_SERVICE_ENVIRONMENT_CAPACITY_LIMITS`).
+        if let Some(requested) = input.capacity_limits.as_ref() {
+            batch::validate_stored_list_length(
+                "capacityLimits",
+                requested.len(),
+                batch::limits::MAX_SERVICE_ENVIRONMENT_CAPACITY_LIMITS,
+            )
+            .map_err(refuse)?;
+        }
+
         let Some(name) = state.service_environment_name(&input.service_environment) else {
             // An identifier that resolves to nothing is refused with the ARN it resolved
             // to and nothing else: the environment is not stored, so that ARN comes from
@@ -200,10 +212,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(requested_state) = input.state {
             environment.state = requested_state;
         }
+        let mut capacity_changed = false;
         if let Some(limits) = input.capacity_limits {
             environment.capacity_limits = limits;
+            capacity_changed = true;
         }
         let arn = environment.arn.clone();
+        // The capacity this environment publishes is what decides whether a service job of
+        // a queue over it can be placed, so a change to it is what makes the next move of
+        // a job resting in `RUNNABLE` due.
+        if capacity_changed {
+            state.rearm_resting_service_jobs(now);
+        }
 
         Ok(UpdateServiceEnvironmentOutput {
             service_environment_name: name,

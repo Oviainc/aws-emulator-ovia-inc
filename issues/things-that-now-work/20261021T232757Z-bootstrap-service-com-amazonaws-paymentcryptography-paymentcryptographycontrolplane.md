@@ -49,3 +49,47 @@ Out of scope for this first slice (stays 501, filed later as individual gap issu
 6. DeleteKey with {"KeyIdentifier":"<KeyArn>","DeleteKeyInDays":7} — expect Key.KeyState=DELETE_PENDING and a DeletePendingTimestamp ~7 days out; a following GetKey must still return the key in DELETE_PENDING
 7. RestoreKey with {"KeyIdentifier":"<KeyArn>"} — expect Key.KeyState back to CREATE_COMPLETE with DeletePendingTimestamp cleared; GetKey confirms
 8. GetKey with {"KeyIdentifier":"arn:aws:payment-cryptography:us-east-1:123456789012:key/doesnotexist0000"} — expect ResourceNotFoundException with HTTP 404, not 501
+
+## Resolution notes
+
+The slice above is implemented and answered from persisted state
+(`src/state.rs` plus `src/ops/{create_key,get_key,create_alias,get_alias,list_keys,list_aliases,delete_key,restore_key}.rs`),
+covered by `tests/all/key_lifecycle.rs`. Two rules were settled differently from this
+issue's text, deliberately, and the implementation follows the settled rule:
+
+- **CreateAlias on an identical retry answers 200, not 409.** `CreateAlias` carries
+  `@idempotent` (`smithy_query(query="operation",operation="CreateAlias")` reports
+  `"idempotent": true`; this crate's OPERATIONS.md lists it under
+  `## CreateAlias / Traits: @idempotent`), and an idempotent operation must let the
+  retry an SDK performs after a lost response succeed. So re-creating the SAME
+  `AliasName` bound to the SAME `KeyArn` answers the stored binding, while rebinding an
+  existing name to a DIFFERENT key — the inconsistent state `ConflictException`
+  documents — is refused with `ConflictException` (409). The issue text above asked for
+  409 on any second create of the name; that would break the modelled idempotency.
+- **DeleteKey on a key already `DELETE_PENDING` answers it unchanged when the retry asks
+  for the SAME waiting period**, for the same reason (`DeleteKey` is `@idempotent`): the
+  retry an SDK performs after a lost response neither moves the stored
+  `DeletePendingTimestamp` nor fails. A second request naming a DIFFERENT
+  `DeleteKeyInDays` is not that retry — it would move a deletion date the caller was
+  already promised — so it is refused with `ConflictException` (409) and the stored
+  schedule is left alone; the key must be restored first. A key whose waiting period has
+  already elapsed (`DELETE_COMPLETE`) is a `ConflictException` too. The waiting period the
+  scheduling call asked for is persisted on the key record (not reported on the wire,
+  which models no such member) because it is what distinguishes the two cases: the
+  deletion instant is computed from the clock, so an identical retry a second later would
+  not match it.
+
+- **A list request that names no `MaxResults` is served fifty items, not a hundred.**
+  That member's own documentation says so on every list operation of this service
+  ("If you do not include a value, it defaults to 50"), so `ListKeys` and
+  `ListAliases` serve a default page of 50 with a resuming `NextToken`, while 100
+  stays the maximum the modelled range admits. Pinned by
+  `a_list_request_with_no_max_results_serves_the_documented_default_page`.
+
+Still 501 and left to their own gap issues, as this issue scoped them: ImportKey,
+ExportKey, GetParametersForImport/Export, GetCertificateSigningRequest,
+GetPublicKeyCertificate, Put/Get/DeleteResourcePolicy, Tag/Untag/ListTagsForResource,
+UpdateAlias, DeleteAlias, Start/StopKeyUsage, the key-replication-region operations and
+the MPA-team operations. Because nothing replicates a key or runs an approval yet,
+`Key.MultiRegionKeyType`, `PrimaryRegion`, `ReplicationStatus` and `MpaStatus` are
+reported absent rather than filled with a status no work produced.

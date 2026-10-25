@@ -10,6 +10,26 @@ Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529
 
 > _Note: this issue was identified against the code base at commit `3ecafc116f2b44ac9fb7ddf17b83f092c778a529`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+_Status update:_ the ROUTING defect both causes rest on is fixed. `src/service/invoke.rs::resolve`
+now reads the addressing a client that cannot resolve `{api-id}.execute-api.{region}.amazonaws.com`
+uses — `/_aws/execute-api/{api-id}/{stage}/{resource-path}` — so a request to a deployed stage is
+claimed by this service and answered by that stage's deployed snapshot instead of by the front
+door's `404 UnknownService`. Every request to a deployed stage now
+produces the stage's own response (the MOCK integration's answer, `403 Forbidden`,
+`403 Missing Authentication Token`, `401`, `415`, or the `500 {"message":"Internal server error"}`
+`API_CONFIGURATION_ERROR` for an integration this emulator cannot perform), so nothing hangs and no
+AWS-internal error code is returned for an invoke URL.
+
+Both replay keys above STILL FAIL, for one remaining reason that is not this routing defect: the two
+checks require the AWS_PROXY integration's Lambda handler to actually RUN (a `200` carrying the
+handler's JSON body, and the item it wrote readable from DynamoDB). Running a `python3.12` deployment
+package is not implemented anywhere in this emulator — Lambda `Invoke` answers `501` for
+`RequestResponse` — and that cause is owned by the open issue
+`issues/things-that-do-not-work/20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md`.
+The per-method/path source-ARN check cause 2 also names is not implemented here either: until the
+function can run, a permitted and a denied AWS_PROXY call are answered by the same
+`API_CONFIGURATION_ERROR`, so the check would change no response.
+
 ## Operation
 CreateDeployment
 

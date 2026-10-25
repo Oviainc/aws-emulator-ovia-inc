@@ -56,7 +56,7 @@ struct Case {
 /// The configurations the rule must round-trip.
 ///
 /// Model ids are real: `anthropic.claude-3-haiku-20240307-v1:0` and
-/// `amazon.titan-text-express-v1` are published rows of this service's own foundation
+/// `amazon.titan-text-lite-v1` are published rows of this service's own foundation
 /// model catalog, `ALL` is the wildcard `IncludedModelId`'s published pattern admits
 /// (`^(ALL|([a-z0-9-]{1,63}[.]{1}[a-z0-9-]{1,63})…)$`), and
 /// `meta.llama3-8b-instruct-v1:0/abcdef123456` carries the optional `/[a-z0-9]{12}`
@@ -97,7 +97,7 @@ fn cases() -> Vec<Case> {
             })),
             model_enforcement: Some(json!({
                 "includedModels": ["anthropic.claude-3-haiku-20240307-v1:0"],
-                "excludedModels": ["amazon.titan-text-express-v1"],
+                "excludedModels": ["amazon.titan-text-lite-v1"],
             })),
         },
         Case {
@@ -111,7 +111,7 @@ fn cases() -> Vec<Case> {
             model_enforcement: Some(json!({
                 "includedModels": [
                     "meta.llama3-8b-instruct-v1:0/abcdef123456",
-                    "amazon.titan-text-express-v1",
+                    "amazon.titan-text-lite-v1",
                     "anthropic.claude-3-haiku-20240307-v1:0",
                 ],
                 "excludedModels": [
@@ -376,7 +376,7 @@ async fn a_further_put_replaces_the_one_configuration_and_keeps_its_identity() {
                     "guardrailVersion": "2",
                     "modelEnforcement": {
                         "includedModels": ["ALL"],
-                        "excludedModels": ["amazon.titan-text-express-v1"],
+                        "excludedModels": ["amazon.titan-text-lite-v1"],
                     },
                 },
             }),
@@ -390,7 +390,7 @@ async fn a_further_put_replaces_the_one_configuration_and_keeps_its_identity() {
                     "guardrailVersion": "2",
                     "modelEnforcement": {
                         "includedModels": ["ALL"],
-                        "excludedModels": ["amazon.titan-text-express-v1"],
+                        "excludedModels": ["amazon.titan-text-lite-v1"],
                     },
                 },
             }),

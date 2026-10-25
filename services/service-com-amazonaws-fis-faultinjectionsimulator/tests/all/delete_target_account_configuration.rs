@@ -151,6 +151,10 @@ async fn template(router: &MultiServiceRouter, label: &str) -> String {
             "description": format!("delete target account configuration suite: {label}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-delete-target-account-configurations",
             "stopConditions": [{ "source": "none" }],
+            // A target account configuration belongs to a template that targets MULTIPLE
+            // accounts: `accountTargeting` and the configurations a template holds state
+            // the same thing between them.
+            "experimentOptions": { "accountTargeting": "multi-account" },
             // `aws:fis:wait` takes a required `duration`, an ISO 8601 duration within the
             // documented 1 to 720 minutes.
             "actions": {

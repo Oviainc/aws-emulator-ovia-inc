@@ -165,6 +165,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `Name` targets `Alias`, whose pattern keeps an alias name out of the
+        // version-number namespace, so a name that does not satisfy it names no alias of
+        // any function — a refusal about the request's shape, answered the way the
+        // framework's own constraint walk answers one (400 `ValidationException`, the
+        // clause naming the member and the expression) and BEFORE the function is
+        // resolved, so it is not reported as a missing resource. The walk cannot state it
+        // itself: its regex engine does not compile the pattern's negative lookahead, so
+        // the value arrives here unchecked.
+        if !crate::state::is_alias_name(&input.name) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::alias_name_message(&input.name),
+            ));
+        }
+
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();

@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{check_enum, rotation_arn, RotationRecord};
+        use crate::state::{check_recurrence, rotation_arn, RotationRecord};
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateRotationErrorModeled::InternalServerException(
@@ -220,30 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
-        // `DayOfWeek` is an enum SHAPE, so it arrives as a plain string.
-        for setting in input.recurrence.weekly_settings.iter().flatten() {
-            check_enum(
-                "recurrence.weeklySettings.dayOfWeek",
-                &setting.day_of_week,
-                DAY_OF_WEEK_VALUES,
-            )
-            .map_err(validation)?;
-        }
-        for day in input.recurrence.shift_coverages.iter().flatten().map(|(day, _)| day) {
-            check_enum("recurrence.shiftCoverages", day, DAY_OF_WEEK_VALUES)
-                .map_err(validation)?;
-        }
-
-        // A recurrence with no daily, weekly or monthly settings describes no shift at all.
-        let describes_a_schedule = carries_a_setting(&input.recurrence.daily_settings)
-            || carries_a_setting(&input.recurrence.weekly_settings)
-            || carries_a_setting(&input.recurrence.monthly_settings);
-        if !describes_a_schedule {
-            return Err(validation(
-                "Value at 'recurrence' failed to satisfy constraint: Member must carry one of \
-                 dailySettings, weeklySettings or monthlySettings",
-            ));
-        }
+        // Which recurrences describe a schedule is one rule, shared with every other
+        // operation that installs a whole `RecurrenceSettings` on a rotation: each
+        // `DayOfWeek` the recurrence carries must be a modelled value (an enum SHAPE arrives
+        // as a plain string), and one of the daily, weekly and monthly settings lists must
+        // carry an entry. It lives in `crate::state` beside the other checks more than one
+        // handler makes, so the refusals cannot drift apart.
+        check_recurrence(&input.recurrence).map_err(validation)?;
 
         // Every contact on the rotation team must exist.
         if let Some(missing) = input
@@ -328,14 +311,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The `resourceType` this operation's not-found error names, spelled as the contact
 /// handlers spell it.
 const CONTACT_RESOURCE_TYPE: &str = "contact";
-
-/// Whether one of `RecurrenceSettings`' settings lists is present AND carries an entry.
-///
-/// An absent list and an empty one say the same thing: this recurrence has no shift of
-/// that period.
-fn carries_a_setting<T>(settings: &Option<Vec<T>>) -> bool {
-    settings.as_ref().is_some_and(|settings| !settings.is_empty())
-}
 
 /// The `resourceType` this operation's quota error names.
 const ROTATION_RESOURCE_TYPE: &str = "rotation";

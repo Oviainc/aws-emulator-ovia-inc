@@ -229,9 +229,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if workspace.component_types.contains_key(&input.component_type_id) {
             return Err(CreateComponentTypeErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "component type {} already exists in workspace {}",
-                        input.component_type_id, input.workspace_id
+                    message: Some(crate::state::already_exists_message(
+                        "Component type",
+                        &input.component_type_id,
+                        Some(&input.workspace_id),
                     )),
                 },
             )
@@ -304,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.component_type_id,
         );
         let now = ::std::time::SystemTime::now();
-        let component_type = crate::state::ComponentType {
+        let mut component_type = crate::state::ComponentType {
             component_type_id: input.component_type_id.clone(),
             arn: arn.clone(),
             workspace_id: input.workspace_id.clone(),
@@ -315,9 +316,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // type", which is a question with an answer for every component
             // type, and `false` is the answer for one created without it.
             is_singleton: input.is_singleton.unwrap_or(false),
-            // The API offers no way to declare a component type abstract, so
-            // one created through it is concrete; the abstract ones are the
-            // service's own built-ins. See `crate::state::ComponentType`.
+            // Not the caller's to declare — `isAbstract` is not a member of
+            // this request — so it is DECIDED from what the request declares,
+            // once the record is in hand, just below.
             is_abstract: false,
             extends_from,
             property_definitions: property_definitions.into_iter().collect(),
@@ -347,6 +348,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: crate::state::STATE_CREATING.to_string(),
             settles_at: now + crate::state::COMPONENT_TYPE_SETTLE_SPAN,
         };
+        // Whether the component type is ABSTRACT is decided here, from the
+        // definitions and functions the request declared plus the ones its
+        // declared inheritance brings, and STORED on the record: every reader
+        // of `isAbstract` and every writer that refuses to instantiate an
+        // abstract type then reads one answer. See
+        // `crate::state::component_type_is_abstract`.
+        component_type.is_abstract =
+            crate::state::component_type_is_abstract(workspace, &component_type);
         let created_state = component_type.state.clone();
 
         // Store the record BEFORE indexing its ARN, so the index can never name

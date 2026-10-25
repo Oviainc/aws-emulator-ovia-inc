@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! A deletion that has COMPLETED is REPORTED, not refused.
+//! A deletion that has COMPLETED leaves NOTHING an operation can resolve.
 //!
-//! Both of this service's delete operations are `@idempotent` and both answer with the
-//! resource's status, and each status enum declares a terminal value for a deletion that
-//! has succeeded (`DeleteFeedResponse$status`: "When deletion of the feed has succeeded,
-//! the status will be DELETED"; `DeleteDictionaryResponse$status`: "The status of the
-//! dictionary after deletion"). So a retry of a deletion this service already accepted
-//! and completed — what an SDK sends when it never saw the first response, and what a
-//! client polling the 202 to completion sends — answers that deletion's own success
-//! carrying `DELETED`, rather than refusing a call the service served.
+//! Both of this service's deletes are accepted with HTTP 202 and complete when the
+//! removal falls due. From that instant the id names no resource of the Region at all,
+//! so EVERY operation that takes it answers the modelled `ResourceNotFoundException`
+//! (HTTP 404) — the delete that served the deletion included, since `@idempotent`
+//! constrains the EFFECT of a repeat (one deletion, not two) and not whether a call
+//! about a resource that no longer exists succeeds. A client can therefore read a 404 as
+//! "already gone" and a success as "it was still there", and no two paths disagree about
+//! what the Region holds in one instant.
 //!
-//! The deleted resource is nonetheless GONE: it is not read, not listed, not mutated and
-//! not tagged, and it holds none of the Region's quota. The suites below assert both
-//! halves over a table of inputs — both resource kinds, resources of several shapes, with
-//! and without siblings in the Region, and however often the delete is retried.
+//! The suites below assert that over a table of inputs — both resource kinds, resources
+//! of several shapes, with and without siblings in the Region, and however often the
+//! delete is repeated — plus what the removal frees: the Region's quota, and nothing
+//! else's record.
 
 use crate::harness::{
     call, call_in_region, enabled_output, listed_ids, message_of, past_the_transition_span,
@@ -28,30 +28,30 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// One row of the completed-deletion table: which kind of resource is deleted, the body
 /// it was created from, how many other resources of that kind the Region holds, and how
-/// often the completed deletion is retried.
+/// often the completed deletion is repeated.
 struct DeleteCase {
     label: &'static str,
     kind: &'static str,
     body: Value,
     siblings: usize,
-    retries: usize,
+    repeats: usize,
 }
 
 /// Rows spanning what the rule generalises over: the resource kind (so both delete
 /// operations), the shape of the resource (how many outputs, whether it carries tags, a
 /// role, entries), whether the Region holds other resources of that kind, and the number
-/// of retries the completed deletion takes.
+/// of times the completed deletion is repeated.
 fn delete_cases() -> Vec<DeleteCase> {
     vec![
         DeleteCase {
-            label: "the only feed of the Region, retried once",
+            label: "the only feed of the Region, repeated once",
             kind: "feed",
             body: json!({"name": "lone-feed", "outputs": [enabled_output("crop1", "cropping")]}),
             siblings: 0,
-            retries: 1,
+            repeats: 1,
         },
         DeleteCase {
-            label: "a feed with three outputs, a role and tags, retried three times",
+            label: "a feed with three outputs, a role and tags, repeated three times",
             kind: "feed",
             body: json!({
                 "name": "rich-feed",
@@ -64,17 +64,17 @@ fn delete_cases() -> Vec<DeleteCase> {
                 "tags": {"team": "broadcast"},
             }),
             siblings: 2,
-            retries: 3,
+            repeats: 3,
         },
         DeleteCase {
-            label: "a dictionary with no entries, retried once",
+            label: "a dictionary with no entries, repeated once",
             kind: "dictionary",
             body: json!({"name": "lone-dictionary", "language": "eng"}),
             siblings: 0,
-            retries: 1,
+            repeats: 1,
         },
         DeleteCase {
-            label: "a dictionary with entries and tags, retried twice",
+            label: "a dictionary with entries and tags, repeated twice",
             kind: "dictionary",
             body: json!({
                 "name": "rich-dictionary",
@@ -83,7 +83,7 @@ fn delete_cases() -> Vec<DeleteCase> {
                 "tags": {"env": "test"},
             }),
             siblings: 3,
-            retries: 2,
+            repeats: 2,
         },
     ]
 }
@@ -132,18 +132,18 @@ async fn reported_ids(router: &MultiServiceRouter, kind: &str) -> Vec<String> {
     listed_ids(router, REGION, path, member).await
 }
 
-/// A delete the service has already COMPLETED is reported, with the terminal status the
-/// model gives a succeeded deletion, however often it is retried — while the deleted
-/// resource is gone from every read and every list.
+/// A delete the service has already COMPLETED is REFUSED, with the modelled 404 and this
+/// service's not-found sentence, however often it is repeated — and the deleted resource
+/// is gone from every read and every list, while its siblings are untouched.
 #[tokio::test]
-async fn a_completed_deletion_is_reported_as_deleted_on_every_retry() {
+async fn a_completed_deletion_is_refused_however_often_the_delete_is_repeated() {
     for case in delete_cases() {
         let DeleteCase {
             label,
             kind,
             body,
             siblings,
-            retries,
+            repeats,
         } = case;
         let router = router();
         let mut sibling_ids = Vec::new();
@@ -151,7 +151,7 @@ async fn a_completed_deletion_is_reported_as_deleted_on_every_retry() {
             let (id, _) = create(&router, kind, sibling_body(kind, &format!("other{index}"))).await;
             sibling_ids.push(id);
         }
-        let (id, arn) = create(&router, kind, body).await;
+        let (id, _arn) = create(&router, kind, body).await;
 
         // The deletion is ACCEPTED, not completed: the transient status says so.
         let (status, accepted) = call(&router, "DELETE", &format!("/v1/{kind}/{id}"), None).await;
@@ -163,23 +163,24 @@ async fn a_completed_deletion_is_reported_as_deleted_on_every_retry() {
         );
 
         past_the_transition_span();
-        for retry in 0..retries {
-            let (status, retried) =
+        for repeat in 0..repeats {
+            let (status, repeated) =
                 call(&router, "DELETE", &format!("/v1/{kind}/{id}"), None).await;
             assert_eq!(
-                (status, &retried["status"]),
-                (202, &json!("DELETED")),
-                "case {label:?}: retry {retry} of the completed delete reports DELETED, got \
-                 {status} with {retried}"
+                (status, &repeated["__type"]),
+                (404, &json!("ResourceNotFoundException")),
+                "case {label:?}: repeat {repeat} of the completed delete is a 404 \
+                 ResourceNotFoundException, got {status} with {repeated}"
             );
             assert_eq!(
-                (&retried["id"], &retried["arn"]),
-                (&json!(id), &json!(arn)),
-                "case {label:?}: retry {retry} names the same resource, got {retried}"
+                message_of(&repeated),
+                NOT_FOUND_MESSAGE,
+                "case {label:?}: repeat {repeat} carries this service's not-found sentence, got \
+                 {repeated}"
             );
         }
 
-        // Reported, yet GONE: the resource is readable nowhere.
+        // The read answers the same, in the same instant: the two paths cannot disagree.
         let (status, read) = call(&router, "GET", &format!("/v1/{kind}/{id}"), None).await;
         assert_eq!(
             (status, &read["__type"]),
@@ -216,10 +217,16 @@ struct Probe {
 }
 
 /// The requests that must answer as they do for an id the store holds nothing for, once
-/// the resource's deletion has completed: a read, a mutation, a tag write, a tag delete,
-/// and the resource's own sub-resources.
+/// the resource's deletion has completed: the delete itself, a read, a mutation, a tag
+/// write, a tag delete, and the resource's own sub-resources.
 fn gone_probes(kind: &str, id: &str, arn: &str) -> Vec<Probe> {
     let mut probes = vec![
+        Probe {
+            label: "repeating the completed delete",
+            method: "DELETE",
+            path: format!("/v1/{kind}/{id}"),
+            body: None,
+        },
         Probe {
             label: "reading the resource",
             method: "GET",
@@ -282,10 +289,11 @@ fn gone_probes(kind: &str, id: &str, arn: &str) -> Vec<Probe> {
     probes
 }
 
-/// A completed deletion is reported by its own delete alone: every other operation
-/// answers for the resource as it does for an id the store holds nothing for.
+/// Once the deletion has completed, EVERY operation that takes the id answers for it as
+/// it does for an id the store holds nothing for — and so does another Region's endpoint,
+/// which never held the resource at all.
 #[tokio::test]
-async fn a_completed_deletion_is_not_a_live_resource() {
+async fn a_completed_deletion_leaves_nothing_any_operation_resolves() {
     for kind in ["feed", "dictionary"] {
         let router = router();
         let (id, arn) = create(&router, kind, sibling_body(kind, "doomed")).await;
@@ -306,10 +314,15 @@ async fn a_completed_deletion_is_not_a_live_resource() {
                 probe.label,
                 probe.method
             );
+            assert_eq!(
+                message_of(&body),
+                NOT_FOUND_MESSAGE,
+                "case {kind:?}/{}: that refusal carries this service's not-found sentence, got \
+                 {body}",
+                probe.label
+            );
         }
 
-        // The completed deletion belongs to the Region that served it: another Region's
-        // endpoint holds no record of it at all, so the retry there is refused.
         let (status, elsewhere) = call_in_region(
             &router,
             "eu-west-1",
@@ -321,14 +334,14 @@ async fn a_completed_deletion_is_not_a_live_resource() {
         assert_eq!(
             (status, &elsewhere["__type"]),
             (404, &json!("ResourceNotFoundException")),
-            "case {kind:?}: another Region's endpoint reports no such deletion, got {status} \
+            "case {kind:?}: another Region's endpoint holds no such resource, got {status} \
              with {elsewhere}"
         );
     }
 }
 
-/// A completed deletion holds none of the Region's quota: the feed it reports is not a
-/// feed the account holds, so the slot it occupied is free again.
+/// A completed deletion holds none of the Region's quota and leaves no record behind: the
+/// slot it occupied takes another feed, and the Region reports only live feeds.
 #[tokio::test]
 async fn a_completed_deletion_holds_no_quota() {
     let router = router();
@@ -357,8 +370,7 @@ async fn a_completed_deletion_holds_no_quota() {
     assert_eq!(status, 202, "the delete is accepted, got {status}");
     past_the_transition_span();
 
-    // The deletion has completed, so the Region holds one feed fewer and takes another —
-    // even though the delete still reports DELETED for the record that is gone.
+    // The deletion has completed, so the Region holds one feed fewer and takes another.
     let (status, created) = call(
         &router,
         "POST",
@@ -370,11 +382,12 @@ async fn a_completed_deletion_holds_no_quota() {
         status, 202,
         "the slot a completed deletion freed takes another feed, got {status} with {created}"
     );
-    let (status, retried) = call(&router, "DELETE", &format!("/v1/feed/{doomed}"), None).await;
+    let (status, repeated) = call(&router, "DELETE", &format!("/v1/feed/{doomed}"), None).await;
     assert_eq!(
-        (status, &retried["status"]),
-        (202, &json!("DELETED")),
-        "the completed deletion is still reported, got {status} with {retried}"
+        (status, &repeated["__type"]),
+        (404, &json!("ResourceNotFoundException")),
+        "the completed deletion left no record for the delete to report, got {status} with \
+         {repeated}"
     );
     let reported = reported_ids(&router, "feed").await;
     assert_eq!(
@@ -382,5 +395,9 @@ async fn a_completed_deletion_holds_no_quota() {
         MAX_FEEDS,
         "the Region reports {MAX_FEEDS} feeds in {REGION}, got {}",
         reported.len()
+    );
+    assert!(
+        !reported.contains(&doomed),
+        "the deleted feed is not among them, got {reported:?}"
     );
 }
