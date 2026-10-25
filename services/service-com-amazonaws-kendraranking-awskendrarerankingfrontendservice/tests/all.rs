@@ -25,6 +25,8 @@ mod plan_capacity_units;
 mod plan_update;
 #[path = "all/regional_isolation.rs"]
 mod regional_isolation;
+#[path = "all/rescore_document_shape_refusals.rs"]
+mod rescore_document_shape_refusals;
 #[path = "all/rescore_execution_plan_lifecycle.rs"]
 mod rescore_execution_plan_lifecycle;
 #[path = "all/resource_tags.rs"]
