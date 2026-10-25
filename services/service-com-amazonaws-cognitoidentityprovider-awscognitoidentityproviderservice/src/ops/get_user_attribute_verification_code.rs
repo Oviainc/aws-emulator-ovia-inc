@@ -243,20 +243,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // medium the message travels over (`crate::state::delivery_medium`, the same
         // rule `UpdateUserAttributes` reports a pending value's delivery by).
         let attribute_name = input.attribute_name.clone();
-        let Some(delivery_medium) = crate::state::delivery_medium(&attribute_name) else {
+        if crate::state::delivery_medium(&attribute_name).is_none() {
             return Err(invalid_parameter(format!(
                 "Invalid AttributeName: {attribute_name} is not an attribute a verification \
                  code can be sent for"
             )));
-        };
+        }
         // The destination is the attribute's STORED value, so a user holding no value
         // for it has nowhere for a code to be sent.
-        let Some(destination) = user
-            .attributes
-            .get(&attribute_name)
-            .filter(|value| !value.is_empty())
-            .cloned()
-        else {
+        let Some(destination) = user.destination_of(&attribute_name) else {
             return Err(invalid_parameter(format!(
                 "Invalid AttributeName: the user has no {attribute_name} to send a code to"
             )));
@@ -269,28 +264,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Sending the code is what this operation DOES, so the code it issued is
         // recorded against the attribute it was issued for; a later code for the same
         // attribute replaces this one.
-        let stored = crate::state::AttributeVerification {
-            code: crate::state::new_verification_code(),
-            destination,
-            delivery_medium: delivery_medium.to_string(),
-            issued_at: now,
-        };
+        let stored = crate::state::VerificationCode::issued(&attribute_name, &destination, now);
         let user = guard
             .pool_mut(&user_pool_id)
             .and_then(|pool| pool.user_mut(&username))
             .ok_or_else(internal_error)?;
-        user.pending_attribute_verifications
-            .insert(attribute_name.clone(), stored.clone());
+        let stored = user.issue_code(
+            crate::state::CodePurpose::AttributeVerification(attribute_name.clone()),
+            stored,
+        );
 
         // Rendered from the record just stored, through the delivery-details rule every
         // operation that reports a sent code shares: the destination is the stored
         // attribute value, reported masked, and the medium the one that value is
         // reached over.
         Ok(GetUserAttributeVerificationCodeOutput {
-            code_delivery_details: crate::state::code_delivery_details(
-                &attribute_name,
-                &stored.destination,
-            ),
+            code_delivery_details: stored.delivery_details(),
         })
     }
 }
