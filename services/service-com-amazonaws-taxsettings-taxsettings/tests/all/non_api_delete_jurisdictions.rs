@@ -32,7 +32,7 @@ use service_com_amazonaws_taxsettings_taxsettings::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::tax_registration_lifecycle::{call, emulator, Answer};
+use crate::tax_registration_lifecycle::{call, emulator, field_list};
 
 /// One stored registration a delete is aimed at: the jurisdiction its legal
 /// address is submitted with, and the type it is registered under.
@@ -165,21 +165,6 @@ async fn store(router: &MultiServiceRouter, row: &Row) -> Value {
         row.case
     );
     body
-}
-
-/// The `name`s a refusal's `fieldList` carries.
-fn field_list(answer: &Answer) -> Vec<String> {
-    answer
-        .get("fieldList")
-        .as_array()
-        .map(|fields| {
-            fields
-                .iter()
-                .filter_map(|field| field.get("name").and_then(Value::as_str))
-                .map(std::string::ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Assert that `account_id` reports a registration of `registration_type`.

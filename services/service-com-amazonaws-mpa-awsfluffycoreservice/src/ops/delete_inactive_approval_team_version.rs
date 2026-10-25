@@ -26,6 +26,13 @@
 //! account is refused with `AccessDeniedException` (403) and never reported as "already
 //! absent" (see [`crate::state::authorize_resource_arn`]).
 //!
+//! So the modelled `ResourceNotFoundException` (404) is NOT what an absent target earns
+//! here: a caller learns that an approval team does not exist from the ARN-addressed
+//! REPORTING operations (`GetApprovalTeam`, `StartActiveApprovalTeamDeletion`), which
+//! answer 404 with [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`] for the very ARN this
+//! delete answers 200 for. Both halves of that contrast are pinned by
+//! `tests/all/absent_approval_team_version_delete.rs`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
