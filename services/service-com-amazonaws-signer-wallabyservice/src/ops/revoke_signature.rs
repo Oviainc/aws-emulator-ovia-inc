@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeSignature
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeSignature`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeSignature::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: records the revocation of the signature the stored signing job
+//! `jobId` produced — the job carries the request's `reason`, the instant of the
+//! call and the calling identity as its `revocationRecord`, which every later
+//! `DescribeSigningJob` reports.
+//!
+//! `SigningStatus` is `InProgress | Failed | Succeeded` and has no revoked
+//! value, so the revocation is carried by that record (and summarised by a
+//! signing job's `isRevoked`) rather than by moving the job's `status`: the
+//! signing itself still finished, it is the signature that is no longer trusted.
 //!
 //! ## Shape of an operation
 //!
@@ -133,6 +134,19 @@ impl From<RevokeSignatureErrorModeled> for RevokeSignatureError {
     }
 }
 
+/// The modelled 404 for a signing job this region's endpoint holds none of, or
+/// one owned by another account than the request named.
+///
+/// `code` is the job-specific not-found discriminator: a client has to tell a
+/// missing JOB apart from every other 404 this service answers.
+fn job_not_found(message: String) -> RevokeSignatureError {
+    RevokeSignatureErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        code: Some(crate::state::ERROR_CODE_JOB_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
 /// The `RevokeSignature` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -169,18 +183,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeSignature` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeSignatureErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeSignature"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RevokeSignatureErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the signer job store is unavailable".to_string()),
+                    code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // AWS reports the identity of the revoker; the identity this request
+        // carried is the SigV4 access key id it was signed with, reported in the
+        // IAM principal ARN form AWS names a caller by (`None` for an unsigned
+        // request).
+        let revoked_by = crate::state::request_principal_arn(ctx.parts());
+        // Signer is regional: the revocation lands on the job held by the region
+        // whose endpoint it was signed for, and on no other region's.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The job is resolved with any completion the clock already owed it
+        // materialised — the same settlement `DescribeSigningJob` performs, so
+        // revoking never rolls a due completion back.
+        let Some(job) = store.settled_job_mut(&region, &input.job_id, now) else {
+            return Err(job_not_found(format!(
+                "Signing job not found for id {}",
+                input.job_id
+            )));
+        };
+
+        // `jobOwner` names the account that owns the job. A request naming an
+        // owner the job does not have names no job this caller can revoke, which
+        // is the same condition to a client as an id nothing holds.
+        if let Some(owner) = input.job_owner.as_deref() {
+            if owner != job.job_owner {
+                return Err(job_not_found(format!(
+                    "Signing job {} not found for job owner {owner}",
+                    input.job_id
+                )));
+            }
+        }
+
+        // A platform published as not supporting revocation produces signatures
+        // that cannot be revoked, so there is no revocation for this call to
+        // record.
+        if !crate::state::platform_supports_revocation(&job.platform_id) {
+            let message = crate::state::revocation_unsupported_message(&job.platform_id);
+            return Err(RevokeSignatureErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                    code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
+                },
+            )
+            .into());
+        }
+
+        job.revoke(&input.reason, revoked_by, now);
+
+        Ok(RevokeSignatureOutput)
     }
 }

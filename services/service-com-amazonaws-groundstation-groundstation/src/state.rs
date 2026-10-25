@@ -3150,10 +3150,31 @@ impl ComAmazonawsGroundstationGroundstationState {
         under_maintenance.chain(reserved).collect()
     }
 
-    /// The antenna at `ground_station` a pass over `window` is placed on: the first one
-    /// nothing holds for any instant of it, taking the antennas this account has been told
-    /// are AT that ground station ([`Self::antennas_at`], in the name order the inventory
-    /// holds them) before the ones this emulator numbers itself ([`antenna_name`]).
+    /// The antennas a pass at `ground_station` can be placed on, in the order the
+    /// placement takes them: the antennas this account has been told are AT that ground
+    /// station ([`Self::antennas_at`], in the name order the inventory holds them) when it
+    /// records any, and otherwise the one antenna this emulator numbers for a ground
+    /// station it was told nothing about ([`antenna_name`]).
+    ///
+    /// A ground station's antennas are FINITE — AWS builds a fixed number of them at a
+    /// site — so this list is also what bounds how much antenna time can be held there at
+    /// once. CHOSEN count for a ground station with no recorded inventory: ONE antenna, the
+    /// smallest a ground station can be operated with, so the one-pass-per-antenna rule
+    /// still bounds it rather than that station taking unboundedly many overlapping passes;
+    /// an operator that wants more says so with [`GROUND_STATIONS_ENV`].
+    pub fn placement_antennas(&self, ground_station: &str) -> Vec<String> {
+        let recorded = self.antennas_at(ground_station);
+        if recorded.is_empty() {
+            vec![antenna_name(1)]
+        } else {
+            recorded
+        }
+    }
+
+    /// The antenna at `ground_station` a pass over `window` is placed on: the first of
+    /// [`Self::placement_antennas`] nothing holds for any instant of it, or `None` when
+    /// every one of them is held — the ground station has no antenna time left over that
+    /// window, which is what a reservation of it is refused on.
     ///
     /// An antenna serves ONE pass at a time, so two reservations whose windows overlap at
     /// a ground station are on different antennas, and a reservation that overlaps none
@@ -3165,30 +3186,14 @@ impl ComAmazonawsGroundstationGroundstationState {
     ///
     /// CHOSEN placement: AWS assigns the antenna itself and documents no rule for which,
     /// and no request of this service names one, so the emulator places a pass on the first
-    /// free antenna. A ground station here therefore never runs out of antennas: when every
-    /// antenna its inventory records is held — and at a ground station whose antennas this
-    /// account has not been told about, where the inventory records none — the placement
-    /// falls through to this emulator's own numbering rather than refusing the reservation,
-    /// which keeps a reservation at a ground station with no recorded inventory (the
-    /// account a `GROUNDSTATION_GROUND_STATIONS` setting says nothing about) answerable.
-    /// A maintenance window on an antenna neither the inventory nor that numbering names
+    /// free antenna. A maintenance window on an antenna the placement never names
     /// ([`MAINTENANCE_ENV`] accepts any `AntennaName`) is an antenna no pass is placed on,
     /// so it holds nothing from a contact — it is still reported as the reservation it is.
-    pub fn free_antenna(&self, ground_station: &str, window: (f64, f64)) -> String {
+    pub fn free_antenna(&self, ground_station: &str, window: (f64, f64)) -> Option<String> {
         let held = self.antennas_held(ground_station, window);
-        let recorded = self.antennas_at(ground_station);
-        // At most one antenna per reservation already held for `window` can be busy, so
-        // one of the first `held + 1` numbered antennas is always free: the search is
-        // bounded even when every recorded antenna is taken.
-        let numbered = (1..=held.len() + 1)
-            .map(antenna_name)
-            .filter(|antenna| !recorded.contains(antenna));
-        recorded
-            .iter()
-            .cloned()
-            .chain(numbered)
+        self.placement_antennas(ground_station)
+            .into_iter()
             .find(|antenna| !held.contains(antenna.as_str()))
-            .unwrap_or_else(|| antenna_name(1))
     }
 }
 

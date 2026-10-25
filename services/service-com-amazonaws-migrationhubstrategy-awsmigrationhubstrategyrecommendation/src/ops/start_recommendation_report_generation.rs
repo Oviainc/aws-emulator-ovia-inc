@@ -163,7 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 StartRecommendationReportGenerationErrorModeled::InternalServerException(
@@ -208,6 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(StartRecommendationReportGenerationErrorModeled::ValidationException)?;
 
         let now = ::std::time::SystemTime::now();
+        // The task is minted in the portfolio of the Region this request was signed for,
+        // and everything below — the coalescing, the quota, the inventory it counts — is
+        // that Region's.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
         // One report generation task runs at a time: while one is in progress a start
@@ -216,14 +219,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the STORE (is a task still owed its terminal status?), never from what this
         // request carries, so two calls of any parameters inside one task's span get the
         // same id back.
-        if let Some(running) = store.in_progress_report_id(now) {
+        let running = store
+            .region_mut(&region)
+            .and_then(|portfolio| portfolio.in_progress_report_id(now));
+        if let Some(running) = running {
             return Ok(StartRecommendationReportGenerationOutput { id: Some(running) });
         }
 
         // The store is bounded: past its quota no further task is minted, so the state
         // cannot grow without end. The operation models no quota error, so the refusal is
         // its `ThrottlingException` — the request is denied because too many were made.
-        if store.recommendation_reports.len() >= crate::state::REPORT_QUOTA {
+        if store.region(&region).recommendation_reports.len() >= crate::state::REPORT_QUOTA {
             return Err(
                 StartRecommendationReportGenerationErrorModeled::ThrottlingException(
                     ThrottlingException {
@@ -238,12 +244,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The report covers the servers the filter names, counted from the inventory as
-        // it stands now. The count is what the task keeps; the filter itself is not
-        // stored.
-        let servers_covered = store.servers_in_groups(&group_id_filter);
+        // And the store keeps a portfolio for a bounded number of Regions: the Region
+        // comes from the caller's own credential scope, so this is what stops made-up
+        // Regions growing the store without bound.
+        if store.region_capacity_reached(&region) {
+            return Err(
+                StartRecommendationReportGenerationErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        message: Some(format!(
+                            "this emulator holds recommendation report generation tasks in at \
+                             most {} Regions",
+                            crate::state::MAX_REGIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
 
-        let id = store.mint_recommendation_report_id();
+        // The report covers the servers the filter names, counted from this Region's
+        // inventory as it stands now. The count is what the task keeps; the filter itself
+        // is not stored.
+        let servers_covered = store.region(&region).servers_in_groups(&group_id_filter);
+
+        let id = store.mint_recommendation_report_id(&region);
         let report = crate::state::RecommendationReport {
             id: id.clone(),
             // Generating the report is not done the instant the call returns: the clock
@@ -257,7 +281,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             completion_time: None,
             completion_due: Some(now + crate::state::COMPLETION_SPAN),
         };
-        store.recommendation_reports.insert(id.clone(), report);
+        store
+            .region_entry(&region)
+            .recommendation_reports
+            .insert(id.clone(), report);
 
         Ok(StartRecommendationReportGenerationOutput { id: Some(id) })
     }

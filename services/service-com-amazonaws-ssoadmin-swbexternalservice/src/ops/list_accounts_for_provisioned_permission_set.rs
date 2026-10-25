@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccountsForProvisionedPermissionSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccountsForProvisionedPermissionSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccountsForProvisionedPermissionSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Amazon Web Services accounts the permission set the request names is
+//! PROVISIONED into, read from this service's state.
+//!
+//! An account holds a permission set once the permission set has been provisioned there,
+//! which is what granting an account assignment on that account does, so each such
+//! account is reported exactly once however many principals were assigned through it. The
+//! `ProvisioningStatus` filter selects by the status each of those accounts is in
+//! ([`crate::state::ComAmazonawsSsoadminSwbexternalserviceState::provisioned_accounts`]):
+//! the account holds the permission set's current definition, or a copy the permission set
+//! has changed since. A request that names no `ProvisioningStatus` is not filtered and
+//! reports every provisioned account.
+//!
+//! Being a report, it writes nothing a later caller sees beyond what the clock already
+//! owes the account's instances.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +173,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccountsForProvisionedPermissionSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountsForProvisionedPermissionSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccountsForProvisionedPermissionSet"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAccountsForProvisionedPermissionSetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The `ProvisioningStatus` the request filters by, as one of the values the
+        // model's enum declares (`PROVISIONING_STATUS_VALUES`, the one source for their
+        // spelling). Reaching this handler means the modelled constraints already hold, so
+        // anything else cannot arrive here; it is still refused rather than answered with
+        // an empty page, which would read as "no account is in that state".
+        let filter = match input.provisioning_status.as_deref() {
+            None => None,
+            Some(status) if PROVISIONING_STATUS_VALUES.contains(&status) => Some(status),
+            Some(status) => {
+                return Err(
+                    ListAccountsForProvisionedPermissionSetErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::provisioning_status_unknown_message(
+                                status,
+                            )),
+                            // The model's `ValidationExceptionReason` enum carries only
+                            // KMS key states, none of which this refusal is.
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The cursor is scoped to THIS enumeration: the operation and the whole filter
+        // that selected the rows, since the page key (an account id) only distinguishes
+        // rows within it.
+        let scope = crate::state::cursor_accounts_for_provisioned_permission_set(
+            &input.instance_arn,
+            &input.permission_set_arn,
+            filter,
+        );
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListAccountsForProvisionedPermissionSetErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.to_string()),
+                        reason: None,
+                    },
+                )
+            },
+        )?;
+
+        let ordered: Vec<(String, String)> = {
+            let mut store = state.lock();
+            // A READ, except for what the CLOCK already owes the instances themselves,
+            // and the account's ambient instance if nothing has enabled one yet.
+            store.on_request(
+                &crate::state::request_region(ctx.parts()),
+                ::std::time::SystemTime::now(),
+            );
+            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup:
+            // permission sets are a feature of an organization instance, so on an account
+            // instance none can ever be provisioned anywhere and the enumeration is
+            // refused rather than answered empty. An ARN this account holds no instance
+            // for is NOT this refusal — it falls through to the 404 below.
+            if store.permission_set_surface_withdrawn(&input.instance_arn) {
+                return Err(
+                    ListAccountsForProvisionedPermissionSetErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                            ),
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if store.instance(&input.instance_arn).is_none() {
+                return Err(
+                    ListAccountsForProvisionedPermissionSetErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "No instance found with the ARN {}",
+                                input.instance_arn
+                            )),
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if store
+                .permission_set(&input.instance_arn, &input.permission_set_arn)
+                .is_none()
+            {
+                return Err(
+                    ListAccountsForProvisionedPermissionSetErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "No permission set found with the ARN {}",
+                                input.permission_set_arn
+                            )),
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // Every account the permission set is provisioned into, each once and with the
+            // provisioning status it is in, kept only when it is the status the request
+            // asked for. The account id is the page key: `AccountId` is 12 digits
+            // (`^\d{12}$`), so its ascending order is the same read as a number.
+            store
+                .provisioned_accounts(&input.instance_arn, &input.permission_set_arn)
+                .into_iter()
+                .filter(|(_, status)| filter.is_none_or(|wanted| wanted == *status))
+                .map(|(account_id, _)| (account_id.clone(), account_id))
+                .collect()
+        };
+
+        let (account_ids, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), input.max_results);
+        Ok(ListAccountsForProvisionedPermissionSetOutput {
+            account_ids: Some(account_ids),
+            next_token,
+        })
     }
 }

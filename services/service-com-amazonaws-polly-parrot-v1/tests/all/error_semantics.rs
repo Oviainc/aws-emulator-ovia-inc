@@ -14,11 +14,11 @@ use bytes::Bytes;
 use service_com_amazonaws_polly_parrot_v1::ops::put_lexicon::MAX_LEXEME_CHARACTERS;
 use service_com_amazonaws_polly_parrot_v1::service::errors;
 use service_com_amazonaws_polly_parrot_v1::state::{
-    PendingTaskStatus, StoredSynthesisTask, TASK_COMPLETION_DELAY,
+    mint_task_id, PendingTaskStatus, StoredSynthesisTask, TASK_COMPLETION_DELAY,
 };
 
 use crate::lexicons_and_speech::{error_code, json, Polly};
-use crate::support::{seed_task, stored_task};
+use crate::support::{fixture_task_id, seed_task, stored_task};
 
 /// The `message` an error response carries, absent when the error carries none.
 fn error_message(response: &http::Response<Bytes>) -> Option<String> {
@@ -81,22 +81,22 @@ fn pls_with_replacement(element: &str, length: usize) -> String {
 
 /// RULE: a read of a resource that does not exist is refused with the modelled
 /// not-found error for that resource — for a speech synthesis task,
-/// `SynthesisTaskNotFoundException` (HTTP 400) — for every identifier the model's own
-/// pattern admits; an identifier the pattern does not admit is refused at the request
-/// boundary instead, and neither answer is ever a 501 or a 5xx.
+/// `SynthesisTaskNotFoundException` (HTTP 400) — for every identifier of the form the
+/// service mints that identifier in; an identifier the model's pattern does not admit
+/// is refused at the request boundary instead, and neither answer is ever a 501 or a
+/// 5xx. (A value the pattern admits that is no identifier at all is the *other*
+/// modelled refusal, which `crate::task_id_validity` covers.)
 #[tokio::test]
 async fn an_unknown_synthesis_task_is_refused_with_its_modeled_not_found_error() {
     let polly = Polly::new();
-    // The rows span `TaskId`'s pattern ^[a-zA-Z0-9_-]{1,100}$: its lower bound, its
-    // upper bound, the length the issue happened to quote, and each character class
-    // it allows.
+    // The rows span the minted identifier form: identifiers from the service's own
+    // minter, the all-zero one, and one spelled with upper-case hex digits.
     let well_formed = [
-        "a".to_string(),
-        "a".repeat(40),
-        "a".repeat(100),
-        "0123456789".to_string(),
-        "Task_1-2".to_string(),
-        "ZZ-_zz99".to_string(),
+        mint_task_id(),
+        mint_task_id(),
+        fixture_task_id("never stored"),
+        "00000000-0000-0000-0000-000000000000".to_string(),
+        "6F3A1B2C-9D4E-4F5A-8B6C-7D8E9F0A1B2C".to_string(),
     ];
     for id in well_formed {
         let response = polly
@@ -140,18 +140,18 @@ async fn get_speech_synthesis_task_reports_the_stored_task() {
     let mut rows: Vec<(&str, StoredSynthesisTask, &str)> = Vec::new();
 
     // A task already in a terminal status stays there.
-    let mut completed = stored_task("completed-task", created);
+    let mut completed = stored_task(&fixture_task_id("completed"), created);
     completed.task_status = "completed".to_string();
     rows.push(("completed", completed, "completed"));
 
     // A failed task reports its reason beside its status.
-    let mut failed = stored_task("failed_task", created);
+    let mut failed = stored_task(&fixture_task_id("failed"), created);
     failed.task_status = "failed".to_string();
     failed.task_status_reason = Some("the output bucket is not writable".to_string());
     rows.push(("failed with a reason", failed, "failed"));
 
     // The clock has already made the completion due, so the read reports it.
-    let mut due = stored_task("dueTask", created);
+    let mut due = stored_task(&fixture_task_id("due"), created);
     due.pending_status = Some(PendingTaskStatus {
         due_at: now - TASK_COMPLETION_DELAY,
         status: "completed".to_string(),
@@ -160,7 +160,7 @@ async fn get_speech_synthesis_task_reports_the_stored_task() {
     rows.push(("completion already due", due, "completed"));
 
     // Not yet due: still the status it was stored in, and a read must not advance it.
-    let mut pending = stored_task("pendingTask", created);
+    let mut pending = stored_task(&fixture_task_id("pending"), created);
     pending.task_status = "scheduled".to_string();
     pending.pending_status = Some(PendingTaskStatus {
         due_at: now + Duration::from_secs(3_600),
@@ -171,7 +171,7 @@ async fn get_speech_synthesis_task_reports_the_stored_task() {
 
     // A task recorded with every optional member set, so none of them is dropped or
     // normalised on the way out.
-    let mut full = stored_task("fullTask", created);
+    let mut full = stored_task(&fixture_task_id("full"), created);
     full.task_status = "completed".to_string();
     full.engine = "neural".to_string();
     full.output_format = "json".to_string();

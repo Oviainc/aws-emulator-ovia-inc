@@ -2,10 +2,11 @@
 
 //! @op ListImportFileTask
 //!
-//! Reports every import file task this account started, a page at a time, from the
-//! records `StartImportFileTask` persisted: each entry is the stored task, in the
-//! store's total order over the minted ids, and `nextToken` is the opaque cursor
-//! [`crate::state::encode_page_token`] mints for the task a page stopped after.
+//! Reports every import file task this account started in the Region the request was
+//! signed for, a page at a time, from the records `StartImportFileTask` persisted there:
+//! each entry is the stored task, in the store's total order over the minted ids, and
+//! `nextToken` is the opaque cursor [`crate::state::encode_page_token`] mints for the
+//! task a page stopped after.
 //!
 //! A pure read of that store (`@readonly`): the one write it makes is materialising the
 //! completion the clock already owed a task it reports, which was owed at that same
@@ -155,7 +156,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListImportFileTaskErrorModeled::InternalServerException(
                 InternalServerException {
@@ -170,9 +170,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `@readonly`: the page is computed from the stored tasks. The only write is
         // materialising the completion the clock already owed each task it reports.
+        //
+        // The tasks are the ones of the Region this request was signed for: a Region
+        // nothing was started in reads as an empty portfolio, and this read mints no
+        // partition for it, while still holding the request to the page rules.
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        // The stand-in a Region with no partition is paged over: it holds nothing, so the
+        // page is empty and the settlement writes `page_of_import_tasks` would make on it
+        // are dropped with it — there is no task in it to owe one. Paging it rather than
+        // answering straight away is what keeps the page rules (the `maxResults` bound,
+        // the refusal of a token this service did not mint) the same in every Region.
+        let mut unwritten = crate::state::RegionState::default();
         let mut store = state.lock();
-        let page = store
+        let portfolio = store.region_mut(&region).unwrap_or(&mut unwritten);
+        let page = portfolio
             .page_of_import_tasks(input.next_token.as_deref(), input.max_results, now)
             .map_err(ListImportFileTaskErrorModeled::ValidationException)?;
 

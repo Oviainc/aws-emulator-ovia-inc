@@ -264,7 +264,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 UpdateApplicationComponentConfigErrorModeled::InternalServerException(
@@ -292,13 +291,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let configures_source_code = repositories.is_some();
         let configures_database = input.secrets_manager_key.is_some();
 
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The update applies to a component of THIS account's portfolio: an id naming none
-        // is reported as the missing resource it is, never silently created.
-        let Some(component) = store
-            .application_components
-            .get_mut(&input.application_component_id)
-        else {
+        // The update applies to a component of THIS account's portfolio in the Region the
+        // request was signed for: an id naming none is reported as the missing resource
+        // it is, never silently created.
+        let found = store.region_mut(&region).and_then(|portfolio| {
+            portfolio
+                .application_components
+                .get_mut(&input.application_component_id)
+        });
+        let Some(component) = found else {
             return Err(
                 UpdateApplicationComponentConfigErrorModeled::ResourceNotFoundException(
                     application_component_not_found(),
