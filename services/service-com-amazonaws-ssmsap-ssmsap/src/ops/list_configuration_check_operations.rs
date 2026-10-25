@@ -248,12 +248,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|record| (record.id.clone(), record.view()))
             .collect();
 
-        let page = crate::state::page(matching, input.max_results, input.next_token.as_deref())
-            .map_err(|error| {
-                ListConfigurationCheckOperationsErrorModeled::ValidationException(
-                    crate::state::page_validation_exception(&error),
-                )
-            })?;
+        let page = crate::state::page(
+            matching,
+            input.max_results,
+            input.next_token.as_deref(),
+            crate::state::Listing::ConfigurationCheckOperations,
+        )
+        .map_err(|error| {
+            ListConfigurationCheckOperationsErrorModeled::ValidationException(
+                crate::state::page_validation_exception(&error),
+            )
+        })?;
 
         Ok(ListConfigurationCheckOperationsOutput {
             configuration_check_operations: Some(page.items),

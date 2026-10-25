@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComponents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComponents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComponents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `ComponentSummary` per component of the registered applications in the
+//! request's Region, computed from state: the components a registration described
+//! (`RegisterApplication$ComponentsInfo`), narrowed to one application when the request
+//! names one, in `<ApplicationId>/<ComponentId>` order, with `MaxResults` bounding the
+//! page and `NextToken` resuming after the last item of the previous one.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +147,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComponents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComponentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The Region this request was signed for: a listing reports the components of
+        // the applications registered at THIS regional endpoint and no others.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListComponentsErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let mut state = state.lock();
+        // Materialise what the clock already owed, so this listing agrees with a
+        // `GetApplication` made at the same instant.
+        state.settle(::std::time::SystemTime::now());
+
+        let region_state = state.region(&region);
+
+        // `ApplicationId` is optional: a request that names one lists that
+        // application's components, and one that names none lists every component
+        // registered in this Region. An id that names no application registered HERE is
+        // refused — this operation models `ResourceNotFoundException` (HTTP 404) for
+        // exactly that, unlike the lookups that answer the same condition with a 400.
+        let applications: Vec<&crate::state::StoredApplication> =
+            match input.application_id.as_deref() {
+                Some(application_id) => {
+                    let application =
+                        region_state.applications.get(application_id).ok_or_else(|| {
+                            ListComponentsErrorModeled::ResourceNotFoundException(
+                                crate::state::not_found(
+                                    crate::state::application_not_found_message(application_id),
+                                ),
+                            )
+                        })?;
+                    vec![application]
+                }
+                None => region_state.applications.values().collect(),
+            };
+
+        // One candidate per component, keyed by the application it belongs to and its
+        // own id: a `ComponentId` is unique only within its application, so that pair
+        // is what orders the listing and what a continuation token resumes from. The
+        // page is taken over those keys, so only the components actually returned are
+        // projected onto `ComponentSummary`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComponents"))
+        // How many candidates there are is counted BEFORE any are built, so the work one
+        // request does over the store is bounded rather than growing with how many
+        // requests came before it: a Region holds at most `MAX_APPLICATIONS`
+        // applications of at most `MAX_COMPONENTS_PER_APPLICATION` components each, both
+        // refused at registration, so the count cannot exceed the ceiling those two
+        // bounds imply (`MAX_COMPONENTS_PER_REGION`). A store that exceeded it would be a
+        // regression in one of them, which this says in a debug build; the listing still
+        // reports every component it holds rather than silently serving a short page.
+        let candidate_count: usize = applications
+            .iter()
+            .map(|application| application.components.len())
+            .sum();
+        debug_assert!(
+            candidate_count <= crate::state::MAX_COMPONENTS_PER_REGION,
+            "a Region holds at most {} components, found {candidate_count}",
+            crate::state::MAX_COMPONENTS_PER_REGION
+        );
+        let mut candidates: Vec<(String, (&str, &crate::state::StoredComponent))> =
+            Vec::with_capacity(candidate_count);
+        candidates.extend(applications.iter().flat_map(|application| {
+            application.components.iter().map(move |component| {
+                (
+                    format!("{}/{}", application.id, component.id),
+                    (application.id.as_str(), component),
+                )
+            })
+        }));
+        // The order a token resumes from has to be the same for the call that handed it
+        // out and the call that resumes from it; components are stored in the order
+        // their registration declared them, so the listing orders them by that key.
+        candidates.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let page = crate::state::page(
+            candidates,
+            input.max_results,
+            input.next_token.as_deref(),
+            crate::state::Listing::Components,
+        )
+        .map_err(|error| {
+            ListComponentsErrorModeled::ValidationException(
+                crate::state::page_validation_exception(&error),
+            )
+        })?;
+
+        let components: Vec<ComponentSummary> = page
+            .items
+            .iter()
+            .map(|(application_id, component)| {
+                // The component's ARN has ONE construction site per item: the key its
+                // tags are held under is the same spelling the summary reports.
+                let arn = crate::state::component_arn(&region, application_id, &component.id);
+                let tags = region_state.tags_for(&arn);
+                component.summary(application_id, &arn, tags)
+            })
+            .collect();
+
+        Ok(ListComponentsOutput {
+            components: Some(components),
+            next_token: page.next_token,
+        })
     }
 }
