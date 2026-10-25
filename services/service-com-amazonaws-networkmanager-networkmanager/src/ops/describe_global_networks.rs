@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeGlobalNetworks
-//! Reports the global networks this service has stored, filtered by `GlobalNetworkIds`
-//! when supplied and paginated by `MaxResults`/`NextToken`. A reporting operation: it
-//! never writes. This is the ONLY file to touch for this operation.
+//! Reports the global networks this service has stored, named by `GlobalNetworkIds` when
+//! supplied and paginated by `MaxResults`/`NextToken`. `GlobalNetworkIds` is the only
+//! reference to a resource this request carries, so each id it names is RESOLVED, not
+//! merely matched: see the refusal below. A reporting operation: it never writes. This is
+//! the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -145,6 +147,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_filter_ids("GlobalNetworkIds", &requested)
             .map_err(DescribeGlobalNetworksErrorModeled::ValidationException)?;
 
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // `GlobalNetworkIds` is the only reference to a resource this request carries —
+        // the operation binds no path resource (GET /global-networks) — so the ids it
+        // names are RESOLVED here, the way every operation of this service resolves the
+        // resource its request addresses: an id naming no stored global network is the
+        // modelled `ResourceNotFoundException` (404) identifying that id, not a narrower
+        // page. A listing whose ids are a plain filter models no not-found at all
+        // (`smithy_query operation="ListAttachments,ListPeerings"`), which is what tells
+        // the two apart. The first unresolvable id in REQUEST order is the one reported,
+        // so the refusal does not depend on how the store is keyed.
+        if let Some(unknown) = requested
+            .iter()
+            .find(|want| !store.global_networks.contains_key(*want))
+        {
+            return Err(DescribeGlobalNetworksErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::GLOBAL_NETWORK_KIND, unknown),
+            )
+            .into());
+        }
+
         // An opaque token this service did not mint cannot name a key offset, so it is a
         // client error rather than an empty page.
         let after = match input.next_token.as_deref() {
@@ -161,8 +185,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        let now = ::std::time::SystemTime::now();
-        let store = state.lock();
+        // Every id named above resolved, so this predicate can only NARROW the listing to
+        // the networks the request asked for — it can no longer hide an unresolvable one.
         let entries: Vec<(String, GlobalNetwork)> = store
             .global_networks
             .iter()

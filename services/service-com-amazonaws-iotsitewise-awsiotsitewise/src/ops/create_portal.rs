@@ -217,13 +217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `TagMap`'s KEYS target `TagKey` (@length 1..128), which the framework's
         // constraint walk does not reach — it validates a map's values only — so the
-        // bound is enforced here, in the same wording `TagResource` uses.
-        if let Some(tags) = input.tags.as_ref() {
-            for key in tags.keys() {
-                if let Err(message) = crate::state::check_tag_key(key) {
-                    return Err(crate::scaffolded::Scaffolded::validation(message));
-                }
-            }
+        // bound is enforced here, in the same wording `TagResource` uses, and as the
+        // client-input error this operation MODELS: its error list declares no
+        // `ValidationException`, so a malformed request can only be
+        // `InvalidRequestException` (400).
+        for tag_key in input.tags.iter().flatten().map(|(tag_key, _)| tag_key) {
+            crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
         }
 
         // "Default: SSO" — `portalAuthMode`'s own documentation. The value set
@@ -323,4 +322,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(output)
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message` — the client-input error
+/// this operation declares, the way every sibling handler reports a malformed
+/// request.
+fn invalid_request(message: String) -> CreatePortalError {
+    CreatePortalError::Modeled(CreatePortalErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
 }

@@ -521,6 +521,28 @@ impl Dictionary {
         self.tags.clone().into_iter().collect()
     }
 
+    /// Whether this dictionary is still EXACTLY what a `CreateDictionary` left behind,
+    /// in the one respect a create does not state — its lifecycle: a dictionary is
+    /// minted transient and settles on the clock, so either of those statuses is what a
+    /// create produces, while one whose deletion has been accepted or has completed is
+    /// on its way out or already gone.
+    ///
+    /// The dictionary's counterpart of [`Feed::is_as_created`], read by
+    /// [`ComAmazonawsElementalinferenceElementalinferenceState::dictionary_created_from`]
+    /// for the same reason: every other member a create of a dictionary states is a
+    /// stored one, so comparing those members with the request covers the rest of the
+    /// record. What it reads is the record's CURRENT content, not its history: a
+    /// dictionary a feed's subtitling output has since named is one of these — the
+    /// stored members are untouched, only the status it REPORTS is derived
+    /// ([`Self::reported_status`]) — so a replay answers with it and reports
+    /// `REFERENCED`.
+    pub fn is_as_created(&self) -> bool {
+        matches!(
+            self.status,
+            DictionaryStatus::Creating | DictionaryStatus::Available
+        )
+    }
+
     /// The `DictionarySummary` projection `ListDictionaries` reports — the dictionary's
     /// counterpart of [`Feed::summary`].
     ///
@@ -546,7 +568,9 @@ impl Dictionary {
 /// tells an output a request would really add from one the feed already holds exactly as
 /// asked (`Feed::outputs_to_append`): the comparison is made on the stored form of both,
 /// so a request that leaves an optional member to the service's default
-/// ([`output_config_with_defaults`]) still matches the output that default produced.
+/// ([`output_config_with_defaults`]) still matches the output that default produced. It
+/// is the same comparison that tells a create this Region has already served from a new
+/// one ([`ComAmazonawsElementalinferenceElementalinferenceState::feed_created_from`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
     pub name: String,
@@ -810,6 +834,25 @@ impl Feed {
     /// than an absent member.
     pub fn tag_map(&self) -> std::collections::HashMap<String, String> {
         self.tags.clone().into_iter().collect()
+    }
+
+    /// Whether this feed is still EXACTLY what a `CreateFeed` left behind, in every
+    /// respect a create does not state: settled in the status a create produces, with
+    /// no resource associated, no release served, no policy attached, nothing owed to
+    /// the clock and no deletion accepted.
+    ///
+    /// A feed some later call has moved on is not a record a repeated create can answer
+    /// with ([`ComAmazonawsElementalinferenceElementalinferenceState::feed_created_from`]):
+    /// the caller of that first create saw its response and acted on it, so a request
+    /// arriving now is a create of its own and not that one retried. What it reads is
+    /// the record's CURRENT content, not its history, so a feed an update changed and
+    /// then changed back is once more a feed that create would have produced.
+    pub fn is_as_created(&self) -> bool {
+        self.status == FeedStatus::Available
+            && self.association.is_none()
+            && self.released_resource_name.is_none()
+            && self.policy.is_none()
+            && self.transition_due_at.is_none()
     }
 
     /// The `FeedSummary` projection `ListFeeds` reports.
@@ -1139,6 +1182,71 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
             ));
         }
         None
+    }
+
+    /// The feed a `CreateFeed` request has ALREADY minted in `region`, if this store
+    /// holds it: the one whose stored name, access role, output list and tags are
+    /// exactly what the request asks for, and which is otherwise still as that create
+    /// left it ([`Feed::is_as_created`]).
+    ///
+    /// A create of this service carries no `@idempotencyToken`, so the request's own
+    /// members are its key. The operation is `@idempotent`, which means the effect of
+    /// several identical requests is the effect of ONE: the second and later ones
+    /// answer with the resource the first minted instead of minting another, so an SDK
+    /// retry of a create whose response was lost cannot double what the Region holds
+    /// (nor what it has spent of its quota). Only a difference in the request itself
+    /// makes it a different create.
+    ///
+    /// A record the Region no longer holds, or one a later call has moved on, is not
+    /// one a replay can answer with: a feed whose deletion has been accepted or which
+    /// has since been associated, released or given a policy is passed over, and a
+    /// replay after a removal fell due mints afresh — the recognition is against what
+    /// the Region holds NOW, with no index to keep in step with the store.
+    ///
+    /// Scans at most [`MAX_FEEDS`] feeds of the Region, each with at most
+    /// [`MAX_OUTPUTS_PER_FEED`] outputs.
+    pub fn feed_created_from<'a>(
+        &'a self,
+        region: &'a str,
+        name: &str,
+        access_role_arn: Option<&str>,
+        outputs: &[Output],
+        tags: &BTreeMap<String, String>,
+    ) -> Option<&'a Feed> {
+        self.feeds_in(region).find(|feed| {
+            feed.is_as_created()
+                && feed.name == name
+                && feed.access_role_arn.as_deref() == access_role_arn
+                && feed.outputs == outputs
+                && &feed.tags == tags
+        })
+    }
+
+    /// The dictionary a `CreateDictionary` request has ALREADY minted in `region`, if
+    /// this store holds it — the dictionary's counterpart of [`Self::feed_created_from`],
+    /// over the members a dictionary create sets.
+    ///
+    /// Every member a create of a dictionary states is a stored one, so the comparison
+    /// below plus [`Dictionary::is_as_created`] covers the whole record: a dictionary
+    /// `UpdateDictionary` or a tag write has moved on no longer matches the request that
+    /// minted it, and one whose deletion has been accepted or completed is passed over
+    /// as a feed's is. The status the clock itself moves (`CREATING` to `AVAILABLE`) is
+    /// not a change to the record, so a replay is recognised on either side of it.
+    pub fn dictionary_created_from<'a>(
+        &'a self,
+        region: &'a str,
+        name: &str,
+        language: &str,
+        entries: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> Option<&'a Dictionary> {
+        self.dictionaries_in(region).find(|dictionary| {
+            dictionary.is_as_created()
+                && dictionary.name == name
+                && dictionary.language == language
+                && dictionary.entries == entries
+                && &dictionary.tags == tags
+        })
     }
 
     /// How many distinct Regions this store holds a feed record in — live feeds and the

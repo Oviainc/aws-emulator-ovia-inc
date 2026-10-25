@@ -726,7 +726,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // changes nothing, whatever the store still holds for the stored revision.
         let task_definition_changed = input.task_definition.is_some()
             && definition.as_ref().map(|found| found.arn.clone()) != snapshot.task_definition_arn;
-        let redeploy = input.force_new_deployment || task_definition_changed;
+        // The members whose own docs say they roll the service: "This parameter triggers a
+        // new service deployment" (`networkConfiguration`, `platformVersion`,
+        // `loadBalancers`, `serviceRegistries`, `serviceConnectConfiguration`,
+        // `volumeConfigurations`, `vpcLatticeConfigurations`, `taskDefinition`). The rest
+        // say the opposite ("This parameter doesn't trigger a new service deployment"), so
+        // changing one of those only changes what the service holds.
+        let rolling_member_requested = input.network_configuration.is_some()
+            || input.platform_version.is_some()
+            || input.load_balancers.is_some()
+            || input.service_registries.is_some()
+            || input.service_connect_configuration.is_some()
+            || input.volume_configurations.is_some()
+            || input.vpc_lattice_configurations.is_some();
+        let redeploy =
+            input.force_new_deployment || task_definition_changed || rolling_member_requested;
         let new_deployment_id = if redeploy {
             Some(guard.next_deployment_id())
         } else {
@@ -752,6 +766,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .services
             .get_mut(&key)
             .expect("the service was just found in this cluster");
+        // The deployment a new one replaces stays with the service while the task set it
+        // placed is still being replaced, so it is captured BEFORE this update writes the
+        // configuration the NEW deployment rolls out.
+        if redeploy && scheduler_owned {
+            service.supersede_deployment(now);
+        }
         if let Some(count) = input.desired_count {
             service.desired_count = count;
         }
@@ -781,7 +801,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             service.availability_zone_rebalancing = rebalancing;
         }
         if input.network_configuration.is_some() {
-            service.network_configuration = input.network_configuration.clone();
+            service.network_configuration =
+                crate::state::defaulted_network_configuration(input.network_configuration.as_ref());
         }
         if let Some(constraints) = input.placement_constraints.clone() {
             service.placement_constraints = constraints;

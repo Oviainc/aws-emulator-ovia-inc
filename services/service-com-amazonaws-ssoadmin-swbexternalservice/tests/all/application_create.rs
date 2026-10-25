@@ -12,8 +12,8 @@
 //! 1. a create stores the application UNDER THE INSTANCE THE REQUEST NAMES: the minted
 //!    `ApplicationArn` carries that instance's id and the account of this emulator, and
 //!    both the create's own response and a later `DescribeApplication` report that
-//!    instance and the identity store connected to it — for the account instance this
-//!    emulator seeds and for an organization instance of a different id alike;
+//!    instance and the identity store connected to it — for the instance this emulator
+//!    seeds and for an instance of a different id alike;
 //! 2. `CreatedFrom` is the REGION OF THE REQUEST THAT CREATED the application, decided
 //!    once at create time: a describe made from any other Region reports the Region the
 //!    create ran in, not the Region of the read;
@@ -236,10 +236,10 @@ async fn identity_store_arn(router: &MultiServiceRouter, instance_arn: &str) -> 
         .to_string()
 }
 
-/// The two instances the rules are asserted against: the ACCOUNT instance this emulator
-/// seeds, and an ORGANIZATION instance held under a different instance id — so the
-/// "under the instance the request names" half of rule 1 varies over the instance instead
-/// of being read off the only one that exists.
+/// The two instances the rules are asserted against: the instance this emulator seeds (the
+/// one a client discovers through `ListInstances`), and another instance held under a
+/// different instance id — so the "under the instance the request names" half of rule 1
+/// varies over the instance instead of being read off the only one that exists.
 async fn instance_fixtures() -> Vec<(&'static str, MultiServiceRouter, String)> {
     let account = router();
     let account_instance = seeded_instance_arn(&account).await;
@@ -249,7 +249,7 @@ async fn instance_fixtures() -> Vec<(&'static str, MultiServiceRouter, String)> 
         "the two fixtures must hold instances of different ids, got {account_instance}"
     );
     vec![
-        ("the seeded account instance", account, account_instance),
+        ("the seeded instance", account, account_instance),
         (
             "an organization instance of another id",
             organization,

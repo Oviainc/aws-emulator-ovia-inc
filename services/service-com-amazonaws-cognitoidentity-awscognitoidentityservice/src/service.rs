@@ -42,7 +42,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -110,21 +110,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // Cognito Identity has no `ValidationException`: the error it declares on every
-        // operation for "missing or bad input parameter(s)" is `InvalidParameterException`
-        // (HTTP 400), so that is the code a caller branches on when a value fails a
-        // modelled constraint — an `IdentityPoolId` outside `^[\w-]+:[0-9a-f-]+$`, say,
-        // which the boundary refuses before any handler runs. The message keeps the
-        // framework's structural account of what failed, which names the member and the
-        // constraint it violated.
+        // A value that fails a constraint the MODEL declares — an `IdentityPoolId`
+        // outside `^[\w-]+:[0-9a-f-]+$`, a `MaxResults` outside its range, a member the
+        // shape requires and the request omits — is refused by the constraint-validation
+        // layer that runs AHEAD of the operation, with HTTP 400 and the error code
+        // `ValidationException`. No operation of this service declares that error, and
+        // that is the point: the refusal is the protocol's, not one of the service's own
+        // modelled failures, so it is NOT `InvalidParameterException` — which this
+        // service's handlers answer for a request whose VALUES are well-formed but
+        // cannot be served (an ARN that names no identity pool, a pagination token this
+        // service did not issue). A client branches on the code, and the two refusals
+        // are different things.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
-                code: "InvalidParameterException".to_string(),
-                message: violations
-                    .iter()
-                    .map(Violation::message)
-                    .collect::<Vec<String>>()
-                    .join("; "),
+                code: "ValidationException".to_string(),
+                message: validation_error_message(violations),
             }),
             // Authentication is the emulator's to answer, not this service's.
             _ => None,
@@ -157,6 +157,44 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+/// The message a constraint refusal carries: how many of the request's values failed,
+/// then one clause per failure — each naming the member, the value the request gave it
+/// and the requirement that value failed, so the caller can fix the request from the text
+/// alone.
+///
+/// The count prefix is part of what a caller reads, so it is stated here rather than left
+/// to the framework's per-violation clause, and the clauses are joined in the order the
+/// validating walk found them.
+fn validation_error_message(violations: &[Violation]) -> String {
+    let clauses: Vec<String> = violations.iter().map(validation_error_clause).collect();
+    let errors = if clauses.len() == 1 { "error" } else { "errors" };
+    format!(
+        "{} validation {errors} detected: {}",
+        clauses.len(),
+        clauses.join("; ")
+    )
+}
+
+/// One failure's clause. The framework writes the sentence; the only thing restated here
+/// is a `@pattern`, which a refusal quotes as the EXPRESSION a value must match rather
+/// than as the model's anchored literal — the anchors are what makes it a whole-value
+/// match, which "must satisfy regular expression pattern" already says.
+fn validation_error_clause(violation: &Violation) -> String {
+    let clause = violation.message();
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => {
+            let unanchored = pattern.trim_start_matches('^').trim_end_matches('$');
+            // Only the clause's trailing pattern is rewritten, so a value that happens to
+            // read like the pattern is still echoed exactly as the request sent it.
+            match clause.strip_suffix(pattern.as_str()) {
+                Some(head) => format!("{head}{unanchored}"),
+                None => clause,
+            }
+        }
+        _ => clause,
     }
 }
 

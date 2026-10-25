@@ -33,7 +33,7 @@ use service_com_amazonaws_ssoadmin_swbexternalservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call, error_code, router, seeded_instance_arn, UNKNOWN_INSTANCE_ARN,
+    account_instance_router, call, error_code, router, seeded_instance_arn, UNKNOWN_INSTANCE_ARN,
 };
 
 /// A customer managed key ARN in the hyphenated-UUID spelling the model's `KmsKeyArn`
@@ -194,11 +194,11 @@ async fn an_update_that_carries_nothing_changes_nothing() {
 /// and idempotent on a second call), and `false` (refused, and the flag stays on).
 #[tokio::test]
 async fn permission_sets_can_only_be_enabled() {
-    let router = router();
-    let arn = seeded_instance_arn(&router).await;
+    // An ACCOUNT instance, so the flag starts OFF and the rows below can walk it from the
+    // enablement an instance is created with through the one update that changes it.
+    let (router, arn) = account_instance_router().await;
 
-    // The instance this account holds is an ACCOUNT instance, so permission sets start
-    // off; whatever it starts at is what a request that names no member must leave.
+    // Whatever the instance starts at is what a request that names no member must leave.
     let initial = describe(&router, &arn).await["PermissionSetsEnabled"].clone();
 
     // (case, the PermissionSetsEnabled value to send — `None` sends the member at all,
@@ -238,13 +238,12 @@ async fn permission_sets_can_only_be_enabled() {
 }
 
 /// Enabling permission sets is a real state change, not a cosmetic flag: the
-/// permission-set surface this instance withdraws while they are disabled is served once
-/// an `UpdateInstance` enables them, and `CreatePermissionSet` is the operation that
+/// permission-set surface an ACCOUNT instance withdraws while they are disabled is served
+/// once an `UpdateInstance` enables them, and `CreatePermissionSet` is the operation that
 /// shows it.
 #[tokio::test]
 async fn enabling_permission_sets_opens_the_permission_set_surface() {
-    let router = router();
-    let arn = seeded_instance_arn(&router).await;
+    let (router, arn) = account_instance_router().await;
 
     let request = json!({"InstanceArn": arn, "Name": "SurfaceProbe"});
     let (status, body) = call(&router, "CreatePermissionSet", &request).await;

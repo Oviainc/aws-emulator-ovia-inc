@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProductRestEndpointPage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProductRestEndpointPage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProductRestEndpointPage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored [`crate::state::ProductRestEndpointPage`] the URI
+//! names, under the portal product that owns it, and reports its raw display content
+//! only for a request that asked for it. A report, not a write. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +158,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProductRestEndpointPage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProductRestEndpointPageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProductRestEndpointPage"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetProductRestEndpointPage",
+            ));
+        };
+
+        // "The query parameter to include raw display content"
+        // (`GetProductRestEndpointPage$IncludeRawDisplayContent`) is modelled as
+        // `__string`, so the boolean it spells is read here; a value that is neither is
+        // refused rather than read as "no".
+        let include_raw = crate::state::parse_boolean_query(
+            "IncludeRawDisplayContent",
+            input.include_raw_display_content.as_deref(),
+        )
+        .map_err(|message| {
+            GetProductRestEndpointPageError::from(
+                GetProductRestEndpointPageErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        })?;
+
+        // A reporting operation: the guard is taken for READING only, so a Get leaves the
+        // store exactly as the next caller will find it. The page's `Status` is derived
+        // from the clock on every read, so nothing has to be written to report it.
+        let store = state.lock();
+
+        // "The account ID of the resource owner of the portal product"
+        // (`GetProductRestEndpointPage$ResourceOwnerAccountId`) selects whose product to
+        // read, the way `GetPortalProduct` reads it: this emulator holds the products of
+        // its OWN account only, so naming any other owner addresses a product it does not
+        // hold.
+        let owner_is_elsewhere = input
+            .resource_owner_account_id
+            .as_deref()
+            .is_some_and(|owner| owner != ::engine::emulator_account_id());
+
+        let stored = if owner_is_elsewhere {
+            ::std::option::Option::None
+        } else {
+            store
+                .portal_products
+                .get(&input.portal_product_id)
+                .and_then(|product| {
+                    product
+                        .product_rest_endpoint_pages
+                        .get(&input.product_rest_endpoint_page_id)
+                })
+        };
+
+        // A page is addressed UNDER its product, so an unknown product and an unknown
+        // page under a known one both name no page: 404 `NotFoundException`.
+        let Some(page) = stored else {
+            return Err(GetProductRestEndpointPageErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid ProductRestEndpointPage identifier specified {}:{}:{}",
+                        ::engine::emulator_account_id(),
+                        input.portal_product_id,
+                        input.product_rest_endpoint_page_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        let raw_display_content = if include_raw {
+            page.raw_display_content()
+        } else {
+            ::std::option::Option::None
+        };
+        let reported = page.to_wire();
+        Ok(GetProductRestEndpointPageOutput {
+            display_content: reported.display_content,
+            last_modified: reported.last_modified,
+            product_rest_endpoint_page_arn: reported.product_rest_endpoint_page_arn,
+            product_rest_endpoint_page_id: reported.product_rest_endpoint_page_id,
+            raw_display_content,
+            rest_endpoint_identifier: reported.rest_endpoint_identifier,
+            status: reported.status,
+            status_exception: reported.status_exception,
+            try_it_state: reported.try_it_state,
+        })
     }
 }

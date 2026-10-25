@@ -28,15 +28,17 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::{Emulator, REGION};
 use crate::router_input_restart::union;
+use crate::router_outputs::minted_network_interface;
 
 /// A router network interface ARN of the shape the modelled `RouterNetworkInterfaceArn`
-/// pattern fixes, for the router configurations below (the creates store the reference as
-/// given, so no interface has to exist).
+/// pattern fixes, for the router INPUT configuration below (that create stores the reference
+/// as given, so no interface has to exist). The router OUTPUT create resolves its interface
+/// against the store, so its body takes a minted one instead.
 const NETWORK_INTERFACE_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:routerNetworkInterface:0000000000a1";
 
 /// A minimal valid CreateFlow body: "the request must include one source."
-fn flow_body(name: &str) -> Value {
+fn flow_body(name: &str, _interface_arn: &str) -> Value {
     json!({
         "name": name,
         "source": { "name": "src", "protocol": "rtp", "whitelistCidr": "10.0.0.0/16" }
@@ -44,7 +46,7 @@ fn flow_body(name: &str) -> Value {
 }
 
 /// A minimal valid CreateRouterInput body.
-fn router_input_body(name: &str) -> Value {
+fn router_input_body(name: &str, _interface_arn: &str) -> Value {
     json!({
         "name": name,
         "configuration": union(
@@ -62,15 +64,16 @@ fn router_input_body(name: &str) -> Value {
     })
 }
 
-/// A minimal valid CreateRouterOutput body.
-fn router_output_body(name: &str) -> Value {
+/// A minimal valid CreateRouterOutput body, on the router network interface
+/// `interface_arn` — a configuration must name an interface this account holds.
+fn router_output_body(name: &str, interface_arn: &str) -> Value {
     json!({
         "name": name,
         "configuration": union(
             "Standard",
             "standard",
             json!({
-                "networkInterfaceArn": NETWORK_INTERFACE_ARN,
+                "networkInterfaceArn": interface_arn,
                 "protocolConfiguration": union(
                     "Rtp",
                     "rtp",
@@ -84,13 +87,14 @@ fn router_output_body(name: &str) -> Value {
     })
 }
 
-/// One create path that stores an Availability Zone: how to build a minimal valid body,
-/// the response member the created resource arrives in, the member its identity is
+/// One create path that stores an Availability Zone: how to build a minimal valid body
+/// (from a name and the minted router network interface a router output's configuration
+/// names), the response member the created resource arrives in, the member its identity is
 /// reported in, and the read-back URI prefix that identity goes on.
 struct CreatePath {
     operation: &'static str,
     uri: &'static str,
-    body: fn(&str) -> Value,
+    body: fn(&str, &str) -> Value,
     member: &'static str,
     identity: &'static str,
     read_prefix: &'static str,
@@ -190,7 +194,9 @@ async fn create_flow_stores_only_a_documented_maintenance_start_hour() {
     let emulator = Emulator::new();
 
     // The flow the parity half of each row updates.
-    let (status, _, created) = emulator.create_flow(flow_body("flow-maintenance-parity")).await;
+    let (status, _, created) = emulator
+        .create_flow(flow_body("flow-maintenance-parity", ""))
+        .await;
     assert_eq!(status, 201, "the parity flow is created, got {status}: {created}");
     let parity_arn = created["flow"]["flowArn"]
         .as_str()
@@ -199,7 +205,7 @@ async fn create_flow_stores_only_a_documented_maintenance_start_hour() {
 
     for (case, hour, accepted) in hour_rows() {
         let name = case_name("f-maint", case);
-        let mut body = flow_body(&name);
+        let mut body = flow_body(&name, "");
         body["maintenance"] = json!({ "maintenanceDay": "Monday", "maintenanceStartHour": hour });
 
         let (status, code, answered) = emulator.create_flow(body.clone()).await;
@@ -286,6 +292,9 @@ async fn create_flow_stores_only_a_documented_maintenance_start_hour() {
 #[tokio::test]
 async fn a_create_stores_only_an_availability_zone_of_its_region() {
     let emulator = Emulator::new();
+    // The router network interface a router output's configuration names: a create resolves
+    // it against the store, so it is minted over the wire first.
+    let interface_arn = minted_network_interface(&emulator, "rni-zone").await;
     // The zone a request that names none is given: a zone of its own Region.
     let default_zone = format!("{REGION}a");
 
@@ -293,7 +302,7 @@ async fn a_create_stores_only_an_availability_zone_of_its_region() {
         for (case, zone, accepted) in zone_rows() {
             let case = format!("{} / {case}", path.operation);
             let name = case_name("z", &case);
-            let mut body = (path.body)(&name);
+            let mut body = (path.body)(&name, &interface_arn);
             if let Some(zone) = zone {
                 body["availabilityZone"] = json!(zone);
             }

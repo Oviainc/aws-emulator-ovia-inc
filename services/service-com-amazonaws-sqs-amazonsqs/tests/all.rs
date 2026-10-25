@@ -29,6 +29,8 @@ mod queue_configuration;
 mod queue_does_not_exist;
 #[path = "all/queue_tags.rs"]
 mod queue_tags;
+#[path = "all/receive_message_attribute_names.rs"]
+mod receive_message_attribute_names;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support.rs"]

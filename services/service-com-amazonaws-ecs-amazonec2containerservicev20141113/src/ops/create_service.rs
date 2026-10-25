@@ -745,9 +745,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             launch_type,
             capacity_provider_strategy,
             platform_version: input.platform_version.clone(),
-            // "If your account has already created the Amazon ECS service-linked role,
-            // that role is used for your service unless you specify a role here."
-            role_arn: crate::state::service_role_arn(input.role.as_deref(), scheduler_owned),
+            // "The name or full Amazon Resource Name (ARN) of the IAM role" the request
+            // named; a service that named none takes the ECS service-linked role where
+            // the role doc says one is required, which the projection resolves.
+            role_arn: crate::state::requested_role_arn(input.role.as_deref()),
             load_balancers: load_balancers.clone(),
             service_registries: input.service_registries.clone().unwrap_or_default(),
             deployment_configuration: crate::state::deployment_configuration(
@@ -758,7 +759,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deployment_controller: controller,
             placement_constraints: input.placement_constraints.clone().unwrap_or_default(),
             placement_strategy: input.placement_strategy.clone().unwrap_or_default(),
-            network_configuration: input.network_configuration.clone(),
+            // The members Amazon ECS materialises into the network configuration it
+            // STORES (`assignPublicIp`) are rendered once, here, so every read reports
+            // the same configuration.
+            network_configuration: crate::state::defaulted_network_configuration(
+                input.network_configuration.as_ref(),
+            ),
             service_connect_configuration: input.service_connect_configuration.clone(),
             volume_configurations: input.volume_configurations.clone().unwrap_or_default(),
             vpc_lattice_configurations: input.vpc_lattice_configurations.clone().unwrap_or_default(),
@@ -802,6 +808,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 None
             },
+            // A created service has replaced no deployment of its own.
+            superseded_deployments: Vec::new(),
         };
         guard.services.insert(key.clone(), record);
 
