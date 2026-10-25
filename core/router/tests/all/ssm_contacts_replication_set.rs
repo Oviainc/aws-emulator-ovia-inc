@@ -3,19 +3,20 @@
 //! Amazon SSM Contacts is fronted by an account-level Incident Manager replication set,
 //! and Incident Manager's own `CreateReplicationSet` — the one call that mints one — is
 //! deprecated. The two services live in DIFFERENT crates, so this suite needs the WHOLE
-//! router: it is the only place both are mounted, which is what makes "an emulated account
-//! is normally not onboarded, so the refusal is the reachable behaviour" assertable.
+//! router: it is the only place both are mounted, which is what makes "the account a client
+//! finds is already onboarded, because no call could onboard it" assertable over the wire.
 //!
-//! The rule: a contact-creating call is refused with `ValidationException` (HTTP 400)
-//! while the account has no ACTIVE replication set, and serviced once it holds one. The
-//! table sends the SAME requests before and after the set is installed, over the contact
-//! types and plan shapes the model admits, so what changes the answer is the account's
-//! state and nothing in the request.
+//! The rule: a prerequisite no API call can create belongs to the emulated account's
+//! initial state, so the contact data plane answers a client's FIRST request; the gate on
+//! it is still real, and refuses with `ValidationException` (HTTP 400) for an account whose
+//! set is gone. The table sends the SAME requests on the account as found and again after
+//! the set is removed, over the contact types and plan shapes the model admits, so what
+//! changes the answer is the account's state and nothing in the request.
 //!
-//! Onboarding cannot be done over the wire — `ssm-incidents` `CreateReplicationSet`
-//! refuses every call as deprecated (Amazon Web Services stopped accepting new Incident
-//! Manager customers on November 7, 2025), which this suite asserts through the router too
-//! — so the set is written into the store the gate reads.
+//! `ssm-incidents` `CreateReplicationSet` refusing every call as deprecated (Amazon Web
+//! Services stopped accepting new Incident Manager customers on November 7, 2025) is
+//! asserted here too, through the router: it is the reason the account cannot start
+//! un-onboarded, since no client could ever open the data plane again.
 //!
 //! Assembling the router costs stack (see `boot_serve.rs`), so it is built — and the
 //! requests are driven — on an explicitly sized thread.
@@ -31,32 +32,31 @@ const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 /// The region both services' credential scopes name.
 const REGION: &str = "us-east-1";
 
-/// Give the account an ACTIVE replication set, in the store the contact data plane's gate
-/// reads, answering the set's ARN.
-///
-/// This is how an account is onboarded here: `CreateReplicationSet` refuses every call as
-/// deprecated, so nothing over the wire can mint one.
-fn install_replication_set(engine: &InMemoryEngine) -> String {
-    use service_com_amazonaws_ssmcontacts_ssmcontacts::state::{
-        AccountReplicationSet, ComAmazonawsSsmcontactsSsmcontactsState,
-    };
+/// The ARN of the replication set the account is onboarded with, as the contact data plane
+/// records it — read from the store rather than rebuilt here.
+fn installed_replication_set(engine: &InMemoryEngine) -> Option<String> {
+    use service_com_amazonaws_ssmcontacts_ssmcontacts::state::ComAmazonawsSsmcontactsSsmcontactsState;
 
-    let arn = format!(
-        "arn:aws:ssm-incidents::{}:replication-set/router-suite",
-        engine::EMULATOR_ACCOUNT_ID
-    );
     engine
         .state::<ComAmazonawsSsmcontactsSsmcontactsState>()
         .lock()
-        .replication_set = Some(AccountReplicationSet {
-        arn: arn.clone(),
-        active: true,
-    });
-    arn
+        .active_replication_set()
+        .map(|set| set.arn.clone())
+}
+
+/// Take the account's replication set away, which no request can do — this is the only way
+/// to reach the refusal, and the reason the account may not START there.
+fn remove_replication_set(engine: &InMemoryEngine) {
+    use service_com_amazonaws_ssmcontacts_ssmcontacts::state::ComAmazonawsSsmcontactsSsmcontactsState;
+
+    engine
+        .state::<ComAmazonawsSsmcontactsSsmcontactsState>()
+        .lock()
+        .replication_set = None;
 }
 
 #[test]
-fn ssm_contacts_writes_are_refused_until_the_account_has_a_replication_set() {
+fn ssm_contacts_serves_the_account_it_finds_and_nothing_can_onboard_another() {
     std::thread::Builder::new()
         .name("ssm-contacts-replication-set".to_string())
         .stack_size(BOOT_STACK_SIZE)
@@ -139,27 +139,50 @@ fn ssm_contacts_writes_are_refused_until_the_account_has_a_replication_set() {
                 ),
             ];
 
-            // Before onboarding every row is refused, and the refusal is the modelled
-            // ValidationException rather than a 501, a 404 or a success.
+            // The account a client finds carries an ACTIVE set, minted in Incident
+            // Manager's namespace, and nothing in this suite put it there.
+            let arn = installed_replication_set(&engine)
+                .expect("the account a client finds must hold an ACTIVE replication set");
+            assert!(
+                arn.contains(":ssm-incidents:"),
+                "the account's set must carry an Incident Manager ARN, got {arn}"
+            );
+
+            // So every row is served on the FIRST request, and each created contact reads
+            // back — no onboarding step of any kind in between.
             for (case, body) in &rows {
                 let response = runtime
                     .block_on(router.dispatch(contacts_request("CreateContact", body)));
                 let status = response.status().as_u16();
                 let rendered = String::from_utf8_lossy(response.body()).to_string();
                 assert_eq!(
-                    status, 400,
-                    "case {case:?}: CreateContact must be refused while the account has no \
-                     replication set, got {status} with {rendered}"
+                    status, 200,
+                    "case {case:?}: CreateContact must be serviced on the account a client \
+                     finds, got {status} with {rendered}"
                 );
-                assert!(
-                    rendered.contains("ValidationException"),
-                    "case {case:?}: expected a ValidationException, got {status} with {rendered}"
+                let created: Value =
+                    serde_json::from_str(&rendered).expect("CreateContact answers JSON");
+                let contact_arn = created["ContactArn"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case:?}: expected a ContactArn in {rendered}"))
+                    .to_string();
+
+                let response = runtime.block_on(router.dispatch(contacts_request(
+                    "GetContact",
+                    &json!({"ContactId": contact_arn}),
+                )));
+                let status = response.status().as_u16();
+                let rendered = String::from_utf8_lossy(response.body()).to_string();
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the created contact must be readable back, got {status} \
+                     with {rendered}"
                 );
             }
 
             // Onboarding over the wire is impossible: the owning service refuses every
-            // CreateReplicationSet as deprecated, which is why a client sees the refusal
-            // above at all.
+            // CreateReplicationSet as deprecated. That is why the account cannot start
+            // without a set — a client could never acquire one.
             let response = runtime.block_on(router.dispatch(incidents_request(
                 "/createReplicationSet",
                 &json!({"regions": {REGION: {}}}),
@@ -172,44 +195,27 @@ fn ssm_contacts_writes_are_refused_until_the_account_has_a_replication_set() {
                  {status} with {rendered}"
             );
 
-            // So the account is onboarded by writing the set into the store the gate
-            // reads, and the same rows are serviced — each created contact readable back.
-            let arn = install_replication_set(&engine);
-            assert!(
-                arn.contains(":ssm-incidents:"),
-                "the installed set must carry an Incident Manager ARN, got {arn}"
-            );
+            // The gate is still real: an account whose set is gone — which only a reach
+            // into the store can arrange — is refused the very same requests, with the
+            // modelled ValidationException rather than a 501, a 404 or a success.
+            remove_replication_set(&engine);
             for (case, body) in &rows {
                 let response = runtime
                     .block_on(router.dispatch(contacts_request("CreateContact", body)));
                 let status = response.status().as_u16();
                 let rendered = String::from_utf8_lossy(response.body()).to_string();
                 assert_eq!(
-                    status, 200,
-                    "case {case:?}: CreateContact must be serviced once the account has a \
+                    status, 400,
+                    "case {case:?}: CreateContact must be refused once the account has no \
                      replication set, got {status} with {rendered}"
                 );
-                let created: Value =
-                    serde_json::from_str(&rendered).expect("CreateContact answers JSON");
-                let arn = created["ContactArn"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("case {case:?}: expected a ContactArn in {rendered}"))
-                    .to_string();
-
-                let response = runtime.block_on(router.dispatch(contacts_request(
-                    "GetContact",
-                    &json!({"ContactId": arn}),
-                )));
-                let status = response.status().as_u16();
-                let rendered = String::from_utf8_lossy(response.body()).to_string();
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: the created contact must be readable back, got {status} \
-                     with {rendered}"
+                assert!(
+                    rendered.contains("ValidationException"),
+                    "case {case:?}: expected a ValidationException, got {status} with {rendered}"
                 );
             }
         })
         .expect("spawn the replication-set thread")
         .join()
-        .expect("SSM Contacts must refuse its writes until the account is onboarded");
+        .expect("SSM Contacts must serve the account a client finds");
 }

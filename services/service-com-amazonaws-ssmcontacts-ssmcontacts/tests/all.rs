@@ -25,6 +25,8 @@ mod contact_updates;
 mod cross_service_onboarding;
 #[path = "all/data_plane_precondition.rs"]
 mod data_plane_precondition;
+#[path = "all/default_onboarding.rs"]
+mod default_onboarding;
 #[path = "all/engagement_lifecycle.rs"]
 mod engagement_lifecycle;
 #[path = "all/onboarding.rs"]

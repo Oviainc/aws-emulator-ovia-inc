@@ -37,6 +37,23 @@ pub(crate) struct Emulator {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
+        let emulator = Self::fresh();
+        // Amazon SSM Contacts is fronted by the account's Incident Manager replication
+        // set: a contact resource lives in that set's Regions, so a write is refused
+        // until the account has an ACTIVE one (`tests/all/replication_set_precondition.rs`
+        // is the suite about that rule). This suite is about the contact lifecycle on an
+        // ONBOARDED account, so it installs the set through the one shared fixture every
+        // suite uses — a suite that varies the account's state installs its own.
+        crate::contact_updates::onboard(&emulator);
+        emulator
+    }
+
+    /// The emulator with NOTHING written into its store: the account exactly as a client
+    /// reaching a freshly started emulator finds it.
+    ///
+    /// `tests/all/default_onboarding.rs` asserts what that account can do, so it must be
+    /// handed no fixture at all; every other suite goes through [`Emulator::new`].
+    pub(crate) fn fresh() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite drives unsigned requests, so signature verification is off; the
@@ -46,15 +63,7 @@ impl Emulator {
         router.register_service(
             service_com_amazonaws_ssmcontacts_ssmcontacts::EmulatedService::new(engine.clone()),
         );
-        let emulator = Self { router, engine };
-        // Amazon SSM Contacts is fronted by the account's Incident Manager replication
-        // set: a contact resource lives in that set's Regions, so a write is refused
-        // until the account has an ACTIVE one (`tests/all/replication_set_precondition.rs`
-        // is the suite about that rule). This suite is about the contact lifecycle on an
-        // ONBOARDED account, so it installs the set through the one shared fixture every
-        // suite uses.
-        crate::contact_updates::onboard(&emulator);
-        emulator
+        Self { router, engine }
     }
 
     /// How many entries the idempotency-replay ledger holds right now.

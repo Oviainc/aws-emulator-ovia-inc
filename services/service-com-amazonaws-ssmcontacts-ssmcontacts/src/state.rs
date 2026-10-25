@@ -25,7 +25,10 @@
 //! The account-level Incident Manager precondition lives here too
 //! ([`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]): it is the
 //! same gate for every replication-set-scoped operation, so it is written once and
-//! consulted from each handler.
+//! consulted from each handler. The emulated account SATISFIES it from the start
+//! ([`ComAmazonawsSsmcontactsSsmcontactsState::default`]) — the API that mints the set is
+//! withdrawn, so no request can supply what the gate wants and an account that began
+//! without it would be refused every operation forever.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::SystemTime;
@@ -286,16 +289,31 @@ pub struct AccountReplicationSet {
     pub active: bool,
 }
 
-/// Per-service state for com-amazonaws-ssmcontacts-ssmcontacts. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
-pub struct ComAmazonawsSsmcontactsSsmcontactsState {
-    /// The account's Incident Manager replication set, when it has one.
+impl AccountReplicationSet {
+    /// The ACTIVE set this emulated account is onboarded with.
     ///
-    /// `None` is an account that was never onboarded, which is what an emulated account
-    /// normally is: Incident Manager's own `CreateReplicationSet` is the only call that
-    /// mints a set and AWS deprecated it on 2025-11-07, so nothing over the wire can
-    /// onboard one. Every replication-set-scoped operation consults it through
-    /// [`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`].
+    /// The emulated account is an account that ALREADY completed Incident Manager
+    /// onboarding, which is the only kind of account that can reach this API at all: the
+    /// one call that mints a set is withdrawn, so an account without one could never
+    /// acquire one and every operation of the service would be permanently unreachable.
+    pub fn onboarded_account() -> Self {
+        Self {
+            arn: default_replication_set_arn(),
+            active: true,
+        }
+    }
+}
+
+/// Per-service state for com-amazonaws-ssmcontacts-ssmcontacts. A handler reaches it through [`service_state`].
+#[derive(Debug)]
+pub struct ComAmazonawsSsmcontactsSsmcontactsState {
+    /// The account's Incident Manager replication set, which it holds — ACTIVE — from the
+    /// moment this store exists (see [`ComAmazonawsSsmcontactsSsmcontactsState::default`]).
+    ///
+    /// Every replication-set-scoped operation consults it through
+    /// [`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]. A set
+    /// that is absent or not yet active closes the data plane, so those two values are the
+    /// states the gate refuses — they are not what a usable account starts in.
     pub replication_set: Option<AccountReplicationSet>,
     /// Contacts and escalation plans, keyed by `ContactArn`.
     pub contacts: BTreeMap<String, ContactRecord>,
@@ -364,6 +382,39 @@ pub struct ComAmazonawsSsmcontactsSsmcontactsState {
     ///
     /// [`idempotency_tokens`]: ComAmazonawsSsmcontactsSsmcontactsState::idempotency_tokens
     pub idempotency_order: VecDeque<(String, String)>,
+}
+
+impl Default for ComAmazonawsSsmcontactsSsmcontactsState {
+    /// The store's initial value: an ONBOARDED account that owns nothing yet.
+    ///
+    /// Every resource map starts empty — only a create puts a contact, channel, rotation,
+    /// override, engagement or page in one — but the account-level prerequisite the data
+    /// plane is gated on starts PRESENT and ACTIVE
+    /// ([`AccountReplicationSet::onboarded_account`]). An account-level prerequisite whose
+    /// minting call the API no longer accepts cannot be acquired by any request, so an
+    /// account that starts without it could never be served a single gated operation,
+    /// while the account AWS serves — one onboarded while that call still existed — is
+    /// served all of them.
+    fn default() -> Self {
+        Self {
+            replication_set: Some(AccountReplicationSet::onboarded_account()),
+            contacts: BTreeMap::new(),
+            alias_index: BTreeMap::new(),
+            contact_channels: BTreeMap::new(),
+            channels_created: 0,
+            rotations: BTreeMap::new(),
+            rotations_created: 0,
+            rotation_overrides: BTreeMap::new(),
+            rotation_overrides_created: 0,
+            activation_codes_issued: 0,
+            engagements: BTreeMap::new(),
+            engagements_started: 0,
+            pages: BTreeMap::new(),
+            pages_sent: 0,
+            idempotency_tokens: BTreeMap::new(),
+            idempotency_order: VecDeque::new(),
+        }
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -786,6 +837,19 @@ pub fn request_region(parts: &http::request::Parts) -> String {
 
 /// The ARN namespace this service's ARNs carry (`awsService.arnNamespace` in the model).
 const ARN_NAMESPACE: &str = "ssm-contacts";
+
+/// The ARN of the Incident Manager replication set this account is onboarded with:
+/// `arn:aws:ssm-incidents::<account>:replication-set/<id>`.
+///
+/// The namespace is `ssm-incidents` because the set is Incident Manager's resource, not
+/// this service's, and the Region segment is empty because the set is the account-level
+/// record of WHICH Regions hold the data rather than a resource in one of them. The id is
+/// derived from the resource's own name, so it is the same in every run of this emulator
+/// and carries nothing from any request.
+pub fn default_replication_set_arn() -> String {
+    let id = opaque_uuid("replication-set");
+    ::emulator_server::emulator_arn("ssm-incidents", "", &format!("replication-set/{id}"))
+}
 
 /// A contact's ARN: `arn:aws:ssm-contacts:<region>:<account>:contact/<alias>`.
 ///
