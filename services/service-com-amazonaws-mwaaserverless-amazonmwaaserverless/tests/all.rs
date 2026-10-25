@@ -33,6 +33,8 @@ mod run_report_agreement;
 mod run_stop;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/task_instance_listing.rs"]
+mod task_instance_listing;
 #[path = "all/task_instance_reads.rs"]
 mod task_instance_reads;
 #[path = "all/validation_errors.rs"]

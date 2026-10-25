@@ -141,7 +141,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::internal_failure(
                 crate::state::STORE_UNAVAILABLE,
@@ -160,36 +159,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let page_size = crate::state::page_size(input.max_results);
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.settle_experiments(now);
+        // The guard is taken, spent and RELEASED inside this block, so the records the
+        // settle produced are written after it rather than while the store is locked.
+        let (experiments, next_token, deliveries) = {
+            let mut store = state.lock();
+            store.settle_experiments(now);
 
-        let mut experiments = Vec::with_capacity(page_size.min(store.experiments.len()));
-        let mut next_token = None;
-        for (id, record) in &store.experiments {
-            // Resume at the first id at or after the token.
-            if input
-                .next_token
-                .as_deref()
-                .is_some_and(|token| id.as_str() < token)
-            {
-                continue;
+            let mut experiments = Vec::with_capacity(page_size.min(store.experiments.len()));
+            let mut next_token = None;
+            for (id, record) in &store.experiments {
+                // Resume at the first id at or after the token.
+                if input
+                    .next_token
+                    .as_deref()
+                    .is_some_and(|token| id.as_str() < token)
+                {
+                    continue;
+                }
+                // The filter is applied BEFORE the page is cut, so a page holds
+                // `maxResults` matching experiments and the token only names one the
+                // filter admits.
+                if input
+                    .experiment_template_id
+                    .as_deref()
+                    .is_some_and(|wanted| record.experiment_template_id != wanted)
+                {
+                    continue;
+                }
+                if experiments.len() >= page_size {
+                    next_token = Some(id.clone());
+                    break;
+                }
+                experiments.push(record.to_summary());
             }
-            // The filter is applied BEFORE the page is cut, so a page holds `maxResults`
-            // matching experiments and the token only names one the filter admits.
-            if input
-                .experiment_template_id
-                .as_deref()
-                .is_some_and(|wanted| record.experiment_template_id != wanted)
-            {
-                continue;
-            }
-            if experiments.len() >= page_size {
-                next_token = Some(id.clone());
-                break;
-            }
-            experiments.push(record.to_summary());
-        }
+            let deliveries = store.take_pending_log_deliveries();
+            (experiments, next_token, deliveries)
+        };
+
+        // The records the clock already owed, to the destination each experiment's template
+        // configured — see [`crate::state::experiment_logs`].
+        crate::state::experiment_logs::deliver(ctx, &region, deliveries).await;
 
         Ok(ListExperimentsOutput {
             experiments: Some(experiments),

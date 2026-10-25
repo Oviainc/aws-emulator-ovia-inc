@@ -19,7 +19,8 @@
 //! between two pages, where the cursor the listing minted is still presented back to it.
 //!
 //! `ListTaskInstances` is the third child-resource listing and declares no not-found
-//! error either, but it is still a scaffolded 501 stub, so it has no page to assert yet.
+//! error either; the suite `task_instance_listing` carries the rule onto it, including
+//! the cursor it issues for one run's walk.
 
 use std::time::Duration;
 

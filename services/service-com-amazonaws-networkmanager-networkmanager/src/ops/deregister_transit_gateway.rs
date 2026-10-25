@@ -1,34 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterTransitGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterTransitGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deregisters one transit gateway of Amazon VPC from one global network, removing it from
+//! the one registration map the three registration operations share
+//! (`crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::transit_gateway_registrations`).
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterTransitGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `DeregisterTransitGateway::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! "This action does not delete your transit gateway, or modify any of its attachments"
+//! (`smithy_query query="doc" shape="DeregisterTransitGateway"`): the gateway belongs to
+//! Amazon VPC, so only the registration — the global network / gateway PAIR
+//! (`crate::state::transit_gateway_registration_key`) — is removed, and the record it
+//! removed is reported `DELETING`, the state the clock no longer decides for it, the way
+//! every other removal of a tie in this service reports the record it just removed. A pair
+//! that holds no registration is the missing-resource answer, so a repeat of the call is a
+//! not-found.
 //!
 //! ## Reaching this service's state
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
-//! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
-//!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
+//! The engine is held on `self` (constructor-injected), NOT passed per request. Reach the
+//! store through [`crate::state::service_state`] and read and write it through the guard
+//! it hands back.
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
@@ -153,17 +144,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterTransitGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterTransitGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterTransitGateway"))
+        // request metadata.
+        let _ = ctx;
+
+        // `TransitGatewayArn` is modelled free-form (it arrives in a path label, which the
+        // pattern `^[\s\S]*$` does not constrain), so the form of the ARN is judged here,
+        // the same way the register judges it, and before the store is locked, since
+        // nothing stored bears on it: a string that names no transit gateway at all is a
+        // field failure on the member that carried it, a different answer from a
+        // well-formed ARN this global network holds no registration for.
+        if crate::state::ec2_resource_region(
+            &input.transit_gateway_arn,
+            crate::state::TRANSIT_GATEWAY_TYPE,
+        )
+        .is_none()
+        {
+            return Err(DeregisterTransitGatewayErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_TRANSIT_GATEWAY_ARN,
+                    crate::state::REASON_FIELD_VALIDATION_FAILED,
+                    "must name a transit gateway and the Region it is in".to_string(),
+                ),
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeregisterTransitGatewayErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The registration is addressed THROUGH the global network in the path, so an
+        // unknown global network is the missing-resource answer whatever transit gateway the
+        // request names.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(
+                DeregisterTransitGatewayErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::GLOBAL_NETWORK_KIND,
+                        &input.global_network_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // The registration the request addresses is the global network / gateway PAIR, so a
+        // pair that holds no registration — one never made, one already deregistered, or one
+        // made in a DIFFERENT global network — is the missing-resource answer, naming the
+        // pair as the resource because a registration carries no id of its own. Removing it
+        // is what makes a second deregister of the same pair a 404, and what frees the
+        // gateway to be registered with another global network.
+        let key = crate::state::transit_gateway_registration_key(
+            &input.global_network_id,
+            &input.transit_gateway_arn,
+        );
+        let removed = store
+            .transit_gateway_registrations
+            .remove(&key)
+            .ok_or_else(|| {
+                DeregisterTransitGatewayErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::TRANSIT_GATEWAY_REGISTRATION_KIND,
+                        &key,
+                    ),
+                )
+            })?;
+
+        // "This action removes any customer gateway associations" (the operation's own
+        // documentation): the associations it means are those of the customer gateways
+        // reached through THIS transit gateway, a relation Amazon VPC holds (a VPN
+        // connection ties a customer gateway to a transit gateway) and this service has no
+        // record of — `AssociateCustomerGateway` ties a gateway to a DEVICE and names no
+        // transit gateway (`smithy_query query="operation"
+        // operation="AssociateCustomerGateway"`). So no stored association is removed here:
+        // removing the global network's associations wholesale would delete ties this
+        // gateway never carried.
+
+        // The removed registration is reported as `DELETING`, the way every other removal of
+        // a tie in this service reports the record it just removed; a later read no longer
+        // lists it.
+        Ok(DeregisterTransitGatewayOutput {
+            transit_gateway_registration: Some(
+                removed.to_shape_with_state(crate::state::STATE_DELETING),
+            ),
+        })
     }
 }
