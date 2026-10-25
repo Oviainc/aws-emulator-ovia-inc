@@ -299,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cluster_state, implied_instance_group_configs, validate_instance_group_config,
             AuditOutcome, ClusterRecord, ClusterStatusRecord, InstanceFleetRecord,
             InstanceGroupRecord, InstancesRecord, StepRecord, DEFAULT_STEP_CONCURRENCY_LEVEL,
-            MAX_INSTANCE_FLEETS_PER_CLUSTER, MAX_INSTANCE_GROUPS_PER_CLUSTER,
+            MAX_CLUSTERS, MAX_INSTANCE_FLEETS_PER_CLUSTER, MAX_INSTANCE_GROUPS_PER_CLUSTER,
             MAX_STEPS_PER_JOB_FLOW, MAX_STEP_CONCURRENCY_LEVEL, TRANSITION_SPAN,
         };
 
@@ -441,6 +441,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(RunJobFlowErrorModeled::InternalServerError(InternalServerError {}).into());
         };
         let mut store = state.lock();
+
+        // The account holds a bounded number of clusters: a cluster record is kept after
+        // it terminates (`ListClusters` still reports it), so past the ceiling the launch
+        // is refused and nothing is stored, the way a quota is.
+        if store.clusters.len() >= MAX_CLUSTERS {
+            return Err(refuse(format!(
+                "This account already holds {MAX_CLUSTERS} clusters, which is the maximum"
+            )));
+        }
 
         let id = store.mint_cluster_id();
         let arn = crate::state::cluster_arn(&region, &id);

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches key-value tags to the persisted resource a `ResourceArn` names.
 //!
 //! ## Shape of an operation
 //!
@@ -144,23 +136,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Attach the request's tags to the resource the `ResourceArn` names.
+    ///
+    /// A tag set is a map from key to value owned by the STORED resource, so attachment is
+    /// per KEY: a key the resource does not carry is added, a key it already carries takes
+    /// the new value ("the new tag value that you specify replaces the previous value for
+    /// that tag"), and every tag whose key the request does not name keeps its value. So the
+    /// call's result is "each of these keys now has this value", which makes a repeat of the
+    /// same call a no-op rather than a failure, and the empty `Tags` list the modelled
+    /// `length 0..200` admits attaches nothing at all.
+    ///
+    /// One resource carries at most the maximum of tags ITS OWN API documents ("You can
+    /// associate as many as 50 tags with an SLO"), and the modelled `TagList` maximum where
+    /// its API documents none, which is the rule
+    /// [`crate::state::max_tags_of`] states for every taggable kind — so the bound an
+    /// attachment enforces is the bound the create of that same kind enforces, and a stored
+    /// resource can never carry more tags than a later attachment to it admits. The RESULTING
+    /// set is what the maximum bounds — the tags the resource already carries count towards it
+    /// just as the request's do, and a key the request re-values adds nothing — so the count
+    /// is taken over the union and a request that would carry the resource past it is the
+    /// modelled `ServiceQuotaExceededException` (402), attaching nothing.
+    ///
+    /// The tag set belongs to the stored resource, so an ARN that names no resource this
+    /// service holds is the modelled `ResourceNotFoundException` (404) and writes nothing:
+    /// there is no resource to attach a tag to.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::ThrottlingException(ThrottlingException {
+                message: crate::state::STATE_UNAVAILABLE.to_string(),
+            })
+            .into());
+        };
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        let mut store = state.lock();
+
+        // A resource whose lifetime the clock has ended is gone, tags included, so the pass
+        // that materialises the lapse runs first and this attachment is refused for it
+        // exactly as for an ARN that never named a resource.
+        store.expire_instrumentation_configurations(&now);
+
+        // The tag set is keyed by the STORED resource's own ARN, so it is resolved before
+        // anything is written — and copied out, since the write borrows the store mutably.
+        let Some(arn) = store
+            .tagged_resource_arn(&input.resource_arn)
+            .map(ToString::to_string)
+        else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::tagged_resource_not_found(&input.resource_arn),
+            )
+            .into());
+        };
+
+        let count_after = store.tag_count_after_put(&arn, &input.tags);
+        let maximum = crate::state::max_tags_of(&arn);
+        if count_after > maximum {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: crate::state::tag_quota_message(count_after, maximum),
+                },
+            )
+            .into());
+        }
+
+        store.put_tags(&arn, &input.tags);
+        Ok(TagResourceOutput {})
     }
 }

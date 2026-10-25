@@ -277,7 +277,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_published: ::std::option::Option::None,
             last_published_description: ::std::option::Option::None,
             status_exception: ::std::option::Option::None,
-            preview: ::std::option::Option::None,
+            // Nothing has been published, disabled or previewed yet, so the service is
+            // building nothing for this portal.
+            transition: ::std::option::Option::None,
+            preview_ready_at: ::std::option::Option::None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             portal_id: portal_id.clone(),
         };
@@ -287,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is the invariant this create depends on. The projection is taken from the very
         // value the store now holds, which is what makes this answer the one a later
         // GetPortal reports.
-        let stored = record.to_wire();
+        let stored = record.to_wire(created_at);
         let displaced = store.portals.insert(portal_id.clone(), record);
         debug_assert!(
             displaced.is_none(),

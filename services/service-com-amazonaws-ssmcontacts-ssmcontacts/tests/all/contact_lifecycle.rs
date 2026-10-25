@@ -126,7 +126,7 @@ impl Emulator {
 
     /// Create a contact channel, asserting the call succeeded, and answer its
     /// `ContactChannelArn`.
-    async fn create_channel(&self, request: Value, case: &str) -> String {
+    pub(crate) async fn create_channel(&self, request: Value, case: &str) -> String {
         let (status, body) = self.call("CreateContactChannel", request).await;
         assert_eq!(
             status, 200,
@@ -135,6 +135,44 @@ impl Emulator {
         body["ContactChannelArn"]
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: expected a ContactChannelArn, got {body:?}"))
+            .to_string()
+    }
+
+    /// Create an on-call rotation whose shift team is `contact_arn`, asserting the call
+    /// succeeded, and answer its `RotationArn`.
+    ///
+    /// A plan's `RotationIds` entry has to name a rotation the store holds, so a suite that
+    /// writes such a plan creates the rotation first. `ContactIds` is modelled `length`
+    /// 1..30, so a rotation always names at least one contact; the recurrence is the
+    /// smallest one `CreateRotation` accepts — one daily hand-off.
+    pub(crate) async fn create_rotation(
+        &self,
+        contact_arn: &str,
+        name: &str,
+        case: &str,
+    ) -> String {
+        let (status, body) = self
+            .call(
+                "CreateRotation",
+                json!({
+                    "Name": name,
+                    "ContactIds": [contact_arn],
+                    "TimeZoneId": "UTC",
+                    "Recurrence": {
+                        "NumberOfOnCalls": 1,
+                        "RecurrenceMultiplier": 1,
+                        "DailySettings": [{"HourOfDay": 9, "MinuteOfHour": 0}],
+                    },
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected CreateRotation to answer 200, got {status} {body:?}"
+        );
+        body["RotationArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a RotationArn, got {body:?}"))
             .to_string()
     }
 
@@ -240,6 +278,11 @@ pub(crate) fn parse(text: &str) -> Value {
 /// cited; the others are rows it did not, including a contact with no `DisplayName`, one
 /// with tags, a multi-stage escalation plan and an on-call schedule whose plan carries
 /// rotations instead of stages.
+///
+/// No row's plan NAMES another resource: this suite creates one contact per emulator, and a
+/// plan's references are resolved against the store when it is written, so the rule about
+/// what a plan may name — and the resources it names being created first — is the subject of
+/// `tests/all/contact_plan_references.rs`.
 struct ContactRow {
     case: &'static str,
     alias: &'static str,
@@ -267,13 +310,13 @@ const CONTACT_CATALOG: &[ContactRow] = &[
         tags: Some(r#"[{"Key": "team", "Value": "sre"}]"#),
     },
     ContactRow {
-        case: "an escalation plan with two stages, the second naming a contact target",
+        case: "an escalation plan with two stages",
         alias: "escalation-tier-1",
         display_name: Some("Escalation Tier 1"),
         contact_type: "ESCALATION",
         plan: r#"{"Stages": [
             {"DurationInMinutes": 10, "Targets": []},
-            {"DurationInMinutes": 20, "Targets": [{"ContactTargetInfo": {"IsEssential": true}}]}
+            {"DurationInMinutes": 20, "Targets": []}
         ]}"#,
         tags: None,
     },
@@ -282,9 +325,9 @@ const CONTACT_CATALOG: &[ContactRow] = &[
         alias: "weekend-rotation",
         display_name: Some("Weekend Rotation"),
         contact_type: "ONCALL_SCHEDULE",
-        // A `RotationIds` entry only has to be an `SsmContactsArn`; the slice stores it
-        // verbatim and resolves no rotation.
-        plan: r#"{"RotationIds": ["arn:aws:ssm-contacts:us-east-1:000000000000:rotation/weekend"]}"#,
+        // The `RotationIds` SHAPE with no entry: the modelled length is 0..25, and an entry
+        // would have to name a rotation this store holds.
+        plan: r#"{"RotationIds": []}"#,
         tags: None,
     },
 ];

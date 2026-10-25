@@ -128,13 +128,14 @@ fn ssm_contacts_serves_the_account_it_finds_and_nothing_can_onboard_another() {
                     }),
                 ),
                 (
-                    "an ONCALL_SCHEDULE whose plan carries rotation ids",
+                    "an ONCALL_SCHEDULE whose plan carries the RotationIds shape",
                     json!({
                         "Alias": "weekend-rotation",
                         "Type": "ONCALL_SCHEDULE",
-                        "Plan": {"RotationIds": [
-                            "arn:aws:ssm-contacts:us-east-1:000000000000:rotation/weekend",
-                        ]},
+                        // The `RotationIds` SHAPE with no entry (modelled length 0..25): an
+                        // entry would have to name a rotation this account holds, and this
+                        // suite is about the account gate rather than what a plan may name.
+                        "Plan": {"RotationIds": []},
                     }),
                 ),
             ];

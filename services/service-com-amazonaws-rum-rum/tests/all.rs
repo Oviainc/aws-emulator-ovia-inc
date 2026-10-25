@@ -17,6 +17,8 @@ mod announced_media_type;
 mod app_monitor_lifecycle;
 #[path = "all/authorization.rs"]
 mod authorization;
+#[path = "all/batch_create_metric_definitions_targeting.rs"]
+mod batch_create_metric_definitions_targeting;
 #[path = "all/cw_log_delivery.rs"]
 mod cw_log_delivery;
 #[path = "all/list_app_monitors_page_size.rs"]

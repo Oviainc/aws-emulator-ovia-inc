@@ -51,7 +51,8 @@ use ::aws_smithy_types::DateTime;
 use crate::ops::types::{
     Attachment, Attribute, AutoScalingGroupProvider, AwsVpcConfiguration, CapacityProvider,
     CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterServiceConnectDefaults,
-    ClusterSetting, Container, ContainerDefinition, ContainerInstance, Deployment,
+    ClusterSetting, Container, ContainerDefinition, ContainerInstance, DaemonContainerDefinition,
+    DaemonTaskDefinition, DaemonVolume, Deployment,
     DeploymentCircuitBreaker, DeploymentConfiguration, DeploymentController, EphemeralStorage,
     Failure, KeyValuePair, LoadBalancer, ManagedInstancesProvider, NetworkConfiguration,
     PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProxyConfiguration,
@@ -467,6 +468,26 @@ pub const TASK_DEFINITION_ACTIVE: &str = "ACTIVE";
 /// revision keeps: "INACTIVE task definitions remain discoverable in your account
 /// indefinitely."
 pub const TASK_DEFINITION_INACTIVE: &str = "INACTIVE";
+
+/// `DaemonTaskDefinition$status` for a registered daemon revision. One of the
+/// `DaemonTaskDefinitionStatus` values
+/// (`smithy_query(query="shape", shape="DaemonTaskDefinitionStatus")`: `ACTIVE`,
+/// `DELETE_IN_PROGRESS`, `DELETED`), and the one `RegisterDaemonTaskDefinition` answers
+/// with: a registered revision is usable straight away, so no clock-owed transition
+/// leads to it.
+pub const DAEMON_TASK_DEFINITION_ACTIVE: &str = "ACTIVE";
+
+/// The namespace mode a daemon revision records when the registration named none, for
+/// `pidMode` and for `ipcMode` alike. Both members' docs: "The valid values are `none`
+/// and `shared`. The default is `none`. If `none` is specified or no value is provided,
+/// the daemon runs with its own PID/IPC namespace, isolated from other tasks" — so a
+/// registration that named nothing and one that named this value describe the same
+/// daemon, and the stored revision spells it once.
+pub const DAEMON_NAMESPACE_MODE_NONE: &str = "none";
+
+/// How many daemon task-definition revisions this emulator holds, across every family.
+/// EMULATOR-CHOSEN, for the same reason as [`MAX_TASK_DEFINITIONS`].
+pub const MAX_DAEMON_TASK_DEFINITIONS: usize = MAX_TASK_DEFINITIONS;
 
 /// The `SortOrder` value that REVERSES a listing's documented default order — the
 /// `ListTaskDefinitions$sort` doc: "Setting this parameter to `DESC` reverses the sort
@@ -925,6 +946,13 @@ pub const TASK_NOT_FOUND_MESSAGE: &str = "The referenced task was not found";
 /// refusal every operation that resolves a task-definition reference answers with.
 pub const TASK_DEFINITION_NOT_FOUND_MESSAGE: &str = "Unable to describe task definition.";
 
+/// `ClientException$message` for a `daemonTaskDefinition` that names no stored daemon
+/// revision. The same condition as [`TASK_DEFINITION_NOT_FOUND_MESSAGE`] one resource
+/// along, so like its neighbours it is ONE sentence whatever family and revision the
+/// request named.
+pub const DAEMON_TASK_DEFINITION_NOT_FOUND_MESSAGE: &str =
+    "Unable to describe daemon task definition.";
+
 /// `ClientException$message` for a `taskDefinition` that names a revision this store
 /// holds in a status that cannot run new work — the `DeregisterTaskDefinition` doc: "You
 /// can't use an `INACTIVE` task definition to run new tasks or create new services, and
@@ -952,8 +980,30 @@ pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid nextToken.";
 /// so the refusal cannot drift between the operation that reads a revision and the ones
 /// that use it.
 pub fn task_definition_reference_message(reference: &str) -> String {
+    revision_reference_message("taskDefinition", TASK_DEFINITION_RESOURCE_TYPE, reference)
+}
+
+/// `ClientException$message` for a `daemonTaskDefinition` that is not a daemon
+/// task-definition reference at all — the condition
+/// [`parse_daemon_task_definition_reference`] answers `None` for, and the same sentence
+/// [`task_definition_reference_message`] states for the plain resource.
+pub fn daemon_task_definition_reference_message(reference: &str) -> String {
+    revision_reference_message(
+        "daemonTaskDefinition",
+        DAEMON_TASK_DEFINITION_RESOURCE_TYPE,
+        reference,
+    )
+}
+
+/// The sentence a reference that names no revision of `resource_type` is refused with:
+/// the `member` it was given in, the forms that member documents and the value that is
+/// none of them.
+///
+/// Spelled once for every member of this shape, so the two resources whose references
+/// are "a family, a family:revision or a full ARN" refuse a value the same way.
+fn revision_reference_message(member: &str, resource_type: &str, reference: &str) -> String {
     format!(
-        "taskDefinition must be a family, family:revision or task-definition ARN; \
+        "{member} must be a family, family:revision or {resource_type} ARN; \
          got {reference:?}"
     )
 }
@@ -1674,6 +1724,68 @@ impl TaskDefinitionRecord {
     }
 }
 
+/// A DAEMON task-definition revision, as `RegisterDaemonTaskDefinition` stored it.
+///
+/// Its own resource beside [`TaskDefinitionRecord`]: "A daemon task definition is a
+/// template that describes the containers that form a daemon", registered under its own
+/// families, revisions and ARNs, and described by its own operation — so a daemon
+/// revision and a plain revision of the same family name are two different records.
+#[derive(Debug, Clone)]
+pub struct DaemonTaskDefinitionRecord {
+    pub arn: String,
+    pub family: String,
+    pub revision: i32,
+    pub status: String,
+    pub container_definitions: Vec<DaemonContainerDefinition>,
+    pub volumes: Vec<DaemonVolume>,
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
+    pub task_role_arn: Option<String>,
+    pub execution_role_arn: Option<String>,
+    /// The namespace modes in effect for this revision, with the default each member
+    /// documents already applied ([`DAEMON_NAMESPACE_MODE_NONE`]), so every read reports
+    /// the mode the daemon actually runs in.
+    pub pid_mode: String,
+    pub ipc_mode: String,
+    /// "The metadata that you apply to the daemon task definition": stored with the
+    /// revision, which is the only place a later read could get it from.
+    pub tags: Vec<Tag>,
+    /// The principal that registered this revision, resolved when the registration ran
+    /// — not when it is read back.
+    pub registered_by: String,
+    pub registered_at: DateTime,
+    /// "The Unix timestamp for the time when the daemon task definition delete was
+    /// requested" — absent until a delete is asked for.
+    pub delete_requested_at: Option<DateTime>,
+}
+
+impl DaemonTaskDefinitionRecord {
+    /// The `DaemonTaskDefinition` every daemon task-definition operation returns, built
+    /// from what is stored — never from the request asking for it.
+    pub fn view(&self) -> DaemonTaskDefinition {
+        DaemonTaskDefinition {
+            daemon_task_definition_arn: Some(self.arn.clone()),
+            family: Some(self.family.clone()),
+            revision: self.revision,
+            task_role_arn: self.task_role_arn.clone(),
+            execution_role_arn: self.execution_role_arn.clone(),
+            container_definitions: Some(self.container_definitions.clone()),
+            // A registration that declared no volumes reads back with an EMPTY LIST, the
+            // same shape a plain revision's `volumes` takes, so a client may index it
+            // unconditionally.
+            volumes: Some(self.volumes.clone()),
+            cpu: self.cpu.clone(),
+            memory: self.memory.clone(),
+            status: Some(self.status.clone()),
+            registered_at: Some(self.registered_at),
+            delete_requested_at: self.delete_requested_at,
+            registered_by: Some(self.registered_by.clone()),
+            pid_mode: Some(self.pid_mode.clone()),
+            ipc_mode: Some(self.ipc_mode.clone()),
+        }
+    }
+}
+
 /// A task, as `RunTask` created it and `StopTask`/the clock left it.
 #[derive(Debug, Clone)]
 pub struct TaskRecord {
@@ -2114,6 +2226,16 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// a revision is deregistered (`TaskDefinition$revision`: "the revision value
     /// always increases by one. This is even if you deregistered previous revisions").
     pub next_revision: HashMap<String, i32>,
+    /// `(family, revision)` -> the registered DAEMON task-definition revision. Daemon
+    /// task definitions are their own resource (see [`DaemonTaskDefinitionRecord`]), so
+    /// they are held beside `task_definitions` rather than in it: the same family name
+    /// can carry both, and a reference of one kind never resolves to the other's record.
+    pub daemon_task_definitions: HashMap<(String, i32), DaemonTaskDefinitionRecord>,
+    /// `family` -> the revision the next `RegisterDaemonTaskDefinition` for it will
+    /// take. Kept beside `daemon_task_definitions` for the reason `next_revision` is
+    /// kept beside `task_definitions`: a revision number is never reused, even after the
+    /// revision that held it is deleted.
+    pub next_daemon_revision: HashMap<String, i32>,
     /// `taskArn` -> the task.
     pub tasks: HashMap<String, TaskRecord>,
     /// `containerInstanceArn` -> the registered container instance.
@@ -2625,6 +2747,21 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         self.task_definitions
             .values()
             .filter(|record| record.family == family && record.status == TASK_DEFINITION_ACTIVE)
+            .max_by_key(|record| record.revision)
+    }
+
+    /// The latest `ACTIVE` daemon revision registered for `family`, if any. The
+    /// `DescribeDaemonTaskDefinition` doc: "you can simply specify the family to find the
+    /// latest ACTIVE revision in that family".
+    pub fn latest_active_daemon_revision(
+        &self,
+        family: &str,
+    ) -> Option<&DaemonTaskDefinitionRecord> {
+        self.daemon_task_definitions
+            .values()
+            .filter(|record| {
+                record.family == family && record.status == DAEMON_TASK_DEFINITION_ACTIVE
+            })
             .max_by_key(|record| record.revision)
     }
 
@@ -4230,13 +4367,33 @@ pub fn invalid_principal_arn_message(principal_arn: &str) -> String {
     format!("Invalid PrincipalArn: {principal_arn}")
 }
 
+/// The ARN resource type a task-definition revision is named under, as the resource
+/// segment of [`task_definition_arn`] and the one
+/// [`parse_task_definition_reference`] reads a reference's family out of.
+pub const TASK_DEFINITION_RESOURCE_TYPE: &str = "task-definition";
+
+/// The ARN resource type a DAEMON task-definition revision is named under — its own
+/// resource, so a daemon revision's ARN is never a plain revision's and neither
+/// reference form resolves to the other's store.
+pub const DAEMON_TASK_DEFINITION_RESOURCE_TYPE: &str = "daemon-task-definition";
+
 /// The ARN of a task-definition revision:
 /// `arn:aws:ecs:<region>:<account>:task-definition/<family>:<revision>`.
 pub fn task_definition_arn(region: &str, family: &str, revision: i32) -> String {
     ::engine::emulator_arn(
         ARN_NAMESPACE,
         region,
-        &format!("task-definition/{family}:{revision}"),
+        &format!("{TASK_DEFINITION_RESOURCE_TYPE}/{family}:{revision}"),
+    )
+}
+
+/// The ARN of a daemon task-definition revision:
+/// `arn:aws:ecs:<region>:<account>:daemon-task-definition/<family>:<revision>`.
+pub fn daemon_task_definition_arn(region: &str, family: &str, revision: i32) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{DAEMON_TASK_DEFINITION_RESOURCE_TYPE}/{family}:{revision}"),
     )
 }
 
@@ -4596,7 +4753,10 @@ pub const TAGGED_RESOURCE_TYPES: [(&str, TaggedResourceKind); 6] = [
     ("container-instance", TaggedResourceKind::ContainerInstance),
     ("service", TaggedResourceKind::Service),
     ("task", TaggedResourceKind::Task),
-    ("task-definition", TaggedResourceKind::TaskDefinition),
+    (
+        TASK_DEFINITION_RESOURCE_TYPE,
+        TaggedResourceKind::TaskDefinition,
+    ),
 ];
 
 /// Which MODELLED error a "this `resourceArn` names no such resource" refusal takes.
@@ -5065,8 +5225,30 @@ pub fn auto_scaling_group_key(reference: &str) -> &str {
 /// definition to run. If a revision isn't specified, the latest ACTIVE revision is
 /// used." `None` when the value is not a task-definition reference at all.
 pub fn parse_task_definition_reference(reference: &str) -> Option<(String, Option<i32>)> {
+    parse_revision_reference(reference, TASK_DEFINITION_RESOURCE_TYPE)
+}
+
+/// The `family` and optional `revision` a `daemonTaskDefinition` request member names.
+///
+/// The member's doc: "The family for the latest ACTIVE revision, family and revision
+/// (family:revision) for a specific revision in the family, or full Amazon Resource Name
+/// (ARN) of the daemon task definition" — the same three forms
+/// [`parse_task_definition_reference`] reads, under this resource's own ARN type.
+pub fn parse_daemon_task_definition_reference(reference: &str) -> Option<(String, Option<i32>)> {
+    parse_revision_reference(reference, DAEMON_TASK_DEFINITION_RESOURCE_TYPE)
+}
+
+/// The `family` and optional `revision` a reference to a revision of `resource_type`
+/// names: a family, a `family:revision`, or the full ARN of either.
+///
+/// One function for both resources whose references take those three forms, so a value
+/// is read the same way whichever member carried it.
+fn parse_revision_reference(
+    reference: &str,
+    resource_type: &str,
+) -> Option<(String, Option<i32>)> {
     let tail = match reference.strip_prefix("arn:") {
-        Some(_) => reference.rsplit_once(":task-definition/")?.1,
+        Some(_) => reference.rsplit_once(&format!(":{resource_type}/"))?.1,
         None => reference,
     };
     let (family, revision) = match tail.rsplit_once(':') {

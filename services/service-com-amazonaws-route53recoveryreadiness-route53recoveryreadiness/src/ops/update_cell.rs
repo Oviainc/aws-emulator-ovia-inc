@@ -162,11 +162,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        let record = state.cells.get_mut(&input.cell_name).ok_or_else(|| {
+        let not_found = || {
             UpdateCellErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
             })
-        })?;
+        };
+        // The cell must exist before its replacement list is weighed against the store,
+        // and its ARN is the container the containment gate measures against.
+        let arn = state
+            .cells
+            .get(&input.cell_name)
+            .map(|record| record.arn.clone())
+            .ok_or_else(not_found)?;
+        // THE CONTAINMENT GATE. A cell belongs to one parent cell or to one recovery
+        // group, so a replacement list may not name a cell another record already
+        // contains — refused before the record is touched, so the previous list survives
+        // the refusal. Naming a cell THIS cell already nests is not a second container.
+        state
+            .check_containment_available(&arn, &input.cells)
+            .map_err(|message| {
+                UpdateCellErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                })
+            })?;
+
+        let record = state.cells.get_mut(&input.cell_name).ok_or_else(not_found)?;
         // "completely replaces the previous list" (the `Cells` member's own docs): the
         // submitted list is stored as given, never merged with what was there.
         record.nested_cell_arns = input.cells;
@@ -174,7 +194,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The answer, read off the record that was just written — one lookup, and the
         // members are taken before the derived scopes are computed so the mutable borrow
         // ends here rather than being worked around with a second lookup.
-        let arn = record.arn.clone();
         let name = record.name.clone();
         let nested_cell_arns = record.nested_cell_arns.clone();
         let tags = record.modeled_tags();

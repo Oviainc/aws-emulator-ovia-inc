@@ -21,7 +21,8 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{
-    call, call_in, emulator, expect_error, expect_ok, optional_text, subtrees, text, texts, REGION,
+    call, call_in, emulator, expect_error, expect_ok, optional_text, subtrees, text, texts,
+    wait_for_settle, REGION,
 };
 
 /// The operation under test.
@@ -33,7 +34,10 @@ const DESCRIBE: &str = "DescribeDBEngineVersions";
 /// A KMS key identifier of the form `CreateCustomDBEngineVersion$KMSKeyId` takes — "a
 /// symmetric encryption KMS key is required for RDS Custom" — written as the 36-character
 /// key id KMS issues.
-const KMS_KEY_ID: &str = "11111111-2222-3333-4444-555555555555";
+///
+/// `pub(crate)` so the `ModifyCustomDBEngineVersion` suite creates its CEVs with the same
+/// key rather than inventing a second one.
+pub(crate) const KMS_KEY_ID: &str = "11111111-2222-3333-4444-555555555555";
 
 /// A second key, so a CEV created from a source CEV can carry its own.
 const OTHER_KMS_KEY_ID: &str = "66666666-7777-8888-9999-aaaaaaaaaaaa";
@@ -41,12 +45,19 @@ const OTHER_KMS_KEY_ID: &str = "66666666-7777-8888-9999-aaaaaaaaaaaa";
 /// A CEV manifest: "a JSON document that describes the installation .zip files stored in
 /// Amazon S3", whose `MediaImportTemplateVersion` "date is in the format YYYY-MM-DD".
 /// Written without spaces because the test harness posts form values unescaped.
-const MANIFEST: &str = "{\"MediaImportTemplateVersion\":\"2020-08-14\"}";
+///
+/// `pub(crate)` for the same reason as [`KMS_KEY_ID`].
+pub(crate) const MANIFEST: &str = "{\"MediaImportTemplateVersion\":\"2020-08-14\"}";
 
-/// `Status` of a created CEV: the value `ModifyCustomDBEngineVersion$Status` publishes
-/// first ("available — You can use this CEV to create a new RDS Custom DB instance"), and
-/// the one `DescribeDBEngineVersions` lists an engine version under by default.
-const STATUS_AVAILABLE: &str = "available";
+/// `Status` of a CEV once this service has finished creating it: the value
+/// `ModifyCustomDBEngineVersion$Status` publishes first ("available — You can use this CEV
+/// to create a new RDS Custom DB instance").
+pub(crate) const STATUS_AVAILABLE: &str = "available";
+
+/// `Status` of a CEV a create has just accepted: the media it names is imported after the
+/// create returns, so the CEV is still being created and reaches [`STATUS_AVAILABLE`] on
+/// its own.
+pub(crate) const STATUS_CREATING: &str = "creating";
 
 /// One row of the create table: a CEV of one engine family, with the members that family's
 /// documentation says it is created from.
@@ -175,7 +186,7 @@ impl Case {
 ///
 /// `<Image>` carries its own `<Status>`, so reading "the one `<Status>` of this engine
 /// version" is only well defined once the image is out of the way.
-fn strip(xml: &str, tag: &str) -> String {
+pub(crate) fn strip(xml: &str, tag: &str) -> String {
     let mut stripped = xml.to_string();
     for subtree in subtrees(xml, tag) {
         stripped = stripped.replace(&subtree, "");
@@ -196,7 +207,7 @@ fn installation_files(xml: &str) -> Vec<String> {
 
 /// The `<DBEngineVersion>` entries `DescribeDBEngineVersions` reports for one
 /// `(Engine, EngineVersion)`, with their `<Image>` stripped.
-async fn described(
+pub(crate) async fn described(
     router: &MultiServiceRouter,
     region: &str,
     case: &str,
@@ -252,11 +263,13 @@ async fn every_engine_family_persists_the_custom_version_it_was_created_with() {
             "case {case:?}: DBParameterGroupFamily must be the family of that major \
              version, got {scalars}"
         );
-        // A created CEV is one an RDS Custom DB instance can be created from.
+        // A created CEV is not usable yet: the installation media is imported after the
+        // create is accepted, so the create answers with the CEV still being created.
         assert_eq!(
             text(&scalars, "Status"),
-            STATUS_AVAILABLE,
-            "case {case:?}: a created CEV must report the status it is usable in, got {scalars}"
+            STATUS_CREATING,
+            "case {case:?}: a created CEV must report the status it is still being created \
+             in, got {scalars}"
         );
         // Its ARN names the engine and the CEV name, so a caller can hand it back as a
         // source; `CreateTime` and the engine description are reported for every entry.
@@ -362,7 +375,9 @@ async fn every_engine_family_persists_the_custom_version_it_was_created_with() {
 
     // Read every created CEV back: the record is what the report reads, so the core
     // attributes have to come back unchanged — and a CEV joins the report that lists the
-    // engine versions a caller can use, without being asked for past them.
+    // engine versions a caller can use, without being asked for past them. Each one has
+    // reached `available` on its own by now, which is the status it is usable in.
+    wait_for_settle();
     for row in CASES {
         let case = row.case();
         let entries = described(
@@ -388,7 +403,8 @@ async fn every_engine_family_persists_the_custom_version_it_was_created_with() {
         assert_eq!(
             text(entry, "Status"),
             STATUS_AVAILABLE,
-            "case {case:?}: the reported status must be the stored one, got {entry}"
+            "case {case:?}: the reported status must be the stored one, which the CEV \
+             reached on its own, got {entry}"
         );
         assert_eq!(
             text(entry, "DBParameterGroupFamily"),
