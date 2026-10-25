@@ -38,7 +38,8 @@ impl Emulator {
     ///
     /// Only a suite that has to SEED a record no implemented operation writes yet needs
     /// the engine (`crate::network_telemetry` does: the operations that register a
-    /// telemetry-bearing connection are still scaffold stubs with their own issues). Every
+    /// telemetry-bearing connection through a GATEWAY, and for a transit gateway Connect
+    /// peer, are still scaffold stubs with their own issues). Every
     /// other suite takes [`Emulator::new`] and reads a resource back through an operation.
     pub(crate) fn with_engine() -> (Self, Arc<engine::InMemoryEngine>) {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
