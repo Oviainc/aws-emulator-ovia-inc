@@ -129,8 +129,22 @@ pub(crate) fn form_encode(value: &str) -> String {
 
 /// Call one operation: `Action` plus the request's members, form-encoded exactly as an
 /// AWS SDK sends them, answered with the HTTP status and the XML body.
+///
+/// Signed for [`REGION`], which is the Region every case that does not care about Regions
+/// runs in; [`call_in`] is the same call signed for another one.
 pub(crate) async fn call(
     router: &MultiServiceRouter,
+    action: &str,
+    members: &[(String, String)],
+) -> (u16, String) {
+    call_in(router, REGION, action, members).await
+}
+
+/// [`call`], signed for `region`: CloudFormation is Regional, so the credential scope of
+/// the request is what decides which Region's stacks it reads and writes.
+pub(crate) async fn call_in(
+    router: &MultiServiceRouter,
+    region: &str,
     action: &str,
     members: &[(String, String)],
 ) -> (u16, String) {
@@ -143,12 +157,12 @@ pub(crate) async fn call(
     }
     let request = http::Request::builder()
         .method("POST")
-        .uri("https://cloudformation.us-east-1.amazonaws.com/")
+        .uri(format!("https://cloudformation.{region}.amazonaws.com/"))
         .header("content-type", "application/x-www-form-urlencoded")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/cloudformation/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/cloudformation/aws4_request, \
                  SignedHeaders=host, Signature=0123456789abcdef"
             ),
         )
@@ -1549,7 +1563,7 @@ async fn one_stacks_event_log_is_bounded_and_read_back_one_page_at_a_time() {
         let state = store(&engine);
         let mut held = state.lock();
         let stack = held
-            .resolve_mut("bounded-events")
+            .resolve_mut(REGION, "bounded-events")
             .expect("the stack just created");
         for index in 0..appended {
             stack.record_event(

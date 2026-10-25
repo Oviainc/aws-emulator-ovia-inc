@@ -43,6 +43,8 @@ mod delete_attachment;
 mod delete_connection;
 #[path = "all/delete_dependency_refusal.rs"]
 mod delete_dependency_refusal;
+#[path = "all/delete_device.rs"]
+mod delete_device;
 #[path = "all/device_lifecycle.rs"]
 mod device_lifecycle;
 #[path = "all/direct_connect_gateway_attachment_lifecycle.rs"]

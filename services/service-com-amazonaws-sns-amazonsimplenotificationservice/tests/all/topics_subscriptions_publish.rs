@@ -157,7 +157,10 @@ pub(crate) fn xml_unescape(text: &str) -> String {
 
 /// Percent-encode a form value: everything but the unreserved set, so an ARN's `:`
 /// and `/` survive the round trip.
-fn percent_encode(value: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite that drives SNS over the same awsQuery form encodes a
+/// value the same way rather than re-deriving the encoding.
+pub(crate) fn percent_encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.as_bytes() {
         match byte {

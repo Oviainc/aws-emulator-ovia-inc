@@ -299,156 +299,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_secs();
-        let mut store = state.lock();
-
-        // "The name for the composite alarm. This name must be unique within the Region."
-        // (`PutCompositeAlarmInput$AlarmName`) — one name names ONE alarm, so a name another
-        // kind of alarm already holds cannot also name a composite alarm.
-        if let Some(kind) = store
-            .alarm_kind(&input.alarm_name)
-            .filter(|kind| *kind != crate::state::ALARM_TYPE_COMPOSITE)
+        // The store's lock is held for the write only, and released before the alarms are
+        // settled below: an alarm evaluation takes it itself, and the notifications it owes
+        // are delivered with it released.
         {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "a {kind} named {} already exists in this Region",
-                input.alarm_name
-            )));
+            let mut store = state.lock();
+            write_composite_alarm(&mut store, &input, rule, children, &region, now)?;
         }
-
-        // "When you update an existing alarm, its state is left unchanged, but the update
-        // completely overwrites the previous configuration of the alarm." — the alarm this
-        // call replaces, when it replaces one: its state carries over (below) and its
-        // configuration is what the history document records as the configuration replaced.
-        let previous = store
-            .composite_alarms
-            .get(&input.alarm_name)
-            .map(|stored| stored.alarm.clone());
-        let is_update = previous.is_some();
-
-        // "The quota for alarms for this customer has already been reached." — CloudWatch's
-        // published quota is 5,000 alarms per Region per account, counted over every kind of
-        // alarm. Replacing an alarm that already exists adds none, so it is never refused.
-        if !is_update && store.alarm_count() >= crate::state::MAX_ALARMS {
-            return Err(PutCompositeAlarmErrorModeled::LimitExceededFault(
-                LimitExceededFault {
-                    message: Some(format!(
-                        "the quota of {} alarms has already been reached",
-                        crate::state::MAX_ALARMS
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // "When this operation creates an alarm, the alarm state is immediately set to
-        // INSUFFICIENT_DATA. The alarm is then evaluated and its state is set appropriately.
-        // … For a composite alarm, this initial time after creation is the only time that the
-        // alarm can be in INSUFFICIENT_DATA state."
-        let carried_state = previous.as_ref().map(|alarm| {
-            (
-                alarm.state_value.clone(),
-                alarm.state_reason.clone(),
-                alarm.state_reason_data.clone(),
-                alarm.state_updated_timestamp,
-                alarm.state_transitioned_timestamp,
-            )
-        });
-        let (state_value, state_reason, state_reason_data, state_updated, state_transitioned) =
-            carried_state.unwrap_or_else(|| {
-                (
-                    Some(crate::state::ALARM_STATE_INSUFFICIENT_DATA.to_string()),
-                    Some("Unchecked: initial alarm creation".to_string()),
-                    None,
-                    Some(crate::state::to_timestamp(now)),
-                    Some(crate::state::to_timestamp(now)),
-                )
-            });
-
-        let alarm = CompositeAlarm {
-            alarm_name: Some(input.alarm_name.clone()),
-            alarm_arn: Some(crate::state::alarm_arn(&region, &input.alarm_name)),
-            alarm_description: input.alarm_description.clone(),
-            alarm_rule: Some(input.alarm_rule.clone()),
-            alarm_configuration_updated_timestamp: Some(crate::state::to_timestamp(now)),
-            // "Indicates whether actions should be executed during any changes to the alarm
-            // state of the composite alarm. The default is TRUE."
-            // (`PutCompositeAlarmInput$ActionsEnabled`)
-            actions_enabled: Some(input.actions_enabled.unwrap_or(true)),
-            ok_actions: input.ok_actions.clone(),
-            alarm_actions: input.alarm_actions.clone(),
-            insufficient_data_actions: input.insufficient_data_actions.clone(),
-            state_value,
-            state_reason,
-            state_reason_data,
-            state_updated_timestamp: state_updated,
-            state_transitioned_timestamp: state_transitioned,
-            // Suppression is a fact about the suppressor alarm's CURRENT state, so it is
-            // computed by the evaluation below rather than taken from the request.
-            actions_suppressed_by: None,
-            actions_suppressed_reason: None,
-            actions_suppressor: input.actions_suppressor.clone(),
-            actions_suppressor_wait_period: input.actions_suppressor_wait_period,
-            actions_suppressor_extension_period: input.actions_suppressor_extension_period,
-            action_configuration: input.action_configuration.clone(),
-        };
-
-        // "Data about the alarm, in JSON format." (`AlarmHistoryItem$HistoryData`) — the
-        // configuration this call stored, and the one it replaced when it replaced an alarm.
-        let history_data =
-            crate::state::composite_configuration_update_history_data(previous.as_ref(), &alarm);
-
-        // "If you are using this operation to update an existing alarm, any tags you specify
-        // in this parameter are ignored." (`PutCompositeAlarmInput$Tags`)
-        let tags = match &previous {
-            Some(_) => store
-                .composite_alarms
-                .get(&input.alarm_name)
-                .map(|stored| stored.tags.clone())
-                .unwrap_or_default(),
-            None => input.tags.clone().unwrap_or_default(),
-        };
-
-        store.composite_alarms.insert(
-            input.alarm_name.clone(),
-            crate::state::StoredCompositeAlarm {
-                alarm,
-                // Parsed ONCE, here: every later evaluation and relationship read walks this
-                // tree rather than parsing the rule text again.
-                // How many nodes it carries, and the child names it resolves to, are derived
-                // ONCE here too, so no later pass re-walks the tree to obtain them.
-                rule_nodes: rule.node_count(),
-                child_names: children,
-                rule,
-                tags,
-                // The evaluation this write owes is due a span after it, so the alarm a
-                // caller reads straight back still carries the state this write left.
-                evaluation_due_secs: now + crate::state::COMPOSITE_EVALUATION_DELAY_SECS,
-                // The stored state is this write's own, not one `SetAlarmState` forced.
-                forced_child_states: None,
-            },
-        );
-        store.record_history(
-            &input.alarm_name,
-            now,
-            AlarmHistoryItem {
-                alarm_name: Some(input.alarm_name.clone()),
-                alarm_contributor_id: None,
-                alarm_type: Some(crate::state::ALARM_TYPE_COMPOSITE.to_string()),
-                timestamp: Some(crate::state::to_timestamp(now)),
-                history_item_type: Some("ConfigurationUpdate".to_string()),
-                history_summary: Some(if is_update {
-                    "Alarm updated from configuration".to_string()
-                } else {
-                    "Alarm created".to_string()
-                }),
-                history_data: Some(history_data),
-                alarm_contributor_attributes: None,
-            },
-        );
-        // Evaluations other writes already made due are materialised here too, so the store
-        // this call leaves behind is as current as the clock makes it. The alarm this call
+        // Every alarm evaluation the clock has already made due is materialised, and the
+        // notifications the resulting transitions owe are delivered. The alarm this call
         // wrote is not among them: its own evaluation is not due yet.
-        store.evaluate_composite_alarms(now);
+        crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
 
         Ok(PutCompositeAlarmOutput)
     }
+}
+
+/// Store the composite alarm this request configures, and record the history item for the
+/// write.
+///
+/// The whole write, so the one place that holds the store's lock is the caller's block.
+fn write_composite_alarm(
+    store: &mut crate::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
+    input: &PutCompositeAlarmInput,
+    rule: crate::state::AlarmRule,
+    children: Vec<String>,
+    region: &str,
+    now: f64,
+) -> Result<(), PutCompositeAlarmError> {
+    // "The name for the composite alarm. This name must be unique within the Region."
+    // (`PutCompositeAlarmInput$AlarmName`) — one name names ONE alarm, so a name another kind
+    // of alarm already holds cannot also name a composite alarm.
+    if let Some(kind) = store
+        .alarm_kind(&input.alarm_name)
+        .filter(|kind| *kind != crate::state::ALARM_TYPE_COMPOSITE)
+    {
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            "a {kind} named {} already exists in this Region",
+            input.alarm_name
+        )));
+    }
+
+    // "When you update an existing alarm, its state is left unchanged, but the update
+    // completely overwrites the previous configuration of the alarm." — the alarm this
+    // call replaces, when it replaces one: its state carries over (below) and its
+    // configuration is what the history document records as the configuration replaced.
+    let previous = store
+        .composite_alarms
+        .get(&input.alarm_name)
+        .map(|stored| stored.alarm.clone());
+    let is_update = previous.is_some();
+
+    // "The quota for alarms for this customer has already been reached." — CloudWatch's
+    // published quota is 5,000 alarms per Region per account, counted over every kind of
+    // alarm. Replacing an alarm that already exists adds none, so it is never refused.
+    if !is_update && store.alarm_count() >= crate::state::MAX_ALARMS {
+        return Err(PutCompositeAlarmErrorModeled::LimitExceededFault(
+            LimitExceededFault {
+                message: Some(format!(
+                    "the quota of {} alarms has already been reached",
+                    crate::state::MAX_ALARMS
+                )),
+            },
+        )
+        .into());
+    }
+
+    // "When this operation creates an alarm, the alarm state is immediately set to
+    // INSUFFICIENT_DATA. The alarm is then evaluated and its state is set appropriately.
+    // … For a composite alarm, this initial time after creation is the only time that the
+    // alarm can be in INSUFFICIENT_DATA state."
+    let carried_state = previous.as_ref().map(|alarm| {
+        (
+            alarm.state_value.clone(),
+            alarm.state_reason.clone(),
+            alarm.state_reason_data.clone(),
+            alarm.state_updated_timestamp,
+            alarm.state_transitioned_timestamp,
+        )
+    });
+    let (state_value, state_reason, state_reason_data, state_updated, state_transitioned) =
+        carried_state.unwrap_or_else(|| {
+            (
+                Some(crate::state::ALARM_STATE_INSUFFICIENT_DATA.to_string()),
+                Some("Unchecked: initial alarm creation".to_string()),
+                None,
+                Some(crate::state::to_timestamp(now)),
+                Some(crate::state::to_timestamp(now)),
+            )
+        });
+
+    let alarm = CompositeAlarm {
+        alarm_name: Some(input.alarm_name.clone()),
+        alarm_arn: Some(crate::state::alarm_arn(region, &input.alarm_name)),
+        alarm_description: input.alarm_description.clone(),
+        alarm_rule: Some(input.alarm_rule.clone()),
+        alarm_configuration_updated_timestamp: Some(crate::state::to_timestamp(now)),
+        // "Indicates whether actions should be executed during any changes to the alarm
+        // state of the composite alarm. The default is TRUE."
+        // (`PutCompositeAlarmInput$ActionsEnabled`)
+        actions_enabled: Some(input.actions_enabled.unwrap_or(true)),
+        ok_actions: input.ok_actions.clone(),
+        alarm_actions: input.alarm_actions.clone(),
+        insufficient_data_actions: input.insufficient_data_actions.clone(),
+        state_value,
+        state_reason,
+        state_reason_data,
+        state_updated_timestamp: state_updated,
+        state_transitioned_timestamp: state_transitioned,
+        // Suppression is a fact about the suppressor alarm's CURRENT state, so it is
+        // computed by the evaluation below rather than taken from the request.
+        actions_suppressed_by: None,
+        actions_suppressed_reason: None,
+        actions_suppressor: input.actions_suppressor.clone(),
+        actions_suppressor_wait_period: input.actions_suppressor_wait_period,
+        actions_suppressor_extension_period: input.actions_suppressor_extension_period,
+        action_configuration: input.action_configuration.clone(),
+    };
+
+    // "Data about the alarm, in JSON format." (`AlarmHistoryItem$HistoryData`) — the
+    // configuration this call stored, and the one it replaced when it replaced an alarm.
+    let history_data =
+        crate::state::composite_configuration_update_history_data(previous.as_ref(), &alarm);
+
+    // "If you are using this operation to update an existing alarm, any tags you specify
+    // in this parameter are ignored." (`PutCompositeAlarmInput$Tags`)
+    let tags = match &previous {
+        Some(_) => store
+            .composite_alarms
+            .get(&input.alarm_name)
+            .map(|stored| stored.tags.clone())
+            .unwrap_or_default(),
+        None => input.tags.clone().unwrap_or_default(),
+    };
+
+    store.composite_alarms.insert(
+        input.alarm_name.clone(),
+        crate::state::StoredCompositeAlarm {
+            alarm,
+            // Parsed ONCE, by the caller: every later evaluation and relationship read walks
+            // this tree rather than parsing the rule text again. How many nodes it carries,
+            // and the child names it resolves to, are derived ONCE too, so no later pass
+            // re-walks the tree to obtain them.
+            rule_nodes: rule.node_count(),
+            child_names: children,
+            rule,
+            tags,
+            // The evaluation this write owes is due a span after it, so the alarm a
+            // caller reads straight back still carries the state this write left.
+            evaluation_due_secs: now + crate::state::COMPOSITE_EVALUATION_DELAY_SECS,
+            // The stored state is this write's own, not one `SetAlarmState` forced.
+            forced_child_states: None,
+        },
+    );
+    store.record_history(
+        &input.alarm_name,
+        now,
+        AlarmHistoryItem {
+            alarm_name: Some(input.alarm_name.clone()),
+            alarm_contributor_id: None,
+            alarm_type: Some(crate::state::ALARM_TYPE_COMPOSITE.to_string()),
+            timestamp: Some(crate::state::to_timestamp(now)),
+            history_item_type: Some("ConfigurationUpdate".to_string()),
+            history_summary: Some(if is_update {
+                "Alarm updated from configuration".to_string()
+            } else {
+                "Alarm created".to_string()
+            }),
+            history_data: Some(history_data),
+            alarm_contributor_attributes: None,
+        },
+    );
+    Ok(())
 }

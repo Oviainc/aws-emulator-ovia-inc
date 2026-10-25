@@ -88,7 +88,7 @@ const QUEUE_ARN: &str = "arn:aws:sqs:us-west-2:000000000000:q1";
 /// The ARN AWS documents for these resources. Route 53 Application Recovery Controller
 /// readiness is a GLOBAL service, so the region segment is empty. Written out here
 /// rather than taken from the handler's helper, so the test pins the format.
-fn arn(resource_type: &str, name: &str) -> String {
+pub(crate) fn arn(resource_type: &str, name: &str) -> String {
     format!(
         "arn:aws:route53-recovery-readiness::{account}:{resource_type}/{name}",
         account = engine::EMULATOR_ACCOUNT_ID
@@ -97,14 +97,14 @@ fn arn(resource_type: &str, name: &str) -> String {
 
 /// An ARN as ONE URI path segment: `{ResourceArn}` is a non-greedy `@httpLabel`, so an
 /// SDK percent-encodes the ARN's `:` and `/` before sending it.
-fn label(value: &str) -> String {
+pub(crate) fn label(value: &str) -> String {
     value.replace('%', "%25").replace(':', "%3A").replace('/', "%2F")
 }
 
 /// Which of the four readiness resources a request addresses. Every rule below holds
 /// for all four, so the tables run over this axis rather than over one kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Cell,
     RecoveryGroup,
     ReadinessCheck,
@@ -112,7 +112,7 @@ enum Kind {
 }
 
 impl Kind {
-    const ALL: [Kind; 4] = [
+    pub(crate) const ALL: [Kind; 4] = [
         Kind::Cell,
         Kind::RecoveryGroup,
         Kind::ReadinessCheck,
@@ -120,7 +120,7 @@ impl Kind {
     ];
 
     /// The collection URI, from the model's `@http` bindings.
-    fn collection(self) -> &'static str {
+    pub(crate) fn collection(self) -> &'static str {
         match self {
             Kind::Cell => "/cells",
             Kind::RecoveryGroup => "/recoverygroups",
@@ -130,7 +130,7 @@ impl Kind {
     }
 
     /// The resource-type segment of this kind's ARN.
-    fn arn_type(self) -> &'static str {
+    pub(crate) fn arn_type(self) -> &'static str {
         match self {
             Kind::Cell => "cell",
             Kind::RecoveryGroup => "recovery-group",
@@ -181,7 +181,7 @@ impl Kind {
     }
 
     /// The smallest create request that stores a record under `name`.
-    fn create_body(self, name: &str) -> Value {
+    pub(crate) fn create_body(self, name: &str) -> Value {
         match self {
             Kind::Cell => json!({"cellName": name}),
             Kind::RecoveryGroup => json!({"recoveryGroupName": name}),
@@ -199,7 +199,7 @@ impl Kind {
 
 /// Assert `reply` is the refusal `status` / `code` / `message` names, and that the
 /// message is the service's constant rather than a sentence built from the request.
-fn assert_refused(case: &str, reply: &Reply, status: u16, code: &str, message: &str) {
+pub(crate) fn assert_refused(case: &str, reply: &Reply, status: u16, code: &str, message: &str) {
     assert_eq!(
         reply.status, status,
         "case {case:?}: expected HTTP {status}, got {} / {}",
@@ -220,7 +220,7 @@ fn assert_refused(case: &str, reply: &Reply, status: u16, code: &str, message: &
 }
 
 /// Create `name` of `kind` and assert the create succeeded.
-async fn create(emulator: &Emulator, kind: Kind, name: &str) -> Reply {
+pub(crate) async fn create(emulator: &Emulator, kind: Kind, name: &str) -> Reply {
     create_with(emulator, kind, kind.create_body(name), name).await
 }
 
@@ -236,7 +236,7 @@ async fn create_with(emulator: &Emulator, kind: Kind, body: Value, case: &str) -
     reply
 }
 
-async fn read(emulator: &Emulator, kind: Kind, name: &str) -> Reply {
+pub(crate) async fn read(emulator: &Emulator, kind: Kind, name: &str) -> Reply {
     emulator
         .send("GET", &format!("{}/{name}", kind.collection()), None)
         .await

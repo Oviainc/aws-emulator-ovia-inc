@@ -302,6 +302,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(request) = store.agreement_requests.get_mut(&input.agreement_request_id) {
             request.accepted_agreement_id = Some(id.clone());
         }
+        // Accepting the quote also INVOICES the charges it incurs right now:
+        // a charge timed `ON_ACCEPTANCE` is "charged immediately when the
+        // agreement request is accepted", so the invoice that bills it is
+        // issued by this call. `ListAgreementInvoiceLineItems` reports them,
+        // and `BatchCreateBillingAdjustmentRequest` adjusts one of them — see
+        // `crate::state::Invoice` for which charges are invoiced at all.
+        for invoice in store.issue_acceptance_invoices(&id, now) {
+            crate::state::audit("AcceptAgreementRequest", "invoiced", &invoice, ctx.parts());
+        }
         crate::state::audit("AcceptAgreementRequest", "accepted", &id, ctx.parts());
 
         // `AgreementStatus` documents the status the agreement a replacement

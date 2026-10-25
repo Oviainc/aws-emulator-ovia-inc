@@ -279,7 +279,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // "If you specify the name of a change set, you must also specify the stack name":
         // only an ARN names a change set on its own.
         crate::state::require_stack_for_change_set_name(
@@ -294,13 +293,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "DescribeChangeSet",
             ));
         };
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // Reporting operation: the only write is materialising a status transition the
         // clock had already made due, which was owed whether or not anyone called.
         store.settle(::std::time::SystemTime::now());
 
         let change_set = store
-            .resolve_change_set(&input.change_set_name, input.stack_name.as_deref())
+            .resolve_change_set(&region, &input.change_set_name, input.stack_name.as_deref())
             .ok_or_else(|| {
                 DescribeChangeSetError::from(
                     DescribeChangeSetErrorModeled::ChangeSetNotFoundException(

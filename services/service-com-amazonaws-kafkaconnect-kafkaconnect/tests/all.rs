@@ -37,3 +37,5 @@ mod validation_messages;
 mod worker_configuration_create_and_describe;
 #[path = "all/worker_configuration_delete_and_tags.rs"]
 mod worker_configuration_delete_and_tags;
+#[path = "all/worker_configuration_properties_encoding.rs"]
+mod worker_configuration_properties_encoding;

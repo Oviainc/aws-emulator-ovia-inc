@@ -190,6 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // makes.
         crate::state::refuse_unassumable_role(&*self.engine, input.role_arn.as_deref())?;
         let now = ::std::time::SystemTime::now();
+        // A stack name or id names a stack only in the Region the request was signed for:
+        // the same name in another Region is another stack, and this call must not delete
+        // it.
+        let request_region = crate::state::request_region(ctx.parts());
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that delete the stack's resources run after it, and each of those reaches
         // another service's own handler, which takes that service's lock.
@@ -199,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // Deleting a stack that is not in the live set is a no-op that succeeds: the
             // request asks for a state the store is already in.
-            let Some(previous) = store.resolve(&input.stack_name) else {
+            let Some(previous) = store.resolve(&request_region, &input.stack_name) else {
                 return Ok(DeleteStackOutput);
             };
             if !previous.is_live() {
@@ -242,9 +246,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let operation_id = crate::state::new_operation_id();
-            let stack = store
-                .resolve_mut(&input.stack_name)
-                .expect("the stack resolved immediately above");
+            // Resolved again for the write, this time mutably. A stack that is no longer
+            // there is the same no-op success the read above answers for one the store
+            // does not hold.
+            let Some(stack) = store.resolve_mut(&request_region, &input.stack_name) else {
+                return Ok(DeleteStackOutput);
+            };
             stack.deletion_mode = input.deletion_mode.clone();
             if let Some(config) = input.deployment_config.as_ref() {
                 stack.deployment_config = crate::state::stored_deployment_config(Some(config));
@@ -281,7 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let deleted = crate::state::provisioning::delete(ctx, &region, &resources).await;
 
         let mut store = state.lock();
-        if let Some(stack) = store.resolve_mut(&stack_id) {
+        if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
             // What is left: a resource whose deletion the owning service carried out no
             // longer carries `materialised`, so a retried delete does not ask for it
             // again.

@@ -210,7 +210,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no stack store to read, so this
             // answers 501 rather than an empty, truthful-looking list.
@@ -224,13 +223,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock had already made due, which was owed whether or not anyone called.
         store.settle(::std::time::SystemTime::now());
 
+        // CloudFormation is Regional: this read answers from the stacks of the Region the
+        // request was signed for, and a name or id of another Region's stack names nothing
+        // here.
+        let region = crate::state::request_region(ctx.parts());
         let matching: Vec<&StoredStack> = match &input.stack_name {
             // "The name or the unique stack ID that's associated with the stack …
             // Running stacks: either. Deleted stacks: you must specify the unique stack
             // ID." A name that resolves to nothing is a `ValidationError`, not an empty
             // list: "If the stack doesn't exist, a ValidationError is returned."
             Some(name_or_id) => {
-                let stack = store.resolve(name_or_id).ok_or_else(|| {
+                let stack = store.resolve(&region, name_or_id).ok_or_else(|| {
                     crate::scaffolded::Scaffolded::validation_error(
                         crate::state::stack_does_not_exist(name_or_id),
                     )
@@ -239,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // "Deleted stacks don't show up in the DescribeStacks operation if the
             // deletion has been completed successfully."
-            None => store.live_stacks().collect(),
+            None => store.live_stacks(&region).collect(),
         };
         // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Stacks)`: one
         // response carries one bounded page, and the token resumes just past it. The page
