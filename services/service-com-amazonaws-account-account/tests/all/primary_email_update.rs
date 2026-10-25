@@ -156,10 +156,9 @@ fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
 }
 
 /// An account with no primary email update ever started has no status to
-/// report: the read is refused with HTTP 400 `ValidationException`, whether the
-/// request names no account, the caller's own, or one the store does not know
-/// (which is a 403 instead — the caller is outside that account's
-/// organization).
+/// report: the read is refused with HTTP 400 `ValidationException` when the
+/// request names no account, while an account the store does not know — and the
+/// caller's own id, which this member cannot name — are the 403 instead.
 #[tokio::test]
 async fn a_status_read_with_no_update_started_is_refused() {
     // (case, request, expected status, expected code)
@@ -173,8 +172,8 @@ async fn a_status_read_with_no_update_started_is_refused() {
         (
             "the caller's own account named explicitly",
             json!({"AccountId": default_account_id()}),
-            400,
-            "ValidationException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "a member account the store does not know",

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBEngineVersions
-//! IMPLEMENTED: this operation reports this service's DB engine version catalogue,
-//! narrowed by the request's `Engine`, `EngineVersion` and `DBParameterGroupFamily`
+//! IMPLEMENTED: this operation reports this service's DB engine version catalogue and the
+//! custom engine versions the account stored, narrowed by the request's `Engine`,
+//! `EngineVersion` and `DBParameterGroupFamily`
 //! members, its `Filters`, `DefaultOnly` and `IncludeAll`, and paged by `MaxRecords` /
 //! `Marker`. This is the ONLY file to touch for it.
 //!
@@ -15,12 +16,13 @@
 //! `custom-sqlserver-ee`, `custom-sqlserver-se`, `custom-sqlserver-web`, and
 //! `custom-sqlserver-dev` beside them on `CreateDBInstance$Engine`).
 //!
-//! The one engine-version kind that IS caller state is RDS Custom for ORACLE, whose
-//! versions exist only as records `CreateCustomDBEngineVersion` mints from
-//! customer-supplied installation media (that member's own documentation) and which the
-//! catalogue operations list no valid value for. That operation is still a scaffolded
-//! 501, so this service holds none and reports none for the `custom-oracle-*` engines.
-//! When it is implemented its records join this report.
+//! The one engine-version kind that IS caller state is a CUSTOM engine version (CEV), the
+//! record `CreateCustomDBEngineVersion` mints from customer-supplied installation media or
+//! from an Amazon Machine Image. Those records are reported here beside the catalogue,
+//! narrowed by the same members and filters, and only to the region they were created in —
+//! which is the whole of what this service reports for the `custom-oracle-*` engines, the
+//! family whose versions are ONLY ever CEVs and which the catalogue operations list no
+//! valid value for.
 //!
 //! ## Shape of an operation
 //!
@@ -184,10 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // This operation reports reference data: it holds no per-caller records, so it
-        // reads neither this service's store nor the request context. Both are bound so
-        // the generated signature stays as it is.
-        let _ = (ctx, &self.engine);
+        // Most of this report is reference data, the same for every caller; the CUSTOM
+        // engine versions in it are the account's own records, so the request's region —
+        // which is the scope they were created in — decides which of them it sees.
+        let region =
+            crate::state::request_region(ctx).map_err(DescribeDBEngineVersionsError::validation)?;
 
         let page_size = crate::state::check_max_records(input.max_records)
             .map_err(DescribeDBEngineVersionsError::validation)?;
@@ -202,8 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let certificates = crate::state::supported_ca_certificate_identifiers();
         // `catalogue()` yields the rows in catalogue order, so the keys below ascend and
         // `paginate` can cut a page from them directly.
-        let matching: Vec<(String, CreateCustomDBEngineVersionOutput)> = catalogue()
-            .filter(|(_, entry, _)| matches_request(entry, &input, &filters))
+        let mut matching: Vec<(String, CreateCustomDBEngineVersionOutput)> = catalogue()
+            .filter(|(_, entry, _)| {
+                matches_request(&SelectableVersion::of_catalogue(entry), &input, &filters)
+            })
             .map(|(index, entry, facts)| {
                 (
                     page_key(index),
@@ -211,6 +216,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })
             .collect();
+        // Then the custom engine versions this account created in this region, in stored
+        // key order — which is why their page keys sort after every catalogue key, so one
+        // total order still carries the whole report.
+        if let Some(state) = crate::state::service_state(&*self.engine) {
+            let store = state.lock();
+            matching.extend(
+                store
+                    .custom_db_engine_versions_in(&region)
+                    .into_iter()
+                    .filter_map(|record| {
+                        // Resolved ONCE per record, and shared by the selection rule and
+                        // the projection.
+                        let profile =
+                            custom_version_basis(&record.engine, &record.engine_version).profile;
+                        matches_request(
+                            &SelectableVersion::of_custom(record, profile),
+                            &input,
+                            &filters,
+                        )
+                        .then(|| {
+                            (
+                                custom_page_key(record),
+                                custom_version_to_wire(record, profile, &input, &certificates),
+                            )
+                        })
+                    }),
+            );
+        }
         // `DefaultOnly` reports "only the default version of the specified engine or the
         // engine and major version combination" — so there has to BE a specified engine
         // whose default to report, and this door has to resolve a default for it (see
@@ -254,6 +287,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// that lexicographic key order is numeric position order.
 fn page_key(index: usize) -> String {
     format!("{index:06}")
+}
+
+/// The pagination key of one stored CUSTOM engine version.
+///
+/// Stable and ordered for the same reason [`page_key`] is, and keyed by the record's own
+/// `(engine, version)` key so the account's CEVs are reported in the order the store
+/// holds them. The prefix is what keeps the two halves of this report in ONE total order:
+/// no digit sorts above a letter, so every custom entry follows every catalogue entry
+/// however many catalogue rows there are.
+fn custom_page_key(record: &crate::state::CustomDbEngineVersionRecord) -> String {
+    format!("cev:{}", record.key())
 }
 
 /// The filter names this operation's `Filters` member documents: "`db-parameter-group-family`",
@@ -779,16 +823,19 @@ const DOCDB_LOG_TYPES: &[&str] = &["audit", "profiler"];
 ///
 /// The engine names are the `Engine` member's published "Valid Values"
 /// (`smithy_query(query="doc",shape="DescribeDBEngineVersionsMessage",member="Engine")`),
-/// minus the four `custom-oracle-*` engines and plus the four `custom-sqlserver-*`
+/// plus the four `custom-sqlserver-*`
 /// engines — which THIS operation's `Engine` member lists none of, so their grounding is
 /// `DescribeDBMajorEngineVersionsRequest$Engine` and `CreateDBInstance$Engine`. What
-/// decides whether an engine belongs here is WHO creates its versions:
+/// decides whether an engine's versions are CATALOGUE rows ([`CATALOG`]) or stored
+/// records is WHO creates them:
 ///
 /// * RDS Custom for Oracle — the `custom-oracle-*` engines — has versions the account
 ///   mints with `CreateCustomDBEngineVersion` from customer-supplied installation media
 ///   (that operation's `Engine` and `DatabaseInstallationFilesS3BucketName`
-///   documentation), so this service reports one only once that operation stores one,
-///   never as catalogue data;
+///   documentation), so this service carries no catalogue row for them and reports one
+///   only once that operation has stored it. The engine facts are still here, because a
+///   stored custom engine version of one of those engines is reported with its ENGINE's
+///   description and character sets like every other entry;
 /// * RDS Custom for SQL Server — `custom-sqlserver-ee`, `custom-sqlserver-se`,
 ///   `custom-sqlserver-web` and `custom-sqlserver-dev` — has AWS-PROVIDED custom engine
 ///   versions, which is why the catalogue operations publish those engine names as valid
@@ -826,6 +873,47 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Aurora (PostgreSQL)",
         exportable_log_types: AURORA_POSTGRESQL_LOG_TYPES,
         character_sets: &[],
+        nchar_character_sets: &[],
+        timezones: &[],
+    },
+    // RDS Custom for ORACLE. These engines carry no catalogue row: their versions are the
+    // custom engine versions an account mints. The Oracle character sets are the engine's
+    // own, while the NCHAR sets are left out ("this setting doesn't apply to RDS Custom DB
+    // instances" on `CreateDBInstance$NcharCharacterSetName`), and RDS Custom publishes no
+    // CloudWatch log export, so the exportable log types are empty.
+    EngineFacts {
+        engine: "custom-oracle-ee",
+        product: "Oracle Database Enterprise Edition",
+        description: "RDS Custom for Oracle Enterprise Edition",
+        exportable_log_types: &[],
+        character_sets: ORACLE_CHARACTER_SETS,
+        nchar_character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "custom-oracle-ee-cdb",
+        product: "Oracle Database Enterprise Edition (CDB)",
+        description: "RDS Custom for Oracle Enterprise Edition (multi-tenant architecture)",
+        exportable_log_types: &[],
+        character_sets: ORACLE_CHARACTER_SETS,
+        nchar_character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "custom-oracle-se2",
+        product: "Oracle Database Standard Edition Two",
+        description: "RDS Custom for Oracle Standard Edition Two",
+        exportable_log_types: &[],
+        character_sets: ORACLE_CHARACTER_SETS,
+        nchar_character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "custom-oracle-se2-cdb",
+        product: "Oracle Database Standard Edition Two (CDB)",
+        description: "RDS Custom for Oracle Standard Edition Two (multi-tenant architecture)",
+        exportable_log_types: &[],
+        character_sets: ORACLE_CHARACTER_SETS,
         nchar_character_sets: &[],
         timezones: &[],
     },
@@ -2036,7 +2124,7 @@ pub(crate) fn serves_another_control_plane(engine: &str) -> bool {
 /// `ListSupportedTimezones` apply to. The gate only ever sees an engine name the
 /// catalogue itself carries, so the prefix match is exact, like every other engine
 /// comparison in this module.
-fn is_rds_custom_engine(engine: &str) -> bool {
+pub(crate) fn is_rds_custom_engine(engine: &str) -> bool {
     engine.starts_with("custom-")
 }
 
@@ -2175,9 +2263,64 @@ pub(crate) fn offers_major_engine_version(engine: &str, major_engine_version: &s
     })
 }
 
+/// What a request SELECTS an engine version on: the members `Engine`, `EngineVersion`,
+/// `DBParameterGroupFamily`, `DefaultOnly` and `IncludeAll` read, and the members the
+/// `Filters` name.
+///
+/// Borrowed, and shared by the two kinds of engine version this report carries — a
+/// catalogue row and a custom engine version the account stored — so ONE selection rule
+/// answers a request rather than one rule per source of versions.
+struct SelectableVersion<'a> {
+    engine: &'a str,
+    engine_version: &'a str,
+    major_engine_version: &'a str,
+    parameter_group_family: &'a str,
+    status: &'a str,
+    engine_modes: &'static [&'static str],
+    default_level: DefaultLevel,
+}
+
+impl<'a> SelectableVersion<'a> {
+    /// What a request selects a CATALOGUE row on.
+    fn of_catalogue(entry: &'a CatalogVersion) -> Self {
+        Self {
+            engine: entry.engine,
+            engine_version: entry.engine_version,
+            major_engine_version: entry.major_engine_version,
+            parameter_group_family: entry.parameter_group_family,
+            status: entry.status,
+            engine_modes: entry.profile.engine_modes,
+            default_level: entry.default_level,
+        }
+    }
+
+    /// What a request selects a STORED custom engine version on.
+    ///
+    /// Its `DefaultLevel` is `Neither`: a default engine version is one of the versions
+    /// AWS publishes for an engine, so a CEV an account minted is never the default of its
+    /// engine or of its major version, and `DefaultOnly` therefore never selects it.
+    /// `profile` is the capability profile of the engine version the CEV is built on,
+    /// resolved once per record by the caller ([`custom_version_basis`]) and shared with
+    /// the projection, so one record is read from the catalogue once per request.
+    fn of_custom(
+        record: &'a crate::state::CustomDbEngineVersionRecord,
+        profile: &'static VersionProfile,
+    ) -> Self {
+        Self {
+            engine: &record.engine,
+            engine_version: &record.engine_version,
+            major_engine_version: &record.major_engine_version,
+            parameter_group_family: &record.parameter_group_family,
+            status: &record.status,
+            engine_modes: profile.engine_modes,
+            default_level: DefaultLevel::Neither,
+        }
+    }
+}
+
 /// Whether `entry` is in the report this request asks for.
 fn matches_request(
-    entry: &CatalogVersion,
+    entry: &SelectableVersion<'_>,
     input: &DescribeDBEngineVersionsInput,
     filters: &[Filter],
 ) -> bool {
@@ -2231,7 +2374,7 @@ fn matches_request(
 
 /// Whether `entry` matches one filter: true when any of the filter's values matches the
 /// member that filter names. Filter values are case-sensitive.
-fn matches_filter(entry: &CatalogVersion, filter: &Filter) -> bool {
+fn matches_filter(entry: &SelectableVersion<'_>, filter: &Filter) -> bool {
     filter
         .values
         .iter()
@@ -2239,7 +2382,7 @@ fn matches_filter(entry: &CatalogVersion, filter: &Filter) -> bool {
             "db-parameter-group-family" => wanted == entry.parameter_group_family,
             "engine" => wanted == entry.engine,
             // The modes of THIS version, which is what the entry reports.
-            "engine-mode" => entry.profile.engine_modes.contains(&wanted.as_str()),
+            "engine-mode" => entry.engine_modes.contains(&wanted.as_str()),
             "engine-version" => wanted == entry.engine_version,
             "status" => wanted == entry.status,
             _ => false,
@@ -2314,27 +2457,29 @@ fn version_description(facts: &EngineFacts, engine_version: &str) -> String {
     format!("{} {engine_version}", facts.product)
 }
 
-/// Project one catalogue entry onto the modelled `DBEngineVersion` wire shape.
+/// The character-set and time-zone members of ONE reported engine version: its
+/// `DefaultCharacterSet`, and the three LISTS a request can ask for.
 ///
-/// `SupportedCharacterSets` and `SupportedTimezones` are reported only when the request
-/// asks for them: "Specifies whether to list the supported character sets for each
-/// engine version" / "… the supported time zones for each engine version", and only for
-/// an engine that has them. Every other member the catalogue knows is reported on every
-/// entry, because a client reads them to choose a version and gate on its capabilities.
-fn to_wire(
-    entry: &CatalogVersion,
-    facts: &EngineFacts,
-    index: usize,
-    input: &DescribeDBEngineVersionsInput,
-    certificates: &[String],
-) -> CreateCustomDBEngineVersionOutput {
-    let profile = entry.profile;
-    // "For RDS Custom, the default is not to list supported character sets. If you
-    // enable this parameter, RDS Custom returns no results" — and `ListSupportedTimezones`
-    // carries the same sentence. So an RDS Custom engine version lists NEITHER, whatever
-    // the request asked for, while `DefaultCharacterSet` below is still reported: no flag
-    // gates it, and it is the engine's own default collation.
-    let rds_custom = is_rds_custom_engine(entry.engine);
+/// "For RDS Custom, the default is not to list supported character sets. If you enable
+/// this parameter, RDS Custom returns no results" — and `ListSupportedTimezones` carries
+/// the same sentence. So an RDS Custom engine version lists NONE of them, whatever the
+/// request asked for, while `DefaultCharacterSet` is still reported: no flag gates it, and
+/// it is the engine's own default collation.
+///
+/// Shared by both projections below, because the rule is the ENGINE's and the request's,
+/// not the catalogue's: a stored custom engine version answers these members exactly as a
+/// catalogue row of the same engine does.
+struct CharacterSetMembers {
+    default_character_set: Option<CharacterSet>,
+    supported_character_sets: Option<Vec<CharacterSet>>,
+    supported_nchar_character_sets: Option<Vec<CharacterSet>>,
+    supported_timezones: Option<Vec<Timezone>>,
+}
+
+/// The character-set and time-zone members of a version of `facts`' engine, as this
+/// request asks for them.
+fn character_set_members(facts: &EngineFacts, input: &DescribeDBEngineVersionsInput) -> CharacterSetMembers {
+    let rds_custom = is_rds_custom_engine(facts.engine);
     let lists_character_sets = input.list_supported_character_sets == Some(true) && !rds_custom;
     let supported_character_sets = (lists_character_sets && !facts.character_sets.is_empty())
         .then(|| facts.character_sets.iter().map(character_set).collect());
@@ -2358,6 +2503,29 @@ fn to_wire(
             })
             .collect()
     });
+    CharacterSetMembers {
+        default_character_set: facts.character_sets.first().map(character_set),
+        supported_character_sets,
+        supported_nchar_character_sets,
+        supported_timezones,
+    }
+}
+
+/// Project one catalogue entry onto the modelled `DBEngineVersion` wire shape.
+///
+/// `SupportedCharacterSets` and `SupportedTimezones` are reported only when the request
+/// asks for them, through [`character_set_members`]. Every other member the catalogue
+/// knows is reported on every entry, because a client reads them to choose a version and
+/// gate on its capabilities.
+fn to_wire(
+    entry: &CatalogVersion,
+    facts: &EngineFacts,
+    index: usize,
+    input: &DescribeDBEngineVersionsInput,
+    certificates: &[String],
+) -> CreateCustomDBEngineVersionOutput {
+    let profile = entry.profile;
+    let character_sets = character_set_members(facts, input);
     CreateCustomDBEngineVersionOutput {
         engine: Some(entry.engine.to_string()),
         engine_version: Some(entry.engine_version.to_string()),
@@ -2399,17 +2567,186 @@ fn to_wire(
                 max_capacity: Some(max),
             }
         }),
-        default_character_set: facts.character_sets.first().map(character_set),
-        supported_character_sets,
-        supported_nchar_character_sets,
-        supported_timezones,
+        default_character_set: character_sets.default_character_set,
+        supported_character_sets: character_sets.supported_character_sets,
+        supported_nchar_character_sets: character_sets.supported_nchar_character_sets,
+        supported_timezones: character_sets.supported_timezones,
         valid_upgrade_target: Some(valid_upgrade_targets(entry, facts, index)),
         // The members a CUSTOM engine version carries — `DBEngineVersionArn`,
         // `CreateTime`, `KMSKeyId`, `Image`, the installation-file members and
         // `CustomDBEngineVersionManifest` — belong to a record
-        // `CreateCustomDBEngineVersion` stores, and this service stores none yet, so no
-        // catalogue entry invents them.
+        // `CreateCustomDBEngineVersion` stores, so no catalogue entry invents them.
         ..Default::default()
     }
 }
+
+/// What the engine-version catalogue says about a CUSTOM engine version's name.
+///
+/// A CEV is named for the engine build it packages — `19.my_cev1` for RDS Custom for
+/// Oracle, `<major>.<minor>.<build>.<revision>.<customized_string>` for the SQL Server
+/// engines (`CreateCustomDBEngineVersion$EngineVersion`) — so its major version, its DB
+/// parameter group family and the capabilities of the engine version it is built on are
+/// the ones this service already publishes for that major version, rather than a second
+/// set of facts about the same engine.
+pub(crate) struct CustomVersionBasis {
+    /// `MajorEngineVersion` — "the major engine version of the CEV".
+    pub(crate) major_engine_version: String,
+    /// `DBParameterGroupFamily`.
+    pub(crate) parameter_group_family: String,
+    /// The capability members of the engine version the CEV is built on.
+    pub(crate) profile: &'static VersionProfile,
+}
+
+/// The profile of a custom engine version whose engine publishes no catalogue row at all
+/// — the `custom-oracle-*` engines. RDS Custom gives the customer host access to a single
+/// DB instance: no engine mode beyond `provisioned`, no read replica and no Aurora
+/// capability, which is exactly the base profile.
+static RDS_CUSTOM_BASE: VersionProfile = VersionProfile::provisioned();
+
+/// Resolve [`CustomVersionBasis`] for the CEV named `engine_version` of `engine`.
+///
+/// The catalogue row whose own `MajorEngineVersion` the CEV name begins with is the
+/// published version family the CEV belongs to, and the longest such match is the right
+/// one (`15.00` and `15` would both prefix `15.00.4249.2.my_cev1`). An engine with no
+/// catalogue rows — RDS Custom for Oracle, whose versions are only ever CEVs — resolves
+/// the major version from the name's leading component, which is the form that
+/// operation's `EngineVersion` member documents (`19.`*customized_string*), and the family
+/// RDS writes for it, `<engine>-<major version>`.
+pub(crate) fn custom_version_basis(engine: &str, engine_version: &str) -> CustomVersionBasis {
+    let published = CATALOG
+        .iter()
+        .filter(|entry| {
+            entry.engine.eq_ignore_ascii_case(engine)
+                && engine_version
+                    .to_ascii_lowercase()
+                    .starts_with(&format!("{}.", entry.major_engine_version.to_ascii_lowercase()))
+        })
+        .max_by_key(|entry| entry.major_engine_version.len());
+    if let Some(entry) = published {
+        return CustomVersionBasis {
+            major_engine_version: entry.major_engine_version.to_string(),
+            parameter_group_family: entry.parameter_group_family.to_string(),
+            profile: entry.profile,
+        };
+    }
+    let major = engine_version
+        .split('.')
+        .next()
+        .unwrap_or(engine_version)
+        .to_string();
+    CustomVersionBasis {
+        parameter_group_family: format!("{engine}-{major}"),
+        major_engine_version: major,
+        profile: &RDS_CUSTOM_BASE,
+    }
+}
+
+/// Whether this service PUBLISHES `engine_version` for `engine` as reference data.
+///
+/// `pub(crate)` because the name of a new custom engine version has to be free among ALL
+/// of that engine's versions, not only among the ones an account minted: a CEV name "is
+/// unique per customer per Amazon Web Services Regions", and a version AWS already
+/// publishes is one every customer in the region already has.
+pub(crate) fn publishes_engine_version(engine: &str, engine_version: &str) -> bool {
+    CATALOG.iter().any(|entry| {
+        entry.engine.eq_ignore_ascii_case(engine)
+            && entry.engine_version.eq_ignore_ascii_case(engine_version)
+    })
+}
+
+/// Project one stored CUSTOM engine version onto the modelled `DBEngineVersion` wire
+/// shape.
+///
+/// The ONE projection of a CEV record: `CreateCustomDBEngineVersion` answers with it and
+/// this report lists it, so the create's answer and every later read of that record cannot
+/// disagree. Everything in it is read from the record, from the `profile` of the engine
+/// version the CEV is built on, and from the engine's own facts; nothing is invented, and a
+/// member the record carries no value for is left out rather than defaulted.
+pub(crate) fn custom_version_to_wire(
+    record: &crate::state::CustomDbEngineVersionRecord,
+    profile: &'static VersionProfile,
+    input: &DescribeDBEngineVersionsInput,
+    certificates: &[String],
+) -> CreateCustomDBEngineVersionOutput {
+    let facts = engine_facts(&record.engine);
+    let character_sets = facts.map(|facts| character_set_members(facts, input));
+    let exportable_log_types: &[&str] = facts.map_or(&[], |facts| facts.exportable_log_types);
+    CreateCustomDBEngineVersionOutput {
+        engine: Some(record.engine.clone()),
+        engine_version: Some(record.engine_version.clone()),
+        major_engine_version: Some(record.major_engine_version.clone()),
+        db_parameter_group_family: Some(record.parameter_group_family.clone()),
+        db_engine_description: facts.map(|facts| facts.description.to_string()),
+        // `DBEngineVersionDescription` is "the description of the database engine version",
+        // which for a CEV is the `Description` the create gave it — "an optional
+        // description of your CEV". A CEV created without one is described the way every
+        // other version of its engine is.
+        db_engine_version_description: record.description.clone().or_else(|| {
+            facts.map(|facts| version_description(facts, &record.engine_version))
+        }),
+        db_engine_version_arn: Some(record.arn()),
+        create_time: Some(record.create_time),
+        kms_key_id: record.kms_key_id.clone(),
+        custom_db_engine_version_manifest: record.manifest.clone(),
+        database_installation_files_s3_bucket_name: record
+            .database_installation_files_s3_bucket_name
+            .clone(),
+        database_installation_files_s3_prefix: record
+            .database_installation_files_s3_prefix
+            .clone(),
+        database_installation_files: Some(record.database_installation_files.clone()),
+        // `Image` — "the EC2 image": reported for a CEV built on an AMI, carrying that
+        // AMI's id and the status of the CEV it backs ("a value that indicates the status
+        // of a custom engine version"). A CEV with no AMI reports no image rather than an
+        // empty one.
+        image: record.image_id.as_ref().map(|image_id| CustomDBEngineVersionAMI {
+            image_id: Some(image_id.clone()),
+            status: Some(record.status.clone()),
+        }),
+        db_engine_media_type: crate::state::reports_engine_media_type(&record.engine)
+            .then(|| crate::state::MEDIA_TYPE_CUSTOMER_PROVIDED.to_string()),
+        status: Some(record.status.clone()),
+        tag_list: Some(record.tags.clone()),
+        supported_ca_certificate_identifiers: Some(certificates.to_vec()),
+        exportable_log_types: Some(strings(exportable_log_types)),
+        supports_log_exports_to_cloudwatch_logs: Some(!exportable_log_types.is_empty()),
+        supported_engine_modes: Some(strings(profile.engine_modes)),
+        supported_feature_names: Some(strings(profile.feature_names)),
+        supports_read_replica: Some(profile.supports_read_replica),
+        supports_global_databases: Some(profile.supports_global_databases),
+        supports_parallel_query: Some(profile.supports_parallel_query),
+        supports_babelfish: Some(profile.supports_babelfish),
+        supports_limitless_database: Some(profile.supports_limitless_database),
+        supports_local_write_forwarding: Some(profile.supports_local_write_forwarding),
+        supports_integrations: Some(profile.supports_integrations),
+        supports_certificate_rotation_without_restart: Some(
+            profile.supports_certificate_rotation_without_restart,
+        ),
+        serverless_v2_features_support: profile.serverless_v2_capacity.map(|(min, max)| {
+            ServerlessV2FeaturesSupport {
+                min_capacity: Some(min),
+                max_capacity: Some(max),
+            }
+        }),
+        default_character_set: character_sets
+            .as_ref()
+            .and_then(|members| members.default_character_set.clone()),
+        supported_character_sets: character_sets
+            .as_ref()
+            .and_then(|members| members.supported_character_sets.clone()),
+        supported_nchar_character_sets: character_sets
+            .as_ref()
+            .and_then(|members| members.supported_nchar_character_sets.clone()),
+        supported_timezones: character_sets
+            .and_then(|members| members.supported_timezones),
+        // `ValidUpgradeTarget` is "a list of engine versions that this database engine
+        // version can be upgraded to", and a CEV has none: upgrading an RDS Custom DB
+        // instance means creating the next CEV, so no version this service holds is an
+        // upgrade target of one an account minted. Reported empty, because the member is
+        // a list and an entry with no target has none rather than omitting it.
+        valid_upgrade_target: Some(Vec::new()),
+        ..Default::default()
+    }
+}
+
 

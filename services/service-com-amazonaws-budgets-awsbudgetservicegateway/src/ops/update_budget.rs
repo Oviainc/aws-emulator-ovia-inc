@@ -199,7 +199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.account_id.clone(),
             input.new_budget.budget_name.clone(),
         );
-        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = crate::state::store_at(&state, now);
         let stored = store.budgets.get_mut(&key).ok_or_else(|| {
             UpdateBudgetErrorModeled::NotFoundException(NotFoundException {
                 message: Some(format!(
@@ -215,11 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `HealthStatus` the budget already carried is kept: the operational state of the
         // billing view it derives from did not change because the caller edited the
         // budget.
-        crate::state::stamp_service_owned(
-            &mut budget,
-            ::std::time::SystemTime::now(),
-            stored.budget.health_status.clone(),
-        );
+        crate::state::stamp_service_owned(&mut budget, now, stored.budget.health_status.clone());
         stored.budget = budget;
 
         Ok(UpdateBudgetOutput {})

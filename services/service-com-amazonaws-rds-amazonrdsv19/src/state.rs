@@ -42,7 +42,9 @@
 //! — each of those carrying at most [`MAX_PARAMETERS_PER_GROUP`] parameters of at most
 //! [`MAX_FREE_FORM_LEN`] characters, a family string of at most [`MAX_FREE_FORM_LEN`]
 //! characters and at most [`MAX_TAGS_PER_RESOURCE`] tags of at most [`MAX_TAG_KEY_LEN`] /
-//! [`MAX_TAG_VALUE_LEN`] characters — and at most one CA certificate override per region,
+//! [`MAX_TAG_VALUE_LEN`] characters — at most
+//! `MAX_REGIONS * CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION` custom engine versions,
+//! and at most one CA certificate override per region,
 //! whatever sequence of requests arrives, and every
 //! per-request scan reads one region's ordered range rather than the whole map.
 
@@ -83,6 +85,7 @@ pub mod option_catalog;
 // handler still reaches every one of them as `crate::state::<name>` and the store struct
 // below stays the one place that says which maps exist.
 pub mod blue_green;
+pub mod custom_engine_versions;
 pub mod db_proxies;
 pub mod engine_log;
 pub mod export_tasks;
@@ -94,6 +97,12 @@ pub use blue_green::{
     mint_blue_green_deployment_identifier, BlueGreenDeploymentRecord,
     BLUE_GREEN_DEPLOYMENT_QUOTA_PER_REGION, BLUE_GREEN_IDENTIFIER_PREFIX,
     BLUE_GREEN_STATUS_AVAILABLE, BLUE_GREEN_STATUS_DELETING, BLUE_GREEN_STATUS_PROVISIONING,
+};
+pub use custom_engine_versions::{
+    check_custom_engine, custom_db_engine_version_key, is_ami_backed_custom_engine,
+    reports_engine_media_type, CustomDbEngineVersionRecord,
+    CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION, CUSTOM_ENGINE_VERSION_ENGINES,
+    CUSTOM_ENGINE_VERSION_STATUS_AVAILABLE, MEDIA_TYPE_CUSTOMER_PROVIDED,
 };
 pub use db_proxies::{
     check_target_group_name, target_to_wire, DbProxyRecord, DbProxyTargetRecord, RegisteredDatabase,
@@ -998,6 +1007,15 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// [`DB_SHARD_GROUP_QUOTA_PER_REGION`] per region and by [`MAX_REGIONS`] regions — and
     /// `DescribeDBShardGroups` reports what is here.
     pub db_shard_groups: BTreeMap<RegionalKey, DbShardGroupRecord>,
+    /// Custom DB engine versions by `(region, custom_db_engine_version_key)` — the CEVs
+    /// the account itself minted, as opposed to the engine versions this service
+    /// publishes as reference data. Ordered, so `DescribeDBEngineVersions` reports and
+    /// pages them deterministically within a region.
+    ///
+    /// `CreateCustomDBEngineVersion` inserts here, bounded by
+    /// [`CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION`] per region and by [`MAX_REGIONS`]
+    /// regions.
+    pub custom_db_engine_versions: BTreeMap<RegionalKey, CustomDbEngineVersionRecord>,
     /// Monotonic counter behind every server-assigned id this service mints, so
     /// resource ids and endpoint hosts are unique and reproducible.
     pub mint_counter: u64,
@@ -1179,6 +1197,47 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         for key in gone {
             self.export_tasks.remove(&key);
         }
+    }
+
+    /// The custom engine versions stored in `region`, in `(engine, version)` key order.
+    ///
+    /// An ordered range rather than a scan of the whole map, so the work is bounded by
+    /// [`CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION`] however many regions the store holds.
+    pub fn custom_db_engine_versions_in(&self, region: &str) -> Vec<&CustomDbEngineVersionRecord> {
+        range_in(&self.custom_db_engine_versions, region)
+    }
+
+    /// The custom engine version `(engine, engine_version)` names in `region`, or `None`
+    /// when the account created none of that name there.
+    pub fn resolve_custom_db_engine_version(
+        &self,
+        region: &str,
+        engine: &str,
+        engine_version: &str,
+    ) -> Option<&CustomDbEngineVersionRecord> {
+        self.custom_db_engine_versions.get(&(
+            region.to_string(),
+            custom_db_engine_version_key(&engine.to_ascii_lowercase(), engine_version),
+        ))
+    }
+
+    /// The custom engine version whose ARN is `arn`, in `region`, or `None` when no stored
+    /// CEV carries it — what `CreateCustomDBEngineVersion$SourceCustomDbEngineVersionIdentifier`
+    /// ("the ARN of a CEV to use as a source") is resolved against, so a source can only
+    /// name a CEV some create really stored.
+    pub fn resolve_custom_db_engine_version_arn(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&CustomDbEngineVersionRecord> {
+        // Only an ARN can match, so a value of any other form does not pay for rendering
+        // a region's stored ARNs.
+        if !arn.starts_with("arn:") {
+            return None;
+        }
+        self.custom_db_engine_versions_in(region)
+            .into_iter()
+            .find(|record| record.arn() == arn)
     }
 
     /// The export tasks stored in `region`, in identifier order.
@@ -1568,6 +1627,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.tenant_databases.keys())
             .chain(self.db_proxies.keys())
             .chain(self.export_tasks.keys())
+            .chain(self.custom_db_engine_versions.keys())
             .map(|(stored, _)| stored.as_str())
             .chain(self.certificate_overrides.keys().map(String::as_str))
             .collect();
@@ -3628,6 +3688,28 @@ pub fn check_region(region: &str) -> Result<(), String> {
         return Err(malformed());
     }
     Ok(())
+}
+
+/// The 8-4-4-4-12 lowercase-hexadecimal token a server-minted resource id of this service
+/// takes when the id AWS assigns is a UUID: `label` says which kind of resource it belongs
+/// to, and `mint` is the store's one monotone counter, so two resources — of the same kind
+/// or of different kinds — can never be minted the same token. The digest is the
+/// maintained `sha2` crate's, so nothing here is hand-rolled.
+pub fn mint_uuid_token(label: &str, mint: u64) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(format!("{label}:{mint}"));
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    let hex = ::hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// `arn:aws:rds:<region>:<account>:db:<identifier>`.

@@ -183,7 +183,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = crate::state::store_at(&state, now);
         let held = crate::state::resource_tags_mut(&mut store, &target).ok_or_else(|| {
             TagResourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(match &target {

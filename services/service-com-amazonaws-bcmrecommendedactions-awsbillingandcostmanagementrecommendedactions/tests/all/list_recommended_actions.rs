@@ -1404,3 +1404,356 @@ async fn re_seeding_an_existing_id_updates_it_in_place() {
         "re-seeded listing: expected the updated timestamp, got {entry}"
     );
 }
+
+/// The page cap this operation reports under: `maxResults` is modelled
+/// `range {min: 1, max: 1000}` (`smithy_query(query="operation",
+/// operation="ListRecommendedActions")`), so no response can carry more than 1000
+/// records, whether or not the caller named a size.
+const PAGE_CAP: usize = 1000;
+
+/// The page size a page of a paginating walk asks for: `Some(n)` sends
+/// `maxResults: n`, `None` names no `maxResults` at all.
+fn requested_size(walk: &[Option<i64>], page_index: usize) -> Option<i64> {
+    walk[page_index.min(walk.len() - 1)]
+}
+
+/// [`PAGE_CAP`] as a `maxResults` a request can carry.
+fn page_cap_as_requested() -> i64 {
+    i64::try_from(PAGE_CAP).expect("the published page cap fits an i64")
+}
+
+/// One resumption case: a token minted over `minted_with` at page size
+/// `minted_size`, then presented with `presented_with` at page size
+/// `presented_size`, and the HTTP status that resumption must answer.
+struct Resumption<'a> {
+    case: &'a str,
+    minted_with: &'a Value,
+    minted_size: i64,
+    presented_with: &'a Value,
+    presented_size: Option<i64>,
+    expected_status: u16,
+}
+
+impl<'a> Resumption<'a> {
+    /// A resumption the service must serve (HTTP 200).
+    fn served(
+        case: &'a str,
+        minted_with: &'a Value,
+        minted_size: i64,
+        presented_with: &'a Value,
+        presented_size: Option<i64>,
+    ) -> Self {
+        Self {
+            case,
+            minted_with,
+            minted_size,
+            presented_with,
+            presented_size,
+            expected_status: 200,
+        }
+    }
+
+    /// A resumption the service must refuse (HTTP 400).
+    fn refused(
+        case: &'a str,
+        minted_with: &'a Value,
+        minted_size: i64,
+        presented_with: &'a Value,
+        presented_size: Option<i64>,
+    ) -> Self {
+        Self {
+            expected_status: 400,
+            ..Self::served(case, minted_with, minted_size, presented_with, presented_size)
+        }
+    }
+}
+
+/// Walk `selection` to exhaustion, asking for the page sizes in `walk` (the last
+/// entry repeats once the walk runs out), and report the ids collected in order.
+///
+/// Every page must answer 200 and carry no more records than that page asked for —
+/// the published cap when it asked for nothing.
+async fn walk_pages(
+    emulator: &Emulator,
+    case: &str,
+    selection: &Value,
+    walk: &[Option<i64>],
+    max_pages: usize,
+) -> Vec<String> {
+    let mut collected: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut page_index = 0_usize;
+
+    loop {
+        let size = requested_size(walk, page_index);
+        let mut request = selection.clone();
+        let object = request
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("case {case:?}: the selection is not a JSON object"));
+        if let Some(size) = size {
+            object.insert("maxResults".to_string(), json!(size));
+        }
+        if let Some(token) = token.as_ref() {
+            object.insert("nextToken".to_string(), json!(token));
+        }
+
+        let (status, body) = emulator.list(&request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: page {page_index} asked for maxResults {size:?}; expected 200, got {status} with {body}"
+        );
+        let page = ids_of(case, &body);
+        let allowed = size.map_or(PAGE_CAP, |size| {
+            usize::try_from(size).expect("a page size fits a usize")
+        });
+        assert!(
+            page.len() <= allowed,
+            "case {case:?}: page {page_index} asked for {allowed} records and carried {}, got {body}",
+            page.len()
+        );
+        collected.extend(page.iter().cloned());
+        page_index += 1;
+        assert!(
+            page_index <= max_pages,
+            "case {case:?}: pagination did not terminate after {page_index} pages, last body {body}"
+        );
+
+        match body.get("nextToken").and_then(Value::as_str) {
+            Some(next) => token = Some(next.to_string()),
+            None => return collected,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_token_resumes_whatever_page_size_the_next_call_asks_for() {
+    let emulator = Emulator::empty();
+    emulator.seed(fixture());
+
+    // The selections to walk, and the ids each one reports in insertion order.
+    let selections: Vec<(&str, Value, Vec<String>)> = vec![
+        ("unfiltered", json!({}), fixture_ids()),
+        (
+            "SEVERITY NOT_EQUALS [INFO]",
+            json!({"filter": {"actions": [
+                {"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": ["INFO"]}
+            ]}}),
+            vec![
+                "ra-budget-create".to_string(),
+                "ra-budget-exceeded".to_string(),
+                "ra-payment-due".to_string(),
+                "ra-anomaly-review".to_string(),
+            ],
+        ),
+        (
+            "FEATURE EQUALS [BUDGETS, PAYMENTS]",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "EQUALS", "values": ["BUDGETS", "PAYMENTS"]}
+            ]}}),
+            vec![
+                "ra-budget-create".to_string(),
+                "ra-budget-exceeded".to_string(),
+                "ra-payment-due".to_string(),
+            ],
+        ),
+    ];
+
+    // Page-size walks: the size each successive page asks for. Rows differ in
+    // whether the size grows, shrinks, repeats, or is dropped altogether — the ways
+    // a caller can vary a per-call page-size hint between pages.
+    let walks: [(&str, &[Option<i64>]); 7] = [
+        ("constant 1", &[Some(1)]),
+        ("1 then absent", &[Some(1), None]),
+        ("absent then 1", &[None, Some(1)]),
+        ("growing 1,2,3", &[Some(1), Some(2), Some(3)]),
+        ("shrinking 3,2,1", &[Some(3), Some(2), Some(1)]),
+        ("2, absent, 1", &[Some(2), None, Some(1)]),
+        (
+            "1,1,absent,4 then the cap",
+            &[Some(1), Some(1), None, Some(4), Some(1000)],
+        ),
+    ];
+
+    for (selection_name, selection, expected) in selections {
+        for (walk_name, walk) in walks {
+            let case = format!("{selection_name} paged as {walk_name}");
+            let collected =
+                walk_pages(&emulator, &case, &selection, walk, expected.len() + 1).await;
+            assert_eq!(
+                collected, expected,
+                "case {case:?}: the concatenation of pages must equal the unpaginated listing {expected:?}, got {collected:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_token_still_names_the_selection_it_was_issued_over() {
+    let emulator = Emulator::empty();
+    emulator.seed(fixture());
+
+    let unfiltered = json!({});
+    let budgets = json!({"filter": {"actions": [
+        {"key": "FEATURE", "matchOption": "EQUALS", "values": ["BUDGETS"]}
+    ]}});
+    let payments = json!({"filter": {"actions": [
+        {"key": "FEATURE", "matchOption": "EQUALS", "values": ["PAYMENTS"]}
+    ]}});
+
+    // The selection a token is minted over, the selection it is then presented
+    // with, and whether that resumption is served: changing or dropping the page
+    // size keeps the token valid, changing the SELECTION does not.
+    let cases: Vec<Resumption> = vec![
+        Resumption::served("same selection, same size", &unfiltered, 1, &unfiltered, Some(1)),
+        Resumption::served("same selection, larger size", &unfiltered, 1, &unfiltered, Some(4)),
+        Resumption::served(
+            "same selection, the page cap",
+            &unfiltered,
+            2,
+            &unfiltered,
+            Some(page_cap_as_requested()),
+        ),
+        Resumption::served("same selection, size dropped", &unfiltered, 2, &unfiltered, None),
+        Resumption::served("filtered selection, size dropped", &budgets, 1, &budgets, None),
+        Resumption::refused("a filter added", &unfiltered, 1, &budgets, Some(1)),
+        Resumption::refused("the filter dropped", &budgets, 1, &unfiltered, Some(1)),
+        Resumption::refused("a different filter value", &budgets, 1, &payments, Some(1)),
+        Resumption::refused(
+            "a different filter value, size dropped",
+            &budgets,
+            1,
+            &payments,
+            None,
+        ),
+    ];
+
+    for Resumption {
+        case,
+        minted_with,
+        minted_size,
+        presented_with,
+        presented_size,
+        expected_status,
+    } in cases
+    {
+        let mut minting = minted_with.clone();
+        minting
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("case {case:?}: the selection is not a JSON object"))
+            .insert("maxResults".to_string(), json!(minted_size));
+        let (status, first) = emulator.list(&minting).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: minting a token expected 200, got {status} with {first}"
+        );
+        let token = first
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: expected a nextToken to resume, got {first}"))
+            .to_string();
+
+        let mut resumed = presented_with.clone();
+        let object = resumed
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("case {case:?}: the selection is not a JSON object"));
+        object.insert("nextToken".to_string(), json!(token));
+        if let Some(size) = presented_size {
+            object.insert("maxResults".to_string(), json!(size));
+        }
+        let (status, body) = emulator.list(&resumed).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status} when resuming, got {status} with {body}"
+        );
+        if expected_status == 200 {
+            let page = ids_of(case, &body);
+            let first_page = ids_of(case, &first);
+            assert!(
+                !page.is_empty(),
+                "case {case:?}: resuming must report the records after the first page, got {body}"
+            );
+            assert!(
+                page.iter().all(|id| !first_page.contains(id)),
+                "case {case:?}: resuming must not repeat the first page {first_page:?}, got {page:?}"
+            );
+        } else {
+            assert_eq!(
+                error_code(case, &body),
+                "ValidationException",
+                "case {case:?}: expected a ValidationException, got {body}"
+            );
+            assert!(
+                body.get("recommendedActions").is_none(),
+                "case {case:?}: a refused token must not silently restart the listing, got {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_request_that_names_no_max_results_is_served_at_the_published_page_cap() {
+    let emulator = Emulator::empty();
+
+    // More records than one page can carry, so an unbounded page is distinguishable
+    // from a page at the cap.
+    let seeded: Vec<StoredAction> = (0..PAGE_CAP + 3)
+        .map(|index| {
+            action(
+                &format!("ra-bulk-{index:05}"),
+                ActionType::CreateBudget,
+                Severity::Info,
+                Feature::Budgets,
+            )
+        })
+        .collect();
+    let seeded_ids: Vec<String> = seeded.iter().map(|action| action.id.clone()).collect();
+    emulator.seed(seeded);
+    assert_eq!(
+        emulator.stored_count(),
+        PAGE_CAP + 3,
+        "case \"bulk inventory\": expected {} records seeded, got {}",
+        PAGE_CAP + 3,
+        emulator.stored_count()
+    );
+
+    let (status, first) = emulator.list(&json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case \"no maxResults\": expected 200, got {status} with {first}"
+    );
+    let page = ids_of("no maxResults", &first);
+    assert_eq!(
+        page.len(),
+        PAGE_CAP,
+        "case \"no maxResults\": expected a page of the published cap {PAGE_CAP}, got {} records",
+        page.len()
+    );
+    assert_eq!(
+        page,
+        seeded_ids[..PAGE_CAP],
+        "case \"no maxResults\": expected the first {PAGE_CAP} records in insertion order, got {page:?}"
+    );
+    let token = first
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("case \"no maxResults\": a capped page owes a nextToken, got {first}")
+        })
+        .to_string();
+
+    let (status, second) = emulator.list(&json!({"nextToken": token})).await;
+    assert_eq!(
+        status, 200,
+        "case \"no maxResults, page 2\": expected 200, got {status} with {second}"
+    );
+    let rest = ids_of("no maxResults, page 2", &second);
+    assert_eq!(
+        rest,
+        seeded_ids[PAGE_CAP..],
+        "case \"no maxResults, page 2\": expected the remaining records, got {rest:?}"
+    );
+    assert!(
+        second.get("nextToken").is_none(),
+        "case \"no maxResults, page 2\": the last page must carry no nextToken, got {second}"
+    );
+}

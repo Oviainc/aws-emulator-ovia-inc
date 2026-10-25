@@ -312,6 +312,14 @@ async fn a_lexicon_round_trips_through_state_and_is_replaced_in_place() {
 
 /// The names `ListLexicons` reported.
 pub(crate) fn listed_names(body: &serde_json::Value) -> BTreeSet<String> {
+    listed_names_in_order(body).into_iter().collect()
+}
+
+/// The names `ListLexicons` reported, in the order the response listed them.
+///
+/// [`listed_names`] answers the SET a response reported; this answers the SEQUENCE,
+/// for a rule about the order the list is served in.
+pub(crate) fn listed_names_in_order(body: &serde_json::Value) -> Vec<String> {
     body["Lexicons"]
         .as_array()
         .expect("Lexicons is a list")
@@ -479,11 +487,11 @@ async fn the_lexicon_store_is_bounded() {
     );
 }
 
-/// RULE: `ListLexicons` serves the store in name order one page at a time, a
-/// `NextToken` appears only while a further lexicon exists, and a token this service
-/// did not mint is `InvalidNextTokenException`.
+/// RULE: `ListLexicons` serves the Region's whole store in name order in ONE response
+/// with no `NextToken`, and a token this service could not have minted is
+/// `InvalidNextTokenException`.
 #[tokio::test]
-async fn list_lexicons_pages_the_store_and_refuses_a_foreign_token() {
+async fn list_lexicons_serves_the_whole_store_and_refuses_a_foreign_token() {
     let polly = Polly::new();
     let content = pls("ipa", "en-US", 1);
     let total = 25;
@@ -496,34 +504,25 @@ async fn list_lexicons_pages_the_store_and_refuses_a_foreign_token() {
         );
     }
 
-    let mut seen: Vec<String> = Vec::new();
-    let mut query = String::new();
-    let mut pages = 0;
-    loop {
-        let page = json(&polly.list_lexicons(&query).await);
-        let names: Vec<String> = page["Lexicons"]
-            .as_array()
-            .expect("Lexicons is a list")
-            .iter()
-            .map(|e| e["Name"].as_str().unwrap_or_default().to_string())
-            .collect();
-        assert!(
-            !names.is_empty(),
-            "page {pages}: a page reached through a NextToken must not be empty"
-        );
-        seen.extend(names);
-        pages += 1;
-        match page["NextToken"].as_str() {
-            Some(token) => query = format!("?NextToken={token}"),
-            None => break,
-        }
-        assert!(pages < 10, "pagination did not terminate");
-    }
-    assert!(pages > 1, "25 lexicons must not fit in one page, got {pages}");
+    let response = polly.list_lexicons("").await;
+    assert_eq!(
+        response.status(),
+        200,
+        "ListLexicons failed, body {:?}",
+        json(&response)
+    );
+    let body = json(&response);
+    let seen: Vec<String> = listed_names_in_order(&body);
     let expected: Vec<String> = (0..total).map(|index| format!("Lex{index:02}")).collect();
     assert_eq!(
         seen, expected,
-        "the pages together must be the whole store, in name order"
+        "one call must report the whole store, in name order"
+    );
+    assert_eq!(
+        body["NextToken"].as_str(),
+        None,
+        "the response is not truncated, so no NextToken is owed, got {:?}",
+        body["NextToken"]
     );
 
     for bad in ["not-a-token", "zzzz", "ff"] {

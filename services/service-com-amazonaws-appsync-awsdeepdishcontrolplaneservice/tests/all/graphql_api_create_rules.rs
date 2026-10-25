@@ -63,7 +63,7 @@ const CONFIGURED_TYPES: &[(&str, &str, &str)] = &[
 /// Source: `AdditionalAuthenticationProvider`'s members — its `userPoolConfig`
 /// targets `CognitoUserPoolConfig`, which (unlike the API-level `UserPoolConfig`)
 /// has no `defaultAction`.
-fn complete_provider(authentication_type: &str) -> Value {
+pub(crate) fn complete_provider(authentication_type: &str) -> Value {
     let config = match authentication_type {
         "OPENID_CONNECT" => json!({
             "openIDConnectConfig": { "issuer": "https://extra-issuer.example.com" },

@@ -15,6 +15,8 @@
 mod catalog_reads;
 #[path = "all/listener_lifecycle_certificates_and_rules.rs"]
 mod listener_lifecycle_certificates_and_rules;
+#[path = "all/listener_rules.rs"]
+mod listener_rules;
 #[path = "all/listener_tls_certificates.rs"]
 mod listener_tls_certificates;
 #[path = "all/provisioning_loop.rs"]

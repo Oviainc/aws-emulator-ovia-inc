@@ -215,11 +215,15 @@ fn create_rows(address_id: &str) -> Vec<Row> {
     // `NFSOnDeviceService`, `S3OnDeviceService`, `TGWOnDeviceService` and
     // `EKSOnDeviceService`; `StorageUnit` is modelled with the single value `TB`, and
     // `S3OnDeviceService`'s `ServiceSize` is `range 3..16` and its `FaultTolerance`
-    // `range 1..4`, so the values below sit inside each published bound).
-    let on_device_configurations: Vec<(&str, Value)> = vec![
+    // `range 1..4`, so the values below sit inside each published bound). Each row asks
+    // for the node count its own configuration declares it needs, since an order that
+    // does not meet it is refused as misprovisioned (`cluster_provisioning` is what
+    // asserts that rule); a configuration naming no node count is served at any size.
+    let on_device_configurations: Vec<(&str, Value, usize)> = vec![
         (
             "NFS storage",
             json!({ "NFSOnDeviceService": { "StorageLimit": 50, "StorageUnit": "TB" } }),
+            1,
         ),
         (
             "S3 compatible storage at the smallest service size",
@@ -231,6 +235,7 @@ fn create_rows(address_id: &str) -> Vec<Row> {
                     "FaultTolerance": 1
                 }
             }),
+            3,
         ),
         (
             "S3 compatible storage at the largest service size",
@@ -242,6 +247,7 @@ fn create_rows(address_id: &str) -> Vec<Row> {
                     "FaultTolerance": 4
                 }
             }),
+            16,
         ),
         (
             "the tape gateway and EKS Anywhere services at once",
@@ -252,11 +258,12 @@ fn create_rows(address_id: &str) -> Vec<Row> {
                     "EKSAnywhereVersion": "0.14.3"
                 }
             }),
+            1,
         ),
     ];
-    for (what, configuration) in on_device_configurations {
+    for (what, configuration, nodes) in on_device_configurations {
         let mut body = base_cluster(address_id);
-        body["InitialClusterSize"] = json!(1);
+        body["InitialClusterSize"] = json!(nodes);
         body["OnDeviceServiceConfiguration"] = configuration;
         seed += 1;
         let pricing_ids = vec![long_term_pricing_id(seed)];
@@ -264,7 +271,7 @@ fn create_rows(address_id: &str) -> Vec<Row> {
         rows.push(Row {
             case: format!("a cluster configured for {what}"),
             body,
-            nodes: 1,
+            nodes,
             pricing_ids,
         });
     }
