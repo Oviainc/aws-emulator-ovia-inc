@@ -114,7 +114,11 @@ fn meta_cases() -> Vec<MetaCase> {
                 "registrationType": "CPF",
                 "legalName": "Maria O'Hara-Exemplo, Jr.",
                 "sector": "Individual",
-                "legalAddress": { "postalCode": "22041-001", "countryCode": "BR" },
+                "legalAddress": {
+                    "stateOrRegion": "Rio de Janeiro",
+                    "postalCode": "22041-001",
+                    "countryCode": "BR",
+                },
                 "verificationDetails": { "dateOfBirth": "1980-07-15" },
             }),
         },

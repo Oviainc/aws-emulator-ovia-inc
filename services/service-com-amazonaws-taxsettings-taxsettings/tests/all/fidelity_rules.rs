@@ -289,7 +289,11 @@ async fn a_submitted_trn_is_pending_until_its_validation_is_due_then_settles() {
                 "registrationType": "GST",
                 "legalName": "Acme India Private Limited",
                 "sector": "Business",
-                "legalAddress": { "postalCode": "560025", "countryCode": "IN" },
+                "legalAddress": {
+                    "stateOrRegion": "Karnataka",
+                    "postalCode": "560025",
+                    "countryCode": "IN",
+                },
             }),
         ),
         (
