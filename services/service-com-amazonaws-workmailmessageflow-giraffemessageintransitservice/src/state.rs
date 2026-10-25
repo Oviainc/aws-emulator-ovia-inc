@@ -11,6 +11,11 @@
 //! and [`ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState::seed_s3_object`]).
 //! Nothing here fabricates content: every byte a handler returns was written into
 //! the store by a seed or by a successful `PutRawMessageContent`.
+//!
+//! Both stores are regional. A message is in transit in the message flow of one
+//! region and an S3 object sits in one bucket region, so each is keyed or tagged
+//! with its region and a handler resolves it against the region the request was
+//! made in ([`request_region`]).
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -122,11 +127,39 @@ impl S3Object {
     }
 }
 
+/// The key an in-transit message is stored under.
+///
+/// This service is a regional data plane: its endpoint carries a region
+/// (`endpointPrefix` `workmailmessageflow` with `sigv4` and an endpoint rule set —
+/// `smithy_query(query="service_info")`), and an in-transit message belongs to the
+/// message flow of exactly one region. The id alone is therefore not an address:
+/// the region a request was made in is part of it, exactly as it is part of the
+/// identity of an [`S3Object`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MessageKey {
+    pub region: String,
+    pub message_id: String,
+}
+
+impl MessageKey {
+    /// The address of `message_id` in `region`'s message flow.
+    pub fn new(region: impl Into<String>, message_id: impl Into<String>) -> Self {
+        Self {
+            region: region.into(),
+            message_id: message_id.into(),
+        }
+    }
+}
+
 /// One email message currently in transit through WorkMail's message flow.
 #[derive(Debug, Clone)]
 pub struct InTransitMessage {
     /// The id the URI label names this message by.
     pub message_id: String,
+    /// The region whose message flow this message is in transit in. Only a request
+    /// made in this region addresses it; every other region's endpoint answers as
+    /// though the message did not exist.
+    pub region: String,
     /// The raw MIME bytes `GetRawMessageContent` returns verbatim as
     /// `messageContent`.
     pub content: Vec<u8>,
@@ -142,9 +175,10 @@ pub struct InTransitMessage {
 }
 
 impl InTransitMessage {
-    fn new(message_id: String, content: Vec<u8>) -> Self {
+    fn new(region: String, message_id: String, content: Vec<u8>) -> Self {
         Self {
             message_id,
+            region,
             content,
             frozen: false,
             last_s3_reference: None,
@@ -156,8 +190,10 @@ impl InTransitMessage {
 /// Per-service state for com-amazonaws-workmailmessageflow-giraffemessageintransitservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState {
-    /// Every in-transit message, keyed by `messageId`.
-    pub messages: HashMap<String, InTransitMessage>,
+    /// Every in-transit message, keyed by the region its message flow is in and
+    /// the `messageId` that region's endpoint addresses it by, so one region's
+    /// endpoint never resolves another region's message.
+    pub messages: HashMap<MessageKey, InTransitMessage>,
     /// The S3 objects a `PutRawMessageContent` reference can resolve to, keyed by
     /// the whole reference (bucket, key and object version) so a versioned
     /// reference resolves only to the version it names.
@@ -165,9 +201,9 @@ pub struct ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState {
 }
 
 impl ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState {
-    /// Put a message into transit with `content` as its MIME body, as WorkMail
-    /// delivery does, and hand back the stored record so a caller can mark it
-    /// frozen.
+    /// Put a message into transit in [`DEFAULT_REGION`] with `content` as its MIME
+    /// body, as that region's WorkMail delivery does, and hand back the stored
+    /// record so a caller can mark it frozen.
     ///
     /// This is the producer this API does not model; it is NOT an AWS operation.
     pub fn seed_in_transit_message(
@@ -175,11 +211,35 @@ impl ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState {
         message_id: impl Into<String>,
         content: impl Into<Vec<u8>>,
     ) -> &mut InTransitMessage {
-        let message_id = message_id.into();
+        self.seed_in_transit_message_in_region(DEFAULT_REGION, message_id, content)
+    }
+
+    /// Put a message into transit in `region`, as that region's WorkMail delivery
+    /// does. The same id may be in transit in another region: the two are distinct
+    /// messages, each addressable only through its own region's endpoint.
+    ///
+    /// This is the producer this API does not model; it is NOT an AWS operation.
+    pub fn seed_in_transit_message_in_region(
+        &mut self,
+        region: impl Into<String>,
+        message_id: impl Into<String>,
+        content: impl Into<Vec<u8>>,
+    ) -> &mut InTransitMessage {
+        let key = MessageKey::new(region, message_id);
+        let message = InTransitMessage::new(
+            key.region.clone(),
+            key.message_id.clone(),
+            content.into(),
+        );
+        self.messages.entry(key).insert_entry(message).into_mut()
+    }
+
+    /// The message `message_id` names in `region`'s message flow, or `None` when no
+    /// message is in transit under that id in that region — including when one is
+    /// in transit under the same id in a different region.
+    pub fn message(&self, region: &str, message_id: &str) -> Option<&InTransitMessage> {
         self.messages
-            .entry(message_id.clone())
-            .insert_entry(InTransitMessage::new(message_id, content.into()))
-            .into_mut()
+            .get(&MessageKey::new(region, message_id))
     }
 
     /// Make `object` resolvable at `reference`, as an S3 `PutObject` does.
@@ -192,15 +252,17 @@ impl ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState {
         self.s3_objects.get(reference)
     }
 
-    /// Replace the MIME content of `message_id` with `content`, recording the
-    /// reference it came from, and answer whether the message existed.
+    /// Replace the MIME content of `message_id` in `region`'s message flow with
+    /// `content`, recording the reference it came from, and answer whether such a
+    /// message existed. A message in transit in another region is left untouched.
     pub fn replace_message_content(
         &mut self,
+        region: &str,
         message_id: &str,
         content: Vec<u8>,
         reference: S3Ref,
     ) -> bool {
-        match self.messages.get_mut(message_id) {
+        match self.messages.get_mut(&MessageKey::new(region, message_id)) {
             Some(message) => {
                 message.content = content;
                 message.last_s3_reference = Some(reference);
