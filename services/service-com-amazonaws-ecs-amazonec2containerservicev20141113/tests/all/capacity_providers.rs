@@ -265,7 +265,9 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
         "case {case:?}: expected the stored managed scaling back, got {scaling}"
     );
 
-    // Every provider the account holds is described when the request names none.
+    // Every provider the account holds is described when the request names none —
+    // including the two Amazon ECS manages for every account in every Region (`FARGATE`
+    // and `FARGATE_SPOT`), which nothing has to create.
     let case = "every provider";
     let body = ok(&router, "DescribeCapacityProviders", json!({}), case).await;
     let mut names: Vec<String> = list(&body, "capacityProviders", case)
@@ -275,7 +277,14 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
     names.sort();
     assert_eq!(
         names,
-        vec!["byarn", "byclusterarn", "byname", "managed"],
+        vec![
+            "FARGATE",
+            "FARGATE_SPOT",
+            "byarn",
+            "byclusterarn",
+            "byname",
+            "managed"
+        ],
         "case {case:?}: expected every stored provider, got {body}"
     );
 }
@@ -405,7 +414,8 @@ async fn a_capacity_provider_request_that_cannot_be_satisfied_is_refused() {
         refused(&router, "CreateCapacityProvider", request, expected, case).await;
     }
 
-    // Nothing above was stored: a refused create creates nothing.
+    // Nothing above was stored: a refused create creates nothing. The account's two
+    // ECS-managed providers are there whether or not anybody created anything.
     let case = "only the provider that was accepted exists";
     let body = ok(&router, "DescribeCapacityProviders", json!({}), case).await;
     let names: Vec<String> = list(&body, "capacityProviders", case)
@@ -414,7 +424,11 @@ async fn a_capacity_provider_request_that_cannot_be_satisfied_is_refused() {
         .collect();
     assert_eq!(
         names,
-        vec!["taken".to_string()],
+        vec![
+            "FARGATE".to_string(),
+            "FARGATE_SPOT".to_string(),
+            "taken".to_string()
+        ],
         "case {case:?}: a refused create must store nothing, got {body}"
     );
 
@@ -750,6 +764,9 @@ async fn describe_capacity_providers_filters_pages_and_reports_failures() {
         }
         let mut expected: Vec<String> = names.clone();
         expected.push("scopedmanaged".to_string());
+        // The providers Amazon ECS manages for the account are walked with the rest.
+        expected.push("FARGATE".to_string());
+        expected.push("FARGATE_SPOT".to_string());
         expected.sort();
         assert_eq!(
             seen, expected,

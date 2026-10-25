@@ -1083,19 +1083,89 @@ pub fn to_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
 }
 
-/// The opaque `nextToken` for a page that stopped at `last_key`.
-///
-/// Hex of the key, so the token is opaque to a client yet resumes EXACTLY where the
-/// page stopped: the next page starts at the first key strictly after it, whether or
-/// not that key still exists.
-pub fn encode_page_token(last_key: &str) -> String {
-    hex::encode(last_key.as_bytes())
+/// The collection a `ListDomains` cursor enumerates: the domains held in ONE Region,
+/// since this endpoint is regional and a listing covers no other Region.
+pub fn domains_page_scope(region: &str) -> String {
+    format!("domains/{region}")
 }
 
-/// The key a `nextToken` resumes after, or `None` when the token is not one this
-/// service issued.
-pub fn decode_page_token(token: &str) -> Option<String> {
-    String::from_utf8(hex::decode(token).ok()?).ok()
+/// The collection a `ListSubscriptions` cursor enumerates: the subscriptions of ONE
+/// domain in ONE Region, which is the only collection that listing reports.
+pub fn subscriptions_page_scope(region: &str, domain_id: &str) -> String {
+    format!("subscriptions/{region}/{domain_id}")
+}
+
+/// The longest `nextToken` this service attempts to decode at all.
+///
+/// A cursor it mints is two hex characters per plaintext byte of a 32-character tag, a
+/// scope built from a Region ([`MAX_REGION_LEN`]) and a modelled id, plus one more
+/// modelled id — well inside this bound. The limit exists because the decode allocation
+/// would otherwise be sized by what a caller sends.
+const MAX_PAGE_TOKEN_LEN: usize = 512;
+
+/// The process-lifetime key that authenticates this service's pagination cursors.
+///
+/// Drawn from the standard library's randomly seeded hasher, so it is derived from
+/// nothing a caller can see or send, never leaves the process and appears in no
+/// response: without it the tag over a cursor's plaintext cannot be computed, which is
+/// what makes a cursor verifiable as one THIS service issued rather than merely
+/// well-formed.
+///
+/// A cursor therefore does not outlive the process that issued it, which matches the
+/// store it is a position into: both live in memory only, so a cursor from an earlier
+/// process names a position in a collection that is gone.
+fn page_token_key() -> &'static [u8; 32] {
+    static KEY: ::std::sync::OnceLock<[u8; 32]> = ::std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        use ::std::hash::BuildHasher as _;
+
+        let seed = ::std::collections::hash_map::RandomState::new();
+        let mut key = [0u8; 32];
+        for (index, chunk) in key.chunks_mut(8).enumerate() {
+            chunk.copy_from_slice(&seed.hash_one(index as u64).to_be_bytes());
+        }
+        key
+    })
+}
+
+/// The authentication tag a cursor of `scope` that resumes after `after_key` carries:
+/// half a SHA-256 over the process key and the length-delimited pair, so the tag of one
+/// collection's cursor is never also another's and a caller can compute neither.
+fn page_token_tag(scope: &str, after_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(page_token_key());
+    hasher.update((scope.len() as u64).to_be_bytes());
+    hasher.update(scope.as_bytes());
+    hasher.update(after_key.as_bytes());
+    hex::encode(&hasher.finalize()[..16])
+}
+
+/// The opaque `nextToken` for a page of `scope` that stopped at `last_key`.
+///
+/// Hex of `<tag>:<scope>:<key>`, so the token stays opaque to a client yet resumes
+/// EXACTLY where the page stopped: the next page starts at the first key strictly after
+/// it, whether or not that key still exists. It carries the collection it was issued
+/// for and the tag that proves this service issued it — what [`decode_page_token`]
+/// checks before any token is used as a resume point.
+pub fn encode_page_token(scope: &str, last_key: &str) -> String {
+    let tag = page_token_tag(scope, last_key);
+    hex::encode(format!("{tag}:{scope}:{last_key}").as_bytes())
+}
+
+/// The key a `nextToken` resumes after in `scope`, or `None` when the token is not one
+/// this service issued FOR THAT collection — a fabricated token, a token whose tag does
+/// not match the key it carries, and a token another listing minted all answer `None`.
+pub fn decode_page_token(scope: &str, token: &str) -> Option<String> {
+    if token.len() > MAX_PAGE_TOKEN_LEN {
+        return None;
+    }
+    let plaintext = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    // A scope carries no `:`, so the first two fields are the tag and the scope and the
+    // remainder is the key, whatever the key itself contains.
+    let mut fields = plaintext.splitn(3, ':');
+    let (tag, token_scope, after_key) = (fields.next()?, fields.next()?, fields.next()?);
+    (token_scope == scope && page_token_tag(scope, after_key) == tag)
+        .then(|| after_key.to_string())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

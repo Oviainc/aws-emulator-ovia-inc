@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeNetworkInsightsAccessScopes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeNetworkInsightsAccessScopes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeNetworkInsightsAccessScopes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's Network Access Scopes out of [`crate::state`]: the whole store by
+//! default, or the subset the request's `NetworkInsightsAccessScopeIds` select, one
+//! `MaxResults`-sized page at a time. A reporting operation — it writes nothing at all, so
+//! two calls carrying the same request report the same scopes.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +69,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::HashSet;
+
+use crate::state::{MAX_ECHOED_PAGE_TOKEN_CHARS, MAX_RESOURCE_IDS};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,18 +141,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeNetworkInsightsAccessScopes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeNetworkInsightsAccessScopesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeNetworkInsightsAccessScopes"))
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The token for the next page of results"
+        // (`DescribeNetworkInsightsAccessScopesRequest$NextToken`) — anything else is
+        // refused rather than read as an id, and it is refused before any other member is
+        // looked at, so whether a bogus token is caught never depends on the rest of the
+        // request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // "There are no supported filters"
+        // (`DescribeNetworkInsightsAccessScopesRequest$Filters`): this operation documents
+        // NO filter name at all, so any filter a request names is refused — exactly as an
+        // undocumented name is refused on the describes that do document some, because a
+        // filter the operation cannot evaluate must never read as "no results". An empty
+        // `Filters` list names none and is an ordinary call.
+        if let Some(filter) = input.filters.as_deref().unwrap_or_default().first() {
+            let name: String = filter
+                .name
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .take(MAX_ECHOED_FILTER_NAME_CHARS)
+                .collect();
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The filter '{name}' is invalid"
+            )));
+        }
+
+        // The selector list is caller-sized, and each entry is resolved against the store,
+        // so it is capped the way every other EC2 operation of this crate caps a
+        // resource-id list — before the store is locked and before any work proportional to
+        // it is done.
+        let requested: &[String] = input
+            .network_insights_access_scope_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "NetworkInsightsAccessScopeIds carries {} ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                requested.len()
+            )));
+        }
+
+        // "The maximum number of results to return with a single call"
+        // (`DescribeNetworkInsightsAccessScopesRequest$MaxResults`). A request that names
+        // none gets the largest page the model publishes, so the `NextToken` path below
+        // behaves the same whether or not a page size was asked for. The model's
+        // `range 1..100` has already refused anything outside it; the same bounds are
+        // applied HERE, beside the other request-size caps and before the store is locked,
+        // the way the sibling analyses describe does — so a value this handler could not
+        // page by never reaches the scan, neither one that is not a positive count (zero
+        // included, which would answer an empty page beside a token that never advances) nor
+        // one above the published maximum.
+        let limit = match input.max_results {
+            None => DEFAULT_MAX_RESULTS,
+            Some(max_results) => usize::try_from(max_results)
+                .ok()
+                .filter(|limit| (MIN_MAX_RESULTS..=DEFAULT_MAX_RESULTS).contains(limit))
+                .ok_or_else(|| {
+                    crate::state::invalid_parameter_value(format!(
+                        "Value ({max_results}) for parameter maxResults is invalid. \
+                         Expecting a value between {MIN_MAX_RESULTS} and {DEFAULT_MAX_RESULTS}"
+                    ))
+                })?,
+        };
+
+        // The store, with the "mounted on an engine that holds no state" case already
+        // turned into the server error every handler of this crate answers it with. Taken
+        // BEFORE the dry-run branch below, because whether a named scope exists is one of
+        // the things a dry run has to answer — the guard is a READ lock and this operation
+        // writes nothing through it.
+        let state = crate::state::require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "The IDs of the Network Access Scopes"
+        // (`DescribeNetworkInsightsAccessScopesRequest$NetworkInsightsAccessScopeIds`): an id
+        // that names no scope of the account is an error, not an absent row. A set, so
+        // narrowing below costs one lookup per stored scope rather than a scan of the
+        // asked-for list.
+        if let Some(unknown) = requested
+            .iter()
+            .find(|id| !store.network_insights_access_scopes.contains_key(id.as_str()))
+        {
+            return Err(crate::state::invalid_network_insights_access_scope_id_not_found(
+                unknown,
+            ));
+        }
+        let wanted: HashSet<&str> = requested.iter().map(String::as_str).collect();
+
+        // DryRun sits AFTER every check a refusal could come from, the way the sibling
+        // analyses describe words it: the flag asks whether the request WOULD have
+        // succeeded, so one that would have been refused for its token, its filters, the
+        // size of its list, its page size or an id naming no scope of the account is
+        // refused with that reason instead. "If you have the required permissions, the
+        // error response is DryRunOperation"
+        // (`DescribeNetworkInsightsAccessScopesRequest$DryRun`), and every caller of this
+        // emulator is permitted, so a dry run that would have succeeded reports that
+        // outcome — and reports no scope, having changed nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        // "Describes the specified Network Access Scopes"
+        // (`DescribeNetworkInsightsAccessScopes`): the ids named narrow the store, and a
+        // request naming none describes every scope the account holds. Each entry is taken
+        // as `(stored id, scope)`: the store is KEYED by `NetworkInsightsAccessScopeId`, so
+        // the key is the id every scope certainly has, while the member on the record is
+        // modelled optional. Narrowing, the paging order and the cursor below all read the
+        // key, so no part of paging can depend on an absent member.
+        let selected: Vec<(&str, &NetworkInsightsAccessScope)> = store
+            .network_insights_access_scopes
+            .iter()
+            .map(|(scope_id, scope)| (scope_id.as_str(), scope))
+            .filter(|(scope_id, _)| wanted.is_empty() || wanted.contains(scope_id))
+            .collect();
+
+        // Paging is in `NetworkInsightsAccessScopeId` order, which the cursor below names a
+        // position in. That order is a TYPE-LEVEL guarantee rather than something this
+        // handler establishes: the store is a `BTreeMap` keyed by that id, so its iteration
+        // is sorted by key and `filter` preserves it. The invariant is therefore only
+        // re-checked in test builds — nothing a request can carry affects it, and a check
+        // that panicked in the serving path would turn a future container change into a
+        // panic instead of a response.
+        debug_assert!(
+            selected.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "the scope store must iterate in NetworkInsightsAccessScopeId order"
+        );
+
+        // That order is both the stable paging order and the cursor, so a token naming the
+        // id the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|(scope_id, _)| *scope_id < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "This value is null when there are no more results to return"
+        // (`DescribeNetworkInsightsAccessScopesResult$NextToken`): a token exactly when a
+        // scope follows this page, naming the stored id that scope is keyed by — so a page
+        // is never reported as the complete set while scopes remain.
+        let next_token = page
+            .get(limit)
+            .map(|(scope_id, _)| crate::state::encode_page_token(scope_id));
+
+        Ok(DescribeNetworkInsightsAccessScopesOutput {
+            network_insights_access_scopes: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|(_, scope)| (*scope).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`NetworkInsightsMaxResults`, `range 1..100`), which is also the most EC2 returns in one
+/// page.
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The smallest page size the model publishes for this operation
+/// (`NetworkInsightsMaxResults`, `range 1..100`), named here for the same reason the sibling
+/// analyses describe names it: a page size below it is refused rather than clamped.
+const MIN_MAX_RESULTS: usize = 1;
+
+/// The most characters of a refused filter name the refusal repeats back.
+///
+/// `Filter$Name` is a plain string the model bounds nowhere, so the message names it only up
+/// to this bound — the same bound, and for the same reason, as the token echo in
+/// [`crate::state::invalid_pagination_token_for`]: a caller is told which filter was refused
+/// without a request's own bytes being reflected in full.
+const MAX_ECHOED_FILTER_NAME_CHARS: usize = MAX_ECHOED_PAGE_TOKEN_CHARS;

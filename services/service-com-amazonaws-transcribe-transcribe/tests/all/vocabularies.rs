@@ -380,14 +380,16 @@ async fn a_vocabulary_being_processed_cannot_be_deleted() {
         .call("GetVocabulary", json!({"VocabularyName": "pending-delete"}))
         .await
         .refused("read a deleted vocabulary", 400, "BadRequestException");
-    // A delete is IDEMPOTENT: a name this account holds no vocabulary under answers
-    // the same empty success, not a refusal — `crate::vocabulary_delete_and_tag_sets`
-    // spans that class, this row keeps the lifecycle honest about it.
-    crate::vocabulary_delete_and_tag_sets::succeeded(
+    // A DELETE NEEDS THE ENTITY: a name this account holds no vocabulary under is the
+    // absent-resource refusal, not an already-satisfied delete —
+    // `crate::vocabulary_delete_and_tag_sets` spans that class, this row keeps the
+    // lifecycle honest about it.
+    crate::vocabulary_delete_and_tag_sets::absent_resource_refusal(
         &transcribe
             .call("DeleteVocabulary", json!({"VocabularyName": "never-created"}))
             .await,
         "delete a vocabulary that does not exist",
+        "vocabulary",
     );
 }
 
@@ -775,13 +777,14 @@ async fn the_vocabulary_filter_family_round_trips() {
             .call("GetVocabularyFilter", json!({"VocabularyFilterName": name}))
             .await
             .refused(case, 400, "BadRequestException");
-        // The same delete, run again now that the filter is gone, is the same empty
-        // success: a delete of something already absent is not an error.
-        crate::vocabulary_delete_and_tag_sets::succeeded(
+        // The same delete, run again now that the filter is gone, is the service's
+        // absent-resource refusal: a delete needs the entity to be there.
+        crate::vocabulary_delete_and_tag_sets::absent_resource_refusal(
             &transcribe
                 .call("DeleteVocabularyFilter", json!({"VocabularyFilterName": name}))
                 .await,
             case,
+            "vocabulary filter",
         );
     }
 }

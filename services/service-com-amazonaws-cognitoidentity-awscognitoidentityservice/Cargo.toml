@@ -22,7 +22,7 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # Renders the GUID half of an `IdentityPoolId` / `IdentityId` and the opaque
-# `ListIdentities` pagination token as hex.
+# pagination token of a listing as hex.
 hex = { workspace = true }
 # Mixes the material a minted GUID is built from.
 sha2 = { workspace = true }

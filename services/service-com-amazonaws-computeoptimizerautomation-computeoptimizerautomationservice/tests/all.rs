@@ -35,6 +35,8 @@ mod automation_rule_preview_summaries;
 mod automation_rule_validation;
 #[path = "all/enrollment_gate.rs"]
 mod enrollment_gate;
+#[path = "all/enrollment_rule_mode.rs"]
+mod enrollment_rule_mode;
 #[path = "all/enum_parameter_rejection.rs"]
 mod enum_parameter_rejection;
 #[path = "all/error_payloads.rs"]
