@@ -21,6 +21,8 @@ mod batch_execute_statement;
 mod collection_cap_constraint_reports;
 #[path = "all/continuous_backups.rs"]
 mod continuous_backups;
+#[path = "all/contributor_insights.rs"]
+mod contributor_insights;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/endpoint_discovery.rs"]
@@ -45,6 +47,8 @@ mod key_schema_element_refusals;
 mod number_canonicalization;
 #[path = "all/on_demand_backups.rs"]
 mod on_demand_backups;
+#[path = "all/on_demand_throughput_capacity_mode.rs"]
+mod on_demand_throughput_capacity_mode;
 #[path = "all/partiql_statements.rs"]
 mod partiql_statements;
 #[path = "all/partiql_transactions.rs"]

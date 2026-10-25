@@ -35,6 +35,8 @@ mod enabled_baseline_update;
 mod enabled_control_lifecycle;
 #[path = "all/enabled_control_reset.rs"]
 mod enabled_control_reset;
+#[path = "all/enabled_control_target_regions.rs"]
+mod enabled_control_target_regions;
 #[path = "all/enabled_control_update.rs"]
 mod enabled_control_update;
 #[path = "all/front_door_validation.rs"]

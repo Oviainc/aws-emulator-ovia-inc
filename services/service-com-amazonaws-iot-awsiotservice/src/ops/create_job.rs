@@ -272,65 +272,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // `targets` is modelled `len 1..` — a minimum and no maximum — so the FAN-OUT
-        // of one request is bounded here, before any work proportional to it: the
-        // parse below, the records it creates and the document each record carries.
-        let target_count = input.targets.len();
-        if target_count > crate::state::MAX_JOB_TARGETS {
-            return Err(over_limit(format!(
-                "a job may name at most {} targets, got {target_count}",
-                crate::state::MAX_JOB_TARGETS
-            )));
-        }
+        // How a refusal of the targets is answered: one wording and one status per
+        // reason, shared with every other operation that targets devices with a job.
+        let refused = |refusal: crate::state::JobTargetsRefusal| -> CreateJobError {
+            match refusal {
+                crate::state::JobTargetsRefusal::Invalid(message) => invalid(message),
+                crate::state::JobTargetsRefusal::NotFound(message) => {
+                    CreateJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: Some(message),
+                    })
+                    .into()
+                }
+                crate::state::JobTargetsRefusal::OverLimit(message) => over_limit(message),
+            }
+        };
 
         // Which DEVICES this job runs on: a thing target names one, a thing-group
-        // target names its members. Parsed BEFORE any lock is taken, so a malformed
-        // request never reaches the stores at all; de-duplicated through a set, so a
-        // repeated target costs no rescan of the ones already seen.
-        let mut targeted_things: Vec<String> = Vec::new();
-        let mut seen_things: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        let mut targeted_groups: Vec<String> = Vec::new();
-        for target_arn in &input.targets {
-            match crate::state::parse_job_target(target_arn) {
-                Ok(crate::state::JobTarget::Thing(thing_name)) => {
-                    // The target is not resolved against the thing registry: a job
-                    // execution is keyed by the thing NAME, and this surface accepts
-                    // a target that is not registered — the recorded data plane then
-                    // answers that name's queue reads from the execution this creates,
-                    // which is what a device registered later (or by another path)
-                    // relies on.
-                    //
-                    // One thing targeted twice is one device, so it gets ONE
-                    // execution of this job.
-                    if seen_things.insert(thing_name.clone()) {
-                        targeted_things.push(thing_name);
-                    }
-                }
-                Ok(crate::state::JobTarget::ThingGroup(group_name)) => {
-                    targeted_groups.push(group_name);
-                }
-                Err(crate::state::JobTargetRejection::UnsupportedResourceType(
-                    resource_type,
-                )) => {
-                    return Err(invalid(format!(
-                        "Resource type {resource_type} not supported as a target"
-                    )));
-                }
-                Err(crate::state::JobTargetRejection::UnaddressableName(name)) => {
-                    return Err(invalid(format!(
-                        "{name} is not a thing name a job may target: a thing name is 1..{} \
-                         characters matching ^[a-zA-Z0-9:_-]+$",
-                        ::service_common::iot_job_executions::MAX_THING_NAME_LEN
-                    )));
-                }
-                Err(crate::state::JobTargetRejection::NotAnIotResourceArn) => {
-                    return Err(invalid(format!(
-                        "{target_arn} is not an IoT thing or thing group ARN"
-                    )));
-                }
-            }
-        }
+        // target names its members. Resolved BEFORE any lock is taken, so a malformed
+        // request never reaches the stores at all, and bounded by
+        // `MAX_JOB_TARGETS` before the walk, so the FAN-OUT of one request — the
+        // records it creates and the document each record carries — is capped before
+        // any work proportional to it.
+        let fanout = crate::state::resolve_job_targets(&input.targets).map_err(refused)?;
+        let targeted_things = fanout.things;
+        let targeted_groups = fanout.groups;
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::service_common::iot_job_executions::now_epoch_seconds();
@@ -374,61 +339,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_JOBS
             )));
         }
-        // A group's executions are its MEMBERS' executions. The group registry holds
-        // no membership (`AddThingToThingGroup` is still a scaffold, its own issue),
-        // so a group target cannot be expanded into the devices it names: a group the
-        // registry does not hold is the modelled 404, and one it DOES hold is the
-        // modelled 400 — never a 200 that reports a group-targeted job as dispatched
-        // while queueing nothing. The FIRST group target decides, as any one of them
-        // refuses the whole request.
+        // A group's executions are its MEMBERS' executions, and no membership is
+        // recorded, so a group target is refused — never answered with a 200 that
+        // reports a group-targeted job as dispatched while queueing nothing. The FIRST
+        // group target decides, as any one of them refuses the whole request.
         if let Some(group_name) = targeted_groups.first() {
-            if store.thing_groups.contains_key(group_name) {
-                return Err(invalid(format!(
-                    "a thing group target cannot be expanded: this emulator records no \
-                     membership for thing group {group_name}, so the devices it names are \
-                     not known"
-                )));
-            }
-            return Err(CreateJobErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Thing group {group_name} does not exist")),
-                },
-            )
-            .into());
+            return Err(refused(store.thing_group_target_refusal(group_name)));
         }
 
         // Targeting a thing with a job IS creating that thing's job execution: it is
         // QUEUED, at version 1, and carries the job's document and in-progress
         // timeout, which is what the device then polls for, starts and reports on.
-        //
-        // The execution numbers are read first (one `i64` per target, inside the
-        // bound above), then the records are built LAZILY, one at a time, so the
-        // store's own ceilings bound what this request allocates instead of being
-        // consulted after a whole Vec of records — each with a copy of the document —
-        // was already materialised.
         let mut pending = executions.lock();
-        let numbers: Vec<i64> = targeted_things
-            .iter()
-            .map(|thing_name| pending.next_execution_number(thing_name, &job.job_id))
-            .collect();
-        let job_id = job.job_id.clone();
-        let document = job.document.clone();
-        let timeout = job.in_progress_timeout_minutes;
-        let records = targeted_things.iter().zip(numbers).map(
-            |(thing_name, execution_number)| {
-                let mut record =
-                    ::service_common::iot_job_executions::JobExecutionRecord::queued(
-                        job_id.clone(),
-                        thing_name.clone(),
-                        document.clone(),
-                        now,
-                    );
-                record.execution_number = execution_number;
-                record.in_progress_timeout_minutes = timeout;
-                record
-            },
-        );
-        if let Err(quota) = pending.try_insert_executions(records) {
+        if let Err(quota) = crate::state::queue_job_executions(
+            &mut pending,
+            &job.job_id,
+            job.document.as_deref(),
+            job.in_progress_timeout_minutes,
+            &targeted_things,
+            now,
+        ) {
             return Err(over_limit(quota));
         }
 

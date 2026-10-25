@@ -16,8 +16,10 @@
 //! * `UserName` narrows the listing to that one user, and a name state does not hold
 //!   is the modelled `UserNotFoundFault`;
 //! * a `Filters` entry selects the users whose named property carries one of its
-//!   values, filters combine conjunctively, and a filter whose `Name` is not one of the
-//!   service's filterable properties is the modelled `InvalidParameterValueException`;
+//!   values, filters combine conjunctively, a filter whose `Name` is not one of the
+//!   service's filterable properties is the modelled `InvalidParameterValueException`,
+//!   and `UserName` sent together with a filter is the modelled
+//!   `InvalidParameterCombinationException`;
 //! * the listing pages over its whole set in name order for any `MaxResults`;
 //! * a describe is a REPORT: two identical calls answer identically.
 //!
@@ -389,8 +391,8 @@ async fn acl_names_are_derived_from_the_acls_that_list_the_user() {
 }
 
 /// `Filters` selects the users whose named property carries one of the entry's values,
-/// several filters combine conjunctively, and a `UserName` given alongside them
-/// narrows the same way.
+/// several filters combine conjunctively, and a `UserName` sent alongside them is
+/// refused: the two members select different things.
 #[tokio::test]
 async fn filters_select_the_users_whose_named_property_matches() {
     let harness = harness();
@@ -441,20 +443,9 @@ async fn filters_select_the_users_whose_named_property_matches() {
             &["data-reader-1"],
         ),
         (
-            "UserName beside a filter it satisfies",
-            json!({
-                "UserName": "a",
-                "Filters": [{ "Name": "acl-name", "Values": ["reader-acl"] }],
-            }),
+            "a filter list that names no filter conflicts with nothing",
+            json!({ "UserName": "a", "Filters": [] }),
             &["a"],
-        ),
-        (
-            "UserName beside a filter it fails",
-            json!({
-                "UserName": "App",
-                "Filters": [{ "Name": "acl-name", "Values": ["reader-acl"] }],
-            }),
-            &[],
         ),
     ];
     for (case, request, expected) in cases {
@@ -462,6 +453,35 @@ async fn filters_select_the_users_whose_named_property_matches() {
         assert_eq!(
             names, *expected,
             "case {case:?}: expected the filtered names in name order, got {names:?}"
+        );
+    }
+
+    // `UserName` selects one user and `Filters` selects a set, so a request carrying
+    // both asks for two selections at once and is refused rather than silently served
+    // as one of them. The rows differ in whether the named user would have satisfied
+    // the filters at all.
+    for (case, request) in [
+        (
+            "UserName beside a filter it satisfies",
+            json!({
+                "UserName": "a",
+                "Filters": [{ "Name": "acl-name", "Values": ["reader-acl"] }],
+            }),
+        ),
+        (
+            "UserName beside a filter it fails",
+            json!({
+                "UserName": "App",
+                "Filters": [{ "Name": "acl-name", "Values": ["reader-acl"] }],
+            }),
+        ),
+    ] {
+        let (status, body) = harness.call("DescribeUsers", &request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidParameterCombinationException"),
+            "case {case:?}: expected the modelled combination fault, got {status} with \
+             {body}"
         );
     }
 }

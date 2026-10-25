@@ -479,21 +479,28 @@ async fn acl_membership_is_reflected_on_the_user() {
         );
     }
 
-    // A user created AFTER the ACL that names it reports the same membership: the
-    // listing derives it from the ACLs rather than from the order of the calls.
+    // Membership is DERIVED from the ACLs rather than recorded when the user was
+    // created: an ACL created LATER that names a user already in state is reported on
+    // that user, which the describe above found in no ACL at all.
     ok(
         &router,
         "CreateACL",
-        &json!({ "ACLName": "acl-later", "UserNames": ["created-last"] }),
+        &json!({ "ACLName": "acl-later", "UserNames": ["in-none"] }),
         "acl-later",
     )
     .await;
-    let created = create_user(&router, "created-last").await;
+    let described = ok(
+        &router,
+        "DescribeUsers",
+        &json!({ "UserName": "in-none" }),
+        "acl-later",
+    )
+    .await;
     assert_eq!(
-        created["User"]["ACLNames"],
+        described["Users"][0]["ACLNames"],
         json!(["acl-later"]),
-        "case \"created-last\": a create must report the membership already in state, \
-         got {created}"
+        "case \"acl-later\": a describe must report the membership already in state, \
+         got {described}"
     );
 
     // The unfiltered listing agrees with every by-name describe.

@@ -113,6 +113,8 @@ mod object_malware_scan;
 mod organization_admin_accounts;
 #[path = "all/organization_configuration.rs"]
 mod organization_configuration;
+#[path = "all/organization_statistics.rs"]
+mod organization_statistics;
 #[path = "all/publishing_destination_lifecycle.rs"]
 mod publishing_destination_lifecycle;
 #[path = "all/publishing_destination_listing.rs"]

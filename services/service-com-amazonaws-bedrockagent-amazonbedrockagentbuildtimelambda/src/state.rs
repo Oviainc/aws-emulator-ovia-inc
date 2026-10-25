@@ -24,6 +24,15 @@
 //! [`data_sources`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::data_sources)
 //! map, keyed by `dataSourceId` and carrying the `knowledgeBaseId` it belongs
 //! to, with [`DataSourceRecord::to_data_source`] as its single projection.
+//!
+//! A data source's ingestion jobs (`StartIngestionJob`, `GetIngestionJob`) are
+//! backed by the
+//! [`ingestion_jobs`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::ingestion_jobs)
+//! map, keyed by `ingestionJobId` and carrying the knowledge base and data
+//! source pair it ran for, with [`IngestionJobRecord::to_ingestion_job`] as its
+//! single projection. A job's status advances on the CLOCK alone, through
+//! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::materialise_due_transitions`],
+//! so every reader of the job observes the same progression.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -33,9 +42,9 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Agent, AgentSummary, CreateFlowOutput, CustomOrchestration, DataSource,
     DataSourceConfiguration, FlowDefinition, FlowValidation, GetFlowOutput,
-    GuardrailConfiguration, KnowledgeBase, KnowledgeBaseConfiguration, MemoryConfiguration,
-    PromptOverrideConfiguration, ServerSideEncryptionConfiguration, StorageConfiguration,
-    VectorIngestionConfiguration,
+    GuardrailConfiguration, IngestionJob, IngestionJobStatistics, KnowledgeBase,
+    KnowledgeBaseConfiguration, MemoryConfiguration, PromptOverrideConfiguration,
+    ServerSideEncryptionConfiguration, StorageConfiguration, VectorIngestionConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned, so it names no
@@ -749,6 +758,163 @@ impl DataSourceRecord {
     }
 }
 
+/// The most ingestion jobs one data source holds; past it `StartIngestionJob`
+/// answers the modelled `ServiceQuotaExceededException` instead of growing.
+///
+/// Amazon Bedrock publishes an adjustable quota on ingestion jobs, and this
+/// emulator models neither Service Quotas nor an account's adjustments — so this
+/// is the emulator's OWN bound on the store, set far above any workflow an
+/// emulator serves, and it is what stops the ingestion-job state growing without
+/// end as one data source is ingested again and again.
+pub const INGESTION_JOB_QUOTA: usize = 1_000;
+
+/// How long after `StartIngestionJob` a job leaves `STARTING` for
+/// `IN_PROGRESS`.
+///
+/// CHOSEN, not documented: AWS publishes no duration for an ingestion job. It is
+/// deliberately non-zero so a caller that reads the job back immediately still
+/// observes the `STARTING` status the modelled `IngestionJobStatus` declares, and
+/// short enough that a client script polling the job converges promptly. It is
+/// the longer of the two spans, so that first read has the widest window.
+pub const INGESTION_JOB_START_SPAN: Duration = Duration::from_millis(450);
+
+/// How long after a job reaches `IN_PROGRESS` it reaches `COMPLETE`.
+///
+/// CHOSEN, not documented, and non-zero for the same reason as
+/// [`INGESTION_JOB_START_SPAN`]: `IN_PROGRESS` is a status the model declares, so
+/// a poller has to be able to observe it. The two spans together keep the whole
+/// progression inside three quarters of a second.
+pub const INGESTION_JOB_RUN_SPAN: Duration = Duration::from_millis(300);
+
+/// The `IngestionJobStatus` values this slice of the service can hold, named as
+/// the model's `IngestionJobStatus` enum names them on the wire.
+///
+/// `StartIngestionJob` mints only [`IngestionJobStatus::Starting`]; the rest of
+/// the chain is owed by the clock. The modelled enum also declares `STOPPING`,
+/// `STOPPED` and `FAILED`, which nothing in this slice reaches: stopping a job is
+/// `StopIngestionJob`'s own operation, and no job here fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestionJobStatus {
+    /// `StartIngestionJob` accepted; the job reaches
+    /// [`IngestionJobStatus::InProgress`] once [`INGESTION_JOB_START_SPAN`] has
+    /// elapsed.
+    Starting,
+    /// The job is running; it reaches [`IngestionJobStatus::Complete`] once
+    /// [`INGESTION_JOB_RUN_SPAN`] more has elapsed.
+    InProgress,
+    /// The job finished — a terminal status, so the clock owes it nothing more.
+    Complete,
+}
+
+impl IngestionJobStatus {
+    /// The member value for the modelled `IngestionJobStatus` enum.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Starting => "STARTING",
+            Self::InProgress => "IN_PROGRESS",
+            Self::Complete => "COMPLETE",
+        }
+    }
+
+    /// The status the clock owes a job in this one next, and how long after it
+    /// reached this status that comes due. `None` for a terminal status.
+    fn owed_next(self) -> Option<(Duration, Self)> {
+        match self {
+            Self::Starting => Some((INGESTION_JOB_START_SPAN, Self::InProgress)),
+            Self::InProgress => Some((INGESTION_JOB_RUN_SPAN, Self::Complete)),
+            Self::Complete => None,
+        }
+    }
+}
+
+/// One stored ingestion job: the single source of truth for every
+/// ingestion-job operation.
+#[derive(Debug, Clone)]
+pub struct IngestionJobRecord {
+    pub knowledge_base_id: String,
+    pub data_source_id: String,
+    pub ingestion_job_id: String,
+    pub description: Option<String>,
+    pub status: IngestionJobStatus,
+    /// A status the CLOCK owes this job, and the instant it comes due. A
+    /// reporting operation may materialise it once that instant has passed; it
+    /// never invents a transition of its own.
+    pub pending_status: Option<(SystemTime, IngestionJobStatus)>,
+    /// What the job ingested: each count is of documents this store holds for
+    /// the data source, so it stays at the modelled default of 0 for as long as
+    /// the store holds none. Nothing here is a number about documents the
+    /// emulator never took in.
+    pub statistics: IngestionJobStatistics,
+    /// Reasons the job failed; empty while nothing has failed.
+    pub failure_reasons: Vec<String>,
+    pub started_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// When the job's text became queryable, which the modelled `textReadyAt`
+    /// documents is "not returned until text extraction is complete for all the
+    /// documents" — so it stays absent until the job reaches
+    /// [`IngestionJobStatus::Complete`].
+    pub text_ready_at: Option<SystemTime>,
+    pub client_token: Option<String>,
+}
+
+impl IngestionJobRecord {
+    /// A job `StartIngestionJob` has just accepted: `STARTING`, with the first
+    /// transition the clock owes it already due.
+    pub fn starting(
+        knowledge_base_id: String,
+        data_source_id: String,
+        ingestion_job_id: String,
+        description: Option<String>,
+        client_token: Option<String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            knowledge_base_id,
+            data_source_id,
+            ingestion_job_id,
+            description,
+            status: IngestionJobStatus::Starting,
+            pending_status: Some((now + INGESTION_JOB_START_SPAN, IngestionJobStatus::InProgress)),
+            // The documents this store holds for the data source are what a job
+            // can scan, and it holds none until a document-level operation
+            // persists one — so every count keeps the default the model gives
+            // it rather than a number nothing counted.
+            statistics: IngestionJobStatistics::default(),
+            // Nothing has failed on a job this call just started.
+            failure_reasons: Vec::new(),
+            started_at: now,
+            updated_at: now,
+            text_ready_at: None,
+            client_token,
+        }
+    }
+
+    /// Whether the clock still owes this job a status, i.e. it has not reached a
+    /// terminal one. A data source ingests one job at a time, so this is what a
+    /// second `StartIngestionJob` conflicts with.
+    pub fn is_running(&self) -> bool {
+        self.status != IngestionJobStatus::Complete
+    }
+
+    /// This record as the modelled `IngestionJob` shape: every member is
+    /// populated from the stored record, never from the request being served.
+    pub fn to_ingestion_job(&self) -> IngestionJob {
+        IngestionJob {
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            data_source_id: self.data_source_id.clone(),
+            ingestion_job_id: self.ingestion_job_id.clone(),
+            description: self.description.clone(),
+            status: self.status.as_wire().to_string(),
+            statistics: Some(self.statistics.clone()),
+            failure_reasons: (!self.failure_reasons.is_empty())
+                .then(|| self.failure_reasons.clone()),
+            started_at: to_date_time(self.started_at),
+            updated_at: to_date_time(self.updated_at),
+            text_ready_at: self.text_ready_at.map(to_date_time),
+        }
+    }
+}
+
 /// A `ListAgents` resume cursor, decoded back into the ordering it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageCursor {
@@ -806,6 +972,16 @@ pub struct ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// carrying the same `@idempotencyToken` returns the data source it already
     /// created.
     pub data_source_client_tokens: HashMap<String, String>,
+    /// Every ingestion job that exists, keyed by its 10-character
+    /// `ingestionJobId`. Each record names the knowledge base and data source
+    /// it ran for, so a read of one data source never reports another's job.
+    pub ingestion_jobs: HashMap<String, IngestionJobRecord>,
+    /// `(knowledgeBaseId, dataSourceId, clientToken)` -> `ingestionJobId`, so a
+    /// retried `StartIngestionJob` carrying the same `@idempotencyToken`
+    /// returns the job it already started rather than starting a second one.
+    /// The key carries the whole scope the replay is read at, so one token
+    /// reused for another data source cannot displace the job it already names.
+    pub ingestion_job_client_tokens: HashMap<(String, String, String), String>,
     /// Feeds id minting; never returned to a caller.
     id_sequence: u64,
 }
@@ -900,6 +1076,60 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .filter(|record| record.knowledge_base_id == knowledge_base_id)
     }
 
+    /// Mint an unused `ingestionJobId`, which the modelled `Id` shape
+    /// constrains to the same `^[0-9a-zA-Z]{10}$` as an `agentId`. `None` when
+    /// every one of [`MINT_ATTEMPTS`] draws collided.
+    pub fn mint_ingestion_job_id(&mut self, now: SystemTime) -> Option<String> {
+        for _ in 0..MINT_ATTEMPTS {
+            let id = self.next_id_candidate(now);
+            if !self.ingestion_jobs.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// The stored ingestion job `ingestion_job_id` names, but only when it ran
+    /// for this knowledge base and data source: a job is identified by the
+    /// triple, so one data source never reports another's job.
+    pub fn ingestion_job_of(
+        &self,
+        knowledge_base_id: &str,
+        data_source_id: &str,
+        ingestion_job_id: &str,
+    ) -> Option<&IngestionJobRecord> {
+        self.ingestion_jobs.get(ingestion_job_id).filter(|record| {
+            record.knowledge_base_id == knowledge_base_id
+                && record.data_source_id == data_source_id
+        })
+    }
+
+    /// The data source's job that has not reached a terminal status, if it has
+    /// one: a data source ingests one job at a time.
+    pub fn running_ingestion_job(
+        &self,
+        knowledge_base_id: &str,
+        data_source_id: &str,
+    ) -> Option<&IngestionJobRecord> {
+        self.ingestion_jobs.values().find(|record| {
+            record.knowledge_base_id == knowledge_base_id
+                && record.data_source_id == data_source_id
+                && record.is_running()
+        })
+    }
+
+    /// How many ingestion jobs this data source has already run, the count the
+    /// per-data-source bound is checked against.
+    pub fn ingestion_job_count(&self, knowledge_base_id: &str, data_source_id: &str) -> usize {
+        self.ingestion_jobs
+            .values()
+            .filter(|record| {
+                record.knowledge_base_id == knowledge_base_id
+                    && record.data_source_id == data_source_id
+            })
+            .count()
+    }
+
     /// How many data sources `knowledge_base_id` already holds, the count the
     /// per-knowledge-base bound is checked against.
     pub fn data_source_count(&self, knowledge_base_id: &str) -> usize {
@@ -929,6 +1159,27 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
                     knowledge_base.status = next;
                     knowledge_base.pending_status = None;
                 }
+            }
+        }
+        // An ingestion job's status is a CHAIN, so a job left unread for long
+        // enough is owed more than one of them: each is applied at the instant
+        // it came due, and the next is due that instant plus its own span. The
+        // chain is finite and strictly advancing, so this ends.
+        for job in self.ingestion_jobs.values_mut() {
+            while let Some((due, next)) = job.pending_status {
+                if now < due {
+                    break;
+                }
+                job.status = next;
+                // The job changed when the clock made the change due, not when
+                // it was noticed.
+                job.updated_at = due;
+                if next == IngestionJobStatus::Complete {
+                    job.text_ready_at = Some(due);
+                }
+                job.pending_status = next
+                    .owed_next()
+                    .map(|(span, after)| (due + span, after));
             }
         }
     }

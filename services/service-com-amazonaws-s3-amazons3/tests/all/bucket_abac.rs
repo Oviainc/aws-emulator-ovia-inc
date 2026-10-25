@@ -13,10 +13,13 @@
 //!    and answers 200 with an empty body; `GetBucketAbac` reports exactly the last
 //!    recorded status. ABAC is a property every general purpose bucket HAS, so a bucket
 //!    no put has touched reports the state it was created in rather than nothing at all.
-//! 2. An `AbacStatus` naming no state the service can set — no `Status`, or a `Status`
-//!    outside `BucketAbacStatus` — is refused with HTTP 400 `MalformedXML`, the code S3
-//!    answers a document that does not validate against its published schema with, and
-//!    records nothing.
+//! 2. An `AbacStatus` naming no state the service can set — no `Status`, a `Status`
+//!    outside `BucketAbacStatus`, or a document shaped some other way — is refused with
+//!    HTTP 400 `MalformedXML`, the code S3 answers a document that does not validate
+//!    against its published schema with, carrying that code's FIXED published sentence and
+//!    nothing about the request, and records nothing. Every form of that one schema
+//!    violation therefore reads the same on the wire, whichever of the boundary validator
+//!    and the handler finds it.
 //! 3. An ABAC read or write against a bucket this emulator does not hold is `NoSuchBucket`
 //!    (404); one whose `x-amz-expected-bucket-owner` is not this emulator's account is
 //!    `AccessDenied` (403).
@@ -25,6 +28,7 @@
 
 use std::sync::Arc;
 
+use service_com_amazonaws_s3_amazons3::state::MALFORMED_XML_MESSAGE;
 use service_com_amazonaws_s3_amazons3::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -104,6 +108,12 @@ async fn send(
         status: parts.status.as_u16(),
         body: String::from_utf8_lossy(&body).to_string(),
     }
+}
+
+/// An `AbacStatus` document carrying `body` between its container tags, for the documents
+/// that are not simply a `Status`.
+fn container(body: &str) -> String {
+    format!("<AbacStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{body}</AbacStatus>")
 }
 
 /// An `AbacStatus` payload carrying `Status` when it is `Some`.
@@ -234,6 +244,14 @@ async fn an_abac_payload_naming_no_settable_status_is_refused() {
         ),
         ("a Status differing only in case", payload(Some("enabled"))),
         ("a Status that is the empty string", payload(Some(""))),
+        (
+            "a container naming some other element instead",
+            container("<State>Enabled</State>"),
+        ),
+        (
+            "a container whose Status sits inside another element",
+            container("<AbacConfiguration><Status>Enabled</Status></AbacConfiguration>"),
+        ),
     ];
     for (label, body) in refused {
         let answer = send(&router, "PUT", &format!("/{bucket}?abac"), body, &[]).await;
@@ -247,6 +265,16 @@ async fn an_abac_payload_naming_no_settable_status_is_refused() {
             "MalformedXML",
             "case {label:?}: expected MalformedXML, got {:?}",
             answer.error_code()
+        );
+
+        // The code's own published sentence, whole and alone: the code says the document
+        // did not validate against the published schema, and that schema is the same for
+        // every document, so no row can be told from another by its message.
+        assert_eq!(
+            answer.element("Message").as_deref(),
+            Some(MALFORMED_XML_MESSAGE),
+            "case {label:?}: expected the published MalformedXML sentence, got {:?}",
+            answer.element("Message")
         );
 
         // And nothing was recorded: the baseline status is still what a read reports.

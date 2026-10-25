@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFunctions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFunctions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFunctions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +71,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::ops::Bound;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -147,20 +140,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFunctions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFunctionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFunctions"))
+        // The engine is reachable from `&self` (constructor-injected); this operation
+        // needs nothing from the request metadata the context carries.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // "The maximum number of functions that you want in the response" — a page holds at
+        // least one item, so a non-positive size names no page at all. The size served is
+        // bounded above by this emulator's own page ceiling, so one request cannot serve the
+        // whole store in a single response. A value the parameter cannot take is refused
+        // with the one sentence this service states the constraint in.
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListFunctionsErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        // "An optional filter to return only the functions that are in the specified stage":
+        // a request that names no stage lists every function it holds, under the stage a
+        // function is created in — the SAME default the function reads take — while
+        // `Stage=LIVE` lists only the functions a publish has copied into that stage. The
+        // value is constrained to the modelled `FunctionStage` enum, so reaching here means
+        // it names one of the two stages.
+        let stage = input
+            .stage
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_FUNCTION_STAGE);
+
+        // A READ: nothing about a function is owed by the clock — a function reaches its
+        // `LIVE` stage through a publish CALL rather than by waiting — so this read
+        // materialises nothing.
+        let store = state.lock();
+
+        let mut items: Vec<FunctionSummary> = Vec::new();
+        let mut is_truncated = false;
+        // `Marker` names where the previous page ENDED, so this page starts after it — "The
+        // response includes functions in the list that occur after the marker" — and walking
+        // the pages enumerates every function exactly once. A function is held under its
+        // name, which is what the store is ordered by, so the resume point is a range bound
+        // rather than a scan.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        for (_, stored) in store.functions.range::<str, _>((start, Bound::Unbounded)) {
+            // A function with no record for the stage asked for is not in that stage, so it
+            // is not on this page; every item is projected from the STAGE record, so a listed
+            // function reports the configuration and the status that stage holds.
+            let Some(stage_record) = stored.stage(stage) else {
+                continue;
+            };
+            if items.len() >= page_size {
+                is_truncated = true;
+                break;
+            }
+            items.push(stage_record.to_summary(&stored.name, &stored.arn));
+        }
+
+        Ok(ListFunctionsOutput {
+            function_list: Some(FunctionList {
+                // "If there are more items in the list than are in this response, this
+                // element is present. It contains the value that you should use in the
+                // `Marker` field of a subsequent request to continue listing functions where
+                // you left off" — the name the page ended at, and nothing at all on a page
+                // that ends the collection.
+                next_marker: if is_truncated {
+                    items.last().map(|summary| summary.name.clone())
+                } else {
+                    None
+                },
+                // "The maximum number of functions requested."
+                max_items,
+                // "The number of functions returned in the response": the length of `Items`.
+                quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+                // "Contains the functions in the list." A page that lists nothing carries no
+                // `Items` element at all, rather than an empty one — the same form every
+                // other CloudFront listing here takes for an account using none of the
+                // resource.
+                items: if items.is_empty() { None } else { Some(items) },
+            }),
+        })
     }
 }

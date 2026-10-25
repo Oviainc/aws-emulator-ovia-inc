@@ -63,3 +63,5 @@ mod vpc_associations;
 mod vpc_authorization_deletion;
 #[path = "all/vpc_disassociation.rs"]
 mod vpc_disassociation;
+#[path = "all/zone_refusal_messages.rs"]
+mod zone_refusal_messages;

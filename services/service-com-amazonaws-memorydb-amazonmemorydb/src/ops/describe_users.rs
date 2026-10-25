@@ -225,6 +225,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let filters = input.filters.unwrap_or_default();
+        // `UserName` selects the ONE user it names and `Filters` selects the SET of
+        // users whose properties the filters match, so a request carrying both asks for
+        // two different selections at once: the members cannot hold together, which is
+        // this service's invalid-COMBINATION error. A filter list that names no filter
+        // selects nothing, so it conflicts with nothing.
+        if input.user_name.is_some() && !filters.is_empty() {
+            return Err(
+                DescribeUsersErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            crate::state::USER_NAME_WITH_FILTERS_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
         if let Some(unknown) = filters
             .iter()
             .find(|filter| !matches!(filter.name.as_str(), FILTER_USER_NAME | FILTER_ACL_NAME))

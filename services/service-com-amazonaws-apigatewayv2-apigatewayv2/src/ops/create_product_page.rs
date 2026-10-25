@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProductPage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProductPage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProductPage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `ProductPageId` under the portal product the URI names, persists
+//! a [`crate::state::ProductPage`] record carrying the request's display content under
+//! that product, and answers 201 with the stored page. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProductPage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProductPageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProductPage"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateProductPage",
+            ));
+        };
+
+        // `DisplayContent$Title` (len 1..255) and `DisplayContent$Body` (len 1..32768)
+        // are required and length-bounded by the model, so the boundary validator has
+        // already refused a request that omits either or oversteps a bound: the content
+        // reaching here is the page's content as it will be stored, with nothing left to
+        // resolve.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // A product page lives under the portal product the URI names, so a product
+        // nothing minted has nothing to create a page under: 404 `NotFoundException`
+        // ("The resource specified in the request was not found"), the wording every
+        // other portal-product reader refuses an unknown id with.
+        let Some(product) = store.portal_products.get_mut(&input.portal_product_id) else {
+            return Err(CreateProductPageErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid PortalProduct identifier specified {}:{}",
+                        ::engine::emulator_account_id(),
+                        input.portal_product_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // Bound the growth a caller drives, the way CreateProductRestEndpointPage bounds
+        // one product's REST endpoint pages: `TooManyRequestsException` is the modelled
+        // error for "a limit has been exceeded" (it carries the limit's name in
+        // `LimitType`).
+        if product.product_pages.len() >= crate::state::MAX_PRODUCT_PAGES_PER_PRODUCT {
+            return Err(CreateProductPageErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("ProductPage".to_string()),
+                    message: Some(format!(
+                        "The maximum number of product pages ({}) for this portal \
+                         product has been reached.",
+                        crate::state::MAX_PRODUCT_PAGES_PER_PRODUCT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let page_id = product.mint_product_page_id();
+        let record = crate::state::ProductPage {
+            product_page_arn: crate::state::product_page_arn(
+                &region,
+                &input.portal_product_id,
+                &page_id,
+            ),
+            product_page_id: page_id.clone(),
+            display_content: input.display_content,
+            last_modified: ::std::time::SystemTime::now(),
+        };
+
+        // `page_id` comes from the product's own id bijection, so it names no existing
+        // page and this inserts. Taking the entry back gives the STORED record, so what
+        // the caller is told is what a later GetProductPage will report rather than an
+        // echo of the request.
+        let stored = product
+            .product_pages
+            .entry(page_id)
+            .or_insert(record)
+            .to_wire();
+        Ok(CreateProductPageOutput {
+            display_content: stored.display_content,
+            last_modified: stored.last_modified,
+            product_page_arn: stored.product_page_arn,
+            product_page_id: stored.product_page_id,
+        })
     }
 }

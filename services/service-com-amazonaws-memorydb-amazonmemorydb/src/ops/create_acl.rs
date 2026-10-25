@@ -262,6 +262,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // An ACL's members ARE users, so each name this request lists is RESOLVED
+        // against the user store before the membership is persisted — the same
+        // resolution `UpdateACL` makes for the members it adds, through the one rule
+        // both read. Without it the ACL would be created listing a member no user
+        // exists for, which every path deriving from the membership then reports.
+        if let Some(message) =
+            state.absent_member_rejection(user_names.iter().map(String::as_str))
+        {
+            return Err(CreateACLErrorModeled::UserNotFoundFault(UserNotFoundFault {
+                message: Some(message),
+            })
+            .into());
+        }
 
         let arn = crate::state::acl_arn(&region, &acl_name);
         let acl = crate::state::StoredAcl {

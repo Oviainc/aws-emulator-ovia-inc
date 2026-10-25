@@ -3917,7 +3917,7 @@ pub const INVALID_AZURE_CLIENT_IDENTIFIER_MESSAGE: &str = "Invalid client identi
 /// well-formed configuration is refused with this text rather than answered with a
 /// connector no credential stands behind.
 pub const UNVERIFIABLE_AZURE_CREDENTIALS_MESSAGE: &str =
-    "Unable to verify Azure credentials for the connector";
+    "Unable to verify Azure credentials for the provided tenant configuration.";
 
 /// The Region and the connector name an `Arn` names, or `None` when the value is not
 /// a well-formed connector ARN of this service.
@@ -4511,6 +4511,15 @@ pub fn unplaceable_timestamp_message(member: &str, at: ::aws_smithy_types::DateT
 pub fn encode_page_token(resume_at: &str) -> String {
     ::aws_smithy_types::base64::encode(resume_at)
 }
+
+/// How Config words `InvalidNextTokenException` for a `NextToken` it did not issue.
+///
+/// FIXED, and it carries NO part of the request: the token the caller sent is not
+/// echoed back. One sentence serves every paged read of this service — the token is
+/// opaque, so the only thing a caller can learn from the refusal is that the value is
+/// not a page of this query, and the page it should resume from is the one the previous
+/// response handed it.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The nextToken provided is invalid";
 
 /// The key a `NextToken` resumes at, or `None` when the token is malformed — i.e.
 /// not something [`encode_page_token`] produced.
@@ -5222,15 +5231,14 @@ pub fn resource_not_discovered_message(identifier: &AggregateResourceIdentifier)
 /// How Config words `NoSuchConfigurationAggregatorException` for a request that named
 /// an aggregator this account does not hold.
 ///
-/// The message is BUILT FROM THE REQUEST — it quotes the
-/// `ConfigurationAggregatorName` the caller sent and names the member to check — so
-/// every operation that refuses an absent aggregator words it the same way.
-pub fn no_such_configuration_aggregator_message(name: &str) -> String {
-    format!(
-        "The configuration aggregator '{name}' provided in the request does not exist. \
-         Please check the ConfigurationAggregatorName and try again."
-    )
-}
+/// FIXED, and it carries NO part of the request: the name the caller sent is not
+/// echoed, so a refusal tells a caller only that the aggregator it named is not one of
+/// this account's. Every operation that models this error answers this one sentence,
+/// which is what lets a client tell this refusal from the other client errors those
+/// operations share.
+pub const NO_SUCH_CONFIGURATION_AGGREGATOR_MESSAGE: &str =
+    "The configuration aggregator does not exist. Check the configuration aggregator \
+     name and try again.";
 
 #[cfg(test)]
 mod tests {

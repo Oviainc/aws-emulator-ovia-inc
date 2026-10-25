@@ -374,7 +374,7 @@ pub struct ComAmazonawsSsmcontactsSsmcontactsState {
     pub engagements_started: u64,
     /// Pages, keyed by `PageArn`: one per contact channel an engagement engaged.
     /// `StartEngagement` inserts, `AcceptPage` acknowledges, `DescribePage` reports one and
-    /// `ListPagesByEngagement` reports an engagement's own; the model has no delete for a
+    /// `ListPagesByEngagement` reports an engagement's own and `ListPagesByContact` the ones\n    /// engaged against one contact's channels; the model has no delete for a
     /// page, so the only call that removes one is `StopEngagement`, and only for a page whose
     /// stage the stopped engagement never reached
     /// ([`ComAmazonawsSsmcontactsSsmcontactsState::cancel_unsent_pages_of`]).
@@ -654,6 +654,33 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
             .pages
             .values()
             .filter(|page| page.engagement_arn == engagement_arn)
+            .filter(|page| page.sent_time <= at)
+            .collect();
+        pages.sort_by_key(|page| page.sequence);
+        pages
+            .into_iter()
+            .map(|page| (page.sequence, page_summary(page)))
+            .collect()
+    }
+
+    /// The pages engaged against the channels of the contact `contact_arn` names that have
+    /// been SENT as of `at`, as the modelled `Page` summaries a listing reports, each with
+    /// the insertion sequence an opaque `NextToken` carries, oldest first.
+    ///
+    /// A page belongs to the contact that owns the channel it engaged, whichever contact's
+    /// engagement reached that channel: an escalation plan engaging a person's channel pages
+    /// THAT person, so the page is theirs to read. Pages of several engagements of the same
+    /// contact are all reported, in the order they were sent, since a contact's channels are
+    /// engaged by every engagement that reaches them.
+    ///
+    /// The sent-time filter is the same one [`Self::sent_pages_of_engagement`] applies: a page
+    /// whose plan stage has not come round yet has engaged nobody, so it is not a page the
+    /// contact has been sent.
+    pub fn sent_pages_of_contact(&self, contact_arn: &str, at: SystemTime) -> Vec<(u64, Page)> {
+        let mut pages: Vec<&PageRecord> = self
+            .pages
+            .values()
+            .filter(|page| page.contact_arn == contact_arn)
             .filter(|page| page.sent_time <= at)
             .collect();
         pages.sort_by_key(|page| page.sequence);
@@ -1375,6 +1402,9 @@ pub const TOKEN_SCOPE_ENGAGEMENTS: &str = "engagements";
 
 /// The `NextToken` scope `ListPagesByEngagement` issues and accepts.
 pub const TOKEN_SCOPE_PAGES_BY_ENGAGEMENT: &str = "pages-by-engagement";
+
+/// The `NextToken` scope `ListPagesByContact` issues and accepts.
+pub const TOKEN_SCOPE_PAGES_BY_CONTACT: &str = "pages-by-contact";
 
 /// The `NextToken` scope `ListRotationOverrides` issues and accepts.
 pub const TOKEN_SCOPE_ROTATION_OVERRIDES: &str = "rotation-overrides";

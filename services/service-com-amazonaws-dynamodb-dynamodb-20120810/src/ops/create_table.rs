@@ -19,7 +19,9 @@
 //! DynamoDB Streams store, and the table reports its
 //! `LatestStreamArn`/`LatestStreamLabel`; vector indexes, SSE and the other members
 //! this slice does not store are refused with the scaffold's 501 and filed as their
-//! own gap issues.
+//! own gap issues — after the request's own contradictions, so an on-demand capacity
+//! ceiling named for a table created PROVISIONED is the `ValidationException` the two
+//! capacity models make it rather than a report that nothing implements the member.
 //!
 //! The table is stored under the REGION the request's endpoint names
 //! ([`crate::state::request_region`], which reads it from the credential scope or from
@@ -277,14 +279,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
 
-        // A member this slice does not store is refused as "not written yet" rather
-        // than accepted and silently dropped.
-        if let Some(member) = unsupported_member(&input) {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                "CreateTable with {member}"
-            )));
-        }
-
         // Every list this request carries is clamped BEFORE anything walks it, so the
         // work that follows is bounded by constants rather than by the request body.
         clamped_lists(&input).map_err(lift)?;
@@ -321,6 +315,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
         let (billing_mode, provisioned_throughput) = validated_throughput(&input).map_err(lift)?;
+        // An on-demand capacity ceiling cannot hold on a table created in the
+        // PROVISIONED capacity mode, whichever resource it was named for
+        // ([`crate::state::check_on_demand_ceilings`]). That contradiction is in the
+        // REQUEST, so it is refused ahead of the scaffold refusal below.
+        crate::state::check_on_demand_ceilings(&billing_mode, requested_on_demand_ceilings(&input))
+            .map_err(lift)?;
+        // A member this slice does not store is refused as "not written yet" rather
+        // than accepted and silently dropped.
+        if let Some(member) = unsupported_member(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "CreateTable with {member}"
+            )));
+        }
         // The warm throughput the table starts life with: the request's values where it
         // named them, otherwise the pair the table's own capacity keeps warm, in force
         // from creation.
@@ -454,6 +461,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new table has been metered once, at zero: `ItemCount`/`TableSizeBytes` are
             // refreshed "approximately every six hours", not by the writes that follow.
             reported_counters: crate::state::MeteredCounters::new(now),
+            // Contributor insights are off on a new table: `CreateTable` carries no
+            // contributor insights member, so `UpdateContributorInsights` is the only
+            // way to turn them on.
+            contributor_insights: crate::state::ContributorInsights::default(),
         };
         let description = table.describe(now);
         store.insert_table(table);
@@ -559,6 +570,23 @@ fn lift_policy_fault(resource: &str, fault: crate::state::PolicyFault) -> Create
             crate::scaffolded::Scaffolded::validation(detail)
         }
     }
+}
+
+/// Every on-demand capacity ceiling this request names: the table's own, and the one
+/// each global secondary index carries — an index's capacity mode is the table's, so the
+/// same rule holds for all of them.
+fn requested_on_demand_ceilings(
+    input: &CreateTableInput,
+) -> impl Iterator<Item = &OnDemandThroughput> {
+    ::std::iter::once(input.on_demand_throughput.as_ref())
+        .chain(
+            input
+                .global_secondary_indexes
+                .iter()
+                .flatten()
+                .map(|index| index.on_demand_throughput.as_ref()),
+        )
+        .flatten()
 }
 
 /// The first input member present that this slice does not store, if any.
@@ -849,6 +877,8 @@ fn validated_indexes(
             throughput_history: crate::state::ThroughputHistory::default(),
             warm_throughput,
             reported_counters: crate::state::MeteredCounters::new(now),
+            // Off on a new index, for the same reason it is off on a new table.
+            contributor_insights: crate::state::ContributorInsights::default(),
         });
     }
     Ok(indexes)

@@ -30,7 +30,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    count, list, ok, refused, register_definition, service, string, ACCOUNT, SIGNED_REGION,
+    count, list, ok, refused, register_capacity, register_definition, service, string, ACCOUNT,
+    SIGNED_REGION,
 };
 
 /// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to
@@ -428,6 +429,9 @@ async fn a_rollout_reaches_its_steady_state_on_the_clock_and_writes_its_events()
         "setup",
     )
     .await;
+    // "The EC2 launch type runs your tasks on Amazon EC2 instances registered to your
+    // cluster", so the rollout needs capacity registered to place its tasks on.
+    register_capacity(&router, "settling", "setup").await;
     let definition_arn = register_definition(&router, "settlingfamily", "setup").await;
 
     // The rule generalises over the number of tasks the rollout has to place, zero
@@ -558,6 +562,7 @@ async fn a_deleted_service_stays_describable_as_inactive_and_refuses_updates() {
         "setup",
     )
     .await;
+    register_capacity(&router, "deleting", "setup").await;
     let definition_arn = register_definition(&router, "deletingfamily", "setup").await;
 
     // The rows differ along what the service still holds when it is deleted and how the
