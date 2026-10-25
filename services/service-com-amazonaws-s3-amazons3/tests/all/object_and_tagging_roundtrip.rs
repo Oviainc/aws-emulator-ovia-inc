@@ -73,6 +73,8 @@ fn sized_object(length: usize) -> Object {
         retention: None,
         // A write initiates no restore either; `RestoreObject` is what does.
         restore: None,
+        // And it attaches no annotation; `PutObjectAnnotation` is what does.
+        annotations: std::collections::BTreeMap::new(),
         body,
     }
 }

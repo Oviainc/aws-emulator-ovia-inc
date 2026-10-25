@@ -302,6 +302,92 @@ pub enum ObjectRestoreWrite {
     TotalByteBudgetReached { would_hold: usize },
 }
 
+/// What [`ComAmazonawsS3Amazons3State::put_object_annotation`] did, so the caller answers
+/// each outcome without re-deriving it — and cannot record an annotation without having
+/// gone through the per-object annotation ceiling and the byte budgets a stored object's
+/// members count against, per bucket AND service-wide. The shape [`ObjectRestoreWrite`]
+/// has, for the same reason: an annotation is one more payload kept beside an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationWrite {
+    /// The addressed object version now carries the annotation that was handed in, under
+    /// the name it was handed in with.
+    Applied,
+    /// The bucket exists but holds no such object version; nothing was written.
+    NoSuchObject,
+    /// The object already carries [`MAX_ANNOTATIONS_PER_OBJECT`] annotations and this call
+    /// names a new one; nothing was written.
+    LimitReached,
+    /// Keeping the annotation would take the bucket past [`MAX_OBJECT_BYTES_PER_BUCKET`]
+    /// retained bytes; nothing was written.
+    ByteBudgetReached { would_hold: usize },
+    /// Keeping the annotation would take the whole store past [`MAX_OBJECT_BYTES_TOTAL`]
+    /// retained bytes; nothing was written.
+    TotalByteBudgetReached { would_hold: usize },
+}
+
+/// How many annotations one object may carry.
+///
+/// From `PutObjectAnnotation`'s own documentation: "Each object can have up to 1,000
+/// annotations." A write that would take an object past it is refused rather than
+/// recorded.
+pub const MAX_ANNOTATIONS_PER_OBJECT: usize = 1_000;
+
+/// The longest an annotation name may be, in BYTES.
+///
+/// "Length Constraints: Minimum length of 1. Maximum length of 512 bytes"
+/// (`PutObjectAnnotationRequest$AnnotationName`), the same bound the
+/// `AnnotationNameTooLong` error reports ("The annotation name exceeds 512 bytes").
+/// `AnnotationName` carries no `length` trait in the model, so nothing refuses an
+/// over-long name before a handler does.
+pub const MAX_ANNOTATION_NAME_BYTES: usize = 512;
+
+/// The smallest an annotation payload may be, in bytes, and the largest: "Must be between
+/// 1 byte and 1 MiB in size" (`PutObjectAnnotationRequest$AnnotationPayload`).
+pub const MIN_ANNOTATION_PAYLOAD_BYTES: usize = 1;
+/// See [`MIN_ANNOTATION_PAYLOAD_BYTES`].
+pub const MAX_ANNOTATION_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// The name prefixes S3 reserves for itself, which no caller's annotation name may start
+/// with: "Annotation names are UTF-8 encoded and cannot start with `aws` or `s3`
+/// (case-insensitive)" (`DeleteObjectAnnotationRequest$AnnotationName`).
+pub const RESERVED_ANNOTATION_NAME_PREFIXES: [&str; 2] = ["aws", "s3"];
+
+/// Why an annotation name is not one this service accepts — see
+/// [`annotation_name_rejection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnnotationNameRejection {
+    /// The name is longer than [`MAX_ANNOTATION_NAME_BYTES`] bytes.
+    TooLong { bytes: usize },
+    /// The name carries no character at all, under the documented minimum length of 1.
+    Empty,
+    /// The name starts with one of the [`RESERVED_ANNOTATION_NAME_PREFIXES`].
+    ReservedPrefix { prefix: &'static str },
+}
+
+/// Why `name` is not an annotation name this service accepts, or `None` when it is one.
+///
+/// ONE place, so a name is valid or invalid wherever it arrives: the two bounds its own
+/// member documents (1 to [`MAX_ANNOTATION_NAME_BYTES`] bytes) and the prefixes S3 keeps
+/// for itself ([`RESERVED_ANNOTATION_NAME_PREFIXES`]). The length is measured in BYTES
+/// because that is the unit both the member and the `AnnotationNameTooLong` error state it
+/// in, which differs from the character count for any name outside ASCII.
+pub fn annotation_name_rejection(name: &str) -> Option<AnnotationNameRejection> {
+    if name.len() > MAX_ANNOTATION_NAME_BYTES {
+        return Some(AnnotationNameRejection::TooLong { bytes: name.len() });
+    }
+    if name.is_empty() {
+        return Some(AnnotationNameRejection::Empty);
+    }
+    RESERVED_ANNOTATION_NAME_PREFIXES
+        .into_iter()
+        .find(|reserved| {
+            name.as_bytes()
+                .get(..reserved.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(reserved.as_bytes()))
+        })
+        .map(|prefix| AnnotationNameRejection::ReservedPrefix { prefix })
+}
+
 /// How many in-progress multipart uploads one bucket in this emulator keeps.
 ///
 /// NOT a fidelity claim: S3 publishes no limit on concurrent multipart uploads of a
@@ -4983,6 +5069,64 @@ pub struct Object {
     /// [`ComAmazonawsS3Amazons3State::restore_object_version`], which is the one place that
     /// sees the byte budgets it has to stay inside.
     pub restore: Option<ObjectRestore>,
+    /// The annotations attached to this stored object version, by name.
+    ///
+    /// "An annotation is a named payload of 1 byte to 1 MiB that you can associate with a
+    /// specific object or object version" (`PutObjectAnnotation`'s own documentation), so
+    /// the annotations of one version live WITH that version and a write of the object does
+    /// not carry them forward — "You cannot use PutObject to only update a single piece of
+    /// metadata for an existing object", so the object a write replaces takes its
+    /// annotations with it, exactly as it takes its tag set.
+    ///
+    /// Keyed by name, which is how every annotation operation addresses one, and sorted,
+    /// because that is the order a listing of them reports. Set AFTER the write, like
+    /// [`Self::retention`] and [`Self::restore`], through
+    /// [`ComAmazonawsS3Amazons3State::put_object_annotation`] — the one place that sees the
+    /// per-object ceiling and the byte budgets an annotation has to stay inside.
+    pub annotations: BTreeMap<String, Annotation>,
+}
+
+/// One annotation attached to one stored object version: the payload
+/// `PutObjectAnnotation` recorded under a name, which `GetObjectAnnotation` answers with.
+///
+/// The name is not here — it is the key the object holds this record under
+/// ([`Object::annotations`]) — and neither is a checksum: nothing in this emulator computes
+/// one, so none is recorded and none is reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Annotation {
+    /// The annotation's bytes, exactly as the request carried them.
+    pub payload: Vec<u8>,
+    /// The annotation's entity tag, including the quotes S3 reports it with — the digest of
+    /// its payload, computed the one way every entity tag here is ([`object_etag`]).
+    pub etag: String,
+    /// When the annotation was last written, which is what a read of it reports as
+    /// `Last-Modified` and a listing of them as `AnnotationEntry$LastModified`.
+    pub last_modified: SystemTime,
+}
+
+impl Annotation {
+    /// The annotation `payload` makes, written at `at`: the payload with the entity tag of
+    /// those bytes beside it, so no caller derives a tag of its own.
+    pub fn new(payload: Vec<u8>, at: SystemTime) -> Self {
+        Self {
+            etag: object_etag(&payload),
+            last_modified: at,
+            payload,
+        }
+    }
+
+    /// The size of the annotation payload, in bytes — what `AnnotationEntry$Size` reports
+    /// and what a read of it answers as `Content-Length`.
+    pub fn size(&self) -> i64 {
+        i64::try_from(self.payload.len()).unwrap_or(i64::MAX)
+    }
+
+    /// How many bytes this annotation retains: its payload AND the entity tag kept beside
+    /// it, the way [`UploadedPart::retained_bytes`] counts a part's, so no annotation
+    /// escapes the budgets a stored object's bytes are bounded by.
+    pub fn retained_bytes(&self) -> usize {
+        self.payload.len() + self.etag.len()
+    }
 }
 
 /// The server-side encryption in force on one stored object: the configuration the write
@@ -5263,6 +5407,7 @@ impl Object {
             + self.version_id.as_ref().map_or(0, String::len)
             + self.metadata_bytes()
             + tag_set_bytes(&self.tags)
+            + self.annotation_bytes()
             + self.encryption.retained_bytes()
             + self
                 .retention
@@ -5285,6 +5430,26 @@ impl Object {
             .filter_map(|header| header.as_ref())
             .map(String::len)
             .sum::<usize>()
+    }
+
+    /// How many bytes this object's annotations retain: each one's name, with the payload
+    /// and entity tag of the annotation held under it ([`Annotation::retained_bytes`]).
+    ///
+    /// Counted by [`Self::retained_bytes`] like every other string kept beside an object,
+    /// so an annotation is bounded by the same per-bucket and service-wide budgets the
+    /// object's own bytes are.
+    pub fn annotation_bytes(&self) -> usize {
+        self.annotations
+            .iter()
+            .map(|(name, annotation)| name.len() + annotation.retained_bytes())
+            .sum()
+    }
+
+    /// The annotation attached to this object under `name`, or `None` when it carries none
+    /// — which is what makes a read or a delete naming a name this object does not hold
+    /// answer `NoSuchAnnotation`.
+    pub fn annotation(&self, name: &str) -> Option<&Annotation> {
+        self.annotations.get(name)
     }
 
     /// How many tags this object's tag set carries, or `None` when it carries none —
@@ -6170,6 +6335,81 @@ impl ComAmazonawsS3Amazons3State {
             .map(|object| {
                 object.restore = Some(restore);
                 ObjectRestoreWrite::Applied
+            })
+    }
+
+    /// Record `annotation` under `name` on the object version `version_id` names in
+    /// `bucket` — the key's current object when it names none. Reports what the write did,
+    /// or `None` when this emulator holds no such bucket (so an annotation write refuses a
+    /// name that is not a bucket instead of creating one).
+    ///
+    /// A REPLACEMENT of the one annotation `name` addresses, and of nothing else: an
+    /// annotation is "a named payload … that you can associate with a specific object or
+    /// object version" (`PutObjectAnnotation`'s own documentation), so a second write under
+    /// the same name is the whole new payload of that name and leaves every other
+    /// annotation of the object where it was.
+    ///
+    /// It decides NOTHING about whether the name or the payload is acceptable: the name's
+    /// bounds are [`annotation_name_rejection`]'s judgement and the payload's are the
+    /// handler's over [`MIN_ANNOTATION_PAYLOAD_BYTES`] and
+    /// [`MAX_ANNOTATION_PAYLOAD_BYTES`] — this is the storage seam those answers end at.
+    ///
+    /// It is the ONLY way an annotation is recorded, because it is the only place that can
+    /// see BOTH the per-object ceiling ([`MAX_ANNOTATIONS_PER_OBJECT`]) and the two byte
+    /// budgets: an annotation is retained with the object ([`Object::retained_bytes`]) and
+    /// is not bounded by anything [`Self::put_object`] checked. Nothing is written unless
+    /// the answer is [`AnnotationWrite::Applied`].
+    pub fn put_object_annotation(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        name: &str,
+        annotation: Annotation,
+    ) -> Option<AnnotationWrite> {
+        let held = self.buckets.get(bucket)?;
+        let Some(object) = held.addressed_object(key, version_id) else {
+            return Some(AnnotationWrite::NoSuchObject);
+        };
+
+        // "Each object can have up to 1,000 annotations", so only a write that names a
+        // name the object does not carry yet can take it past the ceiling: one that
+        // replaces an existing annotation leaves the count where it is.
+        let replaces = object.annotation(name);
+        if replaces.is_none() && object.annotations.len() >= MAX_ANNOTATIONS_PER_OBJECT {
+            return Some(AnnotationWrite::LimitReached);
+        }
+
+        // What the bucket and the whole store would retain with this annotation in place
+        // of the one that name carries: everything they retain now, less the bytes that
+        // annotation holds, plus the bytes of the replacement — and the NAME's own bytes
+        // too when the name is new, since those are retained with it.
+        let released = replaces.map_or(0, Annotation::retained_bytes);
+        let taken = annotation.retained_bytes()
+            + if replaces.is_none() { name.len() } else { 0 };
+        let would_hold = held.retained_bytes().saturating_sub(released) + taken;
+        if would_hold > MAX_OBJECT_BYTES_PER_BUCKET {
+            return Some(AnnotationWrite::ByteBudgetReached { would_hold });
+        }
+        let total_would_hold = self
+            .buckets
+            .values()
+            .map(Bucket::retained_bytes)
+            .sum::<usize>()
+            .saturating_sub(released)
+            + taken;
+        if total_would_hold > MAX_OBJECT_BYTES_TOTAL {
+            return Some(AnnotationWrite::TotalByteBudgetReached {
+                would_hold: total_would_hold,
+            });
+        }
+
+        self.buckets
+            .get_mut(bucket)
+            .and_then(|held| held.addressed_object_mut(key, version_id))
+            .map(|object| {
+                object.annotations.insert(name.to_string(), annotation);
+                AnnotationWrite::Applied
             })
     }
 
@@ -7200,6 +7440,8 @@ mod tests {
             retention: None,
             // A write initiates no restore; `restore_object_version` is what does.
             restore: None,
+            // And it attaches no annotation; `put_object_annotation` is what does.
+            annotations: BTreeMap::new(),
         }
     }
 

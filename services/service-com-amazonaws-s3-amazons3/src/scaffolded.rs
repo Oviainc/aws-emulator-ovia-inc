@@ -351,7 +351,10 @@ pub const DOCUMENTED_ERROR_MESSAGES: &[(&str, &str)] = &[
     ),
     (
         "NoSuchAnnotation",
-        "The specified annotation does not exist on this object.",
+        // The sentence S3's error document carries for this code, which states the
+        // condition alone; the model's own prose for the shape adds a trailing clause
+        // ("… on this object") that the service does not send.
+        "The specified annotation does not exist.",
     ),
     // [ErrorCodeList], and the same text the unmodeled channel already sends for these
     // two codes on the subresource operations whose model declares no error shape —
