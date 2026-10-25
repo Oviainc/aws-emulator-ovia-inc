@@ -211,6 +211,21 @@ pub struct ApiKeyRecord {
 }
 
 impl ApiKeyRecord {
+    /// A key record with `expires` as the call that minted it asked for, set through
+    /// [`ApiKeyRecord::set_expiration`] so a fresh key's two time members are built by
+    /// the same rule an update applies to them.
+    pub fn new(seq: u64, id: String, description: Option<String>, expires: i64) -> Self {
+        let mut record = Self {
+            seq,
+            id,
+            description,
+            expires: 0,
+            deletes: 0,
+        };
+        record.set_expiration(expires);
+        record
+    }
+
     /// This record as the modelled `ApiKey` shape.
     pub fn to_api_key(&self) -> ApiKey {
         ApiKey {
@@ -220,7 +235,83 @@ impl ApiKeyRecord {
             deletes: self.deletes,
         }
     }
+
+    /// Set the key's expiration, in epoch seconds, to the instant the call that sets
+    /// it asked for.
+    ///
+    /// Both `expires` and `deletes` are documented as "seconds since the epoch,
+    /// rounded down to the nearest hour", so the instant is floored here rather than
+    /// by each caller; the deletion time moves with the expiration, since the model
+    /// states no span between an API key expiring and being deleted.
+    pub fn set_expiration(&mut self, expires: i64) {
+        self.expires = floor_to_hour(expires);
+        self.deletes = self.expires;
+    }
 }
+
+/// One hour in seconds: the granularity `ApiKey$expires` and `ApiKey$deletes` are
+/// documented with — both are "seconds since the epoch, rounded down to the nearest
+/// hour".
+pub const SECONDS_PER_HOUR: i64 = 3_600;
+
+/// One day in seconds: the unit the API-key validity window is stated in.
+pub const SECONDS_PER_DAY: i64 = 86_400;
+
+/// The shortest validity an API key accepts, measured from the call that sets it.
+///
+/// Source: `ApiKeyValidityOutOfBoundsException` — "The API key expiration must be set
+/// to a value between 1 and 365 days from creation (for CreateApiKey) or from update
+/// (for UpdateApiKey)".
+pub const API_KEY_MIN_VALIDITY_SECONDS: i64 = SECONDS_PER_DAY;
+
+/// The longest validity an API key accepts ([`API_KEY_MIN_VALIDITY_SECONDS`] states
+/// the source).
+pub const API_KEY_MAX_VALIDITY_SECONDS: i64 = 365 * SECONDS_PER_DAY;
+
+/// Whether `validity` seconds is inside the documented API-key validity window
+/// ([`API_KEY_MIN_VALIDITY_SECONDS`]..=[`API_KEY_MAX_VALIDITY_SECONDS`]).
+///
+/// The window is measured from the call that sets the expiration, so a create and an
+/// update judge the same span against the same bounds.
+pub fn is_api_key_validity(validity: i64) -> bool {
+    (API_KEY_MIN_VALIDITY_SECONDS..=API_KEY_MAX_VALIDITY_SECONDS).contains(&validity)
+}
+
+/// AppSync's fixed text for a validity outside that window, carried by
+/// `ApiKeyValidityOutOfBoundsException` (HTTP 400): the bound the validity crossed,
+/// stated in days, so the caller can correct the value from the message alone. The
+/// rejected value is not echoed — the bound is what the caller has to stay within.
+pub fn api_key_validity_out_of_bounds_message(validity: i64) -> String {
+    if validity < API_KEY_MIN_VALIDITY_SECONDS {
+        format!(
+            "API key must be valid for a minimum of {} days.",
+            API_KEY_MIN_VALIDITY_SECONDS / SECONDS_PER_DAY
+        )
+    } else {
+        format!(
+            "API key can be valid for a maximum of {} days.",
+            API_KEY_MAX_VALIDITY_SECONDS / SECONDS_PER_DAY
+        )
+    }
+}
+
+/// `seconds` rounded DOWN to the nearest hour, the form both `ApiKey$expires` and
+/// `ApiKey$deletes` are documented to take.
+pub fn floor_to_hour(seconds: i64) -> i64 {
+    seconds.saturating_sub(seconds.rem_euclid(SECONDS_PER_HOUR))
+}
+
+/// Now, as whole seconds since the Unix epoch — the form an API key's expiration takes.
+pub fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64)
+}
+
+/// The text `NotFoundException` (HTTP 404) carries for an API key its parent API does
+/// not hold. The requirement the refusal answers is the status and the error shape; no
+/// recording pins AppSync's own wording, so this states the absent resource.
+pub const API_KEY_NOT_FOUND_MESSAGE: &str = "API key not found.";
 
 /// One stored data source of a `GraphqlApiRecord`.
 ///

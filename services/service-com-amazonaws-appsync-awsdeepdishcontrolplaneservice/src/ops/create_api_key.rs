@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let now = unix_seconds();
+        let now = crate::state::unix_seconds();
         // "From the creation time, the time after which the API key expires. [...] The
         // default value for this parameter is 7 days from creation time." An unset
         // `expires` arrives as the modelled default, 0.
@@ -186,21 +186,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The API key expiration must be set to a value between 1 and 365 days from
         // creation" — checked on the submitted instant, before it is floored.
         let validity = requested.saturating_sub(now);
-        if !(MIN_VALIDITY_SECONDS..=MAX_VALIDITY_SECONDS).contains(&validity) {
+        if !crate::state::is_api_key_validity(validity) {
             return Err(CreateApiKeyErrorModeled::ApiKeyValidityOutOfBoundsException(
                 ApiKeyValidityOutOfBoundsException {
-                    message: Some(format!(
-                        "expires must be between 1 and 365 days from creation, got {validity} \
-                         seconds"
+                    message: Some(crate::state::api_key_validity_out_of_bounds_message(
+                        validity,
                     )),
                 },
             )
             .into());
         }
-        // Both `expires` and `deletes` are documented as "seconds since the epoch,
-        // rounded down to the nearest hour". The model documents no grace period
-        // between the two, so the key is due for deletion when it expires.
-        let expires = floor_to_hour(requested);
 
         let mut guard = state.lock();
         // The key's parent API must exist, and must have room for another key.
@@ -234,13 +229,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             key_id = format!("{KEY_VERSION_PREFIX}{}", guard.mint_id());
         }
         let seq = guard.next_seq();
-        let record = crate::state::ApiKeyRecord {
+        // `ApiKeyRecord::new` floors the requested instant to the hour and moves the
+        // deletion time with it, the form both members are documented in.
+        let record = crate::state::ApiKeyRecord::new(
             seq,
-            id: key_id.clone(),
-            description: input.description,
-            expires,
-            deletes: expires,
-        };
+            key_id.clone(),
+            input.description,
+            requested,
+        );
 
         let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
             return Err(CreateApiKeyErrorModeled::NotFoundException(NotFoundException {
@@ -265,36 +261,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// caller-provided expiration. (`da1` keys ceased to be valid in February 2018.)
 const KEY_VERSION_PREFIX: &str = "da2-";
 
-/// One hour in seconds: the granularity `expires` and `deletes` are documented with.
-const SECONDS_PER_HOUR: i64 = 3_600;
-
-/// One day in seconds, the unit the documented validity window is stated in.
-const SECONDS_PER_DAY: i64 = 86_400;
-
 /// `CreateApiKey`'s documented default: "The default value for this parameter is 7
 /// days from creation time."
-const DEFAULT_VALIDITY_SECONDS: i64 = 7 * SECONDS_PER_DAY;
-
-/// `ApiKeyValidityOutOfBoundsException`'s documented lower bound: "between 1 and 365
-/// days from creation".
-const MIN_VALIDITY_SECONDS: i64 = SECONDS_PER_DAY;
-
-/// `ApiKeyValidityOutOfBoundsException`'s documented upper bound.
-const MAX_VALIDITY_SECONDS: i64 = 365 * SECONDS_PER_DAY;
+const DEFAULT_VALIDITY_SECONDS: i64 = 7 * crate::state::SECONDS_PER_DAY;
 
 /// The AppSync service quota for API keys on one GraphQL API, which
 /// `ApiKeyLimitExceededException` reports.
 const API_KEYS_PER_API: usize = 50;
 
-/// Now, as whole seconds since the Unix epoch.
-fn unix_seconds() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs() as i64)
-}
-
-/// `seconds` rounded DOWN to the nearest hour, the form both `ApiKey$expires` and
-/// `ApiKey$deletes` are documented to take.
-fn floor_to_hour(seconds: i64) -> i64 {
-    seconds - seconds.rem_euclid(SECONDS_PER_HOUR)
-}
