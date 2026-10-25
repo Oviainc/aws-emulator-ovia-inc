@@ -30,7 +30,7 @@ use crate::stack_lifecycle::{
     wait_for_the_transition, xml_text, xml_texts,
 };
 use crate::stack_resource_provisioning::s3;
-use service_com_amazonaws_cloudformation_cloudformation::state::status;
+use service_com_amazonaws_cloudformation_cloudformation::state::{status, CAPABILITY_AUTO_EXPAND};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The bucket the snippets live in, as a client's own `PutObject` stored them.
@@ -693,7 +693,17 @@ async fn a_template_naming_both_transforms_reports_both_expansions() {
     })
     .to_string();
 
-    let (status, created) = create_stack(&router, "include-sam", &template, &[]).await;
+    // The template declares the SAM transform, and "if your stack template contains one or
+    // more macros, and you choose to create a stack directly from the processed template,
+    // without first reviewing the resulting changes in a change set, you must acknowledge
+    // this capability. This includes the AWS::Include and AWS::Serverless transforms\".
+    let (status, created) = create_stack(
+        &router,
+        "include-sam",
+        &template,
+        &[member("Capabilities.member.1", CAPABILITY_AUTO_EXPAND)],
+    )
+    .await;
     assert_eq!(
         status, 200,
         "CreateStack must answer 200, got {status} {created}"

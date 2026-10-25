@@ -549,6 +549,127 @@ pub fn is_endpoint_id(value: &str) -> bool {
     value.len() == 19 && value.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// One page of any listing of this service: the records it reports, projected
+/// into the shape the listing answers with, and the cursor the caller resumes at
+/// when the walk stopped before the end of the listing.
+#[derive(Debug)]
+pub struct ListPage<Item> {
+    pub items: Vec<Item>,
+    pub next_token: Option<String>,
+}
+
+/// The key a listing resumes its walk at for `next_token`, as `decode` reads one
+/// out of a cursor: `None` for a request that carries no cursor, and the refusal
+/// for a token this service never issued — which is answered rather than served
+/// as an arbitrary page.
+///
+/// `operation` is the listing's own name and `decode` its cursor's own form;
+/// those are all that differ between the listings, so the refusal itself lives
+/// here. The caller lifts the payload into its own error enum.
+pub fn list_cursor<Key>(
+    next_token: Option<&str>,
+    operation: &str,
+    decode: impl FnOnce(&str) -> Option<Key>,
+) -> Result<Option<Key>, ValidationException> {
+    match next_token {
+        None => Ok(None),
+        Some(token) => match decode(token) {
+            Some(key) => Ok(Some(key)),
+            None => Err(ValidationException {
+                message: Some(format!(
+                    "NextToken {token:?} is not a token returned by {operation}"
+                )),
+            }),
+        },
+    }
+}
+
+/// The page every listing of this service serves: the `records` that `include`
+/// accepts, in the store map's own key order, starting at `resume` and at most
+/// [`page_size`] of them, each projected by `project`, plus the cursor `encode`
+/// mints for the first key the page did not serve.
+///
+/// Each listing differs only in the store map it walks, the form of its cursor
+/// (`encode`/`decode`, see [`list_cursor`]), which records it reports
+/// (`include`) and the shape it projects them into (`project`) — so the walk
+/// itself lives here: every listing then pages over one order and mints the same
+/// cursor for the same key.
+pub fn list_page<'a, Key, Record, Item>(
+    records: impl IntoIterator<Item = (&'a Key, &'a Record)>,
+    max_results: i32,
+    resume: Option<Key>,
+    mut include: impl FnMut(&Record) -> bool,
+    encode: impl Fn(&Key) -> String,
+    mut project: impl FnMut(&Record) -> Item,
+) -> ListPage<Item>
+where
+    Key: Ord + 'a,
+    Record: 'a,
+{
+    let page_size = page_size(max_results);
+    let mut items = Vec::with_capacity(page_size);
+    let mut next_token = None;
+    for (key, record) in records {
+        if !include(record) {
+            continue;
+        }
+        // Resume at the first key at or after the cursor, so a page is still
+        // served when the record the cursor named was deleted meanwhile.
+        if resume.as_ref().is_some_and(|from| key < from) {
+            continue;
+        }
+        if items.len() == page_size {
+            next_token = Some(encode(key));
+            break;
+        }
+        items.push(project(record));
+    }
+
+    ListPage { items, next_token }
+}
+
+/// The Outpost id the inventory listing's cursor names, or `None` when the token
+/// is not one this service issued.
+///
+/// The inventory is keyed by `OutpostId`, so the cursor IS that id — which
+/// `OutpostId`'s `^(op-[a-f0-9]{17}|\d{12}|ec2)$` keeps inside `NextToken`'s own
+/// `^[A-Za-z0-9\+\:\/\=\?\#-_]+$`, so the cursor a response carries is a value
+/// the next request may legally send back.
+pub fn decode_outpost_cursor(token: &str) -> Option<String> {
+    is_outpost_id(token).then(|| token.to_string())
+}
+
+/// The key the Outpost inventory resumes at for `next_token`, or the refusal for
+/// a token this service never issued.
+pub fn outpost_cursor(
+    next_token: Option<&str>,
+    operation: &str,
+) -> Result<Option<String>, ValidationException> {
+    list_cursor(next_token, operation, decode_outpost_cursor)
+}
+
+/// The page the Outpost inventory serves: the Outposts the store holds, in its
+/// own `OutpostId` order, starting at `resume` and at most [`page_size`] of them.
+///
+/// Every Outpost in the store has S3 capacity provisioned and is either owned by
+/// this caller or shared with it, which is what the inventory reports — so this
+/// listing filters nothing and the one walk in [`list_page`] serves it.
+pub fn outpost_page(
+    store: &ComAmazonawsS3outpostsS3outpostsState,
+    region: &str,
+    max_results: i32,
+    resume: Option<String>,
+) -> ListPage<Outpost> {
+    list_page(
+        &store.outposts,
+        max_results,
+        resume,
+        |_| true,
+        String::clone,
+        |outpost| outpost.to_outpost(region),
+    )
+}
+
 /// The cursor an endpoint listing returns to resume at `key`: the
 /// `(OutpostId, EndpointId)` pair the next page starts at.
 ///
@@ -567,27 +688,13 @@ pub fn decode_endpoint_cursor(token: &str) -> Option<(String, String)> {
         .then(|| (outpost_id.to_string(), endpoint_id.to_string()))
 }
 
-/// The key an endpoint listing resumes its walk at for `next_token`: `None` for a
-/// request that carries no cursor, and the refusal for a token this service never
-/// issued — which is answered rather than served as an arbitrary page.
-///
-/// `operation` is the listing's own name, the one part of the refusal that differs
-/// between the listings; the caller lifts the payload into its own error enum.
+/// The key an endpoint listing resumes its walk at for `next_token`, or the
+/// refusal for a token this service never issued.
 pub fn endpoint_cursor(
     next_token: Option<&str>,
     operation: &str,
 ) -> Result<Option<(String, String)>, ValidationException> {
-    match next_token {
-        None => Ok(None),
-        Some(token) => match decode_endpoint_cursor(token) {
-            Some(key) => Ok(Some(key)),
-            None => Err(ValidationException {
-                message: Some(format!(
-                    "NextToken {token:?} is not a token returned by {operation}"
-                )),
-            }),
-        },
-    }
+    list_cursor(next_token, operation, decode_endpoint_cursor)
 }
 
 /// Whether `access_type` and `customer_owned_ipv4_pool` describe one endpoint, or
@@ -627,57 +734,34 @@ pub fn check_coip_pool(
     }
 }
 
-/// One page of an endpoint listing: the `Endpoint`s it reports, and the cursor the
-/// caller resumes at when the walk stopped before the end of the listing.
-#[derive(Debug)]
-pub struct EndpointPage {
-    pub endpoints: Vec<Endpoint>,
-    pub next_token: Option<String>,
-}
-
 /// The page every endpoint listing serves: the endpoints `include` accepts, in
 /// [`ComAmazonawsS3outpostsS3outpostsState::endpoints`]'s own key order, starting at
 /// `resume` and at most [`page_size`] of them, plus the cursor naming the first key
 /// the page did not serve.
 ///
-/// Each listing differs only in which endpoints it reports — `include` — so the walk
-/// itself lives here: both listings then page over one order, settle what the clock
-/// owes at the same point, and mint the same cursor for the same key.
+/// Each listing differs only in which endpoints it reports — `include` — and the walk
+/// itself is [`list_page`]'s: both listings then page over one order, settle what the
+/// clock owes at the same point, and mint the same cursor for the same key.
 pub fn endpoint_page(
     store: &mut ComAmazonawsS3outpostsS3outpostsState,
     now: SystemTime,
     region: &str,
     max_results: i32,
     resume: Option<(String, String)>,
-    mut include: impl FnMut(&EndpointRecord) -> bool,
-) -> EndpointPage {
+    include: impl FnMut(&EndpointRecord) -> bool,
+) -> ListPage<Endpoint> {
     // A listing reports every endpoint it serves, so every status change the clock
     // already owes is materialised before the page is taken.
     store.settle_all(now);
 
-    let page_size = page_size(max_results);
-    let mut endpoints = Vec::with_capacity(page_size);
-    let mut next_token = None;
-    for (key, endpoint) in &store.endpoints {
-        if !include(endpoint) {
-            continue;
-        }
-        // Resume at the first key at or after the cursor, so a page is still
-        // served when the endpoint the cursor named was deleted meanwhile.
-        if resume.as_ref().is_some_and(|from| key < from) {
-            continue;
-        }
-        if endpoints.len() == page_size {
-            next_token = Some(encode_endpoint_cursor(key));
-            break;
-        }
-        endpoints.push(endpoint.to_endpoint(region));
-    }
-
-    EndpointPage {
-        endpoints,
-        next_token,
-    }
+    list_page(
+        &store.endpoints,
+        max_results,
+        resume,
+        include,
+        encode_endpoint_cursor,
+        |endpoint| endpoint.to_endpoint(region),
+    )
 }
 
 /// The one `ResourceNotFoundException$Message` this service answers an

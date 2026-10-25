@@ -274,8 +274,11 @@ async fn assert_delete_refused(service: &RealTime, case: &str, arn: &str, expect
 /// delete succeeds and the ARN names nothing.
 ///
 /// One row per WAY a composition can refer to the configuration — the destination kind
-/// that names it, how many destinations the composition has and which of them carries the
-/// reference — since that is what the rule generalises over.
+/// that names it, how many destinations the composition has, which of them carries the
+/// reference and whether they carry names — since that is what the rule generalises over.
+/// A composition carries at most one destination of each kind
+/// (`smithy_query(query="shape",shape="Composition")`, member `destinations`), so a
+/// two-destination row is one `channel` and one `s3`.
 #[tokio::test]
 async fn a_configuration_a_composition_uses_cannot_be_deleted_until_that_composition_stops() {
     let cases: [(&str, Destinations); 5] = [
@@ -322,14 +325,18 @@ async fn a_configuration_a_composition_uses_cannot_be_deleted_until_that_composi
             },
         ),
         (
-            "a named destination naming it, beside one that names no encoder configuration",
+            "a named channel destination naming it, beside a named S3 destination naming \
+             another",
             |referenced| {
                 json!([
                     { "name": "broadcast", "channel": {
                         "channelArn": arn("channel", "live"),
                         "encoderConfigurationArn": referenced.target_arn,
                     } },
-                    { "channel": { "channelArn": arn("channel", "backup") } },
+                    { "name": "archive", "s3": {
+                        "storageConfigurationArn": referenced.storage_configuration_arn,
+                        "encoderConfigurationArns": [referenced.other_arn],
+                    } },
                 ])
             },
         ),

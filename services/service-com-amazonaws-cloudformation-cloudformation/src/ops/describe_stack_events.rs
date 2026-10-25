@@ -72,10 +72,9 @@ use crate::state::StoredEvent;
 /// One recorded event as the modelled `StackEvent` shape.
 ///
 /// The hook members are absent because nothing in this emulator produces them: no hooks
-/// run. `ResourceProperties` ("BLOB of the properties used to create the resource") is not
-/// reported: the properties document is caller-sized and the log holds up to
-/// [`crate::state::MAX_EVENTS_PER_STACK`] events per stack, so copying one into every
-/// event would let a single template grow the store by its own size over and over.
+/// run. `ResourceProperties` ("BLOB of the properties used to create the resource") is the
+/// properties document of the resource the event is about, which the stack's own events do
+/// not carry: a stack is not a resource the template declared properties for.
 fn stack_event_view(stored: &StoredEvent) -> StackEvent {
     StackEvent {
         stack_id: stored.stack_id.clone(),
@@ -88,7 +87,7 @@ fn stack_event_view(stored: &StoredEvent) -> StackEvent {
         timestamp: crate::state::timestamp(stored.timestamp),
         resource_status: Some(stored.resource_status.clone()),
         resource_status_reason: stored.resource_status_reason.clone(),
-        resource_properties: None,
+        resource_properties: stored.resource_properties.clone(),
         client_request_token: stored.client_request_token.clone(),
         hook_type: None,
         hook_status: None,

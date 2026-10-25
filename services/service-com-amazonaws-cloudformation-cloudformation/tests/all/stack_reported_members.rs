@@ -21,10 +21,10 @@
 //!
 //! The evaluation of a template's `Outputs` has its own suite in `stack_outputs.rs`.
 
-use super::stack_lifecycle::{
-    call, create_stack, describe_stack, member, router, wait_for_the_transition, xml_text,
-    xml_texts,
+use super::harness::{
+    call, create_stack, member, router, wait_for_the_transition, xml_text, xml_texts,
 };
+use super::stack_lifecycle::describe_stack;
 
 /// Whether the response carries the named element at all, empty (`<Tags/>`) or not.
 fn has_element(xml: &str, tag: &str) -> bool {

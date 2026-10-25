@@ -1280,6 +1280,38 @@ pub struct TableStream {
     pub enabled: bool,
 }
 
+/// One item-level change a landed write owes the table's stream.
+///
+/// The data plane writes items while holding THIS service's store lock, and the
+/// records live in the STREAMS service's store, so a write records what it changed
+/// here and the handler hands the queue over at the end of the request
+/// ([`publish_item_changes`]). Which change it was is derived from the images rather
+/// than stored beside them: an item that was not there before is an `INSERT`, one that
+/// was and still is a `MODIFY`, and one that is gone a `REMOVE` (`OperationType`).
+#[derive(Debug, Clone)]
+pub struct PendingStreamRecord {
+    /// The stream the record belongs to, as the streams registry minted its ARN.
+    pub stream_arn: String,
+    /// "The primary key attribute(s) for the DynamoDB item that was modified"
+    /// (`StreamRecord$Keys`), read off the item through the table's own key schema.
+    pub keys: Item,
+    /// The item before the change, for a write that replaced or removed one.
+    pub old_image: Option<Item>,
+    /// The item after the change, for a write that stored one.
+    pub new_image: Option<Item>,
+}
+
+/// The most changes this store queues for the streams service before a handler hands
+/// them over.
+///
+/// The queue is drained at the end of every operation that writes an item, so its
+/// length is bounded by ONE request's writes — a batch write carries at most
+/// [`MAX_BATCH_WRITE_REQUESTS`] of them. The cap is
+/// what keeps that true even if a future write path forgets to drain it: past it a
+/// change is dropped and the drop is logged, rather than letting the
+/// queue grow with the writes of a whole process lifetime.
+pub const MAX_PENDING_STREAM_RECORDS: usize = 1024;
+
 /// The METERED figures a table or index description reports as `ItemCount` and
 /// `TableSizeBytes`/`IndexSizeBytes`.
 ///
@@ -2452,6 +2484,35 @@ impl Table {
         self.removed_at.is_some_and(|due| now >= due)
     }
 
+    /// The ARN of the stream this table currently publishes to, for a table whose
+    /// stream is ON.
+    ///
+    /// A DISABLED stream "takes no further records" — the table keeps reporting it as
+    /// its latest stream, and a consumer can still drain what it captured — so a write
+    /// publishes nothing to it.
+    pub fn enabled_stream_arn(&self) -> Option<String> {
+        self.stream
+            .as_ref()
+            .filter(|stream| stream.enabled)
+            .map(|stream| stream.arn.clone())
+    }
+
+    /// "The primary key attribute(s) for the DynamoDB item that was modified"
+    /// (`StreamRecord$Keys`): the key attributes of `item`, read through this table's
+    /// own key schema, and nothing else.
+    ///
+    /// Read off the ITEM rather than rebuilt from the encoded [`ItemKey`], so the
+    /// values a consumer sees are the ones the table stores.
+    pub fn stream_keys(&self, item: &Item) -> Item {
+        self.key_schema
+            .iter()
+            .filter_map(|element| {
+                item.get_key_value(&element.attribute_name)
+                    .map(|(name, value)| (name.clone(), value.clone()))
+            })
+            .collect()
+    }
+
     /// The name of the `HASH` key attribute.
     pub fn partition_key_name(&self) -> &str {
         self.key_schema
@@ -3341,6 +3402,15 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
     /// (nothing in `DeleteTable` removes a table's on-demand backups), and this is the
     /// only record of one.
     pub backups: BTreeMap<String, Backup>,
+    /// The item-level changes landed writes owe their tables' streams, in the order
+    /// they were made.
+    ///
+    /// NOT part of a table: the records are the STREAMS service's resources, and a
+    /// write can only hand them over once the request that made it is done deciding
+    /// (a transactional write that is cancelled part-way through rolls its queued
+    /// changes back with the items themselves). Bounded by
+    /// [`MAX_PENDING_STREAM_RECORDS`]; drained by [`publish_item_changes`].
+    pub pending_stream_records: Vec<PendingStreamRecord>,
 }
 
 impl ComAmazonawsDynamodbDynamodb20120810State {
@@ -3650,7 +3720,26 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             )));
         }
         table.stored_bytes = table_bytes;
-        Ok(table.items.insert(key, item))
+        // "DynamoDB Streams captures a time-ordered sequence of item-level
+        // modifications in any DynamoDB table": a write that LANDS on a stream-enabled
+        // table owes its stream one record, whether it stores a new item or replaces
+        // one. The images the record carries are the only reason to keep a copy of the
+        // item, so a table with no enabled stream clones nothing.
+        let publishes_to = table.enabled_stream_arn();
+        let keys = publishes_to
+            .as_ref()
+            .map(|_| table.stream_keys(&item))
+            .unwrap_or_default();
+        let new_image = publishes_to.as_ref().map(|_| item.clone());
+        let replaced = table.items.insert(key, item);
+        let change = publishes_to.map(|stream_arn| PendingStreamRecord {
+            stream_arn,
+            keys,
+            old_image: replaced.clone(),
+            new_image,
+        });
+        self.queue_stream_record(change);
+        Ok(replaced)
     }
 
     /// Remove one item from `name`, returning it, and give its bytes back to the
@@ -3667,7 +3756,60 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         table.stored_bytes = table
             .stored_bytes
             .saturating_sub(removed.as_ref().map_or(0, item_size));
+        // A delete that removed NOTHING changed no item, so the stream carries no
+        // record for it: the stream is a sequence of modifications, and a delete of
+        // an absent key is none.
+        let change = removed.as_ref().zip(table.enabled_stream_arn()).map(
+            |(before, stream_arn)| PendingStreamRecord {
+                stream_arn,
+                keys: table.stream_keys(before),
+                old_image: Some(before.clone()),
+                new_image: None,
+            },
+        );
+        self.queue_stream_record(change);
         Ok(removed)
+    }
+
+    /// How many changes are queued for the streams service — the mark a
+    /// transactional write takes before it starts applying, so
+    /// [`Self::rewind_stream_records`] can put the queue back where the items go back.
+    pub fn queued_stream_record_count(&self) -> usize {
+        self.pending_stream_records.len()
+    }
+
+    /// Drop every change queued since `mark`, for a transactional write that is
+    /// rolling its items back: a cancelled transaction made no modification, so its
+    /// tables' streams must carry no record of one.
+    pub fn rewind_stream_records(&mut self, mark: usize) {
+        self.pending_stream_records.truncate(mark);
+    }
+
+    /// Take every queued change, leaving the queue empty — what
+    /// [`publish_item_changes`] hands to the streams service.
+    pub fn take_stream_records(&mut self) -> Vec<PendingStreamRecord> {
+        ::std::mem::take(&mut self.pending_stream_records)
+    }
+
+    /// Queue one change for the streams service, within [`MAX_PENDING_STREAM_RECORDS`].
+    ///
+    /// Past the cap the change is DROPPED rather than making room, so the entries
+    /// already queued keep the positions a transactional write's mark names. Reaching
+    /// the cap at all takes a write path that queued changes without handing them over,
+    /// which is a defect in that path rather than something a caller can ask for, so
+    /// the drop is logged.
+    fn queue_stream_record(&mut self, change: Option<PendingStreamRecord>) {
+        let Some(change) = change else {
+            return;
+        };
+        if self.pending_stream_records.len() >= MAX_PENDING_STREAM_RECORDS {
+            ::tracing::error!(
+                queued = MAX_PENDING_STREAM_RECORDS,
+                "an item change was dropped before it reached the DynamoDB Streams store"
+            );
+            return;
+        }
+        self.pending_stream_records.push(change);
     }
 }
 
@@ -3939,7 +4081,8 @@ pub fn index_arn(region: &str, table: &str, index: &str) -> String {
 pub mod streams_seam;
 
 pub use streams_seam::{
-    disable_table_stream, register_table_stream, stream_view_type, StreamFault,
+    disable_table_stream, publish_item_changes, register_table_stream, stream_view_type,
+    StreamFault,
 };
 
 /// The form a table name must take: 3..=255 characters of

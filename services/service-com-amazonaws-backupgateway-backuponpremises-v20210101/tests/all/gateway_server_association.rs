@@ -40,7 +40,7 @@ use crate::gateway_lifecycle::{
 
 /// An ARN of this service naming `resource_type`/`id`, in the region the harness signs
 /// for.
-fn arn_of(resource_type: &str, id: &str) -> String {
+pub(crate) fn arn_of(resource_type: &str, id: &str) -> String {
     format!(
         "arn:aws:backup-gateway:{REGION}:{}:{resource_type}/{id}",
         engine::EMULATOR_ACCOUNT_ID
@@ -52,7 +52,10 @@ fn arn_of(resource_type: &str, id: &str) -> String {
 /// (`smithy_query(query="shape",shape="ServerArn")`). The id segment absorbs the length,
 /// so every character stays inside the pattern's `[a-zA-Z-0-9]+`, and the resource-type
 /// segment is a single character so that even the 50-character minimum fits.
-fn arn_of_length(len: usize) -> String {
+///
+/// `GatewayArn` carries the SAME pattern with `@length(min: 50, max: 180)`, so the sibling
+/// suites build their gateway-ARN length cases from here too.
+pub(crate) fn arn_of_length(len: usize) -> String {
     let prefix = format!(
         "arn:aws:backup-gateway:{REGION}:{}:h/",
         engine::EMULATOR_ACCOUNT_ID
@@ -70,7 +73,7 @@ fn arn_of_length(len: usize) -> String {
 ///
 /// Spelled out here rather than reused from the crate, so the assertion is independent of
 /// the code that reports the id.
-fn resource_id_of(arn: &str) -> &str {
+pub(crate) fn resource_id_of(arn: &str) -> &str {
     arn.rsplit_once('/')
         .map(|(_, id)| id)
         .unwrap_or_else(|| panic!("{arn} names no resource id"))
@@ -79,7 +82,7 @@ fn resource_id_of(arn: &str) -> &str {
 /// The refusal message, wherever the envelope carries it: a refusal the framework made
 /// before the handler ran states it in `message`, a modelled error the handler returned
 /// in the `Message` member.
-fn message_of(reply: &Reply) -> String {
+pub(crate) fn message_of(reply: &Reply) -> String {
     reply
         .str_at("/message")
         .or_else(|| reply.str_at("/Message"))
@@ -87,7 +90,7 @@ fn message_of(reply: &Reply) -> String {
         .to_string()
 }
 
-async fn import(router: &MultiServiceRouter, name: &str, host: &str) -> String {
+pub(crate) async fn import(router: &MultiServiceRouter, name: &str, host: &str) -> String {
     let reply = call(
         router,
         "ImportHypervisorConfiguration",
@@ -105,7 +108,11 @@ async fn import(router: &MultiServiceRouter, name: &str, host: &str) -> String {
         .to_string()
 }
 
-async fn associate(router: &MultiServiceRouter, gateway_arn: &str, server_arn: &str) -> Reply {
+pub(crate) async fn associate(
+    router: &MultiServiceRouter,
+    gateway_arn: &str,
+    server_arn: &str,
+) -> Reply {
     call(
         router,
         "AssociateGatewayToServer",
@@ -116,7 +123,10 @@ async fn associate(router: &MultiServiceRouter, gateway_arn: &str, server_arn: &
 
 /// The `HypervisorId` `GetGateway` reports for `arn`, `None` for a gateway associated with
 /// no server.
-async fn reported_hypervisor_id(router: &MultiServiceRouter, arn: &str) -> Option<String> {
+pub(crate) async fn reported_hypervisor_id(
+    router: &MultiServiceRouter,
+    arn: &str,
+) -> Option<String> {
     let reply = call(router, "GetGateway", &json!({ "GatewayArn": arn })).await;
     assert_eq!(
         reply.status, 200,
@@ -130,7 +140,9 @@ async fn reported_hypervisor_id(router: &MultiServiceRouter, arn: &str) -> Optio
 
 /// Every gateway `ListGateways` reports, by ARN, with the `HypervisorId` of the server it
 /// is associated with.
-async fn listed_hypervisor_ids(router: &MultiServiceRouter) -> BTreeMap<String, Option<String>> {
+pub(crate) async fn listed_hypervisor_ids(
+    router: &MultiServiceRouter,
+) -> BTreeMap<String, Option<String>> {
     let reply = call(router, "ListGateways", &json!({})).await;
     assert_eq!(
         reply.status, 200,
@@ -164,7 +176,10 @@ async fn listed_hypervisor_ids(router: &MultiServiceRouter) -> BTreeMap<String, 
 /// The server ARN the STORE holds the gateway's association under, read out of the store
 /// rather than off the wire: this is what an association writes and what a refused one
 /// must leave alone.
-fn persisted_server_arn(engine: &Arc<engine::InMemoryEngine>, gateway_arn: &str) -> Option<String> {
+pub(crate) fn persisted_server_arn(
+    engine: &Arc<engine::InMemoryEngine>,
+    gateway_arn: &str,
+) -> Option<String> {
     service_state(&**engine)
         .expect("the in-memory engine must expose this state")
         .lock()
@@ -177,7 +192,10 @@ fn persisted_server_arn(engine: &Arc<engine::InMemoryEngine>, gateway_arn: &str)
 /// The persisted `HypervisorState` of the record stored under `arn` — the value an
 /// association must not have touched (what a read REPORTS is derived from it and the
 /// clock).
-fn persisted_hypervisor_state(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> String {
+pub(crate) fn persisted_hypervisor_state(
+    engine: &Arc<engine::InMemoryEngine>,
+    arn: &str,
+) -> String {
     service_state(&**engine)
         .expect("the in-memory engine must expose this state")
         .lock()
@@ -593,8 +611,8 @@ async fn a_gateway_already_associated_with_another_server_is_refused() {
 /// `PutHypervisorPropertyMappings` resolves the gateway that serves a hypervisor through
 /// this link (`State::gateway_for_hypervisor`), which is how it tells a hypervisor the
 /// store no longer holds from one no gateway serves — so a gateway keeps naming the server
-/// it was associated with after `DeleteHypervisor`, and `DisassociateGatewayFromServer`
-/// (a scaffold under its own stub issue) is the operation that clears it.
+/// it was associated with after `DeleteHypervisor`, and `DisassociateGatewayFromServer` is
+/// the operation that clears it (`gateway_server_disassociation`).
 #[tokio::test]
 async fn deleting_a_server_leaves_the_association_on_the_gateway() {
     let engine = build_engine();

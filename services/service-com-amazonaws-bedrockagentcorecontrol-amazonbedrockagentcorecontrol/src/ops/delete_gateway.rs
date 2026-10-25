@@ -174,12 +174,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .gateways
             .get_mut(&input.gateway_identifier)
             .ok_or_else(|| {
-                DeleteGatewayErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "no gateway with identifier {} exists in this account",
-                        input.gateway_identifier
-                    )),
-                })
+                DeleteGatewayErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::ACTION_DELETE,
+                        crate::state::RESOURCE_GATEWAY,
+                    ),
+                )
             })?;
 
         // The deletion is ACCEPTED here (202) and the gateway reports `DELETING`

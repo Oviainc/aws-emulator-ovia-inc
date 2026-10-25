@@ -461,15 +461,17 @@ async fn deleting_a_stack_records_an_event_per_resource_it_really_deletes() {
             "case \"deleting the stack\": {logical_id}'s DELETE_COMPLETE is newer than its \
              DELETE_IN_PROGRESS, got {ended:?} against {opened:?} in {events:?}"
         );
-        // The deletion did not re-open a transition it had already recorded.
+        // The deletion did not re-open a transition it had already recorded: three events
+        // for the create (it opens, the create is initiated in the owning service, it
+        // completes) and two for the delete.
         assert_eq!(
             events
                 .iter()
                 .filter(|event| event.logical_id.as_deref() == Some(logical_id))
                 .count(),
-            4,
-            "case \"deleting the stack\": {logical_id} transitioned exactly twice per \
-             operation, got {events:?}"
+            5,
+            "case \"deleting the stack\": {logical_id} transitioned once through its create \
+             and once through its delete, got {events:?}"
         );
     }
     assert!(

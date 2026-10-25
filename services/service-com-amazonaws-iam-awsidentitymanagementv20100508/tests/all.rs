@@ -117,5 +117,7 @@ mod user_lifecycle;
 mod user_permissions_boundary;
 #[path = "all/user_tag_listing.rs"]
 mod user_tag_listing;
+#[path = "all/user_tag_removal.rs"]
+mod user_tag_removal;
 #[path = "all/user_tags.rs"]
 mod user_tags;

@@ -20,6 +20,9 @@ mod account_configuration_reads;
 #[path = "all/batch_delete.rs"]
 mod batch_delete;
 
+#[path = "all/batch_stop.rs"]
+mod batch_stop;
+
 #[path = "all/channel_alerts.rs"]
 mod channel_alerts;
 

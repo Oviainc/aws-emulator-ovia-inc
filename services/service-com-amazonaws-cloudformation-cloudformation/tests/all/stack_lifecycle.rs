@@ -12,84 +12,25 @@
 //! declare — because a stack provisions them by calling those services in process (see
 //! `router_with_engine`).
 //!
-//! The wire harness here (`call`, `member`, the XML readers, `router`) is this crate's
-//! one such harness: `stack_outputs.rs` drives its cases through these same helpers.
+//! The wire harness itself lives in `harness.rs`, shared by every suite of this target
+//! (`stack_outputs.rs` and `error_envelope.rs` drive their cases through the same
+//! helpers).
 
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use service_com_amazonaws_cloudformation_cloudformation::state::{
-    self, status, ComAmazonawsCloudformationCloudformationState, StoredStack,
-    MAX_DELETED_STACKS_RETAINED, MAX_EVENTS_PER_STACK, MAX_STACKS, PAGE_SIZE,
-    STATUS_TRANSITION_DELAY, TEMPLATE_BODY_MAX_BYTES,
+    self, status, StoredStack, MAX_DELETED_STACKS_RETAINED, MAX_EVENTS_PER_STACK, MAX_STACKS,
+    PAGE_SIZE, STATUS_TRANSITION_DELAY, TEMPLATE_BODY_MAX_BYTES,
 };
-use service_com_amazonaws_cloudformation_cloudformation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+pub(crate) use crate::harness::{
+    call, call_in, create_stack, get_template, member, router, router_with_engine, store,
+    wait_for_the_transition, xml_text, xml_texts, xml_unescape, REGION,
+};
 
 /// The emulator's canonical account id, as every ARN it emits carries.
 pub(crate) const ACCOUNT_ID: &str = "000000000000";
-/// The region the test's requests are signed for.
-pub(crate) const REGION: &str = "us-east-1";
-
-pub(crate) fn router() -> MultiServiceRouter {
-    router_with_engine().0
-}
-
-/// The router AND the engine behind it, for a case that has to inspect the store or seed
-/// it with more records than a bound's worth of wire calls could create.
-///
-/// The services that OWN the resource types `state::provisioning` creates are mounted
-/// beside CloudFormation on the SAME engine, exactly as `core/router/src/lib.rs` mounts
-/// them: a stack's create calls those services, so a suite that deploys a template
-/// declaring one of those types must have them there — Amazon SNS among them, since the
-/// `AWS::SNS::Topic` most cases here declare is really created in SNS by the stack. (Amazon
-/// Data Firehose is deliberately NOT one of them — `unprovisioned_resources.rs` is the
-/// suite that pins what a stack does when an owning service cannot be reached.) A case that
-/// has to read a stack's topic back goes through SNS's own wire ([`sns`]); what a stack and
-/// SNS must agree about beyond that is
-/// `core/router/tests/all/cloudformation_provisions_sns_topics.rs`.
-pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.register_service(EmulatedService::new(Arc::clone(&engine)));
-    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
-        Arc::clone(&engine),
-    ));
-    router.register_service(
-        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    router.register_service(
-        service_com_amazonaws_codepipeline_codepipeline_20150709::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    router.register_service(
-        service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    // Amazon RDS, for the `AWS::RDS::DBInstance` and `AWS::RDS::DBSubnetGroup` a stack
-    // really creates there: a suite that deploys one reads the database back through RDS's
-    // own wire ([`rds`]).
-    router.register_service(
-        service_com_amazonaws_rds_amazonrdsv19::EmulatedService::new(Arc::clone(&engine)),
-    );
-    (router, engine)
-}
-
-/// This service's store in the shared engine, as every handler reaches it.
-pub(crate) fn store(
-    engine: &Arc<engine::InMemoryEngine>,
-) -> engine::ServiceState<ComAmazonawsCloudformationCloudformationState> {
-    engine.state::<ComAmazonawsCloudformationCloudformationState>()
-}
-
-/// Wait past the instant a stack operation's terminal status becomes due.
-pub(crate) async fn wait_for_the_transition() {
-    tokio::time::sleep(STATUS_TRANSITION_DELAY + Duration::from_millis(250)).await;
-}
 
 /// The status a stack must report on a read taken `started` ago: the in-progress one
 /// while the transition is not yet due, the settled one once it is.
@@ -109,6 +50,19 @@ pub(crate) fn expected_status(
     }
 }
 
+/// `DescribeStacks` for one stack, by name or by stack id.
+pub(crate) async fn describe_stack(
+    router: &MultiServiceRouter,
+    name_or_id: &str,
+) -> (u16, String) {
+    call(
+        router,
+        "DescribeStacks",
+        &[member("StackName", name_or_id)],
+    )
+    .await
+}
+
 /// Percent-encode one form value, so a template body carrying `{`, `"`, `&` or a
 /// multi-byte character survives the body.
 ///
@@ -125,57 +79,6 @@ pub(crate) fn form_encode(value: &str) -> String {
         }
     }
     out
-}
-
-/// Call one operation: `Action` plus the request's members, form-encoded exactly as an
-/// AWS SDK sends them, answered with the HTTP status and the XML body.
-///
-/// Signed for [`REGION`], which is the Region every case that does not care about Regions
-/// runs in; [`call_in`] is the same call signed for another one.
-pub(crate) async fn call(
-    router: &MultiServiceRouter,
-    action: &str,
-    members: &[(String, String)],
-) -> (u16, String) {
-    call_in(router, REGION, action, members).await
-}
-
-/// [`call`], signed for `region`: CloudFormation is Regional, so the credential scope of
-/// the request is what decides which Region's stacks it reads and writes.
-pub(crate) async fn call_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    action: &str,
-    members: &[(String, String)],
-) -> (u16, String) {
-    let mut body = format!("Action={action}&Version=2010-05-15");
-    for (key, value) in members {
-        body.push('&');
-        body.push_str(&form_encode(key));
-        body.push('=');
-        body.push_str(&form_encode(value));
-    }
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://cloudformation.{region}.amazonaws.com/"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/cloudformation/aws4_request, \
-                 SignedHeaders=host, Signature=0123456789abcdef"
-            ),
-        )
-        .body(bytes::Bytes::from(body))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let body = String::from_utf8(response.into_body().to_vec()).expect("a UTF-8 response body");
-    (status, body)
-}
-
-pub(crate) fn member(key: &str, value: &str) -> (String, String) {
-    (key.to_string(), value.to_string())
 }
 
 /// One awsQuery call to IAM over the same router, answered with the HTTP status and the XML
@@ -287,36 +190,6 @@ pub(crate) async fn rds(
     (status, body)
 }
 
-/// Undo the XML text escaping the serializer applies, so a round-tripped value can be
-/// compared with what was sent.
-pub(crate) fn xml_unescape(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-}
-
-/// Every `<tag>` text in document order.
-pub(crate) fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut found = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find(&open) {
-        let after = &rest[start + open.len()..];
-        let Some(end) = after.find(&close) else { break };
-        found.push(xml_unescape(&after[..end]));
-        rest = &after[end + close.len()..];
-    }
-    found
-}
-
-/// The first `<tag>` text, or `None` when the response carries none.
-pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
-    xml_texts(xml, tag).into_iter().next()
-}
-
 /// The inner text of every non-nested `<tag …>…</tag>` BLOCK, in document order, left
 /// exactly as the serializer wrote it.
 ///
@@ -425,17 +298,6 @@ pub(crate) fn list_members(xml: &str, tag: &str) -> Vec<String> {
     members
 }
 
-pub(crate) async fn create_stack(
-    router: &MultiServiceRouter,
-    name: &str,
-    template: &str,
-    extra: &[(String, String)],
-) -> (u16, String) {
-    let mut members = vec![member("StackName", name), member("TemplateBody", template)];
-    members.extend_from_slice(extra);
-    call(router, "CreateStack", &members).await
-}
-
 /// `extra` plus the `Capabilities` member that acknowledges the IAM resources a template
 /// declares.
 ///
@@ -447,19 +309,6 @@ pub(crate) fn acknowledging_iam(extra: &[(String, String)]) -> Vec<(String, Stri
     let mut members = extra.to_vec();
     members.push(member("Capabilities.member.1", "CAPABILITY_NAMED_IAM"));
     members
-}
-
-pub(crate) async fn describe_stack(router: &MultiServiceRouter, name_or_id: &str) -> (u16, String) {
-    call(
-        router,
-        "DescribeStacks",
-        &[member("StackName", name_or_id)],
-    )
-    .await
-}
-
-pub(crate) async fn get_template(router: &MultiServiceRouter, name_or_id: &str) -> (u16, String) {
-    call(router, "GetTemplate", &[member("StackName", name_or_id)]).await
 }
 
 /// A created stack's id is the ARN form CloudFormation mints:
@@ -676,7 +525,7 @@ async fn create_then_describe_and_get_template_round_trip_every_template_shape()
             );
 
             // The template body is persisted verbatim: a byte-identical round trip.
-            let (status, body) = get_template(&router, &identifier).await;
+            let (status, body) = get_template(&router, &identifier, None).await;
             assert_eq!(
                 status, 200,
                 "case {:?}: expected GetTemplate({identifier}) to succeed, got {status} {body}",
@@ -1131,7 +980,7 @@ async fn update_stack_mutates_the_same_stack_and_is_observable_through_the_reads
             case.case
         );
 
-        let (_, body) = get_template(&router, case.stack_name).await;
+        let (_, body) = get_template(&router, case.stack_name, None).await;
         assert_eq!(
             xml_text(&body, "TemplateBody").as_deref(),
             Some(case.expected_template),
@@ -1230,7 +1079,7 @@ async fn update_stack_refuses_what_it_cannot_apply() {
     }
 
     // Every refusal above left the stack exactly as it was.
-    let (_, body) = get_template(&router, "refusals").await;
+    let (_, body) = get_template(&router, "refusals", None).await;
     assert_eq!(
         xml_text(&body, "TemplateBody").as_deref(),
         Some(r#"{"Description":"v1"}"#),
@@ -1845,6 +1694,167 @@ async fn a_stack_policy_round_trips_and_a_policy_url_is_answered_501() {
         Some("ValidationError"),
         "case \"a stack that does not exist\": expected ValidationError, got {body}"
     );
+
+    // `SetStackPolicy` is the other way the policy in force is set, and the rule is the
+    // same: the document set LAST is the one `GetStackPolicy` reports. The rows span the
+    // documents a caller may set, on a stack that already has a policy and on one that
+    // does not.
+    let set_cases: Vec<(&str, &str, &str)> = vec![
+        (
+            "a deny-everything policy on a stack that had none",
+            "unpoliced",
+            r#"{"Statement":[{"Effect":"Deny","Action":"Update:*","Principal":"*","Resource":"*"}]}"#,
+        ),
+        (
+            "a policy that replaces the one an update installed",
+            "policed",
+            r#"{"Statement":[{"Effect":"Allow","Action":"Update:*","Principal":"*","Resource":"*"}]}"#,
+        ),
+        (
+            "several statements, a condition and a resource path",
+            "unpoliced",
+            r#"{"Statement":[{"Effect":"Allow","Action":"Update:Modify","Principal":"*","Resource":"*"},{"Effect":"Deny","Action":"Update:Replace","Principal":"*","Resource":"LogicalResourceId/Db","Condition":{"StringEquals":{"ResourceType":["AWS::SSM::Parameter"]}}}]}"#,
+        ),
+        (
+            "a document carrying unicode, quotes and an ampersand",
+            "unpoliced",
+            r#"{"Statement":[],"Note":"café \"quoted\" & <angled>"}"#,
+        ),
+        (
+            "a one-character document, the modelled minimum length",
+            "policed",
+            "x",
+        ),
+    ];
+    for (case, stack, policy) in set_cases {
+        let (status_code, body) = call(
+            &router,
+            "SetStackPolicy",
+            &[
+                member("StackName", stack),
+                member("StackPolicyBody", policy),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status_code, 200,
+            "case {case:?}: expected SetStackPolicy to succeed, got {status_code} {body}"
+        );
+        let (status_code, body) = call(&router, "GetStackPolicy", &[member("StackName", stack)]).await;
+        assert_eq!(
+            status_code, 200,
+            "case {case:?}: GetStackPolicy answers, got {status_code} {body}"
+        );
+        assert_eq!(
+            xml_text(&body, "StackPolicyBody").as_deref(),
+            Some(policy),
+            "case {case:?}: the policy that was set is the one reported back, got {body}"
+        );
+    }
+
+    // A `SetStackPolicy` the service cannot carry out changes nothing: the policy set last
+    // is still the one in force after each refusal.
+    let in_force = "x";
+    /// One refusal row: the request, the status it must answer and the error code it must
+    /// carry (none for the 501, whose body is the scaffold's).
+    struct PolicyRefusal {
+        case: &'static str,
+        members: Vec<(String, String)>,
+        status: u16,
+        code: Option<&'static str>,
+    }
+    let refusals = vec![
+        PolicyRefusal {
+            case: "both StackPolicyBody and StackPolicyURL",
+            members: vec![
+                member("StackName", "policed"),
+                member("StackPolicyBody", "{}"),
+                member("StackPolicyURL", "https://example.s3.amazonaws.com/policy.json"),
+            ],
+            status: 400,
+            code: Some("ValidationError"),
+        },
+        PolicyRefusal {
+            case: "neither StackPolicyBody nor StackPolicyURL",
+            members: vec![member("StackName", "policed")],
+            status: 400,
+            code: Some("ValidationError"),
+        },
+        PolicyRefusal {
+            case: "a stack that does not exist",
+            members: vec![
+                member("StackName", "no-such-stack"),
+                member("StackPolicyBody", "{}"),
+            ],
+            status: 400,
+            code: Some("ValidationError"),
+        },
+        PolicyRefusal {
+            // Fetching the document would need an outbound connection this emulator does
+            // not make: 501, the same answer CreateStack and UpdateStack give that member.
+            case: "a policy named by URL alone",
+            members: vec![
+                member("StackName", "policed"),
+                member("StackPolicyURL", "https://example.s3.amazonaws.com/policy.json"),
+            ],
+            status: 501,
+            code: None,
+        },
+    ];
+    for PolicyRefusal {
+        case,
+        members,
+        status,
+        code,
+    } in refusals
+    {
+        let (status_code, body) = call(&router, "SetStackPolicy", &members).await;
+        assert_eq!(
+            status_code, status,
+            "case {case:?}: expected {status}, got {status_code} {body}"
+        );
+        if let Some(code) = code {
+            assert_eq!(
+                xml_text(&body, "Code").as_deref(),
+                Some(code),
+                "case {case:?}: expected {code}, got {body}"
+            );
+        }
+        let (_, body) = call(&router, "GetStackPolicy", &[member("StackName", "policed")]).await;
+        assert_eq!(
+            xml_text(&body, "StackPolicyBody").as_deref(),
+            Some(in_force),
+            "case {case:?}: a refused call left the policy in force alone, got {body}"
+        );
+    }
+
+    // A stack policy governs updates to a LIVE stack, so a completed deletion is not a
+    // stack a policy can be set on or read from — even by its stack id.
+    let (_, created) = create_stack(&router, "policy-deleted", "{}", &[]).await;
+    let deleted_id = xml_text(&created, "StackId").expect("a stack id");
+    call(
+        &router,
+        "DeleteStack",
+        &[member("StackName", "policy-deleted")],
+    )
+    .await;
+    wait_for_the_transition().await;
+    for action in ["SetStackPolicy", "GetStackPolicy"] {
+        let mut members = vec![member("StackName", &deleted_id)];
+        if action == "SetStackPolicy" {
+            members.push(member("StackPolicyBody", "{}"));
+        }
+        let (status_code, body) = call(&router, action, &members).await;
+        assert_eq!(
+            status_code, 400,
+            "case \"a completed deletion\": {action} is refused, got {status_code} {body}"
+        );
+        assert_eq!(
+            xml_text(&body, "Code").as_deref(),
+            Some("ValidationError"),
+            "case \"a completed deletion\": expected ValidationError from {action}, got {body}"
+        );
+    }
 
     // A policy named by URL would have to be fetched from Amazon S3, which this emulator
     // does not do: 501, the same honest answer TemplateURL gets — never a 200 that

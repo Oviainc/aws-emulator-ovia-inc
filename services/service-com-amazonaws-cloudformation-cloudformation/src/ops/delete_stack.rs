@@ -3,7 +3,8 @@
 //! @op DeleteStack
 //! IMPLEMENTED: starts the stored stack's deletion — `DELETE_IN_PROGRESS` now, then
 //! `DELETE_COMPLETE` with a `DeletionTime` once the clock makes it due, which takes the
-//! stack out of the live set. A stack with termination protection enabled is refused.
+//! stack out of the live set and deletes the resources it provisioned, each with its own
+//! events. A stack with termination protection enabled is refused.
 //!
 //! Deleting a stack also DELETES THE RESOURCES it created, newest first, through the
 //! services that own them ([`crate::state::provisioning`]); a resource one of those
@@ -246,9 +247,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let operation_id = crate::state::new_operation_id();
-            // Resolved again for the write, this time mutably. A stack that is no longer
-            // there is the same no-op success the read above answers for one the store
-            // does not hold.
+            // "All events triggered by a given stack operation are assigned the same client
+            // request token": the caller's token when it named one, otherwise the one
+            // CloudFormation assigns the operation itself.
+            let client_request_token = input
+                .client_request_token
+                .clone()
+                .unwrap_or_else(crate::state::new_client_request_token);
+            // Resolved again for the write, this time mutably, in the Region the request is
+            // signed for. A stack that is no longer there is the same no-op success the
+            // read above answers for one the store does not hold.
             let Some(stack) = store.resolve_mut(&request_region, &input.stack_name) else {
                 return Ok(DeleteStackOutput);
             };
@@ -259,18 +267,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(role_arn) = &input.role_arn {
                 stack.role_arn = Some(role_arn.clone());
             }
-            if let Some(token) = &input.client_request_token {
-                stack.client_request_token = Some(token.clone());
-            }
+            stack.client_request_token = Some(client_request_token.clone());
             // "Once the call completes successfully, stack deletion starts":
             // DELETE_IN_PROGRESS now, DELETE_COMPLETE (with its DeletionTime) once the
-            // clock makes it due.
+            // clock makes it due — which is also when the resources the stack provisioned
+            // report their own deletion events.
             stack.begin_transition(
                 now,
                 status::DELETE_IN_PROGRESS,
                 status::DELETE_COMPLETE,
                 Some(operation_id),
-                input.client_request_token.clone(),
+                Some(client_request_token),
             );
             (
                 stack.stack_id.clone(),

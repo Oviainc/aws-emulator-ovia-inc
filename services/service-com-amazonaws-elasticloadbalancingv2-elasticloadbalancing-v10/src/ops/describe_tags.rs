@@ -237,7 +237,7 @@ fn not_found(kind: TaggableResource, arn: &str) -> DescribeTagsError {
     match kind {
         TaggableResource::LoadBalancer => DescribeTagsErrorModeled::LoadBalancerNotFoundException(
             LoadBalancerNotFoundException {
-                message: Some(format!("Load balancer '{arn}' not found")),
+                message: Some(crate::state::load_balancer_not_found_message(arn)),
             },
         ),
         TaggableResource::TargetGroup => DescribeTagsErrorModeled::TargetGroupNotFoundException(

@@ -27,6 +27,8 @@ mod contact_lifecycle;
 mod contact_plan_references;
 #[path = "all/contact_updates.rs"]
 mod contact_updates;
+#[path = "all/create_contact_plan_resolution.rs"]
+mod create_contact_plan_resolution;
 #[path = "all/cross_service_onboarding.rs"]
 mod cross_service_onboarding;
 #[path = "all/data_plane_precondition.rs"]

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyCapacityReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyCapacityReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyCapacityReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the capacity reservation of the load balancer `LoadBalancerArn` names, and
+//! answers the reservation it then carries — the same document
+//! `DescribeCapacityReservation` reports.
+//!
+//! Two things a request can ask for, and the model documents that it must ask for at
+//! least one: reserve a `MinimumLoadBalancerCapacity`, or `ResetCapacityReservation`.
+//!
+//! Reserving minimum capacity is a capability of the ACCOUNT, and the account this
+//! emulator serves does not have it, so a request that names
+//! `MinimumLoadBalancerCapacity` is the modelled `OperationNotPermittedException` — the
+//! refusal that tells a caller to ask AWS Support to enable it, rather than a reservation
+//! nothing in this emulator would honour. Resetting is still served: it clears what a
+//! reservation would have reserved and records the instant it did, which
+//! `DescribeCapacityReservation` then reports as `LastModifiedTime`.
+//!
+//! A request that asks for neither, or for both at once, is the modelled
+//! `InvalidConfigurationRequestException`; an ARN this store holds no load balancer for is
+//! the modelled `LoadBalancerNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +176,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyCapacityReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyCapacityReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyCapacityReservation"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("ModifyCapacityReservation")
+        })?;
+        let now = std::time::SystemTime::now();
+
+        // "When modifying capacity reservation, you must include at least one
+        // MinimumLoadBalancerCapacity or ResetCapacityReservation." Read from the request
+        // alone, so both are decided before anything is looked up — and so is the account
+        // capability below, which is why a request to reserve capacity is refused for the
+        // account whether or not the load balancer it names exists.
+        let reserving = input.minimum_load_balancer_capacity.is_some();
+        let resetting = input.reset_capacity_reservation.unwrap_or(false);
+        if !reserving && !resetting {
+            return Err(invalid_configuration(
+                "You must specify either MinimumLoadBalancerCapacity or \
+                 ResetCapacityReservation",
+            ));
+        }
+        if reserving && resetting {
+            return Err(invalid_configuration(
+                "Specify either MinimumLoadBalancerCapacity or ResetCapacityReservation, but \
+                 not both",
+            ));
+        }
+        if reserving {
+            return Err(
+                ModifyCapacityReservationErrorModeled::OperationNotPermittedException(
+                    OperationNotPermittedException {
+                        message: Some(MINIMUM_CAPACITY_NOT_SUPPORTED.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut guard = state.lock();
+        let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
+            return Err(
+                ModifyCapacityReservationErrorModeled::LoadBalancerNotFoundException(
+                    LoadBalancerNotFoundException {
+                        message: Some(crate::state::load_balancer_not_found_message(
+                            &input.load_balancer_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The reset: the load balancer reserves no minimum capacity afterwards, and the
+        // instant this write happened is what a later read reports as `LastModifiedTime`.
+        load_balancer.capacity_reservation_modified_at = Some(now);
+
+        Ok(ModifyCapacityReservationOutput {
+            last_modified_time: load_balancer
+                .capacity_reservation_modified_at
+                .map(::aws_smithy_types::DateTime::from),
+            // The reservation this call left behind, reported exactly as
+            // `DescribeCapacityReservation` reports it: nothing reserved, so no capacity,
+            // no zone holding any, and no decrease budget to spend.
+            decrease_requests_remaining: None,
+            minimum_load_balancer_capacity: None,
+            capacity_reservation_state: Some(Vec::new()),
+        })
     }
+}
+
+/// The refusal AWS answers a request to configure minimum load balancer capacity with for
+/// an account that does not have that capability, in the words it words it — including
+/// where it points a caller who needs it enabled.
+const MINIMUM_CAPACITY_NOT_SUPPORTED: &str = "This AWS account does not support configuring \
+     minimum load balancer capacity reservation. For more information, please contact AWS \
+     Support.";
+
+/// The modelled "the requested configuration is not valid" refusal, for a request that
+/// asks for neither of the two changes this operation makes, or for both at once. The
+/// message names the members the caller has to fix.
+fn invalid_configuration(detail: &str) -> ModifyCapacityReservationError {
+    ModifyCapacityReservationErrorModeled::InvalidConfigurationRequestException(
+        InvalidConfigurationRequestException {
+            message: Some(detail.to_string()),
+        },
+    )
+    .into()
 }

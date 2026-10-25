@@ -78,7 +78,14 @@ async fn associate(
 
 /// `PUT /2020-05-31/distribution-tenant/{Id}/disassociate-web-acl`. The operation's input is
 /// the id and the precondition alone, so the request carries no document.
-async fn disassociate(router: &MultiServiceRouter, id: &str, if_match: Option<&str>) -> Answer {
+///
+/// `pub(crate)` so the suite that asserts how far one disassociation reaches calls it over
+/// the same wire path rather than growing a copy of this.
+pub(crate) async fn disassociate(
+    router: &MultiServiceRouter,
+    id: &str,
+    if_match: Option<&str>,
+) -> Answer {
     call(
         router,
         "PUT",
@@ -90,7 +97,9 @@ async fn disassociate(router: &MultiServiceRouter, id: &str, if_match: Option<&s
 }
 
 /// `GET /2020-05-31/distribution-tenant/{Id}`, asserted served.
-async fn read_tenant(router: &MultiServiceRouter, id: &str, case: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite reads a tenant back through the same implemented reader.
+pub(crate) async fn read_tenant(router: &MultiServiceRouter, id: &str, case: &str) -> Answer {
     let answer = call(
         router,
         "GET",
@@ -110,7 +119,10 @@ async fn read_tenant(router: &MultiServiceRouter, id: &str, case: &str) -> Answe
 /// The tenant's web ACL customization as a read reports it: `(Action, Arn)`, or `None` when
 /// the record carries no `Customizations$WebAcl` at all. An `Arn` the customization leaves
 /// out reads as the empty string.
-fn web_acl_of(tenant: &Node) -> Option<(String, String)> {
+///
+/// `pub(crate)` so a sibling suite reports a tenant's web ACL customization in the same
+/// terms.
+pub(crate) fn web_acl_of(tenant: &Node) -> Option<(String, String)> {
     let web_acl = tenant.at("Customizations/WebAcl")?;
     Some((
         web_acl.text_at("Action").unwrap_or_default().to_string(),
@@ -147,23 +159,27 @@ const DISABLED: &str = "<Customizations><WebAcl><Action>disable</Action></WebAcl
      </Customizations>";
 
 /// One starting point a tenant is in before a web ACL is associated with it.
+///
+/// `pub(crate)` so a sibling suite puts its tenants in these same starting states.
 #[derive(Debug, Clone, Copy)]
-struct Start {
-    case: &'static str,
+pub(crate) struct Start {
+    pub(crate) case: &'static str,
     /// The `Customizations` element the create submits, or `None` to leave the member out.
-    customizations: Option<&'static str>,
+    pub(crate) customizations: Option<&'static str>,
     /// The `(Action, Arn)` a read reports before the association, or `None` for a record
     /// that carries no web ACL customization.
-    web_acl_before: Option<(&'static str, &'static str)>,
+    pub(crate) web_acl_before: Option<(&'static str, &'static str)>,
     /// Whether the tenant carries a customization OTHER than the web ACL, which every call
     /// here must leave in place.
-    other_customizations: bool,
+    pub(crate) other_customizations: bool,
 }
 
 /// The starting points every rule below is asserted over: a tenant with no customizations
 /// at all, one whose customizations are not about a web ACL, one whose web ACL is already
 /// overridden (so the association replaces it) and one whose web ACL is disabled.
-const STARTS: &[Start] = &[
+///
+/// `pub(crate)` so a sibling suite spans the same starting states.
+pub(crate) const STARTS: &[Start] = &[
     Start {
         case: "no customizations at all",
         customizations: None,
@@ -197,7 +213,9 @@ const STARTS: &[Start] = &[
 /// and report `(Id, ETag)`.
 ///
 /// `slug` names the tenant and its domain, which are both unique in the account.
-async fn create_tenant(
+///
+/// `pub(crate)` so a sibling suite creates its tenants over the same wire path.
+pub(crate) async fn create_tenant(
     router: &MultiServiceRouter,
     distribution_id: &str,
     slug: &str,

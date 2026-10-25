@@ -16,7 +16,9 @@ use service_com_amazonaws_kafka_kafka::state::{
     CHANNEL_ACTIVATION_DELAY, MAX_CHANNELS_PER_CLUSTER, TOPIC_CONFIGURATIONS_PER_CHANNEL,
 };
 
-use crate::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
+use crate::kafka_harness::{
+    pct, sleep_past_activation, ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
+};
 
 /// A role ARN a channel assumes to write to its destination. Any role ARN does:
 /// the service stores what it was given and reports it back.
@@ -698,6 +700,9 @@ async fn a_create_for_an_absent_or_malformed_cluster_is_refused() {
     let live = emulator.create_ok(&ClusterRequest::named("live")).await;
     // A cluster that existed and was deleted is as absent as one that never did.
     let deleted = emulator.create_ok(&ClusterRequest::named("deleted")).await;
+    // A cluster is deletable once it has finished provisioning, so it is waited
+    // out of `CREATING` first.
+    sleep_past_activation();
     let dropped = emulator
         .call("DELETE", &format!("/v1/clusters/{}", pct(&deleted)), None)
         .await;
@@ -981,7 +986,9 @@ async fn a_channel_is_only_addressable_under_its_own_cluster() {
         );
     }
 
-    // Deleting the cluster takes its channels with it.
+    // Deleting the cluster takes its channels with it; a cluster is deletable once
+    // it has finished provisioning, so it is waited out of `CREATING` first.
+    sleep_past_activation();
     let dropped = emulator
         .call("DELETE", &format!("/v1/clusters/{}", pct(&owner)), None)
         .await;

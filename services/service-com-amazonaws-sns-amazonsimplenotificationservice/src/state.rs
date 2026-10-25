@@ -138,6 +138,27 @@ pub const MAX_TAG_BYTES_PER_TOPIC: usize = 8 * 1024;
 /// (`CreateTopicInput$DataProtectionPolicy` doc).
 pub const MAX_DATA_PROTECTION_POLICY_LEN: usize = 30_720;
 
+/// The message a `DataProtectionPolicy` past [`MAX_DATA_PROTECTION_POLICY_LEN`] is
+/// refused with, or `None` when the document fits.
+///
+/// Shared by every operation that WRITES a topic's inline data protection policy, so
+/// the one documented bound is the same whichever call carried the document: a
+/// document one write path accepts cannot be one the other refuses. The sentence names
+/// the member, the bound and the length sent, and never reproduces the document.
+///
+/// The length is counted in CHARACTERS, not bytes: "Maximum length of 30,720" is the
+/// constraint on a string member, which Smithy measures in Unicode code points, so a
+/// document of non-ASCII characters is held to the same count as an ASCII one.
+pub fn data_protection_policy_refusal(policy: &str) -> Option<String> {
+    let length = policy.chars().count();
+    (length > MAX_DATA_PROTECTION_POLICY_LEN).then(|| {
+        format!(
+            "Invalid parameter: DataProtectionPolicy - at most \
+             {MAX_DATA_PROTECTION_POLICY_LEN} characters: {length}"
+        )
+    })
+}
+
 /// The bytes an attribute (or tag) map costs: every name and every value, since a
 /// caller supplies both.
 pub fn attribute_bytes(attributes: &HashMap<String, String>) -> usize {

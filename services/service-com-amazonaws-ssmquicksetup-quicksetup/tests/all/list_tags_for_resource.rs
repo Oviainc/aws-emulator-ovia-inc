@@ -237,7 +237,15 @@ fn reported_tags(case: &str, answer: &Value) -> BTreeMap<String, String> {
 }
 
 /// `ListTagsForResource` on `arn`, asserted to succeed, as a key/value map.
-async fn listed(router: &MultiServiceRouter, case: &str, arn: &str) -> BTreeMap<String, String> {
+///
+/// `pub(crate)` because the sibling suites of this one test binary read tags back through
+/// the same reader: `all/reserved_tag_keys.rs` checks that a refused write leaves nothing
+/// for it to report, and this is the one place the reported entries are parsed.
+pub(crate) async fn listed(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+) -> BTreeMap<String, String> {
     let (status, answer) = list_tags(router, arn).await;
     assert_eq!(
         status, 200,

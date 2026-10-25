@@ -205,6 +205,8 @@ mod ipam_routing_policy_registrations;
 mod launch_templates;
 #[path = "all/local_gateway_route_table_virtual_interface_group_associations.rs"]
 mod local_gateway_route_table_virtual_interface_group_associations;
+#[path = "all/local_gateway_route_tables.rs"]
+mod local_gateway_route_tables;
 #[path = "all/local_gateway_virtual_interface_groups.rs"]
 mod local_gateway_virtual_interface_groups;
 #[path = "all/mac_dedicated_hosts.rs"]
@@ -247,6 +249,8 @@ mod resource_specific_error_codes;
 mod route_server_peers;
 #[path = "all/route_servers.rs"]
 mod route_servers;
+#[path = "all/search_local_gateway_routes.rs"]
+mod search_local_gateway_routes;
 #[path = "all/secondary_networks.rs"]
 mod secondary_networks;
 #[path = "all/secondary_subnets.rs"]

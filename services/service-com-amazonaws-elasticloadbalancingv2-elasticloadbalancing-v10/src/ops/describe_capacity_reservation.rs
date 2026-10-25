@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCapacityReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCapacityReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCapacityReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the capacity reservation of the load balancer `LoadBalancerArn` names, as the
+//! store holds it: the instant a capacity-reservation write last changed it, the minimum
+//! capacity it reserves, and the state of that reservation in each Availability Zone.
+//!
+//! A load balancer this emulator holds reserves no minimum capacity — configuring one is
+//! what `ModifyCapacityReservation` refuses for this account, see that operation — so what
+//! is reported for one is "nothing reserved": no minimum capacity and no zone holding
+//! reserved capacity, beside the `LastModifiedTime` of the last write that touched it.
+//!
+//! A reporting operation: it reads the store and writes nothing to it, and an ARN this
+//! store holds no load balancer for is the modelled `LoadBalancerNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +145,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCapacityReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCapacityReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCapacityReservation"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("DescribeCapacityReservation")
+        })?;
+
+        let guard = state.lock();
+        let Some(load_balancer) = guard.load_balancers.get(&input.load_balancer_arn) else {
+            return Err(
+                DescribeCapacityReservationErrorModeled::LoadBalancerNotFoundException(
+                    LoadBalancerNotFoundException {
+                        message: Some(crate::state::load_balancer_not_found_message(
+                            &input.load_balancer_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeCapacityReservationOutput {
+            // What the store holds: `None` for a load balancer no capacity-reservation
+            // write has touched, rather than an instant made up for this read.
+            last_modified_time: load_balancer
+                .capacity_reservation_modified_at
+                .map(::aws_smithy_types::DateTime::from),
+            // "The amount of daily capacity decreases remaining" is a budget of the
+            // reservation decreases a caller has made, and this load balancer reserves no
+            // minimum capacity to decrease, so there is no figure to report.
+            decrease_requests_remaining: None,
+            minimum_load_balancer_capacity: None,
+            // No zone holds reserved capacity for a load balancer that reserves none.
+            capacity_reservation_state: Some(Vec::new()),
+        })
     }
 }

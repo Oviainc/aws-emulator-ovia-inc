@@ -277,6 +277,33 @@ pub async fn security_group_vpcs(
     }
 }
 
+/// Whether any security group a request names belongs to a VPC OTHER than `vpc_id`, as
+/// EC2 reported it.
+///
+/// A load balancer's security groups govern traffic to its network interfaces, which live
+/// in the subnets it is placed in: a group of another VPC can never be applied to them.
+/// `false` when there is no EC2 to ask, because a refusal has to be grounded in what EC2
+/// reported rather than assumed from silence — and `false` for a request that names no
+/// group at all, which associates nothing foreign.
+///
+/// The ONE reading of that rule, called by `CreateLoadBalancer` for the groups a new load
+/// balancer starts with and by `SetSecurityGroups` for the groups that replace them.
+pub async fn has_foreign_security_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    vpc_id: &str,
+    security_groups: &[String],
+) -> bool {
+    let Some(reported) = security_group_vpcs(ctx, region, security_groups).await else {
+        return false;
+    };
+    reported.iter().any(|(_, group_vpc)| {
+        group_vpc
+            .as_deref()
+            .is_some_and(|holding| holding != vpc_id)
+    })
+}
+
 /// What EC2 says about the instances a request named as targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstanceTargets {
