@@ -17,6 +17,8 @@ mod account_configuration;
 mod batch_get_findings_classification;
 #[path = "all/findings_metrics.rs"]
 mod findings_metrics;
+#[path = "all/list_scans_scan_type.rs"]
+mod list_scans_scan_type;
 #[path = "all/metrics_summary.rs"]
 mod metrics_summary;
 #[path = "all/reserved_tag_keys.rs"]

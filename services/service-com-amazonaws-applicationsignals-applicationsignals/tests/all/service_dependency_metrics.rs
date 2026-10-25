@@ -142,8 +142,8 @@ fn slo_body(name: &str, request_based: bool, metric_config: Value) -> Value {
 /// service, a second operation of that same service, the `SliConfig` and the
 /// `RequestBasedSliConfig` form of the same entity members, a far end identified as a remote
 /// SERVICE (by `Name`) and one identified as a remote RESOURCE (by `ResourceType` and
-/// `Identifier`), a caller identity that names no `Environment`, and a caller that is itself
-/// a resource, so its identity names no `Name`.
+/// `Identifier`), a far end whose identity names no `Environment`, a caller in a second
+/// environment, and a caller that is itself a resource, so its identity names no `Name`.
 ///
 /// The dimension names are the ones `src/state.rs` maps the `Attributes` entries onto
 /// (`NEAR_END_DIMENSIONS`, `FAR_END_DIMENSIONS`, `OPERATION_DIMENSION`,
@@ -224,12 +224,12 @@ async fn seed(router: &MultiServiceRouter) {
     .await;
     create_slo(
         router,
-        "billing -> tax, a caller identity that names no Environment",
+        "billing -> tax, a caller in a second environment and a far end that names none",
         slo_body(
             "billing-tax",
             true,
             json!({
-                "KeyAttributes": { "Type": "Service", "Name": "billing" },
+                "KeyAttributes": service_entity("billing", "staging"),
                 "OperationName": "POST /invoice",
                 "MetricType": "LATENCY",
                 "DependencyConfig": {
@@ -331,12 +331,13 @@ fn rows() -> Vec<Row> {
             ]),
         },
         Row {
-            case: "billing -> tax, a caller that names no Environment",
-            caller: json!({ "Type": "Service", "Name": "billing" }),
+            case: "billing -> tax, a far end that names no Environment",
+            caller: service_entity("billing", "staging"),
             operation: "POST /invoice",
             callee: json!({ "Type": "RemoteService", "Name": "tax" }),
             callee_operation: "Quote",
             dimensions: dimensions(&[
+                "Environment=staging",
                 "Service=billing",
                 "Operation=POST /invoice",
                 "RemoteService=tax",
@@ -517,7 +518,7 @@ async fn one_caller_reports_one_entry_per_recorded_edge() {
         ("checkout, three recorded edges", service_entity("checkout", "prod"), 3),
         (
             "billing, one recorded edge",
-            json!({ "Type": "Service", "Name": "billing" }),
+            service_entity("billing", "staging"),
             1,
         ),
         (

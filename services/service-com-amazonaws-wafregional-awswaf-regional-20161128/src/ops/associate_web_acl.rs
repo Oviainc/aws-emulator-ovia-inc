@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateWebACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateWebACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateWebACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +117,28 @@ impl From<AssociateWebACLErrorModeled> for AssociateWebACLError {
     }
 }
 
+/// The `ParameterExceptionField` a `ResourceArn` this operation cannot use is reported
+/// under, from the model's generated `PARAMETER_EXCEPTION_FIELD_VALUES`.
+const FIELD_RESOURCE_ARN: &str = "RESOURCE_ARN";
+
+/// The `ParameterExceptionReason` for a member whose value the service cannot use, from
+/// the model's generated `PARAMETER_EXCEPTION_REASON_VALUES`.
+const REASON_ILLEGAL_ARGUMENT: &str = "ILLEGAL_ARGUMENT";
+
+/// A `WAFInvalidParameterException` naming the member AWS WAF did not accept.
+///
+/// `field` is a `ParameterExceptionField` value and `reason` a
+/// `ParameterExceptionReason` value, so a client branching on them sees what the real
+/// service sends.
+fn invalid_parameter(field: &str, parameter: &str, reason: &str) -> AssociateWebACLError {
+    AssociateWebACLErrorModeled::WAFInvalidParameterException(WAFInvalidParameterException {
+        field: Some(field.to_string()),
+        parameter: Some(parameter.to_string()),
+        reason: Some(reason.to_string()),
+    })
+    .into()
+}
+
 /// The `AssociateWebACL` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +175,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateWebACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateWebACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateWebACL"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateWebACLErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+
+        // "Your request references an ARN that is malformed, or corresponds to a resource
+        // with which a web ACL cannot be associated" is one of the cases
+        // `WAFInvalidParameterException` documents, and it is decided from the ARN alone,
+        // so it is answered before the store is touched: the request leaves no
+        // association behind.
+        if crate::state::associable_resource_type(&input.resource_arn).is_none() {
+            return Err(invalid_parameter(
+                FIELD_RESOURCE_ARN,
+                &input.resource_arn,
+                REASON_ILLEGAL_ARGUMENT,
+            ));
+        }
+
+        // A mutation: the association the spec says this call makes — "Associates a web
+        // ACL with a resource" — is written to the web ACL's own stored record.
+        let mut state = state.lock();
+
+        match state.associate_resource(&input.web_acl_id, &input.resource_arn) {
+            Ok(()) => Ok(AssociateWebACLOutput {}),
+            // The web ACL has to be there for anything to protect the resource: "The
+            // operation failed because the referenced object doesn't exist."
+            Err(crate::state::AssociateRefusal::NoSuchWebACL) => Err(
+                AssociateWebACLErrorModeled::WAFNonexistentItemException(
+                    WAFNonexistentItemException {
+                        // One fixed sentence per refusal class, carrying nothing of the
+                        // request — as AWS WAF Classic's messages do.
+                        message: Some(crate::state::MESSAGE_NONEXISTENT_ITEM.to_string()),
+                    },
+                )
+                .into(),
+            ),
+            // The web ACL already protects every resource this emulator stores for one
+            // (`crate::state::MAX_ASSOCIATED_RESOURCES`), so this is an ARN it cannot be
+            // associated with — the same documented invalid-parameter case as an ARN
+            // naming an unassociable resource. The operation models no limits error, and
+            // `ResourceArn` is the member the request cannot be served for, so it is the
+            // member the refusal names.
+            Err(crate::state::AssociateRefusal::TooManyResources) => Err(invalid_parameter(
+                FIELD_RESOURCE_ARN,
+                &input.resource_arn,
+                REASON_ILLEGAL_ARGUMENT,
+            )),
+        }
     }
 }

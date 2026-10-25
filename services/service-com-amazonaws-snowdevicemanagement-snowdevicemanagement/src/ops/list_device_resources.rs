@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDeviceResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDeviceResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDeviceResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +146,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = &input;
-        let _ = ctx;
-        let _ = &self.engine;
-        // Implement `ListDeviceResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDeviceResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDeviceResources"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDeviceResourcesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the snow-device-management device store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The token carries the resource id the next page resumes at; a value this
+        // service never issued is refused rather than silently serving page one.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListDeviceResourcesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token:?} is not a token returned by ListDeviceResources"
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        let page_size = crate::state::page_size(input.max_results);
+
+        // The addressed device is RESOLVED first: an id that names no device of this
+        // account in the signed Region is the modelled `ResourceNotFoundException`,
+        // whatever page or filter was asked of it.
+        let Some(device) = store.device_in(&region, &input.managed_device_id) else {
+            return Err(ListDeviceResourcesErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::DEVICE_RESOURCE_TYPE,
+                    &input.managed_device_id,
+                ),
+            )
+            .into());
+        };
+
+        // "The Amazon Web Services resources available for a device": the Amazon EC2
+        // instances the device itself runs, in the stable order its cache holds them,
+        // which is what lets a resumed page pick up exactly where the previous one
+        // stopped.
+        let mut resources = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for (instance_id, instance) in &device.ec2_instances {
+            // Resume at the first id at or after the token, so a page is still served
+            // when the resource the token named is gone.
+            if resume_at
+                .as_deref()
+                .is_some_and(|key| instance_id.as_str() < key)
+            {
+                continue;
+            }
+            let summary = instance.to_resource_summary(&region);
+            // "A structure used to filter the results by type of resource": a type no
+            // resource of this device carries selects none of them, which is an empty
+            // page rather than a refusal.
+            if input
+                .r#type
+                .as_deref()
+                .is_some_and(|wanted| summary.resource_type != wanted)
+            {
+                continue;
+            }
+            if resources.len() == page_size {
+                next_token = Some(crate::state::encode_token(instance_id));
+                break;
+            }
+            resources.push(summary);
+        }
+
+        Ok(ListDeviceResourcesOutput {
+            resources: Some(resources),
+            next_token,
+        })
     }
 }

@@ -2,7 +2,8 @@
 
 //! @op ListScans
 //!
-//! Pages the scan store `CreateScan` writes. Reporting only, apart from materialising
+//! Pages the scan store `CreateScan` writes, apart from the scans this listing never
+//! returns (`state::Scan::listed_run`). Reporting only, apart from materialising
 //! the run-state transitions the clock already owes (`state::settle_due_runs`).
 //!
 //! ## Shape of an operation
@@ -208,8 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut next_token = None;
         for (scan_name, scan) in page {
             // Resolved before the page boundary is tested, so an entry this loop skips
-            // can never become the cursor the next page resumes at.
-            let Some(run) = scan.latest_run() else {
+            // can never become the cursor the next page resumes at — a scan this listing
+            // does not report neither fills a page slot nor shifts the next page's
+            // cursor.
+            let Some(run) = scan.listed_run() else {
                 continue;
             };
             if summaries.len() == page_size {

@@ -462,6 +462,27 @@ async fn topology_reads_report_what_the_stored_slos_monitor() {
     )
     .await;
 
+    create_slo(
+        &router,
+        "orders table latency, a four-attribute resource entity",
+        json!({
+            "Name": "orders-table-latency",
+            "SliConfig": {
+                "SliMetricConfig": {
+                    "KeyAttributes": {
+                        "Type": "AWS::Resource",
+                        "ResourceType": "AWS::DynamoDB::Table",
+                        "Identifier": "orders-table",
+                        "Environment": "prod"
+                    },
+                    "MetricType": "LATENCY",
+                    "MetricDataQueries": [metric_query("m1", "AWS/DynamoDB", "SuccessfulRequestLatency")]
+                }
+            }
+        }),
+    )
+    .await;
+
     // A window that contains the instant the SLOs were created, and one that ends before
     // it: an SLO is evidence of its entity from its CreatedTime onwards, so the earlier
     // window sees nothing.
@@ -496,20 +517,32 @@ async fn topology_reads_report_what_the_stored_slos_monitor() {
         service["Service"]["MetricReferences"]
     );
 
-    // An entity named by only SOME of its attributes is reported with the full set the
+    // An entity named by only the attributes its own `Type` makes applicable — a resource is
+    // picked out by its `ResourceType` and `Identifier` — is reported with the fuller set the
     // stored SLO holds for it: the attributes identify the entity, and the fuller set comes
     // out of the store, not out of the request.
+    let resource = json!({
+        "Type": "AWS::Resource",
+        "ResourceType": "AWS::DynamoDB::Table",
+        "Identifier": "orders-table",
+        "Environment": "prod"
+    });
+    let partial_resource = json!({
+        "Type": "AWS::Resource",
+        "ResourceType": "AWS::DynamoDB::Table",
+        "Identifier": "orders-table"
+    });
     let (_, partial) = call(
         &router,
         "POST",
         &format!("/service?{covering}"),
-        Some(json!({ "KeyAttributes": { "Type": "Service", "Name": "checkout" } })),
+        Some(json!({ "KeyAttributes": partial_resource.clone() })),
     )
     .await;
     assert_eq!(
         partial["Service"]["KeyAttributes"],
-        service_entity("checkout"),
-        "case \"GetService checkout by a partial identity\": expected the stored attributes, got {:?}",
+        resource,
+        "case \"GetService orders-table by a partial identity\": expected the stored attributes, got {:?}",
         partial["Service"]["KeyAttributes"]
     );
 
@@ -519,13 +552,13 @@ async fn topology_reads_report_what_the_stored_slos_monitor() {
         &router,
         "POST",
         &format!("/service?{earlier}"),
-        Some(json!({ "KeyAttributes": { "Type": "Service", "Name": "checkout" } })),
+        Some(json!({ "KeyAttributes": partial_resource.clone() })),
     )
     .await;
     assert_eq!(
         partial_earlier["Service"]["KeyAttributes"],
-        json!({ "Type": "Service", "Name": "checkout" }),
-        "case \"GetService checkout by a partial identity, earlier window\": expected the requested attributes, got {:?}",
+        partial_resource,
+        "case \"GetService orders-table by a partial identity, earlier window\": expected the requested attributes, got {:?}",
         partial_earlier["Service"]["KeyAttributes"]
     );
 
