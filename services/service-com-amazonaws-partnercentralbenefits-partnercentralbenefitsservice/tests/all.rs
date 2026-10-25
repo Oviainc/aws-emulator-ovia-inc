@@ -23,6 +23,8 @@ mod application_workflow_stage;
 mod benefit_allocations;
 #[path = "all/benefit_application_lifecycle.rs"]
 mod benefit_application_lifecycle;
+#[path = "all/benefit_catalog_record.rs"]
+mod benefit_catalog_record;
 #[path = "all/client_token_idempotency.rs"]
 mod client_token_idempotency;
 #[path = "all/disassociate_benefit_application_resource.rs"]
