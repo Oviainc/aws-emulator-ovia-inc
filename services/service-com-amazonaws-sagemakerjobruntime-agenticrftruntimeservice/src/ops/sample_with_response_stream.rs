@@ -164,13 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `JobArn` names the job the caller's own execution is running under; this
-        // service's model binds no operation that creates, lists or deletes a job, so
-        // there is no registry to resolve it against and nothing to refuse it on. The
-        // member's modelled constraints (`@length` 1..256 and the ARN `@pattern`) are
-        // the whole restriction, and the framework has already enforced them by the
-        // time `handle` runs: whatever ARN reaches here is the job this turn belongs to.
-
         // `Body` is `@required` and `@httpPayload`, so a request without one is
         // already refused at the boundary; a request WITH an empty payload gets
         // this far and carries no inference request to capture.
@@ -178,6 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation(
                 "Body must carry the inference request payload; it was empty.".to_string(),
             ));
+        }
+
+        // `JobArn` names the job this turn belongs to, created in the SageMaker control
+        // plane — this service's model binds no operation that creates, lists or deletes
+        // one, so the job is resolved against the directory that control plane writes
+        // (`crate::state::job_exists`). The member's modelled constraints (`@length`
+        // 1..256 and the ARN `@pattern`) are already enforced by the time `handle` runs,
+        // and they admit any partition, region, account and job name: an ARN no create
+        // ever minted is well formed and still names no job, so the request cannot be
+        // routed to a model session and is refused rather than served an inference.
+        if !crate::state::job_exists(&*self.engine, &input.job_arn) {
+            return Err(validation(crate::state::job_not_found_message(
+                &input.job_arn,
+            )));
         }
 
         let request_content_type = ctx

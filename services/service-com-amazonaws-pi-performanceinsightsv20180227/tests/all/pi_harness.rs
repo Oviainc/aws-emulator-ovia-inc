@@ -68,6 +68,29 @@ pub fn emulator_with_identity_services() -> MultiServiceRouter {
     router
 }
 
+/// Record a data source in the SHARED data-source directory the way a database
+/// control plane does when it mints a resource id: the id under the monitoring
+/// `ServiceType` that owns it and the engine it runs, plus — when the owner
+/// recorded one — the monitoring configuration a monitoring service projects
+/// onto its own shapes. ONE seeding helper for every suite in this crate that
+/// needs a data source a one-service emulator has no operation to create.
+pub fn register_data_source(
+    engine: &engine::InMemoryEngine,
+    resource_id: &str,
+    service_type: &str,
+    db_engine: &str,
+    monitoring: Option<::service_common::db_data_sources::MonitoringConfiguration>,
+) {
+    let directory =
+        service_com_amazonaws_pi_performanceinsightsv20180227::state::data_source_directory(engine)
+            .expect("the shared data-source directory is reachable from the engine");
+    let mut directory = directory.lock();
+    directory.register(resource_id, service_type, db_engine);
+    if let Some(monitoring) = monitoring {
+        directory.record_monitoring(resource_id, monitoring);
+    }
+}
+
 /// One answer off the wire: the HTTP status and the parsed JSON body.
 #[derive(Debug, Clone)]
 pub struct Answer {

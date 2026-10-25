@@ -51,7 +51,7 @@ fn copy_body(caller_reference: &str, enabled: Option<bool>) -> String {
 ///
 /// `staging` is the `Staging` HEADER the model binds the member to, and `if_match` the
 /// optional `If-Match` one; `None` leaves the header off the request entirely.
-async fn copy_distribution(
+pub(crate) async fn copy_distribution(
     router: &MultiServiceRouter,
     primary_id: &str,
     caller_reference: &str,

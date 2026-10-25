@@ -103,6 +103,7 @@ fn stored_user(password_permanent: bool, password_set_at: Option<SystemTime>) ->
         username: "alice".to_string(),
         sub: state::new_uuid(),
         attributes: std::collections::BTreeMap::new(),
+        pending_attributes: std::collections::BTreeMap::new(),
         password: Some(GOOD_PASSWORD.to_string()),
         password_permanent,
         password_set_at,
