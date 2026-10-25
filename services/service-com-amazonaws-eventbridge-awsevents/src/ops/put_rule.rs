@@ -263,6 +263,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // "You cannot modify these managed rules by using DisableRule, EnableRule,
+        // PutTargets, PutRule, TagResource, or UntagResource"
+        // (`ManagedRuleException`): a name this bus already holds a MANAGED rule
+        // under is refused rather than replaced.
+        if bus
+            .rules
+            .get(&input.name)
+            .is_some_and(|rule| rule.managed_by.is_some())
+        {
+            return Err(PutRuleErrorModeled::ManagedRuleException(ManagedRuleException {
+                message: Some(crate::state::managed_rule_refusal(&input.name)),
+            })
+            .into());
+        }
+
         if !bus.rules.contains_key(&input.name)
             && bus.rules.len() >= crate::state::MAX_RULES_PER_BUS
         {
@@ -313,8 +328,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: rule_state,
             description: input.description,
             role_arn: input.role_arn,
-            // Nothing in this emulator creates a rule on an Amazon Web Services
-            // service's behalf, so no stored rule is a managed rule.
+            // A rule this service created on the account's behalf is never a
+            // managed rule REPLACED here: a managed name is refused above, so a
+            // rule written by this operation is always the customer's own.
             managed_by: None,
             created_by: Some(crate::state::account_id().to_string()),
             event_bus_name: bus_name,

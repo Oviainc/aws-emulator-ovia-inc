@@ -166,6 +166,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // "If you see this error in response to DeleteRule or RemoveTargets, you
+        // can use the Force parameter in those calls to delete the rule or remove
+        // targets from the rule" (`ManagedRuleException`): a managed rule's
+        // targets belong to the service that created it, so removing one is
+        // refused unless the caller insists.
+        if rule.managed_by.is_some() && !input.force {
+            return Err(RemoveTargetsErrorModeled::ManagedRuleException(
+                ManagedRuleException {
+                    message: Some(crate::state::managed_rule_refusal_force_overrides(
+                        &input.rule,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // Removal is keyed by `Id` and idempotent: an id the rule carries is
         // removed, and an id it does not carry asks for a state the rule is
         // already in, so nothing is removed for it and nothing fails. Only the
