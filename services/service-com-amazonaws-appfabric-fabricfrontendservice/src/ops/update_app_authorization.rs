@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAppAuthorization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAppAuthorization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies a PARTIAL update to an app authorization stored under its app bundle
+//! and reports the stored record back (see
+//! [`crate::state::AppAuthorizationRecord::to_app_authorization`]), so
+//! `GetAppAuthorization` and `ListAppAuthorizations` answer from the bytes this
+//! call wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAppAuthorization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Four rules this handler owns:
+//!
+//! * only the members the request SUPPLIES are written — `credential` and
+//!   `tenant` are both optional, and everything else (the ARNs, `app`,
+//!   `authType`, `createdAt`, the tags) belongs to the resource rather than to
+//!   this request;
+//! * a supplied `credential` must match the STORED `authType`, which the
+//!   model's own documentation of the member requires ("Specify credentials
+//!   that match the authorization type of the app authorization to update");
+//! * an applied update invalidates the connect handshake, so the record goes
+//!   back to `PendingConnect` and `updatedAt` moves to now — the operation's
+//!   own documentation states it ("If the app authorization was in a connected
+//!   state, updating the app authorization will set it back to a PendingConnect
+//!   state"). The reset is taken for EVERY applied update, not only one that
+//!   finds the record `Connected`: the model's other two `AppAuthorizationStatus`
+//!   values are post-handshake FAILURES whose documented remedy is to connect
+//!   again (`ConnectionValidationFailed` — "verify the configured credentials
+//!   and try to connect the app authorization again"; `TokenAutoRotationFailed`
+//!   — "you should try to reconnect the app authorization"), and both of them
+//!   report on credentials this call has just replaced, so the state that says
+//!   "created but not yet connected" is the only one left that is true of the
+//!   record. A call that supplies neither member has nothing to apply, so it
+//!   writes nothing and reports the record as it stands;
+//! * a bundle holds AT MOST ONE authorization per (`app`, `tenant`) pair — the
+//!   invariant `CreateAppAuthorization` establishes — so moving one onto a pair
+//!   another authorization of the same bundle already holds is refused, and the
+//!   check is taken under the SAME state lock as the write.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +183,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAppAuthorization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAppAuthorizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAppAuthorization"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateAppAuthorizationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AppFabric emulator could not reach its state store".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // ONE lock for the whole decision: the checks below and the write that
+        // follows them are taken without releasing it, so two concurrent
+        // updates of one bundle cannot both pass a check the other invalidates.
+        let mut store = state.lock();
+        let Some(bundle) = store.resolve_bundle_mut(&input.app_bundle_identifier) else {
+            return Err(UpdateAppAuthorizationErrorModeled::ResourceNotFoundException(
+                crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
+            )
+            .into());
+        };
+        let Some(stored) = bundle.resolve_app_authorization(&input.app_authorization_identifier)
+        else {
+            return Err(UpdateAppAuthorizationErrorModeled::ResourceNotFoundException(
+                crate::state::app_authorization_not_found(&input.app_authorization_identifier),
+            )
+            .into());
+        };
+        // The record's own members: `authType` and `app` are NOT inputs of this
+        // operation, so the update is judged against the ones it was created
+        // with, and `id` is the key the write below reaches it by.
+        let id = stored.id.clone();
+        let app = stored.app.clone();
+        let auth_type = stored.auth_type.clone();
+
+        // A supplied credential must be the kind the STORED authorization type
+        // uses. Only the KIND is read: the secret inside it is never stored,
+        // logged or reported back.
+        let credential_kind = input.credential.as_ref().map(crate::state::credential_kind);
+        if let Some(kind) = credential_kind {
+            if kind != crate::state::credential_kind_for_auth_type(&auth_type) {
+                return Err(UpdateAppAuthorizationErrorModeled::ValidationException(
+                    crate::state::credential_does_not_match_auth_type(&auth_type),
+                )
+                .into());
+            }
+        }
+
+        // At most ONE authorization per (bundle, app, tenant) triple, so a
+        // tenant another authorization of this bundle already holds for the same
+        // application is refused. Finding THIS authorization under the pair is
+        // not a collision: re-stating its own tenant changes nothing.
+        if let Some(tenant) = input.tenant.as_ref() {
+            if let Some(held) = bundle.authorization_for(&app, &tenant.tenant_identifier) {
+                if held.id != id {
+                    return Err(UpdateAppAuthorizationErrorModeled::ValidationException(
+                        crate::state::tenant_already_authorized(&app),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // `credential` and `tenant` are both optional, so a call that supplies
+        // NEITHER has no change to apply: it leaves the record — including its
+        // status and `updatedAt` — exactly as it stands, and reports it.
+        let applied = input.credential.is_some() || input.tenant.is_some();
+        // The record was resolved above under THIS lock, so the key is still
+        // there: the arm below is unreachable by construction, and answers a
+        // modelled server error rather than panicking if that ever changes.
+        let Some(record) = bundle.app_authorizations.get_mut(&id) else {
+            return Err(UpdateAppAuthorizationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the app authorization to update could not be read back".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        if let Some(kind) = credential_kind {
+            record.credential_kind = kind.to_string();
+        }
+        if let Some(tenant) = input.tenant {
+            record.tenant_identifier = tenant.tenant_identifier;
+            record.tenant_display_name = tenant.tenant_display_name;
+        }
+        if applied {
+            // An applied update invalidates the connect handshake: the
+            // credential or the tenant the authorization was connected with has
+            // changed, so `ConnectAppAuthorization` has to run again. Taken from
+            // whichever status the record held — the module header says why the
+            // two post-handshake failure states reset too — and already being
+            // `PendingConnect` makes this the same write.
+            record.status = crate::state::APP_AUTHORIZATION_STATUS_PENDING_CONNECT.to_string();
+            record.updated_at = ::std::time::SystemTime::now();
+        }
+
+        // Read the response back out of the record this call wrote, so what the
+        // caller sees is exactly what a later Get or List will see.
+        let app_authorization = record.to_app_authorization();
+        if applied {
+            crate::state::audit_resource_change(
+                ctx.parts(),
+                Self::NAME,
+                "AppAuthorization",
+                &id,
+                "updated",
+            );
+        }
+        Ok(UpdateAppAuthorizationOutput { app_authorization })
     }
 }
