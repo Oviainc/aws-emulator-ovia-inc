@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetContactList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetContactList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetContactList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored contact list the request names. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +140,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetContactList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetContactListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetContactList"))
+        // Request metadata is not needed: the list is keyed by name within the one
+        // emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetContactList without the shared emulator state",
+            ));
+        };
+
+        let name = input.contact_list_name;
+        let store = state.lock();
+        let Some(record) = store.contact_lists.get(&name) else {
+            return Err(GetContactListErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::contact_list_not_found(&name)),
+            })
+            .into());
+        };
+
+        Ok(GetContactListOutput {
+            contact_list_name: Some(record.name.clone()),
+            // A list with no topics has no `Topics` member at all, rather than an empty
+            // list: nothing was declared for the contact to subscribe to.
+            topics: (!record.topics.is_empty()).then(|| record.topics.clone()),
+            description: record.description.clone(),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(record.created_at)),
+            last_updated_timestamp: Some(::aws_smithy_types::DateTime::from(
+                record.last_updated_at,
+            )),
+            tags: (!record.tags.is_empty()).then(|| record.tag_list()),
+        })
     }
 }

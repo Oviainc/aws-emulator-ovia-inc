@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListContactLists
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListContactLists`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListContactLists::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the stored contact lists, honouring `PageSize` and the opaque `NextToken`
+//! this operation hands back. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +142,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListContactLists` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListContactListsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListContactLists"))
+        // Request metadata is not needed: the listing covers the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListContactLists without the shared emulator state",
+            ));
+        };
+
+        // "Maximum number of contact lists to return at once. Use this parameter to
+        // paginate results." The model puts no bound on `MaxItems`, so only a positive
+        // count truncates a page; a non-positive one is read as no truncation, which
+        // keeps a caller that sends 0 from being stuck on an empty page forever.
+        let page_size = usize::try_from(input.page_size.unwrap_or_default())
+            .ok()
+            .filter(|size| *size > 0);
+
+        // The token is this operation's own: it names the last list the previous page
+        // returned, so the next page resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_tagged_page_token(
+                    crate::state::CONTACT_LISTS_PAGE_TOKEN_TAG,
+                    token,
+                )
+                .ok_or_else(|| {
+                    bad_request("NextToken is not a token returned by ListContactLists.")
+                })?,
+            ),
+        };
+
+        let store = state.lock();
+        // `contact_lists` is ordered by name, so a page is a window over that order and
+        // the resume point is a position in it — which keeps a token valid even if the
+        // list it names has since been deleted.
+        let names: Vec<&String> = store.contact_lists.keys().collect();
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(last) => names.partition_point(|name| name.as_str() <= last),
+        };
+        let remaining = &names[start..];
+        let page = match page_size {
+            Some(size) => &remaining[..size.min(remaining.len())],
+            None => remaining,
+        };
+
+        let contact_lists: Vec<ContactList> = page
+            .iter()
+            .filter_map(|name| store.contact_lists.get(*name))
+            .map(crate::state::ContactListRecord::summary)
+            .collect();
+        // A token only when lists remain behind this page, so a walk terminates.
+        let next_token = (page.len() < remaining.len())
+            .then(|| {
+                page.last().map(|name| {
+                    crate::state::encode_tagged_page_token(
+                        crate::state::CONTACT_LISTS_PAGE_TOKEN_TAG,
+                        name,
+                    )
+                })
+            })
+            .flatten();
+
+        Ok(ListContactListsOutput {
+            contact_lists: Some(contact_lists),
+            next_token,
+        })
     }
+}
+
+/// Refuse the request with this service's input error.
+fn bad_request(message: impl Into<String>) -> ListContactListsError {
+    ListContactListsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

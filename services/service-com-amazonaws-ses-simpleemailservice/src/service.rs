@@ -45,6 +45,26 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// This service's endpoint prefix, as its model gives it
+/// (`smithy_query(query="service_info")`: `awsService.endpointPrefix` `email`) — the name
+/// a host-addressed request resolves to, beside the SigV4 signing name (`ses`) the
+/// generated identity carries.
+pub const ENDPOINT_PREFIX: &str = "email";
+
+/// The URI path space this service's wire protocol uses: the ROOT path, and nothing else.
+///
+/// SES v1 speaks `awsQuery` (`smithy_query(query="service_info")`: protocols
+/// `["awsQuery"]`) and no operation in its model carries a `smithy.api#http` binding, so
+/// every one of its 71 operations arrives as `POST /` with the operation named by the
+/// `Action` form field. The generated `crate::ROUTE_PATH_SEGMENTS` is EMPTY for exactly
+/// that case — the generator keeps it empty for an RPC service with no bindings so as not
+/// to narrow services that already work — and an empty list means "claims every path",
+/// which is what made this service collide with its three signing-name peers. The root
+/// claim is therefore stated here, using the framework's own sentinel for it. It is
+/// deliberately NOT called `ROUTE_PATH_SEGMENTS`: that name belongs to the generated
+/// crate-level constant, which is empty.
+const WIRE_PATH_SEGMENTS: &[&str] = &[emulator_server::ROOT_PATH_SEGMENT];
+
 /// The `com-amazonaws-ses-simpleemailservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +94,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `ses` — a signing name it SHARES with three other
+        // emulated services: SESv2 and Pinpoint Email (`restJson1`, endpoint `email`) and
+        // MailManager (`awsJson1_0` + `rpcv2Cbor`, endpoint `mail-manager`). The router
+        // resolves a request's routing key from the SigV4 credential scope first, so all
+        // four see the SAME key, and claiming on the signing name alone makes all four
+        // claim every request — which the router answers `500 AmbiguousService` for, in a
+        // JSON body an awsQuery client cannot even parse.
+        //
+        // So the claim is narrowed to this service's own wire form: the routing key names
+        // this endpoint (its signing name, or its endpoint prefix for a host-addressed
+        // request), the request arrives on the root path every `awsQuery` operation posts
+        // to (see `WIRE_PATH_SEGMENTS`), and it names no service out of band in an
+        // `awsJson` target — an `awsQuery` request carries its operation in the `Action`
+        // form field and never an `X-Amz-Target`, while the RPC peer that posts to the
+        // same root path always does, and a request that names a service out of band
+        // belongs to the service it names. The two `restJson1` peers own their `/v1/…`
+        // and `/v2/…` path spaces.
+        service_common::routes_to_any(
+            parts,
+            &[self.entry.identity().signing_name(), ENDPOINT_PREFIX],
+        )
+            && service_common::claims_modeled_path(parts, WIRE_PATH_SEGMENTS)
+            && !parts
+                .headers
+                .contains_key(service_common::rpc_target::TARGET_HEADER)
     }
 
     fn override_operation(

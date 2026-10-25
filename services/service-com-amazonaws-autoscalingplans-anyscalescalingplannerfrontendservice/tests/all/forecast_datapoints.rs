@@ -38,6 +38,7 @@ use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice
 };
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::types::FORECAST_DATA_TYPE_VALUES;
 
+use crate::forecast_data::MILLIS_PER_SECOND;
 use crate::scaling_plan_lifecycle::{
     instruction, now_secs, stack_source, Emulator, DAY_SECONDS as DAY,
 };
@@ -404,16 +405,35 @@ fn settled_window() -> (i64, i64) {
     (start, start + 36 * FORECAST_INTERVAL_SECONDS)
 }
 
-/// Every forecast interval inside `window`.
-fn expected_instants(window: (i64, i64)) -> Vec<i64> {
-    let (start, end) = window;
+/// `window`, given in whole epoch seconds, as the epoch MILLISECONDS the membership rule
+/// below is measured in.
+fn in_millis(window: (i64, i64)) -> (i64, i64) {
+    (
+        window.0 * MILLIS_PER_SECOND,
+        window.1 * MILLIS_PER_SECOND,
+    )
+}
+
+/// Every forecast interval instant inside the half-open window `[start, end)`, the window
+/// given in epoch MILLISECONDS so either endpoint may sit inside a second.
+///
+/// THE MEMBERSHIP RULE, written from the documented window and nothing else: forecast data
+/// exists at one point per forecast interval, `StartTime` is "the inclusive start time"
+/// and `EndTime` "the exclusive end time", so an interval's instant is reported exactly
+/// when it is at or after the start and strictly before the end.
+///
+/// `pub(crate)` and measured in milliseconds so ONE place owns the rule for every suite
+/// that asserts which data points a window carries — [`crate::forecast_window_precision`]
+/// drives it with endpoints inside a second, this suite with whole-second ones.
+pub(crate) fn expected_instants(window_millis: (i64, i64)) -> Vec<i64> {
+    let (start, end) = window_millis;
+    let period_millis = FORECAST_INTERVAL_SECONDS * MILLIS_PER_SECOND;
+    let mut at = start.div_euclid(period_millis) * FORECAST_INTERVAL_SECONDS;
     let mut instants = Vec::new();
-    let mut at = start.div_euclid(FORECAST_INTERVAL_SECONDS) * FORECAST_INTERVAL_SECONDS;
-    if at < start {
-        at += FORECAST_INTERVAL_SECONDS;
-    }
-    while at < end {
-        instants.push(at);
+    while at * MILLIS_PER_SECOND < end {
+        if at * MILLIS_PER_SECOND >= start {
+            instants.push(at);
+        }
         at += FORECAST_INTERVAL_SECONDS;
     }
     instants
@@ -422,7 +442,7 @@ fn expected_instants(window: (i64, i64)) -> Vec<i64> {
 #[tokio::test]
 async fn the_four_forecast_data_types_are_computed_from_the_stored_instruction() {
     let window = settled_window();
-    let instants = expected_instants(window);
+    let instants = expected_instants(in_millis(window));
 
     for case in cases() {
         let plan = "forecast plan";

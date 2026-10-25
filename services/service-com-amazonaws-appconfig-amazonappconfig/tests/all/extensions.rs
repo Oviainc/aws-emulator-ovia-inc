@@ -138,8 +138,9 @@ pub(crate) async fn get_extension(
 
 /// The `Extension` members a reader must report, as one comparable value: absent and
 /// present are both represented, so two answers are compared whole rather than member by
-/// member.
-fn extension_facts(body: &Value) -> BTreeMap<&'static str, Value> {
+/// member. `pub(crate)` because every suite that reads an extension back compares the
+/// same members.
+pub(crate) fn extension_facts(body: &Value) -> BTreeMap<&'static str, Value> {
     [
         "Id",
         "Name",

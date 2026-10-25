@@ -232,8 +232,11 @@ fn preset_cases() -> Vec<Case> {
             description: Some("all four PresetSettings members"),
         },
         Case {
-            label: "empty settings object: no member of PresetSettings given",
-            request: json!({ "name": "empty-settings", "settings": {} }),
+            label: "the container alone, with no other PresetSettings member",
+            request: json!({
+                "name": "container-webm",
+                "settings": { "containerSettings": { "container": "WEBM" } }
+            }),
             category: None,
             description: None,
         },
@@ -478,7 +481,9 @@ async fn getting_a_preset_that_was_never_created_is_not_found() {
 ///
 /// The bounded rows use `VideoDescription`'s published `Width`/`Height` range, 32 to
 /// 8192 (`smithy_query(query="shape",shape="VideoDescription")`): each bound is accepted
-/// and one step past each is refused.
+/// and one step past each is refused. A `Settings` graph that names no container is
+/// refused for a reason of its own, which `tests/all/preset_settings_validation.rs`
+/// covers over the whole class.
 #[tokio::test]
 async fn a_request_the_model_refuses_is_a_bad_request() {
     let emulator = Emulator::new();
@@ -507,15 +512,25 @@ async fn a_request_the_model_refuses_is_a_bad_request() {
             "Width one below the 32 minimum",
             json!({
                 "name": "too-narrow",
-                "settings": { "videoDescription": { "width": 31 } }
+                "settings": {
+                    "containerSettings": { "container": "MP4" },
+                    "videoDescription": { "width": 31 }
+                }
             }),
         ),
         (
             "Height one above the 8192 maximum",
             json!({
                 "name": "too-tall",
-                "settings": { "videoDescription": { "height": 8193 } }
+                "settings": {
+                    "containerSettings": { "container": "MP4" },
+                    "videoDescription": { "height": 8193 }
+                }
             }),
+        ),
+        (
+            "Settings naming no container, so describing no output",
+            json!({ "name": "empty-settings", "settings": {} }),
         ),
         (
             "Container outside the enumerated set",
@@ -559,7 +574,10 @@ async fn a_request_the_model_refuses_is_a_bad_request() {
         let reply = emulator
             .create_preset(json!({
                 "name": name,
-                "settings": { "videoDescription": { "width": edge, "height": edge } }
+                "settings": {
+                    "containerSettings": { "container": "MP4" },
+                    "videoDescription": { "width": edge, "height": edge }
+                }
             }))
             .await;
         assert_eq!(

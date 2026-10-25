@@ -20,10 +20,10 @@ use serde_json::{Map, Value};
 use crate::ops::types::{
     AccessDeniedException, AMISecuritySummary, AmiProductSummary, AssessmentSummary,
     AssessmentTargetFilter, AssessmentTargetSummary, ChangeSetSummaryListItem, ChangeSummary,
-    ContainerProductSummary, ContainerSecuritySummary, ControlAssessment, DataProductSummary,
-    Entity, EntitySummary, ErrorDetail, ExpressPrivateOfferConfigurationSummary, FrameworkFilters,
-    FrameworkSummary, MachineLearningProductSummary, OfferSetSummary, OfferSummary,
-    ResaleAuthorizationSummary,
+    ContainerProductSummary, ContainerSecuritySummary, ControlAssessment, ControlError,
+    DataProductSummary, Entity, EntitySummary, ErrorDetail, ErrorScope,
+    ExpressPrivateOfferConfigurationSummary, FrameworkFilters, FrameworkSummary,
+    MachineLearningProductSummary, OfferSetSummary, OfferSummary, ResaleAuthorizationSummary,
     ResourceInUseException, ResourceNotFoundException, SaaSProductSummary, Tag,
     ValidationException,
 };
@@ -286,13 +286,140 @@ pub const ASSESSMENT_ID_PREFIX: &str = "assessment-";
 /// ("arn:aws:aws-marketplace:us-east-1::AWSMarketplace/Assessment/assessment-12345").
 pub const ASSESSMENT_ARN_RESOURCE_TYPE: &str = "Assessment";
 
+/// The framework an AMI product's delivery option is evaluated against:
+/// `ListAssessments` names it "AMI Security", and the model's
+/// `AMISecuritySummary` / `AMISecurityFilters` union members give the id.
+pub const FRAMEWORK_AMI_SECURITY: &str = "AMISecurity";
+
+/// The framework a container product's delivery option is evaluated against,
+/// from the same two sources (`ContainerSecuritySummary` /
+/// `ContainerSecurityFilters`, "Container Security").
+pub const FRAMEWORK_CONTAINER_SECURITY: &str = "ContainerSecurity";
+
 /// The frameworks this catalog assesses against, named by the `FrameworkSummary`
 /// and `FrameworkFilters` union members the model declares (`AMISecuritySummary`
 /// / `AMISecurityFilters` -> `AMISecurity`, `ContainerSecuritySummary` /
 /// `ContainerSecurityFilters` -> `ContainerSecurity`); `FrameworkId`'s doc gives
 /// `AMISecurity` as the unversioned form and `DescribeAssessmentResponse$FrameworkId`'s
 /// the versioned one ("frameworkId@version (for example, AMISecurity@1.0)").
-pub const ASSESSMENT_FRAMEWORKS: &[&str] = &["AMISecurity", "ContainerSecurity"];
+pub const ASSESSMENT_FRAMEWORKS: &[&str] =
+    &[FRAMEWORK_AMI_SECURITY, FRAMEWORK_CONTAINER_SECURITY];
+
+/// The framework version an assessment of this catalog reports.
+///
+/// `DescribeAssessmentResponse$FrameworkId` is the versioned id
+/// ("frameworkId@version (for example, AMISecurity@1.0)") while
+/// `ListAssessmentsRequest$FrameworkId` is the unversioned one ("For example,
+/// AMISecurity"), so a report has to name a version: this is the one the
+/// service's own documentation spells, and the only one this emulator
+/// evaluates.
+pub const ASSESSMENT_FRAMEWORK_VERSION: &str = "1.0";
+
+/// The framework the catalog evaluates a product of `entity_type` against, or
+/// `None` for an entity type neither framework covers.
+///
+/// `ListAssessments` documents an assessment as "the result of evaluating a
+/// product or change set against a framework, such as AMI Security or Container
+/// Security", and the model pairs each framework with the delivery form it
+/// assesses — so an AMI product's delivery options are evaluated against
+/// [`FRAMEWORK_AMI_SECURITY`], a container product's against
+/// [`FRAMEWORK_CONTAINER_SECURITY`], and the catalog's other entity types
+/// ([`ENTITY_TYPES`]) against neither, since no framework of this service
+/// describes them.
+pub fn entity_framework(entity_type: &str) -> Option<&'static str> {
+    match entity_type {
+        "AmiProduct" => Some(FRAMEWORK_AMI_SECURITY),
+        "ContainerProduct" => Some(FRAMEWORK_CONTAINER_SECURITY),
+        _ => None,
+    }
+}
+
+/// How long an assessment stays valid: the span between an assessment's
+/// `CreatedAt` and its `ExpiresAt`.
+///
+/// `AssessmentSummary$ExpiresAt` is "the date and time the assessment expires"
+/// and neither the model nor the operation's documentation states how long that
+/// is, so this span is the emulator's OWN rather than a claim about AWS's.
+/// Nothing of the model is keyed to an expired assessment — there is no status,
+/// filter or error for one — so the instant is reported and never acted on.
+pub const ASSESSMENT_VALIDITY: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
+/// The details member a change submits a product's delivery options in.
+///
+/// A change's details belong to its change type, which the model declares no
+/// shape for, so the member names a change carries come from the catalog's own
+/// change documents rather than from a modelled shape: a change that adds or
+/// updates a product version carries its delivery options in a list under this
+/// member, each entry carrying [`DELIVERY_OPTION_ID_MEMBER`] once the catalog
+/// has assigned one and [`DELIVERY_OPTION_DETAILS_MEMBER`] holding the delivery
+/// form's own members.
+pub const DELIVERY_OPTIONS_DETAIL_MEMBER: &str = "DeliveryOptions";
+
+/// The member of one submitted delivery option that carries its id — what
+/// `FrameworkSummary$DeliveryOptionId` names, and what
+/// `AMISecurityFilters$DeliveryOptionId` selects assessments by.
+pub const DELIVERY_OPTION_ID_MEMBER: &str = "Id";
+
+/// The member of one submitted delivery option that carries the delivery
+/// form's own members, which is what a framework's controls read.
+pub const DELIVERY_OPTION_DETAILS_MEMBER: &str = "Details";
+
+/// The prefix of a delivery option id this catalog assigns, in the
+/// `ResourceId` form (`^[\w\-]+$`) `FrameworkSummary$DeliveryOptionId` targets.
+pub const DELIVERY_OPTION_ID_PREFIX: &str = "do-";
+
+/// How many delivery options one change may submit.
+///
+/// The model declares no shape for a change's details, so it states no bound on
+/// the list under [`DELIVERY_OPTIONS_DETAIL_MEMBER`] — `Change$Details` is
+/// `@length(max: 16384)` but `Change$DetailsDocument` carries the same value as
+/// a document with no length at all — and every option in that list is one the
+/// catalog assigns an id to and records an assessment for, so an unbounded list
+/// is an unbounded amount of state one request leaves behind. This is therefore
+/// the emulator's OWN bound on that list rather than a claim about AWS's, chosen
+/// as `RequestedChangeList`'s own modelled maximum so one change set is bounded
+/// the same way whether it carries its work as changes or as delivery options. A
+/// change past it is refused ([`too_many_delivery_options`]) rather than stored.
+pub const MAX_DELIVERY_OPTIONS_PER_CHANGE: usize = 20;
+
+/// How many assessments the store holds.
+///
+/// On the same footing as [`CHANGE_SET_QUOTA`]: the emulator's own bound on the
+/// state the assessment surface accumulates, far above any workflow an emulator
+/// serves, and what stops it growing without end across change sets. At the
+/// bound the OLDEST assessment is dropped to make room, which is the one a
+/// report ordered newest first reaches last.
+pub const ASSESSMENT_QUOTA: usize = 1_000;
+
+/// A `ControlAssessmentResult` value: the control's condition held.
+pub const CONTROL_PASS: &str = "PASS";
+
+/// A `ControlAssessmentResult` value: the control's condition did not hold, and
+/// the control reports the `ControlError` that says why.
+pub const CONTROL_FAIL: &str = "FAIL";
+
+/// A `ControlAssessmentResult` value: the assessed delivery option carries
+/// nothing this control reads, so nothing was evaluated — which is reported as
+/// such rather than as a pass the catalog never established.
+pub const CONTROL_NOT_EXECUTED: &str = "NOT_EXECUTED";
+
+/// An `AssessmentResult` value: no control of the framework failed.
+pub const ASSESSMENT_PASS: &str = "PASS";
+
+/// An `AssessmentResult` value: at least one control of the framework failed.
+pub const ASSESSMENT_FAIL: &str = "FAIL";
+
+/// A `ControlError$Code` (`^[A-Z_]+$`): the delivery option does not carry the
+/// member this control reads.
+pub const CONTROL_ERROR_MISSING_VALUE: &str = "MISSING_VALUE";
+
+/// A `ControlError$Code`: the delivery option carries the member, with a value
+/// the control refuses.
+pub const CONTROL_ERROR_INVALID_VALUE: &str = "INVALID_VALUE";
+
+/// How much of a submitted value a `ControlError$Scope` entry carries:
+/// `ScopeValue` is `@length(1..1024)`.
+pub const SCOPE_VALUE_LIMIT: usize = 1024;
 
 /// A `ChangeStatus` value.
 pub const STATUS_PREPARING: &str = "PREPARING";
@@ -885,13 +1012,19 @@ pub fn entity_sort_attributes(entity_type: &str) -> Vec<&'static str> {
 /// An assessment is the RESULT of evaluating an entity or a change set against a
 /// framework (`ListAssessments`: "An assessment is the result of evaluating a
 /// product or change set against a framework, such as AMI Security or Container
-/// Security"). This service models no operation that performs such an
-/// evaluation, and this emulator runs none — so no call creates a record here,
-/// and both operations answer from a store that is consequently empty
-/// (`ListAssessments` an empty list, `DescribeAssessment` the modelled
-/// `ResourceNotFoundException`). Reporting a `PASS`/`FAIL` for a framework
-/// evaluation nothing ran would be a fabricated result, which is worse than
-/// reporting that the account holds no assessments.
+/// Security"), and what submits a product to such an evaluation is a change set:
+/// a succeeded `Intent=APPLY` change set that adds or updates a delivery option
+/// of a product one of this catalog's frameworks covers ([`entity_framework`])
+/// is what creates a record here, one per delivery option it submitted, as
+/// [`ComAmazonawsMarketplacecatalogAwsmpseymourState::apply_changes`] applies
+/// that change.
+///
+/// Every value below is COMPUTED from what the change submitted: the controls
+/// are the framework's own checks run over the delivery option's details
+/// ([`assess_delivery_option`]), and the overall result is `FAIL` exactly when
+/// one of them failed. Nothing here reports a judgement the catalog did not
+/// make — a control the delivery option carries nothing for is reported
+/// [`CONTROL_NOT_EXECUTED`].
 #[derive(Debug, Clone)]
 pub struct AssessmentRecord {
     /// `ResourceId`'s `^[\w\-]+$`, in the `assessment-…` form
@@ -935,10 +1068,12 @@ impl AssessmentRecord {
     /// identified by `FrameworkId`".
     pub fn framework_summary(&self) -> Option<FrameworkSummary> {
         match self.framework.as_str() {
-            "AMISecurity" => Some(FrameworkSummary::AMISecuritySummary(AMISecuritySummary {
-                delivery_option_id: self.delivery_option_id.clone(),
-            })),
-            "ContainerSecurity" => Some(FrameworkSummary::ContainerSecuritySummary(
+            FRAMEWORK_AMI_SECURITY => Some(FrameworkSummary::AMISecuritySummary(
+                AMISecuritySummary {
+                    delivery_option_id: self.delivery_option_id.clone(),
+                },
+            )),
+            FRAMEWORK_CONTAINER_SECURITY => Some(FrameworkSummary::ContainerSecuritySummary(
                 ContainerSecuritySummary {
                     delivery_option_id: self.delivery_option_id.clone(),
                 },
@@ -995,11 +1130,12 @@ impl AssessmentRecord {
     pub fn matches_framework_filters(&self, filters: &FrameworkFilters) -> bool {
         let (framework, delivery_option) = match filters {
             FrameworkFilters::AMISecurityFilters(filter) => {
-                ("AMISecurity", filter.delivery_option_id.as_deref())
+                (FRAMEWORK_AMI_SECURITY, filter.delivery_option_id.as_deref())
             }
-            FrameworkFilters::ContainerSecurityFilters(filter) => {
-                ("ContainerSecurity", filter.delivery_option_id.as_deref())
-            }
+            FrameworkFilters::ContainerSecurityFilters(filter) => (
+                FRAMEWORK_CONTAINER_SECURITY,
+                filter.delivery_option_id.as_deref(),
+            )
         };
         self.framework == framework
             && delivery_option.is_none_or(|wanted| self.delivery_option_id.as_deref() == Some(wanted))
@@ -1040,9 +1176,9 @@ pub struct ComAmazonawsMarketplacecatalogAwsmpseymourState {
     pub change_sets: BTreeMap<String, ChangeSetRecord>,
     /// Every entity a succeeded `APPLY` change set has created, keyed by id.
     pub entities: BTreeMap<String, EntityRecord>,
-    /// Every assessment, keyed by its id. Nothing creates one: an assessment is
-    /// the result of a framework evaluation, which this service models no
-    /// operation for and this emulator runs none of — see [`AssessmentRecord`].
+    /// Every assessment, keyed by its id. A succeeded `Intent=APPLY` change set
+    /// that submits a delivery option of a product one of this catalog's
+    /// frameworks covers is what creates one — see [`AssessmentRecord`].
     pub assessments: BTreeMap<String, AssessmentRecord>,
     /// A `StartChangeSet` `ClientRequestToken` to the change set that token
     /// started, so a retried start reports the first change set instead of
@@ -1052,6 +1188,11 @@ pub struct ComAmazonawsMarketplacecatalogAwsmpseymourState {
     pub change_set_seq: u64,
     /// The counter entity ids are minted from.
     pub entity_seq: u64,
+    /// The counter assessment ids are minted from.
+    pub assessment_seq: u64,
+    /// The counter the delivery option ids this catalog assigns are minted
+    /// from.
+    pub delivery_option_seq: u64,
     /// The resource-based policy attached to each resource that has one, keyed
     /// by [`CatalogResource::policy_key`] — the resource's type and id, which
     /// is what identifies it whatever region or partition the ARN naming it was
@@ -1083,6 +1224,31 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
                 return id;
             }
         }
+    }
+
+    /// Mint an unused assessment id, in the `assessment-…` form
+    /// `AssessmentIdentifier` accepts back ([`is_assessment_id`]).
+    pub fn mint_assessment_id(&mut self) -> String {
+        loop {
+            self.assessment_seq = self.assessment_seq.wrapping_add(1);
+            let id = format!(
+                "{ASSESSMENT_ID_PREFIX}{:012x}",
+                self.assessment_seq & 0xffff_ffff_ffff
+            );
+            if !self.assessments.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Mint a delivery option id for an option a change submitted without one,
+    /// matching `ResourceId`'s `^[\w\-]+$`.
+    pub fn mint_delivery_option_id(&mut self) -> String {
+        self.delivery_option_seq = self.delivery_option_seq.wrapping_add(1);
+        format!(
+            "{DELIVERY_OPTION_ID_PREFIX}{:012x}",
+            self.delivery_option_seq & 0xffff_ffff_ffff
+        )
     }
 
     /// The id of the still-running change set that has `entity_id` locked, if
@@ -1317,63 +1483,646 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
         verdict
     }
 
-    /// Write the entities the changes of change set `id` describe, as of `at`.
+    /// Write the entities the changes of change set `id` describe, as of `at`,
+    /// and record what evaluating those entities against this catalog's
+    /// frameworks found.
     ///
     /// A change naming an existing entity mutates that record and bumps its
     /// revision; a change naming none creates the record under the id
     /// `StartChangeSet` reserved for it.
+    ///
+    /// Applying a change is also where the catalog EVALUATES what the change
+    /// submitted: a delivery option of a product one of its security frameworks
+    /// covers ([`entity_framework`]) is assessed against that framework, which
+    /// is what `ListAssessments` then reports and `DescribeAssessment` details.
     fn apply_changes(&mut self, id: &str, at: SystemTime) {
         let Some(record) = self.change_sets.get(id) else {
             return;
         };
         let changes = record.changes.clone();
         let region = record.region.clone();
+        let change_set_id = record.id.clone();
         let stamp = iso8601(at);
         for change in changes {
             let Some(entity_id) = change.entity_id.clone() else {
                 continue;
             };
-            let details = change.details_value();
+            let mut details = change.details_value();
             // `Change$Entity$Type` is a REFERENCE to an entity type, optionally
             // at a schema version (`DataProduct@1.0`); the entity itself is of
             // the type that reference names, so the record and its ARN carry
             // the type, never the version the request addressed it through.
             let entity_type = entity_type_of(&change.entity_type).to_string();
-            let entry = self.entities.entry(entity_id.clone()).or_insert_with(|| {
-                EntityRecord {
-                    arn: entity_arn(&region, &entity_type, &entity_id),
-                    id: entity_id.clone(),
-                    entity_type,
-                    revision: 0,
-                    name: None,
-                    visibility: DEFAULT_ENTITY_VISIBILITY.to_string(),
-                    last_modified_date: stamp.clone(),
-                    details: Value::Object(Map::new()),
-                    tags: Vec::new(),
+            // A delivery option this change submitted without an id is given
+            // one BEFORE the entity is written, so the entity carries the same
+            // id the assessment of that option reports.
+            let options = self.identify_delivery_options(details.as_mut());
+            {
+                let entry = self.entities.entry(entity_id.clone()).or_insert_with(|| {
+                    EntityRecord {
+                        arn: entity_arn(&region, &entity_type, &entity_id),
+                        id: entity_id.clone(),
+                        entity_type: entity_type.clone(),
+                        revision: 0,
+                        name: None,
+                        visibility: DEFAULT_ENTITY_VISIBILITY.to_string(),
+                        last_modified_date: stamp.clone(),
+                        details: Value::Object(Map::new()),
+                        tags: Vec::new(),
+                    }
+                });
+                entry.revision = entry.revision.saturating_add(1);
+                entry.last_modified_date = stamp.clone();
+                for tag in change.entity_tags {
+                    entry.tags.retain(|held| held.key != tag.key);
+                    entry.tags.push(tag);
                 }
-            });
-            entry.revision = entry.revision.saturating_add(1);
-            entry.last_modified_date = stamp.clone();
-            for tag in change.entity_tags {
-                entry.tags.retain(|held| held.key != tag.key);
-                entry.tags.push(tag);
+                if let Some(Value::Object(members)) = details {
+                    if let Some(name) = detail_name(&members) {
+                        entry.name = Some(name);
+                    }
+                    if let Some(visibility) = detail_visibility(&members) {
+                        entry.visibility = visibility;
+                    }
+                    if let Value::Object(held) = &mut entry.details {
+                        for (key, value) in members {
+                            held.insert(key, value);
+                        }
+                    }
+                }
             }
-            if let Some(Value::Object(members)) = details {
-                if let Some(name) = detail_name(&members) {
-                    entry.name = Some(name);
-                }
-                if let Some(visibility) = detail_visibility(&members) {
-                    entry.visibility = visibility;
-                }
-                let Value::Object(held) = &mut entry.details else {
-                    continue;
-                };
-                for (key, value) in members {
-                    held.insert(key, value);
-                }
+            // "An assessment is the result of evaluating a product or change
+            // set against a framework": the product is the entity this change
+            // applied to, so a change against an entity type no framework of
+            // this catalog covers is evaluated against nothing, and so is one
+            // that submitted no delivery option for a framework to assess.
+            let Some(framework) = entity_framework(&entity_type) else {
+                continue;
+            };
+            for option in &options {
+                self.record_assessment(framework, &region, &entity_id, &change_set_id, option, at);
             }
         }
     }
+
+    /// Assign an id to every delivery option `details` submits without one, and
+    /// report those options as the entity now carries them.
+    ///
+    /// A delivery option is addressed by an id the CATALOG assigns — the id
+    /// `FrameworkSummary$DeliveryOptionId` names and
+    /// `AMISecurityFilters$DeliveryOptionId` selects by — so an option
+    /// submitted without one is given an id here, which is then both what the
+    /// entity's details carry and what the assessment of that option reports.
+    /// An option submitted WITH an id keeps it: the change is updating the
+    /// option that id names.
+    ///
+    /// The list is bounded at [`MAX_DELIVERY_OPTIONS_PER_CHANGE`], which
+    /// `StartChangeSet` refuses a change past, so the work here and the number
+    /// of assessments it leads to are bounded by that constant and not by the
+    /// width of the submitted document. The bound is re-applied here so it
+    /// dominates the records written below whatever reaches the store.
+    fn identify_delivery_options(&mut self, details: Option<&mut Value>) -> Vec<Value> {
+        let Some(Value::Array(options)) =
+            details.and_then(|held| held.get_mut(DELIVERY_OPTIONS_DETAIL_MEMBER))
+        else {
+            return Vec::new();
+        };
+        let mut identified: Vec<Value> = Vec::with_capacity(
+            options.len().min(MAX_DELIVERY_OPTIONS_PER_CHANGE),
+        );
+        for option in options.iter_mut().take(MAX_DELIVERY_OPTIONS_PER_CHANGE) {
+            if !option.is_object() {
+                continue;
+            }
+            if option
+                .get(DELIVERY_OPTION_ID_MEMBER)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                let minted = self.mint_delivery_option_id();
+                if let Value::Object(members) = option {
+                    members.insert(DELIVERY_OPTION_ID_MEMBER.to_string(), Value::String(minted));
+                }
+            }
+            identified.push(option.clone());
+        }
+        identified
+    }
+
+    /// Record what evaluating `option` against `framework` found: one
+    /// assessment of the entity `entity_id`, submitted by change set
+    /// `change_set_id`, created as of `at`.
+    ///
+    /// The overall `AssessmentResult` is `FAIL` exactly when one of the
+    /// framework's controls failed — `PASS` says that none did, never that
+    /// every control ran.
+    fn record_assessment(
+        &mut self,
+        framework: &str,
+        region: &str,
+        entity_id: &str,
+        change_set_id: &str,
+        option: &Value,
+        at: SystemTime,
+    ) {
+        let controls = assess_delivery_option(framework, option);
+        if controls.is_empty() {
+            return;
+        }
+        let failed = controls.iter().any(|control| {
+            control.control_assessment_result.as_deref() == Some(CONTROL_FAIL)
+        });
+        // The store holds at most [`ASSESSMENT_QUOTA`] assessments: at the
+        // bound the oldest is dropped to make room for this one, so the state
+        // the assessment surface holds is bounded however many change sets
+        // submit delivery options.
+        while self.assessments.len() >= ASSESSMENT_QUOTA {
+            let Some(oldest) = self
+                .assessments
+                .values()
+                .min_by(|left, right| {
+                    left.created_at
+                        .cmp(&right.created_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+                .map(|record| record.id.clone())
+            else {
+                break;
+            };
+            self.assessments.remove(&oldest);
+        }
+        let id = self.mint_assessment_id();
+        let record = AssessmentRecord {
+            arn: assessment_arn(region, &id),
+            id: id.clone(),
+            framework_id: format!("{framework}@{ASSESSMENT_FRAMEWORK_VERSION}"),
+            framework: framework.to_string(),
+            delivery_option_id: option
+                .get(DELIVERY_OPTION_ID_MEMBER)
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            entity_id: Some(entity_id.to_string()),
+            change_set_id: Some(change_set_id.to_string()),
+            result: if failed { ASSESSMENT_FAIL } else { ASSESSMENT_PASS }.to_string(),
+            created_at: iso8601(at),
+            expires_at: iso8601(at + ASSESSMENT_VALIDITY),
+            controls,
+        };
+        self.assessments.insert(id, record);
+    }
+}
+
+/// The controls of the AMI Security framework, named for the delivery-option
+/// member each one reads.
+///
+/// `ControlAssessment$ControlId` is a `ResourceId` the model constrains in
+/// syntax only (`^[\w\-]+$`) and whose values this service publishes nowhere,
+/// so this catalogue is the emulator's OWN: each control is a check the
+/// emulator can actually RUN over what a change submitted, and what each one
+/// requires is what a change adding an AMI delivery option carries — the image
+/// to evaluate, the role the catalog assumes to read it, the login user it
+/// offers, the ingress its security groups open, and the instructions a buyer
+/// launches it with. A control reports `PASS` only when its condition HELD on
+/// the submitted value.
+pub const CONTROL_AMI_SOURCE_IMAGE: &str = "AmiSourceImageDeclared";
+
+/// A control of [`FRAMEWORK_AMI_SECURITY`] — see [`CONTROL_AMI_SOURCE_IMAGE`].
+pub const CONTROL_AMI_ACCESS_ROLE: &str = "AmiSourceAccessRoleDeclared";
+
+/// A control of [`FRAMEWORK_AMI_SECURITY`] — see [`CONTROL_AMI_SOURCE_IMAGE`].
+pub const CONTROL_AMI_LOGIN_USER: &str = "AmiSourceLoginUserIsNotSuperuser";
+
+/// A control of [`FRAMEWORK_AMI_SECURITY`] — see [`CONTROL_AMI_SOURCE_IMAGE`].
+pub const CONTROL_AMI_INGRESS: &str = "AmiSecurityGroupIngressIsScoped";
+
+/// A control of [`FRAMEWORK_AMI_SECURITY`] — see [`CONTROL_AMI_SOURCE_IMAGE`].
+pub const CONTROL_AMI_USAGE_INSTRUCTIONS: &str = "AmiUsageInstructionsDeclared";
+
+/// The controls of the Container Security framework, on the same footing as
+/// [`CONTROL_AMI_SOURCE_IMAGE`]: what a change adding a container delivery
+/// option carries is the images it delivers and the instructions a buyer runs
+/// them with.
+pub const CONTROL_CONTAINER_IMAGES: &str = "ContainerImagesDeclared";
+
+/// A control of [`FRAMEWORK_CONTAINER_SECURITY`] — see
+/// [`CONTROL_CONTAINER_IMAGES`].
+pub const CONTROL_CONTAINER_IMAGES_PINNED: &str = "ContainerImagesArePinned";
+
+/// A control of [`FRAMEWORK_CONTAINER_SECURITY`] — see
+/// [`CONTROL_CONTAINER_IMAGES`].
+pub const CONTROL_CONTAINER_USAGE_INSTRUCTIONS: &str = "ContainerUsageInstructionsDeclared";
+
+/// The member of an AMI delivery option's details naming the image to evaluate.
+const AMI_IMAGE_PATH: &[&str] = &["AmiSource", "AmiId"];
+
+/// The member naming the role the catalog assumes to read that image.
+const AMI_ACCESS_ROLE_PATH: &[&str] = &["AmiSource", "AccessRoleArn"];
+
+/// The member naming the login user the image offers a buyer.
+const AMI_LOGIN_USER_PATH: &[&str] = &["AmiSource", "UserName"];
+
+/// The member naming the security groups the image expects.
+const AMI_SECURITY_GROUPS_PATH: &[&str] = &["SecurityGroups"];
+
+/// The member of one security group naming the addresses its rule admits.
+const SECURITY_GROUP_IP_RANGES_MEMBER: &str = "IpRanges";
+
+/// The member naming the instructions a buyer uses the delivery option with,
+/// which both delivery forms carry.
+const USAGE_INSTRUCTIONS_PATH: &[&str] = &["UsageInstructions"];
+
+/// The member of a container delivery option's details naming the images it
+/// delivers.
+const CONTAINER_IMAGES_PATH: &[&str] = &["ContainerImages"];
+
+/// An `ErrorScope$Name`: "the name of the resource field the error applies to
+/// (for example, `AMI_ID`, `FILE_PATH`, or `PACKAGE_NAME`)" — the field name a
+/// control's error applies to, in the form that doc spells.
+const SCOPE_AMI_ID: &str = "AMI_ID";
+
+/// An `ErrorScope$Name` — see [`SCOPE_AMI_ID`].
+const SCOPE_ACCESS_ROLE_ARN: &str = "ACCESS_ROLE_ARN";
+
+/// An `ErrorScope$Name` — see [`SCOPE_AMI_ID`].
+const SCOPE_USER_NAME: &str = "USER_NAME";
+
+/// An `ErrorScope$Name` — see [`SCOPE_AMI_ID`].
+const SCOPE_IP_RANGES: &str = "IP_RANGES";
+
+/// An `ErrorScope$Name` — see [`SCOPE_AMI_ID`].
+const SCOPE_USAGE_INSTRUCTIONS: &str = "USAGE_INSTRUCTIONS";
+
+/// An `ErrorScope$Name` — see [`SCOPE_AMI_ID`].
+const SCOPE_CONTAINER_IMAGES: &str = "CONTAINER_IMAGES";
+
+/// The login user an image may not offer: the superuser account, which a buyer
+/// logging in would hold every privilege on the instance as.
+const AMI_SUPERUSER: &str = "root";
+
+/// The CIDR blocks that admit EVERY address, in IPv4 and in IPv6 — an ingress
+/// rule naming one opens its port to the whole internet rather than to the
+/// addresses the product needs.
+const UNRESTRICTED_IP_RANGES: &[&str] = &["0.0.0.0/0", "::/0"];
+
+/// The container image tag that FLOATS: a reference carrying it names whatever
+/// the registry holds when the image is pulled, so what a buyer runs is not the
+/// image that was assessed.
+const FLOATING_IMAGE_TAG: &str = "latest";
+
+/// What evaluating the delivery option `option` against `framework` found: one
+/// `ControlAssessment` per control of that framework, in the order an
+/// assessment reports them.
+///
+/// Empty for a framework this catalog does not assess against, which is what
+/// keeps "nothing was evaluated" apart from "every control passed": no
+/// assessment is recorded at all.
+pub fn assess_delivery_option(framework: &str, option: &Value) -> Vec<ControlAssessment> {
+    let details = delivery_option_details(option);
+    match framework {
+        FRAMEWORK_AMI_SECURITY => vec![
+            text_declared_control(
+                CONTROL_AMI_SOURCE_IMAGE,
+                SCOPE_AMI_ID,
+                AMI_IMAGE_PATH,
+                &details,
+            ),
+            text_declared_control(
+                CONTROL_AMI_ACCESS_ROLE,
+                SCOPE_ACCESS_ROLE_ARN,
+                AMI_ACCESS_ROLE_PATH,
+                &details,
+            ),
+            ami_login_user_control(&details),
+            ami_ingress_control(&details),
+            text_declared_control(
+                CONTROL_AMI_USAGE_INSTRUCTIONS,
+                SCOPE_USAGE_INSTRUCTIONS,
+                USAGE_INSTRUCTIONS_PATH,
+                &details,
+            ),
+        ],
+        FRAMEWORK_CONTAINER_SECURITY => vec![
+            container_images_declared_control(&details),
+            container_images_pinned_control(&details),
+            text_declared_control(
+                CONTROL_CONTAINER_USAGE_INSTRUCTIONS,
+                SCOPE_USAGE_INSTRUCTIONS,
+                USAGE_INSTRUCTIONS_PATH,
+                &details,
+            ),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// The number of delivery options the details of a change submit, or `None`
+/// when they carry no delivery option list at all.
+///
+/// Reads the LENGTH of the submitted list without walking its entries, so a
+/// change past [`MAX_DELIVERY_OPTIONS_PER_CHANGE`] is refused before anything
+/// of it is copied.
+pub fn delivery_option_count(details: &Value) -> Option<usize> {
+    Some(
+        details
+            .get(DELIVERY_OPTIONS_DETAIL_MEMBER)?
+            .as_array()?
+            .len(),
+    )
+}
+
+/// The modelled `ValidationException` payload for a change submitting more
+/// delivery options than [`MAX_DELIVERY_OPTIONS_PER_CHANGE`] — built from the
+/// request: the count it carried and the bound it passed.
+pub fn too_many_delivery_options(count: usize) -> ValidationException {
+    validation(
+        "ChangeSet.Details",
+        format!(
+            "a change submits at most {MAX_DELIVERY_OPTIONS_PER_CHANGE} delivery options, \
+             not {count}"
+        ),
+    )
+}
+
+/// The members of a submitted delivery option that a framework's controls read.
+///
+/// A delivery option carries the delivery form's own members inside
+/// [`DELIVERY_OPTION_DETAILS_MEMBER`], itself wrapped in ONE member naming that
+/// form (`AmiDeliveryOptionDetails`, `EcrDeliveryOptionDetails`), so the
+/// members a control reads are one level further down. An option that wraps
+/// nothing is read as it stands, so the controls see the same members whichever
+/// way the change spelled the option.
+fn delivery_option_details(option: &Value) -> Map<String, Value> {
+    let Some(members) = option.as_object() else {
+        return Map::new();
+    };
+    let Some(Value::Object(details)) = members.get(DELIVERY_OPTION_DETAILS_MEMBER) else {
+        return members.clone();
+    };
+    if details.len() == 1 {
+        if let Some(Value::Object(form)) = details.values().next() {
+            return form.clone();
+        }
+    }
+    details.clone()
+}
+
+/// The value `path` names: a chain of object members walked from `details`.
+fn detail_at<'a>(details: &'a Map<String, Value>, path: &[&str]) -> Option<&'a Value> {
+    let (first, rest) = path.split_first()?;
+    let mut value = details.get(*first)?;
+    for member in rest {
+        value = value.as_object()?.get(*member)?;
+    }
+    Some(value)
+}
+
+/// The assessment of a control whose condition held.
+fn control_passed(id: &str) -> ControlAssessment {
+    ControlAssessment {
+        control_id: Some(id.to_string()),
+        control_assessment_result: Some(CONTROL_PASS.to_string()),
+        // "An array of ControlError objects associated with the control
+        // evaluation": a control that found nothing wrong has none.
+        errors: None,
+    }
+}
+
+/// The assessment of a control the delivery option carries nothing for, so the
+/// catalog evaluated nothing — reported as such rather than as a pass.
+fn control_not_executed(id: &str) -> ControlAssessment {
+    ControlAssessment {
+        control_id: Some(id.to_string()),
+        control_assessment_result: Some(CONTROL_NOT_EXECUTED.to_string()),
+        errors: None,
+    }
+}
+
+/// The assessment of a control whose condition did not hold, with the one error
+/// that says why: its code, the sentence, and the `ErrorScope` naming the field
+/// the error applies to and the value the control refused.
+fn control_failed(
+    id: &str,
+    code: &str,
+    message: String,
+    scope: &str,
+    value: Option<String>,
+) -> ControlAssessment {
+    ControlAssessment {
+        control_id: Some(id.to_string()),
+        control_assessment_result: Some(CONTROL_FAIL.to_string()),
+        errors: Some(vec![ControlError {
+            code: Some(code.to_string()),
+            message: Some(message),
+            scope: Some(vec![ErrorScope {
+                name: Some(scope.to_string()),
+                // Absent when the option carried no value at all: the scope
+                // names the field, and there is nothing to quote for it.
+                value,
+            }]),
+        }]),
+    }
+}
+
+/// `text` as an `ErrorScope$Value` carries it: cut at [`SCOPE_VALUE_LIMIT`]
+/// characters so it stays inside `ScopeValue`'s modelled length, and rendered
+/// as an empty JSON string when it is empty, which `@length(min: 1)` leaves no
+/// room for.
+fn scope_text(text: &str) -> String {
+    if text.is_empty() {
+        return "\"\"".to_string();
+    }
+    match text.char_indices().nth(SCOPE_VALUE_LIMIT) {
+        Some((cut, _)) => text[..cut].to_string(),
+        None => text.to_string(),
+    }
+}
+
+/// The same, for a submitted value that may be no text at all: its JSON
+/// rendering.
+fn scope_value(value: &Value) -> String {
+    match value.as_str() {
+        Some(text) => scope_text(text),
+        None => scope_text(&value.to_string()),
+    }
+}
+
+/// The assessment of a control that requires the delivery option to declare a
+/// non-empty text value at `path`.
+///
+/// The catalog has nothing to deliver or to evaluate without it, so an option
+/// that omits it FAILS the control — unlike one that omits a member the control
+/// merely reads about ([`control_not_executed`]).
+fn text_declared_control(
+    id: &str,
+    scope: &str,
+    path: &[&str],
+    details: &Map<String, Value>,
+) -> ControlAssessment {
+    let member = path.join(".");
+    let Some(value) = detail_at(details, path) else {
+        return control_failed(
+            id,
+            CONTROL_ERROR_MISSING_VALUE,
+            format!("The assessed delivery option does not declare {member}."),
+            scope,
+            None,
+        );
+    };
+    match value.as_str() {
+        Some(text) if !text.trim().is_empty() => control_passed(id),
+        _ => control_failed(
+            id,
+            CONTROL_ERROR_INVALID_VALUE,
+            format!("{member} of the assessed delivery option names no value."),
+            scope,
+            Some(scope_value(value)),
+        ),
+    }
+}
+
+/// The login-user control: the image does not offer [`AMI_SUPERUSER`] as the
+/// account a buyer logs in as. An option that declares no login user carries
+/// nothing for this control to read, so nothing ran.
+fn ami_login_user_control(details: &Map<String, Value>) -> ControlAssessment {
+    let Some(user) = detail_at(details, AMI_LOGIN_USER_PATH).and_then(Value::as_str) else {
+        return control_not_executed(CONTROL_AMI_LOGIN_USER);
+    };
+    if !user.eq_ignore_ascii_case(AMI_SUPERUSER) {
+        return control_passed(CONTROL_AMI_LOGIN_USER);
+    }
+    control_failed(
+        CONTROL_AMI_LOGIN_USER,
+        CONTROL_ERROR_INVALID_VALUE,
+        format!(
+            "{} of the assessed delivery option names the superuser account.",
+            AMI_LOGIN_USER_PATH.join(".")
+        ),
+        SCOPE_USER_NAME,
+        Some(scope_text(user)),
+    )
+}
+
+/// The ingress control: no rule of the security groups the option declares
+/// admits every address ([`UNRESTRICTED_IP_RANGES`]). An option that declares
+/// no address range opens nothing for this control to read, so nothing ran.
+fn ami_ingress_control(details: &Map<String, Value>) -> ControlAssessment {
+    let groups = detail_at(details, AMI_SECURITY_GROUPS_PATH)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let ranges = groups
+        .iter()
+        .filter_map(|group| group.get(SECURITY_GROUP_IP_RANGES_MEMBER))
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(Value::as_str);
+    let mut evaluated = 0usize;
+    for range in ranges {
+        evaluated += 1;
+        if UNRESTRICTED_IP_RANGES.contains(&range) {
+            // The quoted range is cut to `ScopeValue`'s length, which keeps the
+            // sentence built around it inside `ErrorMessage`'s 2048 characters.
+            let quoted = scope_text(range);
+            return control_failed(
+                CONTROL_AMI_INGRESS,
+                CONTROL_ERROR_INVALID_VALUE,
+                format!(
+                    "An ingress rule of the assessed delivery option admits every address \
+                     ({quoted})."
+                ),
+                SCOPE_IP_RANGES,
+                Some(quoted),
+            );
+        }
+    }
+    if evaluated == 0 {
+        return control_not_executed(CONTROL_AMI_INGRESS);
+    }
+    control_passed(CONTROL_AMI_INGRESS)
+}
+
+/// The image-declared control: the option names at least one container image to
+/// deliver, without which there is nothing to assess or to run.
+fn container_images_declared_control(details: &Map<String, Value>) -> ControlAssessment {
+    let member = CONTAINER_IMAGES_PATH.join(".");
+    let Some(value) = detail_at(details, CONTAINER_IMAGES_PATH) else {
+        return control_failed(
+            CONTROL_CONTAINER_IMAGES,
+            CONTROL_ERROR_MISSING_VALUE,
+            format!("The assessed delivery option does not declare {member}."),
+            SCOPE_CONTAINER_IMAGES,
+            None,
+        );
+    };
+    if container_image_references(value).is_empty() {
+        return control_failed(
+            CONTROL_CONTAINER_IMAGES,
+            CONTROL_ERROR_INVALID_VALUE,
+            format!("{member} of the assessed delivery option names no container image."),
+            SCOPE_CONTAINER_IMAGES,
+            Some(scope_value(value)),
+        );
+    }
+    control_passed(CONTROL_CONTAINER_IMAGES)
+}
+
+/// The pinning control: every image the option delivers is pinned to one image
+/// ([`pins_container_image`]). An option that names no image carries nothing
+/// for this control to read, so nothing ran.
+fn container_images_pinned_control(details: &Map<String, Value>) -> ControlAssessment {
+    let references = detail_at(details, CONTAINER_IMAGES_PATH)
+        .map(container_image_references)
+        .unwrap_or_default();
+    if references.is_empty() {
+        return control_not_executed(CONTROL_CONTAINER_IMAGES_PINNED);
+    }
+    for reference in references {
+        if !pins_container_image(reference) {
+            // Cut for the same reason as in [`ami_ingress_control`].
+            let quoted = scope_text(reference);
+            return control_failed(
+                CONTROL_CONTAINER_IMAGES_PINNED,
+                CONTROL_ERROR_INVALID_VALUE,
+                format!(
+                    "A container image of the assessed delivery option is not pinned to one \
+                     image ({quoted})."
+                ),
+                SCOPE_CONTAINER_IMAGES,
+                Some(quoted),
+            );
+        }
+    }
+    control_passed(CONTROL_CONTAINER_IMAGES_PINNED)
+}
+
+/// The image references a submitted `ContainerImages` value names.
+fn container_image_references(value: &Value) -> Vec<&str> {
+    value
+        .as_array()
+        .map(|images| {
+            images
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|image| !image.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `reference` pins the image it names.
+///
+/// A reference carrying a digest (`…@sha256:…`) names one image for ever, and
+/// so does one carrying a tag other than [`FLOATING_IMAGE_TAG`]; a reference
+/// with neither resolves to whatever the registry holds when it is pulled. The
+/// tag is read from the LAST path segment, since the registry host before it
+/// may itself carry a port.
+fn pins_container_image(reference: &str) -> bool {
+    let name = reference.split('/').next_back().unwrap_or(reference);
+    if name.contains('@') {
+        return true;
+    }
+    name.rsplit_once(':')
+        .is_some_and(|(_, tag)| !tag.is_empty() && tag != FLOATING_IMAGE_TAG)
 }
 
 /// The `Name` the details of an applied change give an entity, if any.

@@ -17,6 +17,8 @@ mod agentic_rft_job_lifecycle;
 mod ai_benchmark_job_lifecycle;
 #[path = "all/ai_recommendation_job_lifecycle.rs"]
 mod ai_recommendation_job_lifecycle;
+#[path = "all/ai_recommendation_job_stop.rs"]
+mod ai_recommendation_job_stop;
 #[path = "all/ai_workload_config_lifecycle.rs"]
 mod ai_workload_config_lifecycle;
 #[path = "all/algorithm_lifecycle.rs"]

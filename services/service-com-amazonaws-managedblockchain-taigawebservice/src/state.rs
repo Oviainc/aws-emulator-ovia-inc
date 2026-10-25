@@ -563,8 +563,9 @@ pub const MAX_INVITATIONS: usize = 1_000;
 ///
 /// The ledger grows by one entry per create with a token the service has not seen, and a
 /// token is caller-chosen, so the store needs a ceiling of its own: the resource caps
-/// above do not bound it (`DeleteNode` frees a node slot without freeing the token that
-/// minted it). At this many records the oldest is evicted — see
+/// above do not bound it (they are per resource type, and one of them per network, so
+/// their sum is far larger than any ledger this process should hold). At this many records
+/// the oldest is evicted — see
 /// [`ComAmazonawsManagedblockchainTaigawebserviceState::remember_idempotent`]. The
 /// number is the emulator's own, set well above any realistic workflow's token count.
 pub const MAX_IDEMPOTENCY_RECORDS: usize = 4_096;
@@ -1878,10 +1879,12 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
 
     /// Forget the record of the create that minted `node_id`.
     ///
-    /// Called when the node is deleted: its data "is lost and cannot be recovered", so
-    /// replaying that token could only hand back an id nothing holds. It also keeps the
-    /// ledger from outliving the resources it describes, so a create/delete loop frees
-    /// the token record along with the node.
+    /// Called when the node's deletion STARTS: a node whose removal has begun "can no
+    /// longer participate on the network" (`Node$Status`), so replaying that token could
+    /// only hand back a resource no caller can still use — the same stance
+    /// [`Self::holds_any`] takes. The node is the only id a `CreateNode` mints (the network
+    /// and member its record also names are ones the request named), so this is the record
+    /// that create left behind, and a create/delete loop frees it along with the node.
     pub fn forget_node_token(&mut self, node_id: &str) {
         let stale: Vec<String> = self
             .idempotency
@@ -1898,9 +1901,9 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
     /// Forget every idempotency record that names NOTHING this store still holds.
     ///
     /// The ledger must not outlive the resources it describes — the same reason
-    /// [`Self::forget_node_token`] runs when a node is deleted — so once every id a create
-    /// minted has been deleted, its token is forgotten and replaying it creates afresh,
-    /// which is the same answer the real service gives once a token has aged out.
+    /// [`Self::forget_node_token`] runs when a node's deletion starts — so once every id a
+    /// create minted has been deleted, its token is forgotten and replaying it creates
+    /// afresh, which is the same answer the real service gives once a token has aged out.
     ///
     /// A record that still names ONE live resource is KEPT: a create that minted several
     /// ids (`CreateNetwork` mints a network and its first member) must keep replaying its

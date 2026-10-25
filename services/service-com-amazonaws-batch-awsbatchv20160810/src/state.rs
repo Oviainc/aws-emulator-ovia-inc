@@ -1706,6 +1706,87 @@ pub fn client_exception_message(detail: &str, request_id: &str) -> String {
     format!("Error executing request, Exception : {detail}, RequestId: {request_id}")
 }
 
+/// The segment the validating walk spells a step from a collection into one of its
+/// elements with (`aws_smithy_schema_server::constraints::path`): the step itself, and the
+/// segment before it, name a POSITION inside that collection rather than a member of the
+/// shape.
+const COLLECTION_PATH_STEP: &str = "member";
+
+/// The member a dotted violation path names: its last segment that is a member of a shape
+/// rather than a position inside a collection, so a value inside a list or a map is
+/// reported against the member that list or map arrived on.
+fn violation_member(path: &str) -> &str {
+    let mut segments: Vec<&str> = path.split('.').collect();
+    while let Some(last) = segments.pop() {
+        if last == COLLECTION_PATH_STEP {
+            // What precedes a collection step is the POSITION inside that collection —
+            // an element's index, or a key the caller chose — so it is dropped with it:
+            // the rule fired on the member, and a refusal states the member.
+            segments.pop();
+            continue;
+        }
+        if last.is_empty() {
+            continue;
+        }
+        return last;
+    }
+    path
+}
+
+/// A lowerCamel member name as the English noun phrase a Batch refusal opens with: the
+/// name split into words at its humps, each word lowercased, and the first letter of the
+/// phrase capitalised (`idleResourceAssignmentStrategy` becomes
+/// `Idle resource assignment strategy`).
+///
+/// A run of capitals is one word (`EC2` stays `ec2`), because a hump only starts a word
+/// where a lowercase letter or a digit precedes it, or where a lowercase letter follows
+/// it.
+fn member_phrase(member: &str) -> String {
+    let chars: Vec<char> = member.chars().collect();
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    for (index, c) in chars.iter().enumerate() {
+        let previous = index.checked_sub(1).and_then(|before| chars.get(before));
+        let starts_word = c.is_uppercase()
+            && !word.is_empty()
+            && (previous.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit())
+                || chars.get(index + 1).is_some_and(|next| next.is_lowercase()));
+        if starts_word {
+            words.push(std::mem::take(&mut word));
+        }
+        word.extend(c.to_lowercase());
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let phrase = words.join(" ");
+    let mut letters = phrase.chars();
+    match letters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + letters.as_str(),
+        None => phrase,
+    }
+}
+
+/// How AWS Batch words the refusal of a value outside the closed set an enum member
+/// declares: the member named as a noun phrase ([`member_phrase`]), then the set the
+/// service enforced.
+///
+/// The rejected value is NOT echoed and the path the request nested the member at is not
+/// reported: Batch names the rule that fired and the set it holds the member to, which is
+/// what the caller has to satisfy. Recorded in exactly this form for a `quotaSharePolicy`
+/// whose `idleResourceAssignmentStrategy` is outside its one-member enum, and raised for
+/// every enum member of this service by the refusal seam (`crate::service`), since the
+/// model types each of them as a plain `String` whose membership the boundary validator
+/// checks before any handler runs.
+pub fn enum_membership_detail<S: AsRef<str>>(member_path: &str, allowed: &[S]) -> String {
+    let values: Vec<&str> = allowed.iter().map(AsRef::as_ref).collect();
+    format!(
+        "{} must be one of [{}].",
+        member_phrase(violation_member(member_path)),
+        values.join(", ")
+    )
+}
+
 /// The sentence AWS Batch's resource resolver answers when an identifier names no stored
 /// resource: the ARN the identifier resolved to, then ` does not exist`.
 ///
@@ -3125,6 +3206,10 @@ pub fn is_scheduling_policy_reference(region: &str, value: &str) -> bool {
 /// checked here by every operation that accepts a quota-share policy.
 pub const QUOTA_SHARE_IDLE_RESOURCE_ASSIGNMENT_STRATEGIES: [&str; 1] = ["FIFO"];
 
+/// The member a quota-share policy's idle-resource assignment strategy arrives on, which
+/// is the member an enum-membership refusal of it names ([`enum_membership_detail`]).
+pub const IDLE_RESOURCE_ASSIGNMENT_STRATEGY_MEMBER: &str = "idleResourceAssignmentStrategy";
+
 /// The name of the member a fair-share scheduling policy is carried on, which is the name
 /// AWS Batch uses for that policy KIND in the refusal of a type change
 /// ([`policy_kind_change_message`]).
@@ -3149,41 +3234,52 @@ pub fn policy_kind_change_message(from: &str, to: &str) -> String {
     )
 }
 
-/// The refusal detail when a request carries a policy of neither kind or of both.
+/// The refusal when a request carries a policy of neither kind or of both, or a policy
+/// outside the bounds its own members document.
 ///
 /// "Only one of fairsharePolicy or quotaSharePolicy can be set" — the doc of
 /// `CreateSchedulingPolicy$fairsharePolicy` and `$quotaSharePolicy`. Shared by every
 /// operation that accepts the pair (`CreateSchedulingPolicy`, `UpdateSchedulingPolicy`).
+///
+/// Each refusal carries the envelope AWS is recorded to word IT with, chosen where it is
+/// raised: the exclusivity rule and the fair-share bounds state their detail alone
+/// ([`client_exception`]), while an enum-membership refusal is one of the frontend's
+/// ([`client_exception_enveloped`]).
 pub fn validate_policy_kinds(
     fairshare: Option<&FairsharePolicy>,
     quota_share: Option<&QuotaSharePolicy>,
-) -> Result<(), String> {
+) -> Result<(), ClientException> {
     if fairshare.is_some() && quota_share.is_some() {
-        return Err(
-            "Only one of fairsharePolicy or quotaSharePolicy can be set on a scheduling policy"
-                .to_string(),
-        );
+        return Err(client_exception(
+            "Only one of fairsharePolicy or quotaSharePolicy can be set on a scheduling policy",
+        ));
     }
     if let Some(quota_share) = quota_share {
         validate_quota_share_policy(quota_share)?;
     }
     if let Some(fairshare) = fairshare {
-        validate_fairshare_policy(fairshare)?;
+        validate_fairshare_policy(fairshare).map_err(client_exception)?;
     }
     Ok(())
 }
 
 /// Refuse a `quotaSharePolicy` whose `idleResourceAssignmentStrategy` is not one the
-/// model declares ([`QUOTA_SHARE_IDLE_RESOURCE_ASSIGNMENT_STRATEGIES`]).
-pub fn validate_quota_share_policy(policy: &QuotaSharePolicy) -> Result<(), String> {
+/// model declares ([`QUOTA_SHARE_IDLE_RESOURCE_ASSIGNMENT_STRATEGIES`]), with the sentence
+/// and the frontend envelope every enum-membership refusal of this service carries
+/// ([`enum_membership_detail`]).
+///
+/// A value sent on the WIRE is refused by the boundary validator before any handler runs —
+/// the member is an enum in the model, so the generated schema carries its value set — and
+/// the refusal seam (`crate::service`) words that one from the same builder. This check is
+/// what refuses a policy reaching the rule from anywhere else.
+pub fn validate_quota_share_policy(policy: &QuotaSharePolicy) -> Result<(), ClientException> {
     if !QUOTA_SHARE_IDLE_RESOURCE_ASSIGNMENT_STRATEGIES
         .contains(&policy.idle_resource_assignment_strategy.as_str())
     {
-        return Err(format!(
-            "idleResourceAssignmentStrategy {} is not one of {}",
-            policy.idle_resource_assignment_strategy,
-            QUOTA_SHARE_IDLE_RESOURCE_ASSIGNMENT_STRATEGIES.join(", ")
-        ));
+        return Err(client_exception_enveloped(enum_membership_detail(
+            IDLE_RESOURCE_ASSIGNMENT_STRATEGY_MEMBER,
+            &QUOTA_SHARE_IDLE_RESOURCE_ASSIGNMENT_STRATEGIES,
+        )));
     }
     Ok(())
 }
