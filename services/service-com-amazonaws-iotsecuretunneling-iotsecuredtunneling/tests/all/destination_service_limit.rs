@@ -79,8 +79,7 @@ fn stored_tokens(engine: &Arc<engine::InMemoryEngine>, tunnel_id: &str) -> (Stri
     engine
         .state::<TunnelState>()
         .lock()
-        .tunnels
-        .get(tunnel_id)
+        .tunnel(REGION, tunnel_id)
         .map(|tunnel| {
             (
                 tunnel.source_access_token.clone(),
