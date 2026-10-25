@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Changes the settings of a compute fleet held in [`crate::state`]: this is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every optional member of the input is the REPLACEMENT for the fleet setting it
+//! names, so a member the request carries overwrites the stored setting whole and a
+//! member it omits leaves the stored setting exactly as it was; the fleet's name, its
+//! id, its ARN and its `created` instant are never touched here. A successful update
+//! moves `lastModified` and leaves the fleet applying the change — `UPDATING` until the
+//! clock makes its return to `ACTIVE` due — while a refused one persists nothing at all.
+//!
+//! An `arn` that addresses no fleet this account holds is refused with the modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +194,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFleet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this service models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateFleet (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let now = crate::state::now_millis();
+        let identifier = input.arn.clone();
+
+        let mut guard = state.lock();
+        // One resolver for every fleet-addressing operation: an identifier resolves
+        // only to the fleet it addresses exactly. It also materialises the transition
+        // the clock already owed this fleet, before the merge below reads its status.
+        let Some(stored) = guard.settled_fleet_mut(&identifier, now) else {
+            // Each refusal is audited like the successful write, and the lock is
+            // dropped first, so a log consumer never waits on this request's
+            // critical section — the discipline `UpdateProject` follows.
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::NotFound,
+                Some(&identifier),
+            );
+            return Err(UpdateFleetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // CodeBuild's own sentence for a fleet identifier that
+                    // addresses nothing: fixed text around the identifier the
+                    // caller gave, which is the only value it carries.
+                    message: Some(format!("Fleet {identifier} does not exist")),
+                },
+            )
+            .into());
+        };
+
+        // The merge runs on a COPY of the stored record, written back only once every
+        // check below has passed: a refused update leaves the fleet it named exactly
+        // as it was, `lastModified` and `status` included.
+        let mut fleet = stored.fleet.clone();
+        apply_update(&mut fleet, input);
+
+        // The RESULTING configuration, not the request alone, is what has to be a
+        // valid compute fleet, so the one rule `crate::state` states is asked about
+        // the merged record: a request that only raises `computeType` to an
+        // attribute-driven value is refused exactly when the fleet it would leave
+        // behind carries no `computeConfiguration` to describe its machines.
+        if let Some(message) = crate::state::fleet_configuration_violation(
+            fleet.base_capacity,
+            fleet
+                .scaling_configuration
+                .as_ref()
+                .and_then(|scaling| scaling.max_capacity),
+            fleet.compute_type.as_deref(),
+            fleet.compute_configuration.is_some(),
+        ) {
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&identifier),
+            );
+            return Err(UpdateFleetErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // `lastModified` reports when the fleet was last changed, so a successful
+        // update has to move it. The service clock is millisecond-resolution, so two
+        // updates landing inside one millisecond would otherwise report the same
+        // instant for two different records: the stamp is the later of now and one
+        // millisecond past the stored stamp, which keeps it strictly increasing per
+        // fleet without ever running behind the clock — the rule `UpdateProject`
+        // states.
+        let last_modified_millis = now.max(stored.last_modified_millis + 1);
+        fleet.last_modified = Some(crate::state::datetime(last_modified_millis));
+        // The fleet's machines are provisioned, so the settings this call stored are
+        // not in force the instant it answers: the fleet is `UPDATING` until the
+        // clock makes its return to `ACTIVE` due (`StoredFleet::settle`).
+        fleet.status = Some(FleetStatus {
+            status_code: Some(crate::state::FLEET_STATUS_UPDATING.to_string()),
+            // A fleet applying a change carries no `FleetContextCode`: every value
+            // of that enum explains a failure or a pending deletion.
+            context: None,
+            message: None,
+        });
+
+        // `created` and the creation instant behind it are untouched: this call
+        // changes a fleet's settings, it does not re-create it.
+        stored.fleet = fleet.clone();
+        stored.last_modified_millis = last_modified_millis;
+        stored.active_due_millis = last_modified_millis + crate::state::FLEET_SETTLE_MILLIS;
+        // The lock is dropped before the audit record is written, so a log consumer
+        // can never hold this service's state.
+        drop(guard);
+
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::FleetUpdated,
+            fleet.arn.as_deref(),
+        );
+
+        Ok(UpdateFleetOutput { fleet: Some(fleet) })
+    }
+}
+
+/// Apply one `UpdateFleet` request's members to the stored fleet.
+///
+/// AWS describes each optional member as the replacement for the setting it names
+/// ("the proxy configuration of the compute fleet", "the Amazon Machine Image (AMI) of
+/// the compute fleet"), so a member the request carries replaces the stored setting
+/// WHOLE — a structure member is not merged field by field — and a member it omits
+/// leaves the stored setting alone.
+///
+/// The input is DESTRUCTURED rather than read member by member, so a member the model
+/// gains later fails to compile here instead of being silently dropped.
+fn apply_update(fleet: &mut Fleet, input: UpdateFleetInput) {
+    let UpdateFleetInput {
+        // The fleet is identified by this ARN, which addresses the record being
+        // changed and is not itself a setting of it.
+        arn: _,
+        base_capacity,
+        environment_type,
+        compute_type,
+        compute_configuration,
+        scaling_configuration,
+        overflow_behavior,
+        vpc_config,
+        proxy_configuration,
+        image_id,
+        fleet_service_role,
+        tags,
+    } = input;
+
+    replace(&mut fleet.base_capacity, base_capacity);
+    replace(&mut fleet.environment_type, environment_type);
+    replace(&mut fleet.compute_type, compute_type);
+    replace(&mut fleet.compute_configuration, compute_configuration);
+    replace(&mut fleet.overflow_behavior, overflow_behavior);
+    replace(&mut fleet.vpc_config, vpc_config);
+    replace(&mut fleet.proxy_configuration, proxy_configuration);
+    replace(&mut fleet.image_id, image_id);
+    replace(&mut fleet.fleet_service_role, fleet_service_role);
+    replace(&mut fleet.tags, tags);
+
+    // `scalingConfiguration` comes in as `ScalingConfigurationInput` and is reported
+    // as `ScalingConfigurationOutput`, which adds the `desiredCapacity` the input
+    // shape has no member for: a fleet wants exactly the machines `baseCapacity` asks
+    // for, the rule `CreateFleet` applies when it mints one. So the capacity the
+    // merged record reports is derived from the merged `baseCapacity`, whether this
+    // request replaced the scaling configuration or only the capacity.
+    if let Some(scaling) = scaling_configuration {
+        fleet.scaling_configuration = Some(ScalingConfigurationOutput {
+            scaling_type: scaling.scaling_type,
+            target_tracking_scaling_configs: scaling.target_tracking_scaling_configs,
+            max_capacity: scaling.max_capacity,
+            desired_capacity: None,
+        });
+    }
+    let base_capacity = fleet.base_capacity;
+    if let Some(scaling) = fleet.scaling_configuration.as_mut() {
+        scaling.desired_capacity = base_capacity;
+    }
+}
+
+/// Overwrite `held` with `update` when the request carried that member, and leave it
+/// alone when it did not: an absent member means "unchanged", never "clear it" — the
+/// rule [`crate::ops::update_project`] states for every CodeBuild update.
+fn replace<T>(held: &mut Option<T>, update: Option<T>) {
+    if update.is_some() {
+        *held = update;
     }
 }

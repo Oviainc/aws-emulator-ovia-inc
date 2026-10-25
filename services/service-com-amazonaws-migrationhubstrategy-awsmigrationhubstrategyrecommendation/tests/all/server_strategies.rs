@@ -423,8 +423,9 @@ fn assert_reported(answer: &Answer, what: &str, expected: &[Expected]) {
             ),
             ("/status", value(want.status)),
             ("/isPreferred", json!(want.is_preferred)),
-            // Nothing here attributes an application component to a strategy of a
-            // server, so no count is reported.
+            // These rows seed no application component for the server, so there is
+            // nothing to count and no count is reported; the count itself is the
+            // subject of `assessment_analysis.rs`.
             ("/numberOfApplicationComponents", Value::Null),
         ] {
             let pointer = format!("/serverStrategies/{index}{member}");

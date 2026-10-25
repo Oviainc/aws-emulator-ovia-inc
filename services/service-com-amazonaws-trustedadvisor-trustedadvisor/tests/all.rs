@@ -23,6 +23,8 @@ mod organization_recommendation_accounts;
 mod organization_recommendation_lifecycle;
 #[path = "all/organization_recommendation_read.rs"]
 mod organization_recommendation_read;
+#[path = "all/organization_recommendation_resources.rs"]
+mod organization_recommendation_resources;
 #[path = "all/organization_recommendations.rs"]
 mod organization_recommendations;
 #[path = "all/recommendation_loop.rs"]
