@@ -16,12 +16,14 @@
 
 use serde_json::{json, Value};
 
-use crate::identity_pool_flow::{error_code, Emulator, ABSENT_POOL_ID};
+use crate::identity_pool_flow::{error_code, member, non_empty, Emulator, ABSENT_POOL_ID};
 
 /// An IAM role ARN: `arn:<partition>:iam::<12-digit-account-id>:role/<path and name>`,
 /// the form `RolesMap`'s value and `MappingRule$RoleARN` (both documented "the Role ARN",
-/// `smithy_query(query="shape",shape="RolesMap,MappingRule")`) carry.
-fn role_arn(name: &str) -> String {
+/// `smithy_query(query="shape",shape="RolesMap,MappingRule")`) carry. `pub(crate)` so a
+/// sibling suite in this test target spells a role ARN the same way rather than keeping a
+/// second copy of this helper.
+pub(crate) fn role_arn(name: &str) -> String {
     format!("arn:aws:iam::123456789012:role/{name}")
 }
 
@@ -160,13 +162,17 @@ async fn get_identity_pool_roles_reports_what_the_last_set_stored() {
             .ok("GetIdentityPoolRoles", &json!({"IdentityPoolId": &pool_id}))
             .await;
         assert_eq!(
-            got["IdentityPoolId"].as_str(),
-            Some(pool_id.as_str()),
+            member(&got, "IdentityPoolId"),
+            Some(json!(pool_id)),
             "case {case:?}: GetIdentityPoolRoles names the pool it was asked about, got {got}"
         );
+        // A configuration naming no role of either kind leaves the pool with no role
+        // configuration, which the read reports by leaving the member out.
+        let expected_roles = Some(roles.clone()).filter(non_empty);
+        let actual_roles = member(&got, "Roles");
         assert_eq!(
-            got["Roles"], roles,
-            "case {case:?}: expected the stored Roles {roles}, got {got}"
+            actual_roles, expected_roles,
+            "case {case:?}: expected the stored Roles {expected_roles:?}, got {got}"
         );
         match &role_mappings {
             Some(role_mappings) => assert_eq!(
@@ -181,10 +187,11 @@ async fn get_identity_pool_roles_reports_what_the_last_set_stored() {
     }
 }
 
-/// RULE: a stored pool nobody set roles for has an EMPTY role configuration — which is a
-/// 200 with no role, not a 404 and not a role it was never given.
+/// RULE: a stored pool nobody set roles for has NO role configuration — which is a 200
+/// naming the pool and carrying neither optional member, not a 404 and not a role it was
+/// never given.
 #[tokio::test]
-async fn a_pool_nobody_set_roles_for_reports_an_empty_role_map() {
+async fn a_pool_nobody_set_roles_for_reports_no_role_configuration() {
     let emulator = Emulator::new();
 
     for (case, allow_unauthenticated) in [
@@ -196,12 +203,18 @@ async fn a_pool_nobody_set_roles_for_reports_an_empty_role_map() {
             .ok("GetIdentityPoolRoles", &json!({"IdentityPoolId": &pool_id}))
             .await;
         assert_eq!(
-            got["Roles"],
-            json!({}),
-            "case {case:?}: expected an empty Roles map, got {got}"
+            member(&got, "IdentityPoolId"),
+            Some(json!(pool_id)),
+            "case {case:?}: expected the pool it was asked about, got {got}"
         );
-        assert!(
-            got["RoleMappings"].is_null(),
+        assert_eq!(
+            member(&got, "Roles"),
+            None,
+            "case {case:?}: expected no Roles member, got {got}"
+        );
+        assert_eq!(
+            member(&got, "RoleMappings"),
+            None,
             "case {case:?}: expected no RoleMappings, got {got}"
         );
     }
@@ -474,9 +487,10 @@ async fn a_roles_key_that_is_not_a_role_kind_is_refused() {
             .ok("GetIdentityPoolRoles", &json!({"IdentityPoolId": &pool_id}))
             .await;
         assert_eq!(
-            got["Roles"],
-            json!({}),
-            "case {case:?}: a refused key is not stored, got {got}"
+            member(&got, "Roles"),
+            None,
+            "case {case:?}: a refused key is not stored, so no Roles member is reported, \
+             got {got}"
         );
     }
 }

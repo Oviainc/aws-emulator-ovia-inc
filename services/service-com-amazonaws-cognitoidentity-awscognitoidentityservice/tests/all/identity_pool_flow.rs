@@ -142,6 +142,26 @@ pub(crate) fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The member `name` of a response object, as `Some(value)` when the body carries the key
+/// at all and `None` when it is left out. `pub(crate)` so every suite in this target
+/// asserts a member's PRESENCE the same way — a distinction indexing (`body["Member"]`,
+/// `Null` either way) cannot make.
+pub(crate) fn member(response: &Value, name: &str) -> Option<Value> {
+    response
+        .as_object()
+        .unwrap_or_else(|| panic!("a response object, got {response}"))
+        .get(name)
+        .cloned()
+}
+
+/// Whether a JSON map carries any entry — the configurations that carry none are the ones
+/// whose member a read leaves out.
+pub(crate) fn non_empty(map: &Value) -> bool {
+    !map.as_object()
+        .unwrap_or_else(|| panic!("a map, got {map}"))
+        .is_empty()
+}
+
 /// A well-formed `IdentityPoolId` that no pool was ever created with.
 pub(crate) const ABSENT_POOL_ID: &str = "us-east-1:00000000-0000-0000-0000-000000000000";
 /// A well-formed `IdentityId` that no `GetId` ever minted.
