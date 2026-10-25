@@ -33,6 +33,8 @@ mod encoder_configuration_in_use;
 mod encoder_configurations;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/get_participant.rs"]
+mod get_participant;
 #[path = "all/ingest_configurations.rs"]
 mod ingest_configurations;
 #[path = "all/list_participant_replicas_paging.rs"]
