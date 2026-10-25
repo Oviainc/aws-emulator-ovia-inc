@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeChannelBan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeChannelBan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeChannelBan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the ban `CreateChannelBan` stored on the channel: the banned member, who
+//! banned them and when. A PRIVATE channel is readable only by its members and
+//! moderators, the rule the model states on `CreateChannelMembership`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +153,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeChannelBan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeChannelBanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeChannelBan"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeChannelBanErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        let channel = store
+            .channels
+            .get(&input.channel_arn)
+            .ok_or_else(|| not_found(format!("channel {} not found", input.channel_arn)))?;
+        if let Some(reason) = channel.read_refusal(&input.chime_bearer) {
+            return Err(DescribeChannelBanErrorModeled::ForbiddenException(ForbiddenException {
+                code: Some("Forbidden".to_string()),
+                message: Some(reason.to_string()),
+            })
+            .into());
+        }
+        let ban = channel.ban(&input.member_arn).ok_or_else(|| {
+            // The service words a ban this channel does not hold for its reason, the way
+            // it words a ban it does hold on the operations a banned member is refused.
+            not_found(NOT_BANNED_MESSAGE.to_string())
+        })?;
+
+        Ok(DescribeChannelBanOutput {
+            channel_ban: Some(ban.to_channel_ban(&channel.arn)),
+        })
     }
+}
+
+/// The `Message` a read of a ban this channel does not hold is refused with.
+///
+/// The counterpart of `crate::state::BANNED_MESSAGE`, which the operations a BANNED
+/// member is refused on carry: this service names the ban in both answers rather than
+/// describing the request.
+const NOT_BANNED_MESSAGE: &str = "App instance user is not banned from the specified Channel.";
+
+/// The modelled 404 for a channel or a ban this service does not hold.
+fn not_found(message: String) -> DescribeChannelBanError {
+    DescribeChannelBanErrorModeled::NotFoundException(NotFoundException {
+        code: Some("NotFound".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

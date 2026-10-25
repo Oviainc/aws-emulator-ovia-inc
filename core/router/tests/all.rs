@@ -192,6 +192,12 @@ mod lambda_signing_name_routing;
 mod lex_runtime_v2_sessions_through_the_router;
 #[path = "all/marketplace_signing_name_routing.rs"]
 mod marketplace_signing_name_routing;
+// Out of alphabetical order on purpose: the `c` span of this list, its end, and the
+// appended region at the bottom of the file are where concurrently landing suites insert
+// their own line, and a line next to theirs cannot be merged with them. This `n`/`o` gap
+// is the quietest span in the file.
+#[path = "all/chime_app_instance_admin_authorization.rs"]
+mod chime_app_instance_admin_authorization;
 // Declared HERE, in the sorted list, rather than appended at the end of this file: the
 // tail is where every landing in the same window appends, so it is the contended region,
 // while this span of the sorted list is untouched by those appends.

@@ -10,6 +10,8 @@ build = "build.rs"
 engine = { workspace = true }
 # `chime_family`: the request-claim rule for the six services that share the `chime`
 # SigV4 signing name, stated once rather than inlined in this service's `can_handle`.
+# `chime_app_instance_admins`: the app-instance ADMIN directory this service WRITES when
+# it promotes an identity, which Chime SDK Messaging reads the role from.
 service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

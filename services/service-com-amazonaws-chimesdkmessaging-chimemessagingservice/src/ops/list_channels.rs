@@ -2,9 +2,17 @@
 
 //! @op ListChannels
 //!
-//! Pages over the stored channels of one `AppInstanceArn`, optionally narrowed to one
-//! `privacy`, with an opaque `next-token` that resumes the same ordered view. Reporting
-//! only — it writes nothing.
+//! Pages over the stored channels of one `AppInstanceArn` — its PUBLIC ones for an
+//! ordinary caller — with an opaque `next-token` that resumes the same ordered view.
+//! Reporting only — it writes nothing.
+//!
+//! `privacy` is the model's own restriction: PUBLIC retrieves the account's public
+//! channels, and only an `AppInstanceAdmin` may ask for PRIVATE. An administrator is
+//! promoted by the Chime SDK Identity service and read here through the shared directory
+//! ([`crate::state::app_instance_admins`]), so a caller that administers the app instance
+//! lists its private channels and any other caller is refused with the modelled
+//! `ForbiddenException`. A request that names no privacy lists the public channels rather
+//! than handing the private ones to a caller that may not ask for them.
 //!
 //! ## Shape of an operation
 //!
@@ -174,6 +182,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "Privacy must be one of {CHANNEL_PRIVACY_VALUES:?}; got {privacy:?}"
                 )));
             }
+            // Listing the private channels of an app instance is an ADMINISTRATOR's
+            // action: the caller has to be one of the identities the Chime SDK Identity
+            // service promoted over this app instance.
+            if privacy == "PRIVATE" {
+                let directory = crate::state::app_instance_admins(&*self.engine).ok_or_else(|| {
+                    ListChannelsErrorModeled::ServiceFailureException(ServiceFailureException {
+                        code: Some("ServiceFailure".to_string()),
+                        message: Some(
+                            "the AppInstanceAdmin directory is unavailable".to_string(),
+                        ),
+                    })
+                })?;
+                let administers = directory
+                    .lock()
+                    .administers(&input.app_instance_arn, &input.chime_bearer);
+                if !administers {
+                    return Err(ListChannelsErrorModeled::ForbiddenException(
+                        ForbiddenException {
+                            code: Some("Forbidden".to_string()),
+                            message: Some(
+                                crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            }
         }
         // `MaxResults` is modelled `range 1..50`; an omitted page size takes that
         // maximum, so a caller that asks for no size still gets a bounded page.
@@ -186,19 +221,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = usize::try_from(requested).unwrap_or(0);
 
         let store = state.lock();
-        // One stable ordered view of the app instance's channels: a `HashMap` has no
-        // order of its own, so the ARN — unique per channel — is what makes successive
-        // pages agree.
+        // One stable ordered view of the app instance's channels of the requested
+        // privacy: a `HashMap` has no order of its own, so the ARN — unique per channel —
+        // is what makes successive pages agree. An omitted `privacy` lists the PUBLIC
+        // channels, since the only role the model lets ask for a private one is an
+        // administrator, which the tier above has already established for PRIVATE.
+        let wanted_privacy = input.privacy.as_deref().unwrap_or("PUBLIC");
         let mut view: Vec<&crate::state::ChannelRecord> = store
             .channels
             .values()
             .filter(|c| c.app_instance_arn == input.app_instance_arn)
-            .filter(|c| {
-                input
-                    .privacy
-                    .as_deref()
-                    .is_none_or(|privacy| c.privacy == privacy)
-            })
+            .filter(|c| c.privacy == wanted_privacy)
             .collect();
         view.sort_by(|left, right| left.arn.cmp(&right.arn));
 

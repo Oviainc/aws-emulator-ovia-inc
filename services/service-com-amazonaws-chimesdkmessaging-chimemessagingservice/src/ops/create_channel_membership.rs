@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannelMembership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannelMembership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannelMembership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds `MemberArn` to the stored channel named by `ChannelArn` and PERSISTS the
+//! membership on that channel's record, so `DescribeChannelMembership`,
+//! `ListChannelMemberships`, `SearchChannels` and the privacy and send rules of
+//! `SendChannelMessage` / `GetChannelMessage` / `ListChannelMessages` all read the same
+//! set.
+//!
+//! Who may add a member is the rule the model states on `CreateChannelRequest`'s `Mode`:
+//! moderators and channel members add members to an UNRESTRICTED channel, and only
+//! moderators to a RESTRICTED one. A member banned from the channel cannot be added back
+//! until `DeleteChannelBan` removes the ban, which `CreateChannelBan` documents.
 //!
 //! ## Shape of an operation
 //!
@@ -180,20 +182,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannelMembership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelMembershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannelMembership"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateChannelMembershipErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        if !CHANNEL_MEMBERSHIP_TYPE_VALUES.contains(&input.r#type.as_str()) {
+            return Err(bad_request(format!(
+                "Type must be one of {CHANNEL_MEMBERSHIP_TYPE_VALUES:?}; got {:?}",
+                input.r#type
+            )));
+        }
+        // Sub-channels exist only on elastic channels, which this slice does not serve;
+        // accepting the member would place the membership somewhere no reader looks.
+        if let Some(sub_channel_id) = &input.sub_channel_id {
+            return Err(bad_request(format!(
+                "SubChannelId {sub_channel_id:?} is not supported: this emulator does not serve elastic channels"
+            )));
+        }
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
+            CreateChannelMembershipErrorModeled::NotFoundException(NotFoundException {
+                code: Some("NotFound".to_string()),
+                message: Some(format!("channel {} not found", input.channel_arn)),
+            })
+        })?;
+
+        // Who may add a member: a moderator always, a plain member only on an
+        // UNRESTRICTED channel.
+        let caller_moderates = channel.is_moderator(&input.chime_bearer);
+        if !caller_moderates {
+            if channel.mode == "RESTRICTED" {
+                // Only administrators and moderators add members to a RESTRICTED channel.
+                return Err(forbidden());
+            }
+            if !channel.is_member(&input.chime_bearer) {
+                // On an UNRESTRICTED channel the caller still has to belong to it.
+                return Err(forbidden());
+            }
+        }
+        // A HIDDEN membership is the moderators' own tool, as the model's `Type`
+        // documentation states.
+        if input.r#type == "HIDDEN" && !caller_moderates {
+            return Err(forbidden());
+        }
+        // A banned member stays out until the ban is deleted, and the refusal names the
+        // ban rather than answering with the service's general insufficient-access
+        // sentence.
+        if channel.is_banned(&input.member_arn) {
+            return Err(CreateChannelMembershipErrorModeled::ForbiddenException(
+                ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::BANNED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Membership is a SET: adding a member the channel already holds answers with
+        // the membership it already has rather than recording a second one.
+        if channel.membership(&input.member_arn).is_none() {
+            if channel.memberships.len() >= crate::state::MAX_MEMBERSHIPS_PER_CHANNEL {
+                return Err(
+                    CreateChannelMembershipErrorModeled::ResourceLimitExceededException(
+                        ResourceLimitExceededException {
+                            code: Some("ResourceLimitExceeded".to_string()),
+                            message: Some(format!(
+                                "this emulator holds at most {} memberships per channel",
+                                crate::state::MAX_MEMBERSHIPS_PER_CHANNEL
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            channel
+                .memberships
+                .push(crate::state::ChannelMembershipRecord {
+                    member_arn: input.member_arn.clone(),
+                    r#type: input.r#type,
+                    invited_by: crate::state::identity_of(&input.chime_bearer),
+                    created_millis: now,
+                    last_updated_millis: now,
+                });
+        }
+
+        Ok(CreateChannelMembershipOutput {
+            channel_arn: Some(channel.arn.clone()),
+            member: Some(crate::state::identity_of(&input.member_arn)),
+            // Sub-channels are not served, so no sub-channel is echoed back.
+            sub_channel_id: None,
+        })
     }
+}
+
+/// Refuse the request with this service's own client-input error, HTTP 400.
+fn bad_request(message: String) -> CreateChannelMembershipError {
+    CreateChannelMembershipErrorModeled::BadRequestException(BadRequestException {
+        code: Some("BadRequest".to_string()),
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the caller with the modelled 403 for an action its role on the channel does
+/// not carry.
+fn forbidden() -> CreateChannelMembershipError {
+    CreateChannelMembershipErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+    })
+    .into()
 }
