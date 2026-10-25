@@ -910,6 +910,67 @@ pub fn parse_version_listing_key(position: &str) -> Option<u64> {
     position.parse().ok()
 }
 
+/// What separates the workflow from the run in the scope a task-instance
+/// listing's cursor is bound to. A `WorkflowArn` already contains `/`, but the
+/// scope is only ever compared whole, so any separator a `RunId`
+/// (`^[a-zA-Z0-9]+[a-zA-Z0-9\.\-_]*$`) cannot contain keeps two runs' scopes
+/// distinct; this one spells the scope the way the operation's own URI does
+/// (`/workflows/{WorkflowArn}/runs/{RunId}/tasks`).
+const RUN_SCOPE_INFIX: &str = "/runs/";
+
+/// The walk a task-instance cursor belongs to: the RUN whose task instances it
+/// pages, inside the workflow that holds that run.
+///
+/// A task-instance listing pages the instances of exactly one run, so the run —
+/// not just its workflow — is what a cursor is a position in: a cursor minted
+/// while walking ANOTHER run's instances is then recognisable as one not issued
+/// for this walk.
+fn task_instance_listing_scope(workflow_arn: &str, run_id: &str) -> String {
+    format!("{workflow_arn}{RUN_SCOPE_INFIX}{run_id}")
+}
+
+/// The cursor key for a position in ONE run's task-instance listing: the
+/// identifier of the last instance on the page, scoped to the run the walk is
+/// over.
+///
+/// A run holds its instances keyed by `TaskInstanceId`
+/// ([`WorkflowRun::task_instances`]) and a listing walks them in that key's
+/// order, so the identifier IS the position: resuming after it reports exactly
+/// the instances that order places later, and an instance removed between pages
+/// leaves the cursor resolving to the same place in what remains.
+pub fn format_task_instance_listing_key(
+    workflow_arn: &str,
+    run_id: &str,
+    last_task_instance_id: &str,
+) -> String {
+    format_scoped_listing_key(
+        &task_instance_listing_scope(workflow_arn, run_id),
+        last_task_instance_id,
+    )
+}
+
+/// The POSITION a cursor of `kind` carries for the walk over ONE run's task
+/// instances, as [`format_task_instance_listing_key`] wrote it.
+///
+/// `None` when the token is not one this service issued, when it was issued for
+/// another of its lists, when it was issued on another run's instances, or when
+/// it carries no position at all — each of which the listing refuses with
+/// [`invalid_page_token`], because none of them is a position in the walk being
+/// asked for.
+pub fn parse_task_instance_page_token(
+    kind: &str,
+    token: &str,
+    workflow_arn: &str,
+    run_id: &str,
+) -> Option<String> {
+    parse_scoped_page_token(
+        kind,
+        token,
+        &task_instance_listing_scope(workflow_arn, run_id),
+    )
+    .filter(|position| !position.is_empty())
+}
+
 /// The HTTP status this service answers a resource-lookup miss with.
 ///
 /// The model gives `ResourceNotFoundException` `@httpError 404`

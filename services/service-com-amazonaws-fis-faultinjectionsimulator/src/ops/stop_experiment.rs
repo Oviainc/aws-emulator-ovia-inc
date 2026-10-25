@@ -138,37 +138,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::internal_failure(
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
 
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // Settled first, so a stop lands on the status the clock already owed rather than
-        // on a stale one.
-        let Some(record) = store.settled_experiment_mut(&input.id, now) else {
-            return Err(StopExperimentErrorModeled::ResourceNotFoundException(
-                crate::state::experiment_not_found(&input.id),
-            )
-            .into());
+        // The guard is taken, spent and RELEASED inside this block, so the experiment's
+        // log records are written after it rather than while the store is locked.
+        let (experiment, deliveries) = {
+            let mut store = state.lock();
+            // Settled first, so a stop lands on the status the clock already owed rather
+            // than on a stale one.
+            let Some(record) = store.settled_experiment_mut(&input.id, now) else {
+                return Err(StopExperimentErrorModeled::ResourceNotFoundException(
+                    crate::state::experiment_not_found(&input.id),
+                )
+                .into());
+            };
+            // An experiment that has already ended cannot be stopped: the call is refused
+            // and the record — its status, its reason and its `endTime` — is left exactly
+            // as the run left it, so a caller can tell a stop it performed from one the
+            // service would never have accepted.
+            if record.status.is_terminal() {
+                return Err(StopExperimentErrorModeled::ValidationException(
+                    crate::state::final_state_refusal(&input.id),
+                )
+                .into());
+            }
+            record.request_stop(now);
+            let experiment = record.to_experiment();
+            let deliveries = store.take_pending_log_deliveries();
+            (experiment, deliveries)
         };
-        // An experiment that has already ended cannot be stopped: the call is refused and
-        // the record — its status, its reason and its `endTime` — is left exactly as the
-        // run left it, so a caller can tell a stop it performed from one the service
-        // would never have accepted.
-        if record.status.is_terminal() {
-            return Err(StopExperimentErrorModeled::ValidationException(
-                crate::state::final_state_refusal(&input.id),
-            )
-            .into());
-        }
-        record.request_stop(now);
+
+        // The stop is part of the run, so it is one of the records the run delivers to the
+        // destination the template configured.
+        crate::state::experiment_logs::deliver(ctx, &region, deliveries).await;
 
         Ok(StopExperimentOutput {
-            experiment: Some(record.to_experiment()),
+            experiment: Some(experiment),
         })
     }
 }

@@ -39,10 +39,11 @@ const ACCOUNT: &str = "000000000000";
 /// same front door rather than standing up a second harness.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    /// The one engine the mounted service reads and writes, kept so a sibling
-    /// suite can reach the store for a fixture the API itself cannot produce —
-    /// a record whose instant is far enough in the past that a windowed read
-    /// leaves it out.
+    /// The ONE shared engine the mounted service was constructed from, kept so a
+    /// sibling suite can reach the store for a fixture the API itself cannot
+    /// produce — a record whose instant is far enough in the past that a
+    /// windowed read leaves it out, or a static IP ATTACHED to an instance while
+    /// `AttachStaticIp` is still a 501 stub (`instance_start_addresses.rs`).
     engine: Arc<engine::InMemoryEngine>,
 }
 
@@ -60,8 +61,9 @@ impl Emulator {
         Self { router, engine }
     }
 
-    /// The shared engine this emulator's service holds, for a case that has to
-    /// reach the store directly.
+    /// The shared engine every operation of this emulator reads and writes
+    /// through — the same one a handler holds on `self.engine` — for a case that
+    /// has to reach the store directly.
     pub(crate) fn engine(&self) -> &engine::InMemoryEngine {
         &self.engine
     }
@@ -224,7 +226,10 @@ pub(crate) fn is_uuid_shaped(value: &str) -> bool {
 
 /// Whether `value` satisfies the modelled `Ipv6Address` pattern
 /// `^([A-F0-9]{1,4}:){7}[A-F0-9]{1,4}$`.
-fn is_modelled_ipv6(value: &str) -> bool {
+///
+/// `pub(crate)` so a sibling suite in this test target checks a reported address
+/// the same way.
+pub(crate) fn is_modelled_ipv6(value: &str) -> bool {
     let groups: Vec<&str> = value.split(':').collect();
     groups.len() == 8
         && groups.iter().all(|group| {
