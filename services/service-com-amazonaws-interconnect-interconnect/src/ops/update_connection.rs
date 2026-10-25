@@ -181,12 +181,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An update is permitted only FROM the states the service permits it from
-        // (`crate::state::UPDATABLE_CONNECTION_STATES`): a connection whose circuit is
-        // mid-flight (`pending`, `updating`, `deleting`), impaired (`down`, `failed`)
-        // or gone (`deleted`) has nothing a description or bandwidth change can be
-        // applied to. The refusal states that rule, naming the requested identifier.
-        if !crate::state::is_updatable_state(&stored.connection.state) {
+        // An update that asks for a CHANGE is permitted only FROM the states the
+        // service permits it from (`crate::state::UPDATABLE_CONNECTION_STATES`): a
+        // connection whose circuit is mid-flight (`pending`, `updating`, `deleting`),
+        // impaired (`down`, `failed`) or gone (`deleted`) has nothing a description or
+        // bandwidth change can be applied to. The refusal states that rule, naming the
+        // requested identifier.
+        //
+        // A request every supplied member of which the record ALREADY holds asks for
+        // no change at all, so there is nothing that rule protects: it is answered with
+        // the record the call that applied it already produced, for as long as the
+        // connection is live (`crate::state::update_permitted_from`). That is what
+        // makes this `@idempotent` operation tolerate its own retry — including the one
+        // that lands while the connection is still in the `updating` state the first
+        // call handed it to the clock in.
+        let asks_for_change = !crate::state::update_already_applied(
+            &stored.connection,
+            input.description.as_ref(),
+            input.bandwidth.as_ref(),
+        );
+        if !crate::state::update_permitted_from(&stored.connection.state, asks_for_change) {
             return Err(UpdateConnectionErrorModeled::InterconnectClientException(
                 InterconnectClientException {
                     message: crate::state::connection_not_updatable_message(&input.identifier),
@@ -227,11 +241,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Mutate the stored record in place; a member the request omits is left
         // exactly as it was.
         //
-        // `clientToken` needs no replay index of its own: this update is already
-        // idempotent by construction. Each supplied member is assigned its
-        // requested value, so re-applying the same request is a no-op — the
-        // bandwidth comparison below sees the value it already wrote and neither
-        // re-arms the `updating` transition nor touches the record again.
+        // `clientToken` needs no replay index of its own: this update is idempotent by
+        // construction, because it allocates no resource — each supplied member is
+        // assigned its requested value, so a repeat of a request already applied
+        // assigns what the record holds, and the bandwidth comparison below sees the
+        // value it already wrote and neither re-arms the `updating` transition nor
+        // hands the connection to the clock a second time. The permitted-state guard
+        // above lets that repeat through, which is what makes the claim hold for the
+        // very request that produced the `updating` state.
         if let Some(description) = input.description.clone() {
             stored.connection.description = description;
         }
@@ -241,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "updating: the connection is being updated" — re-provisioning the
                 // circuit is not instantaneous, so the connection reports `updating`
                 // and the clock settles it back into the state it came from.
-                stored.connection.state = "updating".to_string();
+                stored.connection.state = crate::state::UPDATING_CONNECTION_STATE.to_string();
                 stored.pending_transition = Some(crate::state::PendingTransition {
                     due: now + crate::state::PROVISIONING_SPAN,
                     state: settled,

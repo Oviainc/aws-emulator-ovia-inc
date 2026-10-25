@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCoreNetworkRoutingInformation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCoreNetworkRoutingInformation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCoreNetworkRoutingInformation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the routes one SEGMENT of a core network holds at ONE of its edge locations,
+//! narrowed by the request's next-hop and BGP-attribute matches and paged by
+//! `MaxResults`/`NextToken`. A pure READ: every entry is computed from this service's state
+//! — the policy in force on the core network and the peerings and attachments stored
+//! against it — and nothing is written: this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +124,116 @@ impl From<ListCoreNetworkRoutingInformationErrorModeled> for ListCoreNetworkRout
     }
 }
 
+/// The parts of a next hop a `NextHopFilters` entry may select on, in the spelling a
+/// filter name is written in.
+///
+/// The catalog is the member list of the modelled `RoutingInformationNextHop`
+/// (`smithy_query shape=RoutingInformationNextHop`), each member's words joined by
+/// hyphens: a `FilterName` is `len 0..128, pattern ^[0-9a-zA-Z\.-]*$` (`smithy_query
+/// shape=FilterMap`), which admits no underscore, so the hyphenated spelling is the only
+/// one a key can carry. A name outside this set selects on no part of a next hop at all,
+/// which is a field failure on the member that carried it rather than a page the filter was
+/// silently dropped from.
+const NEXT_HOP_FILTER_NAMES: [&str; 6] = [
+    "core-network-attachment-id",
+    "edge-location",
+    "ip-address",
+    "resource-id",
+    "resource-type",
+    "segment-name",
+];
+
+/// The value the next hop `hop` carries for the filter `name`, or `None` where it carries
+/// none (or `name` is not one of [`NEXT_HOP_FILTER_NAMES`], which the handler has already
+/// refused).
+fn next_hop_member<'a>(hop: &'a RoutingInformationNextHop, name: &str) -> Option<&'a str> {
+    match name {
+        "core-network-attachment-id" => hop.core_network_attachment_id.as_deref(),
+        "edge-location" => hop.edge_location.as_deref(),
+        "ip-address" => hop.ip_address.as_deref(),
+        "resource-id" => hop.resource_id.as_deref(),
+        "resource-type" => hop.resource_type.as_deref(),
+        "segment-name" => hop.segment_name.as_deref(),
+        _ => None,
+    }
+}
+
+/// Whether `values` holds `held`.
+fn holds(values: &[String], held: &str) -> bool {
+    values.iter().any(|value| value == held)
+}
+
+/// Whether `entry` satisfies every match the request carries.
+///
+/// Each filter NARROWS the listing and they combine: an entry is reported only where every
+/// filter given selects it. A filter selects an entry when the route attribute it names
+/// carries one of the filter's values — so a filter naming an attribute the route does not
+/// carry selects nothing, and neither does one carrying no value at all.
+/// `ExactAsPathMatches` is matched against the WHOLE path, its AS numbers in order
+/// separated by spaces, which is what makes the match exact rather than a membership test;
+/// `CommunityMatches` is matched against each community the route carries, since a route is
+/// selected by any one of the communities asked for.
+fn selected(
+    entry: &CoreNetworkRoutingInformation,
+    input: &ListCoreNetworkRoutingInformationInput,
+) -> bool {
+    if let Some(filters) = input.next_hop_filters.as_ref() {
+        for (name, values) in filters {
+            let held = entry
+                .next_hop
+                .as_ref()
+                .and_then(|hop| next_hop_member(hop, name));
+            if !held.is_some_and(|held| holds(values, held)) {
+                return false;
+            }
+        }
+    }
+    if let Some(values) = input.local_preference_matches.as_ref() {
+        if !entry
+            .local_preference
+            .as_deref()
+            .is_some_and(|held| holds(values, held))
+        {
+            return false;
+        }
+    }
+    if let Some(values) = input.med_matches.as_ref() {
+        if !entry.med.as_deref().is_some_and(|held| holds(values, held)) {
+            return false;
+        }
+    }
+    if let Some(values) = input.exact_as_path_matches.as_ref() {
+        let held = entry.as_path.as_deref().unwrap_or_default().join(" ");
+        if !holds(values, &held) {
+            return false;
+        }
+    }
+    if let Some(values) = input.community_matches.as_ref() {
+        if !entry
+            .communities
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|community| holds(values, community))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// The key one route is held and paged under: its prefix, then the destination it is
+/// reached through.
+///
+/// The listing is reported in this key's order — the prefix TEXT, and for one prefix reached
+/// several ways the destination text — which is a stable order rather than a numeric one: a
+/// page token names an offset into it, and one route declared twice by the policy in force
+/// is held once. The separator is a character no prefix or id carries, so the two parts
+/// cannot run together.
+fn route_key(prefix: &str, destination: &str) -> String {
+    format!("{prefix}\u{1f}{destination}")
+}
+
 /// The `ListCoreNetworkRoutingInformation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -165,17 +271,270 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCoreNetworkRoutingInformation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCoreNetworkRoutingInformationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // request metadata.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCoreNetworkRoutingInformationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        // The resource the path addresses is checked first: an unknown core network is not
+        // found whatever the rest of the request carries.
+        let Some(core_network) = store.core_networks.get(&input.core_network_id) else {
+            return Err(
+                ListCoreNetworkRoutingInformationErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::CORE_NETWORK_KIND,
+                        &input.core_network_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // A segment and an edge location are the two coordinates of the route table this
+        // listing reads, and both are a function of the policy IN FORCE on the core network:
+        // a request naming a segment that policy does not declare, or a Region it configures
+        // no edge in, addresses no route table at all, so it is refused on the member that
+        // carried it — the same refusal a create naming an edge the policy does not
+        // configure gives. A core network's policy is in force once the `CREATING` ->
+        // `AVAILABLE` transition the clock owes has fallen due, which is exactly when a read
+        // of the core network reports its segments and edges, so until then it declares no
+        // segment here either.
+        let nothing_in_force = crate::state::PolicyTopology::default();
+        let topology = if core_network.state_at(now) == crate::state::STATE_AVAILABLE {
+            &core_network.topology
+        } else {
+            &nothing_in_force
+        };
+        if !topology.has_segment(&input.segment_name) {
+            return Err(
+                ListCoreNetworkRoutingInformationErrorModeled::ValidationException(
+                    crate::state::no_such_segment(
+                        crate::state::FIELD_SEGMENT_NAME,
+                        &input.core_network_id,
+                        &input.segment_name,
+                    ),
+                )
+                .into(),
+            );
+        }
+        if !topology.has_edge_location(&input.edge_location) {
+            return Err(
+                ListCoreNetworkRoutingInformationErrorModeled::ValidationException(
+                    crate::state::no_such_edge(
+                        crate::state::FIELD_EDGE_LOCATION,
+                        &input.core_network_id,
+                        &input.edge_location,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // A filter name that selects on no part of a next hop is refused rather than
+        // dropped: a caller that misspells one must not be answered a page selected by
+        // fewer filters than it asked for. The LENGTH of every match list is bounded here
+        // too, before anything is selected: selecting compares each route held against each
+        // value a filter carries, so the work is the product of the two, and this is what
+        // caps the caller's factor of it — the same bound every other filter of this
+        // service carries.
+        for (member, values) in [
+            (
+                crate::state::FIELD_LOCAL_PREFERENCE_MATCHES,
+                input.local_preference_matches.as_deref(),
+            ),
+            (crate::state::FIELD_MED_MATCHES, input.med_matches.as_deref()),
+            (
+                crate::state::FIELD_EXACT_AS_PATH_MATCHES,
+                input.exact_as_path_matches.as_deref(),
+            ),
+            (
+                crate::state::FIELD_COMMUNITY_MATCHES,
+                input.community_matches.as_deref(),
+            ),
+        ] {
+            crate::state::check_filter_values(member, values.unwrap_or_default()).map_err(
+                ListCoreNetworkRoutingInformationErrorModeled::ValidationException,
+            )?;
+        }
+        if let Some(filters) = input.next_hop_filters.as_ref() {
+            for (name, values) in filters {
+                if !NEXT_HOP_FILTER_NAMES.contains(&name.as_str()) {
+                    return Err(
+                        ListCoreNetworkRoutingInformationErrorModeled::ValidationException(
+                            crate::state::field_rejection(
+                                crate::state::FIELD_NEXT_HOP_FILTERS,
+                                crate::state::REASON_FIELD_VALIDATION_FAILED,
+                                format!(
+                                    "{name} names no part of a next hop; the filters are {}",
+                                    NEXT_HOP_FILTER_NAMES.join(", ")
+                                ),
+                            ),
+                        )
+                        .into(),
+                    );
+                }
+                crate::state::check_filter_values(crate::state::FIELD_NEXT_HOP_FILTERS, values)
+                    .map_err(ListCoreNetworkRoutingInformationErrorModeled::ValidationException)?;
+            }
+        }
+
+        // A token this service did not mint names no position in the listing, so it is
+        // refused on the member rather than answered with an empty page — the refusal every
+        // other listing of this service gives for the same input.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListCoreNetworkRoutingInformationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "NextToken is not a token this service issued".to_string(),
+                        reason: Some(crate::state::REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: crate::state::FIELD_NEXT_TOKEN.to_string(),
+                            message: "the token could not be parsed".to_string(),
+                        }]),
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        // The routes the segment holds at this edge, keyed by [`route_key`] so the listing
+        // is in a stable key order and a route declared twice is held once.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCoreNetworkRoutingInformation"))
+        // A segment restricting itself to other edge locations has no route table at this
+        // one, so it holds nothing here however much the core network holds elsewhere.
+        let mut routes: ::std::collections::BTreeMap<String, CoreNetworkRoutingInformation> =
+            ::std::collections::BTreeMap::new();
+        if topology.segment_present_at(&input.segment_name, &input.edge_location) {
+            // The STATIC routes the policy in force declares for this segment: each
+            // `create-route` entry's prefixes, reached through each destination it names.
+            // A destination naming an attachment carries the prefix only while that
+            // attachment is one of this segment's at this edge and is AVAILABLE — an
+            // attachment still being created, or awaiting the acceptance the policy asked
+            // for, reaches nothing yet — and a destination that names no attachment at all
+            // carries it with NO next hop, which is what a blackholed route is. A static
+            // route is originated by the core network itself, so its AS path is empty rather
+            // than unknown.
+            for route in topology.static_routes_of(&input.segment_name) {
+                for destination in &route.destinations {
+                    let next_hop = if destination == crate::state::POLICY_DESTINATION_BLACKHOLE {
+                        None
+                    } else {
+                        let Some(attachment) = store.attachments.get(destination) else {
+                            continue;
+                        };
+                        if attachment.core_network_id != input.core_network_id
+                            || attachment.segment_name.as_deref() != Some(&input.segment_name)
+                            || !attachment.sits_at(&input.edge_location)
+                            || attachment.state_at(now) != crate::state::STATE_AVAILABLE
+                        {
+                            continue;
+                        }
+                        Some(RoutingInformationNextHop {
+                            // A static route is reached through the attachment itself, not
+                            // over a BGP session, so there is no peer address to report.
+                            ip_address: None,
+                            core_network_attachment_id: Some(attachment.id.clone()),
+                            // The resource the hop reaches is the one that attachment
+                            // attaches, as that resource's own ARN names it — the same
+                            // derivation a telemetry entry's `ResourceId` makes rather than
+                            // a second copy kept beside the ARN.
+                            resource_id: Some(
+                                crate::state::arn_resource_id(&attachment.resource_arn).to_string(),
+                            ),
+                            resource_type: crate::state::arn_resource_kind(&attachment.resource_arn)
+                                .map(str::to_string),
+                            segment_name: attachment.segment_name.clone(),
+                            edge_location: Some(input.edge_location.clone()),
+                        })
+                    };
+                    for prefix in &route.destination_cidr_blocks {
+                        routes.insert(
+                            route_key(prefix, destination),
+                            CoreNetworkRoutingInformation {
+                                prefix: Some(prefix.clone()),
+                                next_hop: next_hop.clone(),
+                                // Nothing stored assigns a route a local preference, a MED
+                                // or a community: no operation of this service declares a
+                                // routing policy, so the three members are absent rather
+                                // than carrying attributes nothing set.
+                                local_preference: None,
+                                med: None,
+                                as_path: Some(Vec::new()),
+                                communities: None,
+                            },
+                        );
+                    }
+                }
+            }
+
+            // The routes this segment's BGP PEERINGS at this edge carry: a Connect peer
+            // peers one edge of the core network with an appliance over the inside IP
+            // addresses its create named, so each of those prefixes is reached through that
+            // peering — at the appliance's own address, and across the appliance's AS, which
+            // is the AS path such a route traverses. A peering carries routes only once its
+            // session is up, which is the transition the clock owes the peer, and only while
+            // its Connect attachment is an AVAILABLE attachment of this segment.
+            for peer in store.connect_peers.values().filter(|peer| {
+                peer.core_network_id == input.core_network_id
+                    && peer.edge_location == input.edge_location
+                    && peer.state_at(now) == crate::state::STATE_AVAILABLE
+            }) {
+                let Some(attachment) = store.attachments.get(&peer.connect_attachment_id) else {
+                    continue;
+                };
+                if attachment.segment_name.as_deref() != Some(&input.segment_name)
+                    || attachment.state_at(now) != crate::state::STATE_AVAILABLE
+                {
+                    continue;
+                }
+                let as_path: Vec<String> = peer.peer_asn.iter().map(i64::to_string).collect();
+                for prefix in &peer.inside_cidr_blocks {
+                    routes.insert(
+                        route_key(prefix, &peer.id),
+                        CoreNetworkRoutingInformation {
+                            prefix: Some(prefix.clone()),
+                            next_hop: Some(RoutingInformationNextHop {
+                                ip_address: Some(peer.peer_address.clone()),
+                                core_network_attachment_id: Some(attachment.id.clone()),
+                                // The resource the hop reaches is the peering itself, which
+                                // is a network resource of this service
+                                // (`crate::state::CONNECT_PEER_KIND`), so it is named the
+                                // way the global network's inventory names it.
+                                resource_id: Some(peer.id.clone()),
+                                resource_type: Some(crate::state::CONNECT_PEER_KIND.to_string()),
+                                segment_name: attachment.segment_name.clone(),
+                                edge_location: Some(peer.edge_location.clone()),
+                            }),
+                            local_preference: None,
+                            med: None,
+                            as_path: Some(as_path.clone()),
+                            communities: None,
+                        },
+                    );
+                }
+            }
+        }
+        drop(store);
+
+        // Reporting a route never writes: every entry above is a function of the stored
+        // policy, the stored peerings and attachments and the clock, so this read leaves the
+        // store exactly as the next caller would have found it.
+        let entries: Vec<(String, CoreNetworkRoutingInformation)> = routes
+            .into_iter()
+            .filter(|(_, entry)| selected(entry, &input))
+            .collect();
+        let page = crate::state::paginate(entries, after.as_deref(), input.max_results);
+        Ok(ListCoreNetworkRoutingInformationOutput {
+            core_network_routing_information: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }
