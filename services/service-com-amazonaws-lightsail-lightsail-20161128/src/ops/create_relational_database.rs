@@ -411,6 +411,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Nothing has asked this database to change yet, so nothing is
                 // waiting for its maintenance window.
                 pending_modification: None,
+                // Nothing has happened to this database yet: the first entry of
+                // its event log is the one the clock writes when the database
+                // has finished being provisioned.
+                events: Vec::new(),
+                next_event_sequence: 0,
             });
             // `operations` is a list because other Lightsail creates act on
             // several resources at once; `CreateRelationalDatabase` creates

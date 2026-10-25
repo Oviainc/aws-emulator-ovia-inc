@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRelationalDatabaseEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRelationalDatabaseEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRelationalDatabaseEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the event log of ONE managed relational database: the entries the
+//! service appended as it changed that database — its engine going down and
+//! coming back up, a snapshot of it being taken, a modification or a parameter
+//! value reaching it — each timestamped at the instant the change happened and
+//! carrying the categories it falls in.
+//!
+//! The log is the stored database's own
+//! ([`crate::state::StoredRelationalDatabase::events`]); this operation only
+//! reports a window of it:
+//!
+//! * `durationInMinutes` opens the window "in the past from which to retrieve
+//!   events", defaulting to the published 60 minutes and accepted between the
+//!   published 1 and 20160 (14 days) — a request outside that is refused with
+//!   the modelled `InvalidInputException` rather than silently clamped;
+//! * the entries inside the window are reported OLDEST FIRST, as the log holds
+//!   them, at most [`crate::state::RELATIONAL_DATABASE_EVENT_PAGE_SIZE`] at a
+//!   time, and `nextPageToken` names the first entry of the page after this one
+//!   while entries remain;
+//! * a `pageToken` that names no entry of that window is refused the same way,
+//!   because there is no page to answer.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +185,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRelationalDatabaseEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRelationalDatabaseEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRelationalDatabaseEvents"))
+        // Reporting only: the answer is the window of the stored database's own
+        // event log the request asked for, and nothing about the request changes
+        // that log. A database is addressed by name alone, so `ctx`'s request
+        // metadata takes no part in it.
+        let _ = ctx;
+
+        // `relationalDatabaseName` is a modelled `@required` member carrying the
+        // `ResourceName` pattern, so the centralized walk already refused an
+        // absent or malformed name. A well-formed name that names nothing is the
+        // service's `DoesNotExist` rejection, never an empty 200.
+        let name = input.relational_database_name;
+
+        // "The number of minutes in the past from which to retrieve events. …
+        // Default: 60 The minimum is 1 and the maximum is 14 days (20160
+        // minutes)." The model carries no range trait for it, so the bounds are
+        // this handler's to enforce — and a value outside them is REFUSED rather
+        // than clamped, because a caller that asked for a window the service
+        // does not serve would otherwise be answered another window's events as
+        // if they were the one it asked for.
+        let duration_in_minutes = input
+            .duration_in_minutes
+            .unwrap_or(crate::state::RELATIONAL_DATABASE_EVENT_DEFAULT_DURATION_MINUTES);
+        if !(crate::state::RELATIONAL_DATABASE_EVENT_MIN_DURATION_MINUTES
+            ..=crate::state::RELATIONAL_DATABASE_EVENT_MAX_DURATION_MINUTES)
+            .contains(&duration_in_minutes)
+        {
+            return Err(invalid_duration(duration_in_minutes));
+        }
+
+        // The instant the window opens at: the events reported are the ones the
+        // log holds at or after it.
+        let since_ms = crate::state::now_ms()
+            .saturating_sub(i64::from(duration_in_minutes).saturating_mul(60_000));
+        // An absent `pageToken` asks for the first page, and so does one the
+        // request carried empty: an empty token names nothing, which is what a
+        // caller that has not paged yet has.
+        let page_token = input.page_token.as_deref().filter(|token| !token.is_empty());
+
+        let (relational_database_events, next_page_token) =
+            crate::state::with_state(&*self.engine, |store| {
+                let database = store
+                    .relational_database(&name)
+                    .ok_or_else(|| not_found(&name))?;
+                database
+                    .event_page(since_ms, page_token)
+                    .ok_or_else(|| invalid_page_token(page_token.unwrap_or_default(), &name))
+            })
+            .ok_or_else(unavailable)??;
+
+        Ok(GetRelationalDatabaseEventsOutput {
+            // A page always reports a list, empty or not: a database nothing has
+            // happened to inside the window has no events to report, and an
+            // absent member would hand a typed caller a null where it iterates.
+            relational_database_events: Some(relational_database_events),
+            // "A next page token is not returned if there are no more results to
+            // display."
+            next_page_token,
+        })
     }
+}
+
+/// No managed relational database of that name is stored: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(name: &str) -> GetRelationalDatabaseEventsError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+        name,
+    )
+}
+
+/// `durationInMinutes` is outside the window this operation retrieves events
+/// from: the modelled `InvalidInputException`, documented as "user input does not
+/// conform to the validation rules of an input field", whose message names the
+/// member, the value it carried and the published bounds.
+fn invalid_duration(duration_in_minutes: i32) -> GetRelationalDatabaseEventsError {
+    GetRelationalDatabaseEventsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(format!(
+            "durationInMinutes {duration_in_minutes} is outside the window this operation \
+             retrieves events from: the minimum is {} and the maximum is {} minutes",
+            crate::state::RELATIONAL_DATABASE_EVENT_MIN_DURATION_MINUTES,
+            crate::state::RELATIONAL_DATABASE_EVENT_MAX_DURATION_MINUTES,
+        )),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// `pageToken` names no event of the window this request asked for, so there is
+/// no page to answer: the same modelled `InvalidInputException`. A page token is
+/// the one a previous page reported as `nextPageToken`, and a shorter window — or
+/// one asked for later — need not still hold that event.
+fn invalid_page_token(token: &str, name: &str) -> GetRelationalDatabaseEventsError {
+    GetRelationalDatabaseEventsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(format!(
+            "pageToken {token:?} does not name an event of the database {name} inside the \
+             requested window; a page token is the one a previous \
+             GetRelationalDatabaseEvents page reported as nextPageToken"
+        )),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetRelationalDatabaseEventsError {
+    GetRelationalDatabaseEventsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

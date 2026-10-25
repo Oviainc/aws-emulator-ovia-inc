@@ -25,6 +25,8 @@ mod delivery_stream_tag_updates;
 mod delivery_stream_tags;
 #[path = "all/description_defaults.rs"]
 mod description_defaults;
+#[path = "all/destination_delivery.rs"]
+mod destination_delivery;
 #[path = "all/destination_update.rs"]
 mod destination_update;
 #[path = "all/refusal_messages.rs"]

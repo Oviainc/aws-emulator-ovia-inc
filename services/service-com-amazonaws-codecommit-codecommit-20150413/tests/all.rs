@@ -65,6 +65,8 @@ mod differences;
 mod file_commit_history;
 #[path = "all/file_deletion.rs"]
 mod file_deletion;
+#[path = "all/folder_collection_members.rs"]
+mod folder_collection_members;
 #[path = "all/folder_listing.rs"]
 mod folder_listing;
 #[path = "all/git_object_ids.rs"]
@@ -85,6 +87,8 @@ mod object_store_bounds;
 mod path_depth_bound;
 #[path = "all/pull_request_creation.rs"]
 mod pull_request_creation;
+#[path = "all/refusal_message_shape.rs"]
+mod refusal_message_shape;
 #[path = "all/repositories_for_approval_rule_template.rs"]
 mod repositories_for_approval_rule_template;
 #[path = "all/repository_description.rs"]

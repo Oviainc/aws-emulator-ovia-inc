@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the ARNs of the clusters STORED for this account.
+//!
+//! Every ARN comes from the `clusters` map in [`crate::state`] — the records
+//! `CreateCluster` wrote — in a total order, paged at `maxResults`. A cluster
+//! `DeleteCluster` tombstoned is NOT one of the account's existing clusters: the
+//! operation "Returns a list of existing clusters" and the `Cluster$status` doc reads
+//! `INACTIVE` as "The cluster has been deleted", so a tombstone is left to the readers
+//! that own it (`DescribeClusters`, `DeleteCluster`). Nothing here mints, mutates or
+//! counts anything: this is a reporting operation (`@readonly` in the model), and a
+//! cluster's own record carries no clock-owed transition that changes WHICH clusters
+//! exist, so this read writes nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -160,20 +163,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListClusters"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListClustersErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "This value can be between 1 and 100."
+        if let Some(max_results) = input.max_results {
+            if !(1..=crate::state::MAX_LIST_PAGE_SIZE).contains(&max_results) {
+                return Err(ListClustersErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "maxResults must be between 1 and {}; got {max_results}",
+                            crate::state::MAX_LIST_PAGE_SIZE
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let guard = state.lock();
+
+        // `nextToken`: "This token should be treated as an opaque identifier that is only
+        // used to retrieve the next items in a list and not for other programmatic
+        // purposes." This operation mints it as the ARN of the cluster the next page
+        // starts at, so a value that names no cluster this account holds is an identifier
+        // that names no page — a `ClientException`, the error for a request "specifying an
+        // identifier that isn't valid" — rather than being read as some insertion point in
+        // the sequence. The cluster only has to be STORED, whatever its status: a token
+        // minted mid-walk still resumes after the cluster it names has been deleted out of
+        // this listing.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) if guard.clusters.values().any(|cluster| cluster.arn == token) => {
+                Some(token.to_string())
+            }
+            Some(_) => {
+                return Err(ListClustersErrorModeled::ClientException(ClientException {
+                    message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                })
+                .into())
+            }
+        };
+
+        // "Returns a list of existing clusters" — every stored cluster the caller has not
+        // deleted, which is what `crate::state`'s `active_cluster` means by a cluster an
+        // operation may act in.
+        let mut matching: Vec<String> = guard
+            .clusters
+            .values()
+            .filter(|cluster| cluster.status != crate::state::CLUSTER_INACTIVE)
+            .map(|cluster| cluster.arn.clone())
+            .collect();
+        // A cluster ARN is `cluster/<name>` and cluster names are unique in an account, so
+        // sorting the ARNs totally orders them and gives paging a stable sequence to walk.
+        matching.sort();
+
+        // "If this parameter isn't used, then ListClusters returns up to 100 results and a
+        // nextToken value if applicable."
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
+        // The token is the ARN the next page starts at, so a page is unaffected by
+        // clusters created or deleted before it.
+        let start = match resume_at.as_deref() {
+            Some(resume) => matching.partition_point(|arn| arn.as_str() < resume),
+            None => 0,
+        };
+        // `start` is either 0 or a `partition_point` result, so it never exceeds the
+        // length and the slice below is always in range.
+        let end = start.saturating_add(page_size).min(matching.len());
+        let cluster_arns = matching[start..end].to_vec();
+        // "This value is null when there are no more results to return."
+        let next_token = matching.get(end).cloned();
+
+        Ok(ListClustersOutput {
+            cluster_arns: Some(cluster_arns),
+            next_token,
+        })
     }
 }
+

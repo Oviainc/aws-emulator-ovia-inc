@@ -103,6 +103,10 @@ pub(crate) async fn error_as(
 /// the status asserted: the same parse as [`error_as`], for a suite that asserts
 /// what the error SAYS as well as which one it is. awsJson carries the code in
 /// `__type` (optionally namespace-qualified) and the message in `message`.
+///
+/// A body that carries NO message text reads as the empty string, which is what an
+/// AWS SDK's parsed `Error.Message` holds for such a response — so a suite can
+/// assert the absence of a message as well as its text.
 pub(crate) async fn refusal_as(
     router: &MultiServiceRouter,
     access_key_id: &str,
@@ -125,7 +129,7 @@ pub(crate) async fn refusal_as(
         .get("message")
         .or_else(|| payload.get("Message"))
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("operation {operation}: no message in {payload}"))
+        .unwrap_or_default()
         .to_string();
     (code, message)
 }

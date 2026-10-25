@@ -91,7 +91,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{no_such_hosted_zone, normalize_zone_id, vpc_id_is_well_formed};
+use crate::state::{
+    no_such_hosted_zone, normalize_zone_id, vpc_id_is_well_formed, vpc_region_is_modelled,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -173,17 +175,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // A disassociation names ONE VPC, and `VPC$VPCId` is what identifies it.
-        // Neither member of the shared `VPC` container is modelled as required
-        // (it is also used by the operations that merely report one), so the
-        // handler is what refuses a request naming no VPC at all — the same
-        // refusal `AssociateVPCWithHostedZone` makes for the same input.
+        // A disassociation names ONE VPC the way the request that associated it
+        // named it: `VPC$VPCId` is what identifies it, and `VPC$VPCRegion` is
+        // "(Private hosted zones only) The region that an Amazon VPC was created
+        // in". Neither member of the shared `VPC` container is modelled as
+        // required (it is also used by the operations that merely report one), so
+        // the handler is what refuses a request naming no VPC at all — the same
+        // two refusals `AssociateVPCWithHostedZone` makes for the same input, so
+        // a `VPC` block one of them accepts is a block the other accepts too.
+        // The region branch is reached only for an ABSENT member: a value outside
+        // the modelled `VPCRegion` enum is refused by the request boundary, which
+        // enforces every modelled constraint before this handler runs.
         let vpc_id = input.vpc.vpc_id.as_deref().unwrap_or_default().trim();
         let vpc_region = input.vpc.vpc_region.as_deref().unwrap_or_default().trim();
         if !vpc_id_is_well_formed(vpc_id) {
             return Err(DisassociateVPCFromHostedZoneErrorModeled::InvalidVPCId(InvalidVPCId {
                 message: Some(format!(
                     "Invalid VPC ID: {vpc_id:?} is not a valid Amazon VPC ID"
+                )),
+            })
+            .into());
+        }
+        if !vpc_region_is_modelled(vpc_region) {
+            return Err(DisassociateVPCFromHostedZoneErrorModeled::InvalidInput(InvalidInput {
+                message: Some(format!(
+                    "Invalid request: VPC.VPCRegion {vpc_region:?} is not a region an Amazon VPC \
+                     can be created in"
                 )),
             })
             .into());

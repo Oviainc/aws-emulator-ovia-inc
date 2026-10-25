@@ -39,6 +39,11 @@ const ACCOUNT: &str = "000000000000";
 /// same front door rather than standing up a second harness.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The one engine the mounted service reads and writes, kept so a sibling
+    /// suite can reach the store for a fixture the API itself cannot produce —
+    /// a record whose instant is far enough in the past that a windowed read
+    /// leaves it out.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -48,9 +53,17 @@ impl Emulator {
         // The suite signs nothing; routing is by `X-Amz-Target`.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_lightsail_lightsail_20161128::EmulatedService::new(engine),
+            service_com_amazonaws_lightsail_lightsail_20161128::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// The shared engine this emulator's service holds, for a case that has to
+    /// reach the store directly.
+    pub(crate) fn engine(&self) -> &engine::InMemoryEngine {
+        &self.engine
     }
 
     /// Call `operation` with `body`, answering its HTTP status and parsed body.

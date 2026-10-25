@@ -18,7 +18,8 @@
 //! ([`claim_bucket_object_store`]) rather than keeping a second object map here —
 //! the **managed relational database** (a MySQL or PostgreSQL database the service
 //! runs for the account) together with the **database snapshot** (a point-in-time
-//! copy of one), the **load balancer** (a regional resource that spreads
+//! copy of one) and the **event log** each database carries of what the service
+//! has done to it, the **load balancer** (a regional resource that spreads
 //! HTTP traffic across the instances attached to it), the **static IP** (a public
 //! IPv4 address the account reserves and attaches to an instance), the **CDN
 //! distribution** (a global resource that caches and serves the content of an
@@ -473,6 +474,87 @@ pub const RELATIONAL_DATABASE_SNAPSHOT_STATE_CREATING: &str = "creating";
 /// See [`RELATIONAL_DATABASE_SNAPSHOT_STATE_CREATING`].
 pub const RELATIONAL_DATABASE_SNAPSHOT_STATE_AVAILABLE: &str = "available";
 
+/// `RelationalDatabaseEvent$eventCategories` values this slice uses — "The
+/// category that the database event belongs to", a plain string in the model with
+/// no enum behind it.
+///
+/// A Lightsail managed database is an Amazon RDS DB instance, so what happens to
+/// it is an RDS DB instance event and carries RDS's own event categories (Amazon
+/// RDS User Guide, "Amazon RDS event categories and event messages"):
+/// `creation` while the database is being provisioned, `availability` for its
+/// engine going down and coming back up, `backup` for a snapshot of it being
+/// taken, and `configuration change` for a modification reaching it.
+pub const RELATIONAL_DATABASE_EVENT_CATEGORY_CREATION: &str = "creation";
+/// See [`RELATIONAL_DATABASE_EVENT_CATEGORY_CREATION`].
+pub const RELATIONAL_DATABASE_EVENT_CATEGORY_AVAILABILITY: &str = "availability";
+/// See [`RELATIONAL_DATABASE_EVENT_CATEGORY_CREATION`].
+pub const RELATIONAL_DATABASE_EVENT_CATEGORY_BACKUP: &str = "backup";
+/// See [`RELATIONAL_DATABASE_EVENT_CATEGORY_CREATION`].
+pub const RELATIONAL_DATABASE_EVENT_CATEGORY_CONFIGURATION_CHANGE: &str = "configuration change";
+
+/// The event a database logs once it has finished being provisioned and accepts
+/// connections.
+///
+/// CHOSEN wording: the model publishes no event text, only that
+/// `RelationalDatabaseEvent$message` is "the message of the database event". What
+/// the service DOES guarantee, and what this slice keeps, is that one entry is
+/// logged per change the service makes to the database, at the instant it
+/// happened, in the categories that change falls in.
+pub const RELATIONAL_DATABASE_EVENT_CREATED: &str = "Database created";
+/// See [`RELATIONAL_DATABASE_EVENT_CREATED`]. Logged when the engine is asked to
+/// go down — a restart or a stop.
+pub const RELATIONAL_DATABASE_EVENT_SHUTDOWN: &str = "Database shutdown";
+/// See [`RELATIONAL_DATABASE_EVENT_CREATED`]. Logged when a restart has brought
+/// the engine back up.
+pub const RELATIONAL_DATABASE_EVENT_RESTARTED: &str = "Database restarted";
+/// See [`RELATIONAL_DATABASE_EVENT_CREATED`]. Logged when the engine has finished
+/// shutting down.
+pub const RELATIONAL_DATABASE_EVENT_STOPPED: &str = "Database stopped";
+/// See [`RELATIONAL_DATABASE_EVENT_CREATED`]. Logged when a stopped database's
+/// engine is serving again.
+pub const RELATIONAL_DATABASE_EVENT_STARTED: &str = "Database started";
+/// See [`RELATIONAL_DATABASE_EVENT_CREATED`]. Logged when a snapshot of the
+/// database starts being taken.
+pub const RELATIONAL_DATABASE_EVENT_BACKUP_STARTED: &str = "Backing up database";
+/// See [`RELATIONAL_DATABASE_EVENT_CREATED`]. Logged when that snapshot can be
+/// restored from.
+pub const RELATIONAL_DATABASE_EVENT_BACKUP_FINISHED: &str = "Finished database backup";
+/// See [`RELATIONAL_DATABASE_EVENT_CREATED`]. Logged when a value reaches the
+/// database's parameter group.
+pub const RELATIONAL_DATABASE_EVENT_PARAMETER_GROUP_CHANGED: &str =
+    "Applied change to database parameter group";
+/// See [`RELATIONAL_DATABASE_EVENT_CREATED`]. Logged when a modification reaches
+/// the database, followed by the members it changed.
+pub const RELATIONAL_DATABASE_EVENT_MODIFICATION_APPLIED: &str = "Applied database modification";
+
+/// The window `GetRelationalDatabaseEvents` reports when the request names none.
+///
+/// An AWS-published value: "The number of minutes in the past from which to
+/// retrieve events. … Default: 60" (the modelled `durationInMinutes`
+/// documentation).
+pub const RELATIONAL_DATABASE_EVENT_DEFAULT_DURATION_MINUTES: i32 = 60;
+
+/// The shortest window `GetRelationalDatabaseEvents` accepts: "The minimum is 1"
+/// (the modelled `durationInMinutes` documentation).
+pub const RELATIONAL_DATABASE_EVENT_MIN_DURATION_MINUTES: i32 = 1;
+
+/// The longest window `GetRelationalDatabaseEvents` accepts: "the maximum is 14
+/// days (20160 minutes)" (the modelled `durationInMinutes` documentation).
+pub const RELATIONAL_DATABASE_EVENT_MAX_DURATION_MINUTES: i32 = 20_160;
+
+/// How long an entry stays in a database's event log.
+///
+/// The longest window a caller may ask for, so an entry older than this can
+/// never be reported again and is dropped rather than kept for ever.
+pub const RELATIONAL_DATABASE_EVENT_RETENTION_MILLIS: i64 =
+    RELATIONAL_DATABASE_EVENT_MAX_DURATION_MINUTES as i64 * 60_000;
+
+/// The most events one database's log keeps, oldest dropped first.
+///
+/// Emulator resource guard, like [`MAX_OPERATION_HISTORY`]: the log is
+/// append-only, so without a cap a long-lived emulator would grow without bound.
+pub const MAX_RELATIONAL_DATABASE_EVENTS: usize = 500;
+
 // ---------------------------------------------------------------------------
 // Operation log
 // ---------------------------------------------------------------------------
@@ -740,6 +822,15 @@ pub const RELATIONAL_DATABASE_PAGE_SIZE: usize = 10;
 /// [`INSTANCE_PAGE_SIZE`], so every stored-resource listing in this slice pages
 /// the same way.
 pub const RELATIONAL_DATABASE_SNAPSHOT_PAGE_SIZE: usize = 10;
+
+/// How many database events one `GetRelationalDatabaseEvents` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more events remain — "A next page
+/// token is not returned if there are no more results to display." Matches
+/// [`INSTANCE_PAGE_SIZE`], so every paged listing in this slice pages the same
+/// way.
+pub const RELATIONAL_DATABASE_EVENT_PAGE_SIZE: usize = 10;
 
 /// How many instance snapshots one `GetInstanceSnapshots` page carries.
 ///
@@ -5967,6 +6058,55 @@ impl PendingRelationalDatabaseModification {
     }
 }
 
+/// One entry of a managed relational database's event log: what the service did
+/// to the database, when it did it, and the categories that change falls in —
+/// the modelled `RelationalDatabaseEvent` as this store holds it.
+///
+/// The log is the DATABASE's own: it is appended to by the service's own changes
+/// to that database and by nothing else, so a read of it reports what happened
+/// rather than anything the reading request carried.
+#[derive(Debug, Clone)]
+pub struct StoredRelationalDatabaseEvent {
+    /// This entry's position in its database's log, drawn from the entry before
+    /// it so it is never reused: the `pageToken`
+    /// `GetRelationalDatabaseEvents` names a page by, which an entry needs
+    /// because nothing else about an event identifies it — two changes can carry
+    /// the same message at the same instant.
+    pub sequence: u64,
+    /// Epoch milliseconds at which the change happened.
+    pub created_at_ms: i64,
+    /// What happened, from this module's `RELATIONAL_DATABASE_EVENT_*` wording.
+    pub message: String,
+    /// The categories the change falls in, from the
+    /// `RELATIONAL_DATABASE_EVENT_CATEGORY_*` values.
+    pub categories: Vec<&'static str>,
+}
+
+impl StoredRelationalDatabaseEvent {
+    /// This entry as the modelled `RelationalDatabaseEvent` of the database
+    /// `resource` names — "the database that the database event relates to".
+    pub fn view(&self, resource: &str) -> crate::ops::types::RelationalDatabaseEvent {
+        crate::ops::types::RelationalDatabaseEvent {
+            resource: Some(resource.to_string()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            message: Some(self.message.clone()),
+            // A list member is reported as a list, so a typed caller iterating
+            // the categories of an event is handed one.
+            event_categories: Some(
+                self.categories
+                    .iter()
+                    .map(|category| (*category).to_string())
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The page token that names THIS entry.
+    pub fn page_token(&self) -> String {
+        self.sequence.to_string()
+    }
+}
+
 /// One stored managed relational database: every member `GetRelationalDatabase`
 /// reports, the master user password `GetRelationalDatabaseMasterUserPassword`
 /// answers with, and the clock-owed transition its state is waiting on.
@@ -6026,10 +6166,23 @@ pub struct StoredRelationalDatabase {
     /// parameter nothing has set is absent, and reports what the engine and this
     /// database's own hardware give it.
     pub parameter_overrides: BTreeMap<String, StoredParameterOverride>,
-    /// The modification an `UpdateRelationalDatabase` call left for this
+    /// The modification an `UpdateRelationalDatabase` call has left for this
     /// database's next maintenance window, while one is outstanding — what
     /// `pendingModifiedValues` reports until the clock applies it.
     pub pending_modification: Option<PendingRelationalDatabaseModification>,
+    /// This database's event log, oldest first — the source of truth for what
+    /// `GetRelationalDatabaseEvents` reports.
+    ///
+    /// One entry per change the SERVICE made to this database: its engine going
+    /// down and coming back up, a snapshot of it being taken, a modification or
+    /// a parameter value reaching it. Appended through
+    /// [`StoredRelationalDatabase::record_event`], which is also what keeps the
+    /// log bounded.
+    pub events: Vec<StoredRelationalDatabaseEvent>,
+    /// The token the next entry of this database's log is named by, counted on
+    /// from the last one minted rather than from the entries still held, so a
+    /// token is never reused after retention has dropped the entry it named.
+    pub next_event_sequence: u64,
 }
 
 impl StoredRelationalDatabase {
@@ -6070,16 +6223,128 @@ impl StoredRelationalDatabase {
     /// The value is carried from here on, and a value applied
     /// `pending-reboot` also leaves the RUNNING engine behind — which is what
     /// [`Self::parameter_apply_status`] reports.
-    pub fn set_parameter(&mut self, update: RelationalDatabaseParameterUpdate) {
+    ///
+    /// The modification reaches the parameter group when the call is answered,
+    /// so that is a change to the database and its log carries one entry for it.
+    ///
+    /// ONE rule for the whole log: an entry says something about this database
+    /// CHANGED, so the apply is logged only where it moves the parameter group —
+    /// a value, or the apply method it was set with, that differs from the one
+    /// this database already carried. Re-sending the value a parameter already
+    /// holds changes nothing and logs nothing, exactly as re-sending a
+    /// modification does ([`Self::apply_modification`]).
+    pub fn set_parameter(&mut self, update: RelationalDatabaseParameterUpdate, now_ms: i64) {
         let pending_reboot = update.apply_method == PARAMETER_APPLY_METHOD_PENDING_REBOOT;
+        let parameter_name = update.spec.parameter_name.to_string();
+        let moved = self
+            .parameter_overrides
+            .get(&parameter_name)
+            .is_none_or(|held| {
+                held.value != update.value || held.apply_method != update.apply_method
+            });
         self.parameter_overrides.insert(
-            update.spec.parameter_name.to_string(),
+            parameter_name.clone(),
             StoredParameterOverride {
                 value: update.value,
                 apply_method: update.apply_method,
                 pending_reboot,
             },
         );
+        if moved {
+            self.record_event(
+                now_ms,
+                format!("{RELATIONAL_DATABASE_EVENT_PARAMETER_GROUP_CHANGED}: {parameter_name}"),
+                &[RELATIONAL_DATABASE_EVENT_CATEGORY_CONFIGURATION_CHANGE],
+            );
+        }
+    }
+
+    /// Append one entry to this database's event log: `message` happened to it
+    /// at `at_ms`, in `categories`.
+    ///
+    /// The ONE place an event is logged, so every change the service makes to a
+    /// database is recorded the same way, and the log is bounded here rather
+    /// than by whoever logs: an entry older than the longest window a caller may
+    /// ask for ([`RELATIONAL_DATABASE_EVENT_RETENTION_MILLIS`]) can never be
+    /// reported again, and the count is capped at
+    /// [`MAX_RELATIONAL_DATABASE_EVENTS`] for the same reason the operation log
+    /// is capped.
+    pub fn record_event(
+        &mut self,
+        at_ms: i64,
+        message: impl Into<String>,
+        categories: &[&'static str],
+    ) {
+        // The token is drawn from a counter of its own rather than from the
+        // entry before it, so a number is never handed out twice however many
+        // entries retention has dropped: a token a client is still holding can
+        // then only name the entry it was reported for.
+        let sequence = self.next_event_sequence;
+        self.next_event_sequence = self.next_event_sequence.wrapping_add(1);
+        let event = StoredRelationalDatabaseEvent {
+            sequence,
+            created_at_ms: at_ms,
+            message: message.into(),
+            categories: categories.to_vec(),
+        };
+        // The log is held OLDEST FIRST, which is the order it is reported in, so
+        // an entry is placed by its instant rather than appended: two changes
+        // that fall due in the same pass of the clock are not necessarily made
+        // due in the order the pass walks them. An entry at the same instant as
+        // one already held goes after it, so changes that share an instant keep
+        // the order they happened in.
+        let at = self
+            .events
+            .iter()
+            .rposition(|held| held.created_at_ms <= at_ms)
+            .map_or(0, |position| position.saturating_add(1));
+        self.events.insert(at, event);
+        let oldest_reportable = at_ms.saturating_sub(RELATIONAL_DATABASE_EVENT_RETENTION_MILLIS);
+        self.events
+            .retain(|event| event.created_at_ms >= oldest_reportable);
+        if let Some(excess) = self.events.len().checked_sub(MAX_RELATIONAL_DATABASE_EVENTS) {
+            self.events.drain(..excess);
+        }
+    }
+
+    /// One page of this database's events inside the window that opens at
+    /// `since_ms`, and the token naming the first event of the page after it —
+    /// present only while events remain.
+    ///
+    /// Oldest first, as the log holds them, and at most
+    /// [`RELATIONAL_DATABASE_EVENT_PAGE_SIZE`] of them. The walk is
+    /// [`catalog_page`], shared with this service's other paged listings; only
+    /// the token an entry is named by is this log's own
+    /// ([`StoredRelationalDatabaseEvent::page_token`]). `None` is the answer
+    /// when `page_token` names no event of that window — there is no page to
+    /// report, which the caller turns into a refusal — and an absent token asks
+    /// for the first page.
+    pub fn event_page(
+        &self,
+        since_ms: i64,
+        page_token: Option<&str>,
+    ) -> Option<(
+        Vec<crate::ops::types::RelationalDatabaseEvent>,
+        Option<String>,
+    )> {
+        let reported = self
+            .events
+            .iter()
+            .filter(|event| event.created_at_ms >= since_ms)
+            .collect::<Vec<_>>();
+        let (page, next_page_token) = catalog_page(
+            &reported,
+            RELATIONAL_DATABASE_EVENT_PAGE_SIZE,
+            page_token,
+            // Owned, because an event is named by its sequence number rather
+            // than by a string member it holds. The walk is over at most
+            // [`MAX_RELATIONAL_DATABASE_EVENTS`] entries, so it is bounded.
+            |event| Some(std::borrow::Cow::Owned(event.page_token())),
+        )?;
+        Some((
+            page.iter().map(|event| event.view(&self.name)).collect(),
+            next_page_token,
+        ))
     }
 
     /// Change the three members of this database a modification can carry,
@@ -6109,7 +6374,7 @@ impl StoredRelationalDatabase {
                 .unwrap_or_default();
             merged.merge(change);
             if !merged.is_empty() {
-                self.apply_modification(merged);
+                self.apply_modification(merged, now_ms);
             }
             return None;
         }
@@ -6134,15 +6399,44 @@ impl StoredRelationalDatabase {
 
     /// Write `change` into this record: the database carries the new values from
     /// here on, and nothing is waiting on them any more.
-    fn apply_modification(&mut self, change: RelationalDatabaseModification) {
+    ///
+    /// `at_ms` is the instant the modification reached the database — the call's
+    /// own instant when it asked to apply now, and the instant it fell due when
+    /// the clock applied it — which is what the entry this logs is timestamped
+    /// at.
+    fn apply_modification(&mut self, change: RelationalDatabaseModification, at_ms: i64) {
+        // A member is a CHANGE only where the value differs from the one the
+        // database already carries: a modification that asks for what the
+        // database already has leaves it as it is and logs nothing, the same
+        // rule the members an update applies at once are held to.
+        let mut changed: Vec<&'static str> = Vec::new();
         if let Some(password) = change.master_user_password {
+            if self.master_user_password.as_deref() != Some(password.as_str()) {
+                changed.push("masterUserPassword");
+            }
             self.master_user_password = Some(password);
         }
         if let Some(blueprint) = change.blueprint {
+            if blueprint.blueprint_id() != self.blueprint.blueprint_id() {
+                changed.push("engineVersion");
+            }
             self.blueprint = blueprint;
         }
         if let Some(enabled) = change.backup_retention_enabled {
+            if enabled != self.backup_retention_enabled {
+                changed.push("backupRetentionEnabled");
+            }
             self.backup_retention_enabled = enabled;
+        }
+        if !changed.is_empty() {
+            self.record_event(
+                at_ms,
+                format!(
+                    "{RELATIONAL_DATABASE_EVENT_MODIFICATION_APPLIED}: {}",
+                    changed.join(", ")
+                ),
+                &[RELATIONAL_DATABASE_EVENT_CATEGORY_CONFIGURATION_CHANGE],
+            );
         }
     }
 
@@ -6158,7 +6452,7 @@ impl StoredRelationalDatabase {
             return;
         }
         if let Some(pending) = self.pending_modification.take() {
-            self.apply_modification(pending.change);
+            self.apply_modification(pending.change, pending.at_ms);
         }
     }
 
@@ -6182,6 +6476,14 @@ impl StoredRelationalDatabase {
             now_ms,
             RELATIONAL_DATABASE_STATE_AVAILABLE,
         ));
+        // The engine goes down here and comes back up when the transition is
+        // due, so the restart is TWO entries in the log, each at its own
+        // instant.
+        self.record_event(
+            now_ms,
+            RELATIONAL_DATABASE_EVENT_SHUTDOWN,
+            &[RELATIONAL_DATABASE_EVENT_CATEGORY_AVAILABILITY],
+        );
     }
 
     /// Start shutting this database's engine down: the database reports
@@ -6202,6 +6504,13 @@ impl StoredRelationalDatabase {
             now_ms,
             RELATIONAL_DATABASE_STATE_STOPPED,
         ));
+        // As with a restart: the engine goes down here, and the log carries a
+        // second entry when it has finished shutting down.
+        self.record_event(
+            now_ms,
+            RELATIONAL_DATABASE_EVENT_SHUTDOWN,
+            &[RELATIONAL_DATABASE_EVENT_CATEGORY_AVAILABILITY],
+        );
     }
 
     /// Start this database's engine back up: the database reports
@@ -9410,6 +9719,22 @@ impl ComAmazonawsLightsailLightsail20161128State {
             from_relational_database_blueprint_id: source.blueprint.blueprint_id(),
         };
         self.insert_relational_database_snapshot(snapshot.clone());
+        // Taking a snapshot is something the service does TO the source
+        // database, so the source's own event log carries it — and a second
+        // entry when the copy can be restored from (see [`Self::advance_clock`]).
+        if let Some(database) = self
+            .relational_databases
+            .get_mut(&snapshot.from_relational_database_name)
+        {
+            database.record_event(
+                now_ms,
+                format!(
+                    "{RELATIONAL_DATABASE_EVENT_BACKUP_STARTED}: {}",
+                    snapshot.name
+                ),
+                &[RELATIONAL_DATABASE_EVENT_CATEGORY_BACKUP],
+            );
+        }
         snapshot
     }
 
@@ -10055,8 +10380,40 @@ impl ComAmazonawsLightsailLightsail20161128State {
                 // restarted, and one being started again after a stop.
                 let engine_coming_up = database.state == RELATIONAL_DATABASE_STATE_REBOOTING
                     || database.state == RELATIONAL_DATABASE_STATE_STARTING;
+                let was_creating = database.state == RELATIONAL_DATABASE_STATE_CREATING;
+                let was_rebooting = database.state == RELATIONAL_DATABASE_STATE_REBOOTING;
                 database.state = due.state;
                 database.due = None;
+                // Settling into a new state is a change to the database, so the
+                // database's event log carries one entry for it, timestamped at
+                // the instant it fell due rather than at the instant someone
+                // happened to read it.
+                let settled = match database.state {
+                    RELATIONAL_DATABASE_STATE_AVAILABLE if was_creating => {
+                        Some(RELATIONAL_DATABASE_EVENT_CREATED)
+                    }
+                    RELATIONAL_DATABASE_STATE_AVAILABLE if was_rebooting => {
+                        Some(RELATIONAL_DATABASE_EVENT_RESTARTED)
+                    }
+                    RELATIONAL_DATABASE_STATE_AVAILABLE => {
+                        Some(RELATIONAL_DATABASE_EVENT_STARTED)
+                    }
+                    RELATIONAL_DATABASE_STATE_STOPPED => {
+                        Some(RELATIONAL_DATABASE_EVENT_STOPPED)
+                    }
+                    // A database the clock has only moved towards its engine
+                    // coming back up (`starting`) has nothing to report yet: it
+                    // is not serving, and the entry for it is logged when it is.
+                    _ => None,
+                };
+                if let Some(message) = settled {
+                    let category = if was_creating {
+                        RELATIONAL_DATABASE_EVENT_CATEGORY_CREATION
+                    } else {
+                        RELATIONAL_DATABASE_EVENT_CATEGORY_AVAILABILITY
+                    };
+                    database.record_event(due.at_ms, message, &[category]);
+                }
                 // A database that has come back up has an engine that read its
                 // whole parameter group as it started, so this is the instant a
                 // value applied `pending-reboot` is loaded — the one thing a
@@ -10096,6 +10453,25 @@ impl ComAmazonawsLightsailLightsail20161128State {
             if due.at_ms <= now_ms {
                 snapshot.state = due.state;
                 snapshot.due = None;
+                // The copy can be restored from now, which completes the backup
+                // of the database it was taken of: the second of the two entries
+                // that backup leaves in THAT database's event log (the first is
+                // logged where the snapshot is taken,
+                // [`Self::snapshot_relational_database`]). A snapshot whose
+                // source has since been deleted has no log to append to.
+                if let Some(database) = self
+                    .relational_databases
+                    .get_mut(&snapshot.from_relational_database_name)
+                {
+                    database.record_event(
+                        due.at_ms,
+                        format!(
+                            "{RELATIONAL_DATABASE_EVENT_BACKUP_FINISHED}: {}",
+                            snapshot.name
+                        ),
+                        &[RELATIONAL_DATABASE_EVENT_CATEGORY_BACKUP],
+                    );
+                }
             }
         }
         for balancer in self.load_balancers.values_mut() {

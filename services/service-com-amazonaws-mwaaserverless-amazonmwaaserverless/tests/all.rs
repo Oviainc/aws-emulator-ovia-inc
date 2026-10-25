@@ -23,6 +23,8 @@ mod region_isolation;
 mod resource_tag_listing;
 #[path = "all/run_lifecycle_progression.rs"]
 mod run_lifecycle_progression;
+#[path = "all/run_stop.rs"]
+mod run_stop;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/task_instance_reads.rs"]
