@@ -74,7 +74,7 @@
 use super::types::*;
 
 use crate::state::{
-    no_such_hosted_zone, normalize_zone_id, TAG_RESOURCE_TYPE_HEALTH_CHECK,
+    no_such_health_check, no_such_hosted_zone, normalize_zone_id, TAG_RESOURCE_TYPE_HEALTH_CHECK,
     TAG_RESOURCE_TYPE_HOSTED_ZONE,
 };
 
@@ -184,17 +184,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             }
             TAG_RESOURCE_TYPE_HEALTH_CHECK => {
-                // This service's store holds no health checks — `CreateHealthCheck`
-                // is still a scaffold — so no health check exists with any id.
-                Err(
-                    ListTagsForResourceErrorModeled::NoSuchHealthCheck(NoSuchHealthCheck {
-                        message: Some(format!(
-                            "no health check exists with the ID {}",
-                            input.resource_id
-                        )),
-                    })
-                    .into(),
-                )
+                // A health check is addressed by the bare id
+                // `CreateHealthCheck` assigned it, which is the id the store is
+                // keyed by. A pure read, exactly as for a zone above.
+                let store = state.lock();
+                let health_check =
+                    store.health_checks.get(&input.resource_id).ok_or_else(|| {
+                        ListTagsForResourceErrorModeled::NoSuchHealthCheck(no_such_health_check(
+                            &input.resource_id,
+                        ))
+                    })?;
+                Ok(ListTagsForResourceOutput {
+                    resource_tag_set: ResourceTagSet {
+                        resource_type: Some(input.resource_type.clone()),
+                        // The resource's own id, so the answer names what was
+                        // read rather than echoing however it was addressed.
+                        resource_id: Some(health_check.id.clone()),
+                        // The `Tags` container is always reported, empty when
+                        // the resource carries no tags.
+                        tags: Some(health_check.to_tag_list()),
+                    },
+                })
             }
             // Unreachable: `ResourceType` is a modelled enum, so a value outside
             // `TagResourceType` is refused before this handler runs.
