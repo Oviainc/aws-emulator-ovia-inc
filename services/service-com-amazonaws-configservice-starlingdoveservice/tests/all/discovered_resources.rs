@@ -17,9 +17,10 @@
 //! resources themselves are seeded in the store the way a handler reaches it
 //! (`service_state`, as the other suites of this crate seed state with), so the
 //! reader's rule is pinned over inventories a table states, including deleted
-//! resources, which no implemented operation records yet (`DeleteResourceConfig` is
-//! still a scaffold). `PutResourceConfig`, which records a resource's configuration
-//! item, is exercised against this reader in `config_discovered_resource_counts`.
+//! resources. `PutResourceConfig`, which records a resource's configuration
+//! item, is exercised against this reader in `config_discovered_resource_counts`, and
+//! `DeleteResourceConfig`, which records a resource's deletion, in
+//! `resource_config_deletion`.
 
 use std::time::{Duration, SystemTime};
 

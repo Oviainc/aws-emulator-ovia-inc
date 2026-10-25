@@ -28,8 +28,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ApprovalRule, ApprovalRuleTemplate, Comment, Location, MergeMetadata, OriginApprovalRuleTemplate,
-    PullRequest, PullRequestTarget, RepositoryMetadata, UserInfo,
+    ApprovalRule, ApprovalRuleEventMetadata, ApprovalRuleOverriddenEventMetadata,
+    ApprovalRuleTemplate, ApprovalStateChangedEventMetadata, Comment, Location, MergeMetadata,
+    OriginApprovalRuleTemplate, PullRequest, PullRequestCreatedEventMetadata, PullRequestEvent,
+    PullRequestMergedStateChangedEventMetadata, PullRequestSourceReferenceUpdatedEventMetadata,
+    PullRequestStatusChangedEventMetadata, PullRequestTarget, RepositoryMetadata, UserInfo,
 };
 use git_object::{Kind, Object, TreeEntry};
 
@@ -70,6 +73,39 @@ pub const MAX_COMMENTS_PER_REPOSITORY: usize = 1_000;
 /// request status can only change from OPEN to CLOSED."
 pub const PULL_REQUEST_STATUS_OPEN: &str = "OPEN";
 pub const PULL_REQUEST_STATUS_CLOSED: &str = "CLOSED";
+
+/// `pullRequestEventType` values the model's `PullRequestEventType` declares
+/// (`smithy_query(query="shape",shape="PullRequestEventType")`). Each names one
+/// kind of change to a pull request, which is what an entry in its event log
+/// records ([`PullRequestEventDetail`]).
+pub const PULL_REQUEST_EVENT_CREATED: &str = "PULL_REQUEST_CREATED";
+pub const PULL_REQUEST_EVENT_STATUS_CHANGED: &str = "PULL_REQUEST_STATUS_CHANGED";
+pub const PULL_REQUEST_EVENT_SOURCE_REFERENCE_UPDATED: &str =
+    "PULL_REQUEST_SOURCE_REFERENCE_UPDATED";
+pub const PULL_REQUEST_EVENT_MERGE_STATE_CHANGED: &str = "PULL_REQUEST_MERGE_STATE_CHANGED";
+pub const PULL_REQUEST_EVENT_APPROVAL_RULE_CREATED: &str = "PULL_REQUEST_APPROVAL_RULE_CREATED";
+pub const PULL_REQUEST_EVENT_APPROVAL_RULE_UPDATED: &str = "PULL_REQUEST_APPROVAL_RULE_UPDATED";
+pub const PULL_REQUEST_EVENT_APPROVAL_RULE_DELETED: &str = "PULL_REQUEST_APPROVAL_RULE_DELETED";
+pub const PULL_REQUEST_EVENT_APPROVAL_RULE_OVERRIDDEN: &str =
+    "PULL_REQUEST_APPROVAL_RULE_OVERRIDDEN";
+pub const PULL_REQUEST_EVENT_APPROVAL_STATE_CHANGED: &str = "PULL_REQUEST_APPROVAL_STATE_CHANGED";
+
+/// How many pull request events one `DescribePullRequestEvents` page carries
+/// when the caller names no `maxResults`, and the largest value that member
+/// accepts. Documented on it: "A non-zero, non-negative integer used to limit
+/// the number of returned results. The default is 100 events, which is also the
+/// maximum number of events that can be returned in a result."
+pub const PULL_REQUEST_EVENTS_PAGE_DEFAULT: i32 = 100;
+pub const PULL_REQUEST_EVENTS_PAGE_MAX: i32 = 100;
+
+/// How many events one pull request's log RETAINS, the newest kept.
+///
+/// The emulator's OWN bound, not an AWS limit: every change to a pull request
+/// appends an entry, and a caller can change one without end (adding and
+/// removing an approval rule, pushing to the source branch), so this is what
+/// keeps one pull request's stored size bounded. Every entry it holds is
+/// released with its repository by `DeleteRepository`.
+pub const MAX_PULL_REQUEST_EVENTS_RETAINED: usize = 1_000;
 
 /// How many OPEN pull requests one repository holds before `CreatePullRequest`
 /// refuses the write with the modelled
@@ -436,6 +472,44 @@ pub fn repository_name_of_resource_arn(raw: &str) -> Result<&str, ResourceArnPro
     }
     Ok(resource)
 }
+
+/// Does `raw` name an identity, as an ARN?
+///
+/// `actorArn` names "the user whose actions resulted in the event", and
+/// CodeCommit refuses a value that is not a full ARN with
+/// `InvalidActorArnException`. An ARN is six colon-separated fields,
+/// `arn:<partition>:<vendor>:<region>:<account>:<resource>`; an IAM ARN carries
+/// no region, so that field may be empty, while the account is the 12-digit
+/// account id and the resource names the identity. Nothing beyond the FORM is
+/// checked here: which identities exist is not something this emulator holds —
+/// a caller is identified by the access key id its request is signed with
+/// ([`caller_identity_arn`]) and any access key id is served — so a well-formed
+/// ARN is resolved by the events that name it.
+pub fn is_identity_arn(raw: &str) -> bool {
+    let [prefix, partition, vendor, _region, account, resource] =
+        raw.splitn(6, ':').collect::<Vec<_>>()[..]
+    else {
+        return false;
+    };
+    prefix == "arn"
+        && !partition.is_empty()
+        && !vendor.is_empty()
+        && account.len() == ACCOUNT_ID_DIGITS
+        && account.bytes().all(|byte| byte.is_ascii_digit())
+        && !resource.is_empty()
+}
+
+/// `InvalidActorArnException`'s message: the sentence the model documents for
+/// the shape — the failure, then what to provide instead — naming nothing from
+/// the request. The one place this crate words that code.
+pub const INVALID_ACTOR_ARN_MESSAGE: &str =
+    "The Amazon Resource Name (ARN) is not valid. Make sure that you have provided the full ARN \
+     for the user who initiated the change for the pull request, and then try again.";
+
+/// `InvalidPullRequestEventTypeException`'s message: likewise the shape's own
+/// documented sentence, worded here once for every operation that raises the
+/// code.
+pub const INVALID_PULL_REQUEST_EVENT_TYPE_MESSAGE: &str = "The pull request event type is not valid.";
 
 /// The message AWS returns with `RepositoryDoesNotExistException`: the requested
 /// repository name, then `" for "`, then the account the lookup ran in.
@@ -1592,6 +1666,122 @@ impl Repository {
         }
     }
 
+    /// Point `branch` at `commit_id`, and record the move on every OPEN pull
+    /// request that reads from that branch.
+    ///
+    /// The ONE place a branch tip is set, because moving a branch moves more
+    /// than the reference: "If the pull request branch is updated by a push
+    /// while the pull request is open, the commit ID changes to reflect the new
+    /// tip of the branch", so each pull request whose SOURCE this branch is
+    /// follows it — the new tip, and the merge base that tip has with the
+    /// destination — and that update is appended to the pull request's event
+    /// log. `actor` is the identity that moved the reference, for a transport
+    /// that carries one; the git transport authenticates with git credentials
+    /// rather than a caller's own, so a push names none.
+    ///
+    /// A pull request that is no longer open is a record of what it was merged
+    /// or closed at, so a later move of its source branch does not touch it.
+    pub fn set_branch_tip(
+        &mut self,
+        branch: &str,
+        commit_id: &str,
+        at: SystemTime,
+        actor: Option<&str>,
+    ) {
+        let previous = self
+            .branches
+            .insert(
+                branch.to_string(),
+                Branch {
+                    name: branch.to_string(),
+                    commit_id: commit_id.to_string(),
+                },
+            )
+            .map(|replaced| replaced.commit_id);
+        if previous.as_deref() == Some(commit_id) {
+            // The reference already pointed there, so nothing moved — and
+            // nothing reading from it changed either.
+            return;
+        }
+
+        let reference = qualified_reference(branch);
+        // What each affected target becomes, resolved while the repository is
+        // only READ: the new merge base comes from the history this branch now
+        // reaches. OFF THE ASYNC WORKER and charged to ONE budget for the whole
+        // move, exactly as the merge base a new pull request reports is, so the
+        // walk this costs is bounded however many pull requests read from the
+        // branch.
+        //
+        // Each entry's merge base is `Some(resolved)` — `Some(None)` where the
+        // two histories share no commit at all — or `None` where the walk could
+        // not finish within what is left of the budget. The two are NOT the
+        // same answer: a base the request could not resolve leaves the stored
+        // one alone, so what a pull request reports does not depend on how many
+        // other pull requests happen to read the same branch.
+        let mut budget = merge::MergeBudget::for_one_request();
+        let moved: Vec<(u64, usize, String, Option<Option<String>>)> =
+            crate::service::off_the_async_worker(|| {
+                let mut moved = Vec::new();
+                for (pull_request_id, pull_request) in &self.pull_requests {
+                    if pull_request.status != PULL_REQUEST_STATUS_OPEN {
+                        continue;
+                    }
+                    for (index, target) in pull_request.targets.iter().enumerate() {
+                        if target.source_reference != reference
+                            || target.source_commit == commit_id
+                        {
+                            continue;
+                        }
+                        let merge_base = match merge::merge_base(
+                            self,
+                            commit_id,
+                            &target.destination_commit,
+                            &mut budget,
+                        ) {
+                            Ok(base) => Some(Some(base)),
+                            Err(merge::MergeProblem::NoMergeBase) => Some(None),
+                            Err(_) => None,
+                        };
+                        moved.push((
+                            *pull_request_id,
+                            index,
+                            target.source_commit.clone(),
+                            merge_base,
+                        ));
+                    }
+                }
+                moved
+            });
+
+        let repository_name = self.name.clone();
+        for (pull_request_id, index, before_commit_id, resolved_base) in moved {
+            let Some(pull_request) = self.pull_requests.get_mut(&pull_request_id) else {
+                continue;
+            };
+            let mut merge_base = None;
+            if let Some(target) = pull_request.targets.get_mut(index) {
+                target.source_commit = commit_id.to_string();
+                if let Some(resolved_base) = resolved_base {
+                    target.merge_base = resolved_base;
+                }
+                merge_base = target.merge_base.clone();
+            }
+            // The reviewable state of the pull request moved with its source
+            // tip, so the next read of it reports another `revisionId`.
+            pull_request.revision = pull_request.revision.saturating_add(1);
+            pull_request.record_event(
+                at,
+                actor.map(str::to_string),
+                PullRequestEventDetail::SourceReferenceUpdated {
+                    repository_name: repository_name.clone(),
+                    before_commit_id,
+                    after_commit_id: commit_id.to_string(),
+                    merge_base,
+                },
+            );
+        }
+    }
+
     /// Keep a commit no ref names readable: record it as a retained unreferenced
     /// commit, so [`Repository::prune_history`] treats it as a root.
     ///
@@ -2322,6 +2512,13 @@ pub struct PullRequestRecord {
     /// [`PullRequestRecord::revision_id`] — so a caller that holds a revision id
     /// can tell whether it still names the revision it read.
     pub revision: u64,
+    /// This pull request's event log, OLDEST FIRST: one entry per change made
+    /// to the pull request, appended by the operation that made it through
+    /// [`PullRequestRecord::record_event`]. Append-only, so the stored order IS
+    /// the order the changes happened, which is the order
+    /// `DescribePullRequestEvents` reports them in. Bounded by
+    /// [`MAX_PULL_REQUEST_EVENTS_RETAINED`].
+    pub events: Vec<PullRequestEventRecord>,
 }
 
 impl PullRequestRecord {
@@ -2367,6 +2564,40 @@ impl PullRequestRecord {
             self.revision,
             tips.join(",")
         ))
+    }
+
+    /// Append one entry to this pull request's event log: the change `detail`
+    /// describes, made by `actor_arn` at `at`.
+    ///
+    /// The ONE place an event is appended, so every operation that changes a
+    /// pull request records it the same way and `DescribePullRequestEvents`
+    /// cannot report a change no operation made. The stored instant is never
+    /// earlier than the previous entry's, so the log stays in the order the
+    /// changes happened whatever the clock does between two calls, and
+    /// `lastActivityDate` moves onto it because an entry in this log IS "user or
+    /// system activity on the pull request".
+    pub fn record_event(
+        &mut self,
+        at: SystemTime,
+        actor_arn: Option<String>,
+        detail: PullRequestEventDetail,
+    ) {
+        let event_date = match self.events.last() {
+            Some(previous) => at.max(previous.event_date),
+            None => at,
+        };
+        self.events.push(PullRequestEventRecord {
+            event_date,
+            actor_arn,
+            detail,
+        });
+        // The emulator's own retention: the oldest entries past the bound are
+        // released, exactly as the oldest commits are by `prune_history`.
+        let held = self.events.len();
+        if held > MAX_PULL_REQUEST_EVENTS_RETAINED {
+            self.events.drain(..held - MAX_PULL_REQUEST_EVENTS_RETAINED);
+        }
+        self.last_activity_date = event_date;
     }
 
     /// This pull request as the modeled `PullRequest` shape — the one place that
@@ -2482,6 +2713,208 @@ impl ApprovalRuleRecord {
                 }
             }),
         }
+    }
+}
+
+/// One entry in a pull request's event log: WHEN the pull request changed, WHO
+/// changed it, and WHAT the change was.
+///
+/// The log lives on the pull request ([`PullRequestRecord::events`]) and is
+/// written by the operations that change it, so `DescribePullRequestEvents`
+/// reports what happened to the stored pull request rather than a history
+/// reconstructed on the request path. The event's TYPE is derived from the
+/// change it carries ([`PullRequestEventDetail::event_type`]), so an entry
+/// cannot report one kind of change and carry another's metadata.
+#[derive(Debug, Clone)]
+pub struct PullRequestEventRecord {
+    /// "The day and time of the pull request event, in timestamp format."
+    pub event_date: SystemTime,
+    /// "The Amazon Resource Name (ARN) of the user whose actions resulted in the
+    /// event" — the calling identity ([`caller_identity_arn`]) for a change made
+    /// through a modeled operation, and NONE for one whose transport carries no
+    /// caller identity to attribute it to (a git push).
+    pub actor_arn: Option<String>,
+    pub detail: PullRequestEventDetail,
+}
+
+/// What changed about the pull request, one variant per `PullRequestEventType`
+/// the model declares, each carrying exactly the metadata that type reports.
+#[derive(Debug, Clone)]
+pub enum PullRequestEventDetail {
+    /// The pull request was opened: "information about the source and
+    /// destination branches for the pull request".
+    Created {
+        repository_name: String,
+        source_commit_id: String,
+        destination_commit_id: String,
+        merge_base: Option<String>,
+    },
+    /// The pull request's `pullRequestStatus` moved, to the status carried here.
+    StatusChanged { status: String },
+    /// The source branch moved while the pull request was open, from
+    /// `before_commit_id` to `after_commit_id`.
+    SourceReferenceUpdated {
+        repository_name: String,
+        before_commit_id: String,
+        after_commit_id: String,
+        merge_base: Option<String>,
+    },
+    /// The merge state of a target changed — what it was merged by and into.
+    MergeStateChanged {
+        repository_name: String,
+        destination_reference: String,
+        merged: bool,
+        merged_by: Option<String>,
+        merge_commit_id: Option<String>,
+        merge_option: Option<String>,
+    },
+    /// An approval rule was created on, updated on, or deleted from the pull
+    /// request. One payload for the three, because the rule an approval-rule
+    /// event names is reported the same way whichever of them happened.
+    ApprovalRuleCreated(ApprovalRuleEvent),
+    ApprovalRuleUpdated(ApprovalRuleEvent),
+    ApprovalRuleDeleted(ApprovalRuleEvent),
+    /// The approval rules of the pull request were overridden (or the override
+    /// was revoked), at the revision carried here.
+    ApprovalRuleOverridden {
+        revision_id: String,
+        override_status: String,
+    },
+    /// A reviewer's approval state changed, at the revision carried here.
+    ApprovalStateChanged {
+        revision_id: String,
+        approval_status: String,
+    },
+}
+
+/// The approval rule an approval-rule event names, as that event reports it.
+#[derive(Debug, Clone)]
+pub struct ApprovalRuleEvent {
+    pub approval_rule_id: String,
+    pub approval_rule_name: String,
+    pub approval_rule_content: String,
+}
+
+impl PullRequestEventDetail {
+    /// The `pullRequestEventType` this change is reported under: the model's own
+    /// value for the kind of change it is.
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::Created { .. } => PULL_REQUEST_EVENT_CREATED,
+            Self::StatusChanged { .. } => PULL_REQUEST_EVENT_STATUS_CHANGED,
+            Self::SourceReferenceUpdated { .. } => PULL_REQUEST_EVENT_SOURCE_REFERENCE_UPDATED,
+            Self::MergeStateChanged { .. } => PULL_REQUEST_EVENT_MERGE_STATE_CHANGED,
+            Self::ApprovalRuleCreated(_) => PULL_REQUEST_EVENT_APPROVAL_RULE_CREATED,
+            Self::ApprovalRuleUpdated(_) => PULL_REQUEST_EVENT_APPROVAL_RULE_UPDATED,
+            Self::ApprovalRuleDeleted(_) => PULL_REQUEST_EVENT_APPROVAL_RULE_DELETED,
+            Self::ApprovalRuleOverridden { .. } => PULL_REQUEST_EVENT_APPROVAL_RULE_OVERRIDDEN,
+            Self::ApprovalStateChanged { .. } => PULL_REQUEST_EVENT_APPROVAL_STATE_CHANGED,
+        }
+    }
+}
+
+impl PullRequestEventRecord {
+    /// The `pullRequestEventType` this entry is reported under.
+    pub fn event_type(&self) -> &'static str {
+        self.detail.event_type()
+    }
+
+    /// This entry as the modeled `PullRequestEvent` shape, for the pull request
+    /// whose log holds it — the one place that projection is written, so an
+    /// event carries the metadata member of its own type and no other.
+    pub fn to_modeled(&self, pull_request_id: u64) -> PullRequestEvent {
+        let mut event = PullRequestEvent {
+            pull_request_id: Some(pull_request_id.to_string()),
+            event_date: Some(to_date_time(self.event_date)),
+            pull_request_event_type: Some(self.event_type().to_string()),
+            actor_arn: self.actor_arn.clone(),
+            ..PullRequestEvent::default()
+        };
+        match &self.detail {
+            PullRequestEventDetail::Created {
+                repository_name,
+                source_commit_id,
+                destination_commit_id,
+                merge_base,
+            } => {
+                event.pull_request_created_event_metadata = Some(PullRequestCreatedEventMetadata {
+                    repository_name: Some(repository_name.clone()),
+                    source_commit_id: Some(source_commit_id.clone()),
+                    destination_commit_id: Some(destination_commit_id.clone()),
+                    merge_base: merge_base.clone(),
+                });
+            }
+            PullRequestEventDetail::StatusChanged { status } => {
+                event.pull_request_status_changed_event_metadata =
+                    Some(PullRequestStatusChangedEventMetadata {
+                        pull_request_status: Some(status.clone()),
+                    });
+            }
+            PullRequestEventDetail::SourceReferenceUpdated {
+                repository_name,
+                before_commit_id,
+                after_commit_id,
+                merge_base,
+            } => {
+                event.pull_request_source_reference_updated_event_metadata =
+                    Some(PullRequestSourceReferenceUpdatedEventMetadata {
+                        repository_name: Some(repository_name.clone()),
+                        before_commit_id: Some(before_commit_id.clone()),
+                        after_commit_id: Some(after_commit_id.clone()),
+                        merge_base: merge_base.clone(),
+                    });
+            }
+            PullRequestEventDetail::MergeStateChanged {
+                repository_name,
+                destination_reference,
+                merged,
+                merged_by,
+                merge_commit_id,
+                merge_option,
+            } => {
+                event.pull_request_merged_state_changed_event_metadata =
+                    Some(PullRequestMergedStateChangedEventMetadata {
+                        repository_name: Some(repository_name.clone()),
+                        destination_reference: Some(destination_reference.clone()),
+                        merge_metadata: Some(MergeMetadata {
+                            is_merged: *merged,
+                            merged_by: merged_by.clone(),
+                            merge_commit_id: merge_commit_id.clone(),
+                            merge_option: merge_option.clone(),
+                        }),
+                    });
+            }
+            PullRequestEventDetail::ApprovalRuleCreated(rule)
+            | PullRequestEventDetail::ApprovalRuleUpdated(rule)
+            | PullRequestEventDetail::ApprovalRuleDeleted(rule) => {
+                event.approval_rule_event_metadata = Some(ApprovalRuleEventMetadata {
+                    approval_rule_name: Some(rule.approval_rule_name.clone()),
+                    approval_rule_id: Some(rule.approval_rule_id.clone()),
+                    approval_rule_content: Some(rule.approval_rule_content.clone()),
+                });
+            }
+            PullRequestEventDetail::ApprovalRuleOverridden {
+                revision_id,
+                override_status,
+            } => {
+                event.approval_rule_overridden_event_metadata =
+                    Some(ApprovalRuleOverriddenEventMetadata {
+                        revision_id: Some(revision_id.clone()),
+                        override_status: Some(override_status.clone()),
+                    });
+            }
+            PullRequestEventDetail::ApprovalStateChanged {
+                revision_id,
+                approval_status,
+            } => {
+                event.approval_state_changed_event_metadata =
+                    Some(ApprovalStateChangedEventMetadata {
+                        revision_id: Some(revision_id.clone()),
+                        approval_status: Some(approval_status.clone()),
+                    });
+            }
+        }
+        event
     }
 }
 
@@ -3422,15 +3855,42 @@ pub fn page_of(
     next_token: Option<&str>,
     max_results: Option<i32>,
 ) -> Result<(Vec<String>, Option<String>), PageProblem> {
+    page_of_at_most(
+        scope,
+        ordered,
+        next_token,
+        max_results,
+        MAX_MAX_RESULTS,
+        DEFAULT_MAX_RESULTS,
+    )
+}
+
+/// The same one page, for an operation that publishes its OWN `maxResults`
+/// maximum and default rather than the range the list operations share.
+///
+/// The pagination rule is [`page_of`]'s in every other respect — the token is one
+/// this service issued for THIS listing, and the answer carries a token only when
+/// a further page exists — so an operation whose documentation states a different
+/// page size (`DescribePullRequestEvents`'s
+/// [`PULL_REQUEST_EVENTS_PAGE_MAX`]) pages through the same code rather than a
+/// second copy of it.
+pub fn page_of_at_most(
+    scope: &str,
+    ordered: &[String],
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+    page_maximum: i32,
+    page_default: i32,
+) -> Result<(Vec<String>, Option<String>), PageProblem> {
     let limit = match max_results {
-        None => DEFAULT_MAX_RESULTS,
-        Some(requested) if (MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(&requested) => requested,
+        None => page_default,
+        Some(requested) if (MIN_MAX_RESULTS..=page_maximum).contains(&requested) => requested,
         // `InvalidMaxResultsException`'s message comes from the one place this crate
         // words that code: the accepted range, with nothing from the request.
         Some(_) => {
             return Err(PageProblem::InvalidMaxResults(invalid_max_results_message(
                 MIN_MAX_RESULTS,
-                MAX_MAX_RESULTS,
+                page_maximum,
             )));
         }
     };
