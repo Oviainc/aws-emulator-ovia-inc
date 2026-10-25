@@ -236,6 +236,12 @@ pub const UPDATE_PARAM_KUBE_API_SERVER_CONFIG: &str = "KubeApiServerConfig";
 pub const UPDATE_PARAM_KUBE_SCHEDULER_CONFIG: &str = "KubeSchedulerConfig";
 /// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
 pub const UPDATE_PARAM_KUBE_CONTROLLER_MANAGER_CONFIG: &str = "KubeControllerManagerConfig";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`] — the Kubernetes version a version
+/// update moves the cluster to.
+pub const UPDATE_PARAM_VERSION: &str = "Version";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`] — the platform version the cluster runs
+/// at the Kubernetes version a version update moves it to.
+pub const UPDATE_PARAM_PLATFORM_VERSION: &str = "PlatformVersion";
 
 /// The `ControlPlaneEgressModeType` members
 /// (`smithy_query query="shape" shape="ControlPlaneEgressModeType"`). "Once set
@@ -388,6 +394,19 @@ pub const DEFAULT_KUBERNETES_VERSION: &str = "1.36";
 /// creates — a new cluster runs the default platform version of its version.
 pub const PLATFORM_VERSION: &str = "eks.4";
 
+/// The `(major, minor)` release a Kubernetes minor-version string names, or
+/// `None` for a string that is not one.
+///
+/// Every Kubernetes version this API carries is a MINOR version — `major.minor`,
+/// e.g. the rows of [`VERSION_CALENDAR`] — so the pair this returns is what
+/// orders two of them and what says whether one is the release right after
+/// another. A string with a third component, a non-numeric component or no `.`
+/// at all names no Kubernetes minor version.
+pub fn kubernetes_minor_version(version: &str) -> Option<(u32, u32)> {
+    let (major, minor) = version.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
 /// The `ipFamily` a cluster gets when `kubernetesNetworkConfig.ipFamily` is
 /// absent: "If you don't specify a value, `ipv4` is used by default"
 /// (`KubernetesNetworkConfigRequest$ipFamily`).
@@ -467,6 +486,19 @@ pub const CANCELLATION_STATUS_SUCCESSFUL: &str = "Successful";
 /// nodes are rolling back" (`CancelUpdate`). The full type catalog is the
 /// model's `UpdateType` enum (`smithy_query query="shape" shape="UpdateType"`).
 pub const UPDATE_TYPE_VERSION_ROLLBACK: &str = "VersionRollback";
+
+/// The `UpdateType` a Kubernetes version update that moves the cluster FORWARD
+/// reports — the other half of the pair [`UPDATE_TYPE_VERSION_ROLLBACK`] is the
+/// backward one of (`smithy_query query="shape" shape="UpdateType"`).
+pub const UPDATE_TYPE_VERSION: &str = "VersionUpdate";
+
+/// The smallest and largest `RollbackConfig$timeoutMinutes` a version rollback
+/// may ask for: "This value can be between 120 (2 hours) and 10080 (7 days)"
+/// (`RollbackConfig$timeoutMinutes`). The model declares the member as a plain
+/// integer, so the published range is enforced by the handler.
+pub const MIN_ROLLBACK_TIMEOUT_MINUTES: i32 = 120;
+/// See [`MIN_ROLLBACK_TIMEOUT_MINUTES`].
+pub const MAX_ROLLBACK_TIMEOUT_MINUTES: i32 = 10080;
 
 /// How long a `VersionRollback` update spends rolling nodes back — the phase in
 /// which `CancelUpdate` can still stop it — before the control plane rollback
@@ -1544,6 +1576,11 @@ pub struct PendingClusterConfig {
     /// so an empty list here would mean "enable nothing"; the `Option` is what
     /// distinguishes a change that does not touch encryption at all.
     pub encryption_config: Option<Vec<EncryptionConfig>>,
+    /// The Kubernetes version an `UpdateClusterVersion` update moves the cluster
+    /// to — "the desired Kubernetes version following a successful update"
+    /// (`UpdateClusterVersionRequest$version`), so the cluster reports the new
+    /// version only once the clock completes the update.
+    pub version: Option<String>,
 }
 
 impl PendingClusterConfig {
@@ -1593,6 +1630,9 @@ impl PendingClusterConfig {
         }
         if let Some(encryption_config) = self.encryption_config {
             record.encryption_config = encryption_config;
+        }
+        if let Some(version) = self.version {
+            record.version = Some(version);
         }
     }
 }
@@ -3123,6 +3163,33 @@ impl ComAmazonawsEksAwswesleyfrontendState {
                 key_region == region && key_cluster == cluster_name
             })
             .map(|(_, _, name)| name.as_str())
+    }
+
+    /// The node groups this store holds in `cluster_name` in `region`, in
+    /// node-group-name order.
+    ///
+    /// The map is keyed `(region, cluster, nodegroup)`, so one cluster's node
+    /// groups are a contiguous, name-sorted RANGE of it — the same walk
+    /// [`Self::capabilities_of`] makes over its own child resource. This is the
+    /// records; [`Self::nodegroup_names_in`] is the names.
+    pub fn nodegroups_of<'a>(
+        &'a self,
+        region: &'a str,
+        cluster_name: &'a str,
+    ) -> impl Iterator<Item = &'a NodegroupRecord> + 'a {
+        self.nodegroups
+            .range((
+                std::ops::Bound::Included((
+                    region.to_string(),
+                    cluster_name.to_string(),
+                    String::new(),
+                )),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(move |((key_region, key_cluster, _), _)| {
+                key_region == region && key_cluster == cluster_name
+            })
+            .map(|(_, record)| record)
     }
 
     /// The capabilities one cluster holds, in capability-name order.
