@@ -49,10 +49,11 @@ use crate::ops::types::{
     CodeGenConfigurationNode, Column, Connection, ConnectionInput, ConnectionsList, Crawler,
     CrawlerTargets, CreateCrawlerInput, CreateCustomEntityTypeInput, CreateJobInput,
     DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput, ErrorDetail, ExecutionProperty,
-    FederatedDatabase, FederatedTable, Job, JobCommand, JobRun, LakeFormationConfiguration,
-    LineageConfiguration, NotificationProperty, PrincipalPermissions, RLSProperties, RecrawlPolicy,
-    RegistryId, Schedule, SchemaChangePolicy, SchemaId, SourceControlDetails, StartJobRunInput,
-    StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
+    FederatedDatabase, FederatedTable, Job, JobCommand, JobRun, JobUpdate,
+    LakeFormationConfiguration, LineageConfiguration, NotificationProperty, PrincipalPermissions,
+    RLSProperties, RecrawlPolicy, RegistryId, Schedule, SchemaChangePolicy, SchemaId,
+    SourceControlDetails, StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput,
+    TableVersion,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -1404,12 +1405,7 @@ impl JobEntry {
             .glue_version
             .clone()
             .unwrap_or_else(|| DEFAULT_GLUE_VERSION.to_string());
-        let max_concurrent_runs = input
-            .execution_property
-            .as_ref()
-            .map(|property| property.max_concurrent_runs)
-            .filter(|runs| *runs > 0)
-            .unwrap_or(DEFAULT_MAX_CONCURRENT_RUNS);
+        let max_concurrent_runs = max_concurrent_runs_of(input.execution_property.as_ref());
         Self {
             name: input.name.clone(),
             job_mode: input
@@ -1447,6 +1443,76 @@ impl JobEntry {
             // A job definition has no runs until `StartJobRun` starts one.
             runs: Vec::new(),
         }
+    }
+
+    /// Overwrite this job definition with the one an `UpdateJob` request submits.
+    ///
+    /// "The previous job definition is completely overwritten by this information"
+    /// (`UpdateJob`), and "unspecified configuration is removed or reset to default
+    /// values" (`UpdateJobRequest$JobUpdate`) — so every member of the stored definition
+    /// the submitted `JobUpdate` can carry is taken from it, absent or not, and the
+    /// members the SERVICE fills are re-derived from the submitted definition exactly as
+    /// [`JobEntry::from_create_input`] derives them for a create. The exceptions are the
+    /// four fields `JobUpdate` has no member for — the job's name, its create instant,
+    /// its tags (read back through the tagging operations) and the runs `StartJobRun`
+    /// already started of it — and `GlueVersion`, which "retains the value from the
+    /// existing job definition" when the update names none (`JobUpdate$GlueVersion`).
+    ///
+    /// A submitted definition naming no `Role` or no `Command` is refused by the
+    /// operation before it reaches here, since `JobUpdate` documents both as required.
+    pub fn apply_update(&mut self, update: &JobUpdate, now: SystemTime) {
+        let glue_version = update
+            .glue_version
+            .clone()
+            .unwrap_or_else(|| self.glue_version.clone());
+        let max_concurrent_runs = max_concurrent_runs_of(update.execution_property.as_ref());
+        // Carried over rather than overwritten; moved out so the whole record below is
+        // rebuilt, which is what makes "completely overwritten" exhaustive.
+        let name = std::mem::take(&mut self.name);
+        let created_on = self.created_on;
+        let tags = std::mem::take(&mut self.tags);
+        let runs = std::mem::take(&mut self.runs);
+        *self = Self {
+            name,
+            job_mode: update
+                .job_mode
+                .clone()
+                .unwrap_or_else(|| DEFAULT_JOB_MODE.to_string()),
+            job_run_queuing_enabled: update.job_run_queuing_enabled,
+            description: update.description.clone(),
+            log_uri: update.log_uri.clone(),
+            role: update.role.clone().unwrap_or_default(),
+            execution_property: ExecutionProperty {
+                max_concurrent_runs,
+            },
+            command: update.command.clone().unwrap_or_default(),
+            default_arguments: update.default_arguments.clone(),
+            non_overridable_arguments: update.non_overridable_arguments.clone(),
+            connections: update.connections.clone(),
+            max_retries: update.max_retries,
+            max_capacity: capacity_from(
+                update.max_capacity,
+                update.allocated_capacity,
+                update.worker_type.as_deref(),
+                update.number_of_workers,
+            ),
+            timeout: update
+                .timeout
+                .unwrap_or_else(|| default_timeout_minutes(&glue_version)),
+            worker_type: update.worker_type.clone(),
+            number_of_workers: update.number_of_workers,
+            security_configuration: update.security_configuration.clone(),
+            notification_property: update.notification_property.clone(),
+            glue_version,
+            code_gen_configuration_nodes: update.code_gen_configuration_nodes.clone(),
+            execution_class: update.execution_class.clone(),
+            source_control_details: update.source_control_details.clone(),
+            maintenance_window: update.maintenance_window.clone(),
+            created_on,
+            last_modified_on: now,
+            tags,
+            runs,
+        };
     }
 
     /// The maximum number of this job's runs that may be in flight at once:
@@ -1531,6 +1597,20 @@ impl JobEntry {
     }
 }
 
+/// `ExecutionProperty$MaxConcurrentRuns` a submitted job definition asks for: what it
+/// names, else the documented default ([`DEFAULT_MAX_CONCURRENT_RUNS`]) — which is also
+/// what a property naming zero concurrent runs resolves to, since that would otherwise
+/// store a job no run of which could ever start.
+///
+/// `CreateJob` and `UpdateJob` carry the same member with the same documentation, so
+/// both resolve it here.
+fn max_concurrent_runs_of(property: Option<&ExecutionProperty>) -> i32 {
+    property
+        .map(|property| property.max_concurrent_runs)
+        .filter(|runs| *runs > 0)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_RUNS)
+}
+
 /// The capacity, in DPUs, a `CreateJob` request asks for: see [`capacity_from`].
 fn capacity_of(input: &CreateJobInput) -> Option<f64> {
     capacity_from(
@@ -1548,8 +1628,8 @@ fn capacity_of(input: &CreateJobInput) -> Option<f64> {
 /// quotes from the model. `None` when nothing names a capacity and no worker
 /// configuration the model gives a DPU figure for is named.
 ///
-/// `CreateJob` and `StartJobRun` carry the same four members and the same documentation
-/// for each, so both resolve capacity here.
+/// `CreateJob`, `UpdateJob` and `StartJobRun` carry the same four members and the same
+/// documentation for each, so all three resolve capacity here.
 fn capacity_from(
     max_capacity: Option<f64>,
     allocated_capacity: i32,

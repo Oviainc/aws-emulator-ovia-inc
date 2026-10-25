@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Overwrites the job definition [`crate::state`] holds under `JobName` with the
+//! submitted `JobUpdate` — "the previous job definition is completely overwritten by
+//! this information", with "unspecified configuration … removed or reset to default
+//! values" — and answers with that name; a later `GetJob`/`BatchGetJobs` reports what
+//! this wrote. The overwrite itself is [`crate::state::JobEntry::apply_update`], so the
+//! members the SERVICE fills are re-derived exactly as `CreateJob` derives them, and the
+//! checks below are the ones the MODEL cannot express, the same ones `CreateJob` makes
+//! of the same members.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +150,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable store is an internal mounting fault, reported through this
+            // operation's own server error, the same way `CreateJob` reports it.
+            return Err(UpdateJobErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue job store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let update = &input.job_update;
+
+        // `JobName` is `@required` with `length 1..255`, and `Timeout`'s `range 1..` and
+        // the `JobMode`/`WorkerType`/`ExecutionClass` enums are refused at the boundary —
+        // so the checks here are the ones the MODEL cannot express.
+
+        // "The name or Amazon Resource Name (ARN) of the IAM role associated with this
+        // job (required)": the submitted definition replaces the stored one whole, so a
+        // definition naming no role, or a blank one, names no role at all.
+        if update
+            .role
+            .as_deref()
+            .is_none_or(|role| role.trim().is_empty())
+        {
+            return Err(invalid_input(
+                "JobUpdate.Role is required and cannot be blank".to_string(),
+            ));
+        }
+
+        // "The `JobCommand` that runs this job (required)", and "for an Apache Spark ETL
+        // job, this must be `glueetl`. For a Python shell job, it must be `pythonshell`.
+        // For an Apache Spark streaming ETL job, this must be `gluestreaming`. For a Ray
+        // job, this must be `glueray`." A command naming anything else names no job this
+        // service can run.
+        let Some(command) = update.command.as_ref() else {
+            return Err(invalid_input("JobUpdate.Command is required".to_string()));
+        };
+        let command_name = command.name.as_deref().unwrap_or_default();
+        if !crate::state::JOB_COMMAND_NAMES.contains(&command_name) {
+            return Err(invalid_input(format!(
+                "Command Name should be one of {:?}, got {command_name:?}",
+                crate::state::JOB_COMMAND_NAMES
+            )));
+        }
+
+        // "Jobs must have timeout values less than 7 days or 10080 minutes. Otherwise,
+        // the jobs will throw an exception."
+        if update
+            .timeout
+            .is_some_and(|timeout| timeout > crate::state::MAX_TIMEOUT_MINUTES)
+        {
+            return Err(invalid_input(format!(
+                "Timeout must be at most {} minutes",
+                crate::state::MAX_TIMEOUT_MINUTES
+            )));
+        }
+
+        // "Do not set `MaxCapacity` if using `WorkerType` and `NumberOfWorkers`": the
+        // two name the same capacity two ways, so a definition carrying both is
+        // ambiguous rather than merely redundant.
+        if update.max_capacity.is_some()
+            && (update.worker_type.is_some() || update.number_of_workers.is_some())
+        {
+            return Err(invalid_input(
+                "Please do not set MaxCapacity if using WorkerType and NumberOfWorkers"
+                    .to_string(),
+            ));
+        }
+
+        let mut store = state.lock();
+        let Some(entry) = store.jobs.get_mut(&input.job_name) else {
+            return Err(UpdateJobErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!("Job {} not found", input.job_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // "Only jobs with Glue version 3.0 and above and command type `glueetl` will be
+        // allowed to set `ExecutionClass` to `FLEX`": the restriction is over the command
+        // and the Glue version the job will carry AFTER this update, and an update naming
+        // no `GlueVersion` keeps the stored one ("the Glue version retains the value from
+        // the existing job definition").
+        if update.execution_class.as_deref() == Some(crate::state::EXECUTION_CLASS_FLEX) {
+            let glue_version = update
+                .glue_version
+                .clone()
+                .unwrap_or_else(|| entry.glue_version.clone());
+            if !crate::state::admits_flex_execution_class(command, &glue_version) {
+                return Err(invalid_input(format!(
+                    "ExecutionClass {} is allowed only on a {} job with Glue version {} or \
+                     above, not on a {command_name:?} job with Glue version {glue_version}",
+                    crate::state::EXECUTION_CLASS_FLEX,
+                    crate::state::SPARK_ETL_COMMAND,
+                    crate::state::MIN_FLEX_GLUE_VERSION
+                )));
+            }
+        }
+
+        // "The previous job definition is completely overwritten by this information."
+        entry.apply_update(update, ::std::time::SystemTime::now());
+        ::tracing::info!(
+            operation = "UpdateJob",
+            job = %input.job_name,
+            command = %command_name,
+            "updated a Glue job definition"
+        );
+
+        Ok(UpdateJobOutput {
+            // "Returns the name of the updated job definition."
+            job_name: Some(input.job_name),
+        })
     }
+}
+
+/// This operation's modelled refusal for a request it cannot serve: "The input provided
+/// was not valid."
+fn invalid_input(message: String) -> UpdateJobError {
+    UpdateJobErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }

@@ -218,17 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceNotFoundException`, which is what the device and task operations
         // answer with. The ARN is resolved BEFORE the request's `tags` is looked at, so
         // a call carrying both an unresolvable ARN and an unacceptable tag is answered
-        // with this.
-        let existing = match resource.kind {
-            crate::state::TaggedResourceKind::Device => store
-                .devices
-                .get_mut(&resource.id)
-                .map(|device| &mut device.tags),
-            crate::state::TaggedResourceKind::Task => {
-                store.tasks.get_mut(&resource.id).map(|task| &mut task.tags)
-            }
-        };
-        let Some(existing) = existing else {
+        // with this. The resolution itself belongs to the state
+        // (the state's `tags_of_mut`), the mutable counterpart of the `tags_of` a tag
+        // read goes through, so this handler, `UntagResource` and the read path cannot
+        // resolve the same `resourceArn` to different records.
+        let Some(existing) = store.tags_of_mut(&resource) else {
             return Err(crate::scaffolded::Scaffolded::not_found(
                 crate::state::TAGGING_NOT_FOUND_MESSAGE,
             ));

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCoreNetworkPrefixListAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCoreNetworkPrefixListAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCoreNetworkPrefixListAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the prefix list associations stored for one core network, in `PrefixListArn`
+//! order, one page at a time. A pure READ: it answers only what
+//! `CreateCoreNetworkPrefixListAssociation` stored in this service's state and writes
+//! nothing: this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +112,17 @@ impl From<ListCoreNetworkPrefixListAssociationsErrorModeled> for ListCoreNetwork
     }
 }
 
+/// The modelled `PrefixListAssociation` for one stored association: the pair it ties
+/// together and the alias it carries, which is every member the shape has (`smithy_query
+/// shape=PrefixListAssociation`) — so the listing reports the record the store holds.
+fn reported(record: &crate::state::PrefixListAssociationRecord) -> PrefixListAssociation {
+    PrefixListAssociation {
+        core_network_id: Some(record.core_network_id.clone()),
+        prefix_list_arn: Some(record.prefix_list_arn.clone()),
+        prefix_list_alias: Some(record.prefix_list_alias.clone()),
+    }
+}
+
 /// The `ListCoreNetworkPrefixListAssociations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +159,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCoreNetworkPrefixListAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCoreNetworkPrefixListAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCoreNetworkPrefixListAssociations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCoreNetworkPrefixListAssociationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        let store = state.lock();
+        // The resource the path addresses is checked first: an unknown core network is not
+        // found whatever the query string carries.
+        if !store.core_networks.contains_key(&input.core_network_id) {
+            return Err(
+                ListCoreNetworkPrefixListAssociationsErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::CORE_NETWORK_KIND,
+                        &input.core_network_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // `PrefixListArn` is a FILTER here, not a resource reference ("The ARN of a
+        // specific prefix list to filter the associations"), so a string that names no
+        // managed prefix list at all is a field failure on the member that carried it —
+        // the same refusal the create and the delete answer for the same input class. A
+        // well-formed ARN naming no stored association is NOT an error: it selects nothing.
+        if let Some(filter) = input.prefix_list_arn.as_deref() {
+            if crate::state::parse_prefix_list_arn(filter).is_none() {
+                return Err(
+                    ListCoreNetworkPrefixListAssociationsErrorModeled::ValidationException(
+                        crate::state::malformed_prefix_list_arn(
+                            crate::state::FIELD_PREFIX_LIST_ARN,
+                        ),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A token this service did not mint names no position in the listing, so it is
+        // refused on the member rather than answered with an empty page — the refusal every
+        // other listing of this service gives for the same input.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListCoreNetworkPrefixListAssociationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "NextToken is not a token this service issued".to_string(),
+                        reason: Some(crate::state::REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: crate::state::FIELD_NEXT_TOKEN.to_string(),
+                            message: "the token could not be parsed".to_string(),
+                        }]),
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        // The store key `crate::state::prefix_list_association_key` mints begins with this
+        // core network's id and ends in the prefix list ARN that identifies the association
+        // inside it, so one core network's associations are a contiguous run of the store,
+        // ordered by that ARN — the order this listing reports, and the key offset its page
+        // token names.
+        let prefix = crate::state::prefix_list_association_key(&input.core_network_id, "");
+        let entries: Vec<(String, PrefixListAssociation)> = store
+            .prefix_list_associations
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .filter(|(_, record)| {
+                input
+                    .prefix_list_arn
+                    .as_deref()
+                    .is_none_or(|wanted| wanted == record.prefix_list_arn)
+            })
+            .map(|(key, record)| (key.clone(), reported(record)))
+            .collect();
+        drop(store);
+
+        let page = crate::state::paginate(entries, after.as_deref(), input.max_results);
+        Ok(ListCoreNetworkPrefixListAssociationsOutput {
+            prefix_list_associations: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }
