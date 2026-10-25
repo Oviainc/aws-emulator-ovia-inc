@@ -4373,6 +4373,38 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         ))
     }
 
+    /// Why `arn` names no flow OUTPUT this account holds, or `None` when the store holds one
+    /// for it.
+    ///
+    /// The output-side counterpart of [`Self::unknown_flow_source_rejection`]: a
+    /// `FlowOutputArn` names an OUTPUT of a flow, which lives on the flow record
+    /// ([`StoredFlow::outputs`]), so it is resolved on the flow the same request names when it
+    /// names one, and across the account's flows when it does not. `member` is the request
+    /// member that named it, for the refusal detail.
+    pub fn unknown_flow_output_rejection(
+        &self,
+        member: &str,
+        flow_arn: Option<&str>,
+        arn: &str,
+    ) -> Option<String> {
+        let held = match flow_arn {
+            Some(flow_arn) => self
+                .flows
+                .get(flow_arn)
+                .is_some_and(|flow| flow.outputs.iter().any(|output| output.output_arn == arn)),
+            None => self
+                .flows
+                .values()
+                .any(|flow| flow.outputs.iter().any(|output| output.output_arn == arn)),
+        };
+        if held {
+            return None;
+        }
+        Some(format!(
+            "{member} {arn:?} does not name a flow output this account holds."
+        ))
+    }
+
     /// Why `arn` names no flow this account holds, or `None` when the store holds one for
     /// it. `member` is the request member that named it, for the refusal detail.
     pub fn unknown_flow_rejection(&self, member: &str, arn: &str) -> Option<String> {
@@ -4382,6 +4414,68 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         Some(format!(
             "{member} {arn:?} does not name a flow this account holds."
         ))
+    }
+
+    /// Why the router input configuration `configuration` cannot be stored because a
+    /// resource of THIS service it names does not exist, or `None` when every such
+    /// reference resolves.
+    ///
+    /// A router input's configuration names what the input INGESTS ON, so a member of it that
+    /// carries the ARN of a resource this service mints and holds must name one the account
+    /// holds: the `NetworkInterfaceArn` of a STANDARD, FAILOVER or MERGE configuration
+    /// (`smithy_query(query="shape",shape="StandardRouterInputConfiguration")`, required on
+    /// each, a `routerNetworkInterface` ARN this service mints), and a MEDIACONNECT FLOW
+    /// configuration's `FlowArn` / `FlowOutputArn` ("the ARN of the flow to connect to" / "the
+    /// ARN of the flow output to connect to this router input"), each optional, because that
+    /// configuration is stored with neither while the input is disconnected ("to disconnect
+    /// it, call the update operation and omit both fields while keeping this configuration
+    /// object"). The MEDIALIVE CHANNEL configuration names a resource of ANOTHER service,
+    /// which this store does not hold, so there is nothing here to resolve it against. The
+    /// input-side counterpart of [`Self::router_output_configuration_rejection`], and the one
+    /// place every operation that stores a router input configuration resolves it, so two of
+    /// them cannot answer one reference differently.
+    pub fn router_input_configuration_rejection(
+        &self,
+        configuration: &RouterInputConfiguration,
+    ) -> Option<String> {
+        match configuration {
+            RouterInputConfiguration::Standard(standard) => self
+                .unknown_router_network_interface_rejection(
+                    "Configuration Standard NetworkInterfaceArn",
+                    &standard.network_interface_arn,
+                ),
+            RouterInputConfiguration::Failover(failover) => self
+                .unknown_router_network_interface_rejection(
+                    "Configuration Failover NetworkInterfaceArn",
+                    &failover.network_interface_arn,
+                ),
+            RouterInputConfiguration::Merge(merge) => self
+                .unknown_router_network_interface_rejection(
+                    "Configuration Merge NetworkInterfaceArn",
+                    &merge.network_interface_arn,
+                ),
+            RouterInputConfiguration::MediaConnectFlow(flow) => {
+                // Neither member is filtered for emptiness: the modelled `FlowArn` /
+                // `FlowOutputArn` patterns admit no empty string, so the boundary walk refuses
+                // one before a handler runs — and an ARN that somehow arrived empty names no
+                // flow this account holds, which is what the lookups answer.
+                let flow_arn = flow.flow_arn.as_deref();
+                if let Some(arn) = flow_arn {
+                    if let Some(rejection) =
+                        self.unknown_flow_rejection("Configuration MediaConnectFlow FlowArn", arn)
+                    {
+                        return Some(rejection);
+                    }
+                }
+                let output_arn = flow.flow_output_arn.as_deref()?;
+                self.unknown_flow_output_rejection(
+                    "Configuration MediaConnectFlow FlowOutputArn",
+                    flow_arn,
+                    output_arn,
+                )
+            }
+            RouterInputConfiguration::MediaLiveChannel(_) => None,
+        }
     }
 
     /// Why the router output configuration `configuration` cannot be stored because a
