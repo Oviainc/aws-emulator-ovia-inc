@@ -36,17 +36,17 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request in this suite is signed for; the handlers read it out of the
 /// SigV4 credential scope to build ARNs.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// A region no resource of this suite is created in, for the not-found rows.
-const OTHER_REGION: &str = "ap-northeast-1";
+pub(crate) const OTHER_REGION: &str = "ap-northeast-1";
 
 /// An account id no resource of this suite is created under, for the not-found rows.
 /// Twelve digits, which is what the modelled `Arn` pattern admits (`[0-9]{12}`).
-const OTHER_ACCOUNT: &str = "999999999999";
+pub(crate) const OTHER_ACCOUNT: &str = "999999999999";
 
 /// A UUID no resource of this suite is created under, for the not-found rows.
-const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
+pub(crate) const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// The `AssociationType` every association in this suite is made with
 /// (`smithy_query(query="shape",shape="AssociationType")`).
@@ -61,18 +61,18 @@ const TAG_VALUE_MAX: usize = 256;
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: String,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_type: String,
+    pub(crate) body: Value,
 }
 
 impl Reply {
-    fn field(&self, pointer: &str) -> Option<&Value> {
+    pub(crate) fn field(&self, pointer: &str) -> Option<&Value> {
         self.body.pointer(pointer).filter(|value| !value.is_null())
     }
 
-    fn string(&self, pointer: &str) -> String {
+    pub(crate) fn string(&self, pointer: &str) -> String {
         self.field(pointer)
             .and_then(Value::as_str)
             .unwrap_or_default()
@@ -82,12 +82,12 @@ impl Reply {
 
 /// An emulator with just this service mounted on a fresh engine, driven in-process
 /// through the production router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not what these tests are about; the router still routes by the
@@ -97,7 +97,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/wisdom/aws4_request, \
              SignedHeaders=host, Signature=not-verified-in-this-suite"
@@ -139,12 +139,16 @@ impl Emulator {
     }
 
     /// `ListTagsForResource` on one resource ARN.
-    async fn list_tags(&self, resource_arn: &str) -> Reply {
+    pub(crate) async fn list_tags(&self, resource_arn: &str) -> Reply {
         self.send("GET", &format!("/tags/{}", label(resource_arn)), None)
             .await
     }
 
-    async fn create_assistant(&self, name: &str, tags: &BTreeMap<String, String>) -> Reply {
+    pub(crate) async fn create_assistant(
+        &self,
+        name: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> Reply {
         self.send(
             "POST",
             "/assistants",
@@ -153,7 +157,11 @@ impl Emulator {
         .await
     }
 
-    async fn create_knowledge_base(&self, name: &str, tags: &BTreeMap<String, String>) -> Reply {
+    pub(crate) async fn create_knowledge_base(
+        &self,
+        name: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> Reply {
         self.send(
             "POST",
             "/knowledgeBases",
@@ -165,7 +173,7 @@ impl Emulator {
         .await
     }
 
-    async fn create_session(
+    pub(crate) async fn create_session(
         &self,
         assistant_id: &str,
         name: &str,
@@ -179,7 +187,7 @@ impl Emulator {
         .await
     }
 
-    async fn create_association(
+    pub(crate) async fn create_association(
         &self,
         assistant_id: &str,
         knowledge_base_id: &str,
@@ -199,7 +207,7 @@ impl Emulator {
         .await
     }
 
-    async fn delete_assistant(&self, assistant_id: &str) -> Reply {
+    pub(crate) async fn delete_assistant(&self, assistant_id: &str) -> Reply {
         self.send(
             "DELETE",
             &format!("/assistants/{}", label(assistant_id)),
@@ -208,7 +216,7 @@ impl Emulator {
         .await
     }
 
-    async fn delete_knowledge_base(&self, knowledge_base_id: &str) -> Reply {
+    pub(crate) async fn delete_knowledge_base(&self, knowledge_base_id: &str) -> Reply {
         self.send(
             "DELETE",
             &format!("/knowledgeBases/{}", label(knowledge_base_id)),
@@ -221,7 +229,7 @@ impl Emulator {
 /// Percent-encode one path label the way an AWS SDK encodes a non-greedy `@httpLabel`:
 /// an ARN label carries `:` and `/`, which must not be read as path structure. A bare
 /// uuid label passes through unchanged.
-fn label(value: &str) -> String {
+pub(crate) fn label(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {
@@ -245,14 +253,14 @@ fn with_tags(mut body: Value, tags: &BTreeMap<String, String>) -> Value {
 
 /// A wisdom ARN of this account, written out here rather than taken from the handler's
 /// helper so the test pins the format the model's `Arn` pattern describes.
-fn wisdom_arn(partition: &str, region: &str, account: &str, resource: &str) -> String {
+pub(crate) fn wisdom_arn(partition: &str, region: &str, account: &str, resource: &str) -> String {
     format!("arn:{partition}:wisdom:{region}:{account}:{resource}")
 }
 
 /// The four resource families this model's implemented surface creates, which is what
 /// the tagging surface's `resourceArn` can name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Family {
+pub(crate) enum Family {
     Assistant,
     KnowledgeBase,
     Session,
@@ -262,7 +270,7 @@ enum Family {
 impl Family {
     /// The ARN resource label this family's ARN carries (`state::assistant_arn` and
     /// friends).
-    fn arn_label(self) -> &'static str {
+    pub(crate) fn arn_label(self) -> &'static str {
         match self {
             Family::Assistant => "assistant",
             Family::KnowledgeBase => "knowledge-base",
@@ -272,7 +280,7 @@ impl Family {
     }
 
     /// The JSON pointer to the created resource's own ARN.
-    fn arn_pointer(self) -> &'static str {
+    pub(crate) fn arn_pointer(self) -> &'static str {
         match self {
             Family::Assistant => "/assistant/assistantArn",
             Family::KnowledgeBase => "/knowledgeBase/knowledgeBaseArn",
@@ -282,7 +290,7 @@ impl Family {
     }
 
     /// The JSON pointer to the `tags` member the create itself reported.
-    fn tags_pointer(self) -> &'static str {
+    pub(crate) fn tags_pointer(self) -> &'static str {
         match self {
             Family::Assistant => "/assistant/tags",
             Family::KnowledgeBase => "/knowledgeBase/tags",
@@ -294,7 +302,7 @@ impl Family {
 
 /// Every family, so the table spans the whole set rather than the one family the issue's
 /// recording used.
-const FAMILIES: [Family; 4] = [
+pub(crate) const FAMILIES: [Family; 4] = [
     Family::Assistant,
     Family::KnowledgeBase,
     Family::Session,
@@ -302,7 +310,7 @@ const FAMILIES: [Family; 4] = [
 ];
 
 /// `count` tags, so a row can vary the tag count without writing each map out.
-fn tag_map(count: usize) -> BTreeMap<String, String> {
+pub(crate) fn tag_map(count: usize) -> BTreeMap<String, String> {
     (0..count)
         .map(|index| (format!("key-{index}"), format!("value-{index}")))
         .collect()
@@ -369,7 +377,7 @@ fn tag_cases() -> Vec<TagCase> {
 /// `seq` keeps the names (and the knowledge base an association is made against) distinct
 /// between rows, since a duplicate name is a conflict and one assistant cannot associate
 /// one knowledge base twice.
-async fn create_tagged(
+pub(crate) async fn create_tagged(
     emulator: &Emulator,
     family: Family,
     seq: usize,
