@@ -495,6 +495,141 @@ async fn findings_are_resolved_against_the_stored_objectives() {
     }
 }
 
+/// Two audit requests that ask DIFFERENT questions of the same store do not answer alike:
+/// the reported findings are a function of `AuditTargets`, `Auditors` and `DetailLevel`
+/// together, so changing any one of them changes the `AuditFindings` payload, and only
+/// requests asking the same question answer the same.
+///
+/// The rows differ along each of the three members in turn — the entity a target names
+/// (stored, never created), the kind of target, the auditor selected (the one whose input
+/// this store holds, one that reads telemetry it never receives) and the detail level asked
+/// for — and every pair of rows is compared: equal payloads exactly where the rows ask the
+/// same question, different payloads everywhere else.
+#[tokio::test]
+async fn requests_asking_different_questions_do_not_answer_alike() {
+    /// One audit request, the objectives its findings must be computed from, whether each
+    /// finding must carry the DETAILED context, and a label naming the QUESTION it asks:
+    /// two rows share a label exactly when they must answer identically.
+    struct Case {
+        case: &'static str,
+        targets: Vec<Value>,
+        extra: Value,
+        assessed: Vec<&'static str>,
+        detailed: bool,
+        answer: &'static str,
+    }
+
+    let router = router();
+    seed(&router).await;
+    let now = now_seconds();
+    let window = format!("StartTime={}&EndTime={}", now - 3_600, now + 3_600);
+
+    let cases = vec![
+        Case {
+            case: "a stored objective, audited in detail",
+            targets: vec![target("slo", json!({ "Slo": { "SloName": "payments-health" } }))],
+            extra: json!({ "Auditors": ["slo"], "DetailLevel": "DETAILED" }),
+            assessed: vec!["payments-health"],
+            detailed: true,
+            answer: "the payments objective in detail",
+        },
+        Case {
+            case: "the same objective, audited briefly",
+            targets: vec![target("slo", json!({ "Slo": { "SloName": "payments-health" } }))],
+            extra: json!({ "Auditors": ["slo"], "DetailLevel": "BRIEF" }),
+            assessed: vec!["payments-health"],
+            detailed: false,
+            answer: "the payments objective briefly",
+        },
+        Case {
+            case: "the entity that objective monitors, audited in detail",
+            targets: vec![target("service", json!({ "Service": { "Name": "payments" } }))],
+            extra: json!({ "Auditors": ["slo"], "DetailLevel": "DETAILED" }),
+            assessed: vec!["payments-health"],
+            detailed: true,
+            // The same objective is assessed, but the finding states the kind of entity the
+            // target resolved, so a service target and an objective target differ.
+            answer: "the payments entity in detail",
+        },
+        Case {
+            case: "a different stored objective, audited in detail",
+            targets: vec![target(
+                "slo",
+                json!({ "Slo": { "SloName": "checkout-latency" } }),
+            )],
+            extra: json!({ "Auditors": ["slo"], "DetailLevel": "DETAILED" }),
+            assessed: vec!["checkout-latency"],
+            detailed: true,
+            answer: "the checkout objective in detail",
+        },
+        Case {
+            case: "an objective that was never created",
+            targets: vec![target("slo", json!({ "Slo": { "SloName": "no-such-slo" } }))],
+            extra: json!({ "Auditors": ["slo"], "DetailLevel": "DETAILED" }),
+            assessed: vec![],
+            detailed: false,
+            answer: "nothing to report",
+        },
+        Case {
+            case: "a stored objective, audited by an auditor that reads traces",
+            targets: vec![target("slo", json!({ "Slo": { "SloName": "payments-health" } }))],
+            extra: json!({ "Auditors": ["trace"], "DetailLevel": "DETAILED" }),
+            assessed: vec![],
+            detailed: false,
+            answer: "nothing to report",
+        },
+    ];
+
+    // Each row's `AuditFindings`, so every pair can be compared once every request is made.
+    let mut answers: Vec<(&'static str, &'static str, Value)> = Vec::new();
+    for case in &cases {
+        let (status, answer) =
+            audit(&router, &window, case.targets.clone(), case.extra.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected HTTP 200, got {status} with {answer:?}",
+            case.case
+        );
+        assert_eq!(
+            assessed_objectives(&answer),
+            case.assessed,
+            "case {:?}: expected the findings of {:?}, got {:?}",
+            case.case,
+            case.assessed,
+            answer["AuditFindings"]
+        );
+        for finding in answer["AuditFindings"].as_array().unwrap_or(&Vec::new()) {
+            assert_eq!(
+                !finding["MetricGraph"].is_null(),
+                case.detailed,
+                "case {:?}: expected the DETAILED context to be present={}, got {:?}",
+                case.case,
+                case.detailed,
+                finding["MetricGraph"]
+            );
+        }
+        answers.push((case.case, case.answer, answer["AuditFindings"].clone()));
+    }
+
+    for (index, (case, question, findings)) in answers.iter().enumerate() {
+        for (other_case, other_question, other_findings) in answers.iter().skip(index + 1) {
+            if question == other_question {
+                assert_eq!(
+                    findings, other_findings,
+                    "case {case:?} vs {other_case:?}: both ask {question:?}, so expected the \
+                     same findings, got {findings:?} and {other_findings:?}"
+                );
+            } else {
+                assert_ne!(
+                    findings, other_findings,
+                    "case {case:?} vs {other_case:?}: expected {question:?} and \
+                     {other_question:?} to answer differently, got {findings:?} for both"
+                );
+            }
+        }
+    }
+}
+
 /// Each finding reports the entity the assessed objective monitors and the facts of the
 /// stored record, and stops being reported once that record is gone.
 ///
