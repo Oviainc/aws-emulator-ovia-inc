@@ -284,13 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(CreateRepositoryErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: format!(
-                        "Cannot create repository {}: tags carries {} distinct keys, more than \
-                         the maximum of {} tags per resource.",
-                        input.repository,
-                        tags.len(),
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    ),
+                    message: crate::state::tag_quota_exceeded_message(),
                     resource_id: Some(input.repository.clone()),
                     resource_type: Some("repository".to_string()),
                 },
