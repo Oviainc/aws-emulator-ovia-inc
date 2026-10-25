@@ -171,6 +171,8 @@ pub(crate) async fn settled_search_job(
     let identifier = started.string("SearchJobIdentifier");
 
     if matches!(settled, Settled::Stopped) {
+        // A stop acts from the running scan, so wait for the set-up phase to pass first.
+        tokio::time::sleep(PAST_THE_CREATING_INSTANT).await;
         let stopped = call(
             emulator,
             region,
@@ -509,6 +511,9 @@ async fn an_export_is_refused_while_the_search_job_has_not_settled() {
         .await;
         let search_job_identifier = started.string("SearchJobIdentifier");
         if cancel {
+            // A stop acts from the running scan, so the row reaches STOPPING by waiting
+            // for the set-up phase to pass and then cancelling.
+            tokio::time::sleep(PAST_THE_CREATING_INSTANT).await;
             call(
                 &emulator,
                 "us-west-2",

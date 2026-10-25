@@ -14,10 +14,10 @@
 //!   whenever the page it just served was full — that invariant is asserted over job
 //!   counts x page sizes by `paging_returns_every_job_exactly_once_whatever_the_page_size`
 //!   in `search_jobs.rs`, which is the one paging harness;
-//! * `StopSearchJob` is `@idempotent`: a status that already is, or is on its way to,
-//!   the end state it asks for answers the empty 200, and only a terminal status this
-//!   operation does not produce conflicts (rows: every value of the model's
-//!   `SearchJobState`);
+//! * `StopSearchJob` acts only from the status its modelled documentation names, and is
+//!   `@idempotent`: a status that already is, or is on its way to, the end state it asks
+//!   for answers the empty 200, and every other status outside that gate conflicts
+//!   (rows: every value of the model's `SearchJobState`);
 //! * an identifier this service mints is a UUID, and the ARN it is embedded in names it
 //!   (rows differ in the start body, and cover both minted identifiers).
 //!
@@ -316,16 +316,17 @@ async fn the_terminal_status_a_scan_settles_to_follows_the_resolved_scope() {
 }
 
 #[tokio::test]
-async fn stopping_a_job_is_idempotent_and_only_an_unreachable_end_state_conflicts() {
+async fn stopping_a_job_is_idempotent_and_a_status_outside_the_gate_conflicts() {
     // One row per status a search job can be observed in: every value of the model's
     // `SearchJobState` (`types::SEARCH_JOB_STATE_VALUES`) plus the `CREATING` a
     // just-started job reports, the status the job is seeded in, what a StopSearchJob
     // against it must answer, and the status the job holds afterwards. A status that
     // already is the end state this `@idempotent` operation asks for, or is on its way to
-    // it, is a no-op success; only a terminal status this operation does not produce is a
-    // conflict.
+    // it, is a no-op success; every other status outside the one the operation's modelled
+    // documentation acts from (`state::STOPPABLE_SEARCH_JOB_STATES`) is a conflict —
+    // whether the scan has not started yet or has already ended.
     let cases: Vec<(&str, u16, &str)> = vec![
-        (state::CREATING, 200, state::STOPPING),
+        (state::CREATING, 409, state::CREATING),
         (state::RUNNING, 200, state::STOPPING),
         (state::STOPPING, 200, state::STOPPING),
         (state::STOPPED, 200, state::STOPPED),

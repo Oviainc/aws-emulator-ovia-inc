@@ -923,6 +923,8 @@ async fn stopping_a_running_job_moves_it_to_stopping_and_then_to_stopped() {
     let identifier = started.string("SearchJobIdentifier");
     let job_uri = format!("/search-jobs/{identifier}");
 
+    // Past the set-up phase, so the scan is the RUNNING one this operation acts from.
+    tokio::time::sleep(PAST_THE_CREATING_INSTANT).await;
     let stopped = call(
         &emulator,
         "us-west-2",
@@ -933,7 +935,7 @@ async fn stopping_a_running_job_moves_it_to_stopping_and_then_to_stopped() {
     .await;
     assert_eq!(
         stopped.status, 200,
-        "StopSearchJob on a job whose scan has not ended must succeed, got {} ({:?})",
+        "StopSearchJob on a running scan must succeed, got {} ({:?})",
         stopped.status, stopped.body
     );
 
@@ -997,8 +999,9 @@ async fn stopping_a_running_job_moves_it_to_stopping_and_then_to_stopped() {
 
     // Stopping a job that has already STOPPED is the end state this `@idempotent`
     // operation asks for, so the repeat is an empty 200 that leaves the job stopped.
-    // (A terminal status this operation does NOT produce is the conflict; that is
-    // asserted per status in `search_job_outcome_and_paging.rs`.)
+    // (A status outside the gate the operation acts from is the conflict; that is
+    // asserted per status in `search_job_outcome_and_paging.rs` and end-to-end in
+    // `stop_search_job_status_gate.rs`.)
     let again = call(
         &emulator,
         "us-west-2",

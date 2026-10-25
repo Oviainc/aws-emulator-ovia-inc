@@ -28,7 +28,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
-    call, emulator, percent_encode, query_value, Answer, PAST_THE_DUE_INSTANT,
+    call, emulator, percent_encode, query_value, Answer, PAST_THE_CREATING_INSTANT,
+    PAST_THE_DUE_INSTANT,
 };
 
 /// Which of this service's taggable resources a row addresses. The set is the resources
@@ -243,8 +244,10 @@ async fn stopped_search_job(
     );
     let identifier = started.string("SearchJobIdentifier");
 
-    // Cancel it inside the transition span, then let the clock make STOPPED due: a
-    // settled search job is what an export may be started from.
+    // Cancel it once its scan is running, which is the status a stop acts from, then let
+    // the clock make STOPPED due: a settled search job is what an export may be started
+    // from.
+    tokio::time::sleep(PAST_THE_CREATING_INSTANT).await;
     let stopped = call(
         emulator,
         region,
