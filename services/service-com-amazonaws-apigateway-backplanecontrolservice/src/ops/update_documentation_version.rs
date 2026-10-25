@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDocumentationVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDocumentationVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDocumentationVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +73,65 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{
+    patch_optional_string, DocumentationVersionEntry, Patch, PatchFailure, MAX_STRING_CHARS,
+};
+
+// The patch paths a `DocumentationVersion` accepts are the ones `apply_patch` below has an
+// arm for.
+//
+// The `DocumentationVersion` shape this service models declares three members —
+// `version`, `createdDate` and `description` (`smithy_query(query="shape",
+// shape="DocumentationVersion")`) — and the first two are not caller-editable: `version`
+// is "the version identifier of the API documentation snapshot" and so this record's key
+// and the path label of every later read of it, which a patch would leave addressing
+// nothing, and `createdDate` is "the date when the API documentation snapshot is
+// created", stamped once by the service. So `description` is the one member "Updates a
+// documentation version" can change — the same rule `UpdateDeployment` applies to a
+// deployment's own `id` and `createdDate`.
+
+/// Apply one patch to a COPY of a stored documentation version.
+fn apply_patch(entry: &mut DocumentationVersionEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // `patch_optional_string` is this crate's one reading of an op on a single-valued
+        // optional string member: `add`/`replace` set it, `remove` clears it, and any
+        // other op is refused as unsupported.
+        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        _ => Err(patch.unsupported_path()),
+    }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateDocumentationVersionError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateDocumentationVersionErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateDocumentationVersionErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateDocumentationVersionErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: String) -> UpdateDocumentationVersionError {
+    UpdateDocumentationVersionErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +206,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDocumentationVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDocumentationVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDocumentationVersion"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches = crate::state::parse_patches(input.patch_operations.as_ref())
+            .map_err(patch_failure)?;
+
+        let mut store = state.lock();
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(crate::state::no_such_rest_api(&input.rest_api_id)))?;
+
+        // Patched on a COPY of the record: a list whose later op is refused leaves the
+        // stored snapshot untouched, rather than keeping the ops before it.
+        let mut updated = api
+            .documentation_versions
+            .get(&input.documentation_version)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_DOCUMENTATION_VERSION.to_string()))?
+            .clone();
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+        api.documentation_versions
+            .insert(input.documentation_version.clone(), updated);
+        // Rendered from the STORED record through the one `DocumentationVersion` body this
+        // crate builds, so the update reports the snapshot exactly as
+        // `GetDocumentationVersion` will read it back — the creation date the create
+        // stamped and the documentation parts it froze included, neither of which a patch
+        // of this resource touches.
+        let body = api
+            .documentation_versions
+            .get(&input.documentation_version)
+            .map(super::create_documentation_version::documentation_version_body)
+            // Unreachable: the entry was inserted under this identifier a statement ago. A
+            // miss would mean the store did not keep it, which is answered as the
+            // server-side failure it would be rather than reported as a success.
+            .ok_or_else(crate::state::state_unavailable)?;
+        let output = UpdateDocumentationVersionOutput {
+            version: body.version,
+            created_date: body.created_date,
+            description: body.description,
+        };
+        // Everything below is owned, so the store lock is released before the access
+        // record is emitted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api = ?input.rest_api_id,
+            documentation_version = ?input.documentation_version,
+            patch_operations = patches.len(),
+            outcome = "updated",
+            "documentation version updated",
+        );
+        Ok(output)
     }
 }

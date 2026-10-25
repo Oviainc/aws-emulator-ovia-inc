@@ -191,7 +191,9 @@ fn text(value: &serde_json::Value) -> String {
 /// A CloudWatch log group ARN satisfying `LogGroupArn`'s pattern
 /// `^arn:aws[a-z0-9-]*:logs:[a-z0-9-]+:[0-9]{12}:log-group:[A-Za-z0-9\.\-\_\#/]{1,512}\:\*$`
 /// — the account segment comes from the engine, never from a literal.
-fn log_group_arn(partition: &str, region: &str, log_group_name: &str) -> String {
+///
+/// `pub(crate)` so the deletion suite builds the same ARNs from the same one rule.
+pub(crate) fn log_group_arn(partition: &str, region: &str, log_group_name: &str) -> String {
     format!(
         "arn:{partition}:logs:{region}:{}:log-group:{log_group_name}:*",
         engine::emulator_account_id()

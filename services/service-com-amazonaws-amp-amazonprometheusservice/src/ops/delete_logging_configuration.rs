@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLoggingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLoggingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the workspace's PERSISTED rules-and-alerting logging
+//! configuration. The accepted call moves the stored record to `DELETING` and the clock
+//! owes its removal ([`crate::state::TRANSITION_DELAY`]), after which the workspace holds
+//! no configuration at all and every reader of it answers the modelled 404. The operation
+//! is `@idempotent`, so a deletion already under way is accepted again without pushing
+//! that owed removal out, and the modelled `LoggingConfigurationStatusCode` rule —
+//! "Update/Deletion is disallowed until logging configuration is ACTIVE and workspace
+//! status is ACTIVE" — is the `ConflictException` (409).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLoggingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +172,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLoggingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLoggingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLoggingConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteLoggingConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the workspace store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // The configuration hangs off the workspace at `/workspaces/{workspaceId}/logging`,
+        // so an id naming no stored workspace is the missing resource — 404.
+        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+            return Err(
+                DeleteLoggingConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let workspace_status = workspace.status_code.clone();
+        let workspace_arn = workspace.arn.clone();
+
+        // A workspace that holds no configuration has nothing to delete, which is the
+        // same modelled 404 `DescribeLoggingConfiguration` answers for that workspace.
+        let Some(logging) = workspace.logging_configuration.as_mut() else {
+            return Err(
+                DeleteLoggingConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::LOGGING_NOT_FOUND_MESSAGE.to_string(),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::LOGGING_CONFIGURATION_RESOURCE_TYPE
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The operation is `@idempotent` and its `clientToken` carries
+        // `@idempotencyToken`: a delete sent while the removal of this very record is
+        // still owed asks for the state the first one already brought about, so it is
+        // accepted again — whatever token it carries — without restarting the span that
+        // removal is owed at. The record's own `DELETING` status is that evidence, so no
+        // token has to be remembered to recognise the replay.
+        if logging.status_code == crate::state::LOGGING_STATUS_DELETING {
+            drop(store);
+            crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
+            return Ok(DeleteLoggingConfigurationOutput);
+        }
+
+        // "Update/Deletion is disallowed until logging configuration is ACTIVE and
+        // workspace status is ACTIVE" (`LoggingConfigurationStatusCode`): deleting a
+        // configuration that is still settling, or one on a workspace that is not active,
+        // would leave an inconsistent state — ConflictException (409).
+        if !crate::state::logging_mutation_allowed(&workspace_status, &logging.status_code) {
+            return Err(
+                DeleteLoggingConfigurationErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "The workspace is {} and its logging configuration is {}; a \
+                         deletion is allowed only while the workspace is {} and its \
+                         logging configuration is {}",
+                        workspace_status,
+                        logging.status_code,
+                        crate::state::STATUS_ACTIVE,
+                        crate::state::LOGGING_STATUS_ACTIVE,
+                    ),
+                    resource_id: input.workspace_id.clone(),
+                    resource_type: crate::state::LOGGING_CONFIGURATION_RESOURCE_TYPE.to_string(),
+                })
+                .into(),
+            );
+        }
+
+        // Accepted: the configuration is DELETING and the clock owes its removal at
+        // `transition_due`, after which the workspace holds none at all. `modifiedAt`
+        // moves, because this call is what changed the record; `createdAt` stays the
+        // instant the configuration was created.
+        logging.status_code = crate::state::LOGGING_STATUS_DELETING.to_string();
+        logging.status_reason = None;
+        logging.modified_at = now;
+        logging.transition_due = Some(now + crate::state::TRANSITION_DELAY);
+        // The stored update token stood for the update that made this record what it is;
+        // it does not speak for a record on its way out, so a replay of that update is a
+        // new request against a configuration that is being deleted.
+        logging.update_token = None;
+        drop(store);
+
+        // The call changed stored state (or replayed the call that did), so it leaves an
+        // access record naming the operation, the resource and the key id the request
+        // presented — see `crate::state::record_state_change`.
+        crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
+
+        Ok(DeleteLoggingConfigurationOutput)
     }
 }
