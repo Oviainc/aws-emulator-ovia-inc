@@ -17,7 +17,11 @@
 //! Everything else in here is minted by a caller: `CreateTask` persists a [`Task`]
 //! plus one [`Execution`] per target, `CancelTask` moves the ones no device has
 //! started yet ([`Execution::is_cancellable`]) to `CANCELED`, and the reporting
-//! operations compute their answers from these records.
+//! operations compute their answers from these records. A device performs ONE
+//! execution at a time, so the executions of one device are a QUEUE the clock
+//! dispatches from one by one
+//! ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::settle`]), not a
+//! set that advances independently.
 //!
 //! Two bounds keep the task records finite, and they bound different things: a Region
 //! may hold [`IN_FLIGHT_TASK_QUOTA`] tasks at once, which is what `CreateTask` refuses
@@ -80,13 +84,17 @@ pub const IN_FLIGHT_TASK_QUOTA: usize = 1_000;
 /// and it refuses nothing.
 pub const TASK_HISTORY_LIMIT: usize = 10_000;
 
-/// How long an execution stays `QUEUED` before the clock owes it `IN_PROGRESS`.
+/// The EARLIEST an execution leaves the queue: how long it stays `QUEUED` before
+/// the clock owes it `IN_PROGRESS` on a device that is not performing another one.
 ///
 /// AWS dispatches a command to a Snow device over however long the device takes
 /// to check in; the emulator CHOOSES this span. It is deliberately not zero, so a
 /// caller that reads straight after `CreateTask` still observes the `QUEUED`
 /// execution. The due instant is stored on the record and materialised by
-/// whichever later call reads it — nothing sleeps.
+/// whichever later call reads it — nothing sleeps. It is a floor and not the
+/// dispatch instant itself: "Only one task is executed on a device at a time", so
+/// an execution whose device is already performing one waits for that one to end
+/// ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::settle`]).
 pub const EXECUTION_START_SPAN: Duration = Duration::from_millis(400);
 
 /// How long an execution stays `IN_PROGRESS` before the clock owes it
@@ -746,30 +754,71 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     ///
     /// An execution the span has elapsed on moves `QUEUED` -> `IN_PROGRESS` ->
     /// `SUCCEEDED`; the second of those applies the task's command to the target
-    /// device. A task whose every execution is terminal becomes `COMPLETED`.
-    /// Nothing here depends on who called: the same changes were owed at this
-    /// instant even if nobody had.
+    /// device. One device performs ONE execution at a time, so the executions of
+    /// one device are a QUEUE rather than a set that advances independently: one
+    /// whose device is still performing another stays `QUEUED` however long its own
+    /// dispatch span has been elapsed, and leaves the queue once that one is
+    /// terminal. The queue's order is the order the executions were created in,
+    /// which is the order this map is keyed in — the task ids a Region's records
+    /// carry are minted from a monotonic counter at a fixed width, so iterating
+    /// `(region, taskId, managedDeviceId)` reaches each device's executions oldest
+    /// first. A task whose every execution is terminal becomes `COMPLETED`. Nothing
+    /// here depends on who called: the same changes were owed at this instant even
+    /// if nobody had.
     pub fn settle(&mut self, now: SystemTime) {
         let tasks = &self.tasks;
         // What the finished executions ask of their devices, applied after the
         // loop so the executions and the devices are never borrowed at once.
         let mut effects: Vec<(String, TaskCommand)> = Vec::new();
-        for execution in self.executions.values_mut() {
-            while let Some(due) = execution.due {
-                if now < due {
-                    break;
+        // Per device, the instant it stops being occupied by the execution it is
+        // already performing. A device with no entry is performing nothing.
+        let mut occupied_until: HashMap<&str, SystemTime> = HashMap::new();
+        for ((_, _, managed_device_id), execution) in self.executions.iter_mut() {
+            let occupied = occupied_until.get(managed_device_id.as_str()).copied();
+            if execution.due.is_none() {
+                // A terminal execution owes nothing. One the device actually
+                // performed occupied it until the instant it ended; one that was
+                // stopped before it was ever dispatched never occupied it at all.
+                if execution.started_at.is_some() {
+                    let ended = match occupied {
+                        Some(busy) => busy.max(execution.last_updated_at),
+                        None => execution.last_updated_at,
+                    };
+                    occupied_until.insert(managed_device_id.as_str(), ended);
                 }
+                continue;
+            }
+            let mut occupied = occupied;
+            while let Some(due) = execution.due {
                 match execution.state.as_str() {
                     "QUEUED" => {
+                        // The command leaves the queue once its dispatch span has
+                        // passed AND the device has finished what it was already
+                        // performing — whichever of the two is later.
+                        let starts = occupied.map_or(due, |busy| due.max(busy));
+                        if now < starts {
+                            // Still queued, and nothing else reaches this device
+                            // before the run it waits for would end. Nothing is
+                            // written: the instant is recomputed from the same
+                            // records on the next call.
+                            occupied = Some(starts + EXECUTION_FINISH_SPAN);
+                            break;
+                        }
                         execution.state = "IN_PROGRESS".to_string();
-                        execution.started_at = Some(due);
-                        execution.last_updated_at = due;
-                        execution.due = Some(due + EXECUTION_FINISH_SPAN);
+                        execution.started_at = Some(starts);
+                        execution.last_updated_at = starts;
+                        execution.due = Some(starts + EXECUTION_FINISH_SPAN);
                     }
                     "IN_PROGRESS" => {
+                        if now < due {
+                            // The device is performing this one until it ends.
+                            occupied = Some(due);
+                            break;
+                        }
                         execution.state = "SUCCEEDED".to_string();
                         execution.last_updated_at = due;
                         execution.due = None;
+                        occupied = Some(due);
                         if let Some(task) = tasks.get(&execution.task_id) {
                             effects.push((execution.managed_device_id.clone(), task.command));
                         }
@@ -779,6 +828,9 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
                     // than looping forever on a record that broke it.
                     _ => execution.due = None,
                 }
+            }
+            if let Some(occupied) = occupied {
+                occupied_until.insert(managed_device_id.as_str(), occupied);
             }
         }
 

@@ -369,10 +369,10 @@ fn publish_into_store(
     let published = ::std::sync::Arc::new(PublishedMessage {
         message_id: message_id.clone(),
         topic_arn: topic.arn.clone(),
-        message: input.message,
+        message: ::std::sync::Arc::from(input.message),
         subject: input.subject,
         message_structure: input.message_structure,
-        message_attributes: input.message_attributes.unwrap_or_default(),
+        message_attributes: ::std::sync::Arc::new(input.message_attributes.unwrap_or_default()),
         message_group_id: input.message_group_id,
         message_deduplication_id,
         sequence_number: sequence_number.clone(),
@@ -426,6 +426,12 @@ pub struct QueueDelivery {
     subscription_arn: String,
     /// The url of the queue the subscription's endpoint ARN names.
     queue_url: String,
+    /// The ARN of that same queue — the subscription's endpoint — which is the RESOURCE the
+    /// queue's own policy is asked about before the delivery is made.
+    queue_arn: String,
+    /// The topic the message was published to: the source the queue's policy may scope its
+    /// grant to (`aws:SourceArn`).
+    topic_arn: String,
     /// The Region the queue is in: the one its own ARN names.
     region: String,
     /// The body the queue receives, shared with every other delivery of this message.
@@ -510,7 +516,7 @@ pub(crate) fn queue_deliveries(
         };
         let body = if target.raw {
             raw_body
-                .get_or_insert_with(|| ::std::sync::Arc::from(published.message.as_str()))
+                .get_or_insert_with(|| published.message.clone())
                 .clone()
         } else {
             enveloped
@@ -530,6 +536,8 @@ pub(crate) fn queue_deliveries(
         deliveries.push(QueueDelivery {
             subscription_arn: subscription.arn.clone(),
             queue_url: target.queue_url,
+            queue_arn: target.queue_arn,
+            topic_arn: published.topic_arn.clone(),
             region: target.region,
             body,
             attributes: if target.raw {
@@ -550,6 +558,9 @@ pub(crate) fn queue_deliveries(
 struct QueueTarget {
     /// The url of the queue the subscription's endpoint ARN names.
     queue_url: String,
+    /// The ARN of that queue: the subscription's endpoint, as the queue's own policy names
+    /// the resource.
+    queue_arn: String,
     /// The Region the queue is in: the one its own ARN names.
     region: String,
     /// Whether the subscription asked for RAW delivery.
@@ -594,6 +605,7 @@ impl QueueTarget {
                 "https://sqs.{region}.amazonaws.com/{}/{}",
                 arn.account, arn.resource
             ),
+            queue_arn: endpoint.to_string(),
             region: region.to_string(),
             // "RawMessageDelivery – When set to true, enables raw message delivery to Amazon
             // SQS […] endpoints. This eliminates the need for the endpoints to process JSON
@@ -612,11 +624,20 @@ impl QueueTarget {
 /// callback ([`smithy_server_runtime::OperationContext::callback`]), so this crate names no
 /// other service crate. The delivery's outcome is not part of this operation's answer, so a
 /// queue that cannot be reached is logged and changes nothing about what the caller is told.
+///
+/// A delivery is made only where the queue's OWN policy grants it: see
+/// [`delivery_is_authorized`]. The queue's policy is read once per queue per request, because
+/// one publish may owe several messages to the same queue — so the reads this adds are
+/// bounded by the same [`MAX_DELIVERIES_PER_REQUEST`] the deliveries are, and so is the
+/// per-request table they are remembered in.
 pub(crate) async fn deliver_to_queues(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     deliveries: &[QueueDelivery],
 ) {
     let mut client: Option<(String, ::aws_sdk_sqs::Client)> = None;
+    // The `Policy` each queue of this fan-out answered with, keyed by its url: at most one
+    // read per queue, whatever this request owes it.
+    let mut policies: Vec<(String, Option<String>)> = Vec::new();
     for delivery in deliveries {
         let client = match client.as_ref() {
             // One client per Region: every queue of one Region is reached through the same
@@ -627,6 +648,26 @@ pub(crate) async fn deliver_to_queues(
                 &client.insert((delivery.region.clone(), fresh)).1
             }
         };
+        let policy = match policies
+            .iter()
+            .find(|(queue_url, _)| *queue_url == delivery.queue_url)
+        {
+            Some((_, policy)) => policy.clone(),
+            None => {
+                let read = queue_policy(client, &delivery.queue_url).await;
+                policies.push((delivery.queue_url.clone(), read.clone()));
+                read
+            }
+        };
+        if !delivery_is_authorized(policy.as_deref(), &delivery.queue_arn, &delivery.topic_arn) {
+            ::tracing::warn!(
+                subscription = %delivery.subscription_arn,
+                queue = %delivery.queue_url,
+                "the subscribed queue's policy does not allow this service to send it a \
+                 message, so the notification is withheld"
+            );
+            continue;
+        }
         let mut request = client
             .send_message()
             .queue_url(&delivery.queue_url)
@@ -658,6 +699,95 @@ pub(crate) async fn deliver_to_queues(
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "a subscribed queue could not be delivered to"
             );
+        }
+    }
+}
+
+/// The service principal an SNS delivery performs its `SendMessage` as: the identity a
+/// queue's own policy has to grant for a notification to reach it.
+const SNS_SERVICE_PRINCIPAL: &str = "sns.amazonaws.com";
+
+/// The IAM action a delivery to a subscribed queue performs on that queue.
+const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
+
+/// The condition key naming the resource a cross-service request came FROM — the topic
+/// published to — which is what a queue policy scopes its grant to.
+const SOURCE_ARN_CONDITION_KEY: &str = "aws:SourceArn";
+
+/// The condition key naming the ACCOUNT that resource belongs to.
+const SOURCE_ACCOUNT_CONDITION_KEY: &str = "aws:SourceAccount";
+
+/// The same account under the key SNS's own documented queue policy uses for it.
+const SOURCE_OWNER_CONDITION_KEY: &str = "aws:SourceOwner";
+
+/// Whether the queue's own policy allows this delivery.
+///
+/// A queue is a resource of another service, and SNS reaches it as the service principal
+/// `sns.amazonaws.com` rather than as the queue's owner: "you must ensure that the Amazon SQS
+/// queue policy allows the Amazon SNS topic to send messages to the queue" — so a queue whose
+/// policy states no such grant receives nothing, and a client that repairs the policy sees
+/// the next notification arrive. That is the ordinary IAM question — may this principal
+/// perform this action on this resource? — so it is answered by the shared evaluation of
+/// policy documents rather than by a reading of its own, over the queue's `Policy` attribute
+/// as the queue reports it. The principal is a service, not an identity with policies of its
+/// own, so the queue's resource policy is the only document in force: with none at all the
+/// implicit deny stands.
+///
+/// The request carries the keys such a grant is scoped by — the topic's ARN and the account
+/// it belongs to — so a policy conditioned on them is decided rather than left undecided.
+fn delivery_is_authorized(policy: Option<&str>, queue_arn: &str, topic_arn: &str) -> bool {
+    let Some(policy) = policy else {
+        return false;
+    };
+    let principals = [SNS_SERVICE_PRINCIPAL.to_string()];
+    let account = ::service_common::arn::parse(topic_arn)
+        .map(|arn| arn.account.to_string())
+        .unwrap_or_default();
+    let context = [
+        (SOURCE_ARN_CONDITION_KEY.to_string(), topic_arn.to_string()),
+        (SOURCE_ACCOUNT_CONDITION_KEY.to_string(), account.clone()),
+        (SOURCE_OWNER_CONDITION_KEY.to_string(), account),
+    ];
+    let request =
+        ::service_common::iam_authorization::Request::new(
+            SEND_MESSAGE_ACTION,
+            queue_arn,
+            &principals,
+        )
+        .with_context(&context);
+    let stated = ::service_common::iam_authorization::resource_decision(policy, &request);
+    ::service_common::iam_authorization::is_allowed(
+        // SNS holds no identity-based policies: a service principal's permission to reach
+        // another service's resource comes from that resource's own policy.
+        ::service_common::iam_authorization::Decision::NotStated,
+        stated,
+    )
+}
+
+/// The `Policy` the queue at `queue_url` reports, or `None` when it carries none — which
+/// includes a queue this call could not read at all, because a queue that cannot be read
+/// cannot have granted anything either.
+async fn queue_policy(client: &::aws_sdk_sqs::Client, queue_url: &str) -> Option<String> {
+    let answered = client
+        .get_queue_attributes()
+        .queue_url(queue_url)
+        .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::Policy)
+        .send()
+        .await;
+    match answered {
+        Ok(answer) => answer
+            .attributes()
+            .and_then(|attributes| {
+                attributes.get(&::aws_sdk_sqs::types::QueueAttributeName::Policy)
+            })
+            .cloned(),
+        Err(error) => {
+            ::tracing::warn!(
+                queue = %queue_url,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "a subscribed queue's policy could not be read"
+            );
+            None
         }
     }
 }
@@ -717,7 +847,7 @@ fn notification_envelope(published: &PublishedMessage) -> String {
     }
     envelope.insert(
         "Message".to_string(),
-        serde_json::Value::from(published.message.as_str()),
+        serde_json::Value::from(&*published.message),
     );
     if let Some(timestamp) = rfc3339(published.published_at) {
         envelope.insert("Timestamp".to_string(), serde_json::Value::from(timestamp));

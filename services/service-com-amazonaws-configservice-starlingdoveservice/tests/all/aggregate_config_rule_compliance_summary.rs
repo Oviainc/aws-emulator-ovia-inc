@@ -24,11 +24,13 @@
 //! aggregator aggregates, which account and Region its filters name, and which `Limit`
 //! it asks for.
 //!
-//! Recording an evaluation result is `PutEvaluations`' job and that operation is still a
-//! scaffold (its own stub issue), so the rows that need results already recorded seed
-//! them into the same shared state a handler reads, through the seed
-//! `config_compliance_by_config_rule` already defines. Everything else goes over the
-//! wire.
+//! Recording an evaluation result for a MANAGED rule is something Config does itself
+//! from the configuration state it recorded, which this emulator does not evaluate, so
+//! the rows that need results already recorded seed them into the same shared state a
+//! handler reads, through the seed `config_compliance_by_config_rule` already defines.
+//! A rule whose verdicts are DELIVERED to Config is driven over the wire in
+//! `put_evaluations`, which pins the same summary surface end to end. Everything else
+//! goes over the wire.
 
 use serde_json::{json, Value};
 

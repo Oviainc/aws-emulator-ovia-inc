@@ -67,3 +67,5 @@ mod rotation_updates;
 mod start_engagement;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_resource_arn_form.rs"]
+mod tagging_resource_arn_form;

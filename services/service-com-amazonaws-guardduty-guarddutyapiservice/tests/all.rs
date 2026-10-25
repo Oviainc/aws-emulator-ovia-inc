@@ -121,6 +121,8 @@ mod resource_tag_removal;
 mod sample_finding_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/threat_entity_set_delete.rs"]
+mod threat_entity_set_delete;
 #[path = "all/threat_entity_set_lifecycle.rs"]
 mod threat_entity_set_lifecycle;
 #[path = "all/threat_entity_set_listing.rs"]

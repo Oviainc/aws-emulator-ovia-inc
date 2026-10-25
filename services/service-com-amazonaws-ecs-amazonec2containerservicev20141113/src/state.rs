@@ -52,7 +52,7 @@ use crate::ops::types::{
     Attachment, Attribute, AutoScalingGroupProvider, AwsVpcConfiguration, CapacityProvider,
     CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterServiceConnectDefaults,
     ClusterSetting, Container, ContainerDefinition, ContainerInstance, DaemonContainerDefinition,
-    DaemonTaskDefinition, DaemonVolume, Deployment,
+    DaemonTaskDefinition, DaemonTaskDefinitionSummary, DaemonVolume, Deployment,
     DeploymentCircuitBreaker, DeploymentConfiguration, DeploymentController, EphemeralStorage,
     Failure, KeyValuePair, LoadBalancer, ManagedInstancesProvider, NetworkConfiguration,
     PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProxyConfiguration,
@@ -476,6 +476,19 @@ pub const TASK_DEFINITION_INACTIVE: &str = "INACTIVE";
 /// with: a registered revision is usable straight away, so no clock-owed transition
 /// leads to it.
 pub const DAEMON_TASK_DEFINITION_ACTIVE: &str = "ACTIVE";
+
+/// The `DaemonTaskDefinitionStatusFilter` value that narrows a daemon task-definition
+/// listing to nothing at all — `ListDaemonTaskDefinitions$status`: "If you set this
+/// parameter to `ALL`, all daemon task definitions are listed regardless of status." The
+/// other two values of that enum are statuses a stored revision carries, so they are
+/// matched against [`DaemonTaskDefinitionRecord::status`] directly.
+pub const DAEMON_TASK_DEFINITION_STATUS_FILTER_ALL: &str = "ALL";
+
+/// The one `DaemonTaskDefinitionRevisionFilter` value
+/// ([`crate::ops::types::DAEMON_TASK_DEFINITION_REVISION_FILTER_VALUES`]) —
+/// `ListDaemonTaskDefinitions$revision`: "Specify `LAST_REGISTERED` to return only the
+/// last registered revision for each daemon task definition family."
+pub const DAEMON_REVISION_FILTER_LAST_REGISTERED: &str = "LAST_REGISTERED";
 
 /// The namespace mode a daemon revision records when the registration named none, for
 /// `pidMode` and for `ipcMode` alike. Both members' docs: "The valid values are `none`
@@ -1814,6 +1827,19 @@ impl DaemonTaskDefinitionRecord {
             registered_by: Some(self.registered_by.clone()),
             pid_mode: Some(self.pid_mode.clone()),
             ipc_mode: Some(self.ipc_mode.clone()),
+        }
+    }
+
+    /// The `DaemonTaskDefinitionSummary` a listing reports for this revision — "A summary
+    /// of a daemon task definition", built from the same stored values as [`Self::view`]
+    /// so a listing and a describe of one revision can never disagree.
+    pub fn summary(&self) -> DaemonTaskDefinitionSummary {
+        DaemonTaskDefinitionSummary {
+            arn: Some(self.arn.clone()),
+            registered_at: Some(self.registered_at),
+            registered_by: Some(self.registered_by.clone()),
+            delete_requested_at: self.delete_requested_at,
+            status: Some(self.status.clone()),
         }
     }
 }

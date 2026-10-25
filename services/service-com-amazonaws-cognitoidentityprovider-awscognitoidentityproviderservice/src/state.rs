@@ -956,6 +956,24 @@ impl UserPool {
             .collect()
     }
 
+    /// The keys in [`UserPool::users`] of the users that belong to
+    /// `group_name`, in ascending key order — the stable order a paginated
+    /// member listing indexes into.
+    ///
+    /// `GroupNameType` carries no case-insensitivity trait, so the name is
+    /// matched exactly as it was created, and a user is reported only while its
+    /// stored membership names that group.
+    pub fn group_member_keys(&self, group_name: &str) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .users
+            .iter()
+            .filter(|(_, user)| user.groups.contains(group_name))
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// The stored user `username` names, mutably.
     pub fn user_mut(&mut self, username: &str) -> Option<&mut User> {
         let key = self.user_storage_key(username)?;

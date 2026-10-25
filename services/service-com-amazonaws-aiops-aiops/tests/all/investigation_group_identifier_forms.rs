@@ -1,30 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for the two FORMS an `InvestigationGroupIdentifier` may take.
+//! End-to-end HTTP tests for the FORM an `InvestigationGroupIdentifier` must take to
+//! address a group.
 //!
 //! Every case drives the real wire path — the production `MultiServiceRouter`,
 //! restJson1 serialization, the modelled-constraint walk and the handlers — so what is
 //! asserted is what a signed AWS SDK request observes.
 //!
-//! The rule under test: every `{identifier}` member of this service addresses a group
-//! by EITHER of the two forms its documentation and its modelled pattern admit — the
-//! group's NAME or the group's ARN — resolved among the groups of the Region the
-//! request was signed for, and an identifier that is neither a stored group's name nor
-//! a stored group's ARN is reported absent. The member's own documentation is
-//! `smithy_query(query="doc",shape="com.amazonaws.aiops#DeleteInvestigationGroupRequest",member="identifier")`:
-//! "Specify either the name or the ARN of the investigation group that you want to
-//! delete." — and the same sentence on `Get`, `Update`, and the three policy
-//! operations; the modelled pattern
-//! (`smithy_query(query="shape",shape="InvestigationGroupIdentifier")`) spells the
-//! alternation out as `^(?:[\-_A-Za-z0-9]{1,512}|arn:...:investigation-group\/[A-Za-z0-9]{16})$`.
+//! The rule under test: an investigation group is addressed by its ARN and by nothing
+//! else. The modelled pattern
+//! (`smithy_query(query="shape",shape="InvestigationGroupIdentifier")`:
+//! `^(?:[\-_A-Za-z0-9]{1,512}|arn:...:investigation-group\/[A-Za-z0-9]{16})$`) admits a
+//! bare label beside the ARN, but that alternative is a WELL-FORMEDNESS rule and not an
+//! address: a well-formed bare label reaches the handler and resolves nothing — the
+//! label a stored group carries as its NAME included — so the operation answers the
+//! modelled `ResourceNotFoundException` (404,
+//! `smithy_query(query="shape",shape="ResourceNotFoundException")`). The same holds for
+//! the tagging operations' `resourceArn`.
 //!
-//! The TAGGING operations are the contrast, and are asserted here too: their
-//! `resourceArn` is documented as the resource's ARN with no name alternative, so a
-//! name addresses no tag set.
-//!
-//! Rows differ along the NAME — its length (each bound of the label class), its
-//! character classes, its case, and a name shaped like an id — and the rule is asserted
-//! against every operation that takes an identifier, reporting and mutating alike.
+//! Rows differ along the bare label: its length (each published bound of the label
+//! class), its character classes, its case, a label shaped like a group id, and the
+//! label a stored group carries as its name — and the rule is asserted against every
+//! operation that takes an identifier, reporting and mutating alike, with the group's
+//! own ARN as the control that each of those operations does serve.
 
 use std::sync::Arc;
 
@@ -34,11 +32,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// A role ARN that satisfies the modelled `RoleArn` (len 20..2048, `^arn:.*$`).
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/AIOpsAssistantRole";
 
-/// A second role ARN, so an update addressed by name is visible in the stored record.
+/// A second role ARN, so an update is visible in the stored record.
 const OTHER_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/AIOpsAssistantRoleTwo";
 
 /// A policy document the policy operations attach and read back.
-const POLICY: &str = r#"{"Version":"2012-10-17","Sid":"by-name"}"#;
+const POLICY: &str = r#"{"Version":"2012-10-17","Sid":"by-arn"}"#;
 
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
 const ACCOUNT: &str = "000000000000";
@@ -47,6 +45,10 @@ const ACCOUNT: &str = "000000000000";
 /// with (`smithy_query(query="shape",shape="ResourceNotFoundException")`: `@httpError
 /// 404`).
 const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The message a 404 on this service's primary resource carries: the modelled resource
+/// type that does not exist, and nothing of the identifier that named it.
+const GROUP_ABSENT: &str = "InvestigationGroup does not exist.";
 
 /// The error code the tagging frontend reports an unresolvable `resourceArn` with — see
 /// `state::TAGGING_RESOURCE_NOT_FOUND`.
@@ -159,6 +161,15 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The message a failed call reported.
+fn message(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+        .to_string()
+}
+
 /// Percent-encode everything a URI component may not carry literally — what an SDK does
 /// for a non-greedy `@httpLabel` path segment.
 fn encode(value: &str) -> String {
@@ -212,8 +223,8 @@ async fn listed(router: &MultiServiceRouter, region: &str) -> Vec<String> {
         .collect()
 }
 
-/// The id segment of a group ARN — a form the modelled pattern admits as a bare label
-/// but which NO `{identifier}` member documents, so it addresses no group.
+/// The id segment of a group ARN — a form the modelled pattern admits as a bare label,
+/// and so one more label that addresses no group.
 fn id_of(arn: &str) -> String {
     arn.rsplit('/')
         .next()
@@ -221,7 +232,50 @@ fn id_of(arn: &str) -> String {
         .to_string()
 }
 
-/// One row of the name table: how a failure names it, and the group name it creates.
+/// Every operation that resolves a group through `{identifier}`, as
+/// `(name, method, uri template, body)`.
+fn identifier_operations() -> Vec<(&'static str, &'static str, &'static str, Option<Value>)> {
+    vec![
+        (
+            "GetInvestigationGroup",
+            "GET",
+            "/investigationGroups/{}",
+            None,
+        ),
+        (
+            "UpdateInvestigationGroup",
+            "PATCH",
+            "/investigationGroups/{}",
+            Some(json!({ "roleArn": OTHER_ROLE_ARN })),
+        ),
+        (
+            "DeleteInvestigationGroup",
+            "DELETE",
+            "/investigationGroups/{}",
+            None,
+        ),
+        (
+            "GetInvestigationGroupPolicy",
+            "GET",
+            "/investigationGroups/{}/policy",
+            None,
+        ),
+        (
+            "PutInvestigationGroupPolicy",
+            "POST",
+            "/investigationGroups/{}/policy",
+            Some(json!({ "policy": POLICY })),
+        ),
+        (
+            "DeleteInvestigationGroupPolicy",
+            "DELETE",
+            "/investigationGroups/{}/policy",
+            None,
+        ),
+    ]
+}
+
+/// One row of the label table: how a failure names it, and the group name it creates.
 struct NameCase {
     case: &'static str,
     name: String,
@@ -231,9 +285,9 @@ struct NameCase {
 /// (`StringWithPatternAndLengthLimits`, len 1..512,
 /// `^[\-_A-Za-z0-9\[\]\(\)\{\}\.: ]+$`) AND inside the bare-label alternative of
 /// `InvestigationGroupIdentifier` (`[\-_A-Za-z0-9]{1,512}`), which is what lets the name
-/// travel as the `{identifier}` path segment: the recorded form, both published length
-/// bounds of that class (1 and 512), the underscore and digit characters it admits,
-/// mixed case, and a name shaped exactly like a 16-character group id.
+/// travel as the `{identifier}` path segment at all: a hyphenated label, both published
+/// length bounds of that class (1 and 512), the underscore and digit characters it
+/// admits, mixed case, and a name shaped exactly like a 16-character group id.
 fn name_cases() -> Vec<NameCase> {
     vec![
         NameCase {
@@ -263,12 +317,12 @@ fn name_cases() -> Vec<NameCase> {
     ]
 }
 
-/// A group is addressed by its NAME exactly as it is by its ARN, on every operation that
-/// takes an `{identifier}`: the reads report the same group, the writes reach the same
-/// record (and are visible through the ARN), and the delete removes it — which frees the
-/// Region's single group slot for the next create.
+/// A group's own NAME addresses nothing on any operation that takes an `{identifier}`:
+/// every one of them reports the modelled 404 for it, nothing the refused calls carried
+/// reaches the stored record, and the group's ARN serves every one of those same
+/// operations.
 #[tokio::test]
-async fn every_identifier_operation_resolves_a_group_by_name_as_well_as_by_arn() {
+async fn a_group_name_addresses_no_group_on_any_identifier_operation() {
     for (index, NameCase { case, name }) in name_cases().into_iter().enumerate() {
         // Each row needs its own group, so each row signs for its own Region.
         let router = emulator();
@@ -277,7 +331,7 @@ async fn every_identifier_operation_resolves_a_group_by_name_as_well_as_by_arn()
         let by_name = encode(&name);
         let by_arn = encode(&arn);
 
-        // GetInvestigationGroup: the name reports the SAME group the ARN does.
+        // The ARN reports the group: the control for every refusal below.
         let (status, via_arn) = call_in(
             &router,
             &region,
@@ -287,47 +341,31 @@ async fn every_identifier_operation_resolves_a_group_by_name_as_well_as_by_arn()
         )
         .await;
         assert_eq!(
-            status, 200,
+            (status, via_arn.get("name").and_then(Value::as_str)),
+            (200, Some(name.as_str())),
             "case {case:?}: the ARN must read the group, got {status} / {via_arn:?}"
         );
-        let (status, via_name) = call_in(
-            &router,
-            &region,
-            "GET",
-            &format!("/investigationGroups/{by_name}"),
-            None,
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: the name must read the group, got {status} / {via_name:?}"
-        );
-        assert_eq!(
-            via_name, via_arn,
-            "case {case:?}: both identifier forms address one record, \
-             via the name {via_name:?} vs via the ARN {via_arn:?}"
-        );
-        assert_eq!(
-            via_name.get("name").and_then(Value::as_str),
-            Some(name.as_str()),
-            "case {case:?}: expected the group's own name back, got {via_name:?}"
-        );
 
-        // UpdateInvestigationGroup through the name reaches the stored record, which the
-        // ARN then reports.
-        let (status, updated) = call_in(
-            &router,
-            &region,
-            "PATCH",
-            &format!("/investigationGroups/{by_name}"),
-            Some(&json!({ "roleArn": OTHER_ROLE_ARN })),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: an update addressed by name must succeed, got {status} / {updated:?}"
-        );
-        let (_, after) = call_in(
+        // And the name addresses nothing, on each of the six operations.
+        for (operation, method, template, body) in identifier_operations() {
+            let probe = format!("{operation} addressed by {case}");
+            let uri = template.replace("{}", &by_name);
+            let (status, answer) = call_in(&router, &region, method, &uri, body.as_ref()).await;
+            assert_eq!(
+                (status, error_code(&answer).as_str()),
+                (404, RESOURCE_NOT_FOUND),
+                "case {probe:?}: expected 404 {RESOURCE_NOT_FOUND}, got {status} / {answer:?}"
+            );
+            assert_eq!(
+                message(&answer),
+                GROUP_ABSENT,
+                "case {probe:?}: expected {GROUP_ABSENT:?}, got {answer:?}"
+            );
+        }
+
+        // None of those refused calls reached the record: the group still carries the
+        // role it was created with, carries no policy, and is still the Region's group.
+        let (status, after) = call_in(
             &router,
             &region,
             "GET",
@@ -336,61 +374,17 @@ async fn every_identifier_operation_resolves_a_group_by_name_as_well_as_by_arn()
         )
         .await;
         assert_eq!(
+            (status, &after),
+            (200, &via_arn),
+            "case {case:?}: the refused calls must leave the record byte for byte, \
+             got {status} / {after:?}"
+        );
+        assert_eq!(
             after.get("roleArn").and_then(Value::as_str),
-            Some(OTHER_ROLE_ARN),
-            "case {case:?}: the update addressed by name must be visible through the ARN, \
-             got {after:?}"
+            Some(ROLE_ARN),
+            "case {case:?}: a refused update must not have replaced the role, got {after:?}"
         );
-
-        // PutInvestigationGroupPolicy / GetInvestigationGroupPolicy /
-        // DeleteInvestigationGroupPolicy, all addressed by the name.
-        let (status, put) = call_in(
-            &router,
-            &region,
-            "POST",
-            &format!("/investigationGroups/{by_name}/policy"),
-            Some(&json!({ "policy": POLICY })),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: a policy put addressed by name must succeed, got {status} / {put:?}"
-        );
-        assert_eq!(
-            put.get("investigationGroupArn").and_then(Value::as_str),
-            Some(arn.as_str()),
-            "case {case:?}: the put must answer the addressed group's ARN, got {put:?}"
-        );
-        for (via, identifier) in [("the name", &by_name), ("the ARN", &by_arn)] {
-            let (status, got) = call_in(
-                &router,
-                &region,
-                "GET",
-                &format!("/investigationGroups/{identifier}/policy"),
-                None,
-            )
-            .await;
-            assert_eq!(
-                (status, got.get("policy").and_then(Value::as_str)),
-                (200, Some(POLICY)),
-                "case {case:?}: the stored document must read back via {via}, \
-                 got {status} / {got:?}"
-            );
-        }
-        let (status, removed) = call_in(
-            &router,
-            &region,
-            "DELETE",
-            &format!("/investigationGroups/{by_name}/policy"),
-            None,
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: a policy delete addressed by name must succeed, \
-             got {status} / {removed:?}"
-        );
-        let (status, gone) = call_in(
+        let (status, policy) = call_in(
             &router,
             &region,
             "GET",
@@ -399,46 +393,91 @@ async fn every_identifier_operation_resolves_a_group_by_name_as_well_as_by_arn()
         )
         .await;
         assert_eq!(
-            (status, error_code(&gone).as_str()),
+            (status, error_code(&policy).as_str()),
             (404, RESOURCE_NOT_FOUND),
-            "case {case:?}: the document deleted by name must be gone, got {status} / {gone:?}"
+            "case {case:?}: a refused put must have attached no policy, \
+             got {status} / {policy:?}"
+        );
+        let remaining = listed(&router, &region).await;
+        assert_eq!(
+            remaining,
+            vec![arn.clone()],
+            "case {case:?}: a refused delete must leave the group listed, got {remaining:?}"
         );
 
-        // DeleteInvestigationGroup through the name removes the group itself.
-        let (status, deleted) = call_in(
+        // The ARN, in contrast, serves every one of those operations end to end: the
+        // policy round-trips through it and the delete frees the Region's group slot.
+        let (status, put) = call_in(
+            &router,
+            &region,
+            "POST",
+            &format!("/investigationGroups/{by_arn}/policy"),
+            Some(&json!({ "policy": POLICY })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a policy put addressed by the ARN must succeed, \
+             got {status} / {put:?}"
+        );
+        let (status, stored) = call_in(
+            &router,
+            &region,
+            "GET",
+            &format!("/investigationGroups/{by_arn}/policy"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, stored.get("policy").and_then(Value::as_str)),
+            (200, Some(POLICY)),
+            "case {case:?}: the stored document must read back through the ARN, \
+             got {status} / {stored:?}"
+        );
+        let (status, removed) = call_in(
             &router,
             &region,
             "DELETE",
-            &format!("/investigationGroups/{by_name}"),
+            &format!("/investigationGroups/{by_arn}/policy"),
             None,
         )
         .await;
         assert_eq!(
             status, 200,
-            "case {case:?}: a delete addressed by name must succeed, got {status} / {deleted:?}"
+            "case {case:?}: a policy delete addressed by the ARN must succeed, \
+             got {status} / {removed:?}"
         );
-        let (status, absent) = call_in(
+        let (status, updated) = call_in(
             &router,
             &region,
-            "GET",
+            "PATCH",
+            &format!("/investigationGroups/{by_arn}"),
+            Some(&json!({ "roleArn": OTHER_ROLE_ARN })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: an update addressed by the ARN must succeed, \
+             got {status} / {updated:?}"
+        );
+        let (status, deleted) = call_in(
+            &router,
+            &region,
+            "DELETE",
             &format!("/investigationGroups/{by_arn}"),
             None,
         )
         .await;
         assert_eq!(
-            (status, error_code(&absent).as_str()),
-            (404, RESOURCE_NOT_FOUND),
-            "case {case:?}: the deleted group must not read back through its ARN, \
-             got {status} / {absent:?}"
+            status, 200,
+            "case {case:?}: a delete addressed by the ARN must succeed, \
+             got {status} / {deleted:?}"
         );
         let remaining = listed(&router, &region).await;
         assert!(
             remaining.is_empty(),
             "case {case:?}: the deleted group must be gone from the listing, got {remaining:?}"
         );
-
-        // And the Region's single group slot is free again, so the lifecycle is not
-        // wedged by a delete that was addressed by name.
         let replacement = create_ok(&router, &region, "created-after-the-delete").await;
         assert_ne!(
             replacement, arn,
@@ -448,22 +487,22 @@ async fn every_identifier_operation_resolves_a_group_by_name_as_well_as_by_arn()
     }
 }
 
-/// An identifier that is neither a stored group's name nor its exact ARN resolves
-/// nothing: every operation reports the group absent and the stored group is untouched.
+/// An identifier that is not a stored group's exact ARN resolves nothing: every
+/// operation reports the group absent and the stored group is untouched.
 ///
-/// Rows span the forms the modelled pattern admits but the member does not document (a
-/// bare id), labels nothing carries, the name of a group that belongs to ANOTHER Region,
-/// and ARNs differing from the stored one in exactly one field.
+/// Rows span the bare forms the modelled pattern admits (the group's own id, labels
+/// nothing carries, the name a group in ANOTHER Region carries), another Region's group
+/// ARN, and ARNs differing from the stored one in exactly one field.
 #[tokio::test]
-async fn an_identifier_that_names_no_group_in_the_region_resolves_nothing() {
+async fn an_identifier_that_is_not_the_groups_arn_resolves_nothing() {
     let router = emulator();
     let home = region(0);
     let elsewhere = region(1);
-    let name = "resolvable-by-name";
+    let name = "addressable-by-its-arn";
     let arn = create_ok(&router, &home, name).await;
     let id = id_of(&arn);
     // A group of another Region carrying its own distinct name: this endpoint may not
-    // resolve it by name either.
+    // resolve it through either form.
     let foreign_name = "owned-by-another-region";
     let foreign_arn = create_ok(&router, &elsewhere, foreign_name).await;
 
@@ -495,44 +534,8 @@ async fn an_identifier_that_names_no_group_in_the_region_resolves_nothing() {
         ),
     ];
 
-    // Every operation that resolves a group through `{identifier}`, as
-    // (name, method, uri template, body).
-    let operations: Vec<(&str, &str, &str, Option<Value>)> = vec![
-        ("GetInvestigationGroup", "GET", "/investigationGroups/{}", None),
-        (
-            "UpdateInvestigationGroup",
-            "PATCH",
-            "/investigationGroups/{}",
-            Some(json!({ "roleArn": OTHER_ROLE_ARN })),
-        ),
-        (
-            "DeleteInvestigationGroup",
-            "DELETE",
-            "/investigationGroups/{}",
-            None,
-        ),
-        (
-            "GetInvestigationGroupPolicy",
-            "GET",
-            "/investigationGroups/{}/policy",
-            None,
-        ),
-        (
-            "PutInvestigationGroupPolicy",
-            "POST",
-            "/investigationGroups/{}/policy",
-            Some(json!({ "policy": POLICY })),
-        ),
-        (
-            "DeleteInvestigationGroupPolicy",
-            "DELETE",
-            "/investigationGroups/{}/policy",
-            None,
-        ),
-    ];
-
     for (form, identifier) in &unresolvable {
-        for (operation, method, template, body) in &operations {
+        for (operation, method, template, body) in identifier_operations() {
             let case = format!("{operation} addressed by {form}");
             let uri = template.replace("{}", &encode(identifier));
             let (status, answer) = call_in(&router, &home, method, &uri, body.as_ref()).await;
@@ -545,32 +548,34 @@ async fn an_identifier_that_names_no_group_in_the_region_resolves_nothing() {
                 RESOURCE_NOT_FOUND,
                 "case {case:?}: expected {RESOURCE_NOT_FOUND}, got {answer:?}"
             );
+            assert!(
+                !message(&answer).contains(identifier),
+                "case {case:?}: the message must not echo the identifier {identifier:?}, \
+                 got {answer:?}"
+            );
         }
     }
 
-    // Nothing above reached the stored group: it still reads back through BOTH of its
-    // forms, with the role it was created with and no policy attached.
-    for (via, identifier) in [("its name", name.to_string()), ("its ARN", arn.clone())] {
-        let (status, body) = call_in(
-            &router,
-            &home,
-            "GET",
-            &format!("/investigationGroups/{}", encode(&identifier)),
-            None,
-        )
-        .await;
-        assert_eq!(
-            (status, body.get("roleArn").and_then(Value::as_str)),
-            (200, Some(ROLE_ARN)),
-            "the refused calls must leave the group alone, read via {via}: \
-             got {status} / {body:?}"
-        );
-    }
+    // Nothing above reached the stored group: it still reads back through its ARN, with
+    // the role it was created with and no policy attached.
+    let (status, body) = call_in(
+        &router,
+        &home,
+        "GET",
+        &format!("/investigationGroups/{}", encode(&arn)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, body.get("roleArn").and_then(Value::as_str)),
+        (200, Some(ROLE_ARN)),
+        "the refused calls must leave the group alone, got {status} / {body:?}"
+    );
     let (status, policy) = call_in(
         &router,
         &home,
         "GET",
-        &format!("/investigationGroups/{}/policy", encode(name)),
+        &format!("/investigationGroups/{}/policy", encode(&arn)),
         None,
     )
     .await;
@@ -637,9 +642,9 @@ async fn a_name_outside_the_identifier_label_class_is_refused_at_the_boundary() 
     }
 }
 
-/// The contrast the model draws: the TAGGING operations take a `resourceArn`, documented
-/// as "The ARN of the CloudWatch investigations resource" with no name alternative, so a
-/// name addresses no tag set while the ARN does.
+/// The TAGGING operations resolve their `resourceArn` the same way: the ARN addresses
+/// the tag set and a bare label addresses nothing — reported through the tagging
+/// frontend's own 404.
 #[tokio::test]
 async fn the_tagging_operations_take_the_arn_and_not_the_name() {
     let router = emulator();

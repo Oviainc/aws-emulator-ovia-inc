@@ -1115,11 +1115,11 @@ async fn a_publish_into_the_reserved_namespace_is_refused_and_stores_nothing() {
 /// The emulator the end-to-end test drives: CloudWatch, SNS and SQS on ONE engine, because
 /// an alarm's action is an SNS topic and the notification is asserted where a client sees
 /// it — on the queue subscribed to that topic.
-struct Emulator {
-    router: MultiServiceRouter,
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -1145,7 +1145,7 @@ const REGION: &str = "us-east-1";
 
 /// One `awsJson` RPC call against the service whose signing name is `signing_name` — the
 /// credential scope is what routes it.
-async fn rpc(
+pub(crate) async fn rpc(
     emulator: &Emulator,
     signing_name: &str,
     target_prefix: &str,
@@ -1183,7 +1183,7 @@ async fn rpc(
 }
 
 /// One awsQuery form call against SNS, the protocol that service serves.
-async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
+pub(crate) async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
     let mut body = format!("Action={action}&Version=2010-03-31");
     for (name, value) in params {
         body.push('&');
@@ -1220,7 +1220,7 @@ async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> Stri
 }
 
 /// The text of the first `<tag>…</tag>` element of an awsQuery response.
-fn element(body: &str, tag: &str) -> String {
+pub(crate) fn element(body: &str, tag: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = body
@@ -1231,6 +1231,22 @@ fn element(body: &str, tag: &str) -> String {
         .find(&close)
         .unwrap_or_else(|| panic!("no </{tag}> in {body}"));
     body[start..start + end].to_string()
+}
+
+/// The queue policy AWS documents for an SQS queue subscribed to an SNS topic: the service
+/// principal `sns.amazonaws.com`, allowed `sqs:SendMessage` on that queue.
+pub(crate) fn grant_sns_delivery(queue_arn: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowSNSDelivery",
+            "Effect": "Allow",
+            "Principal": {"Service": "sns.amazonaws.com"},
+            "Action": "sqs:SendMessage",
+            "Resource": queue_arn,
+        }],
+    })
+    .to_string()
 }
 
 #[tokio::test]
@@ -1262,6 +1278,20 @@ async fn an_alarm_that_crosses_its_threshold_notifies_its_sns_action() {
         .as_str()
         .expect("GetQueueAttributes answers the QueueArn")
         .to_string();
+    // The queue policy an SNS subscriber needs: a notification is an `sqs:SendMessage` the
+    // queue's own policy has to grant the SNS service principal, so a queue that grants it
+    // nothing receives nothing (`sns_action_queue_policy.rs`).
+    rpc(
+        &emulator,
+        "sqs",
+        "AmazonSQS",
+        "SetQueueAttributes",
+        &json!({
+            "QueueUrl": queue_url,
+            "Attributes": {"Policy": grant_sns_delivery(&queue_arn)},
+        }),
+    )
+    .await;
     let topic_arn = element(&sns(&emulator, "CreateTopic", &[("Name", "alarms")]).await, "TopicArn");
     sns(
         &emulator,
