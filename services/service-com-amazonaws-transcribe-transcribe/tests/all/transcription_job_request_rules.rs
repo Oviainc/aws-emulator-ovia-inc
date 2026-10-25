@@ -573,7 +573,11 @@ fn references() -> Vec<Reference> {
 /// text every family's not-found refusal carries ("The requested job couldn't be
 /// found. Check the job name and try your request again." in the recorded responses),
 /// naming the KIND and never the name the caller asked about.
-fn not_found_message(kind: &str) -> String {
+///
+/// `pub(crate)` so the Call Analytics start suite
+/// (`crate::call_analytics_job_start_limits`) asserts the same wording from one home
+/// rather than restating it.
+pub(crate) fn not_found_message(kind: &str) -> String {
     format!("The requested {kind} couldn't be found. Check the {kind} name and try your request again.")
 }
 
