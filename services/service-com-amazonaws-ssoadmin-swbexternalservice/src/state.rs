@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccessControlAttribute, AccountAssignment, AccountAssignmentOperationStatus,
+    AccessControlAttribute, AccountAssignment, AccountAssignmentOperationStatus, Application,
     ApplicationProvider, AttachedManagedPolicy, AuthenticationMethod,
     CustomerManagedPolicyReference, DisplayData, EncryptionConfigurationDetails, Grant,
     InstanceAccessControlAttributeConfiguration, InstanceMetadata,
@@ -546,6 +546,16 @@ pub const PERMISSION_SET_PROVISIONING_SPAN: Duration = Duration::from_millis(500
 /// ceiling it clamps a caller's value to: the model's `MaxResults` shape is
 /// `range(min: 1, max: 100)`.
 pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// The ceiling a `ListApplications` page is clamped to, below [`MAX_PAGE_SIZE`].
+///
+/// The model bounds its OUTPUT list `ApplicationList` at `length(min: 0, max: 50)` while
+/// its `MaxResults` still admits up to 100, so a page that honoured a `MaxResults` of 100
+/// over 100 stored applications would answer a list the model forbids. The extra items
+/// are not dropped: the page carries 50 and the enumeration continues through its
+/// `NextToken`, which is what the member documents ("the service might return fewer
+/// results than the maximum even when there are more results available").
+pub const MAX_APPLICATIONS_PER_PAGE: i32 = 50;
 
 /// The largest page `ListApplicationAccessScopes` can answer: the maximum its own
 /// `MaxResults` MEMBER declares, which narrows the `MaxResults` shape's `range(min: 1,
@@ -1957,6 +1967,30 @@ pub struct ApplicationRecord {
 }
 
 impl ApplicationRecord {
+    /// This record as the modeled `Application` shape — the projection an ENUMERATION of
+    /// applications reports, holding the same values `DescribeApplication` reports for
+    /// the same record, member for member.
+    ///
+    /// `Description` is the one member a create can leave unstored, so it is reported
+    /// exactly when the record holds one; everything else is always stored and always
+    /// reported. Nothing the create was given beyond the modelled members (its `Tags`,
+    /// its `ClientToken`) belongs to this view.
+    pub fn to_shape(&self) -> Application {
+        Application {
+            application_arn: Some(self.application_arn.clone()),
+            application_provider_arn: Some(self.application_provider_arn.clone()),
+            name: Some(self.name.clone()),
+            application_account: Some(self.application_account.clone()),
+            instance_arn: Some(self.instance_arn.clone()),
+            identity_store_arn: Some(self.identity_store_arn.clone()),
+            status: Some(self.status.clone()),
+            portal_options: Some(self.portal_options.clone()),
+            description: self.description.clone(),
+            created_date: Some(self.created_date),
+            created_from: Some(self.created_from.clone()),
+        }
+    }
+
     /// The status `GetApplicationSessionConfiguration` reports for this application: the
     /// one the last `PutApplicationSessionConfiguration` stored, or
     /// [`USER_BACKGROUND_SESSION_STATUS_DEFAULT`] while nothing has configured it.
@@ -3608,6 +3642,27 @@ pub fn cursor_permission_sets(instance_arn: &str) -> String {
 /// instance that permission set belongs to (the same pair the read resolves against).
 pub fn cursor_managed_policies(instance_arn: &str, permission_set_arn: &str) -> String {
     format!("managedPolicies|{instance_arn}|{permission_set_arn}")
+}
+
+/// Cursor scope of a `ListApplications` enumeration: the operation and the whole filter
+/// that selected the rows — the instance whose applications it walks and both members of
+/// the request's `ListApplicationsFilter` — since the key (an `ApplicationArn`) only
+/// distinguishes rows WITHIN one such filter.
+///
+/// A filter member the caller omitted renders as an EMPTY segment, which is a scope of its
+/// own: the three parts are joined by `|`, a character none of them can hold — the model's
+/// `InstanceArn`, `AccountId` and `ApplicationProviderArn` patterns all exclude it — so no
+/// two filters render the same scope.
+pub fn cursor_applications(
+    instance_arn: &str,
+    application_account: Option<&str>,
+    application_provider: Option<&str>,
+) -> String {
+    format!(
+        "applications|{instance_arn}|{}|{}",
+        application_account.unwrap_or_default(),
+        application_provider.unwrap_or_default()
+    )
 }
 
 /// Cursor scope of a `ListApplicationAccessScopes` enumeration: the operation and the
