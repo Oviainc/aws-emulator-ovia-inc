@@ -37,6 +37,8 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/support_case_and_templates.rs"]
 mod support_case_and_templates;
+#[path = "all/support_cases.rs"]
+mod support_cases;
 #[path = "all/tags.rs"]
 mod tags;
 #[path = "all/utilization_report.rs"]
