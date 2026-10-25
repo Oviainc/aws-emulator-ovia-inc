@@ -57,7 +57,7 @@ const ELSEWHERE: &str = "eu-west-1";
 const PAGE_LIMIT: usize = 200;
 
 impl Emulator {
-    async fn list_sub_check_results(&self, body: Value) -> Reply {
+    pub(crate) async fn list_sub_check_results(&self, body: Value) -> Reply {
         self.send(SUB_CHECK_RESULTS, body).await
     }
 
@@ -66,7 +66,7 @@ impl Emulator {
     }
 
     /// Start ONE check against a registered application and return its `OperationId`.
-    async fn one_check(&self, application_id: &str, check: &str) -> String {
+    pub(crate) async fn one_check(&self, application_id: &str, check: &str) -> String {
         let reply = self
             .start_checks(json!({
                 "ApplicationId": application_id,
@@ -125,7 +125,11 @@ fn rule_results(family: u32, count: u32) -> Vec<StoredRuleResult> {
 /// the members a sub-check result may carry (a name, a description, references of none,
 /// one and two entries) and stored in DESCENDING id order for the reason
 /// [`rule_results`] gives. `family` distinguishes one run's results from another's.
-fn sub_check_results(family: u32, count: u32, rules_each: u32) -> Vec<StoredSubCheckResult> {
+pub(crate) fn sub_check_results(
+    family: u32,
+    count: u32,
+    rules_each: u32,
+) -> Vec<StoredSubCheckResult> {
     (0..count)
         .rev()
         .map(|n| StoredSubCheckResult {
@@ -143,7 +147,11 @@ fn sub_check_results(family: u32, count: u32, rules_each: u32) -> Vec<StoredSubC
 /// Put `results` on the configuration check run `operation_id` names, in the Region this
 /// suite drives. See this module's note on why these records are placed rather than
 /// produced.
-fn place_results(emulator: &Emulator, operation_id: &str, results: Vec<StoredSubCheckResult>) {
+pub(crate) fn place_results(
+    emulator: &Emulator,
+    operation_id: &str,
+    results: Vec<StoredSubCheckResult>,
+) {
     emulator.with_state(|state| {
         state
             .region_entry(REGION)
@@ -221,7 +229,7 @@ async fn walk(
 }
 
 /// A member of one reported item, treating JSON `null` as absent.
-fn member<'a>(item: &'a Value, name: &str) -> Option<&'a Value> {
+pub(crate) fn member<'a>(item: &'a Value, name: &str) -> Option<&'a Value> {
     item.get(name).filter(|value| !value.is_null())
 }
 

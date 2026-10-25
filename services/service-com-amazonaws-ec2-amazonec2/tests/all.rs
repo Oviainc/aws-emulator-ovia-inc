@@ -74,6 +74,8 @@ mod capacity_reservation_fleets;
 mod carrier_gateways;
 #[path = "all/coip_pools.rs"]
 mod coip_pools;
+#[path = "all/confirm_product_instance.rs"]
+mod confirm_product_instance;
 #[path = "all/copy_volumes.rs"]
 mod copy_volumes;
 #[path = "all/create_security_group.rs"]

@@ -29,7 +29,7 @@ fn account_ids(n: usize) -> Vec<String> {
 /// The entries the fan-out table stores: they differ in registration type,
 /// sector, country and whether they carry a country block, none of which the
 /// fan-out depends on.
-fn entries() -> Vec<(&'static str, Value)> {
+pub(crate) fn entries() -> Vec<(&'static str, Value)> {
     vec![
         (
             "minimal VAT entry",

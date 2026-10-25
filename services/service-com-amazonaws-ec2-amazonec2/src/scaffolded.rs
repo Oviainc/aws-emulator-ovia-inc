@@ -444,6 +444,15 @@ impl<E> Scaffolded<E> {
         )
     }
 
+    /// `AuthFailure` (HTTP 400): the caller is not authorized for the resource the
+    /// request names — an action the real service permits only to the OWNER of that
+    /// resource, asked by an account that does not own it. Distinct from
+    /// `UnauthorizedOperation`, which is about the caller's permission to call the
+    /// operation at all.
+    pub fn auth_failure(message: impl Into<String>) -> Self {
+        Self::service_error("AuthFailure", 400, message)
+    }
+
     /// `DryRunOperation` (HTTP 412): `DryRun` was set and the request would
     /// otherwise have succeeded, so nothing was done.
     pub fn dry_run_operation() -> Self {
