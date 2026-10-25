@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpgradeLensReview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpgradeLensReview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpgradeLensReview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Upgrades ONE lens review of ONE workload: the review is against the lens VERSION the
+//! lens was associated with the workload at, and this moves it to the lens's LATEST
+//! published version — which is what makes the review `CURRENT` again
+//! (`LensReview$LensStatus`). The review AS IT STOOD against the superseded version is
+//! kept first, as the milestone the request names (`MilestoneName` is `@required` here,
+//! and the milestone ceiling of a workload is why this operation models
+//! `ServiceQuotaExceededException` where the review-template upgrade does not), so what
+//! the workload was reviewed against before the upgrade stays readable through
+//! `GetMilestone` and through a milestone-scoped read of the review.
+//!
+//! A review already against the lens's latest version has nothing to move, so the upgrade
+//! records its milestone and leaves the review where it is; a lens this emulator holds no
+//! content for has no version to move a review to.
+//!
+//! A lens review exists exactly while the lens is associated with the workload, so a lens
+//! the workload does not review resolves to the same modelled 404 as a `WorkloadId`
+//! nothing is stored under.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +196,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpgradeLensReview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpgradeLensReviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpgradeLensReview"))
+        // Nothing here is minted or Region-scoped — the workload and the lens are named by
+        // the request's own labels — so no request metadata is read.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpgradeLensReviewErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // The instant this request is served at: what the milestone it records was recorded
+        // at and what the workload's `UpdatedAt` moves to, read once so both carry one
+        // reading of the clock.
+        let now = std::time::SystemTime::now();
+        // `ClientRequestToken` is the `@idempotencyToken` whose rule is "if you retry a
+        // request with the same client request token and the same parameters after the
+        // original request has completed successfully, the result of the original request
+        // is returned" (its own doc). The parameters besides the token are the three this
+        // request carries, with the lens taken as the review it names rather than as the
+        // spelling it was named by — a lens review is one review however the request spells
+        // its lens (`crate::state::lens_alias`), so a retry that names it the other way is
+        // the same request.
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "LensAlias": crate::state::lens_alias(&input.lens_alias),
+            "MilestoneName": &input.milestone_name,
+            "WorkloadId": &input.workload_id,
+        }));
+
+        let mut store = state.lock();
+
+        // Read BEFORE anything is resolved or written: the original request already
+        // completed, so re-running it would record a second milestone — colliding with the
+        // name the first one took — and move the review again if another version has been
+        // published since, neither of which is the original request's result. A request
+        // that carries no token asks for no replay: the Amazon Web Services SDKs generate
+        // one, and a caller that sends none gets none invented for it.
+        if let Some(client_request_token) = input.client_request_token.as_deref() {
+            match store.upgrade_lens_review_tokens.get(client_request_token) {
+                Some(spent) if spent.fingerprint == fingerprint => {
+                    return Ok(UpgradeLensReviewOutput)
+                }
+                Some(spent) => {
+                    let resource_id = spent.resource_id.clone();
+                    return Err(UpgradeLensReviewErrorModeled::ConflictException(
+                        crate::state::idempotency_token_conflict(
+                            crate::state::WORKLOAD_RESOURCE_TYPE,
+                            resource_id,
+                            client_request_token,
+                        ),
+                    )
+                    .into());
+                }
+                None => {}
+            }
+        }
+
+        // A lens review is a review OF a workload, so the workload has to exist to hold
+        // one — resolved first, before the lens the request named, so a caller whose
+        // workload is gone is not told its lens is.
+        let workload = store.workloads.get(&input.workload_id).ok_or_else(|| {
+            UpgradeLensReviewErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+        })?;
+        // A lens review exists only while that lens is associated with the workload, so a
+        // lens the workload does not carry has no review to upgrade.
+        if !workload.reviews_lens(&input.lens_alias) {
+            return Err(UpgradeLensReviewErrorModeled::ResourceNotFoundException(
+                crate::state::lens_review_not_found(&input.workload_id, &input.lens_alias),
+            )
+            .into());
+        }
+
+        // The version this upgrade moves the review to is the lens's LATEST published
+        // version; the version the review REPORTS is the one it pins, or that latest where
+        // it pins none — the same reading `crate::state::ReviewedLens` is resolved for. Both
+        // are read before anything is written, so the comparison below moves the review
+        // exactly when a read of it would answer a version other than the lens's latest.
+        let latest = store
+            .latest_lens_version(&input.lens_alias)
+            .map(str::to_string);
+        let reported = workload
+            .lens_review_version(&input.lens_alias)
+            .map(str::to_string)
+            .or_else(|| latest.clone());
+
+        // "The name of the milestone in a workload" is `@required` here, so a successful
+        // upgrade always keeps the review as it stood: the milestone is recorded BEFORE
+        // the move, through the one place a milestone is recorded
+        // (`crate::state::record_milestone`) — the same rules, and the same refusals,
+        // `CreateMilestone` records one by. Every refusal is decided before anything is
+        // written, so a refused request upgrades nothing.
+        store
+            .record_milestone(&input.workload_id, input.milestone_name, now)
+            .map_err(|refusal| match refusal {
+                crate::state::MilestoneRefusal::NotFound(exception) => {
+                    UpgradeLensReviewErrorModeled::ResourceNotFoundException(exception)
+                }
+                crate::state::MilestoneRefusal::NameTaken(exception) => {
+                    UpgradeLensReviewErrorModeled::ConflictException(exception)
+                }
+                crate::state::MilestoneRefusal::QuotaExceeded(exception) => {
+                    UpgradeLensReviewErrorModeled::ServiceQuotaExceededException(exception)
+                }
+            })?;
+
+        // The move itself: the review is re-pinned at the lens's latest version. A review
+        // already against that version is already upgraded, and a lens with no published
+        // version here has none to move a review to: either way there is nothing to write,
+        // so nothing records an update that moved no review and nothing clears a pin the
+        // lens's catalog cannot answer for.
+        if latest.is_some() && reported != latest {
+            // Defensive: the workload was resolved above and the milestone just recorded
+            // of it, under this same lock, so this lookup finds it — it is taken again
+            // only because recording the milestone needed the store itself.
+            let workload = store.workloads.get_mut(&input.workload_id).ok_or_else(|| {
+                UpgradeLensReviewErrorModeled::ResourceNotFoundException(
+                    crate::state::workload_not_found(&input.workload_id),
+                )
+            })?;
+            workload
+                .lens_review_record_mut(&input.lens_alias)
+                .lens_version = latest;
+            // The lens reviews are part of the workload record, so moving one changes the
+            // workload, and `Workload$UpdatedAt` — which is also the instant each of its
+            // lens reviews reports as its own — is what every read reports that change by.
+            workload.updated_at = now;
+        }
+
+        // Recorded only now the upgrade has COMPLETED SUCCESSFULLY: a refused request has
+        // no result to replay, so the token it carried is still free. Written through the
+        // ledger's bounded `remember`, which holds the remembered tokens at
+        // `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        if let Some(client_request_token) = input.client_request_token {
+            store.upgrade_lens_review_tokens.remember(
+                client_request_token,
+                crate::state::CompletedUpgradeToken {
+                    resource_id: input.workload_id,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(UpgradeLensReviewOutput)
     }
 }
