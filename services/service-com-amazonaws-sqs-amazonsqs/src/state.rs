@@ -19,7 +19,11 @@
 //! maps the receipt handle a receive minted to the message it names, which is what
 //! `DeleteMessage` resolves. Visibility and retention are evaluated against the clock
 //! by [`Queue::materialise_due`], so the three `ApproximateNumberOfMessages*`
-//! attributes are counts over real state rather than made-up values.
+//! attributes are counts over real state rather than made-up values. A message carries
+//! the visibility timeout it was RECEIVED under, so a later change to the queue's
+//! attribute spares it, while a FIFO queue's delay is re-derived from the queue's
+//! current value by [`Queue::reapply_delay_seconds`], which is where the
+//! FIFO-versus-standard retroactivity of `DelaySeconds` lives.
 //!
 //! Which of those messages a receive may hand over is [`Queue::delivery_order`]: on a
 //! standard queue whatever is visible, and on a FIFO queue each message group in strict
@@ -905,6 +909,35 @@ impl Queue {
         });
     }
 
+    /// Re-derive, from this queue's CURRENT `DelaySeconds`, when each message it
+    /// already holds becomes available — which is what a `DelaySeconds` change does to
+    /// a FIFO queue and does not do to a standard one.
+    ///
+    /// "For standard queues, the per-queue delay setting is not retroactive — changing
+    /// the setting doesn't affect the delay of messages already in the queue. For FIFO
+    /// queues, the per-queue delay setting is retroactive — changing the setting affects
+    /// the delay of messages already in the queue" (the `DelaySeconds` attribute's own
+    /// documentation). A FIFO send carries no per-message delay either ("you can't set
+    /// DelaySeconds per message ... only on a queue level"), so the queue's value is the
+    /// only delay a stored FIFO message has and re-deriving it from the instant the
+    /// message was sent loses nothing.
+    ///
+    /// A delay governs a message's FIRST delivery, so a message already handed to a
+    /// consumer keeps the availability it was delivered under; a message a movement task
+    /// still owes carries that task's delivery slot rather than a delay of its own.
+    pub fn reapply_delay_seconds(&mut self) {
+        if !self.is_fifo() {
+            return;
+        }
+        let delay = self.integer(DELAY_SECONDS);
+        for message in &mut self.messages {
+            if message.first_received_at.is_some() || message.moved_by_task.is_some() {
+                continue;
+            }
+            message.available_at = after(message.sent_at, delay);
+        }
+    }
+
     /// Record the receipt handle a receive just minted for `message_id`, dropping the
     /// handle an earlier receive minted for it.
     ///
@@ -1101,6 +1134,11 @@ impl ComAmazonawsSqsAmazonsqsState {
     /// its own. The cancellation is recorded on the task record, which is what every
     /// later reader projects the task's status and progress from.
     ///
+    /// Putting messages back into a queue is bounded like every other path that adds
+    /// messages to one — see [`Queue::batch_rejection`] — because the source queue may
+    /// have been refilled while the task ran: what it cannot take back keeps its place in
+    /// the destination queue, which still leaves the pair holding every message.
+    ///
     /// `None` when no task answers to the handle.
     pub fn cancel_message_move_task(&mut self, task_handle: &str, now: SystemTime) -> Option<u64> {
         let task = self
@@ -1115,13 +1153,69 @@ impl ComAmazonawsSqsAmazonsqsState {
         // What the task has not moved yet is exactly what still carries its handle and
         // whose delivery slot is still ahead; a message not yet deliverable has never
         // been handed to a consumer, so no receipt handle refers to it.
-        let mut stopped: Vec<StoredMessage> = Vec::new();
+        //
+        // The source queue may have been refilled while the task ran, so what it takes
+        // back is judged against the SAME bounds every other path that adds messages to
+        // a queue is: without that, a caller looping on start / refill / cancel could
+        // grow one queue past its allowance each cycle. The oldest are taken back first,
+        // which is the order they would be handed out in, and a message the queue cannot
+        // take back is NOT dropped — dropping one would lose a message a client was told
+        // had been accepted. It stays in the place it holds in the destination queue,
+        // with the task owing it nothing any more.
+        let store_bytes = self.retained_message_bytes();
+        let stopped: Vec<(String, usize)> = self
+            .queues
+            .get(&destination_queue_name)
+            .map(|destination| {
+                destination
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        message.moved_by_task.as_deref() == Some(task_handle)
+                            && now < message.available_at
+                    })
+                    .map(|message| (message.message_id.clone(), message.retained_bytes()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut returning: BTreeSet<String> = BTreeSet::new();
+        if let Some(source) = self.queues.get(&source_queue_name) {
+            let mut taken_bytes = 0usize;
+            for (message_id, message_bytes) in &stopped {
+                let bytes = taken_bytes.saturating_add(*message_bytes);
+                // The bytes leave the destination queue as they reach the source one, so
+                // the store-wide budget is judged on what the move would leave behind.
+                if source
+                    .batch_rejection(
+                        returning.len().saturating_add(1),
+                        bytes,
+                        store_bytes.saturating_sub(bytes),
+                    )
+                    .is_none()
+                {
+                    taken_bytes = bytes;
+                    returning.insert(message_id.clone());
+                }
+            }
+        }
+
+        let mut moving: Vec<StoredMessage> = Vec::with_capacity(returning.len());
         if let Some(destination) = self.queues.get_mut(&destination_queue_name) {
             let mut staying: VecDeque<StoredMessage> = VecDeque::new();
             for message in std::mem::take(&mut destination.messages) {
-                if message.moved_by_task.as_deref() == Some(task_handle) && now < message.available_at
+                if returning.contains(&message.message_id) {
+                    moving.push(message);
+                } else if message.moved_by_task.as_deref() == Some(task_handle)
+                    && now < message.available_at
                 {
-                    stopped.push(message);
+                    // This one the source queue cannot take back: its delivery stands, so
+                    // it keeps its place here, is deliverable from now, and no later
+                    // cancellation can take it.
+                    staying.push_back(StoredMessage {
+                        available_at: now,
+                        moved_by_task: None,
+                        ..message
+                    });
                 } else {
                     staying.push_back(message);
                 }
@@ -1134,7 +1228,7 @@ impl ComAmazonawsSqsAmazonsqsState {
         // runs from the return, which is when that queue took the message back, exactly as
         // it runs from the move for a message the task delivers.
         if let Some(source) = self.queues.get_mut(&source_queue_name) {
-            for message in stopped.into_iter().rev() {
+            for message in moving.into_iter().rev() {
                 source.messages.push_front(StoredMessage {
                     sent_at: now,
                     available_at: now,
