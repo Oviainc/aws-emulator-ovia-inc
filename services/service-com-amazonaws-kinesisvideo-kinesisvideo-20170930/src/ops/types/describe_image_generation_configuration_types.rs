@@ -24,3 +24,23 @@ pub struct DescribeImageGenerationConfigurationOutput {
     pub image_generation_configuration: Option<ImageGenerationConfiguration>,
 }
 
+/// How a [`DescribeImageGenerationConfigurationOutput`] reaches the wire: as a
+/// [`Report`], so the modelled member is present even for a stream that carries no
+/// image-generation configuration, as JSON `null` rather than an absent key — AWS
+/// answers `{"ImageGenerationConfiguration": null}`, which is the "unconfigured" shape
+/// an SDK caller branches on.
+impl ReportedOutput for DescribeImageGenerationConfigurationOutput {
+    fn output_schema() -> &'static ::aws_smithy_schema::Schema {
+        &Self::SCHEMA
+    }
+
+    fn has_no_value(&self, member: &::aws_smithy_schema::Schema) -> bool {
+        match member.member_name() {
+            Some("ImageGenerationConfiguration") => self.image_generation_configuration.is_none(),
+            // A member added to the model is written by the record itself; it is
+            // reported as absent only once this match names it.
+            _ => false,
+        }
+    }
+}
+
