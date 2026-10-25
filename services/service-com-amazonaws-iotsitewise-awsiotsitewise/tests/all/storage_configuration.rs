@@ -57,7 +57,12 @@ const MODELLED_STORAGE_TYPES: [&str; 2] = ["MULTI_LAYER_STORAGE", "SITEWISE_DEFA
 const MODELLED_FEATURE_STATES: [&str; 2] = ["DISABLED", "ENABLED"];
 
 /// A cold-tier destination, whose two members are each a modelled `ARN`.
-fn multi_layer_storage(bucket: &str, role: &str) -> Value {
+///
+/// This helper, `put`, `describe` and `reported` are `pub(crate)` because the
+/// read-side suite `describe_storage_configuration_reads.rs` drives the same two
+/// operations through them rather than growing a second copy of the request
+/// mechanics.
+pub(crate) fn multi_layer_storage(bucket: &str, role: &str) -> Value {
     json!({
         "customerManagedS3Storage": {
             "s3ResourceArn": format!("arn:aws:s3:::{bucket}"),
@@ -67,19 +72,19 @@ fn multi_layer_storage(bucket: &str, role: &str) -> Value {
 }
 
 /// Put a configuration and return `(status, body)`.
-async fn put(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+pub(crate) async fn put(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(router, "POST", URI, Some(body)).await
 }
 
 /// Describe the account's configuration and return `(status, body)`.
-async fn describe(router: &MultiServiceRouter) -> (u16, Value) {
+pub(crate) async fn describe(router: &MultiServiceRouter) -> (u16, Value) {
     call(router, "GET", URI, None).await
 }
 
 /// The seven members both operations answer the configuration with, as one
 /// value: a member the answer omits reads as `null`, which is how the
 /// expectations below spell "not reported".
-fn reported(body: &Value) -> Value {
+pub(crate) fn reported(body: &Value) -> Value {
     json!({
         "storageType": body["storageType"],
         "multiLayerStorage": body["multiLayerStorage"],
