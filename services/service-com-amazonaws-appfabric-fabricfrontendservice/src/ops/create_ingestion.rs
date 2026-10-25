@@ -265,9 +265,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // @idempotencyToken: the same token replays the ingestion the first call
         // created; the same token with different parameters is the conflict AWS
-        // documents as IdempotentParameterMismatch.
+        // documents as IdempotentParameterMismatch. The token is scoped to the
+        // REGION this call was signed for as well as to the operation: each
+        // Region is its own endpoint with its own resources, so a token spent in
+        // another Region is not a retry of this request.
         if let Some(token) = input.client_token.as_deref() {
-            let key = crate::state::client_token_key(Self::NAME, token);
+            let key = crate::state::client_token_key(&region, Self::NAME, token);
             if let Some(spent) = store.client_tokens.get(&key).cloned() {
                 if spent.fingerprint != fingerprint {
                     return Err(CreateIngestionErrorModeled::ConflictException(
@@ -344,7 +347,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(token) = input.client_token.as_deref() {
             store.remember_client_token(
-                crate::state::client_token_key(Self::NAME, token),
+                crate::state::client_token_key(&region, Self::NAME, token),
                 arn,
                 fingerprint,
             );
