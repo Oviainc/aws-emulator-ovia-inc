@@ -367,13 +367,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A registered user has no remembered device: a device is known only once a
             // sign-in has minted a key for one.
             devices: ::std::collections::BTreeMap::new(),
-            // Nothing has asked for an attribute verification code yet.
-            pending_attribute_verifications: ::std::collections::BTreeMap::new(),
+            // Nothing has asked for a verification code yet; the sign-up's own
+            // confirmation code is issued below, once the user is stored.
+            outstanding_codes: ::std::collections::BTreeMap::new(),
         };
         let pool = guard
             .pool_mut(&user_pool_id)
             .ok_or_else(internal_error)?;
         pool.users.insert(key.clone(), user);
+
+        // Registering the user is what sends its confirmation code: `ConfirmSignUp`
+        // "submits a code that Amazon Cognito sent to your user when they signed up in
+        // your user pool", and the pool's own `AutoVerifiedAttributes` decide where it
+        // goes (`UserPool::confirmation_destination`). A pool that verifies nothing, or
+        // a user holding no value for what it verifies, has no destination — so no code
+        // is minted and no delivery is reported.
+        let stored = pool.users.get(&key).ok_or_else(internal_error)?;
+        let delivery = pool
+            .confirmation_destination(stored)
+            .map(|(attribute, destination)| {
+                crate::state::VerificationCode::issued(&attribute, &destination, now)
+            });
+        let user = pool.user_mut(&input.username).ok_or_else(internal_error)?;
+        let code_delivery_details = delivery.map(|code| {
+            user.issue_code(crate::state::CodePurpose::SignUpConfirmation, code)
+                .delivery_details()
+        });
 
         // Read back from the STORED user, so the response reports what a later read of
         // this pool reports.
@@ -384,11 +403,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the stored status is what decides it.
             user_confirmed: stored.status == crate::state::UserStatus::Confirmed,
             user_sub: stored.sub.clone(),
-            // `CodeDeliveryDetails` is "information about the delivery destination for
-            // that link or code" of a message Amazon Cognito sent. This emulator sends
-            // no mail or SMS, so it reports no delivery: a destination for a message
-            // nothing delivered would be an answer about work nothing performed.
-            code_delivery_details: None,
+            // "Information about the delivery destination for that link or code" of the
+            // message this sign-up sent, rendered from the code just stored, so a
+            // reported delivery is always one a `ConfirmSignUp` can answer.
+            code_delivery_details: code_delivery_details.flatten(),
             // `Session` is "a session Id that you can pass to ConfirmSignUp when you
             // want to immediately sign in your user with the USER_AUTH flow": that flow
             // is not served here, so no session is started for it.

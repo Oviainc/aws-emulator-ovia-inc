@@ -15,6 +15,8 @@
 mod batch_delete_builds;
 #[path = "all/command_execution_lifecycle.rs"]
 mod command_execution_lifecycle;
+#[path = "all/delete_report_group.rs"]
+mod delete_report_group;
 #[path = "all/fleet_lifecycle.rs"]
 mod fleet_lifecycle;
 #[path = "all/list_builds.rs"]
