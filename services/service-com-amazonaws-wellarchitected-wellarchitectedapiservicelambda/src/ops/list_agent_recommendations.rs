@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAgentRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAgentRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAgentRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Lists active optimization recommendations for a specified profile with optional
+//! filtering": one page of the `AgentRecommendationSummary` projections of the
+//! recommendations the profile's COMPLETED generations produced, in recommendation-ARN
+//! order, narrowed by the `state` and `pillar` filters the request carries and resumed
+//! from the opaque `nextToken` a previous page issued.
+//!
+//! A reporting operation — modelled `@readonly`, so it answers from the store and writes
+//! nothing a caller asked for. The one write it makes is the one the CLOCK already made
+//! due: a generation whose analysis has finished has produced its recommendations, and
+//! nothing runs between requests, so they are recorded on the way past
+//! ([`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::materialise_due_agent_recommendations`]).
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +161,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAgentRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAgentRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAgentRecommendations"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAgentRecommendationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Well-Architected Tool agent profile store is unavailable"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        // `maxResults` is modelled `@default(100)`, so it arrives as a value rather than
+        // an option; the clamp restates the member's `@range(min: 1, max: 1000)`.
+        let page_size = crate::state::agent_list_page_size(input.max_results);
+
+        // An opaque token this service did not issue is a bad request, not an empty page:
+        // a token is this service's own cursor rather than a value a caller composes, so it
+        // cannot be corrected, only obtained again, which is what `CANNOT_PARSE` says.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_agent_recommendation_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListAgentRecommendationsErrorModeled::ValidationException(
+                        crate::state::cannot_parse_exception(
+                            crate::state::NEXT_TOKEN_MEMBER,
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A generation whose analysis the clock has finished has produced its
+        // recommendations, so they are recorded before the page is taken: the clock owed
+        // them at that instant whether or not anybody polled the generation.
+        store.materialise_due_agent_recommendations(now);
+
+        // "Lists … for a specified profile": the recommendations of ONE profile, and this
+        // operation DOES model `ResourceNotFoundException` for its `profileArn`
+        // (`smithy_query(query="operation", operation="ListAgentRecommendations")`), unlike
+        // the context and goal listings — so an ARN that names no stored agent profile is
+        // that 404 rather than an empty page.
+        if !store.agent_profiles.contains_key(&input.profile_arn) {
+            return Err(
+                ListAgentRecommendationsErrorModeled::ResourceNotFoundException(
+                    crate::state::agent_profile_not_found(&input.profile_arn),
+                )
+                .into(),
+            );
+        }
+
+        // A recommendation ARN is never reused, so the stored key order IS this service's
+        // list order and a cursor is a single ARN. It is start-EXCLUSIVE: the page resumes
+        // just past the last ARN already returned, so every recommendation is enumerated
+        // exactly once across the pages — and the filters are applied BEFORE the page is
+        // cut, so a page is short only when the listing has run out.
+        let remaining: Vec<&crate::state::AgentRecommendationRecord> = store
+            .agent_recommendations
+            .get(&input.profile_arn)
+            .map(|recommendations| {
+                recommendations
+                    .range::<String, _>((
+                        cursor.as_ref().map_or(::std::ops::Bound::Unbounded, |last| {
+                            ::std::ops::Bound::Excluded(last)
+                        }),
+                        ::std::ops::Bound::Unbounded,
+                    ))
+                    .map(|(_, record)| record)
+                    .filter(|record| selected(record, &input))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let page = &remaining[..remaining.len().min(page_size)];
+        let next_token = match page.last() {
+            Some(last) if remaining.len() > page.len() => {
+                Some(crate::state::encode_agent_recommendation_next_token(&last.arn))
+            }
+            _ => None,
+        };
+
+        Ok(ListAgentRecommendationsOutput {
+            items: page.iter().map(|record| record.to_summary()).collect(),
+            next_token,
+        })
     }
+}
+
+/// Whether one stored recommendation is selected by the request's filters.
+///
+/// Both are optional single-value filters — "return only recommendations with the
+/// specified state (OPEN or CLOSED)" and "return only recommendations for the specified
+/// Well-Architected Tool Framework pillar" — so a filter the request omits selects
+/// everything, and a filter it carries selects the recommendations whose own value equals
+/// it. The state compared against is the one DERIVED from the recommendation's status
+/// ([`crate::state::AgentRecommendationRecord::state`]), so the filter and a reported
+/// summary can never disagree about which state a recommendation is in.
+fn selected(
+    record: &crate::state::AgentRecommendationRecord,
+    input: &ListAgentRecommendationsInput,
+) -> bool {
+    input
+        .state
+        .as_deref()
+        .is_none_or(|state| state == record.state())
+        && input
+            .pillar
+            .as_deref()
+            .is_none_or(|pillar| pillar == record.content.pillar)
 }
