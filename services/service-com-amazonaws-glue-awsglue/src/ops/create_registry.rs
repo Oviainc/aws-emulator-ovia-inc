@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRegistry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRegistry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRegistry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Creates a schema registry: the container a schema set is created inside. The record is
+//! written to [`crate::state::ComAmazonawsGlueAwsglueState::registries`], so `GetRegistry`
+//! in a later request reads back exactly what was persisted and `CreateSchema` naming this
+//! registry finds it.
+//!
+//! A registry name is unique per account (every schema-registry operation addresses its
+//! registry by a `RegistryId` carrying a name or an ARN and no `CatalogId`), so a second
+//! create of a name this endpoint already holds is refused with `AlreadyExistsException`
+//! and leaves the stored registry — its description, tags and timestamps — untouched.
+//!
+//! `Description` is optional ("If description is not provided, there will not be any
+//! default value for this"), and `Tags` is reported as the map the registry carries, which
+//! for a create that sent none is the empty map rather than an absent member.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +168,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRegistry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRegistryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRegistry"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRegistryErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue schema registry store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Every refusal is decided BEFORE anything is written: a refused create must leave
+        // the registry that is already there exactly as it was.
+        if store.registry(&input.registry_name).is_some() {
+            return Err(CreateRegistryErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(crate::state::messages::REGISTRY_ALREADY_EXISTS.to_string()),
+                },
+            )
+            .into());
+        }
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of records one process will hold is bounded.
+        if !store.can_store_registry() {
+            return Err(
+                CreateRegistryErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} schema registries",
+                            crate::state::MAX_REGISTRIES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let stored = store
+            .registries
+            .entry(input.registry_name.clone())
+            .or_insert_with(|| {
+                crate::state::RegistryEntry::new(
+                    &input.registry_name,
+                    input.description.clone(),
+                    input.tags.as_ref(),
+                    now,
+                )
+            });
+
+        ::tracing::info!(
+            operation = "CreateRegistry",
+            registry = %stored.name,
+            "created a schema registry"
+        );
+
+        Ok(CreateRegistryOutput {
+            registry_name: Some(stored.name.clone()),
+            registry_arn: Some(crate::state::registry_arn(&region, &stored.name)),
+            description: stored.description.clone(),
+            // Definite, and EMPTY for a create that carried no tag: the answer to "which
+            // tags does this registry have" is the empty map, not an absent member.
+            tags: Some(stored.tags.clone()),
+        })
     }
 }
