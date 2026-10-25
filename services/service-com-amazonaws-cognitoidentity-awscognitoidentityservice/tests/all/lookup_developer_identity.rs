@@ -14,7 +14,9 @@
 //! * a pair the mapping does not verify is a 409 `ResourceConflictException`, a mapping or
 //!   a resource this service does not hold is a 404 `ResourceNotFoundException`, an
 //!   identity of ANOTHER pool is a 403 `NotAuthorizedException`, and a request naming
-//!   neither side of the mapping is a 400 `InvalidParameterException`;
+//!   neither side of the mapping is a 400 `InvalidParameterException`, while a value
+//!   outside a constraint the MODEL states is refused ahead of the operation with a 400
+//!   `ValidationException`;
 //! * the lookup is a REPORT: repeating it answers the same thing and leaves the pool's
 //!   identities exactly as they were.
 //!
@@ -413,25 +415,25 @@ async fn a_request_the_mapping_cannot_answer_is_refused() {
             "MaxResults one below the modelled minimum",
             lookup_request(&pool_id, Some(&registered), None, Some(0), None),
             400,
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             "MaxResults one past the modelled maximum",
             lookup_request(&pool_id, Some(&registered), None, Some(61), None),
             400,
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             "an identifier one character past the modelled maximum length",
             lookup_request(&pool_id, None, Some(&"x".repeat(1025)), None, None),
             400,
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             "an empty identifier",
             lookup_request(&pool_id, None, Some(""), None, None),
             400,
-            "InvalidParameterException",
+            "ValidationException",
         ),
     ];
 

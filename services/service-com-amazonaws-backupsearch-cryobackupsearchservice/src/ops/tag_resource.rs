@@ -57,6 +57,10 @@
 //!   can use to manage, filter, and search for your resources. Allowed characters include
 //!   UTF-8 letters, numbers, spaces, and the following characters: + - = . _ : /.
 //!
+//! That character set is an input constraint the model carries no `@pattern` for, so it is
+//! enforced here through `crate::state::check_tag_entry`: a key or value outside it is a
+//! `ValidationException` (400) and nothing is written.
+//!
 //! ## Errors
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — The resource was not found for this request.
@@ -172,9 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // The caps that bound caller-driven growth of one stored record: every entry has
-        // to fit, and the merged tag set has to stay within the per-resource maximum.
-        // Refused whole, so a partial write never lands.
+        // What a tag entry has to satisfy before it can be stored: its key and value stay
+        // within the set of characters `Tags` documents and within the caps that bound
+        // caller-driven growth of one stored record, and the merged tag set stays within
+        // the per-resource maximum. Checked over the whole request before anything is
+        // written, so a refused call leaves no partial write and a later
+        // `ListTagsForResource` cannot report an entry this service refused.
         for (key, value) in &input.tags {
             crate::state::check_tag_entry(key, value)
                 .map_err(crate::scaffolded::Scaffolded::validation)?;

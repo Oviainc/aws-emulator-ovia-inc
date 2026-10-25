@@ -25,6 +25,8 @@ mod delete_ingest_configuration;
 mod disconnect_participant;
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
+#[path = "all/encoder_configuration_in_use.rs"]
+mod encoder_configuration_in_use;
 #[path = "all/encoder_configurations.rs"]
 mod encoder_configurations;
 #[path = "all/error_envelope.rs"]

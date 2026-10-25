@@ -15,9 +15,13 @@
 //! `BatchDeleteBuilds` removes a build, and the reporting operations
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
 //! `BatchGetFleets`, `BatchGetSandboxes`, `BatchGetCommandExecutions`,
-//! `BatchGetReportGroups`, `ListProjects`, `ListBuildsForProject`,
-//! `ListSandboxes`, `ListSandboxesForProject`, `ListSourceCredentials`) only
-//! read them.
+//! `BatchGetReportGroups`, `ListProjects`, `ListSharedProjects`,
+//! `ListBuildsForProject`, `ListSandboxes`, `ListSandboxesForProject`,
+//! `ListSourceCredentials`) only read them.
+//!
+//! Sharing is its own record: a [`StoredResourcePolicy`] is the resource-based
+//! policy attached to one project or report group, and a project carrying one is
+//! what `ListSharedProjects` reports as shared.
 //!
 //! The model shapes themselves are what is stored, so a read hands back exactly
 //! the structure the write persisted rather than a second, drifting copy of the
@@ -456,6 +460,23 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     /// Report groups, keyed by report group name (names are unique per account,
     /// the same way project names are).
     pub report_groups: BTreeMap<String, StoredReportGroup>,
+    /// Resource-based policies, keyed by the ARN of the project or report group
+    /// each one is attached to.
+    ///
+    /// Keyed by ARN because that is the only way the resource-policy operations
+    /// address one (`PutResourcePolicy$resourceArn`: "The ARN of the Project or
+    /// ReportGroup resource you want to associate with a resource policy"), and
+    /// because one resource carries at most one such policy — a second write for
+    /// the same ARN replaces it. A project's entry here is what makes that project
+    /// SHARED, which is what `ListSharedProjects` reports; the entry for a report
+    /// group is the same record for the other resource kind CodeBuild shares.
+    ///
+    /// Bounded by the resources it describes, so it needs no ceiling of its own
+    /// beside [`MAX_PROJECTS`] and [`MAX_REPORT_GROUPS`]: an entry is meaningful
+    /// only for an ARN this account holds, so the write that creates one
+    /// (`PutResourcePolicy`, still scaffolded) is where the ARN has to resolve to a
+    /// held project or report group before the entry is stored.
+    pub resource_policies: BTreeMap<String, StoredResourcePolicy>,
     /// Imported source-repository credentials, keyed by the `ServerType` they
     /// were imported for.
     ///
@@ -581,6 +602,24 @@ pub struct StoredReportGroup {
     /// Epoch millis the report group was created at.
     pub created_millis: i64,
     /// Epoch millis the report group was last changed at.
+    pub last_modified_millis: i64,
+}
+
+/// The resource-based policy attached to one project or report group: the record
+/// that makes that resource a SHARED one.
+///
+/// CodeBuild shares a project or a report group by storing a policy against its ARN
+/// (`PutResourcePolicy`: "Stores a resource policy for the ARN of a Project or
+/// ReportGroup object"), so the attachment is what the shared-resource listings read
+/// and the policy document itself is what `GetResourcePolicy` hands back. The
+/// document is kept verbatim: it is a caller-supplied grant, not a credential, and a
+/// reader must report exactly the text that was stored.
+#[derive(Debug, Clone)]
+pub struct StoredResourcePolicy {
+    /// The policy document as the caller stored it.
+    pub policy: String,
+    /// Epoch millis the policy was last written at, kept as the integer a list
+    /// operation sorts on — the way [`StoredProject`]'s stamps are.
     pub last_modified_millis: i64,
 }
 

@@ -158,7 +158,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     // [`crate::scaffolded::wire_status`].
     const SUCCESS_STATUS: u16 = 200u16;
 
-    /// Delete the stored custom language model, or report nothing to do.
+    /// Delete the stored custom language model, or refuse a name this account holds
+    /// no model under.
     ///
     /// The clock-owed status transition is materialised FIRST, so a model whose
     /// training was already due is deleted rather than refused for a status it had
@@ -217,22 +218,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "custom language model deleted"
                 );
             }
-            // A DELETE IS IDEMPOTENT: a name this account holds no language model
-            // under leaves nothing to do, and absence is the state the caller asked
-            // for — so the answer is this operation's ordinary empty success, not a
-            // failure. This operation models no `NotFoundException` at all (unlike
-            // every reader of the family), which is the same reading: a teardown that
-            // runs twice, or one that follows a create that never took, succeeds both
-            // times instead of leaking a failure. It is why the delete path does NOT
-            // take the service's absent-resource branch
-            // (`crate::state::not_found_message` over `BadRequestException`), exactly
-            // as `DeleteVocabulary` does not.
+            // A DELETE IS NOT IDEMPOTENT: the entity has to be there. The same
+            // `BadRequestException` sentence covers it — "This can occur when the
+            // entity you're trying to delete doesn't exist OR if it's in a non-terminal
+            // state" — so a name this account holds no model under is refused with this
+            // service's own absent-resource text
+            // (`crate::state::not_found_message`), as the family's reader answers it,
+            // and nothing is stored or removed.
             None => {
                 ::tracing::info!(
                     operation = "DeleteLanguageModel",
                     model = %input.model_name,
-                    "no custom language model of that name; the delete is already satisfied"
+                    "no custom language model of that name; the delete is refused"
                 );
+                return Err(DeleteLanguageModelErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::not_found_message(
+                            crate::state::KIND_LANGUAGE_MODEL,
+                        )),
+                    },
+                )
+                .into());
             }
         }
 

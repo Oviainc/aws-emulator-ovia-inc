@@ -27,6 +27,8 @@ mod device_resources;
 mod device_task_lifecycle;
 #[path = "all/empty_inventory_refusals.rs"]
 mod empty_inventory_refusals;
+#[path = "all/region_gate_error_envelope.rs"]
+mod region_gate_error_envelope;
 #[path = "all/resource_tag_removal.rs"]
 mod resource_tag_removal;
 #[path = "all/resource_tagging.rs"]

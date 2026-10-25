@@ -146,22 +146,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+        // The transitions the clock has already made due are written down FIRST, so the
+        // refusal below decides against the same store a read at this instant would
+        // report: a composition whose stop the clock has already finished is gone, and
+        // holds nothing back.
+        store.materialize_due_compositions(::std::time::SystemTime::now());
+
         // A delete of a resource this store does not hold is the modelled
         // `ResourceNotFoundException` (HTTP 404), the same answer `DeleteStage` gives —
         // so a second delete of the same ARN is refused rather than silently accepted.
-        //
-        // The model's "Ensures that no Compositions are using this template; otherwise,
-        // returns an error" (the modelled `ConflictException`, HTTP 409) has nothing to
-        // find yet: a Composition is created only by `StartComposition`, still a scaffold
-        // with its own gap issue, so this store holds no composition and no encoder
-        // configuration in it can be in use. The refusal belongs with the records that
-        // would make it true, and goes in when they land.
-        if store.encoder_configurations.remove(&input.arn).is_none() {
+        if !store.encoder_configurations.contains_key(&input.arn) {
             return Err(crate::state::resource_not_found(
                 DeleteEncoderConfigurationErrorModeled::ResourceNotFoundException,
                 &input.arn,
             ));
         }
+
+        // "Ensures that no Compositions are using this template; otherwise, returns an
+        // error": the compositions using it are the ones whose destinations refer to this
+        // ARN and whose stop has not completed (`composition_using`, the one lookup for
+        // that question), so the modelled `ConflictException` (HTTP 409) is answered and
+        // the configuration stays exactly as a read reports it.
+        if let Some(composition) = store.composition_using(&input.arn) {
+            let message = crate::state::resource_in_use_by_composition_message(
+                &input.arn,
+                &composition.arn,
+                &composition.state,
+            );
+            return Err(crate::state::conflict(
+                DeleteEncoderConfigurationErrorModeled::ConflictException,
+                message,
+            ));
+        }
+
+        store.encoder_configurations.remove(&input.arn);
         Ok(DeleteEncoderConfigurationOutput {})
     }
 }

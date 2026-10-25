@@ -319,6 +319,22 @@ pub const MAX_TAG_KEY_LENGTH: usize = 128;
 /// See [`MAX_TAGS_PER_JOB`].
 pub const MAX_TAG_VALUE_LENGTH: usize = 256;
 
+/// The punctuation a tag key or value may carry besides letters, numbers and spaces.
+///
+/// Source: the `Tags` member documentation of every operation of this service that takes
+/// a `TagMap` — `smithy_query(query="doc", shape="TagResourceRequest", member="Tags")`,
+/// and the same sentence on `StartSearchJobInput$Tags` and
+/// `StartSearchResultExportJobInput$Tags` — which names the characters a tag of this
+/// service is allowed to use. The model puts no `@pattern` on `TagMap`, so the boundary
+/// validator cannot refuse a tag outside that set and the service enforces it itself
+/// ([`check_tag_entry`]).
+pub const TAG_PUNCTUATION: &[char] = &['+', '-', '=', '.', '_', ':', '/'];
+
+/// How a refusal spells the set [`TAG_PUNCTUATION`] belongs to, so one validation message
+/// describes the whole constraint and the caller can fix the request from it alone.
+pub const ALLOWED_TAG_CHARACTERS: &str =
+    "UTF-8 letters, numbers, spaces, and the following characters: + - = . _ : /";
+
 /// The ARN resource segment of a search job: `search-job/<SearchJobIdentifier>`.
 pub const SEARCH_JOB_RESOURCE: &str = "search-job";
 
@@ -1430,8 +1446,13 @@ pub fn page_size(max_results: i32) -> usize {
     }
 }
 
-/// Refuse one tag entry whose key or value is longer than this store's cap, naming the
-/// member and the bound the way a validation refusal does.
+/// Refuse one tag entry whose key or value is longer than this store's cap or carries a
+/// character outside the set a tag of this service may use, naming the member and the
+/// constraint the way a validation refusal does.
+///
+/// Every operation that WRITES a tag goes through here — `TagResource` merging into a
+/// stored record and the two `Start` operations minting one — so a tag AWS refuses never
+/// becomes state of any resource this service holds.
 pub fn check_tag_entry(key: &str, value: &str) -> Result<(), String> {
     let key_length = key.chars().count();
     if key_length > MAX_TAG_KEY_LENGTH {
@@ -1445,7 +1466,37 @@ pub fn check_tag_entry(key: &str, value: &str) -> Result<(), String> {
             "Tags value for key '{key}' is {value_length} characters, more than the maximum of {MAX_TAG_VALUE_LENGTH}"
         ));
     }
+    if let Some(character) = disallowed_tag_character(key) {
+        return Err(format!(
+            "Tags key '{key}' contains '{character}', which is not one of the allowed characters: \
+             {ALLOWED_TAG_CHARACTERS}"
+        ));
+    }
+    if let Some(character) = disallowed_tag_character(value) {
+        return Err(format!(
+            "Tags value for key '{key}' contains '{character}', which is not one of the allowed \
+             characters: {ALLOWED_TAG_CHARACTERS}"
+        ));
+    }
     Ok(())
+}
+
+/// The first character of `text` outside the set a tag key or value may use, or `None`
+/// when every one of them is in it. The scan is over CHARACTERS, so a multi-byte letter
+/// is one letter and never a run of bytes outside the set.
+pub fn disallowed_tag_character(text: &str) -> Option<char> {
+    text.chars().find(|character| !tag_character_allowed(*character))
+}
+
+/// Whether one character is in the set a tag key or value may use: a letter, a number, a
+/// space, or one of [`TAG_PUNCTUATION`].
+///
+/// `char::is_alphanumeric` is what carries "UTF-8 letters, numbers": it admits every
+/// Unicode letter and digit, not just the ASCII ones, so a tag in a non-Latin script is
+/// as acceptable as an English one. Everything else — `*`, `#`, `@`, `,`, `"`, a control
+/// character, a tab or a newline — is outside the set.
+pub fn tag_character_allowed(character: char) -> bool {
+    character.is_alphanumeric() || character == ' ' || TAG_PUNCTUATION.contains(&character)
 }
 
 /// Refuse a tag set that would leave one job holding more than [`MAX_TAGS_PER_JOB`]

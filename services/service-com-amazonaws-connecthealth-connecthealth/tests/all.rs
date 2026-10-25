@@ -23,6 +23,8 @@ mod domain_subscription_lifecycle;
 mod error_detail_member;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/pagination_token_issuance.rs"]
+mod pagination_token_issuance;
 #[path = "all/patient_insights_job_lifecycle.rs"]
 mod patient_insights_job_lifecycle;
 #[path = "all/region_scoping.rs"]

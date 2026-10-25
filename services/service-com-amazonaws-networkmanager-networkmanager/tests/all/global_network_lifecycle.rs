@@ -180,6 +180,12 @@ pub(crate) fn ids_of(body: &Value, list: &str, id_member: &str) -> Vec<String> {
         .collect()
 }
 
+/// One row of a listing table: the case name, the ids the request names, and the answer it
+/// must get — `Ok(page)` the ids the page must carry, `Err(id)` the id a not-found refusal
+/// must identify. Shared with the suites that table a listing's id member
+/// (`crate::describe_global_networks_id_resolution`).
+pub(crate) type ListingCase = (&'static str, Vec<String>, Result<Vec<String>, String>);
+
 #[tokio::test]
 async fn global_network_and_site_lifecycle_round_trips_through_stored_state() {
     let emulator = Emulator::new();
@@ -609,19 +615,24 @@ async fn listings_filter_by_the_ids_the_request_names() {
     both_sites.sort();
 
     // Rows differ along the number of ids named and whether each names a stored record.
-    let network_cases: Vec<(&str, Vec<String>, Vec<String>)> = vec![
-        ("no filter", vec![], both_networks.clone()),
-        ("one id", vec![first.clone()], vec![first.clone()]),
-        ("every id", both_networks.clone(), both_networks.clone()),
+    // `Ok(page)` is the page the request must answer; `Err(id)` is the modelled
+    // ResourceNotFoundException identifying `id` — `GlobalNetworkIds` is the only
+    // resource reference this operation carries, so it RESOLVES each id it names
+    // (the whole rule, over a wider table, is `describe_global_networks_id_resolution`).
+    let unknown_network = "global-network-00000000000000000".to_string();
+    let network_cases: Vec<ListingCase> = vec![
+        ("no filter", vec![], Ok(both_networks.clone())),
+        ("one id", vec![first.clone()], Ok(vec![first.clone()])),
+        ("every id", both_networks.clone(), Ok(both_networks.clone())),
         (
             "an id that names nothing",
-            vec!["global-network-00000000000000000".to_string()],
-            vec![],
+            vec![unknown_network.clone()],
+            Err(unknown_network.clone()),
         ),
         (
             "a known and an unknown id",
-            vec![second.clone(), "global-network-00000000000000000".to_string()],
-            vec![second.clone()],
+            vec![second.clone(), unknown_network.clone()],
+            Err(unknown_network.clone()),
         ),
     ];
     for (case, filter, want) in network_cases {
@@ -635,15 +646,35 @@ async fn listings_filter_by_the_ids_the_request_names() {
             format!("/global-networks?{}", query.join("&"))
         };
         let (status, body) = emulator.get(&uri).await;
-        assert_eq!(
-            status, 200,
-            "case {case}: expected 200, got {status} with {body}"
-        );
-        assert_eq!(
-            ids_of(&body, "GlobalNetworks", "GlobalNetworkId"),
-            want,
-            "case {case}: DescribeGlobalNetworks returned the wrong set"
-        );
+        match want {
+            Ok(want) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case}: expected 200, got {status} with {body}"
+                );
+                assert_eq!(
+                    ids_of(&body, "GlobalNetworks", "GlobalNetworkId"),
+                    want,
+                    "case {case}: DescribeGlobalNetworks returned the wrong set"
+                );
+            }
+            Err(unknown) => {
+                assert_eq!(
+                    status, 404,
+                    "case {case}: expected 404, got {status} with {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "ResourceNotFoundException",
+                    "case {case}: expected ResourceNotFoundException, got {body}"
+                );
+                assert_eq!(
+                    body["ResourceId"].as_str(),
+                    Some(unknown.as_str()),
+                    "case {case}: the refusal must identify {unknown}, got {body}"
+                );
+            }
+        }
     }
 
     let site_cases: Vec<(&str, Vec<String>, Vec<String>)> = vec![

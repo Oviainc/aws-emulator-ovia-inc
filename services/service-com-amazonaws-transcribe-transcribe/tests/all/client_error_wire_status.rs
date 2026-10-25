@@ -17,11 +17,9 @@
 //! 3. A request naming a resource this account does not hold is refused with
 //!    `BadRequestException` — the shape whose own model documentation covers "the
 //!    entity you're trying to delete doesn't exist" — and the refusal names the KIND
-//!    of resource, never the name the caller asked about. The custom-vocabulary
-//!    family's two DELETES are the exception the recordings show: they are idempotent
-//!    and answer their empty success for a name the account holds nothing under (the
-//!    class is spanned by `crate::vocabulary_delete_and_tag_sets`), so this suite
-//!    pins that they are NOT refusals.
+//!    of resource, never the name the caller asked about. That holds whether the
+//!    operation reads, writes or DELETES: a delete needs the entity to be there (the
+//!    class is spanned by `crate::vocabulary_delete_and_tag_sets`).
 //!
 //! The harness (the emulator, the awsJson1_1 call and the answer accessors) is the
 //! transcription-job suite's, reused rather than stood up a second time.
@@ -181,9 +179,7 @@ async fn every_success_answers_this_protocols_status() {
 
 /// Every operation that can be asked about a resource this account does not hold
 /// answers HTTP 400 `BadRequestException`, whatever family the resource belongs to and
-/// whether the operation reads, writes or deletes — except the custom-vocabulary
-/// family's idempotent deletes, which answer their empty success (asserted at the end
-/// of this test).
+/// whether the operation reads, writes or deletes.
 #[tokio::test]
 async fn a_resource_this_account_does_not_hold_is_a_bad_request() {
     let transcribe = Transcribe::new();
@@ -299,6 +295,24 @@ async fn a_resource_this_account_does_not_hold_is_a_bad_request() {
             json!({"ResourceArn": arn("call-analytics-job", "any-job")}),
             KIND_RESOURCE,
         ),
+        (
+            "DeleteVocabulary for a vocabulary that was never created",
+            "DeleteVocabulary",
+            json!({"VocabularyName": "never-created"}),
+            KIND_VOCABULARY,
+        ),
+        (
+            "DeleteVocabularyFilter for a filter that was never created",
+            "DeleteVocabularyFilter",
+            json!({"VocabularyFilterName": "never-created"}),
+            KIND_VOCABULARY_FILTER,
+        ),
+        (
+            "DeleteLanguageModel for a model that was never created",
+            "DeleteLanguageModel",
+            json!({"ModelName": "never-created"}),
+            KIND_LANGUAGE_MODEL,
+        ),
     ];
 
     for (case, operation, request, kind) in rows {
@@ -322,33 +336,6 @@ async fn a_resource_this_account_does_not_hold_is_a_bad_request() {
                 );
             }
         }
-    }
-
-    // The exception, one row per custom-vocabulary-family delete: a delete of a
-    // resource this account does not hold is IDEMPOTENT — it answers this protocol's
-    // empty success, not a refusal. (The job family is not: its
-    // `DeleteTranscriptionJob` row above is a recorded refusal.)
-    let idempotent: Vec<(&str, &str, Value)> = vec![
-        (
-            "DeleteVocabulary for a vocabulary that was never created",
-            "DeleteVocabulary",
-            json!({"VocabularyName": "never-created"}),
-        ),
-        (
-            "DeleteVocabularyFilter for a filter that was never created",
-            "DeleteVocabularyFilter",
-            json!({"VocabularyFilterName": "never-created"}),
-        ),
-    ];
-    for (case, operation, request) in idempotent {
-        let answered = transcribe.call(operation, request).await;
-        answered.ok_status(case, 200);
-        assert_eq!(
-            answered.body,
-            json!({}),
-            "case {case:?}: an idempotent delete must answer an empty body, got {:?}",
-            answered.body
-        );
     }
 }
 
