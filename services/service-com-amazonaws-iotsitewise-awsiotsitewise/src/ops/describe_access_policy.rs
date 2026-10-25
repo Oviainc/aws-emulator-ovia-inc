@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccessPolicy
+//! IMPLEMENTED: reports the stored IoT SiteWise Monitor access policy the request
+//! names, exactly as `CreateAccessPolicy` persisted it; an id that resolves to no
+//! stored policy is the modelled 404.
 //!
 //! ## Shape of an operation
 //!

@@ -25,5 +25,7 @@ mod resource_not_found_message;
 mod service_claim;
 #[path = "all/shape_validation.rs"]
 mod shape_validation;
+#[path = "all/shared_query_decision.rs"]
+mod shared_query_decision;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

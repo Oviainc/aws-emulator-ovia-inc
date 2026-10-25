@@ -12,9 +12,10 @@
 //! when the request names one, paged at `maxResults`, and nothing from any other
 //! Region.
 //!
-//! An account that manages no device in the signed Region is not refused for that —
-//! what every operation answers such a caller is pinned in
-//! `empty_inventory_refusals.rs`.
+//! What a caller signed for a Region this account has activated NO device in is
+//! answered is a different rule, pinned in `device_region_gate.rs`; the last
+//! assertion of the first test here pins only that the front-door denial comes even
+//! earlier than that.
 //!
 //! Rows differ along what the rules generalise over: the size of the `targets` list
 //! (absent, empty, both modelled bounds, past the maximum), the command and target
@@ -37,10 +38,16 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The Region this suite activates devices in.
 const ACTIVE_REGION: &str = "ap-southeast-2";
 
-/// Other Regions of the same account, which hold no device and no task of their
-/// own. Three of them, so a listing is shown to be a property of the Region the
-/// request is signed for rather than of one particular Region name.
+/// Other Regions of the same account, which hold no device of their own. Three of
+/// them, so the answer is shown to be a property of the Region the request is signed
+/// for rather than of one particular Region name.
 const OTHER_REGIONS: &[&str] = &["us-east-1", "eu-west-1", "us-west-2"];
+
+/// One further Region of the same account that DOES hold a device of its own, and no
+/// task: it is what shows `ListTasks` to be scoped to the Region the request is
+/// signed for, since it meets the device/region precondition and still reports none
+/// of the tasks created in [`ACTIVE_REGION`].
+const PEER_REGION: &str = "eu-central-1";
 
 /// `TaskState`'s values, from
 /// `smithy_query(query="shape",shape="TaskState")` — the filter `ListTasks` admits.
@@ -84,6 +91,23 @@ fn emulator_with(region: &str, count: u64) -> (MultiServiceRouter, Vec<String>) 
         .expect("the in-memory engine carries this service's state")
         .lock()
         .activate_devices(region, count, SystemTime::now());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, activated)
+}
+
+/// One emulator with `count` devices in `region` and one device in [`PEER_REGION`],
+/// answering the router and the ids activated in `region`.
+fn emulator_with_peer(region: &str, count: u64) -> (MultiServiceRouter, Vec<String>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let state = service_state(&*engine).expect("the in-memory engine carries this service's state");
+    let activated = state
+        .lock()
+        .activate_devices(region, count, SystemTime::now());
+    state
+        .lock()
+        .activate_devices(PEER_REGION, 1, SystemTime::now());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
@@ -234,9 +258,10 @@ async fn create_task_that_names_no_target_is_denied_at_the_front_door() {
         }
     }
 
-    // The denial is the front door's, ahead of anything this service's handler does:
-    // an account that manages no device at all still answers it for a `CreateTask`
-    // that names no target.
+    // The denial is the front door's, ahead of anything this service's handler does —
+    // including the device/region precondition the handler checks first: a Region this
+    // account manages no device in still answers the front-door denial for a
+    // `CreateTask` that names no target.
     let (bare, _) = emulator_with(ACTIVE_REGION, 0);
     let answer = call(
         &bare,
@@ -257,7 +282,7 @@ async fn create_task_that_names_no_target_is_denied_at_the_front_door() {
 
 #[tokio::test]
 async fn list_tasks_reports_the_tasks_created_in_the_region_and_filters_them_by_state() {
-    let (router, activated) = emulator_with(ACTIVE_REGION, 3);
+    let (router, activated) = emulator_with_peer(ACTIVE_REGION, 3);
 
     // Nothing has been created yet, so the list is empty.
     let empty = call(&router, ACTIVE_REGION, "GET", "/tasks", None).await;
@@ -462,19 +487,32 @@ async fn list_tasks_reports_the_tasks_created_in_the_region_and_filters_them_by_
     }
 
     // The tasks belong to the Region they were created in: another Region of the same
-    // account reports none of them, and reports that as an empty list.
+    // account that meets the device/region precondition reports none of them, and
+    // reports that as an empty list.
+    let case = format!("ListTasks in {PEER_REGION}");
+    let answer = call(&router, PEER_REGION, "GET", "/tasks", None).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected HTTP 200, got {} with {}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.body["tasks"],
+        json!([]),
+        "case {case:?}: a Region no task was created in reports none, got {}",
+        answer.body
+    );
+
+    // And a Region of the same account that has activated no device at all does not
+    // get a listing to read at all: the device/region precondition refuses it.
     for region in OTHER_REGIONS {
         let case = format!("ListTasks in {region}");
         let answer = call(&router, region, "GET", "/tasks", None).await;
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected HTTP 200, got {} with {}",
-            answer.status, answer.body
-        );
-        assert_eq!(
-            answer.body["tasks"],
-            json!([]),
-            "case {case:?}: a Region no task was created in reports none, got {}",
+            answer.error_code(),
+            "AccessDeniedException",
+            "case {case:?}: a Region holding no device is refused, got {} with {}",
+            answer.status,
             answer.body
         );
     }

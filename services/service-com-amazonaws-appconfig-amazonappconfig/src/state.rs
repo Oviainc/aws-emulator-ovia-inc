@@ -293,6 +293,44 @@ pub fn extension_arn(region: &str, extension_id: &str, version_number: i32) -> S
     )
 }
 
+/// The ARN of one version of an AWS-authored extension: the same ARN
+/// [`extension_arn`] mints for the same resource shape, with the ACCOUNT field EMPTY.
+///
+/// Every ARN this emulator mints for a resource an account owns carries the one account
+/// id it presents. An AWS-authored extension is owned by no account — it is AppConfig's,
+/// published to every account alike — so there is no account to name in its ARN, and the
+/// model's `Arn` pattern makes that field optional for exactly this reason
+/// (`:(\d{12})?:`, `smithy_query(query="shape",shape="Arn")`). The ARN is still minted by
+/// the one helper that builds every ARN here, so the partition, the service namespace and
+/// the Region come from the same place as every other ARN; only the field an unowned
+/// resource has no value for is cleared.
+fn aws_authored_extension_arn(region: &str, name: &str, version_number: i32) -> String {
+    let owned = extension_arn(region, name, version_number);
+    // `arn:<partition>:<service>:<region>:<account>:<resource>` — the account is the
+    // fifth field, and the resource portion is left whole (it carries `/`, not `:`).
+    let mut fields: Vec<&str> = owned.splitn(6, ':').collect();
+    if let Some(account) = fields.get_mut(4) {
+        *account = "";
+    }
+    fields.join(":")
+}
+
+/// The ARN of one extension association: `extensionassociation/<association id>`, the
+/// resource portion [`parse_resource_arn`] reads back. An association belongs to the
+/// account rather than to the resource it binds, so its resource portion is rooted at the
+/// type, exactly as a deployment strategy's is.
+pub fn extension_association_arn(region: &str, association_id: &str) -> String {
+    ::engine::emulator_arn(
+        SERVICE_NAMESPACE,
+        region,
+        &format!("extensionassociation/{association_id}"),
+    )
+}
+
+/// The most extension associations this service holds. See [`MAX_EXTENSIONS`]: the bound
+/// that keeps a loop of create calls from growing the emulator's heap without limit.
+pub const MAX_EXTENSION_ASSOCIATIONS: usize = 100;
+
 /// The most tags ONE resource keeps, however many tag calls fill it: "You can specify a
 /// maximum of 50 tags for a resource" (`TagResource`'s own documentation,
 /// `smithy_query(query="operation",operation="TagResource")`).
@@ -429,6 +467,12 @@ pub enum TaggedResource<'arn> {
         extension_id: &'arn str,
         version_number: i32,
     },
+    /// `extensionassociation/<association id>`. An association belongs to the account
+    /// rather than to the resource it binds, so its resource portion is rooted at the
+    /// type — which is the ARN `CreateExtensionAssociation` answers with.
+    ExtensionAssociation {
+        extension_association_id: &'arn str,
+    },
 }
 
 /// The resource `resource_arn` addresses, or `None` when it addresses nothing whose tags
@@ -439,11 +483,10 @@ pub enum TaggedResource<'arn> {
 /// account, [`::engine::EMULATOR_ACCOUNT_ID`], and its store is not partitioned by
 /// region), so what is read is the service namespace — which must be
 /// [`SERVICE_NAMESPACE`] — and the resource portion. An ARN naming an AppConfig resource
-/// type whose tags this service does not persist (a hosted configuration version or an
-/// extension association: no record this service stores for one carries a tag map)
-/// answers `None`, exactly as an ARN naming a resource that does not exist does —
-/// which includes a predefined `AppConfig.*` deployment strategy, since this service stores
-/// no record for one.
+/// type whose tags this service does not persist (a hosted configuration version: no
+/// record this service stores for one carries a tag map) answers `None`, exactly as an ARN
+/// naming a resource that does not exist does — which includes a predefined
+/// `AppConfig.*` deployment strategy, since this service stores no record for one.
 pub fn parse_resource_arn(resource_arn: &str) -> Option<TaggedResource<'_>> {
     let mut sections = resource_arn.splitn(6, ':');
     let prefix = sections.next()?;
@@ -505,6 +548,11 @@ pub fn parse_resource_arn(resource_arn: &str) -> Option<TaggedResource<'_>> {
                 // Every extension ARN names one version, so a resource portion whose
                 // last segment is not a version number addresses no extension.
                 version_number: version.parse().ok()?,
+            })
+        }
+        ["extensionassociation", extension_association_id] if named(extension_association_id) => {
+            Some(TaggedResource::ExtensionAssociation {
+                extension_association_id,
             })
         }
         _ => None,
@@ -982,6 +1030,140 @@ impl ConfigurationProfile {
     }
 }
 
+/// One row of AppConfig's AWS-authored extension catalogue: an extension AppConfig
+/// itself authors, visible to every account without a `CreateExtension` call of its own,
+/// exactly as a predefined deployment strategy ([`PREDEFINED_DEPLOYMENT_STRATEGIES`]) is
+/// deployable without a `CreateDeploymentStrategy` call.
+///
+/// `ListExtensions` "lists all custom and Amazon Web Services authored AppConfig
+/// extensions in the account", and its `Items` are "the list of available extensions. The
+/// list includes Amazon Web Services authored and user-created extensions"
+/// (`smithy_query(query="doc",shape="ExtensionSummaries")`), so the authored half of that
+/// listing is part of the operation's contract rather than something only a create fills.
+#[derive(Debug, Clone, Copy)]
+pub struct AwsAuthoredExtension {
+    /// The extension's published name, which is also its id: an authored extension is
+    /// AppConfig's rather than any account's, so nothing mints an `Id` for it and a
+    /// caller names it in an `ExtensionIdentifier` exactly as it is published.
+    pub name: &'static str,
+    /// What the published catalogue says the extension does.
+    pub description: &'static str,
+    /// The action points the extension binds an action to, each a member of
+    /// `ACTION_POINT_VALUES` in `crate::ops::types` (the model's `ActionPoint` enum).
+    pub action_points: &'static [&'static str],
+    /// The parameters the extension declares, which the `CreateExtensionAssociation`
+    /// call that associates it supplies values for.
+    pub parameters: &'static [AwsAuthoredParameter],
+}
+
+/// One parameter an [`AwsAuthoredExtension`] declares: the published name a caller fills
+/// in when associating the extension, and whether a value for it is required.
+#[derive(Debug, Clone, Copy)]
+pub struct AwsAuthoredParameter {
+    /// The parameter name, as the published association example spells it.
+    pub name: &'static str,
+    /// What the parameter is for.
+    pub description: &'static str,
+    /// Whether an association must supply a value: "A parameter value must be specified
+    /// in the extension association" (`smithy_query(query="shape",shape="Parameter")`).
+    pub required: bool,
+}
+
+/// The version every AWS-authored extension is published at, and the only version it
+/// holds: `CreateExtension` refuses an authored name, so nothing appends a version to
+/// one and no reader of it has another to report.
+pub const AWS_AUTHORED_EXTENSION_VERSION: i32 = 1;
+
+/// The action points AppConfig's deployment-event notification extensions bind: the
+/// deployment lifecycle events a notification reports — the rollout starting, the
+/// deployment completing, and the rollback that undoes one. Each is a member of the
+/// model's `ActionPoint` enum (`smithy_query(query="shape",shape="ActionPoint")`), and the
+/// set is the one the AWS AppConfig User Guide publishes for these extensions: the points
+/// a deployment passes through WITHOUT reaching a lifecycle outcome (each growth step, and
+/// the bake that follows the rollout) are not among them, and an authored extension's set
+/// is not the caller's to change.
+const DEPLOYMENT_EVENT_ACTION_POINTS: &[&str] = &[
+    "ON_DEPLOYMENT_START",
+    "ON_DEPLOYMENT_COMPLETE",
+    "ON_DEPLOYMENT_ROLLED_BACK",
+];
+
+/// AppConfig's AWS-authored extensions, from the AWS AppConfig User Guide's predefined
+/// notification extensions: the deployment-event extensions a caller associates to a
+/// resource to have AppConfig report that resource's deployment lifecycle to an Amazon
+/// SQS queue, an Amazon SNS topic or the default Amazon EventBridge event bus.
+///
+/// Every column is a published AWS fact rather than a value this emulator may choose: the
+/// `name` is the identifier the guide tells a caller to pass as `ExtensionIdentifier`, the
+/// action points are the deployment lifecycle ([`DEPLOYMENT_EVENT_ACTION_POINTS`]), and a
+/// parameter is named as the guide's own association example spells it — a queue or topic
+/// ARN for the two extensions that need one, and none at all for the EventBridge
+/// extension, which publishes to the account's default event bus.
+pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
+    AwsAuthoredExtension {
+        name: "AWS.AppConfig.DeploymentEventsToEventBridge",
+        description: "Sends AppConfig deployment events to the default Amazon EventBridge \
+                      event bus",
+        action_points: DEPLOYMENT_EVENT_ACTION_POINTS,
+        parameters: &[],
+    },
+    AwsAuthoredExtension {
+        name: "AWS.AppConfig.DeploymentEventsToSns",
+        description: "Sends AppConfig deployment events to an Amazon SNS topic",
+        action_points: DEPLOYMENT_EVENT_ACTION_POINTS,
+        parameters: &[AwsAuthoredParameter {
+            name: "topicArn",
+            description: "The ARN of the Amazon SNS topic deployment events are published to",
+            required: true,
+        }],
+    },
+    AwsAuthoredExtension {
+        name: "AWS.AppConfig.DeploymentEventsToSqs",
+        description: "Sends AppConfig deployment events to an Amazon SQS queue",
+        action_points: DEPLOYMENT_EVENT_ACTION_POINTS,
+        parameters: &[AwsAuthoredParameter {
+            name: "queueArn",
+            description: "The ARN of the Amazon SQS queue deployment events are sent to",
+            required: true,
+        }],
+    },
+];
+
+/// The AWS-authored extension published under `name`, or `None` when the name is not one
+/// of AppConfig's own.
+///
+/// An authored extension's name is also its id, so this answers an `ExtensionIdentifier`
+/// in either of those two forms; [`aws_authored_extension`] adds the ARN form and builds
+/// the record.
+pub fn aws_authored_extension_named(name: &str) -> Option<&'static AwsAuthoredExtension> {
+    AWS_AUTHORED_EXTENSIONS
+        .iter()
+        .find(|authored| authored.name == name)
+}
+
+/// The AWS-authored extension `identifier` addresses — by name, by id (which for an
+/// authored extension is its name) or by the ARN of one of its versions — as the record
+/// every reader of an extension reports, together with the version an ARN pins.
+///
+/// The ARN is built in `region` rather than stored, because an authored extension belongs
+/// to AppConfig in every Region: the record a reader answers carries the ARN for the
+/// Region the request was signed for ([`request_region`]), which is the same Region the
+/// ARNs of that caller's own resources carry.
+pub fn aws_authored_extension(identifier: &str, region: &str) -> Option<(Extension, Option<i32>)> {
+    if let Some(authored) = aws_authored_extension_named(identifier) {
+        return Some((Extension::aws_authored(authored, region), None));
+    }
+    if let Some(TaggedResource::Extension {
+        extension_id,
+        version_number,
+    }) = parse_resource_arn(identifier)
+    {
+        return aws_authored_extension_named(extension_id)
+            .map(|authored| (Extension::aws_authored(authored, region), Some(version_number)));
+    }
+    None
+}
+
 /// An extension: the logic AppConfig injects at an action point of its own workflow.
 ///
 /// An extension is VERSIONED. Its name and its system-generated id are properties of the
@@ -1022,6 +1204,65 @@ impl Extension {
     pub fn latest_version(&self) -> Option<&ExtensionVersion> {
         self.versions.values().next_back()
     }
+
+    /// The record one row of [`AWS_AUTHORED_EXTENSIONS`] reads as, in `region`.
+    ///
+    /// An authored extension is the same resource an account's own extension is — one
+    /// name, one id and a version carrying the definition — so every reader reports it
+    /// through the one record type rather than a second shape of its own. Its id is its
+    /// published name, nothing having minted one for it, it holds the single version it is
+    /// published at ([`AWS_AUTHORED_EXTENSION_VERSION`]), and that version's ARN names no
+    /// account ([`aws_authored_extension_arn`]), because no account owns it.
+    ///
+    /// Each action carries the point it runs at and no `Uri`: that member names where the
+    /// action sends what it produces, and for a notification extension the destination is
+    /// the value an association supplies for the extension's own parameter, not part of
+    /// the extension — so there is nothing published here to report, and a URI invented
+    /// for it would be a destination no caller named.
+    pub fn aws_authored(authored: &AwsAuthoredExtension, region: &str) -> Self {
+        let version = ExtensionVersion {
+            version_number: AWS_AUTHORED_EXTENSION_VERSION,
+            arn: aws_authored_extension_arn(region, authored.name, AWS_AUTHORED_EXTENSION_VERSION),
+            description: Some(authored.description.to_string()),
+            actions: authored
+                .action_points
+                .iter()
+                .map(|point| {
+                    (
+                        (*point).to_string(),
+                        vec![Action {
+                            name: Some((*point).to_string()),
+                            ..Action::default()
+                        }],
+                    )
+                })
+                .collect(),
+            parameters: authored
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    (
+                        parameter.name.to_string(),
+                        Parameter {
+                            description: Some(parameter.description.to_string()),
+                            required: parameter.required,
+                            // A published parameter is supplied when the extension is
+                            // associated, which is what a parameter that is NOT dynamic
+                            // means: "Indicates whether this parameter's value can be
+                            // supplied at the extension's action point instead of during
+                            // extension association"
+                            // (`smithy_query(query="shape",shape="Parameter")`).
+                            dynamic: false,
+                        },
+                    )
+                })
+                .collect(),
+            // An authored extension is AppConfig's, so no `CreateExtension` call was
+            // asked to assign it metadata and it carries none.
+            tags: HashMap::new(),
+        };
+        Self::new(authored.name.to_string(), authored.name.to_string(), version)
+    }
 }
 
 /// One version of an extension, exactly as the `CreateExtension` call that wrote it
@@ -1039,6 +1280,37 @@ pub struct ExtensionVersion {
     /// The metadata `CreateExtension` was asked to assign to this extension version.
     /// Held on the record like an application's tags; the `Extension` shape carries no
     /// `Tags` member, so they are reported by the tagging operations.
+    pub tags: HashMap<String, String>,
+}
+
+/// An extension association: "a specified relationship between an extension and an
+/// AppConfig resource, such as an application or a configuration profile"
+/// (`smithy_query(query="operation",operation="CreateExtensionAssociation")`).
+///
+/// The association is what makes an extension run in one resource's workflow: it binds
+/// ONE version of ONE extension to ONE application, environment or configuration profile,
+/// and carries the values for the parameters that extension declares.
+#[derive(Debug, Clone)]
+pub struct ExtensionAssociation {
+    pub id: String,
+    /// The ARN of the association itself, minted when it was created.
+    pub arn: String,
+    /// The id of the extension this association binds — a minted id for an extension this
+    /// account created, the published name for an AWS-authored one — kept beside the ARN
+    /// so a reader can resolve the extension itself rather than re-parse the ARN.
+    pub extension_id: String,
+    /// The ARN of the extension VERSION this association binds, which is the version's own
+    /// ARN rather than one rebuilt here.
+    pub extension_arn: String,
+    pub extension_version_number: i32,
+    /// The ARN of the application, environment or configuration profile the extension is
+    /// associated to.
+    pub resource_arn: String,
+    /// The values supplied for the extension's declared parameters.
+    pub parameters: HashMap<String, String>,
+    /// The metadata `CreateExtensionAssociation` was asked to assign, held on the record
+    /// like every other resource's tags; the `ExtensionAssociation` shape carries no
+    /// `Tags` member, so the tagging operations report them.
     pub tags: HashMap<String, String>,
 }
 
@@ -1081,11 +1353,10 @@ pub struct Deployment {
     /// called".
     ///
     /// Recorded when the deployment starts, so a later read reports what was applied THEN
-    /// rather than what is associated now. It is empty for every deployment this emulator
-    /// starts, and that is a computed fact rather than a placeholder: an extension reaches
-    /// a deployment only through an extension ASSOCIATION, and every operation that writes
-    /// one (`CreateExtensionAssociation`, `UpdateExtensionAssociation`) still answers 501,
-    /// so no association exists for a deployment to invoke.
+    /// rather than what is associated now: an extension reaches a deployment only through
+    /// an extension ASSOCIATION, and the ones listed here are the associations
+    /// [`ComAmazonawsAppconfigAmazonappconfigState::applied_extensions_for`] found bound to
+    /// this deployment's application, environment or configuration profile at that instant.
     pub applied_extensions: Vec<AppliedExtension>,
     pub started_at: SystemTime,
     pub completed_at: Option<SystemTime>,
@@ -1115,6 +1386,10 @@ pub struct NewDeployment {
     pub description: Option<String>,
     pub kms_key_identifier: Option<String>,
     pub version_label: Option<String>,
+    /// The extension associations in force when the deployment was asked for, which the
+    /// deployment records as its `AppliedExtensions`
+    /// ([`ComAmazonawsAppconfigAmazonappconfigState::applied_extensions_for`]).
+    pub applied_extensions: Vec<AppliedExtension>,
     pub tags: HashMap<String, String>,
 }
 
@@ -1157,8 +1432,9 @@ impl Deployment {
             state: DEPLOYMENT_DEPLOYING.to_string(),
             percentage_complete: 0.0,
             deployment_type: DEPLOYMENT_TYPE_USER.to_string(),
-            // Nothing to apply: see the field's own note.
-            applied_extensions: Vec::new(),
+            // The associations in force when this deployment was asked for: see the
+            // field's own note.
+            applied_extensions: new.applied_extensions,
             started_at,
             completed_at: None,
             // Nothing has stopped it: the only thing that sets this is a caller's stop.
@@ -1645,6 +1921,20 @@ pub fn resource_arn_not_found(resource_arn: &str) -> String {
     )
 }
 
+/// `Message` for an extension association no `ExtensionAssociationId` resolves to.
+///
+/// Built on the same template as every other not-found refusal of this service, and like
+/// the extension's it echoes no identifier: the id travels in the URI, so the refusal
+/// states the kind and the account it was looked up in.
+pub fn extension_association_not_found() -> String {
+    not_found_message(
+        "Extension Association",
+        &[],
+        AccountClause::Reported,
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
 /// `Message` for a version an extension does not hold.
 ///
 /// A version-level miss is a DIFFERENT refusal from [`extension_not_found`] and has no
@@ -1881,9 +2171,17 @@ pub struct ComAmazonawsAppconfigAmazonappconfigState {
     /// [`Self::try_insert_extension`] and [`Self::try_insert_extension_version`] are the
     /// only ways in, so the [`MAX_EXTENSIONS`] and [`MAX_EXTENSION_VERSIONS`] bounds
     /// cannot be bypassed by a handler mutating the map directly. AppConfig's own
-    /// AWS-authored `AWS.*` extensions are not in here: this service stores no record
-    /// for one.
+    /// AWS-authored extensions are not in here — they are AppConfig's rather than this
+    /// account's, so no create wrote them and no delete unwrites them;
+    /// [`Self::resolve_extension`] and [`Self::all_extensions`] answer for those too.
     extensions: HashMap<String, Extension>,
+    /// Every extension association this account created, by association id.
+    ///
+    /// PRIVATE for the same reason the extension map is:
+    /// [`Self::try_insert_extension_association`] is the only way in, so the
+    /// [`MAX_EXTENSION_ASSOCIATIONS`] bound cannot be bypassed by a handler mutating the
+    /// map directly.
+    extension_associations: HashMap<String, ExtensionAssociation>,
     /// Bytes of hosted configuration content this service is holding, across every
     /// configuration profile. Maintained by
     /// [`Self::reserve_hosted_configuration_bytes`] and bounded by
@@ -1909,6 +2207,7 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         self.deployment_strategies.contains_key(id)
             || self.applications.contains_key(id)
             || self.extensions.contains_key(id)
+            || self.extension_associations.contains_key(id)
             || self.applications.values().any(|application| {
                 application.environments.contains_key(id)
                     || application.profiles.contains_key(id)
@@ -1938,7 +2237,7 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
     }
 
     /// The extension `identifier` names, and the version number the identifier itself
-    /// pins, or `None` when this service holds no such extension.
+    /// pins, or `None` when no extension this account can see answers to it.
     ///
     /// `identifier` is "the name, the ID, or the Amazon Resource Name (ARN) of the
     /// extension"
@@ -1947,24 +2246,37 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
     /// `ExtensionIdentifier` resolves it the same way. An ARN addresses ONE version, so
     /// it pins that version number; an id or a name addresses the extension as a whole
     /// and pins none.
-    pub fn resolve_extension(&self, identifier: &str) -> Option<(&Extension, Option<i32>)> {
+    ///
+    /// Both halves of the account's catalogue answer: an extension this account created,
+    /// and failing that one of AppConfig's AWS-authored extensions
+    /// ([`AWS_AUTHORED_EXTENSIONS`]), which every account can read without having created
+    /// it. A created extension cannot carry an authored name — `CreateExtension` refuses
+    /// one — so the two halves never answer for the same identifier.
+    pub fn resolve_extension(
+        &self,
+        identifier: &str,
+        region: &str,
+    ) -> Option<(Extension, Option<i32>)> {
         if let Some(by_id) = self.extensions.get(identifier) {
-            return Some((by_id, None));
+            return Some((by_id.clone(), None));
         }
         if let Some(TaggedResource::Extension {
             extension_id,
             version_number,
         }) = parse_resource_arn(identifier)
         {
-            return self
-                .extensions
-                .get(extension_id)
-                .map(|extension| (extension, Some(version_number)));
+            if let Some(by_arn) = self.extensions.get(extension_id) {
+                return Some((by_arn.clone(), Some(version_number)));
+            }
         }
-        self.extensions
+        if let Some(by_name) = self
+            .extensions
             .values()
             .find(|extension| extension.name == identifier)
-            .map(|extension| (extension, None))
+        {
+            return Some((by_name.clone(), None));
+        }
+        aws_authored_extension(identifier, region)
     }
 
     /// The extension stored under `extension_id`, for a caller that already holds the
@@ -1986,6 +2298,26 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
     /// reaching into the map.
     pub fn created_extensions(&self) -> impl Iterator<Item = &Extension> {
         self.extensions.values()
+    }
+
+    /// The whole extension catalogue this account can see, in `region`: AppConfig's
+    /// AWS-authored extensions ([`AWS_AUTHORED_EXTENSIONS`]) and every extension this
+    /// account created.
+    ///
+    /// This is [`resolve_extension`] read over the whole catalogue rather than for one
+    /// identifier, so a listing reports nothing a reader of it would then miss on, and
+    /// each extension exactly once: an authored name is reserved, so no created extension
+    /// can carry one. `ListExtensions`, which reports "all custom and Amazon Web Services
+    /// authored AppConfig extensions in the account", is the caller this exists for; the
+    /// order a listing reports them in is the listing's own.
+    ///
+    /// [`resolve_extension`]: ComAmazonawsAppconfigAmazonappconfigState::resolve_extension
+    pub fn all_extensions(&self, region: &str) -> Vec<Extension> {
+        AWS_AUTHORED_EXTENSIONS
+            .iter()
+            .map(|authored| Extension::aws_authored(authored, region))
+            .chain(self.created_extensions().cloned())
+            .collect()
     }
 
     /// Store a brand-new extension, holding its first version.
@@ -2051,6 +2383,172 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
             self.extensions.remove(extension_id);
         }
         Some(removed)
+    }
+
+    /// The ARN of the AppConfig resource `identifier` names, as the record an extension
+    /// association reports it by, or `None` when it addresses nothing an extension may be
+    /// associated to.
+    ///
+    /// `ResourceIdentifier` is "the ARN of an application, configuration profile, or
+    /// environment"
+    /// (`smithy_query(query="doc",shape="CreateExtensionAssociationRequest",member="ResourceIdentifier")`),
+    /// so an ARN is resolved against the tree and answered only when the resource it
+    /// addresses exists. The ARN is rebuilt from the resolved record in `region` rather
+    /// than echoed back, so what the association stores is this service's own ARN for the
+    /// resource it found — not whatever partition or account the caller typed.
+    ///
+    /// The member's type is `Identifier`, the same shape every "ID or name" member of this
+    /// service targets, so an identifier that is not an ARN at all is resolved the way
+    /// every other `ApplicationIdentifier` is ([`Self::resolve_application_id`]): an
+    /// application is the one resource of the three that an id or a name addresses
+    /// unambiguously on its own.
+    pub fn resolve_association_resource(&self, identifier: &str, region: &str) -> Option<String> {
+        let resource = match parse_resource_arn(identifier) {
+            Some(resource) => resource,
+            // Not an ARN: an application id or name, which is the one form of the three
+            // that addresses a resource on its own.
+            None => {
+                let application_id = self.resolve_application_id(identifier)?;
+                return Some(::engine::emulator_arn(
+                    SERVICE_NAMESPACE,
+                    region,
+                    &format!("application/{application_id}"),
+                ));
+            }
+        };
+        let portion = match resource {
+            TaggedResource::Application { application_id } => {
+                let application = self.applications.get(application_id)?;
+                format!("application/{}", application.id)
+            }
+            TaggedResource::Environment {
+                application_id,
+                environment_id,
+            } => {
+                let environment = self
+                    .applications
+                    .get(application_id)?
+                    .environments
+                    .get(environment_id)?;
+                format!("application/{application_id}/environment/{}", environment.id)
+            }
+            TaggedResource::ConfigurationProfile {
+                application_id,
+                configuration_profile_id,
+            } => {
+                let profile = self
+                    .applications
+                    .get(application_id)?
+                    .profiles
+                    .get(configuration_profile_id)?;
+                format!(
+                    "application/{application_id}/configurationprofile/{}",
+                    profile.id
+                )
+            }
+            // Every other AppConfig resource — a deployment, a deployment strategy, an
+            // extension, another association — is not one of the three an extension
+            // associates to.
+            _ => return None,
+        };
+        Some(::engine::emulator_arn(SERVICE_NAMESPACE, region, &portion))
+    }
+
+    /// The extension association `association_id` names, or `None` when this account
+    /// created none under that id. `GetExtensionAssociation` is the caller this exists for.
+    pub fn extension_association(&self, association_id: &str) -> Option<&ExtensionAssociation> {
+        self.extension_associations.get(association_id)
+    }
+
+    /// The extension associations in force for a deployment of
+    /// `configuration_profile_id` into `environment_id` of `application_id`, as the
+    /// `AppliedExtensions` that deployment records: "the extensions that were previously
+    /// associated to the configuration profile, environment, or the application when
+    /// `StartDeployment` was called"
+    /// (`smithy_query(query="doc",shape="Deployment",member="AppliedExtensions")`).
+    ///
+    /// An association binds ONE of the three, and a deployment runs all three levels, so
+    /// an association bound to any of them is applied to the deployment. The binding is
+    /// matched on the resource the association's ARN ADDRESSES rather than on the ARN text,
+    /// so an association created against one Region's ARN still applies to a deployment
+    /// started in another: this emulator holds one tree, not one per Region. The order is
+    /// by association id, so two reads of one deployment report the same list.
+    pub fn applied_extensions_for(
+        &self,
+        application_id: &str,
+        environment_id: &str,
+        configuration_profile_id: &str,
+    ) -> Vec<AppliedExtension> {
+        let mut applied: BTreeMap<&str, AppliedExtension> = BTreeMap::new();
+        for association in self.extension_associations.values() {
+            let bound = match parse_resource_arn(&association.resource_arn) {
+                Some(TaggedResource::Application {
+                    application_id: bound_application,
+                }) => bound_application == application_id,
+                Some(TaggedResource::Environment {
+                    application_id: bound_application,
+                    environment_id: bound_environment,
+                }) => bound_application == application_id && bound_environment == environment_id,
+                Some(TaggedResource::ConfigurationProfile {
+                    application_id: bound_application,
+                    configuration_profile_id: bound_profile,
+                }) => {
+                    bound_application == application_id
+                        && bound_profile == configuration_profile_id
+                }
+                _ => false,
+            };
+            if bound {
+                applied.insert(
+                    association.id.as_str(),
+                    AppliedExtension {
+                        extension_id: Some(association.extension_id.clone()),
+                        extension_association_id: Some(association.id.clone()),
+                        version_number: association.extension_version_number,
+                        parameters: Some(association.parameters.clone()),
+                    },
+                );
+            }
+        }
+        applied.into_values().collect()
+    }
+
+    /// Whether any association binds the `version_number` version of the extension
+    /// `extension_id` names.
+    ///
+    /// "You must delete all associations to an extension before you delete the extension"
+    /// (`smithy_query(query="operation",operation="DeleteExtension")`), which this is what
+    /// `DeleteExtension` checks before removing a version: an association names ONE
+    /// version, so the association that blocks a delete is one bound to the version the
+    /// delete would take away.
+    pub fn extension_version_is_associated(
+        &self,
+        extension_id: &str,
+        version_number: i32,
+    ) -> bool {
+        self.extension_associations.values().any(|association| {
+            association.extension_id == extension_id
+                && association.extension_version_number == version_number
+        })
+    }
+
+    /// Store an extension association this account created.
+    ///
+    /// Answers `false`, having stored nothing, when this service already holds
+    /// [`MAX_EXTENSION_ASSOCIATIONS`] of them — the bound that keeps a loop of create
+    /// calls from growing the emulator's heap without limit.
+    /// `CreateExtensionAssociation` is the caller this exists for, and answers that
+    /// `false` with the `ServiceQuotaExceededException` it models.
+    pub fn try_insert_extension_association(
+        &mut self,
+        association: ExtensionAssociation,
+    ) -> bool {
+        if self.extension_associations.len() >= MAX_EXTENSION_ASSOCIATIONS {
+            return false;
+        }
+        self.extension_associations
+            .insert(association.id.clone(), association);
+        true
     }
 
     /// Resolve a deployment strategy id to the strategy it names: one this account
@@ -2258,6 +2756,11 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
                     .get(&version_number)?
                     .tags,
             ),
+            // An association carries the tags the `CreateExtensionAssociation` call that
+            // wrote it was asked to assign.
+            TaggedResource::ExtensionAssociation {
+                extension_association_id,
+            } => Some(&self.extension_associations.get(extension_association_id)?.tags),
         }
     }
 
@@ -2321,6 +2824,14 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
                     .get_mut(extension_id)?
                     .versions
                     .get_mut(&version_number)?
+                    .tags,
+            ),
+            TaggedResource::ExtensionAssociation {
+                extension_association_id,
+            } => Some(
+                &mut self
+                    .extension_associations
+                    .get_mut(extension_association_id)?
                     .tags,
             ),
         }

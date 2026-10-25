@@ -160,6 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // The account/region device precondition, FIRST: tasks run on devices, so a
+        // Region this account has activated none in is refused rather than answered
+        // with an empty page — ahead of the `nextToken` and `state` filter the
+        // request carries.
+        if !store.has_devices_in(&region) {
+            return Err(ListTasksErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
+
         // The token carries the task id the next page resumes at; a value this
         // service never issued is refused rather than silently serving page one.
         let resume_at = match input.next_token.as_deref() {

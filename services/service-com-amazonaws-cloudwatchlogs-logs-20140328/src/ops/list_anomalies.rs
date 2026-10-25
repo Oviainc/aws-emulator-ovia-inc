@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAnomalies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAnomalies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAnomalies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: enumerates the anomalies the account's log anomaly detectors have reported
+//! — optionally only one detector's, optionally only the suppressed or only the unsuppressed
+//! ones — a page at a time. The suppression each anomaly reports is the one in force at the
+//! time of the call, which is what `UpdateAnomaly` writes and the clock expires. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +115,64 @@ impl From<ListAnomaliesErrorModeled> for ListAnomaliesError {
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "ListAnomalies";
+
+/// `SUPPRESSED`, one of the two values the model's `SuppressionState` enum carries: "You can
+/// specify this parameter if you want to the operation to return only anomalies that are
+/// currently either suppressed or unsuppressed."
+const SUPPRESSION_STATE_SUPPRESSED: &str = "SUPPRESSED";
+
+/// `UNSUPPRESSED`, the other value of the model's `SuppressionState` enum.
+const SUPPRESSION_STATE_UNSUPPRESSED: &str = "UNSUPPRESSED";
+
+/// How many anomalies one page carries when the request names no `limit`: "The maximum
+/// number of items to return. If you don't specify a value, the default maximum value of 50
+/// items is used." (`ListAnomaliesInput$limit`)
+const DEFAULT_LIMIT: i32 = 50;
+
+/// Where the next page resumes: the detector and the anomaly the last reported anomaly
+/// belonged to, plus the filters of the enumeration it belongs to. A continuation that
+/// changes a filter is refused, because the token is only a position within ONE filtered
+/// enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    anomaly_detector_arn: Option<String>,
+    suppression_state: Option<String>,
+    after_detector: String,
+    after_anomaly: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "anomalyDetectorArn": self.anomaly_detector_arn,
+            "suppressionState": self.suppression_state,
+            "afterDetector": self.after_detector,
+            "afterAnomaly": self.after_anomaly,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        let optional = |member: &str| match value.get(member) {
+            None | Some(::serde_json::Value::Null) => Ok(None),
+            Some(text) => text.as_str().map(|text| Some(text.to_string())).ok_or(()),
+        };
+        Some(Self {
+            anomaly_detector_arn: optional("anomalyDetectorArn").ok()?,
+            suppression_state: optional("suppressionState").ok()?,
+            after_detector: value.get("afterDetector")?.as_str()?.to_string(),
+            after_anomaly: value.get("afterAnomaly")?.as_str()?.to_string(),
+        })
+    }
+}
+
 /// The `ListAnomalies` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -155,18 +209,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAnomalies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAnomaliesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAnomalies"))
+        // `ctx` carries only request metadata; this operation reports on stored anomalies
+        // and needs none of it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAnomaliesError::from(ListAnomaliesErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let invalid = |message: &str| {
+            ListAnomaliesError::from(ListAnomaliesErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            ))
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.anomaly_detector_arn != input.anomaly_detector_arn
+                    || cursor.suppression_state != input.suppression_state
+                {
+                    return Err(invalid(
+                        "nextToken was issued for a different ListAnomalies request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        let now_ms = crate::state::now_ms();
+        let store = state.lock();
+
+        // "Use this to optionally limit the results to only the anomalies found by a certain
+        // anomaly detector": a request naming a detector this account does not hold names a
+        // resource that is not there, rather than selecting nothing.
+        if let Some(arn) = input.anomaly_detector_arn.as_deref() {
+            if !store.anomaly_detectors.contains_key(arn) {
+                return Err(ListAnomaliesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            "anomaly detector",
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // One enumeration over the selected detectors, in detector-ARN then anomaly-id order
+        // (both stores are ordered maps), so a page boundary is a position in a total order.
+        let mut matching: Vec<(String, Anomaly)> = Vec::new();
+        for (arn, detector) in &store.anomaly_detectors {
+            if input
+                .anomaly_detector_arn
+                .as_deref()
+                .is_some_and(|selected| selected != arn)
+            {
+                continue;
+            }
+            for anomaly in detector.reported_anomalies(now_ms) {
+                // The filter is on the suppression IN FORCE at the time of the call, which is
+                // what the projection above reports.
+                let suppressed = anomaly.suppressed.unwrap_or(false);
+                let selected = match input.suppression_state.as_deref() {
+                    Some(SUPPRESSION_STATE_SUPPRESSED) => suppressed,
+                    Some(SUPPRESSION_STATE_UNSUPPRESSED) => !suppressed,
+                    // A request naming no state asks for both; `SuppressionState` is a
+                    // modelled enum, so a value outside it is refused before this handler
+                    // runs.
+                    _ => true,
+                };
+                if selected {
+                    matching.push((arn.clone(), anomaly));
+                }
+            }
+        }
+        drop(store);
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|(arn, anomaly)| {
+                (arn.as_str(), anomaly.anomaly_id.as_str())
+                    <= (cursor.after_detector.as_str(), cursor.after_anomaly.as_str())
+            }),
+            None => 0,
+        };
+        // `limit` is modelled `range 1..50`, so the boundary validator has already refused a
+        // value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(DEFAULT_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // "The token for the next set of items to return": there is a next set only while
+        // anomalies remain beyond this page.
+        let next_token = page.last().filter(|_| last < matching.len()).map(
+            |(arn, anomaly)| {
+                Cursor {
+                    anomaly_detector_arn: input.anomaly_detector_arn.clone(),
+                    suppression_state: input.suppression_state.clone(),
+                    after_detector: arn.clone(),
+                    after_anomaly: anomaly.anomaly_id.clone(),
+                }
+                .encode()
+            },
+        );
+
+        Ok(ListAnomaliesOutput {
+            anomalies: Some(
+                page.iter()
+                    .map(|(_, anomaly)| anomaly.clone())
+                    .collect::<Vec<Anomaly>>(),
+            ),
+            next_token,
+        })
     }
 }

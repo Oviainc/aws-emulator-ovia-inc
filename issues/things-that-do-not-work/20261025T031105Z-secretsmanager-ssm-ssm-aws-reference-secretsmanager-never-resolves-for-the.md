@@ -1,0 +1,29 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: secretsmanager__ssm.parameter-store-reference-is-refused-without-the-secretsmanager-grant
+Issue-Key: secretsmanager__ssm.parameter-store-reference-is-refused-without-the-secretsmanager-grant|_poll#13|Timeout|time.sleep(interval_s)
+Issue-Commit: 271fde8cc1a42675cd9f2105c7c7bd008dd933ab
+
+# SSM /aws/reference/secretsmanager never resolves for the harness's own credentials, so the Parameter Store front door's authorization against Secrets Manager is unreachable
+
+> _Note: this issue was identified against the code base at commit `271fde8cc1a42675cd9f2105c7c7bd008dd933ab`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetParameter
+
+## Description
+One root cause. Cause count: 1.
+
+Cause 1 of 1: SSM GetParameter does not serve /aws/reference/secretsmanager/<secret-name>, so neither the success arm nor the cross-service authorization arm of that front door can be observed.
+AWS: Parameter Store exposes a Secrets Manager secret at the reserved path /aws/reference/secretsmanager/<secret-name>, and ssm:GetParameter on that path returns the secret's SecretString as the parameter Value. Crucially, the read is authorized against SECRETS MANAGER rather than against Parameter Store: AWS documents that 'Parameter Store honors IAM policies attached to Secrets Manager secrets. For example, if User 1 doesn't have access to Secret A, then User 1 can't retrieve Secret A by using Parameter Store.' A principal holding ssm:GetParameter on '*' and secretsmanager:DescribeSecret but NOT secretsmanager:GetSecretValue is therefore refused on the reference path and gets no secret bytes, while the same principal reads an ordinary String parameter fine; the replay of this check records SSM's refusal as ValidationException with the message 'An error occurred while calling one AWS dependency service.' — SSM's generic wrapper for a failed downstream Secrets Manager call, not Secrets Manager's own AccessDeniedException and not a ParameterNotFound masking.
+Emulator: the reference path never resolves at all, for any caller. The check's very first beat — a baseline GetParameter on /aws/reference/secretsmanager/<name> using the harness's own unrestricted credentials, polled for 90 s before any restricted role exists — never returns OK, so the check runs to the suite's 60 s cap ('Check timed out after 60.0s'). The restricted-role beats, the dependency refusal and the grant-then-succeed beat are never reached.
+Why: this front door is how applications and ECS/Lambda parameter integrations read secrets without talking to Secrets Manager directly. On this emulator the reference read simply does not work, and the security property that matters most about it — that the Secrets Manager permission, not the SSM one, decides the read — can never be exercised, so a least-privilege test that is supposed to prove 'this role cannot reach the secret through Parameter Store' proves nothing.
+Fix: the SSM GetParameter handler's reserved-path resolver — recognise /aws/reference/secretsmanager/<name>[:<stage-or-version>], resolve it against the Secrets Manager store, authorize it as secretsmanager:GetSecretValue on the target secret, and map a downstream denial onto ValidationException (HTTP 400) rather than serving bytes or reporting ParameterNotFound. Related open issues record the resolution gap from the success side and do not carry this check's replay key: 20261024T190718Z-secretsmanager-ssm-ssm-getparameter-does-not-resolve-aws-reference-secretsmanager.md and 20261024T190718Z-cloudformation-secretsmanager-ssm-ssm-getparameter-never-resolves-aws-reference-secretsmanager-so.md. The cross-service authorization half described here is not covered by either.
+Traces: secretsmanager__ssm.parameter-store-reference-is-refused-without-the-secretsmanager-grant.
+
+## Evidence
+Replay verdict: [mismatch] secretsmanager__ssm.parameter-store-reference-is-refused-without-the-secretsmanager-grant — 'Check timed out after 60.0s'. The check stalls in its first _poll, whose description is 'the reference \'/aws/reference/secretsmanager/<name>\' to resolve for the harness\'s own credentials (the front door is a different service from the store and may lag CreateSecret)', waiting up to 90 s for GetParameter on that path to return OK with Value == 'reference-guarded-value'. Expected on AWS: that baseline read succeeds and serves the secret's bytes; then the restricted role (ssm:GetParameter on '*', secretsmanager:DescribeSecret, no secretsmanager:GetSecretValue) is refused on the identical call with HTTP 400 ValidationException 'An error occurred while calling one AWS dependency service.' and no secret bytes, while that same role reads an ordinary parameter successfully; adding secretsmanager:GetSecretValue then makes the identical SSM call succeed.
+
+## Steps to Reproduce
+1. secretsmanager CreateSecret(Name=<name>, SecretString='reference-guarded-value'). 2. ssm PutParameter(Name=<ordinary param>, Type='String', Value='ordinary-parameter-value'). 3. With unrestricted credentials, ssm GetParameter(Name='/aws/reference/secretsmanager/<name>', WithDecryption=True) — it never returns the secret's value (the baseline poll runs out). On AWS this returns Parameter.Value == 'reference-guarded-value'. 4. Then, to reach the graded behavior: create a role allowing ssm:GetParameter on '*' and secretsmanager:DescribeSecret on the secret but NOT secretsmanager:GetSecretValue, assume it, and repeat step 3 as that role — AWS refuses with HTTP 400 ValidationException ('An error occurred while calling one AWS dependency service.') while the ordinary parameter from step 2 still reads fine; adding secretsmanager:GetSecretValue to the role makes the identical call succeed.

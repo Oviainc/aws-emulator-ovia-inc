@@ -73,3 +73,5 @@ mod service_specific_credentials;
 mod state_roundtrip;
 #[path = "all/user_lifecycle.rs"]
 mod user_lifecycle;
+#[path = "all/user_permissions_boundary.rs"]
+mod user_permissions_boundary;

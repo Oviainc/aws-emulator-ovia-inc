@@ -196,6 +196,17 @@ pub struct ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// is also why this is an `Option` rather than a map: like `slos`, this store is one
     /// account's and one Region's.
     pub grouping_configuration: Option<GroupingConfiguration>,
+    /// This account's Application Signals enablement, or `None` while discovery has never
+    /// been started.
+    ///
+    /// At most ONE record exists, for the same reason `grouping_configuration` holds one:
+    /// this store is one account's. `StartDiscovery` "enables this Amazon Web Services
+    /// account to be able to use CloudWatch Application Signals by creating the
+    /// AWSServiceRoleForCloudWatchApplicationSignals service-linked role", and an account
+    /// that already holds that role needs no second one — so the record is written by the
+    /// FIRST call and left exactly as it is by every later one
+    /// ([`Self::start_discovery`]).
+    discovery: Option<Discovery>,
 }
 
 impl ComAmazonawsApplicationsignalsApplicationsignalsState {
@@ -315,6 +326,31 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         self.grouping_configuration.take().is_some()
     }
 
+    /// Enable Application Signals for this account, and hand back the record the account's
+    /// enablement is held under.
+    ///
+    /// The enablement IS the service-linked role the account gains
+    /// ([`discovery_service_linked_role_arn`]), stamped with the instant it was created, so
+    /// `started_at` comes from the clock at the write rather than from a request.
+    ///
+    /// Idempotent: a role is created only while the account holds none, so an account that
+    /// is already enabled keeps the record of the call that enabled it — neither the role
+    /// nor the instant it was created moves — and every later call is the same success.
+    pub fn start_discovery(&mut self, started_at: ::aws_smithy_types::DateTime) -> Discovery {
+        self.discovery
+            .get_or_insert_with(|| Discovery {
+                service_linked_role_arn: discovery_service_linked_role_arn(),
+                started_at,
+            })
+            .clone()
+    }
+
+    /// This account's Application Signals enablement, or `None` while discovery has never
+    /// been started for it.
+    pub fn discovery(&self) -> Option<&Discovery> {
+        self.discovery.as_ref()
+    }
+
     /// Whether another SLO would put this service over its [`MAX_SLOS`] quota.
     pub fn at_slo_quota(&self) -> bool {
         self.slos.len() >= MAX_SLOS
@@ -357,6 +393,55 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         };
         (window.into_iter().map(summary_of).collect(), next_cursor)
     }
+}
+
+/// What this account's Application Signals enablement is: the service-linked role the
+/// account gained when discovery was started, and the instant it gained it.
+///
+/// Held beside the account's other singleton records rather than derived, because the
+/// instant is the clock reading of the call that enabled the account and nothing else in
+/// the store carries it.
+#[derive(Debug, Clone)]
+pub struct Discovery {
+    /// The ARN of the service-linked role the account holds, as
+    /// [`discovery_service_linked_role_arn`] renders it.
+    pub service_linked_role_arn: String,
+    /// The instant the account was enabled: the clock at the first `StartDiscovery` call,
+    /// which is when the role was created.
+    pub started_at: DateTime,
+}
+
+/// The service principal the CloudWatch Application Signals service-linked role is linked
+/// to — the service that assumes it, and the segment IAM files the role under.
+///
+/// It is this service's own endpoint prefix under `amazonaws.com` (`OPERATIONS.md`:
+/// `Endpoint prefix: application-signals`), which is also the principal the emulated IAM
+/// service's published catalog of service-linked role names lists this role under, so the
+/// ARN this service renders and the one IAM reports for that role are the same string.
+pub const SERVICE_PRINCIPAL: &str = "application-signals.amazonaws.com";
+
+/// The service-linked role `StartDiscovery` creates in the account.
+///
+/// Model doc for the operation: "Enables this Amazon Web Services account to be able to use
+/// CloudWatch Application Signals by creating the
+/// AWSServiceRoleForCloudWatchApplicationSignals service-linked role."
+pub const DISCOVERY_SERVICE_LINKED_ROLE_NAME: &str =
+    "AWSServiceRoleForCloudWatchApplicationSignals";
+
+/// The ARN of [`DISCOVERY_SERVICE_LINKED_ROLE_NAME`]:
+/// `arn:aws:iam::<account>:role/aws-service-role/application-signals.amazonaws.com/AWSServiceRoleForCloudWatchApplicationSignals`
+/// — a role under the path IAM gives a service-linked role.
+///
+/// The role is an IAM resource, so the ARN names IAM rather than this service, and IAM is
+/// global: the ARN carries NO Region, whichever Region the caller signed for. One role is
+/// created per account and reused, so every call reads the same ARN.
+pub fn discovery_service_linked_role_arn() -> String {
+    // `iam` is the IAM ARN namespace the role belongs to, not this service's.
+    ::engine::emulator_arn(
+        "iam",
+        "",
+        &format!("role/aws-service-role/{SERVICE_PRINCIPAL}/{DISCOVERY_SERVICE_LINKED_ROLE_NAME}"),
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

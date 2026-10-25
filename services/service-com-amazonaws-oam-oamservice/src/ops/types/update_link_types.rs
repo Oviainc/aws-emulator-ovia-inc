@@ -9,8 +9,16 @@
 
 use super::*;
 
+use ::aws_smithy_schema::serde::SerdeError;
+
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-oam-oamservice.json");
 
+/// `UpdateLink`'s input, exactly as the model declares it: the shape the generated
+/// `UPDATE_LINK_INPUT_SCHEMA` describes, which is what routes the request, reads its
+/// body and carries every member's constraint traits.
+///
+/// The handler is given [`UpdateLinkRequest`] rather than this, for the reason stated
+/// there.
 #[smithy_macros::smithy(shape = "com.amazonaws.oam#UpdateLinkInput")]
 #[derive(Debug, Clone, Default)]
 pub struct UpdateLinkInput {
@@ -18,6 +26,119 @@ pub struct UpdateLinkInput {
     pub resource_types: Vec<String>,
     pub link_configuration: Option<LinkConfiguration>,
     pub include_tags: Option<bool>,
+}
+
+/// How `UpdateLink` RECEIVES its request: [`UpdateLinkInput`]'s members, with
+/// `ResourceTypes` carried as "present" or "absent" and its bounds left for the
+/// handler to enforce.
+///
+/// `UpdateLink` decides AUTHORIZATION on the link `Identifier` names before it judges
+/// anything else the request carries (see [`crate::ops::update_link`]), and the
+/// framework's centralized walk cannot express that order: an absent `@required`
+/// member is refused as the body is read, and a value outside a member's `@length` is
+/// refused by the walk that follows — both before any handler runs. `UpdateLinkInput`
+/// cannot hold "no `ResourceTypes` at all" either, because the model marks the member
+/// `@required`. This is what lets both reach the handler, and it is the ONLY
+/// difference from the generated input: every member is read from, and written back
+/// through, the generated member schemas of `UpdateLinkInput::SCHEMA`, so the wire
+/// form and every other member's constraints are exactly what the model declares.
+///
+/// `ResourceTypes` is therefore the one member the pre-handler walk does not see, and
+/// the handler enforces its presence (`MissingRequiredParameterException`) and its
+/// modelled `@length(1..50)` / `@uniqueItems` / enum bounds
+/// (`InvalidParameterException`) itself, after the authorization decision.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateLinkRequest {
+    pub identifier: String,
+    /// The list the request carried, or `None` when it carried none.
+    pub resource_types: Option<Vec<String>>,
+    pub link_configuration: Option<LinkConfiguration>,
+    pub include_tags: Option<bool>,
+}
+
+impl UpdateLinkRequest {
+    /// The member of the generated input schema named `name`.
+    ///
+    /// Read from the schema rather than kept as a second copy of it, so a member's
+    /// wire name, its `@jsonName` and its constraint traits stay single-homed in the
+    /// model-derived schema.
+    fn member(name: &str) -> Result<&'static ::aws_smithy_schema::Schema, SerdeError> {
+        UPDATE_LINK_INPUT_SCHEMA
+            .members()
+            .iter()
+            .copied()
+            .find(|member| member.member_name() == Some(name))
+            .ok_or_else(|| {
+                SerdeError::custom(format!("UpdateLinkInput declares no member '{name}'"))
+            })
+    }
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for UpdateLinkRequest {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), SerdeError> {
+        // What this writes is what the constraint walk validates. `Identifier`'s
+        // `@pattern` and anything `LinkConfiguration` declares are written, and so
+        // refused before the handler as on every other operation; `ResourceTypes` is
+        // deliberately not, because its bounds are the handler's to report after it
+        // has decided whether the caller may act on the link at all.
+        s.write_string(Self::member("Identifier")?, self.identifier.as_str())?;
+        if let Some(link_configuration) = &self.link_configuration {
+            s.write_struct(Self::member("LinkConfiguration")?, link_configuration)?;
+        }
+        if let Some(include_tags) = self.include_tags {
+            s.write_boolean(Self::member("IncludeTags")?, include_tags)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for UpdateLinkRequest {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> Result<Self, SerdeError> {
+        let mut identifier: Option<String> = None;
+        let mut resource_types: Option<Vec<String>> = None;
+        let mut link_configuration: Option<LinkConfiguration> = None;
+        let mut include_tags: Option<bool> = None;
+        // Driven by the generated schema, so the member a body key resolves to is
+        // decided by the model and not by this reader.
+        d.read_struct(UPDATE_LINK_INPUT_SCHEMA, &mut |member, d| {
+            match member.member_name() {
+                Some("Identifier") => identifier = Some(d.read_string(member)?),
+                Some("ResourceTypes") => {
+                    let mut read: Vec<String> = Vec::new();
+                    d.read_list(member, &mut |element| {
+                        read.push(element.read_string(member)?);
+                        Ok(())
+                    })?;
+                    resource_types = Some(read);
+                }
+                Some("LinkConfiguration") => {
+                    link_configuration = Some(
+                        <LinkConfiguration as ::aws_smithy_schema_server::DeserializableStruct>
+                            ::deserialize(d)?,
+                    );
+                }
+                Some("IncludeTags") => include_tags = Some(d.read_boolean(member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            // `Identifier` is `@required` and nothing about this operation's
+            // authorization decision can be taken without it, so an absent one is the
+            // framework's refusal, worded by `crate::service` as every other absent
+            // member of this service is.
+            identifier: identifier
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("Identifier"))?,
+            resource_types,
+            link_configuration,
+            include_tags,
+        })
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.oam#UpdateLinkOutput")]
