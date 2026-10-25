@@ -14,8 +14,9 @@
 //! where they sit on the time axis (pre-epoch, the epoch itself, a current instant) and
 //! whether the group named exists. The narrowest ACCEPTED interval — bounds a
 //! millisecond apart — is a row too, so the check is "strictly increasing" and not "at
-//! least a second apart", and the pair that differs only below the resolution an `f64`
-//! of epoch seconds can hold is the row that pins the comparison as exact.
+//! least a second apart"; the pairs that differ only below the resolution an `f64` of
+//! epoch seconds can hold, which pin the comparison as exact, are the sibling table in
+//! [`crate::interval_resolution`].
 //!
 //! The emulator and the HTTP plumbing are the shared [`crate::profiling_group_lifecycle`]
 //! harness, not a fork of it.
@@ -33,9 +34,11 @@ const GROUP: &str = "interval-group";
 const MISSING_GROUP: &str = "interval-never-created";
 
 /// One operation of this service that takes a `startTime`/`endTime` range, as the path
-/// it is bound to plus the other members a request to it must carry.
-struct Operation {
-    name: &'static str,
+/// it is bound to plus the other members a request to it must carry. `pub(crate)` so a
+/// sibling suite about the same rule drives the same operation list rather than forking
+/// it.
+pub(crate) struct Operation {
+    pub(crate) name: &'static str,
     /// The operation's path for one profiling group.
     path: fn(&str) -> String,
     /// Members beyond the two bounds that the operation requires (already `&`-prefixed).
@@ -45,7 +48,7 @@ struct Operation {
 /// Every operation whose request names BOTH bounds of a range. `BatchGetFrameMetricData`
 /// also models the pair, but is still a scaffolded 501, so it has no behaviour to assert
 /// here yet.
-fn operations() -> Vec<Operation> {
+pub(crate) fn operations() -> Vec<Operation> {
     vec![
         Operation {
             name: "ListProfileTimes",
@@ -158,7 +161,7 @@ fn bounds() -> Vec<Bounds> {
 /// `at` as the service renders an instant it names in a message: the ISO 8601
 /// `date-time` form, which is also the form the request carried it in — so the expected
 /// message below is derived from the row's own bounds and not written out by hand.
-fn canonical(at: &str) -> String {
+pub(crate) fn canonical(at: &str) -> String {
     DateTime::from_str(at, Format::DateTime)
         .unwrap_or_else(|error| panic!("unparseable instant {at:?}: {error}"))
         .fmt(Format::DateTime)
@@ -166,7 +169,8 @@ fn canonical(at: &str) -> String {
 }
 
 /// The refusal a non-interval must answer with, built from that request's own bounds.
-fn expected_refusal(start: &str, end: &str) -> String {
+/// `pub(crate)` so every suite about this rule asserts the one sentence.
+pub(crate) fn expected_refusal(start: &str, end: &str) -> String {
     format!(
         "Interval start time ({}) must be before end time ({})",
         canonical(start),
@@ -174,7 +178,7 @@ fn expected_refusal(start: &str, end: &str) -> String {
     )
 }
 
-async fn create_group(harness: &Harness, name: &str) {
+pub(crate) async fn create_group(harness: &Harness, name: &str) {
     let created = harness
         .send(
             "POST",
@@ -193,17 +197,28 @@ async fn create_group(harness: &Harness, name: &str) {
     );
 }
 
-async fn call(harness: &Harness, operation: &Operation, group: &str, row: &Bounds) -> Answer {
+/// Call one ranged operation for one group with the two bounds spelled exactly as the
+/// caller gives them. `pub(crate)` so a sibling suite reaches every ranged operation
+/// through this one sender.
+pub(crate) async fn call_bounds(
+    harness: &Harness,
+    operation: &Operation,
+    group: &str,
+    start: &str,
+    end: &str,
+) -> Answer {
     let uri = format!(
-        "{}?startTime={}&endTime={}{}",
+        "{}?startTime={start}&endTime={end}{}",
         (operation.path)(group),
-        row.start,
-        row.end,
         operation.extra
     );
     harness
         .send("GET", &uri, "application/json", Vec::new())
         .await
+}
+
+async fn call(harness: &Harness, operation: &Operation, group: &str, row: &Bounds) -> Answer {
+    call_bounds(harness, operation, group, row.start, row.end).await
 }
 
 #[tokio::test]

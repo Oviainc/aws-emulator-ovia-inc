@@ -239,13 +239,11 @@ fn iso8601(secs: f64) -> String {
 
 /// The refusal this operation answers a window that is not a window with, built from
 /// that request's own bounds: "Interval start time (<startTime>) must be before end time
-/// (<endTime>)".
+/// (<endTime>)". The sentence itself comes from the shared
+/// [`crate::interval_validation::expected_refusal`], so every suite about this service's
+/// interval rule asserts one wording.
 fn expected_window_refusal(start: f64, end: f64) -> String {
-    format!(
-        "Interval start time ({}) must be before end time ({})",
-        iso8601(start),
-        iso8601(end)
-    )
+    crate::interval_validation::expected_refusal(&iso8601(start), &iso8601(end))
 }
 
 /// The two analysis lists, which AWS OMITS from the body when the analysis has nothing to
