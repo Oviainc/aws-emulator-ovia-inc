@@ -197,18 +197,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // admits several entries — but its documentation is explicit that it carries
         // one objective ARN at a time and that passing several is not supported, which
         // is the constraint enforced here. An entry without an ARN names no objective
-        // to filter on.
+        // to filter on. Either way the filter is one this operation does not accept, so
+        // both are refused with the service's one fixed invalid-filter sentence — the
+        // same text ListObjectives answers its own filter with, because the sentence
+        // belongs to the class and not to the member at fault.
         let mut objective_filter: Option<String> = None;
         if let Some(filter) = input.common_control_filter.as_ref() {
             if let Some(objectives) = filter.objectives.as_ref() {
                 if objectives.len() > 1 {
                     return Err(ListCommonControlsErrorModeled::ValidationException(
                         ValidationException {
-                            message: Some(format!(
-                                "commonControlFilter.objectives accepts one objective ARN at \
-                                 a time; {} were supplied",
-                                objectives.len()
-                            )),
+                            message: Some(crate::service::INVALID_FILTER_MESSAGE.to_string()),
                         },
                     )
                     .into());
@@ -217,10 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let Some(arn) = entry.arn.as_ref() else {
                         return Err(ListCommonControlsErrorModeled::ValidationException(
                             ValidationException {
-                                message: Some(
-                                    "commonControlFilter.objectives[0].arn must be set"
-                                        .to_string(),
-                                ),
+                                message: Some(crate::service::INVALID_FILTER_MESSAGE.to_string()),
                             },
                         )
                         .into());
