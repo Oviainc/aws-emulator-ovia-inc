@@ -55,6 +55,8 @@ mod calculated_spend;
 mod client_error_envelopes;
 #[path = "all/create_resource_tag_keys.rs"]
 mod create_resource_tag_keys;
+#[path = "all/default_page_sizes.rs"]
+mod default_page_sizes;
 #[path = "all/notification_alert_delivery.rs"]
 mod notification_alert_delivery;
 #[path = "all/notification_deletion.rs"]

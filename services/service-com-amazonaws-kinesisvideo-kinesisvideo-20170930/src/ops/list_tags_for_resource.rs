@@ -140,7 +140,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for ListTagsForResource<Eng>
 {
     type Input = ListTagsForResourceInput;
-    type Output = ListTagsForResourceOutput;
+    type Output = Report<ListTagsForResourceOutput>;
     type Error = ListTagsForResourceError;
 
     const NAME: &'static str = "ListTagsForResource";
@@ -205,9 +205,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
 
-        Ok(ListTagsForResourceOutput {
+        Ok(Report::of(ListTagsForResourceOutput {
+            // This listing is never truncated, so there is no next page to resume from;
+            // the member still reaches the wire, as JSON `null` (see [`Report`]).
             next_token: None,
             tags: Some(tags),
-        })
+        }))
     }
 }

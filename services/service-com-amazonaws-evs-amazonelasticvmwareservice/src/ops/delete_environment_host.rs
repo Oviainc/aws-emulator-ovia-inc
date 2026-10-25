@@ -1,15 +1,43 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEnvironmentHost
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEnvironmentHost`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes one named ESX host from a stored Amazon EVS environment and reports the
+//! record it wrote together with a summary of the environment the host was deleted
+//! from, which [`crate::ops::list_environment_hosts`] reads back. An `environmentId`
+//! this service holds no live environment for in the request's Region, or a `hostName`
+//! that environment holds no host record for, is a `ResourceNotFoundException`, and
+//! nothing is written for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEnvironmentHost::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The host goes `DELETING` and the clock owes it `DELETED`: removing an ESX host from
+//! the environment is the same kind of work as adding it and not a record to erase. The
+//! record itself is KEPT once it settles, so a later read still reports the deletion
+//! ([`crate::state::MAX_HOSTS_PER_ENVIRONMENT`] bounds how many finished records an
+//! environment keeps), while a host that has reached `DELETED` no longer OCCUPIES its
+//! environment: it stops blocking the environment's own deletion
+//! ([`crate::state::StoredEnvironment::live_hosts`]), and its DNS hostname and its
+//! management address are free for the next host.
+//!
+//! An Amazon EVS host IS an EC2 bare metal instance — "An ESX host that runs on an
+//! Amazon EC2 bare metal instance" (`Host` doc) — so the delete also TERMINATES that
+//! instance in the account's own Amazon EC2 store
+//! ([`crate::state::ec2_resources::terminate_host_instance`]), the counterpart of the
+//! launch `CreateEnvironmentHost` performs: a deleted host must not leave an instance
+//! running that no environment holds.
+//!
+//! "Before deleting a host, you must unassign and decommission the host from within the
+//! SDDC Manager user interface": nothing here judges that, because SDDC Manager is not
+//! part of this emulator — no operation of this service reports whether a host is
+//! assigned to a VCF cluster (the same reason [`crate::state::StoredConnector::checks`]
+//! is always empty) — so there is no fact to refuse the request on.
+//!
+//! The operation is `@idempotent`
+//! (`smithy_query(query="operation",operation="DeleteEnvironmentHost")`): a host that is
+//! already going away is reported as it stands, so a repeated call neither restarts the
+//! removal nor moves `modifiedAt`, and the host's instance is not terminated a second
+//! time.
+//!
+//! Like every implemented operation of this service, the request is authorized before
+//! the environment it names is looked up ([`crate::state::authorization`]).
 //!
 //! ## Shape of an operation
 //!
@@ -95,11 +123,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `DeleteEnvironmentHostError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#DeleteEnvironmentHost")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#DeleteEnvironmentHost",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteEnvironmentHostErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -153,18 +187,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEnvironmentHost` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEnvironmentHostErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEnvironmentHost"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteEnvironmentHostErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+        // `clientToken` is read and ignored on purpose: "This parameter is not used in
+        // Amazon EVS currently. If you supply input for this parameter, it will have no
+        // effect." (`clientToken` doc). The operation is idempotent through the stored
+        // record instead — a host that is already going away is reported as it stands.
+        let _ = &input.client_token;
+        let region = crate::state::request_region(ctx.parts());
+        // Authorization first: AWS decides it at the IAM layer, before the resource the
+        // request names is evaluated, so the ARN is the one the REQUEST names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&crate::state::environment_arn(&region, &input.environment_id)),
+        ) {
+            return Err(denied);
+        }
+
+        let mut state = state.lock();
+        // Reporting only: this materialises the state changes the clock already owed,
+        // which were due whether or not anybody called, so the environment and its hosts
+        // are in the state that is due at this instant before the delete is evaluated.
+        state.materialise_due_transitions();
+
+        // Regional resource: an environment exists at the endpoint of the Region it was
+        // created in, so its hosts can only be deleted from that Region. An environment
+        // that has reached DELETED is gone as far as a delete is concerned: "The resource
+        // might not be specified correctly, or it may have a state of DELETED"
+        // (`ResourceNotFoundException` doc).
+        let environment = state
+            .environment_in_region_mut(&region, &input.environment_id)
+            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .ok_or_else(|| {
+                DeleteEnvironmentHostErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+
+        // A host record this environment never held is the missing resource, whatever
+        // state the records it does hold are in: a record that has already reached
+        // DELETED is what the idempotent repeat below reports.
+        let host = environment.hosts.get_mut(&input.host_name).ok_or_else(|| {
+            DeleteEnvironmentHostErrorModeled::ResourceNotFoundException(
+                crate::state::host_not_found(&input.host_name),
+            )
+        })?;
+
+        // `@idempotent`: a host that is already DELETING or DELETED is reported as it
+        // stands, so a repeated call neither restarts the removal nor moves `modifiedAt`.
+        let already_going_away =
+            host.state == crate::state::HOST_DELETING || host.state == crate::state::HOST_DELETED;
+
+        // Removing the ESX host from the environment has started but is not finished: the
+        // host is DELETING and the clock owes it DELETED. The EC2 instance the host IS is
+        // terminated by the call that starts the removal, so a repeat terminates nothing
+        // a second time.
+        let mut due_at = None;
+        let mut terminated_instance = None;
+        if !already_going_away {
+            let pending = crate::state::PendingStatus::starting_now(crate::state::HOST_DELETED);
+            due_at = Some(pending.due_at);
+            host.state = crate::state::HOST_DELETING.to_string();
+            host.modified_at_ms = crate::state::now_ms();
+            host.pending = Some(pending);
+            terminated_instance = host.ec2.as_ref().map(|ec2| ec2.instance_id.clone());
+        }
+        let deleted = host.to_wire();
+        if let Some(due_at) = due_at {
+            // The records this environment is finished with are kept so a later read
+            // still reports the deletion, up to the cap this bounds them by.
+            environment.purge_finished_hosts();
+            state.note_transition_due(due_at);
+        }
+        // The environment's health checks read its hosts — the host count, and the cores
+        // a license has to cover — so they are recomputed before the summary is built.
+        state.recompute_environment_checks();
+        // The host was deleted FROM this environment, and the summary reports the
+        // environment as it stands: deleting a child resource of it is no modification of
+        // the environment itself, so its own `modifiedAt` does not move.
+        let environment_summary = state
+            .environment_in_region(&region, &input.environment_id)
+            .map(|environment| environment.to_summary())
+            .ok_or_else(|| {
+                DeleteEnvironmentHostErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+        // "An ESX host that runs on an Amazon EC2 bare metal instance" (`Host` doc): the
+        // instance IS the host, so the host's deletion ends it in the account's own
+        // Amazon EC2 store rather than leaving an instance of a host no environment holds
+        // running. The EC2 store is written while this service's lock is held, the same
+        // order `CreateEnvironmentHost` takes the two locks in.
+        if let Some(instance_id) = terminated_instance {
+            crate::state::ec2_resources::terminate_host_instance(&*self.engine, &instance_id);
+        }
+
+        Ok(DeleteEnvironmentHostOutput {
+            environment_summary: Some(environment_summary),
+            host: Some(deleted),
+        })
     }
 }

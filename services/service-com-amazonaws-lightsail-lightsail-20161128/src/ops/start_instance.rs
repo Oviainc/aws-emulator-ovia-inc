@@ -271,9 +271,7 @@ fn assign_addresses_for_start(
     // address at all.
     let attached_static_ip = if crate::state::ip_address_type_has_ipv4(ip_address_type) {
         store
-            .static_ips
-            .values()
-            .find(|static_ip| static_ip.attached_to.as_deref() == Some(name))
+            .attached_static_ip(name)
             .map(|static_ip| static_ip.ip_address.clone())
     } else {
         None

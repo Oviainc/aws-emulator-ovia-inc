@@ -105,6 +105,8 @@ mod route_validation;
 mod service_claim;
 #[path = "all/stage_lifecycle.rs"]
 mod stage_lifecycle;
+#[path = "all/stage_pagination.rs"]
+mod stage_pagination;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/vpc_link_lifecycle.rs"]

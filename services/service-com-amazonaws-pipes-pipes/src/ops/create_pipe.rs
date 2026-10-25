@@ -3,7 +3,10 @@
 //! @op CreatePipe
 //! IMPLEMENTED: persists the whole pipe record in [`crate::state`], mints its ARN, and
 //! answers from the record it just stored. A name that already exists is refused with
-//! `ConflictException` (409). This is the ONLY file to touch for this operation.
+//! `ConflictException` (409); a `Tags` entry breaking a published tag rule is refused with
+//! the `BadRequestException` (400) the tagging layer answers a broken tag rule with, so a
+//! pipe cannot be created carrying a tag `TagResource` would refuse. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -214,20 +217,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The tag rules a write that installs tags enforces for itself: `TagKey`'s and
         // `TagValue`'s `@length` bounds (the boundary validator walks a map's entry count
-        // and its values' shapes but not its KEYS) and the tag-key prefix AWS reserves.
-        // The same `state::tag_violation` `TagResource` applies, so a pipe cannot be
-        // CREATED carrying a key a later `TagResource` would refuse. Sorted, so a request
-        // carrying several illegal tags is always refused with the same message.
-        for (key, value) in input
+        // and its values' shapes but not its KEYS), the documented tag character set and
+        // the tag-key prefix AWS reserves. The same `state::tag_violation` `TagResource`
+        // applies, so a pipe cannot be CREATED carrying a tag a later `TagResource` would
+        // refuse, and it is refused with the same `BadRequestException` the tagging layer
+        // answers a broken tag rule with. Sorted, so a request carrying several illegal
+        // tags is always refused with the same message.
+        let requested: ::std::collections::BTreeMap<&String, &String> = input
             .tags
             .iter()
-            .flat_map(|tags| tags.iter().collect::<::std::collections::BTreeMap<_, _>>())
-        {
+            .flat_map(|tags| tags.iter())
+            .collect();
+        for (&key, &value) in &requested {
             if let Some(violation) = crate::state::tag_violation(key, value) {
-                return Err(CreatePipeErrorModeled::ValidationException(
-                    crate::state::tag_violation_error("Tags", violation),
-                )
-                .into());
+                // What request validation echoes is the member's value: every tag the
+                // request carried, in that one deterministic order.
+                let shown = crate::state::echoed_tags(
+                    requested
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str())),
+                );
+                return Err(CreatePipeError::bad_request(crate::state::tag_refusal(
+                    crate::state::CREATE_TAGS_MEMBER,
+                    violation,
+                    key,
+                    &shown,
+                )));
             }
         }
 

@@ -123,6 +123,8 @@ mod organization_configuration;
 mod organization_managed_members;
 #[path = "all/organization_statistics.rs"]
 mod organization_statistics;
+#[path = "all/publishing_destination_delete.rs"]
+mod publishing_destination_delete;
 #[path = "all/publishing_destination_lifecycle.rs"]
 mod publishing_destination_lifecycle;
 #[path = "all/publishing_destination_listing.rs"]

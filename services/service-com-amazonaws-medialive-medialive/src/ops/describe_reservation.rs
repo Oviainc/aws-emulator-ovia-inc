@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +168,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReservation"))
+        // `ctx` carries request metadata only: a reservation is reported for the
+        // region it was purchased in, which is on the record, not for the region
+        // this read was signed for.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises the transitions the clock had
+        // already made due, which were owed at this instant whether or not
+        // anybody read. The reservation's own lifecycle needs no write at all —
+        // its `State` is derived from its `End` and this instant.
+        state.settle(now);
+
+        let reservation = state
+            .reservation_description(&input.reservation_id, now)
+            .ok_or_else(|| {
+                not_found(crate::state::not_found_message(
+                    "Reservation",
+                    &input.reservation_id,
+                ))
+            })?;
+
+        // The described reservation IS the purchased one: every member is moved
+        // across from the store's single projection rather than derived a second
+        // time here, so the two readers cannot drift.
+        Ok(DescribeReservationOutput {
+            arn: reservation.arn,
+            count: reservation.count,
+            currency_code: reservation.currency_code,
+            duration: reservation.duration,
+            duration_units: reservation.duration_units,
+            end: reservation.end,
+            fixed_price: reservation.fixed_price,
+            name: reservation.name,
+            offering_description: reservation.offering_description,
+            offering_id: reservation.offering_id,
+            offering_type: reservation.offering_type,
+            region: reservation.region,
+            renewal_settings: reservation.renewal_settings,
+            reservation_id: reservation.reservation_id,
+            resource_specification: reservation.resource_specification,
+            start: reservation.start,
+            state: reservation.state,
+            tags: reservation.tags,
+            usage_price: reservation.usage_price,
+        })
     }
+}
+
+/// A `ReservationId` naming no reservation this account holds, as the 404
+/// `NotFoundException` this operation models.
+fn not_found(message: String) -> DescribeReservationError {
+    DescribeReservationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to read the reservation from. A modelled server error,
+/// never a fresh engine (which would answer from an empty store nobody ever
+/// wrote to).
+fn unavailable() -> DescribeReservationError {
+    DescribeReservationErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMediaStorageConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMediaStorageConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMediaStorageConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates the stored signaling channel a `ChannelARN` names with the stream its
+//! media is stored in, or drops that association when the configuration is disabled.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +155,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMediaStorageConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMediaStorageConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMediaStorageConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateMediaStorageConfigurationErrorModeled::ClientLimitExceededException(
+                    ClientLimitExceededException {
+                        message: Some(
+                            "The signaling channel store is unavailable. Try again later."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        // The channel is the resource this call addresses, so its absence is the 404.
+        let channel = store
+            .resolve_channel(None, Some(input.channel_arn.as_str()))
+            .map_err(|_| {
+                UpdateMediaStorageConfigurationError::from(
+                    UpdateMediaStorageConfigurationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::CHANNEL_NOT_FOUND_MESSAGE.to_string()),
+                        },
+                    ),
+                )
+            })?;
+        let channel_name = channel.channel_name.clone();
+        let channel_arn = channel.channel_arn.clone();
+        let channel_status = channel.status.clone();
+
+        let enabling = input.media_storage_configuration.status
+            == crate::state::MEDIA_STORAGE_ENABLED;
+
+        // "If StorageStatus is enabled, the data will be stored in the StreamARN
+        // provided. […] If StorageStatus is disabled, no data will be stored, and the
+        // StreamARN parameter will not be needed" — so the stream is resolved, and the
+        // mapping is recorded, only for the enabling form.
+        let mapped_stream_arn = if enabling {
+            let Some(stream_arn) = input.media_storage_configuration.stream_arn.clone() else {
+                return Err(
+                    UpdateMediaStorageConfigurationErrorModeled::InvalidArgumentException(
+                        InvalidArgumentException {
+                            message: Some(
+                                "StreamARN must be specified when the media storage \
+                                 configuration is ENABLED."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let stream = store
+                .resolve(None, Some(stream_arn.as_str()))
+                .map_err(|_| {
+                    UpdateMediaStorageConfigurationError::from(
+                        UpdateMediaStorageConfigurationErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(crate::state::STREAM_NOT_FOUND_MESSAGE.to_string()),
+                            },
+                        ),
+                    )
+                })?;
+
+            // "In order for WebRTC Ingestion to work, the stream must have data
+            // retention enabled" — a stream that persists nothing cannot store a
+            // channel's media, which is the case `NoDataRetentionException` is modeled
+            // for.
+            if stream.data_retention_in_hours <= 0 {
+                return Err(
+                    UpdateMediaStorageConfigurationErrorModeled::NoDataRetentionException(
+                        NoDataRetentionException {
+                            message: Some(
+                                "The Stream data retention in hours is equal to zero.".to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // Either resource must be ACTIVE, and the stream must not already hold
+            // another channel's media: both are the cases `ResourceInUseException` is
+            // modeled for ("already mapped to a different Kinesis Video Stream
+            // resource, or if the provided input StreamARN or ChannelARN is not in
+            // Active status").
+            if stream.status != crate::state::STATUS_ACTIVE
+                || channel_status != crate::state::STATUS_ACTIVE
+            {
+                return Err(
+                    UpdateMediaStorageConfigurationErrorModeled::ResourceInUseException(
+                        ResourceInUseException {
+                            message: Some(format!(
+                                "The channel {channel_name} and the stream {} must both be \
+                                 {} before their media storage configuration can be updated.",
+                                stream.stream_name,
+                                crate::state::STATUS_ACTIVE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            if let Some(other) = store
+                .mapped_resources(&stream_arn)
+                .into_iter()
+                .filter_map(|item| item.arn)
+                .find(|arn| arn != &channel_arn)
+            {
+                return Err(
+                    UpdateMediaStorageConfigurationErrorModeled::ResourceInUseException(
+                        ResourceInUseException {
+                            message: Some(format!(
+                                "The stream {stream_arn} is already mapped to {other}."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            Some(stream_arn)
+        } else {
+            None
+        };
+
+        let Some(channel) = store.signaling_channels.get_mut(&channel_name) else {
+            return Err(
+                UpdateMediaStorageConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::CHANNEL_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        channel.media_storage_status = input.media_storage_configuration.status;
+        channel.media_storage_stream_arn = mapped_stream_arn;
+
+        Ok(UpdateMediaStorageConfigurationOutput {})
     }
 }

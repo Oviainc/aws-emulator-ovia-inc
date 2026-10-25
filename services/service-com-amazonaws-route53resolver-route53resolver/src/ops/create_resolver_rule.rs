@@ -231,12 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             && (!target_ips.is_empty() || input.resolver_endpoint_id.is_some())
         {
             return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(crate::state::rslvr_message(
-                        crate::state::RSLVR_CODE_SYSTEM_RULE_FORWARDING_TARGET,
-                        "Cannot specify resolver endpoint ID and target IP for SYSTEM type resolver rule",
-                    )),
-                },
+                crate::state::system_rule_forbids_forwarding_target(),
             )
             .into());
         }
@@ -256,17 +251,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A FORWARD rule is what forwards queries "to the IP addresses that are
-        // specified in TargetIps", so it cannot do without them; and no other
-        // rule type may carry them.
+        // A FORWARD rule is what forwards queries through a Resolver endpoint
+        // "to the IP addresses that are specified in TargetIps", so it needs the
+        // endpoint and the target addresses TOGETHER: either one alone describes
+        // no forwarding path. That makes it ONE precondition, reported with one
+        // RSLVR-coded refusal whichever of the two members is missing — the
+        // mirror image of the SYSTEM refusal above. No other rule type may carry
+        // target addresses.
         if rule_type == RULE_TYPE_FORWARD {
-            if target_ips.is_empty() {
+            if target_ips.is_empty() || input.resolver_endpoint_id.is_none() {
                 return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(format!(
-                            "A rule with RuleType {RULE_TYPE_FORWARD} must specify TargetIps"
-                        )),
-                    },
+                    crate::state::forward_rule_requires_forwarding_target(),
                 )
                 .into());
             }
@@ -359,19 +354,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ResolverEndpointId`: "The ID of the outbound Resolver endpoint that
         // you want to use to route DNS queries to the IP addresses that you
-        // specify in TargetIps" — a FORWARD rule routes through one, so it names
-        // one, and whatever names an endpoint must name a stored OUTBOUND one.
-        if rule_type == RULE_TYPE_FORWARD && input.resolver_endpoint_id.is_none() {
-            return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(format!(
-                        "A rule with RuleType {RULE_TYPE_FORWARD} must specify ResolverEndpointId"
-                    )),
-                },
-            )
-            .into());
-        }
-
+        // specify in TargetIps" — whatever names an endpoint must name a stored
+        // OUTBOUND one. That a FORWARD rule names one at all is the forwarding
+        // precondition refused above.
         let mut store = state.lock();
 
         if let Some(endpoint_id) = input.resolver_endpoint_id.as_deref() {

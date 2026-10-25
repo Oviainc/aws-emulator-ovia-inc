@@ -63,6 +63,8 @@ mod list_users_in_group;
 mod resend_confirmation_code;
 #[path = "all/resource_server_lifecycle.rs"]
 mod resource_server_lifecycle;
+#[path = "all/risk_configuration.rs"]
+mod risk_configuration;
 #[path = "all/self_service_sign_up.rs"]
 mod self_service_sign_up;
 #[path = "all/set_user_settings.rs"]

@@ -1172,6 +1172,15 @@ use crate::ops::types::Ipv6Range;
 pub mod traffic_mirror_filters;
 pub use traffic_mirror_filters::*;
 
+/// What `CreatePublicIpv4Pool` adds to the public IPv4 pool store below: the network border
+/// group a created pool is advertised from, and the refusal for a create the store has no
+/// room for. The pool record, its insert and its projection live in the "Public IPv4 address
+/// pools" section of this module, beside the BYOIP provision that also creates one.
+/// Re-exported, so a handler reaches them as `crate::state::<item>` like every other
+/// primitive here.
+pub mod public_ipv4_pools;
+pub use public_ipv4_pools::*;
+
 /// The `Reservation` shape, under the name the scaffold generated for it.
 ///
 /// `com.amazonaws.ec2#Reservation` is both `RunInstances`'s output shape and the
@@ -3441,10 +3450,15 @@ impl ComAmazonawsEc2Amazonec2State {
     /// out of, so the caller reads them off that association rather than this writer
     /// guessing them.
     ///
-    /// The caller-chosen bytes the block string retains are charged against the store's
-    /// byte budget HERE, which is what [`subnet_payload_bytes`] gives back on delete; a
-    /// writer still asks [`Self::would_exceed_stored_bytes`] first so it can refuse
-    /// instead of overshooting.
+    /// The bytes the association retains are charged against the store's byte budget HERE,
+    /// by the one definition of that charge ([`subnet_ipv6_association_payload_bytes`]),
+    /// which is what [`subnet_payload_bytes`] gives back on delete.
+    ///
+    /// `None`, with NOTHING written, for a subnet the store does not hold, for a subnet
+    /// already at [`MAX_IPV6_ASSOCIATIONS_PER_SUBNET`] association records, and when the
+    /// bytes the association would hold would cross [`MAX_STORED_BYTES`]. All three are
+    /// asked HERE, before the first write, the way [`Self::insert_coip_pool`] enforces its
+    /// own ceiling — so a caller that forgets to ask cannot grow the store without bound.
     pub fn associate_subnet_ipv6_cidr_block(
         &mut self,
         subnet_id: &str,
@@ -3455,8 +3469,13 @@ impl ComAmazonawsEc2Amazonec2State {
         if !self.subnets.contains_key(subnet_id) {
             return None;
         }
+        let charged_bytes = subnet_ipv6_association_payload_bytes(&ipv6_cidr_block);
+        if !self.has_subnet_ipv6_association_capacity(subnet_id)
+            || self.would_exceed_stored_bytes(charged_bytes)
+        {
+            return None;
+        }
         let association_id = self.next_id("subnet-cidr-assoc");
-        let charged_bytes = ipv6_cidr_block.len();
         let association = SubnetIpv6CidrBlockAssociation {
             association_id: Some(association_id),
             ipv6_cidr_block: Some(ipv6_cidr_block),
@@ -3476,6 +3495,22 @@ impl ComAmazonawsEc2Amazonec2State {
         self.subnet_ipv6_associated_at
             .insert(subnet_id.to_string(), Instant::now() + TRANSITION_DELAY);
         Some(association)
+    }
+
+    /// Whether another IPv6 CIDR block association fits inside the ceiling this store keeps
+    /// for ONE subnet ([`MAX_IPV6_ASSOCIATIONS_PER_SUBNET`]).
+    ///
+    /// The same contract as [`Self::has_subnet_capacity`]: a writer asks first so it can
+    /// refuse instead of overshooting. A subnet the store does not hold has no room for an
+    /// association either.
+    pub fn has_subnet_ipv6_association_capacity(&self, subnet_id: &str) -> bool {
+        self.subnets.get(subnet_id).is_some_and(|subnet| {
+            subnet
+                .ipv6_cidr_block_association_set
+                .as_deref()
+                .map_or(0, <[SubnetIpv6CidrBlockAssociation]>::len)
+                < MAX_IPV6_ASSOCIATIONS_PER_SUBNET
+        })
     }
 
     /// Whether another subnet CIDR reservation fits inside the store's ceiling
@@ -12371,6 +12406,20 @@ pub const MAX_SUBNETS: usize = 4_096;
 /// codes).
 pub const SUBNET_LIMIT_EXCEEDED: &str = "SubnetLimitExceeded";
 
+/// The largest number of IPv6 CIDR block association records this store keeps for ONE
+/// subnet.
+///
+/// A capacity bound in the style of [`MAX_SUBNETS`], not an AWS quota. "You can only
+/// associate a single IPv6 CIDR block with your subnet" (`AssociateSubnetCidrBlock`), so a
+/// subnet HOLDS one block at a time and this ceiling is never the rule a well-formed
+/// request meets; it bounds the association RECORDS one subnet's set can grow to — a block
+/// it still holds, plus any a later disassociation leaves behind to be reported — so a
+/// caller looping over the associate cannot grow one subnet's record without bound even if
+/// a writer forgets to ask.
+/// [`ComAmazonawsEc2Amazonec2State::has_subnet_ipv6_association_capacity`] is the predicate
+/// a writer asks before associating.
+pub const MAX_IPV6_ASSOCIATIONS_PER_SUBNET: usize = 4;
+
 /// The largest number of DHCP option sets this in-memory store holds.
 ///
 /// A capacity bound in the style of [`MAX_VPCS`], not an AWS quota: this store mints one
@@ -14907,9 +14956,23 @@ pub fn vpc_payload_bytes(vpc: &Vpc) -> usize {
     tag_list_bytes(vpc.tags.as_deref().unwrap_or_default()).saturating_add(ipv6_bytes)
 }
 
+/// What ONE of a subnet's IPv6 CIDR block associations costs the store's byte budget: the
+/// fixed [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, plus the block string
+/// the caller chose.
+///
+/// The ONE definition of that charge, so the writer that takes it
+/// ([`ComAmazonawsEc2Amazonec2State::associate_subnet_ipv6_cidr_block`]) and
+/// [`subnet_payload_bytes`], which gives it back, cannot disagree — and so a loop of
+/// associate calls carrying a short block cannot be nearly free against
+/// [`MAX_STORED_BYTES`] while each stored association, its minted id and its state retain
+/// far more.
+pub fn subnet_ipv6_association_payload_bytes(ipv6_cidr_block: &str) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES.saturating_add(ipv6_cidr_block.len())
+}
+
 /// The caller-chosen bytes a stored subnet retains: its tags, which is what
-/// [`ComAmazonawsEc2Amazonec2State::insert_subnet`] charged, plus the IPv6 block an
-/// association holds, which is what
+/// [`ComAmazonawsEc2Amazonec2State::insert_subnet`] charged, plus what each IPv6
+/// association costs ([`subnet_ipv6_association_payload_bytes`]), which is what
 /// [`ComAmazonawsEc2Amazonec2State::associate_subnet_ipv6_cidr_block`] charged — so
 /// [`ComAmazonawsEc2Amazonec2State::remove_subnet`] gives back exactly what was taken,
 /// the same arrangement [`vpc_payload_bytes`] has for a VPC.
@@ -14918,7 +14981,11 @@ pub fn subnet_payload_bytes(subnet: &Subnet) -> usize {
         .ipv6_cidr_block_association_set
         .iter()
         .flatten()
-        .map(|association| association.ipv6_cidr_block.as_deref().map_or(0, str::len))
+        .map(|association| {
+            subnet_ipv6_association_payload_bytes(
+                association.ipv6_cidr_block.as_deref().unwrap_or_default(),
+            )
+        })
         .sum();
     tag_list_bytes(subnet.tags.as_deref().unwrap_or_default()).saturating_add(ipv6_bytes)
 }

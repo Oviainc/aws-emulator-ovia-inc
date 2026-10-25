@@ -316,9 +316,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // The caller-chosen bytes the association retains, against the crate's one byte
-        // budget: a request-sized string is stored, so it is charged for like any other.
-        let payload_bytes = ipv6_cidr_block.len();
+        // How many association records this store keeps for one subnet is a ceiling of the
+        // store's own, asked before the write the way every other capacity predicate is.
+        // A subnet that still holds a block is already refused above, so this answers only
+        // for a subnet whose set has grown past what the store keeps.
+        if !store.has_subnet_ipv6_association_capacity(&input.subnet_id) {
+            return Err(state::cidr_limit_exceeded(format!(
+                "The subnet '{subnet_id}' holds as many IPv6 CIDR block associations as \
+                 this emulator keeps for one subnet ({max})",
+                subnet_id = input.subnet_id,
+                max = state::MAX_IPV6_ASSOCIATIONS_PER_SUBNET,
+            )));
+        }
+
+        // The bytes the association retains, against the crate's one byte budget, counted
+        // by the ONE definition of that charge (`state::subnet_ipv6_association_payload_bytes`,
+        // which the writer below takes) so this gate and the charge cannot disagree.
+        let payload_bytes = state::subnet_ipv6_association_payload_bytes(&ipv6_cidr_block);
         if store.would_exceed_stored_bytes(payload_bytes) {
             return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
                 "This emulator holds {held} of at most {max} bytes of caller-supplied \
@@ -329,7 +343,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The one writer of a subnet's association set, so this operation and
-        // `DescribeSubnets` cannot report the association differently.
+        // `DescribeSubnets` cannot report the association differently. It asks both
+        // ceilings again itself, which the two gates above have already answered — so a
+        // `None` here is the store losing the subnet between two reads of the same lock.
         let Some(association) = store.associate_subnet_ipv6_cidr_block(
             &input.subnet_id,
             ipv6_cidr_block,

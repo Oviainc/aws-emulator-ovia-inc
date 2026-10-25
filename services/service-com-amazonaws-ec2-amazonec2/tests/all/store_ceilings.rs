@@ -24,8 +24,9 @@ use std::time::{Duration, SystemTime};
 use ec2::ops::types::{Host, IpamPool, ServiceConfiguration, VpcEndpoint};
 use ec2::state::{
     BYOIP_CIDR_STATE_PROVISIONED, ByoipCidrRecord, ComAmazonawsEc2Amazonec2State as Ec2State,
-    MAX_STORED_DEDICATED_HOSTS, MAX_STORED_RECORDS_PER_STORE, SECONDARY_NETWORK_TYPE_RDMA,
-    SECONDARY_SUBNET_STATE_CREATE_COMPLETE, STORED_RECORD_OVERHEAD_BYTES, SecondarySubnetSpec,
+    MAX_IPV6_ASSOCIATIONS_PER_SUBNET, MAX_STORED_DEDICATED_HOSTS, MAX_STORED_RECORDS_PER_STORE,
+    SECONDARY_NETWORK_TYPE_RDMA, SECONDARY_SUBNET_STATE_CREATE_COMPLETE,
+    STORED_RECORD_OVERHEAD_BYTES, SUBNET_STATE_AVAILABLE, SecondarySubnetSpec, SubnetSpec,
     volume_recycle_bin_entry_payload_bytes,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
@@ -173,6 +174,117 @@ fn a_write_past_the_ceiling_stores_nothing() {
             budget,
             "case {case:?}: a refused write charges nothing, so the budget must still read \
              {budget}"
+        );
+    }
+}
+
+/// A record a writer APPENDS to a parent, rather than minting a store of its own, is held to
+/// the same two bounds by that writer: a subnet's IPv6 CIDR block associations.
+///
+/// Rows along what the bounds generalise over — how long the block string a caller chose is,
+/// and how many times it asks: every admitted association costs the fixed record overhead
+/// PLUS the block, one subnet takes no more than
+/// [`MAX_IPV6_ASSOCIATIONS_PER_SUBNET`] of them however often the writer is called, a refused
+/// one charges nothing, and removing the subnet gives back exactly what the associations
+/// charged.
+#[test]
+fn a_subnet_takes_bounded_charged_ipv6_associations_and_gives_them_back() {
+    // The blocks differ in length, so the charge is read off the block rather than assumed
+    // to be a constant, and in count, so the ceiling is met from more than one direction.
+    let rows: [(&str, &str); 3] = [
+        ("a /64 block", "2600:1f14:1234:5600::/64"),
+        ("a shorter block", "2001:db8::/32"),
+        (
+            "a block spelled out in full",
+            "2600:1f14:0000:0000:0000:0000:0000:0000/56",
+        ),
+    ];
+
+    for (case, block) in rows {
+        let (_router, engine) = super::ec2_query::emulator();
+        let state = engine.state::<Ec2State>();
+        let mut guard = state.lock();
+
+        let subnet_id = guard.insert_subnet(SubnetSpec {
+            vpc_id: "vpc-0store0ceilings".to_string(),
+            cidr_block: "10.0.0.0/24".to_string(),
+            availability_zone: format!("{REGION}a"),
+            availability_zone_id: "usw2-az1".to_string(),
+            region: REGION.to_string(),
+            state: SUBNET_STATE_AVAILABLE.to_string(),
+            default_for_az: false,
+            map_public_ip_on_launch: false,
+            tags: Vec::new(),
+        });
+        // Taken AFTER the subnet, so what the assertions below read is the associations'
+        // charge alone — the subnet itself carries nothing the caller chose.
+        let baseline = guard.stored_bytes();
+
+        // The charge this test expects, spelled out rather than read from the production
+        // helper: the fixed overhead every stored record costs, plus the block the caller
+        // chose.
+        let expected_charge = STORED_RECORD_OVERHEAD_BYTES + block.len();
+
+        for attempt in 0..MAX_IPV6_ASSOCIATIONS_PER_SUBNET + 2 {
+            let before = guard.stored_bytes();
+            let association = guard.associate_subnet_ipv6_cidr_block(
+                &subnet_id,
+                block.to_string(),
+                None,
+                None,
+            );
+            let charged = guard.stored_bytes().saturating_sub(before);
+            if attempt < MAX_IPV6_ASSOCIATIONS_PER_SUBNET {
+                assert!(
+                    association.is_some(),
+                    "case {case:?}: association {attempt} of \
+                     {MAX_IPV6_ASSOCIATIONS_PER_SUBNET} must be admitted, got \
+                     {association:?}"
+                );
+                assert_eq!(
+                    charged, expected_charge,
+                    "case {case:?}: association {attempt} must cost the record overhead plus \
+                     the block, got {charged}"
+                );
+            } else {
+                assert!(
+                    association.is_none(),
+                    "case {case:?}: attempt {attempt} is past \
+                     {MAX_IPV6_ASSOCIATIONS_PER_SUBNET} associations, so the writer must \
+                     refuse it, got {association:?}"
+                );
+                assert_eq!(
+                    charged, 0,
+                    "case {case:?}: a refused association charges nothing, got {charged}"
+                );
+            }
+        }
+
+        let held = guard
+            .subnets
+            .get(&subnet_id)
+            .and_then(|subnet| subnet.ipv6_cidr_block_association_set.as_ref())
+            .map_or(0, Vec::len);
+        assert_eq!(
+            held, MAX_IPV6_ASSOCIATIONS_PER_SUBNET,
+            "case {case:?}: the subnet must hold exactly the associations the writer \
+             admitted, got {held}"
+        );
+        assert_eq!(
+            guard.stored_bytes(),
+            baseline + MAX_IPV6_ASSOCIATIONS_PER_SUBNET * expected_charge,
+            "case {case:?}: every admitted association must be charged once"
+        );
+
+        assert!(
+            guard.remove_subnet(&subnet_id).is_some(),
+            "case {case:?}: the subnet {subnet_id:?} was just inserted, so it can be removed"
+        );
+        assert_eq!(
+            guard.stored_bytes(),
+            baseline,
+            "case {case:?}: removing the subnet must give back exactly what its associations \
+             charged"
         );
     }
 }

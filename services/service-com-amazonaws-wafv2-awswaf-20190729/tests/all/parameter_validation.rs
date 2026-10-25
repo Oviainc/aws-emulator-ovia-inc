@@ -45,7 +45,9 @@ const ENTITY_ID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// The `message` member of an awsJson error body, whichever casing the shape
 /// models it with.
-fn error_message(body: &Value) -> String {
+///
+/// Shared with the sibling suites rather than copied into each one.
+pub(crate) fn error_message(body: &Value) -> String {
     body.get("Message")
         .or_else(|| body.get("message"))
         .and_then(Value::as_str)
@@ -54,7 +56,11 @@ fn error_message(body: &Value) -> String {
 }
 
 /// The awsJson error code of a refusal, from the body's `__type`.
-fn error_code(body: &Value) -> String {
+///
+/// Shared with the sibling suites rather than copied into each one. Compared
+/// exactly as the body carries it, so a code stays pinned to the shape name this
+/// service answers with.
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"].as_str().unwrap_or_default().to_string()
 }
 

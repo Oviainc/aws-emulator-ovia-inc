@@ -1099,12 +1099,14 @@ async fn the_tag_reader_reports_the_tags_the_resource_carries() {
             reported, expected,
             "case {case:?}: expected Tags {expected:?}, got {reported:?}"
         );
-        // `Tags` is the WHOLE body: every tag of a resource fits in one page, so no
-        // `NextToken` is minted and none appears on the wire.
+        // `Tags` and `NextToken` are the whole body: every tag of a resource fits in
+        // one page, so no resume token is minted — and the member still reaches the
+        // wire as JSON `null`, the form AWS answers this service's listings with, so a
+        // client dereferencing it gets `null` rather than `undefined`.
         assert_eq!(
             answer.body,
-            serde_json::json!({ "Tags": expected }),
-            "case {case:?}: the whole response body must be the tag map, got {:?}",
+            serde_json::json!({ "NextToken": null, "Tags": expected }),
+            "case {case:?}: the whole response body must be the tag map and a null NextToken, got {:?}",
             answer.body
         );
     }

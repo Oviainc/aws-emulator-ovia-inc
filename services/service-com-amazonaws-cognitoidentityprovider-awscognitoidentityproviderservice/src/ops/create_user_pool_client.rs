@@ -399,6 +399,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or(false),
             auth_session_validity: input.auth_session_validity,
             refresh_token_rotation: input.refresh_token_rotation,
+            // A new app client holds no threat-protection settings of its own, so
+            // it uses the pool's until `SetRiskConfiguration` gives it some.
+            risk_configuration: None,
         };
         pool.clients.insert(client_id.clone(), client);
 

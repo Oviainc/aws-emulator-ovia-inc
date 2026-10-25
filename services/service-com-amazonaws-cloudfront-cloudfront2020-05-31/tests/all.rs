@@ -59,6 +59,8 @@ mod distributions_by_origin_request_policy_id;
 mod distributions_by_realtime_log_config;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/field_level_encryption_profile_lifecycle.rs"]
+mod field_level_encryption_profile_lifecycle;
 #[path = "all/function_lifecycle.rs"]
 mod function_lifecycle;
 #[path = "all/function_list.rs"]

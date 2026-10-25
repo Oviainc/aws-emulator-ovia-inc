@@ -961,8 +961,9 @@ async fn an_action_the_experiment_options_skip_earns_no_privilege_failure() {
     let router = emulator();
 
     // One role, created through the real `CreateRole`, carrying NO identity policy: the
-    // account's own records therefore show it may not perform `cloudwatch:DescribeAlarms`,
-    // which is the permission `aws:cloudwatch:assert-alarm-state` needs.
+    // account's own records therefore show it may perform neither
+    // `cloudwatch:DescribeAlarms`, which `aws:cloudwatch:assert-alarm-state` needs, nor
+    // `ec2:StopInstances`, which `aws:ec2:stop-instances` needs.
     let (status, created) = iam(
         &router,
         "CreateRole",
@@ -984,8 +985,12 @@ async fn an_action_the_experiment_options_skip_earns_no_privilege_failure() {
     });
     // Two templates: one plain, and one whose action names a target identified by TAG —
     // which this emulator resolves to nothing — under the mode that skips such an action.
-    let mut tagged_action = action.clone();
-    tagged_action["targets"] = json!({ "Alarms": "tagged" });
+    // The alarm assert takes no target, so the tagged one is an action that does: stopping
+    // instances, whose `ec2:StopInstances` this role is no more allowed to perform.
+    let tagged_action = json!({
+        "actionId": "aws:ec2:stop-instances",
+        "targets": { "Instances": "tagged" }
+    });
     let templates = [
         (
             "plain",
