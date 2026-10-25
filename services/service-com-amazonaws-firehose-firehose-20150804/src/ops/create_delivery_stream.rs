@@ -246,7 +246,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You must specify only one of the following destination configuration
         // parameters" — the create carries exactly one destination.
-        let destination = sole_destination(&input)?;
+        let mut destination = sole_destination(&input)?;
+        // A stored destination holds its data processing as Firehose runs it, not as it
+        // was submitted: the parameters Firehose fills in itself are materialised and the
+        // list is put in the service's canonical order, so the describe echo and the
+        // delivery path read one normalised configuration.
+        destination.normalise_processors();
 
         // `DeliveryStreamType` defaults to `DirectPut`: "Provider applications access the
         // Firehose stream directly."

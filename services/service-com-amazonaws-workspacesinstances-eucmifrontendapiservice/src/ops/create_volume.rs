@@ -150,19 +150,14 @@ fn validate_configuration(
 ) -> Result<(), ValidationException> {
     use crate::state::{
         availability_zones_in_region, field_validation_failed, reject_reserved_tag_keys,
-        volume_type_spec, DEFAULT_VOLUME_TYPE,
+        specification_tag_keys, volume_type_spec, DEFAULT_VOLUME_TYPE,
     };
 
     // A tag key in the reserved `aws:` namespace names a tag AWS generates, not one a
     // caller may set, whichever resource type the specification names.
     reject_reserved_tag_keys(
         "TagSpecifications",
-        input
-            .tag_specifications
-            .iter()
-            .flatten()
-            .flat_map(|specification| specification.tags.iter().flatten())
-            .filter_map(|tag| tag.key.as_deref()),
+        specification_tag_keys(input.tag_specifications.iter().flatten()),
     )?;
 
     if !availability_zones_in_region(region)
@@ -395,26 +390,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "Metadata tags for the volume": each `TagSpecification` carries a
-        // `ResourceTypeEnum` and a `TagList`. The only resource this call creates is a
-        // volume, so a specification that names another resource type tags nothing here;
-        // one that names none, or names `volume`, tags the new volume. A repeated key
-        // keeps the last value, which is what merging onto a map gives.
-        let mut tags = std::collections::BTreeMap::new();
-        for specification in input.tag_specifications.unwrap_or_default() {
-            let targets_volume = specification
-                .resource_type
-                .as_deref()
-                .is_none_or(|kind| kind == crate::state::VOLUME_TAG_SPECIFICATION_RESOURCE_TYPE);
-            if !targets_volume {
-                continue;
-            }
-            for tag in specification.tags.unwrap_or_default() {
-                if let Some(key) = tag.key {
-                    tags.insert(key, tag.value.unwrap_or_default());
-                }
-            }
-        }
+        // "Metadata tags for the volume": the only resource this call creates is a
+        // volume, so the shared reader keeps the tags of each specification that names
+        // `volume` or names no resource type at all, and drops the rest.
+        let tags = crate::state::tags_in_specifications(
+            crate::state::VOLUME_TAG_SPECIFICATION_RESOURCE_TYPE,
+            input.tag_specifications.iter().flatten(),
+        );
 
         let volume_id = state.mint_volume_id();
         let record = crate::state::VolumeRecord {

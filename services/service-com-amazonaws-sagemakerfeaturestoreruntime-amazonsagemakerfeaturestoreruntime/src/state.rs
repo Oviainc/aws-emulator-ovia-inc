@@ -157,6 +157,32 @@ impl FeatureGroupStore {
         true
     }
 
+    /// Offer a prepared record to this group's online store: the one INGESTION every
+    /// write of a whole record performs.
+    ///
+    /// "If a new record's EventTime is greater, the new record is written to both the
+    /// OnlineStore and OfflineStore. Otherwise, the record is a historic record and it is
+    /// written only to the OfflineStore": only the OnlineStore is modelled here, so a
+    /// posted record whose event time is not later than the stored record's leaves that
+    /// record standing ([`Ingested::Historic`]). A record the group does not hold yet is
+    /// stored unless the group is full ([`Ingested::AtCapacity`]).
+    pub fn ingest(&mut self, prepared: PreparedRecord) -> Ingested {
+        if let (Some(posted), Some(stored)) = (
+            prepared.event_time_secs,
+            self.record(&prepared.record.identifier)
+                .and_then(StoredRecord::event_time_secs),
+        ) {
+            if posted <= stored {
+                return Ingested::Historic;
+            }
+        }
+        if self.insert_record(prepared.record) {
+            Ingested::Stored
+        } else {
+            Ingested::AtCapacity
+        }
+    }
+
     /// Remove the record entirely (`HardDelete`).
     pub fn remove_record(&mut self, identifier: &str) {
         self.records.remove(identifier);
@@ -280,6 +306,151 @@ impl StoredRecord {
     }
 }
 
+/// What became of a prepared record offered to a feature group's online store
+/// ([`FeatureGroupStore::ingest`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ingested {
+    /// Stored, over-writing any record the group held under the same identifier.
+    Stored,
+    /// Not stored: the posted record is historic — its event time is not later than
+    /// that of the record the group already holds — so only the OfflineStore, which this
+    /// emulator does not model, would take it. Not a failure.
+    Historic,
+    /// Not stored: the record is new and the group already holds
+    /// [`MAX_RECORDS_PER_GROUP`] of them.
+    AtCapacity,
+}
+
+/// One whole-record write, read from a request and ready to be committed to a feature
+/// group's online store.
+///
+/// A record ingestion is the same write whether it arrives on its own or as one entry of
+/// a batch — "List of FeatureValues to be inserted. This will be a full over-write." —
+/// so [`prepare_record`] states those rules once and both callers commit what it hands
+/// back through [`FeatureGroupStore::ingest`].
+#[derive(Debug, Clone)]
+pub struct PreparedRecord {
+    /// The record as it would be stored, with `ExpiresAt` already derived.
+    record: StoredRecord,
+    /// The posted event time in epoch seconds, which is what orders the write against
+    /// the record the group already holds.
+    event_time_secs: Option<f64>,
+}
+
+impl PreparedRecord {
+    /// The value of the group's record-identifier feature in this record, i.e. the
+    /// record the write identifies.
+    pub fn identifier(&self) -> &str {
+        &self.record.identifier
+    }
+
+    /// `ExpiresAt = EventTime + TtlDuration`, as the ISO-8601 string a read reports,
+    /// when the write carries a TTL duration and a parsable event time.
+    pub fn expires_at(&self) -> Option<&str> {
+        self.record.expires_at.as_deref()
+    }
+}
+
+/// Read one posted record against the DEFINITION of the feature group it is written to.
+///
+/// The two names the record is read through are the group's own, as the control plane
+/// recorded them — its `RecordIdentifierFeatureName` and its `EventTimeFeatureName` —
+/// never the order or the names of the features one request happens to post. `Err` is
+/// the refusal message for a record this data plane cannot read: a caller answers it
+/// with its modelled `ValidationError`, or — in a batch — as that entry's own error.
+pub fn prepare_record(
+    definition: &::service_common::feature_store_groups::FeatureGroupRecord,
+    record: &[crate::ops::types::FeatureValue],
+    ttl_duration: Option<&crate::ops::types::TtlDuration>,
+) -> Result<PreparedRecord, String> {
+    // `Record` is modelled `len 1..` and refused at the boundary; read it fallibly all
+    // the same, so a caller reached with an empty list refuses it instead of storing a
+    // record with no feature values.
+    if record.is_empty() {
+        return Err("Record must carry at least one FeatureValue".to_owned());
+    }
+
+    let identifier_feature_name = &definition.record_identifier_feature_name;
+    let identifier = match record
+        .iter()
+        .find(|feature| feature.feature_name == *identifier_feature_name)
+    {
+        Some(crate::ops::types::FeatureValue {
+            value_as_string: Some(value),
+            ..
+        }) => value.clone(),
+        Some(_) => {
+            return Err(format!(
+                "the record identifier feature '{identifier_feature_name}' must carry \
+                 ValueAsString, not ValueAsStringList"
+            ))
+        }
+        None => {
+            return Err(format!(
+                "Record is missing the record identifier feature \
+                 '{identifier_feature_name}' of feature group '{}'",
+                definition.name
+            ))
+        }
+    };
+
+    // A record that carries no value for the group's event-time feature has no event
+    // time, so neither the historic-record rule nor a TTL has anything to compute from.
+    let event_time_feature_name = &definition.event_time_feature_name;
+    let event_time = record
+        .iter()
+        .find(|feature| feature.feature_name == *event_time_feature_name)
+        .and_then(|feature| feature.value_as_string.clone());
+
+    // An event time the group identified must be a timestamp: the TTL and the
+    // historic-record rule are both computed from it, so a value in neither accepted
+    // format is refused rather than silently disabling both.
+    let event_time_secs = match event_time.as_deref() {
+        Some(at) => match parse_event_time_secs(at) {
+            Some(secs) => Some(secs),
+            None => {
+                return Err(format!(
+                    "EventTime: the event time feature '{event_time_feature_name}' must carry \
+                     an ISO-8601 timestamp or seconds since the epoch, not '{at}'"
+                ))
+            }
+        },
+        None => None,
+    };
+
+    // The write's TTL, in seconds: `ExpiresAt = EventTime + TtlDuration`, per the
+    // `TtlDuration` shape's doc. The unit is a modelled enum, refused at the boundary,
+    // so a value outside it only reaches here if the walk let it through.
+    let ttl_secs = match ttl_duration {
+        None => None,
+        Some(ttl) => match ttl_seconds(ttl) {
+            Some(secs) => Some(secs),
+            None => {
+                return Err(format!(
+                    "TtlDuration.Unit: '{}' is not a TtlDurationUnit; expected one of {}",
+                    ttl.unit,
+                    crate::ops::types::TTL_DURATION_UNIT_VALUES.join(", ")
+                ))
+            }
+        },
+    };
+
+    let mut stored = StoredRecord {
+        identifier,
+        features: record.iter().map(StoredFeatureValue::from).collect(),
+        event_time,
+        expires_at: None,
+        expires_at_secs: None,
+        ttl_secs,
+        soft_deleted: false,
+    };
+    stored.recompute_expiry();
+    Ok(PreparedRecord {
+        record: stored,
+        event_time_secs,
+    })
+}
+
 /// One feature value of a stored record.
 #[derive(Debug, Clone, Default)]
 pub struct StoredFeatureValue {
@@ -319,6 +490,43 @@ impl From<&crate::ops::types::FeatureValue> for StoredFeatureValue {
 /// name the data plane resolves and the store it reaches can never be two names.
 pub fn group_key(name_or_arn: &str) -> &str {
     ::service_common::feature_store_groups::group_name(name_or_arn)
+}
+
+/// The ARN namespace of the resources this data plane reads (`arnNamespace` in the
+/// model's `aws.api#service` trait, which is also this service's sigv4 signing name).
+pub const ARN_SERVICE: &str = "sagemaker";
+
+/// The region an ARN carries when the request is unsigned, so no SigV4 credential scope
+/// names one. It matches the region the emulator's generated shared config hands the AWS
+/// CLI.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region this request's SigV4 credential scope names, or [`DEFAULT_REGION`] when the
+/// request is unsigned.
+///
+/// A feature group's ARN takes its region from here, so a client signing for one region
+/// is never told about a resource in another.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_owned())
+}
+
+/// `arn:aws:sagemaker:<region>:<account>:feature-group/<name>` — the ARN of the feature
+/// group `name_or_arn` names, in either spelling the modelled `FeatureGroupNameOrArn`
+/// admits.
+///
+/// This is the form the SageMaker control plane mints a `FeatureGroupArn` in (the
+/// `FeatureGroupArn` shape's own pattern,
+/// `^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:feature-group/`), so it names the ARN
+/// a group HAS — or, for a name no group was created under, the one it would have.
+pub fn feature_group_arn(region: &str, name_or_arn: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("feature-group/{}", group_key(name_or_arn)),
+    )
 }
 
 /// An event time in epoch seconds.
@@ -374,6 +582,30 @@ pub fn undeclared_value<'a>(values: &'a [String], declared: &[&str]) -> Option<&
         .map(String::as_str)
         .find(|value| !declared.contains(value))
 }
+
+/// The refusal message for a `TargetStores` list carrying a value the model's
+/// `TargetStore` enum does not declare, or `None` when every value it carries is
+/// declared (an absent list always is).
+///
+/// Every write of this data plane reads the list the same way — "is the OnlineStore
+/// among these?" ([`targets_online_store`]) — so an undeclared value would be read as
+/// "not the OnlineStore" and silently turn the write into a no-op success. The boundary
+/// validator refuses it first; this is the handlers' own guard, stated once so no two of
+/// them word it differently.
+pub fn undeclared_target_store(target_stores: Option<&Vec<String>>) -> Option<String> {
+    let unknown = undeclared_value(target_stores?, crate::ops::types::TARGET_STORE_VALUES)?;
+    Some(format!(
+        "TargetStores: '{unknown}' is not a TargetStore; expected one of {}",
+        crate::ops::types::TARGET_STORE_VALUES.join(", ")
+    ))
+}
+
+/// The per-entry `ErrorCode` a batch operation of this data plane reports a refused
+/// entry with: the wire code of the modelled `ValidationError` every single-record
+/// operation answers the same failure with, so one classification serves the whole
+/// service. It is never `ResourceNotFound`, which would say a record is missing from a
+/// feature group that exists.
+pub const VALIDATION_ERROR_CODE: &str = "ValidationError";
 
 /// Whether a caller asked for `ExpiresAt` in the response.
 ///

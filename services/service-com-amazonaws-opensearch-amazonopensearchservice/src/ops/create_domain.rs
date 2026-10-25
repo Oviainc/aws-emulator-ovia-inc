@@ -239,6 +239,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // The storage a domain is created with has to be storage the service publishes
+        // for the instance type the domain runs on: a volume sized outside that
+        // published range describes a cluster the service cannot provision, so it is
+        // refused rather than stored.
+        if let Some(refusal) = crate::state::ebs_volume_size_refusal(
+            input.ebs_options.as_ref(),
+            input
+                .cluster_config
+                .as_ref()
+                .and_then(|cluster| cluster.instance_type.as_deref()),
+        ) {
+            return Err(CreateDomainErrorModeled::ValidationException(refusal).into());
+        }
+
         // "Domain names are unique across the domains owned by an account within an
         // Amazon Web Services Region" (`CreateDomainRequest$DomainName`), so a second
         // create of the same name is the modelled already-exists refusal, not a second

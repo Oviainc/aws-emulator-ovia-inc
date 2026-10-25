@@ -40,7 +40,7 @@
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
 
 use crate::configuration_templates::{
-    as_params, expected_options, option_params, published_stack, reported_options, Option4,
+    as_params, expected_options, option_params, overridden_options, published_stack, Option4,
 };
 use crate::lifecycle::{Answer, Emulator, PAST_DUE, SOLUTION_STACK};
 
@@ -156,7 +156,10 @@ async fn configuration_sets(emulator: &Emulator, case: &str, environment: &str) 
                     .value("SolutionStackName")
                     .unwrap_or_default()
                     .to_string(),
-                options: reported_options(member),
+                // A configuration set reports the RESOLVED settings, platform
+                // defaults included, so the overrides are what a row about a
+                // deployed or drafted CHANGE reads.
+                options: overridden_options(member),
             }
         })
         .collect()
@@ -800,7 +803,7 @@ async fn a_configuration_template_is_reported_as_deployed_and_carries_no_draft()
         described.body
     );
     assert_eq!(
-        reported_options(&reported[0]),
+        overridden_options(&reported[0]),
         expected_options(&[(ASG, "MaxSize", "8", "")]),
         "case {case:?}: the template's own settings must be reported, got {}",
         described.body

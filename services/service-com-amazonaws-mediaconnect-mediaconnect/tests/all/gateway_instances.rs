@@ -46,7 +46,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::create_bridge;
+use crate::bridge_lifecycle::{create_bridge, gateway_with_networks};
 use crate::bridge_members_and_deletion::force_bridge_state;
 use crate::flow_lifecycle::Emulator;
 
@@ -100,29 +100,11 @@ async fn delete_gateway(emulator: &Emulator, arn: &str) -> (u16, Option<String>,
 /// Create one gateway over the wire and answer its ARN.
 ///
 /// The create is `gateway_lifecycle`'s subject; here it is only the fixture every instance
-/// below is registered with. `pub(crate)` for the same reason as
+/// below is registered with, so it goes through the one gateway fixture the test crate owns
+/// ([`gateway_with_networks`]). `pub(crate)` for the same reason as
 /// [`describe_gateway_instance`].
 pub(crate) async fn gateway_with(emulator: &Emulator, name: &str) -> String {
-    let (status, code, created) = emulator
-        .send(
-            "POST",
-            "/v1/gateways",
-            Some(json!({
-                "name": name,
-                "egressCidrBlocks": ["10.0.0.0/16"],
-                "networks": [{ "name": "net-1", "cidrBlock": "10.0.0.0/24" }],
-            })),
-        )
-        .await;
-    assert_eq!(
-        (status, code.as_deref()),
-        (201, None),
-        "fixture {name:?}: create expected 201, got {status} {code:?}: {created}"
-    );
-    created["gateway"]["gatewayArn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("fixture {name:?}: the create answers an ARN: {created}"))
-        .to_string()
+    gateway_with_networks(emulator, name, &["net-1"]).await
 }
 
 /// Register one instance with `gateway_arn` through the out-of-band channel, and answer its

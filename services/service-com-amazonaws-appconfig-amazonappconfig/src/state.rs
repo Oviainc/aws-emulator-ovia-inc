@@ -2499,6 +2499,16 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         self.extension_associations.get(association_id)
     }
 
+    /// Every extension association this account created, for a reader that must report
+    /// them without reaching into the map. The order is the map's, which is no order at
+    /// all: a listing orders what it reports itself.
+    ///
+    /// `ListExtensionAssociations`, which reports "all AppConfig extension associations in
+    /// the account", is the caller this exists for.
+    pub fn extension_associations(&self) -> impl Iterator<Item = &ExtensionAssociation> {
+        self.extension_associations.values()
+    }
+
     /// The extension associations in force for a deployment of
     /// `configuration_profile_id` into `environment_id` of `application_id`, as the
     /// `AppliedExtensions` that deployment records: "the extensions that were previously
@@ -2930,6 +2940,10 @@ pub const LISTING_EXTENSIONS: &str = "ListExtensions";
 /// The `kind` a `ListHostedConfigurationVersions` cursor is stamped with, so a token
 /// minted by another listing cannot resume this one. See [`paginate`].
 pub const LISTING_HOSTED_CONFIGURATION_VERSIONS: &str = "ListHostedConfigurationVersions";
+
+/// The `kind` a `ListExtensionAssociations` cursor is stamped with, so a token minted by
+/// another listing cannot resume this one. See [`paginate`].
+pub const LISTING_EXTENSION_ASSOCIATIONS: &str = "ListExtensionAssociations";
 
 /// One page of a list operation: the items on it, and the token that resumes the walk
 /// after them (`None` on the last page).

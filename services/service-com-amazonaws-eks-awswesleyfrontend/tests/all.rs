@@ -37,6 +37,8 @@ mod cluster_version_catalog;
 mod cluster_version_update;
 #[path = "all/cluster_versions.rs"]
 mod cluster_versions;
+#[path = "all/connected_cluster_gate.rs"]
+mod connected_cluster_gate;
 #[path = "all/connected_clusters.rs"]
 mod connected_clusters;
 #[path = "all/encryption_config_association.rs"]

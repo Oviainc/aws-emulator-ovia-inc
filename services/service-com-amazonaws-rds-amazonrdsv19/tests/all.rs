@@ -45,6 +45,8 @@ mod db_parameter_groups;
 mod db_shard_groups;
 #[path = "all/db_subnet_group_deletion.rs"]
 mod db_subnet_group_deletion;
+#[path = "all/db_subnet_group_resolution.rs"]
+mod db_subnet_group_resolution;
 #[path = "all/docdb_query_surface.rs"]
 mod docdb_query_surface;
 #[path = "all/engine_default_cluster_parameters.rs"]

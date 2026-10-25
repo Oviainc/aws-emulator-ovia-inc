@@ -32,7 +32,7 @@ use crate::resource_tagging::{escape, list_tags, tag, tags_uri};
 
 /// The id prefix and ARN resource type of a peering: the model's own
 /// `^peering-([0-9a-f]{8,17})$` (`smithy_query shape=PeeringId`).
-const PEERING: &str = "peering";
+pub(crate) const PEERING: &str = "peering";
 
 /// The id prefix of the EC2 transit gateway peering attachment a peering establishes:
 /// `TransitGatewayPeeringAttachmentId` carries `^tgw-attach-([0-9a-f]{8,17})$`
@@ -49,7 +49,7 @@ const EDGES: [&str; 3] = ["us-west-2", "eu-central-1", "ap-southeast-4"];
 /// `^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpc\/vpc-[0-9a-f]{8,17}$` for `VpcArn`
 /// (`smithy_query shape=VpcArn`) — with the `transit-gateway` resource type and a `tgw-` id;
 /// `digits` is how many hex digits that id carries, which that pattern writes as 8 to 17.
-fn transit_gateway_arn(
+pub(crate) fn transit_gateway_arn(
     partition: &str,
     region: &str,
     account: &str,
@@ -63,7 +63,7 @@ fn transit_gateway_arn(
 }
 
 /// The account the emulator runs as, which is the account every peering it mints belongs to.
-fn own_account() -> String {
+pub(crate) fn own_account() -> String {
     engine::emulator_account_id().to_string()
 }
 
@@ -179,7 +179,7 @@ fn request_of(case: &PeeringCase, core_network: &str, index: usize) -> Value {
 }
 
 /// `CreateTransitGatewayPeering`.
-async fn create_peering(emulator: &Emulator, body: Value) -> (u16, Value) {
+pub(crate) async fn create_peering(emulator: &Emulator, body: Value) -> (u16, Value) {
     emulator.post("/transit-gateway-peerings", body).await
 }
 
@@ -191,7 +191,7 @@ async fn get_peering(emulator: &Emulator, id: &str) -> (u16, Value) {
 }
 
 /// `GetTransitGatewayPeering`, asserting the call succeeded.
-async fn get_peering_ok(emulator: &Emulator, case: &str, id: &str) -> Value {
+pub(crate) async fn get_peering_ok(emulator: &Emulator, case: &str, id: &str) -> Value {
     let (status, body) = get_peering(emulator, id).await;
     assert_eq!(
         status, 200,
@@ -206,7 +206,7 @@ fn member(value: &Value, member: &str) -> Option<String> {
 }
 
 /// The `PeeringId` of a `TransitGatewayPeering`.
-fn peering_id(case: &str, wrapper: &Value) -> String {
+pub(crate) fn peering_id(case: &str, wrapper: &Value) -> String {
     member(&wrapper["Peering"], "PeeringId")
         .unwrap_or_else(|| panic!("case {case:?}: no Peering.PeeringId in {wrapper}"))
 }
@@ -572,7 +572,7 @@ async fn a_create_outside_the_rule_is_refused_and_stores_nothing() {
 
 /// How many peerings the store holds for the global network that owns `core_network`, as
 /// `GetNetworkResourceCounts` reports them.
-async fn peering_count(emulator: &Emulator, core_network: &str) -> usize {
+pub(crate) async fn peering_count(emulator: &Emulator, core_network: &str) -> usize {
     let network = global_network_of(emulator, core_network).await;
     let (status, body) = emulator
         .get(&format!(

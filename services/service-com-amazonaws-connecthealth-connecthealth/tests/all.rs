@@ -29,6 +29,8 @@ mod pagination_token_issuance;
 mod patient_insights_job_lifecycle;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
+#[path = "all/reserved_tag_key_prefix.rs"]
+mod reserved_tag_key_prefix;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/start_patient_insights_job_write_discipline.rs"]

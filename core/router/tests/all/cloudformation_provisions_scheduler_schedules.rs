@@ -1019,3 +1019,322 @@ async fn a_provisioned_schedule_group_carries_the_tags_cloudformation_gives_it()
         );
     }
 }
+
+/// A `ScheduleGroupNamePrefix` (modelled `length 1..64`, pattern `^[0-9a-zA-Z-_.]+$`) no group
+/// in these Regions starts with: neither a name a row declares or leaves to CloudFormation
+/// (`<stack name>-<logical id>-<unique id>`, and every stack here is named
+/// `scheduler-group-listing-…`) nor the account's own `default` group begins with it.
+const UNMATCHED_PREFIX: &str = "zz";
+
+/// How many leading characters the partial-prefix probe filters by — a PROPER prefix of
+/// every group name a row in [`ROWS`] ends up with.
+const PARTIAL_PREFIX_CHARS: usize = 4;
+
+/// Most pages [`list_schedule_groups`] follows before it calls a `NextToken` chain
+/// non-terminating: these Regions hold a handful of groups, so even a page size of one is
+/// well inside it.
+const MAX_LISTING_PAGES: usize = 16;
+
+/// One form the paginated read takes, and whether the group the stack declared has to be
+/// among the entries that form enumerates.
+struct ListingProbe {
+    case: &'static str,
+    /// The `NamePrefix` the read filters by, as a function of the group name the stack
+    /// published; `None` leaves the filter off, so the whole account/Region is enumerated.
+    prefix: fn(&str) -> Option<String>,
+    /// The `MaxResults` page size the read asks for, `None` for one that names none. Both
+    /// values are inside the modelled `range 1..100`
+    /// (`smithy_query(operation="ListScheduleGroups")`); the bounds themselves, and one past
+    /// each, are the owning crate's own suite.
+    max_results: Option<u32>,
+    /// Whether the declared group is among the enumerated entries.
+    enumerates_group: bool,
+}
+
+/// The rows the listing is probed along: whether the read filters at all, by the group's
+/// whole name, by a proper prefix of it or by a prefix nothing starts with, and how many
+/// entries it asks for per page — so the group is reached both in one page and only by
+/// following a `NextToken`.
+const PROBES: &[ListingProbe] = &[
+    ListingProbe {
+        case: "no filter, the page size the service chooses",
+        prefix: |_| None,
+        max_results: None,
+        enumerates_group: true,
+    },
+    ListingProbe {
+        case: "no filter, one group per page, so the group is reached through NextToken",
+        prefix: |_| None,
+        max_results: Some(1),
+        enumerates_group: true,
+    },
+    ListingProbe {
+        case: "the group's whole name as the prefix",
+        prefix: |group| Some(group.to_string()),
+        max_results: None,
+        enumerates_group: true,
+    },
+    ListingProbe {
+        case: "a proper prefix of the group's name",
+        prefix: |group| Some(group.chars().take(PARTIAL_PREFIX_CHARS).collect()),
+        max_results: None,
+        enumerates_group: true,
+    },
+    ListingProbe {
+        case: "the whole name, asking for the largest page the model admits",
+        prefix: |group| Some(group.to_string()),
+        max_results: Some(100),
+        enumerates_group: true,
+    },
+    ListingProbe {
+        case: "a prefix no group starts with",
+        prefix: |_| Some(UNMATCHED_PREFIX.to_string()),
+        max_results: None,
+        enumerates_group: false,
+    },
+];
+
+/// Page through `ListScheduleGroups` (`GET /schedule-groups`, whose `NamePrefix`,
+/// `MaxResults` and `NextToken` members are `@httpQuery`-bound under those names) with the
+/// filter and page size asked for, following the token to the end, and answer every summary
+/// the whole enumeration carried.
+///
+/// Each page is checked where it is read: a 200 carrying the required `ScheduleGroups` list,
+/// no page longer than the size asked for, and the enumeration as a whole in ascending name
+/// order with no name twice — a paginated read is one walk over one total order, so a client
+/// that follows the token sees each group exactly once and terminates.
+async fn list_schedule_groups(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    prefix: Option<&str>,
+    max_results: Option<u32>,
+) -> Vec<Value> {
+    let mut collected: Vec<Value> = Vec::new();
+    let mut next: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        pages += 1;
+        assert!(
+            pages <= MAX_LISTING_PAGES,
+            "case {case:?}: expected the NextToken chain to terminate within \
+             {MAX_LISTING_PAGES} pages, collected {collected:?}"
+        );
+        let mut query: Vec<String> = Vec::new();
+        if let Some(prefix) = prefix {
+            query.push(format!("NamePrefix={}", form_encode(prefix)));
+        }
+        if let Some(max) = max_results {
+            query.push(format!("MaxResults={max}"));
+        }
+        if let Some(token) = &next {
+            query.push(format!("NextToken={}", form_encode(token)));
+        }
+        let uri = if query.is_empty() {
+            "/schedule-groups".to_string()
+        } else {
+            format!("/schedule-groups?{}", query.join("&"))
+        };
+
+        let (status, answered) = scheduler(router, region, "GET", &uri).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from ListScheduleGroups({uri}), got {status} \
+             with body {answered}"
+        );
+        let page = answered
+            .get("ScheduleGroups")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: no required 'ScheduleGroups' list in {answered}")
+            });
+        if let Some(limit) = max_results {
+            assert!(
+                page.len() <= limit as usize,
+                "case {case:?}: expected at most {limit} group(s) in a page, got {} in \
+                 {answered}",
+                page.len()
+            );
+        }
+        collected.extend(page);
+        next = answered
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if next.is_none() {
+            break;
+        }
+    }
+
+    let names = listed_names(&collected);
+    let mut in_order = names.clone();
+    in_order.sort();
+    in_order.dedup();
+    assert_eq!(
+        names, in_order,
+        "case {case:?}: expected the enumeration in ascending name order with each group \
+         once, got {names:?}"
+    );
+    collected
+}
+
+/// The `Name` of every summary, in the order the enumeration carried them.
+fn listed_names(summaries: &[Value]) -> Vec<String> {
+    summaries
+        .iter()
+        .filter_map(|summary| summary.get("Name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every row: the group a `CREATE_COMPLETE` stack declared is ENUMERATED by EventBridge
+/// Scheduler's own paginated listing — `State` `ACTIVE`, under the ARN the stack published —
+/// in every form the read takes, and it is gone from the listing once the stack that
+/// declared it is deleted.
+///
+/// The same rule the sibling suites check through `GetScheduleGroup` and `ListSchedules`, at
+/// the DISCOVERY observation point: a resource a stack provisioned through the owning
+/// service's create API is one that service's own list operation reports, so a client that
+/// finds its resources by listing finds them. The probes vary what the rule generalises
+/// over — whether the read filters by name at all, by the whole name, by a proper prefix or
+/// by a prefix nothing matches, and how many entries it asks for per page — on top of the
+/// rows' own variation in whether the template names the group, which Region it deploys in
+/// and which form it is written in.
+#[tokio::test]
+async fn a_declared_group_is_enumerated_by_list_schedule_groups() {
+    let router = build_router();
+
+    for (index, row) in ROWS.iter().enumerate() {
+        let deployed = row.case;
+        let region = row.region;
+        let stack_name = format!("scheduler-group-listing-{index}");
+        let template = (row.template)();
+
+        let (status, body) = cloudformation(
+            &router,
+            region,
+            "CreateStack",
+            &[
+                ("StackName", &stack_name),
+                ("TemplateBody", &template),
+                ("Capabilities.member.1", "CAPABILITY_IAM"),
+                ("Capabilities.member.2", "CAPABILITY_NAMED_IAM"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {deployed:?}: expected HTTP 200 from CreateStack, got {status} with body \
+             {body}"
+        );
+
+        tokio::time::sleep(PAST_STACK_SPAN).await;
+        let (status, described) =
+            cloudformation(&router, region, "DescribeStacks", &[("StackName", &stack_name)]).await;
+        assert_eq!(
+            status, 200,
+            "case {deployed:?}: expected HTTP 200 from DescribeStacks, got {status} with body \
+             {described}"
+        );
+        assert_eq!(
+            opt_element(&described, "StackStatus").as_deref(),
+            Some("CREATE_COMPLETE"),
+            "case {deployed:?}: expected the stack to reach CREATE_COMPLETE, got {described}"
+        );
+        let outputs = outputs_of(&described);
+        let group = match row.group_name_output {
+            Some(key) => outputs
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| panic!("case {deployed:?}: no output {key:?} in {described}")),
+            None => DEFAULT_GROUP.to_string(),
+        };
+        let expected_arn = group_arn(region, &group);
+
+        for probe in PROBES {
+            let case = format!("{deployed} / {}", probe.case);
+            let prefix = (probe.prefix)(&group);
+            let listed =
+                list_schedule_groups(&router, region, &case, prefix.as_deref(), probe.max_results)
+                    .await;
+            let matching: Vec<&Value> = listed
+                .iter()
+                .filter(|summary| {
+                    summary.get("Name").and_then(Value::as_str) == Some(group.as_str())
+                })
+                .collect();
+
+            if probe.enumerates_group {
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "case {case:?}: expected the declared group {group:?} exactly once among \
+                     the enumerated groups, got {listed:?}"
+                );
+                let summary = matching[0];
+                assert_eq!(
+                    summary.get("State").and_then(Value::as_str),
+                    Some("ACTIVE"),
+                    "case {case:?}: expected the enumerated group to be ACTIVE, got {summary}"
+                );
+                assert_eq!(
+                    summary.get("Arn").and_then(Value::as_str),
+                    Some(expected_arn.as_str()),
+                    "case {case:?}: expected the enumerated ARN {expected_arn:?}, got {summary}"
+                );
+                for dated in ["CreationDate", "LastModificationDate"] {
+                    let reported = summary.get(dated).and_then(Value::as_f64);
+                    assert!(
+                        reported.is_some_and(|seconds| seconds > 0.0),
+                        "case {case:?}: expected the enumerated group to carry a server-set \
+                         {dated}, got {reported:?} in {summary}"
+                    );
+                }
+            } else {
+                assert!(
+                    listed.is_empty(),
+                    "case {case:?}: expected a prefix no group starts with to be an empty page \
+                     rather than a refusal or a match, got {listed:?}"
+                );
+            }
+
+            // An unfiltered read enumerates the whole account/Region, so the group AWS
+            // creates with the account is in it beside the stack's.
+            if prefix.is_none() {
+                let names = listed_names(&listed);
+                assert!(
+                    names.iter().any(|name| name == DEFAULT_GROUP),
+                    "case {case:?}: expected the account's {DEFAULT_GROUP:?} group among the \
+                     enumerated groups, got {names:?}"
+                );
+            }
+        }
+
+        // Deleting the stack takes the group it created out of the listing, while the
+        // account's own `default` group — never the stack's to delete — stays in it.
+        let (status, body) =
+            cloudformation(&router, region, "DeleteStack", &[("StackName", &stack_name)]).await;
+        assert_eq!(
+            status, 200,
+            "case {deployed:?}: expected HTTP 200 from DeleteStack, got {status} with body \
+             {body}"
+        );
+        tokio::time::sleep(PAST_GROUP_DELETION_SPAN).await;
+        let case = format!("{deployed} / once the stack is deleted");
+        let names = listed_names(&list_schedule_groups(&router, region, &case, None, None).await);
+        if row.group_name_output.is_some() {
+            assert!(
+                !names.iter().any(|name| name == &group),
+                "case {case:?}: expected {group:?} to be gone from the listing once the stack \
+                 that declared it was deleted, got {names:?}"
+            );
+        } else {
+            assert!(
+                names.iter().any(|name| name == DEFAULT_GROUP),
+                "case {case:?}: expected the account's {DEFAULT_GROUP:?} group to survive the \
+                 stack, got {names:?}"
+            );
+        }
+    }
+}

@@ -6,7 +6,10 @@
 //! names the caller's own account is refused with the modelled 403
 //! `AccessDeniedException` before the address is acted on: per the model's own
 //! `AccountId` documentation, the management account can't specify its own
-//! `AccountId`.
+//! `AccountId`. A request on an account whose previous update has been accepted
+//! and whose address change the clock has not applied yet is refused with the
+//! modelled 409 `ConflictException`, rather than replacing a record and dropping
+//! a change that is already owed.
 //!
 //! ## Shape of an operation
 //!
@@ -203,6 +206,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // came due has already made its address the account's primary email,
         // and starting another update must not lose that.
         account.settle_primary_email_update(now);
+        // What the settle above leaves ACCEPTED is an update whose completion is
+        // still OWED: the service has already confirmed that address change and
+        // the clock has not applied it yet. A change the clock owes is never
+        // discarded to make room for a new one — the request conflicts with "the
+        // current status of the resource", which is what this operation's
+        // modelled `ConflictException` is for, exactly as a Region opt still in
+        // flight refuses the opposite opt call. A PENDING update owes nothing
+        // (only a passcode moves it), and a terminal one has nothing left to
+        // lose, so both are replaced below.
+        if let Some(in_flight) = account
+            .primary_email_update
+            .as_ref()
+            .filter(|update| update.is_accepted())
+        {
+            return Err(StartPrimaryEmailUpdateErrorModeled::ConflictException(
+                crate::state::primary_email_update_in_progress(&in_flight.status),
+            )
+            .into());
+        }
         // The account carries its MOST RECENT update, so starting another one
         // replaces the record rather than adding a second: a restarted update is
         // the one a status read reports, with its own `UpdatedAt`.

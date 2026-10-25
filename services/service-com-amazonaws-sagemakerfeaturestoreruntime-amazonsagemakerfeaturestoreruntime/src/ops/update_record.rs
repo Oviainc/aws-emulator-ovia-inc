@@ -231,13 +231,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // OnlineStore" and silently turn the update into a no-op success. The boundary
         // validator refuses an undeclared enum value first; this is the handler's own
         // guard, against the model's own value list (`TARGET_STORE_VALUES`).
-        if let Some(stores) = input.target_stores.as_ref() {
-            if let Some(unknown) = crate::state::undeclared_value(stores, TARGET_STORE_VALUES) {
-                return Err(validation(format!(
-                    "TargetStores: '{unknown}' is not a TargetStore; expected one of {}",
-                    TARGET_STORE_VALUES.join(", ")
-                )));
-            }
+        if let Some(message) = crate::state::undeclared_target_store(input.target_stores.as_ref()) {
+            return Err(validation(message));
         }
 
         // The data plane's one feature-group resolution: a `FeatureGroupName` naming no

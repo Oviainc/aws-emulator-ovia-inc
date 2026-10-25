@@ -47,6 +47,8 @@ mod return_shipping_label_reports;
 mod return_shipping_labels;
 #[path = "all/service_versions.rs"]
 mod service_versions;
+#[path = "all/snowball_usage.rs"]
+mod snowball_usage;
 #[path = "all/software_updates.rs"]
 mod software_updates;
 #[path = "all/state_roundtrip.rs"]

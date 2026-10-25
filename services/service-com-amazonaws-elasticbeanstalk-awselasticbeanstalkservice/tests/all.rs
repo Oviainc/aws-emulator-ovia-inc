@@ -21,6 +21,8 @@ mod application_version_updates;
 mod application_versions;
 #[path = "all/configuration_options.rs"]
 mod configuration_options;
+#[path = "all/configuration_resolution.rs"]
+mod configuration_resolution;
 #[path = "all/configuration_set_deployment_status.rs"]
 mod configuration_set_deployment_status;
 #[path = "all/configuration_templates.rs"]

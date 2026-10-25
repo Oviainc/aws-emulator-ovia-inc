@@ -344,6 +344,17 @@ impl ComAmazonawsGlueAwsglueState {
             .and_then(|catalog| catalog.connections.get(name))
     }
 
+    /// The stored connection definition `name` of `catalog_id`, mutably.
+    pub fn connection_mut(
+        &mut self,
+        catalog_id: &str,
+        name: &str,
+    ) -> Option<&mut ConnectionEntry> {
+        self.catalogs
+            .get_mut(catalog_id)
+            .and_then(|catalog| catalog.connections.get_mut(name))
+    }
+
     /// How many records the whole store holds of one catalog-scoped kind: `count` says
     /// how many ONE catalog holds, and this sums it over every catalog.
     ///
@@ -1839,6 +1850,35 @@ impl ConnectionEntry {
             },
             tags: tags.cloned().unwrap_or_default(),
         }
+    }
+
+    /// Overwrite this connection's definition with the one the client submitted.
+    ///
+    /// `ConnectionInput` is the WHOLE client-settable definition of a connection — the
+    /// same shape a create submits, "used to specify a connection to create or update" —
+    /// so an update writes every member it carries and clears the ones it omits, and
+    /// `ConnectionSchemaVersion` is recomputed from what it carries exactly as at create.
+    /// The members no `ConnectionInput` carries keep their own rules, because the client
+    /// cannot set them: `CreationTime` is the instant of the CREATE and never moves,
+    /// `LastUpdatedTime` and `LastUpdatedBy` become this call's instant and principal, and
+    /// the tags are written through the tagging operations rather than by this update.
+    ///
+    /// The submitted `Name` is written like any other member; relocating the entry under
+    /// a new key would be the caller's job, since the key lives in
+    /// [`Catalog::connections`].
+    pub fn apply_input(
+        &mut self,
+        input: &ConnectionInput,
+        last_updated_by: Option<String>,
+        now: SystemTime,
+    ) {
+        // One function decides what a `ConnectionInput` means, so an update projects it
+        // exactly as a create does; only the create's own instant is carried over.
+        let created_at = self.definition.creation_time;
+        let rewritten = Self::from_input(input, last_updated_by, None, now);
+        self.name = rewritten.name;
+        self.definition = rewritten.definition;
+        self.definition.creation_time = created_at;
     }
 
     /// What a read of this connection reports.
