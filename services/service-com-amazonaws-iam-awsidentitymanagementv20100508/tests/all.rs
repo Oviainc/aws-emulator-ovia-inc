@@ -71,6 +71,8 @@ mod service_provisioned_roles;
 mod service_specific_credentials;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/user_attached_policies.rs"]
+mod user_attached_policies;
 #[path = "all/user_lifecycle.rs"]
 mod user_lifecycle;
 #[path = "all/user_permissions_boundary.rs"]
