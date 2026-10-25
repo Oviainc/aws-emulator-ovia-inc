@@ -495,6 +495,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A caller-supplied tag may not write into the namespace Amazon Web Services keeps
+        // for its own tags, whichever operation carries the `tags` list.
+        if let Some(message) =
+            crate::state::reserved_tag_prefix_violation(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
@@ -558,15 +571,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 let definition = match guard.usable_revision(&family, revision) {
                     Ok(definition) => definition.clone(),
-                    Err(message) => {
+                    Err(refusal) => {
                         // "You can't use an INACTIVE task definition to ... create new
-                        // services", and a reference that resolves to nothing is the
-                        // same refusal it always is.
-                        return Err(CreateServiceErrorModeled::ClientException(
-                            ClientException {
-                                message: Some(message.to_string()),
-                            },
-                        )
+                        // services" names a revision this store HOLDS in a status this
+                        // call cannot accept, so it is the bad parameter it is; a
+                        // reference that resolves to nothing names an identifier the
+                        // store knows nothing about, which stays a client fault.
+                        let message = Some(refusal.message().to_string());
+                        return Err(match refusal {
+                            crate::state::TaskDefinitionRefusal::Inactive => {
+                                CreateServiceErrorModeled::InvalidParameterException(
+                                    InvalidParameterException { message },
+                                )
+                            }
+                            crate::state::TaskDefinitionRefusal::NotFound => {
+                                CreateServiceErrorModeled::ClientException(ClientException {
+                                    message,
+                                })
+                            }
+                        }
                         .into());
                     }
                 };

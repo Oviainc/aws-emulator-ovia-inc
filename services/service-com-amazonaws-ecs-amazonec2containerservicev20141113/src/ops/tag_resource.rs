@@ -18,7 +18,9 @@
 //! `InvalidParameterException` for the rest (`crate::state::TaggedResourceKind`). A write
 //! that would leave the resource carrying more tags than the documented maximum is
 //! refused as the resource limit it breaks (`LimitExceededException`), and then nothing
-//! is written.
+//! is written. A `tags` entry whose key or value carries the prefix Amazon Web Services
+//! reserves for its own tags is refused as the bad parameter it is
+//! (`crate::state::reserved_tag_prefix_violation`), and nothing is written either.
 //!
 //! ## Shape of an operation
 //!
@@ -198,6 +200,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The reserved namespace is the SERVICE's restriction, not the model's: the
+        // `TagKey` pattern admits ':', so a key or value carrying the prefix Amazon Web
+        // Services keeps for itself is a well-formed value this operation still refuses,
+        // and it refuses it before anything is written.
+        if let Some(message) = crate::state::reserved_tag_prefix_violation(&input.tags) {
+            return Err(TagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
