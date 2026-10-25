@@ -1869,11 +1869,11 @@ impl PaymentRequest {
 /// which this service records for every seller-submitted request
 /// (`SendAgreementPaymentRequest` and `SendAgreementCancellationRequest` are
 /// both documented as the seller's own call) — so `proposer_account_id` is the
-/// account the submitting call recorded on the request, not the proposer of an
-/// agreement, which this service never learns. The buyer is the acceptor of the
-/// agreement the request was sent under, which [`caller_is_party`] decides — so
-/// `agreement` is the stored agreement the request's `agreement_id` names, and a
-/// request whose agreement is gone has no buyer to match.
+/// account the submitting call recorded on the request itself, rather than the
+/// proposer of the agreement it was sent under. The buyer is the acceptor of
+/// that agreement, which [`caller_is_party`] decides — so `agreement` is the
+/// stored agreement the request's `agreement_id` names, and a request whose
+/// agreement is gone has no buyer to match.
 ///
 /// A `party_type` that is neither value matches nothing; the handler refuses it
 /// before any request is scanned.
@@ -1891,17 +1891,42 @@ pub fn submitted_request_party_matches(
     }
 }
 
+/// The accounts of the two parties of an agreement this emulator mints.
+///
+/// An agreement names an account for BOTH of its sides: `Acceptor` is "the
+/// details of the party accepting the agreement terms" ("commonly the buyer")
+/// and `Proposer` "details of the party proposing the agreement terms"
+/// ("commonly the seller"), each carrying "the AWS account ID" of that party —
+/// so neither side of a stored agreement is reported empty.
+///
+/// Both are the single account this emulator serves
+/// ([`::engine::emulator_account_id`], which every account-valued member it
+/// reports carries), because that one account makes the calls of BOTH
+/// documented roles of this API: it accepts an agreement request — the buyer's
+/// call, whose acceptor "can optionally provide purchase orders" — and it
+/// submits the payment and cancellation requests the model documents as the
+/// seller's ("Allows sellers (proposers) to …"). So it is the acceptor and the
+/// proposer of every agreement the store holds, which is what makes both
+/// members reportable and either `PartyType` selectable ([`caller_is_party`]).
+pub fn agreement_parties() -> (Acceptor, Proposer) {
+    let account = ::engine::emulator_account_id().to_string();
+    (
+        Acceptor {
+            account_id: Some(account.clone()),
+        },
+        Proposer {
+            account_id: Some(account),
+        },
+    )
+}
+
 /// Whether the caller is the party `party_type` names on `agreement`.
 ///
 /// A party type is "the party type of the caller", so it selects by the account
-/// the agreement records for that side. This emulator serves one account, which
-/// `AcceptAgreementRequest` records as the acceptor of every agreement it mints;
-/// the proposer is the seller who published the proposal, whose account the
-/// emulator holds no record of. So `Acceptor` selects the agreements this
-/// account accepted, and `Proposer` selects those it proposed — none, until a
-/// proposer account is ever stored. A party type that is neither value selects
-/// nothing; a handler refuses it where it is a request member, with
-/// [`validation_exception`] and the modelled `INVALID_PARTY_TYPE` reason.
+/// the agreement records for that side ([`agreement_parties`]). A party type
+/// that is neither value selects nothing; a handler refuses it where it is a
+/// request member, with [`validation_exception`] and the modelled
+/// `INVALID_PARTY_TYPE` reason.
 ///
 /// Shared by `SearchAgreements`' `PartyType` filter and by the acceptor side of
 /// [`submitted_request_party_matches`], which is how every listing of

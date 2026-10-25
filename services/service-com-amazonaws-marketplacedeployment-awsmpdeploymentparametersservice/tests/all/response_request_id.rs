@@ -232,12 +232,12 @@ async fn every_response_names_the_request_it_answers_with_a_fresh_id() {
             400,
         ),
         Row::new(
-            "TagResource with a tag value outside the modelled bounds",
+            "TagResource with a tag key outside the tagging limits",
             "POST",
             live_path.clone(),
             400,
         )
-        .with_body(json!({ "tags": { "owner": "not a tag value" } })),
+        .with_body(json!({ "tags": { "": "v" } })),
         Row::new(
             "PutDeploymentParameter with a catalog that names no catalog",
             "POST",

@@ -70,11 +70,11 @@
 //! that record ([`CacheParameterGroupRecord::parameter_values`]), because a
 //! group reports its family's engine defaults with exactly those values laid
 //! over them — which is what `DescribeCacheParameters` answers with.
-//! `ModifyCacheParameterGroup` is the operation that WRITES that map;
-//! `ResetCacheParameterGroup`, which removes an entry from it, is still a
-//! scaffolded 501 and owns its own gap issue. Keeping the map on the group
-//! record is what lets the writer write the copy the reader already reads
-//! instead of a second one beside it.
+//! `ModifyCacheParameterGroup` is the operation that WRITES that map and
+//! `ResetCacheParameterGroup` the one that removes entries from it, so a
+//! parameter a group no longer holds a value for reports the engine's own
+//! default again. Keeping the map on the group record is what lets the writers
+//! write the copy the reader already reads instead of a second one beside it.
 //!
 //! Beside the cache resources sits the RBAC user: `CreateUser` mints one,
 //! `ModifyUser` changes its permissions and the way it authenticates,
@@ -977,9 +977,8 @@ pub struct CacheParameterGroupRecord {
     /// name in this map is the customer's value ([`PARAMETER_SOURCE_USER`]),
     /// one that is not is the service's ([`PARAMETER_SOURCE_SYSTEM`]).
     /// `ModifyCacheParameterGroup` sets an entry and
-    /// `ResetCacheParameterGroup` removes one; the latter is still a scaffolded
-    /// 501 with its own issue, so a value a group has been given stays set
-    /// until it lands.
+    /// `ResetCacheParameterGroup` removes one, which puts the parameter back to
+    /// the engine's own default.
     pub parameter_values: BTreeMap<String, String>,
 }
 
@@ -2144,9 +2143,7 @@ fn allowed_value_range(term: &str) -> Option<(f64, Option<f64>)> {
 /// The one place a value a request asks to SET is held against the catalog, so
 /// every operation that writes a parameter value applies the same rule.
 pub fn check_parameter_value(parameter: &ParameterRecord, value: &str) -> Result<(), String> {
-    if !parameter.is_modifiable || parameter.is_node_type_specific() {
-        return Err(format!("Parameter {} is not modifiable.", parameter.name));
-    }
+    check_parameter_modifiable(parameter)?;
     let number = parameter_number(&parameter.data_type, value);
     // A value that is not one of the parameter's own DATA TYPE is refused for
     // that, naming the type it is not a value of and the value that is not one:
@@ -2176,10 +2173,37 @@ pub fn check_parameter_value(parameter: &ParameterRecord, value: &str) -> Result
     Err(format!("{INVALID_PARAMETER_VALUE}, allowed values are:{allowed}"))
 }
 
+/// Whether a customer may change what the parameter `parameter` describes is
+/// worth at all, or the reason the engine does not let them.
+///
+/// A parameter the engine fixes (`Parameter$IsModifiable: false`) and one whose
+/// value is per cache node type both take whatever value the service or the
+/// node's own capacity gives them, so neither a request SETTING a value nor one
+/// RESETTING it to the engine default asks for a change that can be made. The
+/// one place that rule is stated, so [`check_parameter_value`] and every
+/// operation that only names a parameter word the same refusal.
+pub fn check_parameter_modifiable(parameter: &ParameterRecord) -> Result<(), String> {
+    if !parameter.is_modifiable || parameter.is_node_type_specific() {
+        return Err(format!("Parameter {} is not modifiable.", parameter.name));
+    }
+    Ok(())
+}
+
 /// How ElastiCache opens the refusal of a value a parameter does not take; see
 /// [`check_parameter_value`], which is where the published set the value is
 /// outside of is appended to it.
 const INVALID_PARAMETER_VALUE: &str = "invalid parameter value";
+
+/// How ElastiCache refuses a request that names a parameter the group's family
+/// publishes none of: the refusal names the parameter that was asked for, which
+/// is the one thing the client got wrong.
+///
+/// The one place that refusal is worded, so a request SETTING such a parameter
+/// and one RESETTING it answer a name the published catalog does not carry
+/// identically.
+pub fn unknown_parameter_message(name: &str) -> String {
+    format!("Could not find parameter with name: {name}")
+}
 
 /// How many parameters one request may change: "A maximum of 20 parameters may
 /// be modified per request"

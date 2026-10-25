@@ -49,6 +49,23 @@ pub(crate) fn router() -> MultiServiceRouter {
     router
 }
 
+/// A router serving only this service, over an engine the test ALSO holds, for the
+/// suites that have to reach the service's own store — to rewind an instant the
+/// clock has already made due, or to seed state whose writer is still a scaffolded
+/// 501. Every other suite takes [`router`], which keeps the engine to itself.
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    // The suite drives unsigned requests, so no authenticator is registered.
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+            engine.clone(),
+        ),
+    );
+    (router, engine)
+}
+
 /// One awsQuery call: `Action` plus form parameters, answered with the HTTP status
 /// and the XML body.
 pub(crate) async fn call(

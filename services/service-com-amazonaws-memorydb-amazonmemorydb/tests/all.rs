@@ -21,6 +21,8 @@ mod arn_addressed_refusals;
 mod canonical_access_string;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/default_parameter_group_catalog.rs"]
+mod default_parameter_group_catalog;
 #[path = "all/default_parameter_groups.rs"]
 mod default_parameter_groups;
 #[path = "all/engine_versions.rs"]
@@ -31,6 +33,8 @@ mod events;
 mod fault_http_status;
 #[path = "all/page_size_window.rs"]
 mod page_size_window;
+#[path = "all/page_size_windows.rs"]
+mod page_size_windows;
 #[path = "all/parameter_catalog.rs"]
 mod parameter_catalog;
 #[path = "all/parameter_groups.rs"]

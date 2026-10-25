@@ -5,8 +5,10 @@
 //! Mints a rescore execution plan and INSERTS it into this service's store: a fresh
 //! 36-character id, the ARN built from the request's region, and the submitted
 //! `Name`/`Description`/`CapacityUnits`/`Tags`, all read back by
-//! `DescribeRescoreExecutionPlan` and `ListRescoreExecutionPlans`. A repeated
-//! `ClientToken` returns the plan that token already created. A request past a quota —
+//! `DescribeRescoreExecutionPlan` and `ListRescoreExecutionPlans`. The plan belongs to
+//! the region the request was signed for — the region its ARN names — and is reachable
+//! only through that region. A repeated `ClientToken` returns the plan that token
+//! already created in that same region. A request past a quota —
 //! one plan too many, or a `CapacityUnits` asking for more extra capacity than the
 //! service publishes a ceiling for — is refused with the modelled
 //! `ServiceQuotaExceededException` and stores nothing.
@@ -218,18 +220,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // "Multiple calls to the CreateRescoreExecutionPlanRequest API with the same
-        // client token will create only one rescore execution plan."
+        // client token will create only one rescore execution plan." The token is
+        // scoped to the region this request is addressed to, like the plan it created:
+        // the same token signed for another region mints that region's own plan.
         let client_token = input
             .client_token
             .as_deref()
             .filter(|token| !token.is_empty())
             .map(str::to_string);
         if let Some(token) = client_token.as_deref() {
-            if let Some(plan) = store
-                .client_tokens
-                .get(token)
-                .and_then(|id| store.plans.get(id))
-            {
+            if let Some(plan) = store.plan_for_client_token(&region, token) {
                 return Ok(CreateRescoreExecutionPlanOutput {
                     id: plan.id.clone(),
                     arn: plan.arn.clone(),
@@ -256,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A plan this account has no room for is refused with the modelled quota error
         // rather than stored — which is also what keeps this store finite. Checked after
         // the idempotency lookup above, so a repeated token still gets its plan back.
-        if store.plans.len() >= crate::state::MAX_RESCORE_EXECUTION_PLANS {
+        if store.plan_count() >= crate::state::MAX_RESCORE_EXECUTION_PLANS {
             return Err(
                 CreateRescoreExecutionPlanErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
@@ -276,12 +276,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.next_id(now);
         let arn = crate::state::plan_arn(&region, &id);
 
-        store.arn_index.insert(arn.clone(), id.clone());
-        if let Some(token) = client_token {
-            store.client_tokens.insert(token, id.clone());
-        }
-        store.plans.insert(
-            id.clone(),
+        // The plan is stored in the region this request is addressed to, which is the
+        // region its ARN names and the only scope its id resolves in.
+        store.insert_plan(
+            &region,
             crate::state::RescoreExecutionPlan {
                 id: id.clone(),
                 arn: arn.clone(),
@@ -306,6 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: std::collections::BTreeMap::new(),
                 tags_written: 0,
             },
+            client_token,
         );
         // A tag key identifies at most one tag ("Keys are not case sensitive and must
         // be unique." — `Tag$Key`), so the tags a create carries go in through the same
@@ -314,7 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@length 0..200`, which is `MAX_TAGS_PER_PLAN`, so a create can never take a
         // plan past the ceiling `TagResource` enforces.
         if let Some(tags) = input.tags {
-            if let Some(plan) = store.plans.get_mut(&id) {
+            if let Some(plan) = store.plan_mut(&region, &id) {
                 for tag in tags {
                     plan.put_tag(tag);
                 }

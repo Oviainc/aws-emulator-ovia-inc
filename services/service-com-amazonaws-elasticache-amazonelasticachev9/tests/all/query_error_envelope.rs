@@ -138,12 +138,8 @@ const ERROR_CASES: &[ErrorCase] = &[
     },
     ErrorCase {
         case: "a scaffolded operation, which answers the 501 channel",
-        action: "ResetCacheParameterGroup",
-        params: &[
-            ("CacheParameterGroupName", "default.redis7"),
-            ("ParameterNameValues.ParameterNameValue.1.ParameterName", "maxmemory-policy"),
-            ("ParameterNameValues.ParameterNameValue.1.ParameterValue", "allkeys-lru"),
-        ],
+        action: "CompleteMigration",
+        params: &[("ReplicationGroupId", "no-such-replication-group")],
         status: 501,
         code: "NotImplemented",
     },
