@@ -213,13 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .to_string();
         if !core_network.topology.has_edge_location(&edge_location) {
             return Err(CreateSiteToSiteVpnAttachmentErrorModeled::ValidationException(
-                crate::state::field_rejection(
+                crate::state::no_such_edge(
                     crate::state::FIELD_VPN_CONNECTION_ARN,
-                    crate::state::VALIDATION_REASON_OTHER,
-                    format!(
-                        "core network {} configures no edge location in {edge_location}",
-                        input.core_network_id
-                    ),
+                    &input.core_network_id,
+                    &edge_location,
                 ),
             )
             .into());

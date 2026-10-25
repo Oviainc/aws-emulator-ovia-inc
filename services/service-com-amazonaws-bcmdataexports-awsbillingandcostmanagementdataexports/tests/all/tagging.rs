@@ -292,9 +292,9 @@ async fn tags_belong_to_the_export_they_were_set_on() {
         .ok("DeleteExport", &json!({ "ExportArn": first }))
         .await;
     let recreated = untagged_export(&client, "tag_isolation_one").await;
-    assert_eq!(
+    assert_ne!(
         recreated, first,
-        "recreating a deleted export mints the same name-derived ARN"
+        "the export that takes the freed name is a new one, with an ARN of its own"
     );
     assert_eq!(
         listed_tags(&client, "recreated export", &recreated).await,

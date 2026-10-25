@@ -41,9 +41,16 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The wire error code of `com.amazonaws.emr#InvalidRequestException`, this
+/// service's modelled client-input error: "This exception occurs when there is
+/// something wrong with user input" (HTTP 400). Used by
+/// [`EmulatedService::override_refusal`] so a refusal the framework raises before
+/// any handler runs carries an error identity this service's model declares.
+const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
 
 /// The `com-amazonaws-emr-elasticmapreduce` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +105,44 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Amazon EMR validates an ENUM-valued member itself, ahead of the generic
+        // request validator, and refuses a value outside that enum's value set with
+        // its own modelled client-input error `InvalidRequestException` ("This
+        // exception occurs when there is something wrong with user input", HTTP
+        // 400) — recorded for `ListClusters$ClusterStates` and
+        // `ListNotebookExecutions$Status`, and the identity an SDK client branching
+        // on `emr.exceptions.InvalidRequestException` catches. The framework's
+        // default code here, the synthetic `smithy.framework#ValidationException`,
+        // is an identity no EMR operation declares, so such a client sees only a
+        // generic `ClientError`.
+        //
+        // Every OTHER modelled constraint — a `@length`, a `@range`, a required
+        // member absent — is left to the generic validator's `ValidationException`,
+        // which is what EMR is recorded answering for one (`RunJobFlow`'s
+        // `ManagedScalingPolicy` bounds, and the refusals its own handler raises).
+        // A request violating both classes at once is refused as the enum class,
+        // because that is the check EMR runs first.
+        //
+        // The status (400) and the message stay the framework's: that message is
+        // built from the request, naming the offending value, the member path the
+        // model spells and the constraint it failed. Only the error identity
+        // changes. An authentication refusal keeps the framework's wording — it is
+        // not an input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations)
+                if violations
+                    .iter()
+                    .any(|violation| matches!(violation.kind, ViolationKind::EnumValue(_))) =>
+            {
+                Some(Refused {
+                    code: INVALID_REQUEST_EXCEPTION.to_string(),
+                    message: aws_smithy_schema_server::envelope(violations)?,
+                })
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(

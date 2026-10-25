@@ -1,19 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApprovalTeam
-//! Applies the supplied `Description`, `ApprovalStrategy` and/or `Approvers` to the
-//! stored team, records a new `VersionId` and `LastUpdateTime`, and returns that new
-//! version id. A following `GetApprovalTeam` reports the updated fields and the new
-//! version.
+//! Records the supplied `Description`, `ApprovalStrategy` and/or `Approvers` as a NEW
+//! VERSION of the stored team and returns that version's id.
+//!
+//! "Updates require team approval. Updates to an active team must be approved by the
+//! team": a change to the configuration an ACTIVE team's approvers approved is therefore
+//! not applied where it is asked for. It is REQUESTED — the team keeps its description,
+//! strategy, approvers and version id, reports `PENDING` with `UPDATE_PENDING_APPROVAL`,
+//! and the requested version is what `GetApprovalTeam` reports in `PendingUpdate`, beside
+//! the update session this operation puts the change to the team in
+//! (`UpdateSessionArn`). The clock owes the rest: the approvers' approval
+//! ([`crate::state::UPDATE_APPROVAL_DELAY`]), after which the team reports
+//! `UPDATE_PENDING_ACTIVATION`, and the activation of the approved configuration
+//! ([`crate::state::UPDATE_ACTIVATION_DELAY`]), at which point the requested version
+//! becomes the team's live one and the team is `ACTIVE` again with nothing pending.
+//!
+//! A team whose configuration has never been activated (a team still waiting on its
+//! approvers' invitations), and one that is no longer active, has no approved
+//! configuration to protect, so the change is applied in place and the new version is
+//! live at once.
 //!
 //! * An ARN outside the caller's own account is refused with `AccessDeniedException`
 //!   (403) BEFORE the lookup ([`crate::state::authorize_resource_arn`]); an ARN inside
 //!   it that no stored team carries earns `ResourceNotFoundException` (404).
-//! * A team already in `DELETING` cannot be changed: `ConflictException` (409).
+//! * A team already in `DELETING` cannot be changed: `ConflictException` (409). Neither
+//!   can a team that already has a version awaiting its approvers' approval — one change
+//!   at a time.
 //! * An `MofN` strategy asking for more approvals (M) than the team will have approvers
 //!   (N) earns `ValidationException` (400) — the same unsatisfiable combination
 //!   `CreateApprovalTeam` refuses, checked against the approver set the update produces.
 //!   `Approvers` naming one identity twice is refused the same way.
+//! * A request that would take the store past its session ceiling earns the modelled
+//!   `ServiceQuotaExceededException` (402).
 //!
 //! An approver the request keeps (same `PrimaryIdentityId` from the same identity source)
 //! keeps its `ApproverId` and its invitation response; one the request adds is newly
@@ -22,8 +41,10 @@
 //! Every `UpdateActions` entry is APPLIED to the team the update produces: the single
 //! modelled action ([`crate::state::SYNCHRONIZE_MFA_DEVICES_ACTION`]) synchronizes the
 //! MFA devices of every approver on the team, which `GetApprovalTeam` reports per
-//! approver in `MfaMethods`. A request that carries no field and no action to apply
-//! leaves the team — and therefore its version — as it was.
+//! approver in `MfaMethods`. It changes no member of the configuration the team approved
+//! — it reads each approver's devices back off the identity source — so it takes effect
+//! where it is asked for rather than waiting on an approval. A request that carries no
+//! field and no action to apply leaves the team — and therefore its version — as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -178,7 +199,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The account boundary is evaluated BEFORE the resource is resolved: an ARN
         // outside the caller's account is refused with the modelled
         // `AccessDeniedException` (403) whatever is stored under it, so a client never
@@ -206,21 +226,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // Snapshot what the decision needs, so minting approver ids (which borrows the
-        // store mutably) does not overlap the borrow of the team.
-        let (existing_approvers, status, current_strategy) = {
-            let team = state.team(&input.arn).ok_or_else(not_found)?;
-            (
-                team.approvers.clone(),
-                team.status,
-                team.approval_strategy,
-            )
-        };
+        // Snapshot the stored team, so minting approver ids and the update session (both
+        // of which borrow the store mutably) do not overlap the borrow of the team.
+        let team_record = state.team(&input.arn).cloned().ok_or_else(not_found)?;
+        let existing_approvers = team_record.approvers.clone();
+        let status = team_record.status;
+        let current_strategy = team_record.approval_strategy;
+        let current_description = team_record.description.clone();
+        let outstanding_update = team_record
+            .outstanding_update()
+            .map(|update| update.version_id.clone());
 
         if status == crate::state::TeamStatus::Deleting {
             return Err(UpdateApprovalTeamErrorModeled::ConflictException(ConflictException {
                 message: format!(
                     "Approval team '{}' is being deleted and cannot be updated.",
+                    input.arn
+                ),
+            })
+            .into());
+        }
+
+        // One change at a time: a team already waiting on its approvers has a version it
+        // is moving to, and a second request would ask them to approve two.
+        if let Some(version_id) = outstanding_update {
+            return Err(UpdateApprovalTeamErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Approval team '{}' already has version '{version_id}' awaiting the team's \
+                     approval, so it cannot be updated again.",
                     input.arn
                 ),
             })
@@ -307,6 +340,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .any(|action| action == crate::state::SYNCHRONIZE_MFA_DEVICES_ACTION)
         });
 
+        // Whether this request asks for the team's CONFIGURATION to change. An update
+        // action asks for no configuration member to change: it reads each approver's MFA
+        // devices back off the identity source, which is not a change the team's approvers
+        // have anything to approve.
+        let changes_configuration =
+            input.description.is_some() || new_strategy.is_some() || new_approvers.is_some();
+
+        // A change to the configuration an ACTIVE team's approvers approved has to be
+        // approved by them too, so it is REQUESTED here rather than applied: the team
+        // keeps its description, strategy, approvers and version id, and reports the
+        // requested version until the team approves it and it is activated.
+        if status == crate::state::TeamStatus::Active && changes_configuration {
+            // Nothing is written until every instant this handshake records can be
+            // computed, so a requested change can never be left waiting on an approval
+            // that is owed at no instant at all.
+            if now
+                .checked_add(crate::state::UPDATE_APPROVAL_DELAY)
+                .is_none()
+            {
+                return Err(UpdateApprovalTeamErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the update's approval instant could not be computed".to_string(),
+                    },
+                )
+                .into());
+            }
+
+            // The store is bounded, so a caller looping on this operation cannot grow
+            // this process's memory without end (`crate::state::MAX_SESSIONS`). This
+            // operation declares `ServiceQuotaExceededException` (402), which is the
+            // error for exactly this condition.
+            if state.sessions.len() >= crate::state::MAX_SESSIONS {
+                return Err(
+                    UpdateApprovalTeamErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: format!(
+                                "The account has reached its quota of {} approval sessions.",
+                                crate::state::MAX_SESSIONS
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // The session asks the approvers the team has NOW: they are the ones whose
+            // approval the change needs.
+            let session_approvers: Vec<crate::state::SessionApprover> = team_record
+                .approvers
+                .iter()
+                .map(|approver| crate::state::SessionApprover {
+                    approver_id: approver.approver_id.clone(),
+                    identity_id: approver.primary_identity_id.clone(),
+                    identity_source_arn: approver.primary_identity_source_arn.clone(),
+                    // Nothing records a vote, so every approver starts unanswered; the
+                    // approval the clock owes is what answers for them.
+                    response: crate::state::SessionResponse::NoResponse,
+                    response_time: None,
+                })
+                .collect();
+            let seq = state.next_session_seq();
+            // The one constructor every session of this service is built by
+            // (`crate::state::Session::for_team`), so the update session and the baseline
+            // session differ only in their kind and their approvers.
+            let Some(session) = crate::state::Session::for_team(
+                crate::state::SessionKind::Update,
+                &team_record,
+                session_approvers,
+                crate::state::request_region(ctx.parts()),
+                now,
+                seq,
+            ) else {
+                return Err(UpdateApprovalTeamErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the session's expiration instant could not be computed"
+                            .to_string(),
+                    },
+                )
+                .into());
+            };
+            let session_arn = session.arn.clone();
+            state.insert_session(session);
+
+            let mut requested_approvers = new_approvers.unwrap_or(existing_approvers);
+            if synchronize_mfa_devices {
+                for approver in &mut requested_approvers {
+                    approver.synchronize_mfa_devices();
+                }
+            }
+            let team = state.team_mut(&input.arn).ok_or_else(not_found)?;
+            // An update action is applied where it was asked for, to the team as it
+            // stands: it changes no member the team's approvers approved.
+            if synchronize_mfa_devices {
+                team.synchronize_mfa_devices();
+                team.bump_version(now);
+            }
+            let version = team.mint_version();
+            team.request_update(crate::state::PendingTeamUpdate::requested(
+                version,
+                input.description.clone().unwrap_or(current_description),
+                new_strategy.unwrap_or(current_strategy),
+                requested_approvers,
+                session_arn,
+                now,
+            ));
+            // The version id the caller is answered with is the REQUESTED one: it is the
+            // version the team will carry once this change is approved and activated.
+            return Ok(UpdateApprovalTeamOutput {
+                version_id: Some(version.to_string()),
+            });
+        }
+
+        // A team whose configuration has never been activated — and one that is no longer
+        // active — has no approved configuration to protect, so the change is applied
+        // where it was asked for.
         let team = state.team_mut(&input.arn).ok_or_else(not_found)?;
         let mut applied = false;
         if let Some(description) = input.description.as_ref() {

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNotebookExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNotebookExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNotebookExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the notebook executions the shared engine holds, newest first, filtered by
+//! the editor, execution engine, status and time range the request names, and paged at
+//! [`crate::state::LIST_NOTEBOOK_EXECUTIONS_PAGE_SIZE`]. Every summary is a projection
+//! of the record `StartNotebookExecution` wrote
+//! ([`crate::state::NotebookExecutionRecord::to_summary`]).
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +161,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNotebookExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNotebookExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNotebookExecutions"))
+        use crate::state::{
+            LIST_NOTEBOOK_EXECUTIONS_PAGE_SIZE, NOTEBOOK_EXECUTION_DEFAULT_FROM,
+        };
+
+        // Reporting only: the writes below are the statuses the clock already made due,
+        // each owed at this instant whether or not anybody listed the executions.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListNotebookExecutionsErrorModeled::InternalServerError(
+                InternalServerError {},
+            )
+            .into());
+        };
+        let mut store = state.lock();
+        store.advance_all_notebook_executions(now);
+
+        // "The beginning of time range filter for listing notebook executions. The
+        // default is the timestamp of 30 days ago." / "The end of time range filter for
+        // listing notebook executions. The default is the current timestamp."
+        // (`ListNotebookExecutionsInput$From` and `$To` docs.)
+        let from = input.from.map_or_else(
+            || {
+                crate::state::timestamp(
+                    now.checked_sub(NOTEBOOK_EXECUTION_DEFAULT_FROM).unwrap_or(now),
+                )
+                .as_secs_f64()
+            },
+            |at| at.as_secs_f64(),
+        );
+        let to = input
+            .to
+            .map_or_else(|| crate::state::timestamp(now).as_secs_f64(), |at| at.as_secs_f64());
+
+        // Newest first: ids are minted from a monotonic sequence, so reverse key order
+        // is reverse start order.
+        let matched: Vec<&crate::state::NotebookExecutionRecord> = store
+            .notebook_executions
+            .values()
+            .rev()
+            .filter(|record| {
+                // "The unique identifier of the editor associated with the notebook
+                // execution" (`ListNotebookExecutionsInput$EditorId` doc): an execution
+                // that names no editor is not the one the filter asks for.
+                input.editor_id.as_deref().is_none_or(|editor| {
+                    record.execution.editor_id.as_deref() == Some(editor)
+                })
+            })
+            .filter(|record| {
+                input
+                    .execution_engine_id
+                    .as_deref()
+                    .is_none_or(|engine| record.execution_engine_id() == Some(engine))
+            })
+            .filter(|record| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| record.execution.status.as_deref() == Some(status))
+            })
+            .filter(|record| {
+                let started = record
+                    .execution
+                    .start_time
+                    .map_or(f64::NEG_INFINITY, |at| at.as_secs_f64());
+                started >= from && started <= to
+            })
+            .collect();
+
+        // The marker is the id of the first execution the previous page did not report.
+        let start = match input.marker.as_ref() {
+            Some(marker) => match matched.iter().position(|record| {
+                record.execution.notebook_execution_id.as_deref() == Some(marker.as_str())
+            }) {
+                Some(at) => at,
+                None => {
+                    return Err(ListNotebookExecutionsErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            error_code: None,
+                            message: Some(format!("Marker '{marker}' is not valid.")),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => 0,
+        };
+        let end = matched
+            .len()
+            .min(start + LIST_NOTEBOOK_EXECUTIONS_PAGE_SIZE);
+        let executions: Vec<NotebookExecutionSummary> = matched[start..end]
+            .iter()
+            .map(|record| record.to_summary())
+            .collect();
+        let marker = matched
+            .get(end)
+            .and_then(|record| record.execution.notebook_execution_id.clone());
+
+        Ok(ListNotebookExecutionsOutput {
+            notebook_executions: Some(executions),
+            marker,
+        })
     }
 }

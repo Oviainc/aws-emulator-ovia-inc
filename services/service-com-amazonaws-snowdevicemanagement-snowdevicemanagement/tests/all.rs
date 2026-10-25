@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_device_gate.rs"]
 mod account_device_gate;
+#[path = "all/create_task_tag_validation.rs"]
+mod create_task_tag_validation;
 #[path = "all/device_ec2_instances.rs"]
 mod device_ec2_instances;
 #[path = "all/device_resources.rs"]

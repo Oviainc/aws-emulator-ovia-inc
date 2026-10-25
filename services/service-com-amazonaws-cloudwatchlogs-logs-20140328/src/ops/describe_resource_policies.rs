@@ -289,11 +289,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if scope == crate::state::POLICY_SCOPE_ACCOUNT {
                 store
                     .account_resource_policies
-                    .values()
+                    .iter()
                     // An account-scoped policy is attached to no resource, so a request
                     // filtered to one selects none of them.
                     .filter(|_| wanted_group.is_none())
-                    .map(|policy| (policy.policy_name.clone(), policy))
+                    // The key such a policy is stored under IS its `policyName`, which
+                    // every account-scoped policy carries.
+                    .map(|(policy_name, policy)| (policy_name.clone(), policy))
                     .collect()
             } else {
                 store
@@ -335,7 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_policies: Some(
                 page.iter()
                     .map(|(_, policy)| ResourcePolicy {
-                        policy_name: Some(policy.policy_name.clone()),
+                        policy_name: policy.policy_name.clone(),
                         policy_document: Some(policy.policy_document.clone()),
                         last_updated_time: Some(policy.last_updated_time_ms),
                         policy_scope: Some(policy.policy_scope().to_string()),

@@ -23,6 +23,20 @@ pub const TAGGABLE_KINDS: [&str; 2] = ["feed", "dictionary"];
 /// credential scope, so the ARNs it mints must carry exactly this region.
 pub const REGION: &str = "us-west-2";
 
+/// The `maxResults` a suite asks for when it means "every resource of this endpoint":
+/// the largest page a list of this service admits
+/// (`smithy_query(query="operation",operation="ListFeeds")` gives `maxResults` the range
+/// `{min: 1, max: 100}`), which is also as many resources of a kind as one Region can
+/// hold, so one call reports all of them and a suite never has to page.
+pub const PAGE_SIZE: usize = 100;
+
+/// The `message` an error body carries.
+pub fn message_of(error: &Value) -> &str {
+    error["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refusal carries a message, got {error}"))
+}
+
 /// This service's SigV4 signing name (`OPERATIONS.md`, "Wire protocol"): the router
 /// resolves the claiming service from it.
 pub const SIGNING_NAME: &str = "elemental-inference";
@@ -302,6 +316,42 @@ pub async fn create_tagged_resource(
 /// `GetDictionary`), which is where a tag write or delete has to show up.
 pub async fn read_resource(router: &MultiServiceRouter, kind: &str, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("/v1/{kind}/{id}"), None).await
+}
+
+/// The ids one endpoint's list operation reports, sorted so a comparison does not
+/// depend on which Region minted an id first.
+///
+/// One page of [`PAGE_SIZE`], which is every resource of the kind a Region can hold, so
+/// the list a suite compares against is the whole of what that endpoint reports.
+pub async fn listed_ids(
+    router: &MultiServiceRouter,
+    region: &str,
+    path: &str,
+    member: &str,
+) -> Vec<String> {
+    let uri = format!("{path}?maxResults={PAGE_SIZE}");
+    let (status, page) = call_in_region(router, region, "GET", &uri, None).await;
+    assert_eq!(
+        status, 200,
+        "case {region:?}: GET {uri} answers 200, got {status} with {page}"
+    );
+    assert!(
+        page["nextToken"].is_null(),
+        "case {region:?}: every resource of this Region fits in one page, got {page}"
+    );
+    let mut ids: Vec<String> = page[member]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {region:?}: GET {uri} reports a {member} array, got {page}"))
+        .iter()
+        .map(|summary| {
+            summary["id"]
+                .as_str()
+                .expect("a summary carries an id")
+                .to_string()
+        })
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// One row of the unresolvable-ARN table: how the ARN differs from the one the resource

@@ -587,8 +587,8 @@ pub(crate) fn cases() -> Vec<Case> {
 /// Check `arn` against the modelled `Arn` constraints — `length 20..2048` and
 /// `pattern ^arn:aws[-a-z0-9]*:(bcm-data-exports):[-a-z0-9]*:[0-9]{12}:[-a-zA-Z0-9/:_]+$`
 /// (smithy_query shape `Export`, member `ExportArn`) — piecewise, and that its resource
-/// portion is `expected_resource`.
-fn assert_modelled_arn(case: &str, arn: &str, expected_resource: &str) {
+/// portion names the export called `expected_name` under a generated id of its own.
+fn assert_modelled_arn(case: &str, arn: &str, expected_name: &str) {
     assert!(
         (20..=2048).contains(&arn.len()),
         "case {case:?}: expected an ARN of length 20..2048, got {} in {arn:?}",
@@ -627,9 +627,56 @@ fn assert_modelled_arn(case: &str, arn: &str, expected_resource: &str) {
         "case {case:?}: resource must match [-a-zA-Z0-9/:_]+, got {arn:?}"
     );
     assert_eq!(
-        fields[5], expected_resource,
+        fields[5],
+        format!(
+            "export/{expected_name}/{}",
+            generated_export_id(case, arn, expected_name)
+        ),
         "case {case:?}: unexpected ARN resource in {arn:?}"
     );
+}
+
+/// The generated id the ARN this service minted for the export called `name` carries: the
+/// resource portion of a minted export ARN is `export/<name>/<generated id>`, where the id
+/// is the SERVER's choice and not the caller's.
+///
+/// Panics unless the resource portion has exactly that form and the id is UUID-shaped — the
+/// form this service's export ARNs carry after the export name.
+///
+/// `pub(crate)` so every suite in this target reads a minted id the one way.
+pub(crate) fn generated_export_id<'a>(case: &str, arn: &'a str, name: &str) -> &'a str {
+    let resource = arn
+        .splitn(6, ':')
+        .nth(5)
+        .unwrap_or_else(|| panic!("case {case:?}: {arn:?} carries no ARN resource portion"));
+    let id = resource
+        .strip_prefix(&format!("export/{name}/"))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a resource of export/{name}/<generated id>, got \
+                 {resource:?}"
+            )
+        });
+    assert!(
+        is_uuid_shaped(id),
+        "case {case:?}: expected a UUID-shaped generated id, got {id:?} in {arn:?}"
+    );
+    id
+}
+
+/// Whether `value` carries the 8-4-4-4-12 lowercase-hex shape of a VERSION 4 UUID: the
+/// third group's first glyph is the version nibble, which is `4` for the random form
+/// (`state::new_export_id`).
+pub(crate) fn is_uuid_shaped(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups.iter().map(|group| group.len()).eq([8usize, 4, 4, 4, 12])
+        && groups.iter().all(|group| {
+            group
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
+        })
+        && groups[2].starts_with('4')
 }
 
 fn is_arn_lower_segment_char(c: char) -> bool {
@@ -678,7 +725,7 @@ async fn an_export_round_trips_through_persisted_state() {
             .as_str()
             .unwrap_or_else(|| panic!("case {label:?}: CreateExport returned no ExportArn: {created}"))
             .to_string();
-        assert_modelled_arn(&label, &arn, &format!("export/{}", case.name));
+        assert_modelled_arn(&label, &arn, &case.name);
 
         // GET — every submitted member comes back, plus the server-assigned ExportArn,
         // with the submitted DataQuery reported exactly as it was stored.
@@ -848,12 +895,18 @@ async fn an_export_round_trips_through_persisted_state() {
             "case {label:?}: a deleted export must not be listed"
         );
 
-        // The name is reusable once the export holding it is gone.
+        // The name is reusable once the export holding it is gone — and the export that
+        // takes it is a new one, with an ARN of its own. (`minted_export_arn.rs` is where
+        // that rule is asserted over a table of names and regions.)
         let recreated = client.ok("CreateExport", &case.create_request()).await;
-        assert_eq!(
-            recreated["ExportArn"],
-            json!(arn),
-            "case {label:?}: recreating a deleted export must mint the same name-derived ARN"
+        let recreated_arn = recreated["ExportArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {label:?}: CreateExport returns an ExportArn"))
+            .to_string();
+        assert_modelled_arn(&label, &recreated_arn, &case.name);
+        assert_ne!(
+            recreated_arn, arn,
+            "case {label:?}: recreating a deleted export must mint a NEW ARN"
         );
     }
 }
@@ -1128,7 +1181,7 @@ async fn one_name_is_a_distinct_export_in_each_region() {
             .as_str()
             .unwrap_or_else(|| panic!("case {region:?}: CreateExport returns an ExportArn"))
             .to_string();
-        assert_modelled_arn(region, &arn, &format!("export/{}", case.name));
+        assert_modelled_arn(region, &arn, &case.name);
         assert_eq!(
             arn.split(':').nth(3),
             Some(region),
@@ -1179,10 +1232,18 @@ async fn one_name_is_a_distinct_export_in_each_region() {
     let recreated = client
         .ok_in_region(regions[0], "CreateExport", &case.create_request())
         .await;
+    let recreated_arn = recreated["ExportArn"]
+        .as_str()
+        .expect("CreateExport returns an ExportArn");
+    assert_modelled_arn(regions[0], recreated_arn, &case.name);
     assert_eq!(
-        recreated["ExportArn"],
-        json!(arns[0]),
+        recreated_arn.split(':').nth(3),
+        Some(regions[0]),
         "after the delete the name is free again in that region, got {recreated}"
+    );
+    assert_ne!(
+        recreated_arn, arns[0],
+        "the export that takes the freed name is a new one, with an ARN of its own"
     );
     for (region, arn) in regions.iter().zip(&arns).skip(1) {
         let (status, _) = client.call("GetExport", &json!({ "ExportArn": arn })).await;
@@ -1357,11 +1418,20 @@ async fn creating_past_the_export_limit_is_refused_with_the_quota_error() {
         name: format!("bounded_{index:04}"),
         ..template.clone()
     };
+    let mut freed_arn = String::new();
 
     for index in 0..MAX_EXPORTS {
-        client
+        let created = client
             .ok("CreateExport", &at_limit(index).create_request())
             .await;
+        if index == 0 {
+            // The ARN of the export whose slot the delete below frees: the one the service
+            // minted, since it carries a generated id this test cannot predict.
+            freed_arn = created["ExportArn"]
+                .as_str()
+                .expect("CreateExport returns an ExportArn")
+                .to_string();
+        }
     }
 
     let (status, body) = client
@@ -1411,8 +1481,6 @@ async fn creating_past_the_export_limit_is_refused_with_the_quota_error() {
     );
 
     // Freeing a slot lets the next create through again.
-    let freed = at_limit(0);
-    let freed_arn = engine::emulator_arn(SIGNING_NAME, REGION, &format!("export/{}", freed.name));
     client
         .ok("DeleteExport", &json!({ "ExportArn": freed_arn }))
         .await;

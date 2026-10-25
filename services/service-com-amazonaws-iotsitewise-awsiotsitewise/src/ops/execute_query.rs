@@ -5,6 +5,12 @@
 //! SQL parser and runs it over the shared engine store (`crate::state`), answering
 //! the rows the store holds; this is the ONLY file to touch for it.
 //!
+//! The engine itself — [`run_statement`] and the helpers below it — is this
+//! service's ONE query path: `StartQuery` runs the statements of a workspace's
+//! asynchronous queries through the same entry point, so the two operations cannot
+//! drift about which statements they admit or which rows they read. Changing this
+//! operation's own wire behaviour stays here; changing the engine changes both.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -166,117 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // The statement is SQL, so it goes through a real SQL parser (the `sqlparser`
-        // crate) rather than being matched on as text: a statement the parser cannot
-        // read is a syntax error, which is the request being invalid.
-        //
-        // How big a TREE the statement may build is bounded here, before the parser
-        // sees it, by three measures taken off the statement's TOKENS — the same
-        // lexer the parser itself runs, so no string, delimited identifier or
-        // comment can desynchronise the measures from what the parse will see
-        // ([`parse_nesting`]): how deeply it nests, how many keywords that nest
-        // without a bracket it carries, and how many operators it chains. The third
-        // is what bounds the shape neither of the others sees — a left-associative
-        // chain (`1+1+1+…`) needs no bracket and no keyword, and the parser builds it
-        // iteratively, so nothing in the parse refuses it while the TREE it produces
-        // is as deep as the chain is long. Past any of the three the statement is
-        // refused with a modelled error and no tree is built at all, so neither the
-        // parse, nor the move into the task below, nor the drop of the tree can walk
-        // deeper than this service allows. The parser is given the nesting limit too,
-        // as a second line of defence.
-        let dialect = ::sqlparser::dialect::GenericDialect {};
-        let nesting = parse_nesting(&dialect, &input.query_statement)?;
-        if nesting.nesting > MAX_PARSE_DEPTH {
-            return Err(invalid_request(format!(
-                "The query statement nests {} expressions, which is more than the \
-                 {MAX_PARSE_DEPTH} levels this service parses.",
-                nesting.nesting
-            )));
-        }
-        if nesting.prefix_forms > MAX_PREFIX_FORMS {
-            return Err(invalid_request(format!(
-                "The query statement carries {} of the keywords that nest without a \
-                 bracket, which is more than the {MAX_PREFIX_FORMS} this service parses.",
-                nesting.prefix_forms
-            )));
-        }
-        if nesting.operators > MAX_OPERATORS {
-            return Err(invalid_request(format!(
-                "The query statement chains {} operators, which is more than the \
-                 {MAX_OPERATORS} this service parses.",
-                nesting.operators
-            )));
-        }
-        let mut statements = {
-            let mut parser = ::sqlparser::parser::Parser::new(&dialect)
-                .with_recursion_limit(MAX_PARSE_DEPTH)
-                .try_with_sql(&input.query_statement)
-                .map_err(|error| invalid_request(format!("Invalid query statement: {error}")))?;
-            // The parser itself is dropped here, before anything is awaited: it
-            // borrows the dialect and is not `Send`, and the parsed statements are
-            // all the rest of this handler needs.
-            parser
-                .parse_statements()
-                .map_err(|error| invalid_request(format!("Invalid query statement: {error}")))?
-        };
-        if statements.len() != 1 {
-            return Err(invalid_request(format!(
-                "A query statement carries exactly one statement, but this one carries {}.",
-                statements.len()
-            )));
-        }
-        // A query READS asset data; nothing else is a statement this operation runs,
-        // so anything that is not a query is an invalid query statement. Taken by
-        // VALUE, so the tree moves into the blocking task below instead of being
-        // cloned into it.
-        let ::sqlparser::ast::Statement::Query(query) = statements.remove(0) else {
-            return Err(invalid_request(
-                "A query statement must be a SELECT query.".to_string(),
-            ));
-        };
-        let owned = *query;
-
-        // Every step of the run is charged against ONE budget: a wall-clock deadline,
-        // a row-work step budget and an expression-depth ceiling.
-        let budget = Budget::new();
-        let view = view_of(plan(&owned)?)?;
-        // The store is held only while the view's rows are read off it. Filtering,
-        // ordering and projecting the caller's statement then run WITHOUT the shared
-        // state lock, so no query can hold it for the length of its own
-        // interpretation.
-        let (columns, rows) = {
-            let store = state.lock();
-            materialise(&store, &view.view, &budget)?
-        };
-        // The interpretation itself is CPU-bound and synchronous, so it runs on a
-        // blocking worker under a wall-clock timeout rather than on the async
-        // runtime's: a request that spends its whole budget cannot pin a runtime
-        // worker, and this call has somewhere to land when it is cancelled or the
-        // server is shutting down. The statement MOVES into the task, and `plan` runs
-        // again there because the borrow it answers cannot cross that move; it is a
-        // total check over an already-admitted statement, so it cannot refuse what
-        // the call above accepted.
-        let result = ::tokio::time::timeout(
-            MAX_QUERY_TIME,
-            ::tokio::task::spawn_blocking(move || {
-                let select = plan(&owned)?;
-                run_select(select, &owned, columns, rows, &view, &budget)
-            }),
-        )
-        .await
-        .map_err(|_| {
-            query_timeout(format!(
-                "The query ran for longer than {} seconds without finishing.",
-                MAX_QUERY_TIME.as_secs()
-            ))
-        })?
-        .map_err(|_| {
-            ExecuteQueryError::Modeled(ExecuteQueryErrorModeled::InternalFailureException(
-                InternalFailureException {
-                    message: "the query could not be run".to_string(),
-                },
-            ))
-        })??;
+        // The statement is parsed, planned and RUN by [`run_statement`], this
+        // service's one query engine. `StartQuery` runs the statements of a
+        // workspace's asynchronous queries through that same entry point, so neither
+        // operation can answer a statement the other refuses, or read rows the other
+        // cannot.
+        let result = run_statement(&state, &input.query_statement).await?;
 
         // Paging over the computed result: `nextToken` is the index of the first row
         // of the next page, hex-encoded (the member carries no pattern, and hex keeps
@@ -320,6 +221,245 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             next_token,
         })
+    }
+}
+
+/// Parse `statement`, plan it and run it over the store, answering the rows it
+/// computes and what the run COST.
+///
+/// This is this service's query engine, entered here by both operations that run a
+/// caller's SQL: `ExecuteQuery`, which answers the rows synchronously, and
+/// `StartQuery`, which runs the statement of a workspace's asynchronous query. One
+/// entry point rather than two, so both admit the same statements, over the same
+/// views, under the same budget.
+///
+/// The statement is SQL, so it goes through a real SQL parser (the `sqlparser`
+/// crate) rather than being matched on as text: a statement the parser cannot read
+/// is a syntax error, which is the request being invalid.
+///
+/// How big a TREE the statement may build is bounded before the parser sees it, by
+/// three measures taken off the statement's TOKENS — the same lexer the parser
+/// itself runs, so no string, delimited identifier or comment can desynchronise the
+/// measures from what the parse will see ([`parse_nesting`]): how deeply it nests,
+/// how many keywords that nest without a bracket it carries, and how many operators
+/// it chains. The third is what bounds the shape neither of the others sees — a
+/// left-associative chain (`1+1+1+…`) needs no bracket and no keyword, and the
+/// parser builds it iteratively, so nothing in the parse refuses it while the TREE
+/// it produces is as deep as the chain is long. Past any of the three the statement
+/// is refused with a modelled error and no tree is built at all, so neither the
+/// parse, nor the move into the task below, nor the drop of the tree can walk
+/// deeper than this service allows. The parser is given the nesting limit too, as a
+/// second line of defence.
+///
+/// Failures are reported in `ExecuteQuery`'s own error channel, because the engine
+/// lives in that operation's file; a caller whose channel is a different one asks
+/// [`classify`] which kind of failure it is holding.
+pub(crate) async fn run_statement(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState>,
+    statement: &str,
+) -> Result<QueryRun, ExecuteQueryError> {
+    let dialect = ::sqlparser::dialect::GenericDialect {};
+    let nesting = parse_nesting(&dialect, statement)?;
+    if nesting.nesting > MAX_PARSE_DEPTH {
+        return Err(invalid_request(format!(
+            "The query statement nests {} expressions, which is more than the \
+             {MAX_PARSE_DEPTH} levels this service parses.",
+            nesting.nesting
+        )));
+    }
+    if nesting.prefix_forms > MAX_PREFIX_FORMS {
+        return Err(invalid_request(format!(
+            "The query statement carries {} of the keywords that nest without a \
+             bracket, which is more than the {MAX_PREFIX_FORMS} this service parses.",
+            nesting.prefix_forms
+        )));
+    }
+    if nesting.operators > MAX_OPERATORS {
+        return Err(invalid_request(format!(
+            "The query statement chains {} operators, which is more than the \
+             {MAX_OPERATORS} this service parses.",
+            nesting.operators
+        )));
+    }
+    let mut statements = {
+        let mut parser = ::sqlparser::parser::Parser::new(&dialect)
+            .with_recursion_limit(MAX_PARSE_DEPTH)
+            .try_with_sql(statement)
+            .map_err(|error| invalid_request(format!("Invalid query statement: {error}")))?;
+        // The parser itself is dropped here, before anything is awaited: it
+        // borrows the dialect and is not `Send`, and the parsed statements are
+        // all the rest of this run needs.
+        parser
+            .parse_statements()
+            .map_err(|error| invalid_request(format!("Invalid query statement: {error}")))?
+    };
+    if statements.len() != 1 {
+        return Err(invalid_request(format!(
+            "A query statement carries exactly one statement, but this one carries {}.",
+            statements.len()
+        )));
+    }
+    // A query READS asset data; nothing else is a statement this engine runs,
+    // so anything that is not a query is an invalid query statement. Taken by
+    // VALUE, so the tree moves into the blocking task below instead of being
+    // cloned into it.
+    let ::sqlparser::ast::Statement::Query(query) = statements.remove(0) else {
+        return Err(invalid_request(
+            "A query statement must be a SELECT query.".to_string(),
+        ));
+    };
+    let owned = *query;
+
+    // Every step of the run is charged against ONE budget: a wall-clock deadline,
+    // a row-work step budget and an expression-depth ceiling.
+    let budget = Budget::new();
+    let view = view_of(plan(&owned)?)?;
+    // How long the run takes is MEASURED from here — the instant the store is first
+    // read — to the instant the interpretation answers, because that span is the
+    // work the engine did and is what a query's reported execution time is.
+    let started = ::std::time::Instant::now();
+    // The store is held only while the view's rows are read off it. Filtering,
+    // ordering and projecting the caller's statement then run WITHOUT the shared
+    // state lock, so no query can hold it for the length of its own
+    // interpretation.
+    let (columns, rows) = {
+        let store = state.lock();
+        materialise(&store, &view.view, &budget)?
+    };
+    // How many BYTES of stored cells the run read, summed before the rows move into
+    // the task below. Counted off the materialised rows themselves, so it is what
+    // this run actually scanned rather than a figure standing in for it; `Cell::chars`
+    // answers a cell's BYTE length (see its own documentation), which is what a
+    // `bytesScanned` figure is reported in.
+    let bytes_scanned = rows
+        .iter()
+        .flat_map(|row| row.iter().map(Cell::chars))
+        .sum::<usize>();
+    // The interpretation itself is CPU-bound and synchronous, so it runs on a
+    // blocking worker under a wall-clock timeout rather than on the async
+    // runtime's: a request that spends its whole budget cannot pin a runtime
+    // worker, and this call has somewhere to land when it is cancelled or the
+    // server is shutting down. The statement MOVES into the task, and `plan` runs
+    // again there because the borrow it answers cannot cross that move; it is a
+    // total check over an already-admitted statement, so it cannot refuse what
+    // the call above accepted.
+    let result = ::tokio::time::timeout(
+        MAX_QUERY_TIME,
+        ::tokio::task::spawn_blocking(move || {
+            let select = plan(&owned)?;
+            run_select(select, &owned, columns, rows, &view, &budget)
+        }),
+    )
+    .await
+    .map_err(|_| {
+        query_timeout(format!(
+            "The query ran for longer than {} seconds without finishing.",
+            MAX_QUERY_TIME.as_secs()
+        ))
+    })?
+    .map_err(|_| {
+        ExecuteQueryError::Modeled(ExecuteQueryErrorModeled::InternalFailureException(
+            InternalFailureException {
+                message: "the query could not be run".to_string(),
+            },
+        ))
+    })??;
+
+    Ok(QueryRun {
+        columns: result.columns,
+        rows: result.rows,
+        bytes_scanned: u64::try_from(bytes_scanned).unwrap_or(u64::MAX),
+        elapsed: started.elapsed(),
+    })
+}
+
+/// What one run of a query statement produced: the result itself — the projected
+/// columns and the rows — and what the run cost.
+///
+/// The cost is measured, not estimated: the bytes are summed off the rows the run
+/// read off the store and the duration is the wall clock around the run. A caller
+/// that reports a query's statistics reports these.
+#[derive(Debug)]
+pub(crate) struct QueryRun {
+    columns: Vec<(String, &'static str)>,
+    rows: Vec<Vec<Cell>>,
+    bytes_scanned: u64,
+    elapsed: ::std::time::Duration,
+}
+
+impl QueryRun {
+    /// How many rows the statement answered.
+    pub(crate) fn row_count(&self) -> u64 {
+        u64::try_from(self.rows.len()).unwrap_or(u64::MAX)
+    }
+
+    /// How many bytes of stored cells the run read off the store.
+    pub(crate) fn bytes_scanned(&self) -> u64 {
+        self.bytes_scanned
+    }
+
+    /// How long the run took, from the first read of the store to the answer.
+    pub(crate) fn elapsed(&self) -> ::std::time::Duration {
+        self.elapsed
+    }
+}
+
+/// Which kind of failure a [`run_statement`] error is, with the wording it carries.
+///
+/// The engine answers in `ExecuteQuery`'s error channel; an operation with a channel
+/// of its own — a different error set, or an asynchronous query that reports a
+/// failed RUN through its own status rather than through the response — needs to
+/// know which kind it is holding without re-deciding the classification the engine
+/// already made.
+#[derive(Debug)]
+pub(crate) enum QueryFailure<'a> {
+    /// The statement is not one this service can answer at all: a syntax error, a
+    /// view or column the catalog does not hold, a clause whose value is wrong.
+    Invalid(&'a str),
+    /// Valid SQL a real service would answer that this engine has not written.
+    Unsupported(&'a str),
+    /// The statement outran the engine's budget, so the run did not finish.
+    Timeout(&'a str),
+    /// The run could not be carried out.
+    Internal(&'a str),
+}
+
+/// Which [`QueryFailure`] `error` is. See that type.
+pub(crate) fn classify(error: &ExecuteQueryError) -> QueryFailure<'_> {
+    match error {
+        ExecuteQueryError::NotImplemented(not_implemented) => {
+            QueryFailure::Unsupported(&not_implemented.message)
+        }
+        ExecuteQueryError::ValidationException(validation) => {
+            QueryFailure::Invalid(&validation.message)
+        }
+        ExecuteQueryError::Modeled(modeled) => match modeled {
+            ExecuteQueryErrorModeled::InvalidRequestException(failure) => {
+                QueryFailure::Invalid(&failure.message)
+            }
+            ExecuteQueryErrorModeled::ValidationException(failure) => {
+                QueryFailure::Invalid(failure.message.as_deref().unwrap_or_default())
+            }
+            ExecuteQueryErrorModeled::QueryTimeoutException(failure) => {
+                QueryFailure::Timeout(failure.message.as_deref().unwrap_or_default())
+            }
+            // The engine constructs none of the three below — it has no rate limit,
+            // no identity check and nothing it declares unavailable — but a
+            // classification has to be total, and each says the same thing to a
+            // caller: the run could not be carried out.
+            ExecuteQueryErrorModeled::InternalFailureException(failure) => {
+                QueryFailure::Internal(&failure.message)
+            }
+            ExecuteQueryErrorModeled::ServiceUnavailableException(failure) => {
+                QueryFailure::Internal(&failure.message)
+            }
+            ExecuteQueryErrorModeled::ThrottlingException(failure) => {
+                QueryFailure::Internal(&failure.message)
+            }
+            ExecuteQueryErrorModeled::AccessDeniedException(failure) => {
+                QueryFailure::Internal(failure.message.as_deref().unwrap_or_default())
+            }
+        },
     }
 }
 
@@ -1837,11 +1977,13 @@ fn query_timeout(message: String) -> ExecuteQueryError {
 /// service would answer it, so reporting it as an invalid request would be a false
 /// statement about the caller's query. 501 says what is true — this construct is
 /// not written yet — and is the answer the emulator reserves for exactly that.
+///
+/// The message names the CONSTRUCT and no operation, because every operation that
+/// runs a statement through this engine ([`run_statement`]) answers it, and a
+/// message naming one of them would be wrong for the others.
 fn unsupported(construct: &str) -> ExecuteQueryError {
     ExecuteQueryError::NotImplemented(crate::scaffolded::NotImplemented {
-        message: format!(
-            "operation ExecuteQuery does not implement {construct} in this emulator"
-        ),
+        message: format!("this emulator does not implement {construct} in a query statement"),
     })
 }
 

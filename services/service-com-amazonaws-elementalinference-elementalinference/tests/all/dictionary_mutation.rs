@@ -16,8 +16,9 @@
 //!   `UpdateDictionary` writes the members the request carried (and only those) into the
 //!   stored dictionary, so `GetDictionary` and `ExportDictionaryEntries` report them;
 //! * `DeleteDictionary` retires the dictionary: it reports `DELETING`, and once the
-//!   removal falls due the id stops resolving, so `GetDictionary` answers 404
-//!   `ResourceNotFoundException` — forever, not transiently;
+//!   deletion falls due the id stops resolving for a read, so `GetDictionary` answers 404
+//!   `ResourceNotFoundException` — forever, not transiently — while a retry of the
+//!   delete itself reports the completed deletion (`tests/all/completed_deletion.rs`);
 //! * a dictionary is `REFERENCED`, with the referencing feed's id in `references`,
 //!   exactly while some feed output's subtitling config names it, whichever call put it
 //!   there; and "you cannot delete a dictionary that is referenced by a feed", which is
@@ -26,7 +27,7 @@
 //!   transient one a caller would have to wait out.
 
 use crate::harness::{
-    call, enabled_output, expected_dictionary_arn, past_the_transition_span, router,
+    call, enabled_output, expected_dictionary_arn, message_of, past_the_transition_span, router,
     subtitling_output,
 };
 use serde_json::{json, Value};
@@ -34,13 +35,6 @@ use service_com_amazonaws_elementalinference_elementalinference::state::{
     dictionary_referenced_message, DICTIONARY_BEING_DELETED_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
-
-/// The `message` a refusal carries.
-fn message_of(error: &Value) -> &str {
-    error["message"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the refusal carries a message, got {error}"))
-}
 
 /// Create one dictionary and return its id.
 async fn create_dictionary(router: &MultiServiceRouter, body: Value) -> String {
@@ -454,13 +448,15 @@ async fn delete_dictionary_retires_the_dictionary_from_state() {
             );
         }
 
-        // An id that never existed answers the same 404 as a deleted one.
-        let (status, error) = call(&router, "DELETE", &format!("/v1/dictionary/{id}"), None).await;
+        // Retrying the delete reports the deletion it already served, with the status
+        // the model gives a dictionary after deletion, rather than refusing a call the
+        // service accepted.
+        let (status, retried) = call(&router, "DELETE", &format!("/v1/dictionary/{id}"), None).await;
         assert_eq!(
-            (status, &error["__type"]),
-            (404, &json!("ResourceNotFoundException")),
-            "case {label:?}: deleting a dictionary that is gone is a 404, got {status} with \
-             {error}"
+            (status, &retried["status"]),
+            (202, &json!("DELETED")),
+            "case {label:?}: retrying the completed delete reports DELETED, got {status} with \
+             {retried}"
         );
     }
 }

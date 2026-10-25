@@ -4,8 +4,9 @@
 //! Mints a task, persists it `IN_PROGRESS` with the targets, command, description and
 //! tags the request carried, and queues one execution per target device, so a later
 //! `DescribeTask` / `ListExecutions` reports what this call stored. A target naming no
-//! managed device is answered with the modelled `ResourceNotFoundException`, and
-//! `@idempotencyToken` means a repeated `clientToken` reports the first task rather
+//! managed device is answered with the modelled `ResourceNotFoundException`, a `tags`
+//! map that breaks the AWS-wide tagging rules with the modelled `ValidationException`,
+//! and `@idempotencyToken` means a repeated `clientToken` reports the first task rather
 //! than minting a second.
 //!
 //! ## Shape of an operation
@@ -170,6 +171,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Command::Unlock(_) => crate::state::TaskCommand::Unlock,
             Command::Reboot(_) => crate::state::TaskCommand::Reboot,
         };
+
+        // "Optional metadata that you assign to a resource": the `tags` a create
+        // carries is the same `TagMap` the tagging operations write, so it is held to
+        // the same AWS-wide tagging rules (`crate::state::tag_violation`). The whole
+        // map is checked BEFORE anything else happens — before the idempotency replay,
+        // the targets are resolved, or a record is minted — because it is the REQUEST
+        // that is unacceptable, not the state it would have reached: so a task never
+        // comes into being carrying a tag `TagResource` would refuse, and a repeated
+        // `clientToken` sent with such a map is answered with the refusal rather than
+        // the first task.
+        if let Some(violation) = input.tags.as_ref().and_then(|tags| {
+            crate::state::tag_violation(tags, &::std::collections::BTreeMap::new())
+        }) {
+            return Err(CreateTaskErrorModeled::ValidationException(ValidationException {
+                message: crate::state::tag_validation_message(&violation),
+            })
+            .into());
+        }
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());

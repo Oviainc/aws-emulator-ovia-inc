@@ -25,7 +25,8 @@
 //! Tool profiles (`CreateProfile`, `GetProfile`) are backed the same way, each keyed by the
 //! `ProfileArn` the create minted, and the association of one with a workload
 //! (`AssociateProfiles`, `DisassociateProfiles`) is held on the workload the association is
-//! OF. The agent profiles
+//! OF, pinned at the profile version the workload is reviewed against — the version
+//! `UpgradeProfileVersion` moves to the one that profile is at. The agent profiles
 //! (`CreateAgentProfile`, `GetAgentProfile`, `ListAgentProfiles`) and the optimization
 //! goals recorded against one (`CreateAgentGoal`, `GetAgentGoal`, `DeleteAgentGoal`) are
 //! backed the same way,
@@ -1718,8 +1719,8 @@ pub struct WorkloadRecord {
     ///
     /// `AssociateProfiles` (and a `CreateWorkload` that names a profile) is what adds an
     /// entry here, through [`Self::associate_profile`]; `DisassociateProfiles` is what
-    /// removes one. The list is held at [`MAX_PROFILES_PER_WORKLOAD`] by the operations
-    /// that add to it.
+    /// removes one, and `UpgradeProfileVersion` what moves the version one is pinned at.
+    /// The list is held at [`MAX_PROFILES_PER_WORKLOAD`] by the operations that add to it.
     pub profiles: Vec<WorkloadProfileRecord>,
 }
 
@@ -3642,6 +3643,23 @@ pub struct CreateProfileToken {
     pub fingerprint: String,
 }
 
+/// What an `UpgradeProfileVersion` idempotency token resolves to: the profile whose
+/// association the original request upgraded, plus that request's parameter fingerprint.
+///
+/// The operation answers an EMPTY body, so a replay has no value to return — what the
+/// token is for here is keeping the replay from acting a second time, which matters
+/// because the upgrade can also record a milestone and a second recording of the same
+/// milestone name would collide ([`milestone_name_conflict`]). The profile ARN is kept so
+/// a token reused with different parameters can name the resource it already upgraded, and
+/// the workload id so the token goes with the workload whose association it upgraded
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::remove_workload`]).
+#[derive(Debug, Clone)]
+pub struct UpgradeProfileVersionToken {
+    pub workload_id: String,
+    pub profile_arn: String,
+    pub fingerprint: String,
+}
+
 /// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for an
 /// AGENT profile — the resource `CreateAgentProfile` mints and every
 /// `/api/v1/agent-profiles/{profileArn}` route resolves.
@@ -4244,6 +4262,10 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateProfile`'s `ClientRequestToken` -> what the original request created.
     /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_profile_tokens: TokenLedger<CreateProfileToken>,
+    /// `UpgradeProfileVersion`'s `ClientRequestToken` -> the upgrade the original request
+    /// performed. Caller input keys it, so it is a BOUNDED [`TokenLedger`]: write it
+    /// through [`TokenLedger::remember`].
+    pub upgrade_profile_version_tokens: TokenLedger<UpgradeProfileVersionToken>,
     /// Every stored custom lens, keyed by its 32-lowercase-hex lens id — the resource
     /// part of its ARN, which is how a `LensAlias` names it.
     pub lenses: HashMap<String, LensRecord>,
@@ -4991,6 +5013,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         // A share shares THIS workload, so it cannot outlive it either.
         self.workload_shares.remove(workload_id);
         self.create_workload_share_tokens
+            .retain(|token| token.workload_id != workload_id);
+        // An upgrade token resolves to the upgrade of an association OF this workload, so
+        // it goes with the associations the record above carried.
+        self.upgrade_profile_version_tokens
             .retain(|token| token.workload_id != workload_id);
         Some(record)
     }
