@@ -267,11 +267,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(UpdateAccountCustomizationsOutput {
-            account_color: Some(
-                stored
-                    .account_color
-                    .unwrap_or_else(|| crate::state::ACCOUNT_COLOR_NONE.to_string()),
-            ),
+            // The same rule `GetAccountCustomizations` reports the colour under,
+            // stated once on the record (`AccountUxCustomization::
+            // reported_account_color`): this echo and a later read of the record
+            // this request stored cannot answer two different colours.
+            account_color: Some(stored.reported_account_color().to_string()),
             visible_services: stored.visible_services,
             visible_regions: stored.visible_regions,
         })

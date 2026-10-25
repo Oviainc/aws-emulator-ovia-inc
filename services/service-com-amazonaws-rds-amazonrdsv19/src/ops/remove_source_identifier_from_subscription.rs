@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveSourceIdentifierFromSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveSourceIdentifierFromSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveSourceIdentifierFromSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +132,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveSourceIdentifierFromSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveSourceIdentifierFromSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveSourceIdentifierFromSubscription"))
+        // A subscription belongs to the region it was created in, so only that region's
+        // subscriptions are in scope for a call signed for it.
+        let region = crate::state::request_region(ctx)
+            .map_err(RemoveSourceIdentifierFromSubscriptionError::validation)?;
+        let name = input.subscription_name;
+        let source_identifier = input.source_identifier;
+
+        // Both values the request names are checked BEFORE the store is touched, so a
+        // request this service refuses changes no subscription.
+        crate::state::check_subscription_name(&name)
+            .map_err(RemoveSourceIdentifierFromSubscriptionError::invalid_parameter_value)?;
+        // "An identifier must begin with a letter and must contain only ASCII letters,
+        // digits, and hyphens. It can't end with a hyphen or contain two consecutive
+        // hyphens" — the rule the identifier members of this service share, and the one
+        // `CreateEventSubscription` applies to each `SourceIds` entry.
+        crate::state::check_identifier(
+            "SourceIdentifier",
+            &source_identifier,
+            crate::state::MAX_SOURCE_ID_LEN,
+        )
+        .map_err(RemoveSourceIdentifierFromSubscriptionError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a fabricated subscription.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // A name this region holds no subscription under is the modelled 404.
+        let key = (region.clone(), name.clone());
+        let Some(record) = store.event_subscriptions.get_mut(&key) else {
+            return Err(
+                RemoveSourceIdentifierFromSubscriptionErrorModeled::SubscriptionNotFoundFault(
+                    SubscriptionNotFoundFault {
+                        message: Some(format!("Event Subscription {name} not found.")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The source this call removes is resolved against the subscription's OWN sources
+        // rather than against the region's resources: what the operation removes is the
+        // subscription's interest in a source, so an identifier the subscription does not
+        // cover is the source that "could not be found" (`SourceNotFoundFault`), and a
+        // source whose resource was deleted meanwhile is still removable, because the
+        // subscription is what holds it.
+        let Some(position) = record
+            .source_ids
+            .iter()
+            .position(|stored| *stored == source_identifier)
+        else {
+            return Err(
+                RemoveSourceIdentifierFromSubscriptionErrorModeled::SourceNotFoundFault(
+                    SourceNotFoundFault {
+                        message: Some(format!(
+                            "Source id {source_identifier} is not subscribed to event \
+                             subscription {name}."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The sources that remain keep the order the subscription stored them in: removing
+        // one source leaves every other source of the subscription exactly as it was.
+        record.source_ids.remove(position);
+
+        Ok(RemoveSourceIdentifierFromSubscriptionOutput {
+            event_subscription: Some(record.to_wire()),
+        })
     }
 }
+

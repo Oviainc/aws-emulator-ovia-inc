@@ -261,6 +261,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Tell the store the earliest instant at which `settle` has to look at the
         // keyspaces again.
         store.note_transition_due(settles_at);
+        // The tables are gone, so the CDC streams that followed them are: a stream
+        // captures the changes of one table, and that table no longer exists.
+        let forgotten = streams
+            .lock()
+            .forget_streams_in_keyspace(&region, &input.keyspace_name);
+        // A tag set belongs to a stream, so the tag sets of the streams just forgotten go
+        // with them: nothing may answer for a stream ARN the stream store no longer
+        // holds, not even in the span before `settle` removes the keyspace — and its
+        // tables — itself. The same step `DeleteTable` takes for the one table it deletes.
+        store.forget_stream_tags(&region, &forgotten);
         drop(store);
 
         // Every table deleted with the keyspace takes its capacities with it, so the
@@ -275,11 +285,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 table_name,
             );
         }
-        // The tables are gone, so the CDC streams that followed them are: a stream
-        // captures the changes of one table, and that table no longer exists.
-        streams
-            .lock()
-            .forget_streams_in_keyspace(&region, &input.keyspace_name);
 
         Ok(DeleteKeyspaceOutput {})
     }

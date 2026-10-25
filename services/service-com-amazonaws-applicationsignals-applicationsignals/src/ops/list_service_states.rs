@@ -159,7 +159,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// A read: it projects what the store holds and persists nothing. The range is refused
     /// when it does not run forwards — a rule about the PAIR of members, so it is enforced
     /// here rather than by a per-member constraint — and the reported range is the requested
-    /// one, as `ListServices` reports it.
+    /// one, as `ListServices` reports it. The page bound is refused the same way when it is
+    /// not a count of at least one item: this operation's `MaxResults` models a maximum and
+    /// no minimum, so the minimum every list of this service holds to is stated here.
     ///
     /// The projection is derived in `crate::state`
     /// ([`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::observed_service_states`]),
@@ -177,6 +179,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The page bound is a PER-MEMBER constraint, so it is answered first, as the
+        // boundary validator answers every constraint the model does state before any
+        // handler rule about a pair of members runs.
+        //
+        // `MaxResults` carries the model's own `@default` of 20, and its range states a
+        // MAXIMUM only — no minimum — so a bound of zero or below is inside the modelled
+        // range and reaches this handler. It is refused here, by the same page-bound rule
+        // every list of this service holds: a page is a count of items, so the smallest a
+        // caller can ask for is one, and a bound is refused rather than coerced into a page
+        // the request never asked for.
+        let page_size = crate::state::page_bound(
+            MAX_RESULTS_MEMBER_PATH,
+            input.max_results,
+            crate::state::MAX_SERVICE_STATES_PAGE,
+        )
+        .map_err(refused)?;
+
         if let Some(message) = crate::state::time_range_refusal(&input.start_time, &input.end_time)
         {
             return Err(refused(message));
@@ -210,13 +229,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // `MaxResults` carries the model's own `@default` of 20 and its `range ..250` is
-        // refused before this handler runs, so the bound is read straight off the input.
         let (service_states, next_token) = crate::state::page_of(
             observed,
             crate::state::SERVICE_STATES_TOKEN_TAG,
             input.next_token.as_deref(),
-            input.max_results.max(0) as usize,
+            page_size,
         )
         .map_err(refused)?;
 
@@ -229,10 +246,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The member path a refusal of this operation's page bound names: `MaxResults`, spelled the
+/// way the boundary validator spells a member path for this service — camel case, as the
+/// refusal of the same bound on a sibling list spells it.
+const MAX_RESULTS_MEMBER_PATH: &str = "maxResults";
+
 /// This operation's modelled refusal of a request it will not serve: `ValidationException`
 /// (HTTP 400), the only client error it declares beyond throttling.
-fn refused(message: String) -> ListServiceStatesError {
-    ListServiceStatesErrorModeled::ValidationException(ValidationException {
+fn refused(message: String) -> ListServiceStatesError {    ListServiceStatesErrorModeled::ValidationException(ValidationException {
         message: Some(message),
     })
     .into()

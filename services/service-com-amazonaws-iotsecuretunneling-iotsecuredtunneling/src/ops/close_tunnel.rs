@@ -130,15 +130,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("CloseTunnel"))?;
 
         let now = ::std::time::SystemTime::now();
+        // A tunnel is closed through the endpoint of its own Region and no other:
+        // a tunnel of another Region is not a resource this one holds.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         store.materialize_expired_tunnels(now);
 
-        if !store.tunnels.contains_key(&input.tunnel_id) {
+        if store.tunnel(&region, &input.tunnel_id).is_none() {
             return Err(CloseTunnelErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::tunnel_not_found_message(&input.tunnel_id)),
@@ -150,11 +152,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `delete` carries no declared default, so an absent flag is the documented
         // `false`: close the tunnel but keep its data readable.
         if input.delete.unwrap_or(false) {
-            if let Some(tunnel) = store.tunnels.remove(&input.tunnel_id) {
-                store.arn_index.remove(&tunnel.tunnel_arn);
-                store.tags.remove(&tunnel.tunnel_arn);
-            }
-        } else if let Some(tunnel) = store.tunnels.get_mut(&input.tunnel_id) {
+            store.remove_tunnel(&region, &input.tunnel_id);
+        } else if let Some(tunnel) = store.tunnel_mut(&region, &input.tunnel_id) {
             tunnel.status = crate::state::TunnelStatus::Closed;
             // "we close the WebSocket connections between the client and proxy
             // server": neither end is connected to a closed tunnel.

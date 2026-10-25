@@ -23,8 +23,11 @@
 //!
 //! * a job no worker has claimed, or one already completed, takes no result
 //!   (`InvalidJobStateException`): there is no worker whose outcome it is;
-//! * a nonce that is not the one the job's newest poll published does not claim it
-//!   (`InvalidNonceException`), which is what makes the claim exclusive;
+//! * a nonce no dispatch of the job published, and any nonce at all once a worker has
+//!   claimed the job, does not claim it (`InvalidNonceException`), which is what makes
+//!   the claim exclusive — while the job is still waiting, EVERY nonce a poll
+//!   published for it claims it, because a redelivery does not take the job away from
+//!   the worker that was handed it first;
 //! * a job whose ACTION is no longer running — abandoned by a stop, or already finished
 //!   — is not work any more, so it is swept away ([`super::ComAmazonawsCodepipelineCodepipeline20150709State::retire_finished_jobs`])
 //!   and a call naming it is answered `JobNotFoundException`, exactly as `PollForJobs`
@@ -91,9 +94,16 @@ pub enum JobProblem {
 ///
 /// `AcknowledgeJob` "confirms a job worker has received the specified job", which is what
 /// makes that worker the one whose result the job accepts: the job moves to `InProgress`
-/// and its claim is no longer open to another worker. A job that is not waiting to be
-/// claimed takes no acknowledgement — the nonce that claimed it is the only one that ever
-/// reached it, so presenting one for a job already claimed or completed is refused.
+/// and its claim is no longer open to another worker. Two conditions follow, and both are
+/// `InvalidNonceException`:
+///
+/// * a job that is no longer waiting to be claimed takes no acknowledgement — the claim
+///   it already granted is what "worked on by only one job worker" means, so no nonce
+///   reaches it any more;
+/// * while it IS waiting, the nonce has to be one a poll published for it — any of them:
+///   a job that resurfaced with a fresh nonce is still the job the earlier dispatch
+///   handed out, so the earlier nonce claims it just as well, and claiming through one of
+///   them is what closes the others.
 pub fn acknowledge(
     state: &mut State,
     job_id: &str,
@@ -104,20 +114,12 @@ pub fn acknowledge(
     // is the sweep every job-worker operation performs first.
     state.retire_finished_jobs();
     let job = job_mut(state, job_id)?;
-    if job.nonce.as_deref() != Some(nonce) {
-        return Err(JobProblem::InvalidNonce(format!(
-            "Nonce {nonce} is not the nonce the newest poll published for job {job_id}"
+    if job.status != JOB_STATUS_QUEUED || !job.admits_nonce(nonce) {
+        return Err(JobProblem::InvalidNonce(super::invalid_nonce_message(
+            job_id,
         )));
     }
-    if job.status != JOB_STATUS_QUEUED {
-        return Err(JobProblem::InvalidNonce(format!(
-            "Nonce {nonce} no longer claims job {job_id}, which is in status {}: a job is \
-             worked on by only one job worker",
-            job.status
-        )));
-    }
-    job.status = JOB_STATUS_IN_PROGRESS.to_string();
-    job.last_status_change = now;
+    job.claim(nonce, now);
     Ok(job.status.clone())
 }
 
@@ -179,8 +181,7 @@ pub fn record_success(
             // token, so the worker's next poll is handed the continuing work rather than
             // a second record accumulating for one action.
             job.status = JOB_STATUS_QUEUED.to_string();
-            job.nonce = None;
-            job.leased_until = None;
+            job.release();
             job.continuation_token = Some(token);
             job.last_status_change = now;
             return Ok(());

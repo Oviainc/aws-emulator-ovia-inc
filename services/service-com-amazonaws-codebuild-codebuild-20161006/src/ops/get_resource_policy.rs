@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resource-based policy stored against one resource's ARN: this is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -134,23 +127,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_RESOURCE_POLICY_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the policy document stored against `resourceArn`, exactly as it was
+    /// stored.
+    ///
+    /// A resource-based policy is state keyed by the ARN it is attached to, so this
+    /// read is that one lookup: the document comes back byte for byte, because it is a
+    /// caller-supplied grant whose exact text a reader has to hand back, and an ARN
+    /// carrying no policy is a missing resource rather than an empty answer.
+    ///
+    /// Purely reporting: nothing in the store changes, so a later caller sees exactly
+    /// what this one saw.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this operation models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetResourcePolicy (this engine carries no CodeBuild state)",
+            ));
+        };
+        let _ = ctx;
+
+        // `resourceArn` is typed only `NonEmptyString`, so the ARN is parsed before the
+        // store is read, the way `crate::ops::put_resource_policy` parses the ARN it
+        // writes against: a value that is not the ARN of a resource this service
+        // attaches a policy to is a malformed input rather than a missing one.
+        if crate::state::PolicyTarget::of_arn(&input.resource_arn).is_none() {
+            return Err(GetResourcePolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INVALID_RESOURCE_ARN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let policy = state
+            .lock()
+            .resource_policies
+            .get(&input.resource_arn)
+            .map(|held| held.policy.clone());
+        let Some(policy) = policy else {
+            return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::RESOURCE_POLICY_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetResourcePolicyOutput {
+            policy: Some(policy),
+        })
     }
 }

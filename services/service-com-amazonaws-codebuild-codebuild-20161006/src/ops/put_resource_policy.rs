@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
+//! Stores the resource-based policy that shares one project or report group: this is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -137,23 +130,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_RESOURCE_POLICY_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Store `policy` against the ARN of the project or report group it shares, and
+    /// answer that ARN.
+    ///
+    /// A resource-based policy is state keyed by the ARN it is attached to, so this
+    /// write REPLACES whatever document that ARN already carried — the document is the
+    /// whole grant rather than a delta, so the last writer wins and nothing of an
+    /// earlier one survives — and the document is persisted VERBATIM: it is a
+    /// caller-supplied grant whose exact text a reader has to hand back, so nothing
+    /// here re-serializes, escapes or normalises it.
+    ///
+    /// The request is parsed before the store is read: `resourceArn` is typed only
+    /// `NonEmptyString`, so a value that is not the ARN of a resource this service
+    /// attaches a policy to (`PutResourcePolicy` stores one "for the ARN of a Project
+    /// or ReportGroup object") is a malformed input rather than a missing resource, and
+    /// so is a `policy` that is not the JSON-formatted document the member describes.
+    /// An ARN of the right shape that this account holds no resource for is the missing
+    /// resource.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this operation models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutResourcePolicy (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let Some(target) = crate::state::PolicyTarget::of_arn(&input.resource_arn) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&input.resource_arn),
+            );
+            return Err(invalid_input(crate::state::INVALID_RESOURCE_ARN_MESSAGE));
+        };
+
+        if !crate::state::is_policy_document(&input.policy) {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&input.resource_arn),
+            );
+            return Err(invalid_input(
+                crate::state::INVALID_POLICY_DOCUMENT_MESSAGE,
+            ));
+        }
+
+        let now = crate::state::now_millis();
+        let mut guard = state.lock();
+        if !guard.holds_policy_target(&input.resource_arn) {
+            // The lock is dropped before the audit record is written, so a log consumer
+            // never waits on this request's critical section.
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.resource_arn),
+            );
+            return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(target.absent_message().to_string()),
+                },
+            )
+            .into());
+        }
+        guard.resource_policies.insert(
+            input.resource_arn.clone(),
+            crate::state::StoredResourcePolicy {
+                // MOVED, not copied: the document is caller-sized, and nothing below
+                // reads it.
+                policy: input.policy,
+                last_modified_millis: now,
+            },
+        );
+        drop(guard);
+
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::ResourcePolicyStored,
+            Some(&input.resource_arn),
+        );
+
+        // The ARN the policy was stored against, which is the one the request named:
+        // `PutResourcePolicyOutput$resourceArn` is "The ARN of the Project or
+        // ReportGroup resource that is associated with a resource policy".
+        Ok(PutResourcePolicyOutput {
+            resource_arn: Some(input.resource_arn),
+        })
     }
+}
+
+/// A refusal of the request itself, as the one modelled client error for a malformed
+/// input. `message` is a FIXED sentence of CodeBuild's, so nothing of the request —
+/// above all not the policy document, which is the caller's own text — reaches the wire
+/// in it.
+fn invalid_input(message: &str) -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

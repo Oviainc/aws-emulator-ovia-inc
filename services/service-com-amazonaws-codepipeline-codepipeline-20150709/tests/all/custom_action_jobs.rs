@@ -15,7 +15,8 @@
 //!    property to the value supplied.
 //! 4. A poll reports the jobs waiting for that action type, oldest first, at most
 //!    `maxBatchSize` of them, each handed out with a fresh `nonce` and then withheld
-//!    from later polls until that claim lapses.
+//!    from later polls until that claim lapses — and every nonce a dispatch published
+//!    claims the job until one of them has.
 //!
 //! `GetJobDetails` reads one of those jobs back by its id — the round trip for the job
 //! the execution plane queued — and refuses an id that names no job with
@@ -29,6 +30,7 @@
 //! one write path. Everything else goes through `MultiServiceRouter::dispatch`, so
 //! nothing here can pass by reading a handler's internals.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -691,8 +693,7 @@ async fn an_execution_reaching_a_custom_action_queues_a_job_for_its_worker() {
 
 /// Rule 4's second half, as the invariant it is: the job a poll reports is HELD for
 /// that worker — a poll in the meantime is reported nothing — and once the claim lapses
-/// the job is available again, with a new nonce, so the lapsed one no longer reaches
-/// it.
+/// the job is available again, handed out with a new nonce.
 #[tokio::test]
 async fn a_polled_job_is_held_until_its_claim_lapses() {
     let emulator = Emulator::new();
@@ -735,6 +736,101 @@ async fn a_polled_job_is_held_until_its_claim_lapses() {
         "case \"a poll after the claim lapsed\": expected a fresh nonce, got {second_nonce:?} \
          twice"
     );
+}
+
+/// RULE: a redelivery does not take the job away from the worker that was handed it
+/// first. Every nonce a poll published for a job still WAITING to be claimed claims
+/// it, whichever dispatch published it, and the acknowledgement is what closes the
+/// set: once one of them has claimed the job, none of them claims it any more.
+///
+/// The rows differ along which of the outstanding dispatches acknowledges — the first,
+/// a middle one, the newest — because the rule is about the whole set and not about
+/// one position in it.
+#[tokio::test]
+async fn every_nonce_a_poll_published_claims_the_job_until_one_of_them_has() {
+    /// How many times each row lets the job be re-dispatched without acknowledging it.
+    const DISPATCHES: usize = 3;
+
+    for claiming in 0..DISPATCHES {
+        let case = format!("the nonce of dispatch {} claims the job", claiming + 1);
+        let emulator = Emulator::new();
+        let pipeline = format!("nonce-pipe-{claiming}");
+        let (action_type, _) =
+            running_pipeline(&emulator, &pipeline, json!([]), json!({"Command": "build"})).await;
+
+        // The same job, dispatched `DISPATCHES` times: nothing acknowledges it, so
+        // each lapsed claim makes it available again with a nonce of its own.
+        let first = emulator.poll_until_job(&action_type).await;
+        let job_id = first["id"].as_str().unwrap_or_default().to_string();
+        let mut nonces = vec![first["nonce"].as_str().unwrap_or_default().to_string()];
+        while nonces.len() < DISPATCHES {
+            // Nothing sleeps in the handler: the claim lapses by the passage of time.
+            tokio::time::sleep(JOB_POLL_LEASE + Duration::from_millis(100)).await;
+            let (status, response) = emulator.poll(&action_type, None, None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from a poll, got {status} with {response}"
+            );
+            let jobs = reported_jobs(&response);
+            assert_eq!(
+                jobs.iter().map(|job| job["id"].as_str()).collect::<Vec<_>>(),
+                vec![Some(job_id.as_str())],
+                "case {case:?}: an unacknowledged job is dispatched again, got {response}"
+            );
+            nonces.push(jobs[0]["nonce"].as_str().unwrap_or_default().to_string());
+        }
+        let distinct: BTreeSet<&String> = nonces.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            nonces.len(),
+            "case {case:?}: each dispatch publishes its own nonce, got {nonces:?}"
+        );
+
+        // The chosen dispatch's nonce claims the job, whichever one it is.
+        let acknowledged = emulator
+            .ok(
+                "AcknowledgeJob",
+                &json!({"jobId": job_id, "nonce": nonces[claiming]}),
+            )
+            .await;
+        assert_eq!(
+            acknowledged["status"],
+            json!("InProgress"),
+            "case {case:?}: the acknowledgement reports the status the job now carries, \
+             got {acknowledged}"
+        );
+
+        // And the claim closes the set: every nonce the job ever published — the one
+        // that claimed it included — and any nonce it never published are refused with
+        // the error the operation models, worded over the job the nonce was presented
+        // for.
+        let refused: Vec<(String, String)> = nonces
+            .iter()
+            .enumerate()
+            .map(|(index, nonce)| (format!("dispatch {}", index + 1), nonce.clone()))
+            .chain(std::iter::once((
+                "a nonce no dispatch published".to_string(),
+                flip_first_digit(&nonces[claiming]),
+            )))
+            .collect();
+        for (which, nonce) in refused {
+            let (status, response) = emulator
+                .cp("AcknowledgeJob", &json!({"jobId": job_id, "nonce": nonce}))
+                .await;
+            let (code, message) = error_of("AcknowledgeJob", &response);
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InvalidNonceException"),
+                "case {case:?}, {which}: a claimed job is claimed by nobody else, got \
+                 {status} {response}"
+            );
+            assert_eq!(
+                message,
+                format!("Invalid nonce for job id {job_id}"),
+                "case {case:?}, {which}: unexpected refusal wording"
+            );
+        }
+    }
 }
 
 /// Rule 4's cap, exhaustively over how many jobs are waiting and how many the caller

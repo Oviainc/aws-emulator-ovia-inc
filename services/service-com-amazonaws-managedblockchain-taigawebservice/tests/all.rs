@@ -29,6 +29,8 @@ mod list_accessors;
 mod list_members;
 #[path = "all/list_proposal_votes.rs"]
 mod list_proposal_votes;
+#[path = "all/listing_scope_before_filters.rs"]
+mod listing_scope_before_filters;
 #[path = "all/member_deletion_lifecycle.rs"]
 mod member_deletion_lifecycle;
 #[path = "all/modelled_error_payloads.rs"]

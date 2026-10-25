@@ -2,7 +2,11 @@
 
 //! @op DescribeTunnel
 //!
-//! Reports the stored tunnel `tunnelId` names, built entirely from [`crate::state`].
+//! Reports the stored tunnel `tunnelId` names in the Region of the endpoint the
+//! request came in on, built entirely from [`crate::state`]. A tunnel of another
+//! Region is not a resource this endpoint holds, so it answers the modelled
+//! `ResourceNotFoundException` for one.
+//!
 //! A read: it never mints, rotates or echoes an access token (the real API does not
 //! return them here), and the only state it settles is the close the clock already
 //! owed a tunnel whose `maxLifetimeTimeoutMinutes` has elapsed.
@@ -133,16 +137,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("DescribeTunnel"))?;
 
         let now = ::std::time::SystemTime::now();
+        // A tunnel belongs to the Region of the endpoint it was opened against, so
+        // only that endpoint reports it: a tunnel of another Region is not a
+        // resource this one holds.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         // Settle the transition the clock already made due before reporting.
         store.materialize_expired_tunnels(now);
 
-        let Some(stored) = store.tunnels.get(&input.tunnel_id).cloned() else {
+        let Some(stored) = store.tunnel(&region, &input.tunnel_id).cloned() else {
             return Err(DescribeTunnelErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::tunnel_not_found_message(&input.tunnel_id)),

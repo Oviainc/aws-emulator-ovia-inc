@@ -22,10 +22,14 @@ use super::execution::{
     STATUS_FAILED, STATUS_STOPPED, STATUS_STOPPING, STATUS_SUCCEEDED, TRANSITION_INBOUND,
     TRANSITION_OUTBOUND,
 };
+use super::rules::{
+    ConditionOutcome, CONDITION_TYPE_BEFORE_ENTRY, CONDITION_TYPE_ON_SUCCESS, RESULT_FAIL,
+    RESULT_SKIP,
+};
 use super::{
     random_uuid_v4, ComAmazonawsCodepipelineCodepipeline20150709State, PipelineExecutionRecord,
 };
-use crate::ops::types::SourceRevision;
+use crate::ops::types::{Condition, SourceRevision};
 
 /// The `ActionCategory` of an action that waits for a human decision.
 const CATEGORY_APPROVAL: &str = "Approval";
@@ -51,6 +55,9 @@ const STAGE_IN_PROGRESS: &str = "InProgress";
 const STAGE_SUCCEEDED: &str = "Succeeded";
 /// See [`STAGE_IN_PROGRESS`].
 const STAGE_FAILED: &str = "Failed";
+/// See [`STAGE_IN_PROGRESS`]. The status of a stage an entry condition's `SKIP` result
+/// kept the execution out of.
+const STAGE_SKIPPED: &str = "Skipped";
 
 /// Materialise every step of `pipeline_name`'s executions the clock has already made
 /// due, performing each step's real work.
@@ -94,6 +101,7 @@ pub fn plan(
         executions,
         executions_by_pipeline,
         jobs,
+        rule_executions,
         ..
     } = store;
     let pipeline = pipelines.get(pipeline_name)?;
@@ -117,6 +125,7 @@ pub fn plan(
             declaration,
             pipeline_arn: &pipeline.arn,
             jobs: &mut *jobs,
+            rules: &mut *rule_executions,
             disabled: &disabled,
         };
         if let Some(job) = step_execution(record, &mut context, now) {
@@ -139,6 +148,9 @@ struct StepContext<'a> {
     /// The jobs waiting for custom actions' workers: written when an execution
     /// reaches an action CodePipeline does not run itself.
     jobs: &'a mut super::JobQueue,
+    /// The rule executions the stage-condition plane records: written when an
+    /// execution reaches a stage whose conditions declare rules.
+    rules: &'a mut super::RuleExecutionLog,
     /// The `(stage, StageTransitionType)` pairs a caller has disabled.
     disabled: &'a ::std::collections::BTreeSet<(String, String)>,
 }
@@ -204,7 +216,11 @@ fn step_execution(
 
     for index in 0..record.stages.len() {
         match record.stages[index].status.as_deref() {
-            Some(STAGE_SUCCEEDED) => {
+            // A stage the execution is past: it either ran to success or an entry
+            // condition that was met kept the execution out of it with `SKIP`. Either
+            // way the execution carries on, so the only thing that holds it here is
+            // the outbound transition.
+            Some(STAGE_SUCCEEDED | STAGE_SKIPPED) => {
                 // "Disabling the outbound transition" holds the execution IN the stage
                 // it has finished, so it never enters the stage after it.
                 if transition_held(
@@ -231,6 +247,27 @@ fn step_execution(
                 ) {
                     return None;
                 }
+                // A stage's ENTRY conditions are evaluated at the instant the
+                // execution would enter it, and a condition that was MET decides
+                // whether it does.
+                match settle_conditions(record, context, index, CONDITION_TYPE_BEFORE_ENTRY, now) {
+                    ConditionGate::Proceed => {}
+                    ConditionGate::Skipped => {
+                        // A skipped stage is one the execution is PAST, so the same
+                        // outbound hold the arm above applies decides whether it may
+                        // leave it for the next stage.
+                        if transition_held(
+                            disabled,
+                            &record.stages[index].name,
+                            TRANSITION_OUTBOUND,
+                        ) && index + 1 < record.stages.len()
+                        {
+                            return None;
+                        }
+                        continue;
+                    }
+                    ConditionGate::Failed => return None,
+                }
                 record.stages[index].status = Some(STAGE_IN_PROGRESS.to_string());
                 record.last_update_time = now;
             }
@@ -238,10 +275,110 @@ fn step_execution(
         return step_stage(record, context, index, now);
     }
 
-    // Every stage succeeded, so the execution has.
+    // Every stage succeeded or was skipped, so the execution has.
     record.status = STATUS_SUCCEEDED.to_string();
     record.last_update_time = now;
     None
+}
+
+/// What a stage's condition set decided about the execution at that stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionGate {
+    /// No condition was met — or the stage declares none at this site — so the
+    /// execution carries on.
+    Proceed,
+    /// The stage is skipped: an entry condition that was met declared `SKIP`, so the
+    /// execution moves to the next stage without entering this one.
+    Skipped,
+    /// The stage failed, and the execution with it: the record already carries both.
+    Failed,
+}
+
+/// Evaluate one condition site of one stage and apply what its outcome decides.
+///
+/// Evaluating the rules and recording them is the condition plane's
+/// ([`super::rules`]); what belongs here is the EXECUTION's part: a condition that was
+/// MET is acted on through the `Result` it declares, and a `Result` this emulator would
+/// have to perform work for (restarting a stage, rolling one back) is not claimed as
+/// done — the stage fails with the reason, exactly as an action whose work this
+/// emulator cannot perform does.
+fn settle_conditions(
+    record: &mut PipelineExecutionRecord,
+    context: &mut StepContext<'_>,
+    stage: usize,
+    condition_type: &str,
+    now: SystemTime,
+) -> ConditionGate {
+    // Cloned out of the pinned declaration first, so the conditions can be evaluated
+    // while the execution's own record is written.
+    let conditions: Vec<Condition> = record
+        .stages
+        .get(stage)
+        .and_then(|run| super::execution::declared_stage(context.declaration, run))
+        .and_then(|declared| match condition_type {
+            CONDITION_TYPE_BEFORE_ENTRY => declared
+                .before_entry
+                .as_ref()
+                .map(|before_entry| before_entry.conditions.clone()),
+            CONDITION_TYPE_ON_SUCCESS => declared
+                .on_success
+                .as_ref()
+                .map(|on_success| on_success.conditions.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if conditions.is_empty() {
+        return ConditionGate::Proceed;
+    }
+
+    let stage_name = record.stages[stage].name.clone();
+    let outcome = super::rules::evaluate_conditions(
+        context.rules,
+        &record.pipeline_name,
+        &record.pipeline_execution_id,
+        record.pipeline_version,
+        &stage_name,
+        condition_type,
+        &conditions,
+        &record.variables_map,
+        now,
+    );
+    record.last_update_time = now;
+    let ConditionOutcome::Met { result, detail } = outcome else {
+        return ConditionGate::Proceed;
+    };
+
+    if result == RESULT_SKIP && condition_type == CONDITION_TYPE_BEFORE_ENTRY {
+        record.stages[stage].status = Some(STAGE_SKIPPED.to_string());
+        return ConditionGate::Skipped;
+    }
+    let detail = if result == RESULT_FAIL {
+        detail
+    } else if result == RESULT_SKIP {
+        format!(
+            "{detail}; the condition declares the result {result}, which applies to a \
+             stage that has not run, so the stage is failed instead"
+        )
+    } else {
+        format!(
+            "{detail}; the condition declares the result {result}, and this emulator \
+             starts no such remediation of a stage on its own, so the stage is failed \
+             instead"
+        )
+    };
+    for action in &mut record.stages[stage].actions {
+        if action.is_in_progress() {
+            action.status = Some("Abandoned".to_string());
+            action.token = None;
+            action.last_status_change = now;
+        }
+    }
+    record.stages[stage].status = Some(STAGE_FAILED.to_string());
+    record.status = STATUS_FAILED.to_string();
+    record.status_summary = Some(format!(
+        "the {condition_type} condition of stage {stage_name} was met: {detail}"
+    ));
+    ConditionGate::Failed
 }
 
 /// Move one stage of one execution forward.
@@ -330,6 +467,14 @@ fn step_stage(
         return None;
     }
 
+    // Every run order of the stage is complete, so its SUCCESS conditions are
+    // evaluated at that instant, and only a stage no condition was met for is
+    // reported `Succeeded`.
+    if settle_conditions(record, context, stage, CONDITION_TYPE_ON_SUCCESS, now)
+        != ConditionGate::Proceed
+    {
+        return None;
+    }
     record.stages[stage].status = Some(STAGE_SUCCEEDED.to_string());
     record.last_update_time = now;
     None
@@ -539,16 +684,36 @@ fn start_action(
     }
 
     if category == CATEGORY_DEPLOY && provider == PROVIDER_S3 {
-        let (Some(bucket), Some(key)) = (config.get("BucketName"), config.get("ObjectKey")) else {
+        // "Extract file before deploy": the configuration value is the string "true" or
+        // "false" on the wire, and it decides which of the provider's other keys the
+        // declaration has to carry.
+        let extract = config
+            .get("Extract")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let Some(bucket) = config.get("BucketName") else {
             fail_action(
                 action,
                 FAILURE_CONFIGURATION_ERROR,
-                "an S3 deploy action must declare the configuration keys BucketName and \
-                 ObjectKey",
+                "an S3 deploy action must declare the configuration key BucketName",
                 now,
             );
             return None;
         };
+        // An extracting deploy writes one object per archive entry, so there is no
+        // single object key for it: `ObjectKey` is then OPTIONAL and, when declared, is
+        // the prefix the entries land beneath. Without extraction the artifact is
+        // delivered as one object, which has to have a key.
+        let key = config.get("ObjectKey").cloned();
+        if !extract && key.is_none() {
+            fail_action(
+                action,
+                FAILURE_CONFIGURATION_ERROR,
+                "an S3 deploy action that does not extract the artifact must declare the \
+                 configuration key ObjectKey",
+                now,
+            );
+            return None;
+        }
         let Some(name) = input_artifacts.first().cloned() else {
             fail_action(
                 action,
@@ -574,12 +739,8 @@ fn start_action(
             action: index,
             input,
             bucket: bucket.clone(),
-            key: key.clone(),
-            // "Extract file before deploy": the configuration value is the string
-            // "true" or "false" on the wire.
-            extract: config
-                .get("Extract")
-                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            key,
+            extract,
         });
     }
 
@@ -777,7 +938,7 @@ async fn run_job(
             key,
             extract,
             ..
-        } => run_deploy(&client, input, bucket, key, *extract).await,
+        } => run_deploy(&client, input, bucket, key.as_deref(), *extract).await,
     }
 }
 
@@ -860,7 +1021,7 @@ async fn run_deploy(
     client: &::aws_sdk_s3::Client,
     input: &ArtifactRef,
     bucket: &str,
-    key: &str,
+    key: Option<&str>,
     extract: bool,
 ) -> JobOutcome {
     let read = client
@@ -893,7 +1054,12 @@ async fn run_deploy(
         }
     };
 
-    let entries = if extract {
+    // The prefix an extracting deploy delivers its entries beneath, or the ONE key an
+    // unextracted artifact is delivered under — which a declaration has to state,
+    // because nothing else says where that object goes. The planner refuses that case
+    // before the job is claimed, so this is the same refusal rather than a panic.
+    let prefix = key.unwrap_or_default();
+    let entries: Vec<(String, Vec<u8>)> = if extract {
         // Decoding an archive is synchronous CPU work over caller content, so it runs on
         // the blocking pool rather than on the worker serving this request: the async
         // task stays cancellable while it runs.
@@ -914,9 +1080,17 @@ async fn run_deploy(
             }
         }
         .into_iter()
-        .map(|(name, body)| (extracted_key(key, &name), body))
+        .map(|(name, body)| (extracted_key(prefix, &name), body))
         .collect()
     } else {
+        let Some(key) = key else {
+            return JobOutcome::Failed {
+                code: FAILURE_CONFIGURATION_ERROR.to_string(),
+                message: "an S3 deploy action that does not extract the artifact must \
+                          declare the configuration key ObjectKey"
+                    .to_string(),
+            };
+        };
         vec![(key.to_string(), bytes.to_vec())]
     };
 
@@ -940,7 +1114,7 @@ async fn run_deploy(
         }
     }
     JobOutcome::Done {
-        summary: format!("Deployed {count} object(s) to s3://{bucket}/{key}"),
+        summary: format!("Deployed {count} object(s) to s3://{bucket}/{prefix}"),
         revision: input.revision.clone(),
         variables: BTreeMap::new(),
     }
@@ -1008,7 +1182,8 @@ fn unzip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
 }
 
 /// The key one extracted entry is delivered under: the declared `ObjectKey` is the
-/// prefix every entry lands beneath.
+/// prefix every entry lands beneath, and a declaration that names none delivers each
+/// entry under its own name at the root of the bucket.
 fn extracted_key(prefix: &str, name: &str) -> String {
     let prefix = prefix.trim_end_matches('/');
     if prefix.is_empty() {
