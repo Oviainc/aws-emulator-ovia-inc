@@ -180,10 +180,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        // The service-managed keyspaces and their system tables are part of the account
-        // before any call, so an ARN that names one resolves here.
-        store.ensure_service_managed_catalog(&crate::state::request_region(ctx));
         // See the note in `tag_resource.rs`: the transitions the clock already owed.
         store.settle(::std::time::SystemTime::now());
 
@@ -198,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let Some(tags) = store.resource_tags_mut(&input.resource_arn) else {
+        let Some(tags) = store.resource_tags_mut(&region, &input.resource_arn) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::arn_not_found(&input.resource_arn),
             )

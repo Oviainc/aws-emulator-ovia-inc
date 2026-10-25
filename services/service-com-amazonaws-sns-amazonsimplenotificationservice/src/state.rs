@@ -1474,6 +1474,49 @@ pub const SANDBOX_NUMBER_VERIFIED: &str = "Verified";
 /// The name a refusal gives a sandbox destination phone number record.
 pub const SANDBOX_NUMBER_RECORD: &str = "SMS sandbox destination phone numbers";
 
+/// How many decimal digits a one-time password this service delivers to a sandbox
+/// destination number carries.
+///
+/// `smithy_query(query="shape", shape="OTPCode")` reports `length {min: 5, max: 8}`
+/// and pattern `^[0-9]+$`, so a code must be five to eight digits and nothing else;
+/// six is the length SNS's own sandbox verification page asks a customer to enter,
+/// and it sits inside those bounds.
+pub const SANDBOX_OTP_DIGITS: usize = 6;
+
+/// The sentence a verification carrying a one-time password that is not the one
+/// currently delivered to that destination number is refused with.
+///
+/// This service keeps ONE live code per destination number — a later
+/// `CreateSMSSandboxPhoneNumber` delivers a new one and retires the last — so any
+/// code but that one is a code that is no longer good, which is how the refusal is
+/// worded. Fixed text with no variable part: it reproduces NEITHER the code the
+/// caller sent nor the one that was delivered, so a refusal never leaks the secret
+/// it is judging, and not the destination number either (the model marks that member
+/// `@sensitive`). Recorded evidence: `VerifySMSSandboxPhoneNumber` presented with a
+/// code that is not the delivered one answers `400 VerificationException` with
+/// exactly this sentence.
+pub const INVALID_OTP_MESSAGE: &str =
+    "Verification code has expired, cannot verify the destination phone number.";
+
+/// What a refused verification reports in the modelled `Status` member, "the status
+/// of the verification error" (`VerificationException$Status` doc).
+///
+/// The recorded refusal pins the SENTENCE ([`INVALID_OTP_MESSAGE`]) and carries no
+/// evidence about this member, so the value is not reproduced from a recording: it
+/// names the condition that sentence states, so the member and the sentence cannot
+/// disagree.
+pub const INVALID_OTP_STATUS: &str = "Expired";
+
+/// How many times [`ComAmazonawsSnsAmazonsimplenotificationserviceState::next_sandbox_one_time_password`]
+/// re-mints a code one of this account's sandbox numbers already holds.
+///
+/// Reducing an id to [`SANDBOX_OTP_DIGITS`] digits can land on a code that is
+/// already live, and a repeat would let a retired code keep verifying, so the mint
+/// tries again — bounded, so a caller cannot make the loop run on. Eight attempts
+/// against at most [`MAX_RECORDS_PER_STORE`] live codes out of the ten-to-the-six a
+/// code can take leaves nothing for the fall-through to do.
+const SANDBOX_OTP_MINT_ATTEMPTS: usize = 8;
+
 /// One destination phone number in the calling account's SMS sandbox, as
 /// `CreateSMSSandboxPhoneNumber` added it.
 #[derive(Debug, Clone)]
@@ -1484,6 +1527,13 @@ pub struct SandboxPhoneNumberRecord {
     pub phone_number: String,
     /// [`SANDBOX_NUMBER_PENDING`] or [`SANDBOX_NUMBER_VERIFIED`].
     pub status: String,
+    /// The one-time password last delivered to this destination number — the code
+    /// `VerifySMSSandboxPhoneNumber` checks the caller's against.
+    ///
+    /// AWS delivers it by SMS, to the number itself, so it is never on the wire in
+    /// either direction but the caller's: this field is this emulator's stand-in for
+    /// that carrier. No response carries it and no refusal names it.
+    pub one_time_password: String,
     pub created_at: SystemTime,
 }
 
@@ -1839,6 +1889,49 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
     pub fn next_unique_id(&mut self) -> String {
         self.id_counter = self.id_counter.saturating_add(1);
         uuid_v4_shaped(self.id_counter)
+    }
+
+    /// A fresh one-time password to deliver to a sandbox destination number:
+    /// [`SANDBOX_OTP_DIGITS`] decimal digits, and NOT a code any of this account's
+    /// sandbox numbers currently holds — so delivering a new code to a number really
+    /// does retire the one it had, rather than possibly re-delivering it.
+    ///
+    /// Minted from the store's own id counter ([`Self::next_unique_id`]), so
+    /// successive deliveries get different codes rather than one fixed code for ever,
+    /// and NOT derived from the request, because a code the caller's own request
+    /// determines would leave the verification step deciding nothing. It is not key
+    /// material and nothing is authenticated with it: it stands in for the code the
+    /// real service texts to the destination number, and a test reads it from the
+    /// record it was delivered to, the way the handler does.
+    pub fn next_sandbox_one_time_password(&mut self) -> String {
+        let mut code = self.sandbox_otp_candidate();
+        for _ in 1..SANDBOX_OTP_MINT_ATTEMPTS {
+            if !self
+                .sandbox_phone_numbers
+                .values()
+                .any(|record| record.one_time_password == code)
+            {
+                break;
+            }
+            code = self.sandbox_otp_candidate();
+        }
+        code
+    }
+
+    /// One candidate one-time password: [`SANDBOX_OTP_DIGITS`] decimal digits of a
+    /// fresh [`Self::next_unique_id`]'s digest, which [`SANDBOX_OTP_MINT_ATTEMPTS`]
+    /// governs the retrying of.
+    fn sandbox_otp_candidate(&mut self) -> String {
+        let seed = self.next_unique_id();
+        let digest = Sha256::digest(seed.as_bytes());
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        let modulus = 10u64.pow(SANDBOX_OTP_DIGITS as u32);
+        format!(
+            "{value:0width$}",
+            value = u64::from_be_bytes(bytes) % modulus,
+            width = SANDBOX_OTP_DIGITS,
+        )
     }
 
     /// Record one delivery of `message` to `subscription_arn`, then bring the log back

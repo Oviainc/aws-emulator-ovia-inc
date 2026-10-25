@@ -1062,23 +1062,33 @@ impl ComAmazonawsAccountAccountState {
         }
     }
 
-    /// Whether `address` is already in use as an account's primary email
-    /// address: either an account holds it, or another account's update is
+    /// Whether `address` is already in use by an account OTHER than
+    /// `account_id`: another account holds it, or another account's update is
     /// ACCEPTED for it, so its completion is already owed.
+    ///
+    /// The question is asked ON BEHALF of one account, and it is asked about
+    /// every OTHER account symmetrically — both halves of the test skip
+    /// `account_id`. Giving an account the address it already holds, or the one
+    /// its own accepted update is already owed, takes that address from nobody
+    /// and changes nothing, so it is not the conflict this service documents
+    /// ("you try to change an account's root user email to an email address
+    /// which is already in use").
     ///
     /// Settle first ([`settle_primary_email_updates`](Self::settle_primary_email_updates)):
     /// an address a completed update put on an account is in use from the
     /// instant that completion came due. An address a PENDING update merely
     /// asked for is NOT in use — nothing has been changed for it yet, and the
     /// passcode it waits for may never arrive.
-    pub fn primary_email_in_use(&self, address: &str) -> bool {
-        self.accounts.values().any(|account| {
-            account.primary_email == address
-                || account
-                    .primary_email_update
-                    .as_ref()
-                    .is_some_and(|update| update.is_accepted() && update.requested_email == address)
-        })
+    pub fn primary_email_in_use_by_other(&self, address: &str, account_id: &str) -> bool {
+        self.accounts
+            .values()
+            .filter(|account| account.account_id != account_id)
+            .any(|account| {
+                account.primary_email == address
+                    || account.primary_email_update.as_ref().is_some_and(|update| {
+                        update.is_accepted() && update.requested_email == address
+                    })
+            })
     }
 
     /// The account `account_id` names, for a mutating operation that must NOT

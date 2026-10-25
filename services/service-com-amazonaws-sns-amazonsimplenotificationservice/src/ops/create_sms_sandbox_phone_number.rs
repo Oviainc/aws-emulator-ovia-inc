@@ -148,13 +148,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const SUCCESS_STATUS: u16 = 200u16;
 
     /// Add `PhoneNumber` to this account's SMS sandbox as a pending destination
-    /// number, so a listing reports it and `DeleteSMSSandboxPhoneNumber` can remove
-    /// it.
+    /// number and deliver a one-time password to it, so a listing reports the number,
+    /// `VerifySMSSandboxPhoneNumber` can check a caller's code against the delivered
+    /// one, and `DeleteSMSSandboxPhoneNumber` can remove it.
     ///
     /// A number the sandbox ALREADY holds keeps the record it has — and with it the
     /// verification status it reached: the operation adds a destination number, and
     /// adding one that is already there takes nothing away. No modelled error says
     /// "this number is already in the sandbox", so the call succeeds.
+    ///
+    /// What it does NOT keep is the code: this operation "sends a one-time password
+    /// (OTP) to that phone number" on every call it answers, so a repeat delivers a
+    /// FRESH one — which is the whole reason a caller repeats it — and the superseded
+    /// code stops verifying.
     async fn handle(
         &self,
         input: Self::Input,
@@ -170,10 +176,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = store.lock();
 
-        if store.sandbox_phone_numbers.contains_key(&input.phone_number) {
-            return Ok(CreateSMSSandboxPhoneNumberOutput {});
-        }
-        if store.sandbox_phone_numbers.len() >= state::MAX_RECORDS_PER_STORE {
+        let held = store.sandbox_phone_numbers.contains_key(&input.phone_number);
+        if !held && store.sandbox_phone_numbers.len() >= state::MAX_RECORDS_PER_STORE {
             return Err(CreateSMSSandboxPhoneNumberErrorModeled::UserErrorException(
                 UserErrorException {
                     message: Some(state::limit_exceeded_message(state::SANDBOX_NUMBER_RECORD)),
@@ -181,17 +185,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        store.sandbox_phone_numbers.insert(
-            input.phone_number.clone(),
-            state::SandboxPhoneNumberRecord {
-                phone_number: input.phone_number,
-                // The number is pending until its one-time password is verified; the
-                // OTP travels by SMS, which is out of band for this emulator, so
-                // nothing here moves the status on.
-                status: state::SANDBOX_NUMBER_PENDING.to_string(),
-                created_at: std::time::SystemTime::now(),
-            },
-        );
+
+        // The code travels by SMS, which is out of band for this emulator, so the
+        // record it was delivered to is the only place it can be read from. Minted
+        // only now, on a call that will be answered.
+        let delivered = store.next_sandbox_one_time_password();
+        match store.sandbox_phone_numbers.get_mut(&input.phone_number) {
+            Some(record) => record.one_time_password = delivered,
+            None => {
+                store.sandbox_phone_numbers.insert(
+                    input.phone_number.clone(),
+                    state::SandboxPhoneNumberRecord {
+                        phone_number: input.phone_number,
+                        // The number is pending until the code just delivered to it
+                        // is verified; nothing but `VerifySMSSandboxPhoneNumber`
+                        // moves the status on.
+                        status: state::SANDBOX_NUMBER_PENDING.to_string(),
+                        one_time_password: delivered,
+                        created_at: std::time::SystemTime::now(),
+                    },
+                );
+            }
+        }
 
         Ok(CreateSMSSandboxPhoneNumberOutput {})
     }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUserGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUserGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUserGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation answers from this service's state. The paragraphs below
+//! are the scaffold's notes on how an operation of this service is wired.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +150,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUserGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUserGroup"))
+        // "Deletes a user group" — a mutation. The group's identity is its id and
+        // every member of the answer is read out of the stored record, so no
+        // Region is resolved here.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // One instant for the whole request: the clock's own settlements are
+        // measured against it, and the removal it owes is due a span after it.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A group whose removal already fell due is gone, so a delete naming it
+        // answers not-found rather than deleting it twice; a group whose change
+        // has fallen due is `active` again and can be deleted. Both were owed at
+        // this instant whether or not anybody called. See
+        // `crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::settle_user_groups`.
+        store.settle_user_groups(now);
+
+        // "The user group was not found or does not exist": the modelled 404,
+        // worded the one way every operation resolving a `UserGroupId` does.
+        let Some(group) = store.user_groups.get(&input.user_group_id) else {
+            return Err(DeleteUserGroupErrorModeled::UserGroupNotFoundFault(
+                UserGroupNotFoundFault {
+                    message: Some(format!("User group {} not found.", input.user_group_id)),
+                },
+            )
+            .into());
+        };
+        // `InvalidUserGroupStateFault` is "the user group is not in an active
+        // state": a group still being created, carrying a change the clock has
+        // not applied, or already on its way out takes no further change — the
+        // statuses a change is accepted in are stated once in
+        // `crate::state::user_group_state_refusal`.
+        if let Some(message) = crate::state::user_group_state_refusal(group) {
+            return Err(DeleteUserGroupErrorModeled::InvalidUserGroupStateFault(
+                InvalidUserGroupStateFault {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // "The user group must first be disassociated from the replication group
+        // before it can be deleted": a group an attached resource still grants
+        // access through cannot leave, and the same holds for a serverless cache
+        // it is attached to.
+        let attached = group
+            .replication_group_ids
+            .first()
+            .or_else(|| group.serverless_cache_names.first());
+        if let Some(attached) = attached {
+            return Err(DeleteUserGroupErrorModeled::InvalidUserGroupStateFault(
+                InvalidUserGroupStateFault {
+                    message: Some(format!(
+                        "User group {} is associated with {attached}; it must be disassociated \
+                         before it can be deleted.",
+                        input.user_group_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(group) = store.user_groups.get_mut(&input.user_group_id) else {
+            // Unreachable: the lookup above holds the same lock.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        // The group is leaving: this call answers with it `deleting` — the last
+        // thing this API reports about it — and the clock owes its removal a span
+        // later, after which every lookup answers `UserGroupNotFoundFault` and
+        // the id is free for a create again.
+        group.status = crate::state::STATUS_DELETING.to_string();
+        group.pending_status = None;
+        group.pending_removal = Some(now + crate::state::USER_DELETION_TRANSITION);
+        // Read back out of the store, so the response is the persisted group
+        // rather than the request echoed. `UserGroup` is generated once per
+        // operation, so the stored group's ONE modelled view is remapped onto
+        // this operation's copy of that shape rather than built a second time.
+        let deleting = group.to_modeled();
+        // No event is recorded: nothing on the user-group surface records one
+        // (neither its create nor its modify does), so a delete that logged one
+        // would be the only user-group event a `DescribeEvents` reader ever saw.
+
+        Ok(DeleteUserGroupOutput {
+            user_group_id: deleting.user_group_id,
+            status: deleting.status,
+            engine: deleting.engine,
+            user_ids: deleting.user_ids,
+            minimum_engine_version: deleting.minimum_engine_version,
+            pending_changes: deleting.pending_changes,
+            replication_groups: deleting.replication_groups,
+            serverless_caches: deleting.serverless_caches,
+            arn: deleting.arn,
+        })
     }
 }

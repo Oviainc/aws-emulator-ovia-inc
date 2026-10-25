@@ -74,7 +74,10 @@ const ISSUER_CA: &str = "Amazon";
 
 /// Request the certificate `name` for `domain`, with `alternatives` as its
 /// alternate domains, answering the `certificate` the create reports.
-async fn create_certificate(
+///
+/// `pub(crate)` so a sibling suite that needs a certificate of the account
+/// stands one up the same way rather than re-typing the call.
+pub(crate) async fn create_certificate(
     emulator: &Emulator,
     name: &str,
     domain: &str,
@@ -88,7 +91,9 @@ async fn create_certificate(
 }
 
 /// The stored certificate `name`, in full, as `GetCertificates` reports it.
-async fn certificate(emulator: &Emulator, name: &str) -> Value {
+///
+/// `pub(crate)` for the same reason as [`create_certificate`].
+pub(crate) async fn certificate(emulator: &Emulator, name: &str) -> Value {
     let body = emulator
         .ok(
             "GetCertificates",
@@ -107,7 +112,10 @@ async fn certificate(emulator: &Emulator, name: &str) -> Value {
 ///
 /// The issuance is owed by the clock, not by the poll: it arrives without anyone
 /// asking more than once.
-async fn wait_for_issued_certificate(emulator: &Emulator, name: &str) -> Value {
+///
+/// `pub(crate)` so the ONE issuance wait of this test target serves every suite
+/// whose case needs an issued certificate.
+pub(crate) async fn wait_for_issued_certificate(emulator: &Emulator, name: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let reported = certificate(emulator, name).await;

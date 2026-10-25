@@ -57,8 +57,9 @@ const FAIL_DEFINITION: &str =
 const ECHO_DEFINITION: &str =
     r#"{"StartAt":"Echo","States":{"Echo":{"Type":"Pass","End":true}}}"#;
 
-/// A definition whose only state this emulator does not execute, so the execution
-/// ends `FAILED` with ASL's own `States.Runtime`.
+/// A definition whose only state names no integration call this emulator makes (a
+/// bare Lambda function ARN as its `Resource`), so the execution ends `FAILED` with
+/// ASL's own `States.Runtime`.
 const TASK_DEFINITION: &str = r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}}}"#;
 
 /// A definition that waits long enough that the execution stays non-terminal for the
@@ -169,7 +170,7 @@ async fn the_redrive_projection_reports_whether_a_redrive_would_succeed() {
             reason: None,
         },
         ProjectionCase {
-            case: "a run whose state this emulator does not execute",
+            case: "a run whose state names no integration call this emulator makes",
             definition: TASK_DEFINITION,
             input: "{}",
             stop: false,

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResourceSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResourceSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Replaces a stored resource set's declared type and its list of resources with the
+//! ones the request carries, and answers with the record it just wrote. That record is
+//! the only thing `GetResourceSet` and `ListResourceSets` read, so nothing here is
+//! echoed back to the caller without being persisted first. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResourceSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The request carries no tags, and a resource's tags are its own state rather than
+//! part of the set it describes, so they survive an update untouched — the tag
+//! operations are what change them.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +170,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResourceSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResourceSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResourceSet"))
+        let _ = ctx;
+        // The `@pattern` only says the value is SHAPED like a CloudFormation type name;
+        // the member's documentation enumerates the closed catalog of types the
+        // readiness feature can audit, so a pattern-shaped value outside that catalog
+        // names no type this service has readiness rules for. An update is held to the
+        // same catalog as a create: otherwise a stored record could be moved onto a type
+        // the rule-listing surface says does not exist.
+        crate::state::validate_resource_type(&input.resource_set_type).map_err(|message| {
+            UpdateResourceSetErrorModeled::ValidationException(ValidationException {
+                message: Some(message.to_string()),
+            })
+        })?;
+        // CC-02 growth bound: an update must not grow one record past what a create
+        // could have stored.
+        crate::state::validate_resources(&input.resources).map_err(|message| {
+            UpdateResourceSetErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateResourceSetErrorModeled::InternalServerException(InternalServerException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let record = state
+            .resource_sets
+            .get_mut(&input.resource_set_name)
+            .ok_or_else(|| {
+                UpdateResourceSetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+            })?;
+        // A PUT of the whole set: the submitted type and resource list REPLACE what was
+        // stored rather than merging with it. The ARN and the name are the record's
+        // identity and the tags are not part of this request, so all three stay as they
+        // are.
+        record.resource_set_type = input.resource_set_type;
+        record.resources = input.resources;
+
+        // Reported out of the record that was just written, so what the caller sees is
+        // what a later `GetResourceSet` will see.
+        Ok(UpdateResourceSetOutput {
+            resource_set_arn: Some(record.arn.clone()),
+            resource_set_name: Some(record.name.clone()),
+            resource_set_type: Some(record.resource_set_type.clone()),
+            resources: Some(record.resources.clone()),
+            tags: record.modeled_tags(),
+        })
     }
 }
+

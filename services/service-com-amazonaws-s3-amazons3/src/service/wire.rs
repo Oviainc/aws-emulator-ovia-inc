@@ -50,7 +50,8 @@ use std::collections::BTreeSet;
 
 use aws_smithy_runtime_api::http::{Request, Response, StatusCode};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeDeserializer, ShapeSerializer};
-use aws_smithy_schema::{Schema, ShapeId};
+use aws_smithy_schema::{Schema, ShapeId, ShapeType};
+use aws_smithy_schema_server::constraints::{path, Violation, ViolationKind};
 use aws_smithy_schema_server::protocol::{ProtocolError, ServerProtocol};
 use aws_smithy_schema_server::xml::XmlShapeDeserializer;
 use aws_smithy_schema_server::{xml_escape, HttpBindingDeserializer, RestXmlServerProtocol};
@@ -343,6 +344,49 @@ fn carries_access_control_policy(input_schema: &Schema) -> bool {
 
 /// The member name [`carries_access_control_policy`] looks for.
 const ACCESS_CONTROL_POLICY_MEMBER: &str = "AccessControlPolicy";
+
+/// The violation to refuse `request` with when its body is an XML DOCUMENT carrying a
+/// character the XML character set does not allow, or `None` when it is not or does not.
+///
+/// XML 1.0 defines which characters a document may contain (see
+/// [`crate::state::first_forbidden_xml_char`]); a body carrying any other one is not
+/// well-formed XML, whatever it otherwise says, so no codec can read it and no handler can
+/// act on it. Refusing it as a violation of the member the document is BOUND to is what
+/// makes it carry S3's own `MalformedXML` (`crate::service::s3_refusal` chooses the code
+/// from the member), rather than reaching the body codec and surfacing as whatever that
+/// codec, or the response serializer echoing the character back, happens to produce.
+///
+/// Scoped to a STRUCTURED `@httpPayload` member, so the bytes of an object's body — which
+/// are not a document and may legitimately hold any byte at all — are never scanned.
+fn xml_charset_violation(request: &Request, input_schema: &Schema) -> Option<Violation> {
+    let payload = input_schema.members().iter().find(|member| {
+        member.http_payload().is_some()
+            && matches!(
+                member.shape_type(),
+                ShapeType::Structure
+                    | ShapeType::Union
+                    | ShapeType::List
+                    | ShapeType::Map
+                    | ShapeType::Document
+            )
+    })?;
+    let body = std::str::from_utf8(request.body().bytes()?).ok()?;
+    let forbidden = crate::state::first_forbidden_xml_char(body)?;
+    Some(Violation {
+        path: path::member(payload.member_name()?),
+        kind: ViolationKind::Pattern(XML_CHARACTER_SET.to_string()),
+        value: Some(format!("{forbidden:?}")),
+    })
+}
+
+/// The XML 1.0 `Char` production, as the refusal above names the rule a body broke (W3C
+/// XML 1.0, §2.2 "Characters").
+///
+/// `pub(crate)`: it is also what tells `crate::service::violation_is_in_request_document`
+/// that a violation naming the payload member ALONE is about the DOCUMENT rather than
+/// about a scalar binding of a member of the same name.
+pub(crate) const XML_CHARACTER_SET: &str =
+    "#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]";
 
 /// `document` with every `@xmlAttribute` member moved out of its element's start tag and
 /// into a child element of that element, or `None` when it carries none (in which case
@@ -668,6 +712,12 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         request: &'a Self::Request,
         input_schema: &Schema,
     ) -> Result<Box<dyn ShapeDeserializer + 'a>, ProtocolError> {
+        // A request whose body IS an XML document is refused here when that document
+        // carries a character XML cannot hold, before any codec reads it. See
+        // [`xml_charset_violation`].
+        if let Some(violation) = xml_charset_violation(request, input_schema) {
+            return Err(ProtocolError::Invalid(vec![violation]));
+        }
         // Only the two ACL writes can carry a member that travels as an XML attribute,
         // and only a body that actually spells one needs normalizing; everything else —
         // every other operation, and an ACL write whose grantee is already spelled as an

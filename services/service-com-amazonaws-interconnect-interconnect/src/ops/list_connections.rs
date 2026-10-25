@@ -141,7 +141,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListConnectionsErrorModeled::InterconnectServerException(
                 InterconnectServerException {
@@ -156,14 +156,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // supplied filter is an exact-match conjunct, and an absent one constrains
         // nothing. Each summary is PROJECTED from the stored connection, so the list
         // and the get report one record.
+        //
+        // The sequence being filtered and paged is the connections of the Region
+        // this request was signed for — a connection belongs to the Region it was
+        // created in — so the page counts, the cursors and the filters all operate
+        // over this endpoint's own set and not over every Region's.
         let matching: Vec<(String, ConnectionSummary)> = {
             let mut store = state.lock();
             // Same clock-owed settle as GetConnection: a page must not report
             // `deleting` for a connection whose `deleted` was already due.
             store.materialise_due_transitions(::std::time::Instant::now());
             store
-                .connections
-                .iter()
+                .connections_in(&region)
                 .map(|(id, stored)| (id, &stored.connection))
                 .filter(|(_, connection)| {
                     input

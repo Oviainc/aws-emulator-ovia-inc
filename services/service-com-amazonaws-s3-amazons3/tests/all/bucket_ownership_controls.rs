@@ -259,8 +259,13 @@ async fn putting_ownership_controls_stores_them_and_reads_back_through_get() {
 async fn reading_a_bucket_with_no_ownership_controls_is_not_found() {
     let router = router();
 
-    // Two buckets that have never been configured, one of them in a non-default Region, so
-    // the answer is about the missing subresource rather than about one bucket.
+    // Two buckets whose ownership controls have been WITHDRAWN, one of them in a
+    // non-default Region, so the answer is about the missing subresource rather than about
+    // one bucket. A bucket is CREATED with the Object Ownership setting it comes into being
+    // with ("by default, `ObjectOwnership` is set to `BucketOwnerEnforced`"), so the only
+    // way to a bucket with no ownership controls at all is the delete
+    // `GetBucketOwnershipControls` names: "you've manually deleted the bucket ownership
+    // control value using the DeleteBucketOwnershipControls API operation".
     for (case, bucket, constraint) in [
         ("a bucket created with no location constraint", "ownership-absent-default", None),
         (
@@ -274,6 +279,13 @@ async fn reading_a_bucket_with_no_ownership_controls_is_not_found() {
             created.status, 200,
             "case {case:?}: the bucket must be created first, got {}",
             created.status
+        );
+        let withdrawn = delete_ownership_controls(&router, bucket, None).await;
+        assert_eq!(
+            withdrawn.status, 204,
+            "case {case:?}: the controls must be withdrawn first, got {} with body {:?}",
+            withdrawn.status,
+            String::from_utf8_lossy(&withdrawn.body)
         );
 
         let read = get_ownership_controls(&router, bucket).await;
@@ -379,11 +391,12 @@ async fn a_refused_ownership_controls_payload_changes_nothing() {
     // The container naming no Rule is refused by the boundary rather than by the handler:
     // `OwnershipControls$Rules` is a REQUIRED member and the flattened `<Rule>` children
     // are the only way to carry it, so a container with none fails validation before the
-    // handler runs and goes out through the framework's refusal code.
+    // handler runs — a document that does not validate against S3's published schema,
+    // which is the same code the handler answers the same payload with.
     let empty = put_ownership_controls(&router, bucket, &[]).await;
     assert_eq!(
         empty.error_code(),
-        "ValidationException",
+        "MalformedXML",
         "an OwnershipControls naming no Rule must be refused for the missing required \
          member, got {:?}",
         empty.error_code()

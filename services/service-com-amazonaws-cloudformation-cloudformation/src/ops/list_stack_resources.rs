@@ -94,7 +94,10 @@ fn stack_resource_summary(deployed: &DeployedResource) -> StackResourceSummary {
         resource_type: deployed.resource.resource_type.clone(),
         last_updated_timestamp: crate::state::timestamp(deployed.status_timestamp),
         resource_status: deployed.status.clone(),
-        resource_status_reason: None,
+        // "Success/failure message associated with the resource": what the record carries,
+        // which is the "work started" message for a resource whose operation is under way
+        // and nothing for one whose status speaks for itself.
+        resource_status_reason: deployed.status_reason.clone(),
         drift_information: crate::state::resource_drift_information_summary(deployed),
         module_info: None,
     }
@@ -105,8 +108,11 @@ fn stack_resource_summary(deployed: &DeployedResource) -> StackResourceSummary {
 /// yields a template's resources in the parsed object's iteration order, so the stored
 /// order is not one a client can depend on, while this one is the same on every build and
 /// makes the page boundaries stable.
-fn ordered_resources(stack: &StoredStack) -> Vec<&DeployedResource> {
-    let mut ordered: Vec<&DeployedResource> = stack.resources.iter().collect();
+fn ordered_resources(stack: &StoredStack) -> Vec<DeployedResource> {
+    // What the stack reports right now: an operation waiting at a wait condition has
+    // created some of the template's resources and not started the ones that wait on it
+    // (`StoredStack::reported_resources`).
+    let mut ordered: Vec<DeployedResource> = stack.reported_resources();
     ordered.sort_by(|left, right| left.resource.logical_id.cmp(&right.resource.logical_id));
     ordered
 }
@@ -203,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let summaries: Vec<StackResourceSummary> = ordered_resources(stack)
-            .into_iter()
+            .iter()
             .map(stack_resource_summary)
             .collect();
         // `@paginated(inputToken: NextToken, outputToken: NextToken, items:

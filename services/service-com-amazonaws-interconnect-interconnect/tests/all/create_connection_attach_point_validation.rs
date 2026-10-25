@@ -268,10 +268,16 @@ async fn every_listed_attach_point_is_accepted_and_read_back() {
                     body["connection"]["attachPoint"]
                 );
 
-                // Read back through the implemented reader: the stored record is what a
-                // later caller sees.
+                // Read back through the implemented reader, in the Region the create
+                // addressed: a connection belongs to the Region it was created in.
                 let identifier_of = text(&body["connection"], "id");
-                let (status, fetched) = emulator.get_connection(&identifier_of).await;
+                let (status, fetched) = emulator
+                    .ic_in(
+                        region,
+                        "GetConnection",
+                        json!({ "identifier": identifier_of }),
+                    )
+                    .await;
                 assert_eq!(
                     status, 200,
                     "case {case:?}: expected the connection to be readable, got {status} with {fetched:?}"
@@ -336,7 +342,9 @@ async fn a_connection_of_the_account_is_an_attach_point_by_arn() {
             "case {case:?}: expected an ARN naming a connection of the account to be accepted, got {status} with {attached:?}"
         );
         let attached_id = text(&attached["connection"], "id");
-        let (status, fetched) = emulator.get_connection(&attached_id).await;
+        let (status, fetched) = emulator
+            .ic_in(region, "GetConnection", json!({ "identifier": attached_id }))
+            .await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected the connection to be readable, got {status} with {fetched:?}"

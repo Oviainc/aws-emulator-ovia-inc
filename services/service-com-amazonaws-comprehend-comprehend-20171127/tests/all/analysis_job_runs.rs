@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::comprehend_client::Comprehend;
+use crate::comprehend_client::{create_bucket_payload, Comprehend};
 
 /// The bucket every row's input and output live in.
 const BUCKET: &str = "analysis-job-bucket";
@@ -113,7 +113,9 @@ const RUNS: &[Run] = &[
 
 /// Create `BUCKET`, so the runs' reads and writes have somewhere to go.
 async fn create_bucket(comprehend: &Comprehend) {
-    let (status, body) = comprehend.s3("PUT", &format!("/{BUCKET}"), b"").await;
+    let (status, body) = comprehend
+        .s3("PUT", &format!("/{BUCKET}"), create_bucket_payload().as_bytes())
+        .await;
     assert_eq!(
         status,
         200,

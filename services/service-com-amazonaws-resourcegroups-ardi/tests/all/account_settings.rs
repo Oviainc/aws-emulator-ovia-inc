@@ -21,7 +21,11 @@
 //!   never zero, so a caller reading straight afterwards still sees it in flight;
 //! * the settings a region reports are the ones written through that region;
 //! * a desired status the model does not admit is `BadRequestException` (400) and
-//!   changes nothing, and an update that names no desired status changes nothing.
+//!   changes nothing, and an update that names no desired status changes nothing;
+//! * the LAST accepted request decides the outcome: a request accepted while a
+//!   switch is still in flight supersedes it, and only a request that is accepted
+//!   and names a status does — one refused, or naming none, leaves the switch in
+//!   flight exactly as it stands.
 
 use std::time::{Duration, SystemTime};
 
@@ -32,7 +36,7 @@ use service_com_amazonaws_resourcegroups_ardi::ops::types::{
 };
 use service_com_amazonaws_resourcegroups_ardi::state::{
     ComAmazonawsResourcegroupsArdiState, LIFECYCLE_EVENTS_ACTIVE, LIFECYCLE_EVENTS_INACTIVE,
-    LIFECYCLE_EVENTS_IN_PROGRESS, MAX_ACCOUNT_SETTINGS_REGIONS,
+    LIFECYCLE_EVENTS_IN_PROGRESS, LIFECYCLE_EVENTS_SETTLE_DELAY, MAX_ACCOUNT_SETTINGS_REGIONS,
 };
 
 use super::resource_group_lifecycle::{error_code, Emulator};
@@ -89,9 +93,9 @@ async fn reported(emulator: &Emulator, region: &str, case: &str) -> (String, Str
     settings_of(case, "GetAccountSettings", status, &body)
 }
 
-/// The instant the switch `region` has in flight is owed, or `None` when nothing is
-/// in flight there.
-fn due_at(emulator: &Emulator, region: &str) -> Option<SystemTime> {
+/// The switch `region` has in flight — the status it will put in effect and the
+/// instant it is owed — or `None` when nothing is in flight there.
+fn pending_switch(emulator: &Emulator, region: &str) -> Option<(String, SystemTime)> {
     emulator
         .engine()
         .state::<ComAmazonawsResourcegroupsArdiState>()
@@ -99,7 +103,13 @@ fn due_at(emulator: &Emulator, region: &str) -> Option<SystemTime> {
         .account_settings
         .get(region)
         .and_then(|record| record.pending.as_ref())
-        .map(|pending| pending.due_at)
+        .map(|pending| (pending.status.clone(), pending.due_at))
+}
+
+/// The instant the switch `region` has in flight is owed, or `None` when nothing is
+/// in flight there.
+fn due_at(emulator: &Emulator, region: &str) -> Option<SystemTime> {
+    pending_switch(emulator, region).map(|(_, due_at)| due_at)
 }
 
 /// Whether the store holds a settings record for `region` at all — a region nothing
@@ -530,4 +540,229 @@ async fn an_update_that_names_no_desired_status_changes_nothing() {
         None,
         "case {case:?}: an update that asks for nothing must start no switch",
     );
+}
+
+/// One request of a run of `UpdateAccountSettings` calls made back to back, before
+/// the span any of them starts has elapsed.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// A request naming a desired status the model admits.
+    Ask(&'static str),
+    /// A request naming a desired status the model does not admit.
+    Refused(&'static str),
+    /// A request naming no desired status at all.
+    Nothing,
+}
+
+/// Runs of requests made while the switch an earlier one started is still in flight.
+///
+/// The rows differ along how many requests the run makes, the order of the statuses
+/// asked for, whether it ends on a change or on the status last asked for, and
+/// whether a request that asks for no status change — one the model does not admit,
+/// or one naming no status at all — comes before, between or after the accepted
+/// ones.
+fn supersede_runs() -> Vec<(&'static str, Vec<Step>)> {
+    vec![
+        ("one request", vec![Step::Ask(LIFECYCLE_EVENTS_ACTIVE)]),
+        (
+            "on, then off before the first switch lands",
+            vec![
+                Step::Ask(LIFECYCLE_EVENTS_ACTIVE),
+                Step::Ask(LIFECYCLE_EVENTS_INACTIVE),
+            ],
+        ),
+        (
+            "off, then on before the first switch lands",
+            vec![
+                Step::Ask(LIFECYCLE_EVENTS_INACTIVE),
+                Step::Ask(LIFECYCLE_EVENTS_ACTIVE),
+            ],
+        ),
+        (
+            "the same status asked for twice",
+            vec![
+                Step::Ask(LIFECYCLE_EVENTS_ACTIVE),
+                Step::Ask(LIFECYCLE_EVENTS_ACTIVE),
+            ],
+        ),
+        (
+            "three requests, ending on the feature on",
+            vec![
+                Step::Ask(LIFECYCLE_EVENTS_ACTIVE),
+                Step::Ask(LIFECYCLE_EVENTS_INACTIVE),
+                Step::Ask(LIFECYCLE_EVENTS_ACTIVE),
+            ],
+        ),
+        (
+            "four requests, ending on the feature off",
+            vec![
+                Step::Ask(LIFECYCLE_EVENTS_INACTIVE),
+                Step::Ask(LIFECYCLE_EVENTS_ACTIVE),
+                Step::Ask(LIFECYCLE_EVENTS_ACTIVE),
+                Step::Ask(LIFECYCLE_EVENTS_INACTIVE),
+            ],
+        ),
+        (
+            "a refused request between two accepted ones",
+            vec![
+                Step::Ask(LIFECYCLE_EVENTS_ACTIVE),
+                Step::Refused("ENABLED"),
+                Step::Ask(LIFECYCLE_EVENTS_INACTIVE),
+            ],
+        ),
+        (
+            "a request naming nothing between two accepted ones",
+            vec![
+                Step::Ask(LIFECYCLE_EVENTS_INACTIVE),
+                Step::Nothing,
+                Step::Ask(LIFECYCLE_EVENTS_ACTIVE),
+            ],
+        ),
+        (
+            "a refused request after the last accepted one",
+            vec![
+                Step::Ask(LIFECYCLE_EVENTS_ACTIVE),
+                Step::Refused(LIFECYCLE_EVENTS_IN_PROGRESS),
+            ],
+        ),
+        (
+            "a request naming nothing after the last accepted one",
+            vec![Step::Ask(LIFECYCLE_EVENTS_INACTIVE), Step::Nothing],
+        ),
+        (
+            "a request naming nothing before the only accepted one",
+            vec![Step::Nothing, Step::Ask(LIFECYCLE_EVENTS_ACTIVE)],
+        ),
+    ]
+}
+
+/// The LAST accepted request decides the outcome: a request accepted while a switch
+/// is still in flight supersedes it, so the status in effect once the span elapses is
+/// the one that request asked for — and a request that asks for no status change
+/// leaves the switch in flight exactly as it stands.
+#[tokio::test]
+async fn the_last_accepted_request_decides_the_outcome() {
+    for (index, (case, run)) in supersede_runs().into_iter().enumerate() {
+        // The region is varied along the rows as well: the rule holds wherever the
+        // run is made, and every row is made against a store of its own.
+        let region = ["us-east-1", "eu-west-1"][index % 2];
+        let emulator = Emulator::new();
+        let mut asked: Option<&str> = None;
+        let mut previous_due: Option<SystemTime> = None;
+
+        for (step_index, step) in run.iter().enumerate() {
+            let at = format!("{case} in {region}, step {step_index} {step:?}");
+            let before = pending_switch(&emulator, region);
+            // Read before the call, so the span is asserted against the clock the
+            // handler itself read rather than against a later instant: a loaded
+            // runner must not be able to make the assertion depend on how long the
+            // call took.
+            let called_at = SystemTime::now();
+            match *step {
+                Step::Ask(desired) => {
+                    let (status, body) = update_settings(
+                        &emulator,
+                        region,
+                        &json!({ "GroupLifecycleEventsDesiredStatus": desired }),
+                    )
+                    .await;
+                    let (reported_desired, effective, message) =
+                        settings_of(&at, "UpdateAccountSettings", status, &body);
+                    assert_eq!(
+                        (reported_desired.as_str(), effective.as_str()),
+                        (desired, LIFECYCLE_EVENTS_IN_PROGRESS),
+                        "case {at:?}: expected {desired} desired and the switch in flight, \
+                         got {body}",
+                    );
+                    assert_eq!(
+                        message,
+                        Value::Null,
+                        "case {at:?}: nothing failed, so no status message may be reported, \
+                         got {body}",
+                    );
+                    let (pending_status, due) = pending_switch(&emulator, region)
+                        .unwrap_or_else(|| panic!("case {at:?}: expected a switch in flight"));
+                    assert_eq!(
+                        pending_status, desired,
+                        "case {at:?}: expected the switch in flight to put {desired} in effect, \
+                         got {pending_status}",
+                    );
+                    // The span this request starts is the one that now has to elapse,
+                    // whole: an accepted request supersedes a switch still in flight
+                    // rather than queueing behind it or inheriting what was left of
+                    // its span.
+                    assert!(
+                        due >= called_at + LIFECYCLE_EVENTS_SETTLE_DELAY,
+                        "case {at:?}: expected the switch to fall due a whole span after the \
+                         request, got {due:?} against {called_at:?}",
+                    );
+                    if let Some(previous) = previous_due {
+                        assert!(
+                            due >= previous,
+                            "case {at:?}: expected the superseding switch to fall due no earlier \
+                             than the one it replaced, got {due:?} against {previous:?}",
+                        );
+                    }
+                    previous_due = Some(due);
+                    asked = Some(desired);
+                }
+                Step::Refused(value) => {
+                    let (status, body) = update_settings(
+                        &emulator,
+                        region,
+                        &json!({ "GroupLifecycleEventsDesiredStatus": value }),
+                    )
+                    .await;
+                    assert_eq!(
+                        (status, error_code(&body)),
+                        (400, "BadRequestException"),
+                        "case {at:?}: expected 400 BadRequestException, got {status} {body}",
+                    );
+                }
+                Step::Nothing => {
+                    let (status, body) = update_settings(&emulator, region, &json!({})).await;
+                    let (reported_desired, effective, _) =
+                        settings_of(&at, "UpdateAccountSettings", status, &body);
+                    let expected = match asked {
+                        Some(desired) => (desired, LIFECYCLE_EVENTS_IN_PROGRESS),
+                        // Nothing has been asked for yet, so there is no switch in
+                        // flight and the feature is reported off.
+                        None => (LIFECYCLE_EVENTS_INACTIVE, LIFECYCLE_EVENTS_INACTIVE),
+                    };
+                    assert_eq!(
+                        (reported_desired.as_str(), effective.as_str()),
+                        expected,
+                        "case {at:?}: expected the stored settings reported unchanged, got {body}",
+                    );
+                }
+            }
+            if !matches!(*step, Step::Ask(_)) {
+                assert_eq!(
+                    pending_switch(&emulator, region),
+                    before,
+                    "case {at:?}: a request that asks for no status change must leave the switch \
+                     in flight exactly as it stands",
+                );
+            }
+        }
+
+        // Only once the span the LAST accepted request started has elapsed is the
+        // status it asked for the one in effect, and every later read reports it.
+        let decided = asked.expect("every run makes at least one accepted request");
+        make_switch_due(&emulator, region);
+        for read in 0..2 {
+            let settled = reported(&emulator, region, case).await;
+            assert_eq!(
+                (settled.0.as_str(), settled.1.as_str()),
+                (decided, decided),
+                "case {case:?} in {region} (read {read}): expected {decided} both desired and in \
+                 effect, got {settled:?}",
+            );
+        }
+        assert_eq!(
+            due_at(&emulator, region),
+            None,
+            "case {case:?} in {region}: a settled switch is no longer in flight",
+        );
+    }
 }

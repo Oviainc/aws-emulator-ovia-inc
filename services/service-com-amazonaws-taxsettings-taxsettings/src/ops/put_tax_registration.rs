@@ -22,19 +22,24 @@
 //! * a `legalAddress` submitted for a registration type AWS derives the address
 //!   from the tax number for (`crate::state::TYPES_WITH_DERIVED_LEGAL_ADDRESS`)
 //!   is refused: the address is not the caller's to supply. India's `PAN` is such
-//!   a type, and because this emulator has no registry to derive an address FROM,
-//!   while every shape that reports a registration requires one, a `PAN` entry
-//!   cannot be stored here either way — the same knowingly-not-emulated gap as
-//!   the Brazil and Mexico carve-outs below.
-//! * `legalName` and `legalAddress` are optional on `TaxRegistrationEntry` but
+//!   a type, so a `PAN` entry is stored with its address filled in rather than
+//!   submitted.
+//! * `legalName` and `legalAddress` are optional on `TaxRegistrationEntry` and
 //!   `@required` on every shape that REPORTS a registration (`TaxRegistration`,
-//!   `TaxRegistrationWithJurisdiction`), so an entry omitting either is refused
-//!   rather than stored in a form no read could return. The model documents a
-//!   Brazil carve-out for both (and a Mexico one, where both are "populated
-//!   based on your tax registration number"), which rests on data verified
-//!   outside this API; this service models no API that supplies one, so the
-//!   carve-outs are knowingly NOT emulated — such a TRN must be submitted with
-//!   its legal name and address here.
+//!   `TaxRegistrationWithJurisdiction`), so an entry that omits one is refused
+//!   UNLESS the jurisdiction it identifies is one the service fills that member
+//!   in for: Brazil for the legal name, Brazil's `CNPJ` type and Mexico for both
+//!   (`crate::state::COUNTRIES_WITH_DERIVED_LEGAL_NAME`,
+//!   `crate::state::COUNTRIES_WITH_DERIVED_LEGAL_ADDRESS`). Filling one in means
+//!   reading the account's registration back from the tax authority's registry,
+//!   which this emulator has none of, so the stored record reports the
+//!   jurisdiction the entry identified and
+//!   `crate::state::DERIVED_MEMBER_UNKNOWN` for what only that registry holds —
+//!   the write is accepted, because the service accepts it.
+//!   An entry that identifies no jurisdiction at all (no `legalAddress`, and a
+//!   type the model ties to no one country) is refused for the missing address:
+//!   neither carve-out can be read without a country, and the `countryCode` every
+//!   read reports could be neither supplied nor derived.
 //! * the model's non-blank pattern `^(?!\s*$)[\s\S]+$` is a negative lookahead
 //!   the boundary validator's regex engine cannot compile, so this handler
 //!   applies it to `registrationId`, `legalName` and every address line.
@@ -249,12 +254,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Whether this entry is storable at all is decided in ONE place, which
         // `BatchPutTaxRegistration` uses too, so the two writers cannot disagree
         // about one entry: the refusals the module header lists (a legal address
-        // submitted for a type AWS derives it from, a missing legal name or
-        // address, a blank value the boundary validator's regex engine could not
-        // refuse) and then the per-country business rules the model documents,
-        // keyed off the entry's `legalAddress.countryCode` — all of it BEFORE the
-        // write, so an entry AWS refuses persists nothing. Everything else on
-        // this input (the 12-digit `accountId`, the 1..=200 lengths, the closed
+        // submitted for a type AWS derives it from, a legal name or address the
+        // entry's own jurisdiction requires and it omits, a blank value the
+        // boundary validator's regex engine could not refuse) and then the
+        // per-country business rules the model documents, keyed off the
+        // jurisdiction the entry identifies — all of it BEFORE the write, so an
+        // entry AWS refuses persists nothing. Everything else on this input (the
+        // 12-digit `accountId`, the 1..=200 lengths, the closed
         // `TaxRegistrationType` / `Sector` value sets, the `certifiedEmailId`
         // pattern, the 1..=5 document list) the boundary validator already
         // refused before this handler ran.

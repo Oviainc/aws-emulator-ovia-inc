@@ -378,15 +378,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let interpreted = {
             let definition = definition.clone();
             let execution_input = execution_input.clone();
-            tokio::task::spawn_blocking(move || {
+            crate::state::integration::interpret(ctx, &region, move |tasks| {
                 crate::state::plan_run_settling_after(
-                    &definition,
-                    &execution_input,
-                    started,
-                    &context,
-                    crate::state::EVENT_EXECUTION_STARTED,
-                    0,
+                    &crate::state::RunAttempt {
+                        definition: &definition,
+                        input: &execution_input,
+                        start: started,
+                        context: &context,
+                        opening: crate::state::EVENT_EXECUTION_STARTED,
+                        previous_event_id: 0,
+                    },
                     std::time::Duration::ZERO,
+                    tasks,
                 )
             })
             .await

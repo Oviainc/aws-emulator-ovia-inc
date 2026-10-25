@@ -1893,6 +1893,71 @@ pub fn mint_webhook_secret(store: &::emulator_server::CredentialStore) -> Option
     (secret.chars().count() == WEBHOOK_SECRET_LEN).then_some(secret)
 }
 
+/// Why `filter_groups` cannot be a webhook's filter groups, as the message the modelled
+/// `InvalidInputException` carries — or `None` when they can.
+///
+/// AWS documents the rule on `filterGroups`: "At least one WebhookFilter in the array
+/// must specify EVENT as its type", and "for a filter group to pass, each of its filters
+/// must pass", so a group without an `EVENT` filter can never trigger a build. The model
+/// expresses no such constraint, so the boundary validator passes it and the refusal
+/// belongs to the handler — on every operation that SETS a webhook's filter groups,
+/// `CreateWebhook` and `UpdateWebhook` alike. It names the member and the constraint the
+/// way a boundary refusal does.
+pub fn webhook_filter_groups_violation(
+    filter_groups: Option<&[Vec<crate::ops::types::WebhookFilter>]>,
+) -> Option<String> {
+    filter_groups
+        .unwrap_or_default()
+        .iter()
+        .position(|group| {
+            !group
+                .iter()
+                .any(|filter| filter.r#type == EVENT_WEBHOOK_FILTER_TYPE)
+        })
+        .map(|index| {
+            format!(
+                "Value at 'filterGroups[{index}]' failed to satisfy constraint: \
+                 at least one WebhookFilter must specify {EVENT_WEBHOOK_FILTER_TYPE} as its type"
+            )
+        })
+}
+
+/// Why a webhook whose `build_type` is this one cannot belong to a project whose primary
+/// source type is `source_type`, as the message the modelled `InvalidInputException`
+/// carries — or `None` when it can.
+///
+/// Two rules, each documented on the member it is about, and each checked wherever a
+/// webhook's build type is SET (`CreateWebhook` and `UpdateWebhook` alike):
+///
+/// * a runner webhook ([`RUNNER_WEBHOOK_BUILD_TYPE`]) is "only available for NO_SOURCE
+///   source type projects", and is the only webhook such a project takes;
+/// * every other build type is a repository-event webhook, so it needs a source whose
+///   provider sends repository events ([`WEBHOOK_SOURCE_TYPES`]).
+pub fn webhook_build_type_violation(
+    source_type: &str,
+    build_type: Option<&str>,
+    project_arn: &str,
+) -> Option<String> {
+    let runner = build_type.is_some_and(|build_type| build_type == RUNNER_WEBHOOK_BUILD_TYPE);
+    if runner {
+        (source_type != RUNNER_WEBHOOK_SOURCE_TYPE).then(|| {
+            format!(
+                "Value at 'buildType' failed to satisfy constraint: {RUNNER_WEBHOOK_BUILD_TYPE} \
+                 is only available for {RUNNER_WEBHOOK_SOURCE_TYPE} source type projects, and \
+                 project {project_arn} has source type {source_type}"
+            )
+        })
+    } else {
+        (!WEBHOOK_SOURCE_TYPES.contains(&source_type)).then(|| {
+            format!(
+                "A webhook cannot be connected to project {project_arn}: its source type \
+                 {source_type} does not support webhooks. Supported source types are {}",
+                WEBHOOK_SOURCE_TYPES.join(", "),
+            )
+        })
+    }
+}
+
 /// `arn:aws:codebuild:<region>:<account>:build-batch/<id>`.
 ///
 /// `build-batch` is CodeBuild's own resource type for a batch build, which is

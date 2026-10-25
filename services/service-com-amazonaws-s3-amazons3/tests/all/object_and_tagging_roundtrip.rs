@@ -486,14 +486,14 @@ async fn writing_an_object_replaces_the_one_at_that_key() {
                 "case {case:?}: expected the content type of this write ({value:?}), got {:?}",
                 got.header("content-type")
             ),
-            // An object stored without a content type has none to report, so the read is
-            // served with the protocol's default payload type rather than with the type
-            // of the object this write replaced.
+            // An object stored with no `Content-Type` carries S3's documented default,
+            // `binary/octet-stream` — never the type of the object this write replaced,
+            // and never a type inferred from the key.
             None => assert_eq!(
                 got.header("content-type").as_deref(),
-                Some("application/octet-stream"),
-                "case {case:?}: an object written with no content type must not report \
-                 the replaced object's, got {:?}",
+                Some("binary/octet-stream"),
+                "case {case:?}: an object written with no content type must report S3's \
+                 default rather than the replaced object's, got {:?}",
                 got.header("content-type")
             ),
         }

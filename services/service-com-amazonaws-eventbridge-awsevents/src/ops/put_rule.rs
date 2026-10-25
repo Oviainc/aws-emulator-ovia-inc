@@ -205,10 +205,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if let Some(pattern) = event_pattern.as_deref() {
+            // The reason `event_pattern::parse` answers with is ALREADY the
+            // whole message ("Event pattern is not valid. Reason: …"), so it is
+            // carried as it stands: restating the opening here would answer a
+            // message stating it twice.
             if let Err(reason) = crate::state::event_pattern::parse(pattern) {
                 return Err(PutRuleErrorModeled::InvalidEventPatternException(
                     InvalidEventPatternException {
-                        message: Some(format!("Event pattern is not valid. Reason: {reason}")),
+                        message: Some(reason),
                     },
                 )
                 .into());
