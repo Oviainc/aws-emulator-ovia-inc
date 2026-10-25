@@ -13,8 +13,12 @@
 // points it into `tests/all/`.
 #[path = "all/data_cells_filters.rs"]
 mod data_cells_filters;
+#[path = "all/glue_catalog.rs"]
+mod glue_catalog;
 #[path = "all/lf_tags.rs"]
 mod lf_tags;
+#[path = "all/permission_scope.rs"]
+mod permission_scope;
 #[path = "all/permissions.rs"]
 mod permissions;
 #[path = "all/registered_resources.rs"]
