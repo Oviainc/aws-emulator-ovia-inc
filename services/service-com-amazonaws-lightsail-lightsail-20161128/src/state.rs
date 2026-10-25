@@ -23,7 +23,9 @@
 //! IPv4 address the account reserves and attaches to an instance), the **CDN
 //! distribution** (a global resource that caches and serves the content of an
 //! origin resource), the peering of a Region's **Lightsail VPC** with the
-//! account's default VPC there, the append-only **operation log** every mutating
+//! account's default VPC there, the temporary **container image registry log in**
+//! credentials `CreateContainerServiceRegistryLogin` hands out for the account's
+//! container image registry, the append-only **operation log** every mutating
 //! call writes, and the service's static **Region catalog** — the Regions and
 //! Availability Zones `GetRegions` lists and every other operation validates a
 //! location against. Everything mutable in this module is reached through
@@ -608,6 +610,8 @@ pub const OPERATION_TYPE_PEER_VPC: &str = "PeerVpc";
 pub const OPERATION_TYPE_UNPEER_VPC: &str = "UnpeerVpc";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DISABLE_ADD_ON: &str = "DisableAddOn";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_ENABLE_ADD_ON: &str = "EnableAddOn";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -6774,6 +6778,124 @@ pub fn ecr_image_puller_principal_arn(region: &str, name: &str, token: &str) -> 
     )
 }
 
+// ---------------------------------------------------------------------------
+// The container image registry of the account
+// ---------------------------------------------------------------------------
+
+/// How long one set of container image registry log in credentials stays valid.
+///
+/// A duration the service DOCUMENTS, not a chosen one: the modelled
+/// `ContainerServiceRegistryLogin$expiresAt` states it itself — "The log in
+/// credentials expire 12 hours after they are created, at which point you will
+/// need to create a new set of log in credentials using the
+/// `CreateContainerServiceRegistryLogin` action."
+pub const REGISTRY_LOGIN_LIFETIME_MS: i64 = 12 * 60 * 60 * 1_000;
+
+/// The path space the container image registry of this account is published
+/// under, beneath the endpoint the emulator is reached on.
+///
+/// `ContainerServiceRegistryLogin$registry` is "The address to use to push
+/// container images to the container image registry of a Lightsail account", so
+/// it is a promise that the caller which read it can reach that address. AWS
+/// publishes the registry as a DNS name of its own; the HOSTNAME is
+/// environment-specific while the promise is not, this emulator owns no DNS
+/// zone, and a literal AWS hostname would send the next client out of the
+/// emulator entirely (see [`request_endpoint`]). So the registry is published
+/// beneath the request's own endpoint, with the region AWS puts in its hostname
+/// carried in the path instead — exactly as
+/// [`CONTAINER_SERVICE_PUBLIC_PATH_PREFIX`] carries a container service's
+/// labels. The prefix names this service and this resource, so it cannot
+/// collide with another service's modelled URI space.
+pub const CONTAINER_IMAGE_REGISTRY_PATH_PREFIX: &str = "/lightsail-container-image-registry";
+
+/// The address a `docker login` — and the pushes after it — are pointed at for
+/// this account's registry in `region`, as announced to a caller that reached
+/// this emulator at `endpoint` (its `Host`/`:authority`).
+///
+/// `https`, because the emulator serves one TLS listener
+/// (`emulator_server::serve_emulator_until_shutdown`) and no plaintext one, so
+/// that is the scheme its own endpoint answers on.
+pub fn container_image_registry_url(endpoint: &str, region: &str) -> String {
+    format!("https://{endpoint}{CONTAINER_IMAGE_REGISTRY_PATH_PREFIX}/{region}")
+}
+
+/// The region whose registry a request to a published registry address
+/// addresses, or `None` when the path is not one
+/// [`container_image_registry_url`] publishes.
+///
+/// Anything the caller appended BENEATH the region is the registry protocol's
+/// own path (`/v2/…` for a Docker client): it names no part of this service, so
+/// it addresses the same registry as the announced address itself.
+pub fn parse_container_image_registry_path(path: &str) -> Option<String> {
+    let rest = path
+        .strip_prefix(CONTAINER_IMAGE_REGISTRY_PATH_PREFIX)?
+        .strip_prefix('/')?;
+    let region = rest.split('/').next().unwrap_or_default();
+    (!region.is_empty()).then(|| region.to_string())
+}
+
+/// The most sets of registry log in credentials this store keeps per region.
+///
+/// Emulator resource guard, NOT an AWS quota: AWS caps the number of live sets
+/// nowhere, and the clock already forgets every set
+/// [`REGISTRY_LOGIN_LIFETIME_MS`] after it was created, which bounds the store
+/// for any ordinary caller. This bounds it for one that asks for more than that
+/// within a single window; the set dropped is the OLDEST, which is the one
+/// closest to expiring anyway.
+pub const MAX_REGISTRY_LOGINS_PER_REGION: usize = 500;
+
+/// One set of container image registry log in credentials this account was
+/// handed: the username it logs in with, what a presented password is checked
+/// against, and when the set expires.
+///
+/// The password itself is NOT kept. It was minted by the emulator's credential
+/// store, carried to its caller in the one response that creates it, and only
+/// its SHA-256 digest is stored — so nothing can read a usable password back out
+/// of this store, the same reason a bucket access key keeps only its id here
+/// (see [`StoredBucketAccessKey`]).
+#[derive(Debug, Clone)]
+pub struct StoredRegistryLogin {
+    /// The username this set logs in with, which is also what identifies it: the
+    /// id the credential store minted for it.
+    pub username: String,
+    /// The SHA-256 digest of the password, hex — see [`StoredRegistryLogin`].
+    password_digest: String,
+    pub created_at_ms: i64,
+    /// The instant this set expires: [`REGISTRY_LOGIN_LIFETIME_MS`] after it was
+    /// created.
+    pub expires_at_ms: i64,
+}
+
+impl StoredRegistryLogin {
+    /// The set created at `created_at_ms` that logs in as `username` with
+    /// `password` — which is hashed here and not retained.
+    pub fn new(username: String, password: &str, created_at_ms: i64) -> Self {
+        Self {
+            username,
+            password_digest: registry_password_digest(password),
+            created_at_ms,
+            expires_at_ms: created_at_ms.saturating_add(REGISTRY_LOGIN_LIFETIME_MS),
+        }
+    }
+
+    /// Whether `password` is the password this set logs in with.
+    pub fn accepts(&self, password: &str) -> bool {
+        // DIGESTS are compared, not secrets: the stored value is the SHA-256 of
+        // a 712-character random token, so what the comparison can tell a
+        // guesser is at most how far a digest matched, which nobody can turn
+        // back into the password that produced it.
+        self.password_digest == registry_password_digest(password)
+    }
+}
+
+/// The SHA-256 of a registry password, hex — the only form of one this store
+/// holds. See [`StoredRegistryLogin`].
+fn registry_password_digest(password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// One container image registered to a container service: the digest that was
 /// pushed, the name this service assigned it, and when it was registered.
 ///
@@ -8646,6 +8768,16 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// container service and a bucket. A `BTreeMap` so a listing walks a stable,
     /// total order and a page token can name the next load balancer.
     pub load_balancers: BTreeMap<(String, String), StoredLoadBalancer>,
+    /// The live sets of container image registry log in credentials, keyed by
+    /// the region the creating request was made in, newest last.
+    ///
+    /// The registry is the ACCOUNT's — `CreateContainerServiceRegistryLogin`
+    /// creates credentials for "the container image registry of your Lightsail
+    /// account" — and the address each set was handed carries the region that
+    /// request was signed for, so that region is what a later log in presents
+    /// its credentials at. The clock forgets a set 12 hours after it was created
+    /// (see [`Self::advance_clock`]), so every set held here is still valid.
+    pub registry_logins: BTreeMap<String, Vec<StoredRegistryLogin>>,
     /// The peering of each Region's Lightsail VPC with the account's default VPC
     /// there, keyed by the Region's name. A Region with no entry is one whose
     /// Lightsail VPC nothing has ever asked to peer.
@@ -9542,6 +9674,47 @@ impl ComAmazonawsLightsailLightsail20161128State {
         operation
     }
 
+    /// The live set of registry log in credentials for `region` that `username`
+    /// and `password` log in with, if the store holds one.
+    ///
+    /// Every set the clock has already expired is gone before this runs (see
+    /// [`Self::advance_clock`]), so a match here is a set that is still valid.
+    pub fn registry_login(
+        &self,
+        region: &str,
+        username: &str,
+        password: &str,
+    ) -> Option<&StoredRegistryLogin> {
+        self.registry_logins
+            .get(region)?
+            .iter()
+            .find(|login| login.username == username && login.accepts(password))
+    }
+
+    /// Record a set of registry log in credentials just created in `region`,
+    /// dropping the oldest once that region holds
+    /// [`MAX_REGISTRY_LOGINS_PER_REGION`].
+    pub fn insert_registry_login(&mut self, region: &str, login: StoredRegistryLogin) {
+        let logins = self.registry_logins.entry(region.to_string()).or_default();
+        logins.push(login);
+        if let Some(excess) = logins.len().checked_sub(MAX_REGISTRY_LOGINS_PER_REGION) {
+            // A set the store had to forget early stops logging in before the
+            // expiry its caller was handed, so the eviction is traceable rather
+            // than a silent surprise. The username is the id this store holds;
+            // no password or digest is logged.
+            for evicted in logins.drain(..excess) {
+                ::tracing::warn!(
+                    region = %region,
+                    username = %evicted.username,
+                    created_at_epoch_millis = evicted.created_at_ms,
+                    limit = MAX_REGISTRY_LOGINS_PER_REGION,
+                    "the oldest container image registry log in credentials were dropped to \
+                     keep this region within the store's bound"
+                );
+            }
+        }
+    }
+
     /// Build and record an operation of `operation_type` against `resource_name`.
     ///
     /// `resource_type` is the kind of resource the operation acted on, from the
@@ -9691,7 +9864,9 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// into the phase it was owed (activating the deployment that was waiting),
     /// a Region's Lightsail VPC peering walks into the phase it was owed
     /// (established, or gone), a CDN distribution settles into the status it was
-    /// owed, and an operation whose work is done settles into `Succeeded`.
+    /// owed, an operation whose work is done settles into `Succeeded`, and a set
+    /// of container image registry log in credentials past its 12-hour validity
+    /// is forgotten.
     ///
     /// This is the one write a reporting operation performs. Each transition was
     /// owed at this instant whether or not anybody called, so applying it here
@@ -9866,6 +10041,14 @@ impl ComAmazonawsLightsailLightsail20161128State {
                 setup.settles_at_ms = None;
             }
         }
+        // A set of container image registry log in credentials expires 12 hours
+        // after it was created whether or not anybody calls again
+        // ([`REGISTRY_LOGIN_LIFETIME_MS`]), so a set the clock has taken past
+        // its expiry is forgotten rather than left loggable-in with.
+        for logins in self.registry_logins.values_mut() {
+            logins.retain(|login| login.expires_at_ms > now_ms);
+        }
+        self.registry_logins.retain(|_, logins| !logins.is_empty());
     }
 
     /// Run `body` against the tag-carrying record `name` names in `region` —
@@ -10029,6 +10212,15 @@ macro_rules! add_on_records {
 
 add_on_records!(StoredInstance, StoredDisk);
 
+/// What an add-on operation needs from the CALLER's request — the member path a
+/// refusal names, and the sentence an unresolvable name is refused with — in a
+/// module of its own. Re-exported here, so every caller reaches it as
+/// `crate::state::…` exactly like the rest of this module.
+pub mod add_ons;
+pub use add_ons::{
+    add_on_resource_not_found, AddOnMember, ADD_ONS_LIST_MEMBER, ADD_ON_REQUEST_MEMBER,
+};
+
 /// The add-ons of `record` with the one of type `add_on_type` removed.
 ///
 /// A stored add-on is named by its type (the modelled `AddOnType` value the
@@ -10136,13 +10328,18 @@ pub fn tags_without(record: &dyn TaggedRecord, keys: &BTreeSet<String>) -> Vec<T
 /// request structure supplies. An `AutoSnapshot` request that names no
 /// `snapshotTimeOfDay` gets the hour Lightsail would pick for it, drawn here from
 /// the resource's own name so the answer is the same on every later read.
+///
+/// `member` is where the caller's request carries them, so every refusal below
+/// names a member of the request that was actually sent.
 pub fn add_ons_from_requests(
+    member: AddOnMember,
     resource_name: &str,
     requests: &[AddOnRequest],
 ) -> Result<Vec<AddOn>, String> {
     if requests.len() > MAX_ADD_ONS {
         return Err(format!(
-            "addOns carries {} entries, more than the {MAX_ADD_ONS} this service accepts",
+            "{} carries {} entries, more than the {MAX_ADD_ONS} this service accepts",
+            member.carrier,
             requests.len()
         ));
     }
@@ -10175,7 +10372,8 @@ pub fn add_ons_from_requests(
                 ..Default::default()
             }),
             other => Err(format!(
-                "addOns[].addOnType must be one of [{}], got '{other}'",
+                "{}.addOnType must be one of [{}], got '{other}'",
+                member.entry,
                 crate::ops::types::ADD_ON_TYPE_VALUES.join(", ")
             )),
         })
@@ -10200,6 +10398,7 @@ pub const ADD_ON_TYPE_AUTO_SNAPSHOT: &str = "AutoSnapshot";
 /// act. Every operation that creates a disk goes through here, so `CreateDisk`
 /// and `CreateDiskFromSnapshot` accept exactly the same add-ons.
 pub fn disk_add_ons_from_requests(
+    member: AddOnMember,
     disk_name: &str,
     requests: &[AddOnRequest],
 ) -> Result<Vec<AddOn>, String> {
@@ -10208,12 +10407,12 @@ pub fn disk_add_ons_from_requests(
         .find(|request| request.add_on_type != ADD_ON_TYPE_AUTO_SNAPSHOT)
     {
         return Err(format!(
-            "addOns[].addOnType '{}' cannot be enabled on a disk: a disk accepts only \
+            "{}.addOnType '{}' cannot be enabled on a disk: a disk accepts only \
              {ADD_ON_TYPE_AUTO_SNAPSHOT}",
-            request.add_on_type
+            member.entry, request.add_on_type
         ));
     }
-    add_ons_from_requests(disk_name, requests)
+    add_ons_from_requests(member, disk_name, requests)
 }
 
 /// Whether `value` is a date in the `YYYY-MM-DD` form an automatic snapshot is
@@ -10647,3 +10846,138 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsLightsailLightsail20161128State>)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plausible instant to create a set of credentials at, and the credentials
+    /// one is created with. The username is shaped like one the credential store
+    /// mints; the password stands in for the secret it mints.
+    const CREATED_AT_MS: i64 = 1_700_000_000_000;
+    const USERNAME: &str = "EMULATORASJ4K7QWRT2X";
+    const PASSWORD: &str = "a-minted-registry-password";
+    const REGION: &str = "us-east-1";
+
+    /// One store holding one set of registry log in credentials.
+    fn store_with_one_login() -> ComAmazonawsLightsailLightsail20161128State {
+        let mut store = ComAmazonawsLightsailLightsail20161128State::default();
+        store.insert_registry_login(
+            REGION,
+            StoredRegistryLogin::new(USERNAME.to_string(), PASSWORD, CREATED_AT_MS),
+        );
+        store
+    }
+
+    /// RULE: the CLOCK is what ends a set of container image registry log in
+    /// credentials — it is recognised for the documented 12 hours after it was
+    /// created and gone from the store from that instant on, whether or not
+    /// anybody called in between. The integration suite asserts the `expiresAt`
+    /// the caller is told; this asserts the instant itself, which no wall-clock
+    /// test can reach.
+    #[test]
+    fn a_registry_login_is_forgotten_once_the_clock_passes_its_expiry() {
+        let expiry = CREATED_AT_MS + REGISTRY_LOGIN_LIFETIME_MS;
+        // (case, the instant the clock has reached, whether the set logs in)
+        let cases = [
+            ("the instant it was created", CREATED_AT_MS, true),
+            ("one millisecond before it expires", expiry - 1, true),
+            ("the instant it expires", expiry, false),
+            ("an hour after it expired", expiry + 60 * 60 * 1_000, false),
+        ];
+        for (case, at_ms, want) in cases {
+            // A fresh store per case: the clock only ever moves forward, so each
+            // instant is reached from the creation rather than from the last case.
+            let mut store = store_with_one_login();
+            store.advance_clock(at_ms);
+            let found = store.registry_login(REGION, USERNAME, PASSWORD).is_some();
+            assert_eq!(
+                found, want,
+                "case {case}: expected the set to log in = {want}, got {found}"
+            );
+            assert_eq!(
+                store.registry_logins.contains_key(REGION),
+                want,
+                "case {case}: expected an expired set to be gone from the store, got \
+                 {:?}",
+                store.registry_logins.get(REGION).map(Vec::len)
+            );
+        }
+    }
+
+    /// RULE: the store's own per-region bound keeps the credentials it holds
+    /// finite: past [`MAX_REGISTRY_LOGINS_PER_REGION`] the OLDEST set is the one
+    /// dropped, and every younger set still logs in.
+    #[test]
+    fn the_oldest_registry_login_is_the_one_the_bound_drops() {
+        let mut store = ComAmazonawsLightsailLightsail20161128State::default();
+        // One set past the bound, each a millisecond younger than the last so
+        // "oldest" is well defined.
+        let total = MAX_REGISTRY_LOGINS_PER_REGION + 1;
+        let username = |index: usize| format!("{USERNAME}{index}");
+        for index in 0..total {
+            store.insert_registry_login(
+                REGION,
+                StoredRegistryLogin::new(
+                    username(index),
+                    PASSWORD,
+                    CREATED_AT_MS + i64::try_from(index).expect("the index fits"),
+                ),
+            );
+        }
+        store.advance_clock(CREATED_AT_MS);
+
+        assert_eq!(
+            store.registry_logins.get(REGION).map(Vec::len),
+            Some(MAX_REGISTRY_LOGINS_PER_REGION),
+            "case the region at its bound: expected {MAX_REGISTRY_LOGINS_PER_REGION} sets"
+        );
+        assert!(
+            store
+                .registry_login(REGION, &username(0), PASSWORD)
+                .is_none(),
+            "case the oldest set: expected it to have been dropped"
+        );
+        for index in 1..total {
+            assert!(
+                store
+                    .registry_login(REGION, &username(index), PASSWORD)
+                    .is_some(),
+                "case the set created {index} milliseconds in: expected it to still log in"
+            );
+        }
+    }
+
+    /// RULE: only the credentials a set was created with log in to it, and only at
+    /// the registry of the region it was created for.
+    #[test]
+    fn only_the_credentials_a_registry_login_was_created_with_are_accepted() {
+        let mut store = store_with_one_login();
+        store.advance_clock(CREATED_AT_MS);
+
+        // (case, region, username, password)
+        let refused = [
+            ("another region's registry", "us-west-2", USERNAME, PASSWORD),
+            ("a username no set was created for", REGION, "AWS", PASSWORD),
+            ("another password", REGION, USERNAME, "another-password"),
+            ("the password of the username", REGION, USERNAME, USERNAME),
+            ("no password at all", REGION, USERNAME, ""),
+            ("a password one character short", REGION, USERNAME, &PASSWORD[..PASSWORD.len() - 1]),
+        ];
+        for (case, region, username, password) in refused {
+            assert!(
+                store.registry_login(region, username, password).is_none(),
+                "case {case}: expected no set to be recognised"
+            );
+        }
+        assert!(
+            store
+                .registry_login(REGION, USERNAME, PASSWORD)
+                .is_some_and(|login| login.expires_at_ms
+                    == CREATED_AT_MS + REGISTRY_LOGIN_LIFETIME_MS),
+            "case the credentials it was created with: expected the set to be recognised, \
+             expiring 12 hours after it was created"
+        );
+    }
+}
+

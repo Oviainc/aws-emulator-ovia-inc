@@ -5,7 +5,9 @@
 //! ingest state was refreshed, and reports that instant with the channel's identity. A
 //! reset leaves the channel's CONFIGURATION alone, so `ModifiedAt` and the ETag — which
 //! track the configuration a conditional update races with — keep their values, and a
-//! later `GetChannel` reports the stored `ResetAt` byte for byte.
+//! later `GetChannel` reports the stored `ResetAt` byte for byte. A channel that receives
+//! no ingest of its own has no ingest state to refresh, so the reset is refused there
+//! instead and records nothing.
 //!
 //! `handle` below is the implementation; `crate::state` holds the store it writes.
 //!
@@ -88,6 +90,19 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The member path a refused reset names: the channel the request addressed, in
+/// lowerCamel as the wire names it.
+const CHANNEL_NAME_MEMBER: &str = "channelName";
+
+/// Why a reset is refused on a channel that receives no ingest of its own — the
+/// requirement the addressed channel failed, which `crate::state::validation_failed`
+/// states in this service's envelope. A reset refreshes the channel's ingest stream, and a
+/// multiview channel has none to refresh: it composites the channels in its multiview
+/// configuration, so the ingest to refresh is theirs.
+const MULTIVIEW_RESET_NOT_ALLOWED_REQUIREMENT: &str = "You can't reset a multiview \
+    channel, because it receives no ingest of its own. Reset its source channels instead \
+    and then try again";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -190,6 +205,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A channel that composites other channels receives no ingest of its own, so
+        // there is no ingest state for a reset to refresh — the case the model's
+        // `MULTIVIEW_RESET_NOT_ALLOWED` validation type names. Refused before anything is
+        // written, so no reset instant is recorded and a later read still reports none.
+        if channel.is_multiview() {
+            return Err(ResetChannelStateErrorModeled::ValidationException(
+                crate::state::validation_failed(
+                    CHANNEL_NAME_MEMBER,
+                    MULTIVIEW_RESET_NOT_ALLOWED_REQUIREMENT,
+                    "MULTIVIEW_RESET_NOT_ALLOWED",
+                ),
+            )
+            .into());
+        }
 
         // The reset instant: the moment this call refreshed the channel's ingest stream.
         // It is persisted, and OVERWRITTEN by each later reset, because the field records

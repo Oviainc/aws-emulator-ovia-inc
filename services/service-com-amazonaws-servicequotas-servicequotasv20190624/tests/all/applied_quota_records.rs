@@ -11,10 +11,10 @@
 //!   value, adjustability, scope, rate window and usage-metric dimensions — and a
 //!   code the service does not publish is refused instead of answered with another
 //!   quota's record;
-//! * every listing serves a BOUNDED page when the caller names no `MaxResults` (which
-//!   "defaults to a value appropriate to the operation"), carrying a `NextToken` for
-//!   exactly as long as items remain, so a walk of the chain yields the published
-//!   listing once.
+//! * `MaxResults` bounds what a CALLER may ask for and not what a listing serves when
+//!   none is named, so an unasked listing carries its WHOLE published set in one page
+//!   with no `NextToken`, while an asked page size cuts that same listing into
+//!   `NextToken`-chained pages that walk to it once.
 //!
 //! The rows below span the shapes a `ServiceQuota` comes in — adjustable and fixed,
 //! counted and measured, rate-shaped and plain, regional and global, with AWS's own
@@ -23,7 +23,6 @@
 //! harness (`Client`, `walk_pages`) is the one `quota_workflow.rs` owns.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_servicequotas_servicequotasv20190624::state::UNASKED_PAGE_SIZE;
 
 use crate::quota_workflow::{client, emulator, walk_pages, Client};
 
@@ -247,8 +246,8 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// The services the page-size rule is pinned over: `iam` publishes fewer quotas than
-/// one unasked page, `lambda` and `vpc` a few pages' worth, `ec2` hundreds.
+/// The services the page-size rule is pinned over: `iam` publishes a handful of
+/// quotas, `lambda` and `vpc` a few dozen, `ec2` hundreds.
 const PAGED_SERVICES: &[&str] = &["iam", "lambda", "vpc", "ec2"];
 
 /// The `Resource` dimension of a record's usage metric, when it publishes one.
@@ -495,19 +494,19 @@ async fn a_pair_the_catalog_does_not_publish_is_refused_rather_than_substituted(
     }
 }
 
-/// RULE: every QUOTA listing of this service serves a bounded page even when the
-/// caller names no `MaxResults`, carrying a `NextToken` for exactly as long as items
-/// remain — so a client that walks the chain sees the whole listing and one that reads
-/// a single page knows there is more. (`ListServices` is NOT one of these: its unasked
-/// page is the whole inventory, which `catalog_pagination.rs` pins.)
+/// RULE: `MaxResults` bounds what a CALLER may ask for, not what a listing of this
+/// service serves when the caller names none — so an unasked QUOTA listing carries the
+/// service's whole published set in one page with no `NextToken`, and only a page a
+/// caller cut short with `MaxResults` is followed by a token that resumes exactly
+/// where it stopped.
 #[tokio::test]
-async fn an_unasked_quota_page_is_bounded_and_resumes_while_items_remain() {
+async fn an_unasked_quota_listing_is_whole_and_an_asked_page_resumes() {
     let engine = emulator();
     let client = client(&engine, "us-east-1");
 
     // Rows: the quota listings of this service, over item sets that are shorter than
-    // one unasked page (iam's four quotas), a few pages long (lambda, vpc) and
-    // hundreds long (ec2's quotas).
+    // the smallest asked page but one (iam's few quotas), a few dozen long (lambda,
+    // vpc) and hundreds long (ec2's quotas).
     let mut listings: Vec<(&str, Value, &str)> = Vec::new();
     for service_code in PAGED_SERVICES {
         listings.push((
@@ -522,63 +521,75 @@ async fn an_unasked_quota_page_is_bounded_and_resumes_while_items_remain() {
         ));
     }
 
-    let mut shorter_than_a_page = 0_usize;
-    let mut longer_than_a_page = 0_usize;
+    let mut shorter_than_the_largest_page = 0_usize;
+    let mut longer_than_the_largest_page = 0_usize;
 
     for (operation, base, items) in listings {
         let case = format!("{operation} {base}");
         // The published listing, walked one page at a time with the tokens the
-        // service itself issues.
-        let whole = walk_pages(&client, operation, &base, items, None).await;
+        // service itself issues for a caller-named page size.
+        let whole = walk_pages(&client, operation, &base, items, Some(100)).await;
         assert!(
             !whole.is_empty(),
             "case {case}: expected a non-empty listing, got {whole:?}"
         );
+        if whole.len() > 100 {
+            longer_than_the_largest_page += 1;
+        } else {
+            shorter_than_the_largest_page += 1;
+        }
 
         let first = client.ok(operation, base.clone()).await;
         let page = first[items].as_array().cloned().unwrap_or_default();
-        let expected = UNASKED_PAGE_SIZE.min(whole.len());
         assert_eq!(
             page.len(),
-            expected,
-            "case {case}: an unasked page holds at most {UNASKED_PAGE_SIZE} items, expected \
-             {expected}, got {}",
+            whole.len(),
+            "case {case}: an unasked listing carries its whole set of {} items, got {}",
+            whole.len(),
             page.len()
         );
         assert_eq!(
-            page,
-            whole[..expected],
-            "case {case}: the unasked page must be the first items of the published order"
+            page, whole,
+            "case {case}: the unasked page must be the published listing itself"
         );
-        assert_eq!(
-            first["NextToken"].is_string(),
-            whole.len() > UNASKED_PAGE_SIZE,
-            "case {case}: a NextToken is present exactly while items remain ({} items), got \
-             {first}",
-            whole.len()
+        assert!(
+            first["NextToken"].is_null(),
+            "case {case}: the whole listing is the last page, so no NextToken follows it, got {}",
+            first["NextToken"]
         );
 
-        if whole.len() > UNASKED_PAGE_SIZE {
-            longer_than_a_page += 1;
-            // The token resumes where the page stopped: no item is repeated and none
-            // is skipped.
+        // A page a CALLER cut short is followed by a token that resumes exactly where
+        // it stopped: no item repeated, none skipped.
+        for size in [1_usize, 3] {
+            if whole.len() <= size {
+                continue;
+            }
+            let mut asked = base.clone();
+            asked["MaxResults"] = json!(size);
+            let short = client.ok(operation, asked.clone()).await;
+            let token = short["NextToken"].as_str().unwrap_or_default().to_string();
+            assert!(
+                !token.is_empty(),
+                "case {case} MaxResults={size}: {} items remain after this page, so a NextToken \
+                 must follow it, got {short}",
+                whole.len() - size
+            );
             let mut resume = base.clone();
-            resume["NextToken"] = json!(first["NextToken"].as_str().unwrap_or_default());
+            resume["NextToken"] = json!(token);
+            resume["MaxResults"] = json!(size);
             let resumed = client.ok(operation, resume).await;
             let second = resumed[items].as_array().cloned().unwrap_or_default();
-            let stop = (UNASKED_PAGE_SIZE * 2).min(whole.len());
+            let stop = (size * 2).min(whole.len());
             assert_eq!(
                 second,
-                whole[UNASKED_PAGE_SIZE..stop],
-                "case {case}: the token must resume at item {UNASKED_PAGE_SIZE}, got {resumed}"
+                whole[size..stop],
+                "case {case} MaxResults={size}: the token must resume at item {size}, got {resumed}"
             );
-        } else {
-            shorter_than_a_page += 1;
         }
 
-        // Asked page sizes, inside the modelled 1..100 range and on both sides of
-        // the unasked one, yield the same listing. The one-item walk is skipped for
-        // a listing of hundreds of items, which the other sizes already cover.
+        // Asked page sizes across the modelled 1..100 range yield the same listing.
+        // The one-item walk is skipped for a listing of hundreds of items, which the
+        // other sizes already cover.
         for size in [1_i64, 3, 11, 100] {
             if size == 1 && whole.len() > 100 {
                 continue;
@@ -592,8 +603,9 @@ async fn an_unasked_quota_page_is_bounded_and_resumes_while_items_remain() {
     }
 
     assert!(
-        shorter_than_a_page >= 1 && longer_than_a_page >= 1,
-        "case catalog: the rule must be exercised on a listing shorter than one page and on one \
-         longer than it, got {shorter_than_a_page} and {longer_than_a_page}"
+        shorter_than_the_largest_page >= 1 && longer_than_the_largest_page >= 1,
+        "case catalog: the rule must be exercised on a listing shorter than the largest page a \
+         caller may ask for and on one longer than it, got {shorter_than_the_largest_page} and \
+         {longer_than_the_largest_page}"
     );
 }

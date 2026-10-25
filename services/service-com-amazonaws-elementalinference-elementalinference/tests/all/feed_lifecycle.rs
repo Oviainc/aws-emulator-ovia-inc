@@ -19,7 +19,8 @@
 //! * `UpdateFeed` overwrites the stored feed, so later reads report the new values,
 //!   and answers 200, so the response reports the feed's settled status;
 //! * `DeleteFeed` retires the feed, so once the deletion falls due `GetFeed` is a 404
-//!   and `ListFeeds` no longer lists it;
+//!   and `ListFeeds` no longer lists it, while a retry of the delete itself reports the
+//!   completed deletion (`tests/all/completed_deletion.rs`);
 //! * an id no live feed has is `ResourceNotFoundException` (HTTP 404) on every feed
 //!   operation that takes one;
 //! * the feed store is BOUNDED: past the quota `CreateFeed` answers the modelled
@@ -506,9 +507,9 @@ async fn update_feed_overwrites_the_stored_feed() {
         );
         assert_eq!(
             updated["status"],
-            json!("AVAILABLE"),
-            "case {label:?}: UpdateFeed answers 200, so the settled feed it reconfigured still \
-             reports AVAILABLE, got {:?}",
+            json!("UPDATING"),
+            "case {label:?}: the reconfiguration is in flight, so the update reports \
+             UPDATING, got {:?}",
             updated["status"]
         );
         assert_eq!(
@@ -552,7 +553,7 @@ async fn update_feed_overwrites_the_stored_feed() {
         assert_eq!(
             settled["status"],
             json!("AVAILABLE"),
-            "case {label:?}: the updated feed stays AVAILABLE, got {:?}",
+            "case {label:?}: the reconfigured feed settles back into AVAILABLE, got {:?}",
             settled["status"]
         );
     }

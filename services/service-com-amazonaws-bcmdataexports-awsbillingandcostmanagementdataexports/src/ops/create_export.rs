@@ -8,7 +8,8 @@
 //! configuration in force, the way the service reports it — so `GetExport`,
 //! `ListExports` and `ListTagsForResource` read back exactly what the service stored. A
 //! definition whose destination configuration names a delivery this service does not
-//! write is refused instead of stored.
+//! write is refused instead of stored, as is a `ResourceTags` claiming the reserved
+//! `aws:` tag-key namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`]).
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
@@ -178,7 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this account's exports, not even whether its request would have been valid. The
         // resource an export creation acts on is the export the request names.
         let region = crate::state::request_region(&ctx.parts().headers);
-        let arn = crate::state::export_arn(&region, &input.export.name);
+        // The ARN is minted HERE, carrying the generated id that makes it this export's own
+        // (see `crate::state::export_arn`): it is not a function of the submitted name, so a
+        // name a deleted export once held names a different export with a different ARN.
+        // It is also the resource the authorization decision below is about.
+        let arn = crate::state::export_arn(
+            &region,
+            &input.export.name,
+            &crate::state::new_export_id(),
+        );
         crate::state::authorize(
             &*self.engine,
             ctx,
@@ -189,8 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Each tag consists of a key and a value, and each key must be unique for the
         // resource" (the modelled doc for `ResourceTags`), so a request carrying one key
-        // twice names two values for one tag and cannot be satisfied. The same reading of
-        // a `ResourceTagList` serves every operation that accepts one, so it lives in
+        // twice names two values for one tag and cannot be satisfied, and a key claiming
+        // the reserved `aws:` namespace names a tag Amazon Web Services generates, which a
+        // create may no more seed than `TagResource` may add. The same reading of a
+        // `ResourceTagList` serves every operation that accepts one, so it lives in
         // `crate::state` rather than here.
         let tags = crate::state::tag_map(input.resource_tags.unwrap_or_default())
             .map_err(CreateExportErrorModeled::ValidationException)?;
@@ -255,9 +266,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request is validated BEFORE the store bound is applied: a name already in
         // use is owed the 400, not the quota 402, even when the store happens to be full.
         //
-        // The minted ARN is a function of the region and the name, so an ARN already in
-        // the store is exactly "this region already holds an export with this name".
-        if store.exports.contains_key(&arn) {
+        // A name is unique among the exports the region currently HOLDS, and the minted ARN
+        // carries an id no other export shares, so the refusal is a lookup by region and
+        // name and never by the ARN this call just minted.
+        if store.export_named(&region, &export.name).is_some() {
             return Err(CreateExportErrorModeled::ValidationException(ValidationException {
                 message: format!(
                     "An export named {} already exists; export names must be unique.",

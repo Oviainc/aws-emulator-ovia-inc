@@ -35,9 +35,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::RESOURCE_NOT_TAGGABLE_MESSAGE;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
 
-use crate::export_lifecycle::{error_code, NOT_FOUND_STATUS};
+use crate::export_lifecycle::{error_code, generated_export_id, NOT_FOUND_STATUS};
 use crate::front_door_authorization::{
-    allow, allow_all_but, create_request, deny, export_arn, Emulator, ACCOUNT_KEY,
+    allow, allow_all_but, create_request, deny, export_arn_pattern, Emulator, ACCOUNT_KEY,
 };
 
 /// The export every call below names.
@@ -111,11 +111,9 @@ async fn seeded_export(emulator: &Emulator) -> String {
         .as_str()
         .expect("CreateExport returns an ExportArn")
         .to_string();
-    assert_eq!(
-        arn,
-        export_arn(EXPORT_NAME),
-        "the minted ARN is the one the table's resource-scoped policies name"
-    );
+    // The minted ARN names this export under a generated id of its own, which is why the
+    // table's resource-scoped policies name it with a wildcard rather than by spelling it.
+    generated_export_id("the untagging setup", &arn, EXPORT_NAME);
     arn
 }
 
@@ -168,7 +166,7 @@ async fn untagging_is_authorized_on_its_own_action_before_anything_is_written() 
                         "bcmde-untag-allowed",
                         Some(&allow(
                             "bcm-data-exports:UntagResource",
-                            &export_arn(EXPORT_NAME),
+                            &export_arn_pattern(EXPORT_NAME),
                         )),
                     )
                     .await,
@@ -214,7 +212,7 @@ async fn untagging_is_authorized_on_its_own_action_before_anything_is_written() 
                         "bcmde-untag-other-resource",
                         Some(&allow(
                             "bcm-data-exports:UntagResource",
-                            &export_arn("somebody_elses_export"),
+                            &export_arn_pattern("somebody_elses_export"),
                         )),
                     )
                     .await,
@@ -387,7 +385,10 @@ async fn untagging_is_decided_from_every_identity_policy_in_force() {
     let grant = emulator
         .managed_policy(
             "bcmde-untag-managed-grant",
-            &allow("bcm-data-exports:UntagResource", &export_arn(EXPORT_NAME)),
+            &allow(
+                "bcm-data-exports:UntagResource",
+                &export_arn_pattern(EXPORT_NAME),
+            ),
         )
         .await;
     let sibling_grant = emulator
@@ -401,7 +402,7 @@ async fn untagging_is_decided_from_every_identity_policy_in_force() {
             "bcmde-untag-managed-other-resource",
             &allow(
                 "bcm-data-exports:UntagResource",
-                &export_arn("somebody_elses_export"),
+                &export_arn_pattern("somebody_elses_export"),
             ),
         )
         .await;
@@ -427,7 +428,7 @@ async fn untagging_is_decided_from_every_identity_policy_in_force() {
             role: "bcmde-untag-place-inline",
             inline: Some(allow(
                 "bcm-data-exports:UntagResource",
-                &export_arn(EXPORT_NAME),
+                &export_arn_pattern(EXPORT_NAME),
             )),
             attachments: vec![],
             allowed: true,
@@ -578,7 +579,11 @@ async fn the_refusal_layers_of_untagging_are_decided_in_order() {
     let foreign = format!(
         "arn:aws:bcm-data-exports:us-east-1:111122223333:export/{EXPORT_NAME}"
     );
-    let absent = export_arn("never_created_export");
+    let absent = format!(
+        "arn:aws:bcm-data-exports:us-east-1:{}:export/never_created_export/\
+         00000000-0000-0000-0000-000000000000",
+        ::engine::emulator_account_id()
+    );
 
     // LAYER 1 — a caller with no grant is told it is refused, whatever ARN it names: the
     // decision is reached before the ARN is judged and before anything is looked up, so a

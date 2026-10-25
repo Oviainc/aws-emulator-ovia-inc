@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateQuote
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateQuote`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the members the request carries to the stored quote and
+//! answers the record as it now stands. Every member this operation takes besides
+//! the identifier is optional on a `@http(method: "PATCH")` update, so one the
+//! request carries replaces the stored value and one it omits leaves the stored
+//! value exactly as it was. The Outpost association is the one member with a third
+//! form: the model widens it to `OutpostIdentifierOrEmpty` here, and the empty
+//! string REMOVES the association.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateQuote::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing else about the quote moves: its id, account, creation and expiration
+//! instants stay the ones it was created with, and no pricing is reported, for the
+//! reason `CreateQuote` reports none.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +126,40 @@ impl From<UpdateQuoteErrorModeled> for UpdateQuoteError {
     }
 }
 
+/// What one request asks for the quote's Outpost association, which is the one
+/// member of this update with three forms rather than two.
+///
+/// `UpdateQuote` binds the association as `OutpostIdentifierOrEmpty` — the member is
+/// `OutpostIdentifier` on every other operation that takes one — and the model
+/// documents the widening: "Specify an empty string to remove the Outpost
+/// association." So an omitted member leaves the stored association alone, the empty
+/// string clears it, and an identifier replaces it.
+enum Association {
+    /// The request carried no `OutpostIdentifier`: the stored association stands.
+    Unchanged,
+    /// The request carried the empty string: the quote is left with no Outpost.
+    Removed,
+    /// The request named an Outpost, resolved to that Outpost's own `OutpostArn`.
+    Set(String),
+}
+
+/// How this operation states that the `QuoteIdentifier` it was given names no quote
+/// of this region.
+///
+/// Stated in one place because both the check that the quote exists and the borrow
+/// that changes it report it, and the two cannot be allowed to word it differently.
+/// `supplied` is the identifier AS SENT, which is what the echo reads back — not the
+/// bare id an ARN resolved to.
+fn quote_not_found(supplied: &str) -> UpdateQuoteError {
+    UpdateQuoteErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::identifier_not_found(
+            crate::state::QUOTE_IDENTIFIER_MEMBER,
+            supplied,
+        )),
+    })
+    .into()
+}
+
 /// The `UpdateQuote` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +196,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateQuote` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateQuoteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateQuote"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateQuoteErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // The region this request is addressed to: a quote is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved — one region's endpoint cannot change another region's quote.
+        let region = crate::state::request_region(ctx.parts());
+        // `QuoteIdentifier` accepts the bare id or the full quote ARN; both name the
+        // same stored record.
+        let quote_id = crate::state::resolve_quote_id(&input.quote_identifier).ok_or_else(|| {
+            UpdateQuoteErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::quote_identifier_pattern_report()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // This call reports the quote it updated, so it reports the status that quote
+        // holds NOW: the expiry the clock has already made due is materialised first,
+        // exactly as every other path that reports a quote does, so an update never
+        // answers a stale status.
+        store.settle_quotes();
+        // The quote this request names is what a refusal is about, so it is resolved
+        // before the Outpost the request may also name.
+        if store.quote(&region, &quote_id).is_none() {
+            return Err(quote_not_found(&input.quote_identifier));
+        }
+
+        // The association the request asks for, resolved while the store is only
+        // borrowed to read: the quote and the Outpost live in the same store, so the
+        // Outpost has to be looked up before the quote is borrowed to change.
+        let association = match input.outpost_identifier.as_deref() {
+            None => Association::Unchanged,
+            Some("") => Association::Removed,
+            Some(supplied) => {
+                let outpost_id = crate::state::resolve_outpost_id(supplied).ok_or_else(|| {
+                    UpdateQuoteErrorModeled::ValidationException(ValidationException {
+                        message: Some(crate::state::outpost_identifier_pattern_report()),
+                    })
+                })?;
+                // A quote may be associated only with an Outpost that exists, in the
+                // region this request is addressed to: one of another region is not
+                // part of this region's inventory. The ARN the quote reports is that
+                // Outpost's OWN `OutpostArn`, whichever identifier form named it.
+                let outpost = store.outpost(&region, &outpost_id).ok_or_else(|| {
+                    UpdateQuoteErrorModeled::NotFoundException(NotFoundException {
+                        // The identifier echo names the member the absent identifier
+                        // arrived in and echoes the value AS SUPPLIED.
+                        message: Some(crate::state::identifier_not_found(
+                            crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                            supplied,
+                        )),
+                    })
+                })?;
+                // An Outpost this store holds always carries the ARN its create
+                // minted, so an Outpost without one is this service's own invariant
+                // broken — reported as the server error it is, never as a not-found
+                // about an Outpost that does exist.
+                let outpost_arn = outpost.outpost.outpost_arn.clone().ok_or_else(|| {
+                    UpdateQuoteErrorModeled::InternalServerException(InternalServerException {
+                        message: Some("the Outpost is stored without an ARN".to_string()),
+                    })
+                })?;
+                Association::Set(outpost_arn)
+            }
+        };
+
+        // The same quote, now borrowed to change. It was resolved above under this
+        // same lock, which has not been released, so the fallback is unreachable by
+        // construction; it is stated rather than asserted because a handler answers a
+        // modelled failure instead of panicking.
+        let record = store
+            .quote_mut(&region, &quote_id)
+            .ok_or_else(|| quote_not_found(&input.quote_identifier))?;
+        // Each member the request carried, written over the stored one; each member
+        // it omitted left exactly as it was. `QuoteDescription` is modelled
+        // `length(min: 0)` with a pattern that admits the empty string, so an empty
+        // description is a value the caller may set and is stored as sent.
+        crate::state::apply(&mut record.quote.country_code, input.country_code);
+        crate::state::apply(&mut record.quote.description, input.description);
+        crate::state::apply(
+            &mut record.quote.requested_capacities,
+            input.requested_capacities,
+        );
+        crate::state::apply(
+            &mut record.quote.requested_constraints,
+            input.requested_constraints,
+        );
+        crate::state::apply(
+            &mut record.quote.requested_payment_options,
+            input.requested_payment_options,
+        );
+        crate::state::apply(
+            &mut record.quote.requested_payment_terms,
+            input.requested_payment_terms,
+        );
+        match association {
+            Association::Unchanged => {}
+            Association::Removed => record.quote.outpost_arn = None,
+            Association::Set(outpost_arn) => record.quote.outpost_arn = Some(outpost_arn),
+        }
+
+        Ok(UpdateQuoteOutput {
+            quote: Some(record.quote.clone()),
+        })
     }
 }

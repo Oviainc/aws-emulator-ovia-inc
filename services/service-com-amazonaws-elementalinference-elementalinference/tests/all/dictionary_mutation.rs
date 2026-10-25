@@ -16,17 +16,18 @@
 //!   `UpdateDictionary` writes the members the request carried (and only those) into the
 //!   stored dictionary, so `GetDictionary` and `ExportDictionaryEntries` report them;
 //! * `DeleteDictionary` retires the dictionary: it reports `DELETING`, and once the
-//!   removal falls due the id stops resolving, so `GetDictionary` answers 404
-//!   `ResourceNotFoundException` — forever, not transiently;
+//!   deletion falls due the id stops resolving for a read, so `GetDictionary` answers 404
+//!   `ResourceNotFoundException` — forever, not transiently — while a retry of the
+//!   delete itself reports the completed deletion (`tests/all/completed_deletion.rs`);
 //! * a dictionary is `REFERENCED`, with the referencing feed's id in `references`,
 //!   exactly while some feed output's subtitling config names it, whichever call put it
 //!   there; and "you cannot delete a dictionary that is referenced by a feed", which is
 //!   the modelled `ConflictException` (HTTP 409);
-//! * `UpdateFeed` answers HTTP 200, so it reports the feed's SETTLED status — never a
-//!   transient one a caller would have to wait out.
+//! * `UpdateFeed` reports the transient `UPDATING` for the span of the reconfiguration
+//!   it starts, and the feed then settles back into the status that span suspended.
 
 use crate::harness::{
-    call, enabled_output, expected_dictionary_arn, past_the_transition_span, router,
+    call, enabled_output, expected_dictionary_arn, message_of, past_the_transition_span, router,
     subtitling_output,
 };
 use serde_json::{json, Value};
@@ -34,13 +35,6 @@ use service_com_amazonaws_elementalinference_elementalinference::state::{
     dictionary_referenced_message, DICTIONARY_BEING_DELETED_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
-
-/// The `message` a refusal carries.
-fn message_of(error: &Value) -> &str {
-    error["message"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the refusal carries a message, got {error}"))
-}
 
 /// Create one dictionary and return its id.
 async fn create_dictionary(router: &MultiServiceRouter, body: Value) -> String {
@@ -454,13 +448,15 @@ async fn delete_dictionary_retires_the_dictionary_from_state() {
             );
         }
 
-        // An id that never existed answers the same 404 as a deleted one.
-        let (status, error) = call(&router, "DELETE", &format!("/v1/dictionary/{id}"), None).await;
+        // Retrying the delete reports the deletion it already served, with the status
+        // the model gives a dictionary after deletion, rather than refusing a call the
+        // service accepted.
+        let (status, retried) = call(&router, "DELETE", &format!("/v1/dictionary/{id}"), None).await;
         assert_eq!(
-            (status, &error["__type"]),
-            (404, &json!("ResourceNotFoundException")),
-            "case {label:?}: deleting a dictionary that is gone is a 404, got {status} with \
-             {error}"
+            (status, &retried["status"]),
+            (202, &json!("DELETED")),
+            "case {label:?}: retrying the completed delete reports DELETED, got {status} with \
+             {retried}"
         );
     }
 }
@@ -841,26 +837,24 @@ async fn delete_dictionary_is_refused_while_a_feed_references_it() {
     }
 }
 
-/// UpdateFeed answers HTTP 200 — the overwrite is complete when the call returns — so it
-/// reports the status the feed HOLDS, and the stored feed is left in that same status:
-/// an update never parks a feed in a transient status, and it neither cancels nor
-/// accelerates a transition the clock already owes.
+/// `UpdateFeed` reconfigures the feed's payload, which is work the service carries out
+/// after the call: the feed reports the transient `UPDATING` while that is in flight and
+/// the clock then settles it back into the status the reconfiguration suspended — it
+/// neither cancels nor accelerates a transition the clock already owes.
 #[tokio::test]
-async fn update_feed_reports_the_status_the_feed_holds() {
+async fn update_feed_reports_updating_and_settles_back_into_the_status_it_suspended() {
     // One row per status a feed can be in when the update arrives — every settled
     // status the service produces — with rows differing in how many outputs the payload
-    // carries. `expected_now` is what the update and an immediate read report;
-    // `expected_later` is what the clock leaves once anything it owed has fallen due.
-    let rows: [(&str, &str, &str, Value); 4] = [
+    // carries. `expected_later` is what the clock leaves once the reconfiguration has
+    // fallen due: the status the update suspended.
+    let rows: [(&str, &str, Value); 4] = [
         (
             "a feed read right after its creation",
-            "AVAILABLE",
             "AVAILABLE",
             json!([enabled_output("crop1", "cropping")]),
         ),
         (
             "a settled, unassociated feed",
-            "AVAILABLE",
             "AVAILABLE",
             json!([
                 enabled_output("crop1", "cropping"),
@@ -870,18 +864,16 @@ async fn update_feed_reports_the_status_the_feed_holds() {
         (
             "a feed a resource holds",
             "ACTIVE",
-            "ACTIVE",
             json!([enabled_output("meta1", "contextualMetadata")]),
         ),
         (
             "a feed whose resource has been released",
             "ARCHIVED",
-            "ARCHIVED",
             json!([subtitling_output("subs1", None)]),
         ),
     ];
 
-    for (label, expected_now, expected_later, outputs) in rows {
+    for (label, expected_later, outputs) in rows {
         let router = router();
         let feed_id = create_feed(
             &router,
@@ -890,7 +882,7 @@ async fn update_feed_reports_the_status_the_feed_holds() {
         )
         .await;
 
-        if expected_now == "ACTIVE" || expected_now == "ARCHIVED" {
+        if expected_later == "ACTIVE" || expected_later == "ARCHIVED" {
             let (status, _) = call(
                 &router,
                 "POST",
@@ -900,7 +892,7 @@ async fn update_feed_reports_the_status_the_feed_holds() {
             .await;
             assert_eq!(status, 200, "case {label:?}: AssociateFeed answers 200");
         }
-        if expected_now == "ARCHIVED" {
+        if expected_later == "ARCHIVED" {
             let (status, _) = call(
                 &router,
                 "POST",
@@ -924,8 +916,8 @@ async fn update_feed_reports_the_status_the_feed_holds() {
         );
         assert_eq!(
             updated["status"],
-            json!(expected_now),
-            "case {label:?}: the update reports the status the feed holds, got {:?}",
+            json!("UPDATING"),
+            "case {label:?}: the update reports the reconfiguration in flight, got {:?}",
             updated["status"]
         );
         assert_eq!(
@@ -936,11 +928,12 @@ async fn update_feed_reports_the_status_the_feed_holds() {
         );
 
         // The status in the response is the stored one: a read straight after reports
-        // it, and the clock then does exactly what it already owed — no more.
+        // it, and the clock then settles the feed back into the status it suspended — no
+        // more than that.
         let (status, immediately) = call(&router, "GET", &format!("/v1/feed/{feed_id}"), None).await;
         assert_eq!(
             (status, &immediately["status"]),
-            (200, &json!(expected_now)),
+            (200, &json!("UPDATING")),
             "case {label:?}: GetFeed straight after the update reports the same status, got \
              {status} with {immediately}"
         );
@@ -949,7 +942,8 @@ async fn update_feed_reports_the_status_the_feed_holds() {
         assert_eq!(
             later["status"],
             json!(expected_later),
-            "case {label:?}: the update left owed exactly what the clock already owed, got {:?}",
+            "case {label:?}: the update left owed exactly the settle back into the status it \
+             suspended, got {:?}",
             later["status"]
         );
         assert_eq!(

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the component of a registered application a request names by `ApplicationId`
+//! and `ComponentId`, together with the tags held for that component's ARN. The response
+//! is projected from the registration that declared the component
+//! ([`crate::state::StoredApplication::component_view`]); a reference that resolves to
+//! nothing is refused with the modelled `ValidationException`, and nothing the emulator
+//! has not been told — a hostname, a kernel or HANA version, replication or cluster state
+//! — is reported for it.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +143,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetComponent"))
+        // The Region this request was signed for: a read resolves a component of an
+        // application registered at THIS regional endpoint and no others.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetComponentErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let mut state = state.lock();
+        // A change the clock already owed is materialised before anything is reported, so
+        // this read reports the status the application and its components already are in.
+        // It is the only write a reporting operation makes.
+        state.settle(::std::time::SystemTime::now());
+        let region_state = state.region(&region);
+
+        // Both members are modelled `@required` with patterns, so reaching here means the
+        // request names an application and a component in well-formed ids. They still
+        // have to NAME something, and this operation models no `ResourceNotFoundException`
+        // (see `crate::state::no_component_message`), so a reference that resolves to
+        // nothing is refused with the `ValidationException` it does model rather than
+        // answered with a fabricated component.
+        let Some(application) = region_state.applications.get(&input.application_id) else {
+            return Err(GetComponentErrorModeled::ValidationException(
+                crate::state::no_registered_application(&input.application_id),
+            )
+            .into());
+        };
+        let Some(component) = application.component(&input.component_id) else {
+            return Err(GetComponentErrorModeled::ValidationException(
+                crate::state::validation(crate::state::no_component_message(
+                    &input.application_id,
+                    &input.component_id,
+                )),
+            )
+            .into());
+        };
+
+        // The whole response is PROJECTED from the stored registration, so nothing is
+        // assembled by hand here.
+        let view = application.component_view(component, &region);
+        // The tags of the component, read from the one place every tag of this service is
+        // held, keyed by the resource's own ARN — the SAME spelling the projection above
+        // reports, so the two cannot drift. A component nobody has tagged carries none,
+        // and the application's tags are not reported in their place.
+        let tags = region_state.tags_for(&crate::state::component_arn(
+            &region,
+            &application.id,
+            &component.id,
+        ));
+
+        Ok(GetComponentOutput {
+            component: Some(view),
+            tags,
+        })
     }
 }

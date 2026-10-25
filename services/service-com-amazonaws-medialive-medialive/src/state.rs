@@ -34,10 +34,11 @@
 //! its `OutputType` and
 //! `MedialiveInputArns` out of the inputs this store holds — see
 //! [`input_devices`]. A device also carries the TRANSFER pending on it, which
-//! `TransferInputDevice` records and `ListInputDeviceTransfers` reports in the
-//! direction the reader asks for, and the latest THUMBNAIL it has sent, which
-//! `DescribeInputDeviceThumbnail` reports — one only a connected Link unit
-//! sends, so a device claimed through this emulator's API has none.
+//! `TransferInputDevice` records, `ListInputDeviceTransfers` reports in the
+//! direction the reader asks for and `AcceptInputDeviceTransfer` ends for the
+//! account the transfer names as its recipient, and the latest THUMBNAIL it has
+//! sent, which `DescribeInputDeviceThumbnail` reports — one only a connected
+//! Link unit sends, so a device claimed through this emulator's API has none.
 //!
 //! The input security group lifecycle lives here too: one
 //! [`InputSecurityGroupRecord`] per created group and the counter that mints its
@@ -333,9 +334,9 @@ pub use alerts::{
 pub mod input_devices;
 
 pub use input_devices::{
-    input_device_transfer_type, input_device_type_for_id, is_account_id,
-    not_a_device_id_message, not_an_account_id_message, InputDeviceRecord,
-    InputDeviceThumbnailRecord, InputDeviceTransferRecord, MAX_INPUT_DEVICES,
+    input_device_transfer_type, input_device_type_for_id, is_account_id, not_a_device_id_message,
+    not_an_account_id_message, InputDeviceRecord, InputDeviceThumbnailRecord,
+    InputDeviceTransferRecord, TransferAcceptance, MAX_INPUT_DEVICES,
     MAX_INPUT_DEVICE_THUMBNAIL_BYTES, MAX_TRANSFER_MESSAGE_CHARS,
 };
 
@@ -351,9 +352,9 @@ pub mod clusters;
 
 pub use clusters::{
     cluster_alert_output, cluster_alert_state, cluster_state, described_cluster_network_settings,
-    ClusterAlertRecord, ClusterRecord, ClusterRefusal, NewCluster, CLUSTER_ALERT_FILTERS,
-    CLUSTER_ALERT_FILTER_ALL, MAX_CLUSTERS, MAX_CLUSTER_ALERTS, MAX_CLUSTER_INTERFACE_MAPPINGS,
-    MAX_CLUSTER_TOKENS,
+    ClusterAlertRecord, ClusterChanges, ClusterRecord, ClusterRefusal, ClusterUpdateRefusal,
+    NewCluster, CLUSTER_ALERT_FILTERS, CLUSTER_ALERT_FILTER_ALL, MAX_CLUSTERS, MAX_CLUSTER_ALERTS,
+    MAX_CLUSTER_INTERFACE_MAPPINGS, MAX_CLUSTER_TOKENS,
 };
 
 pub(crate) use clusters::cluster_description_output;

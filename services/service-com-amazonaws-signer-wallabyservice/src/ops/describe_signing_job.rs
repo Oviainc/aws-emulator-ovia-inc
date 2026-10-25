@@ -224,9 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             requested_by: job.requested_by.clone(),
             status: Some(job.status.clone()),
             status_reason: job.status_reason.clone(),
-            // A revocation record is written by `RevokeSignature`, which is still
-            // a stub with its own gap issue; no job carries one yet.
-            revocation_record: None,
+            // The revocation `RevokeSignature` recorded on this job, and nothing
+            // for a job whose signature is still trusted.
+            revocation_record: job.revocation_record.clone(),
             job_owner: Some(job.job_owner.clone()),
             job_invoker: job.job_invoker.clone(),
         })

@@ -73,10 +73,14 @@ mod origin_access_identity_update;
 mod origin_request_policy_config_read;
 #[path = "all/origin_request_policy_lifecycle.rs"]
 mod origin_request_policy_lifecycle;
+#[path = "all/origin_request_policy_list.rs"]
+mod origin_request_policy_list;
 #[path = "all/public_key_lifecycle.rs"]
 mod public_key_lifecycle;
 #[path = "all/response_headers_policy_lifecycle.rs"]
 mod response_headers_policy_lifecycle;
+#[path = "all/staging_config_promotion.rs"]
+mod staging_config_promotion;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/streaming_distribution_list.rs"]

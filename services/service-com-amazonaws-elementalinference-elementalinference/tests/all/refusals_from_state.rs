@@ -29,20 +29,12 @@
 //! code are what the model fixes (`ValidationException` 400, `ConflictException` 409)
 //! and every row asserts them too.
 
-use crate::harness::{call, output_config, past_the_transition_span, router};
+use crate::harness::{call, message_of, output_config, past_the_transition_span, router};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
     dictionary_referenced_message, feed_not_associated_message, FeedStatus,
 };
 use smithy_server_runtime::MultiServiceRouter;
-
-/// The `message` a refusal carries.
-fn message_of(error: &Value) -> String {
-    error["message"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the refusal carries a message, got {error}"))
-        .to_string()
-}
 
 /// One output, named `name`, in the smallest config the model admits — a feed the
 /// documentation requires to carry "at least one output".
@@ -117,6 +109,21 @@ async fn feed_in_status(router: &MultiServiceRouter, status: FeedStatus) -> Stri
             assert_eq!(code, 202, "DeleteFeed answers 202, got {code} with {body}");
             id
         }
+        FeedStatus::Updating => {
+            let id = create_feed(router, "reconfigured-feed", json!([plain_output("crop1")])).await;
+            let (code, body) = call(
+                router,
+                "PUT",
+                &format!("/v1/feed/{id}"),
+                Some(json!({
+                    "name": "reconfigured-feed",
+                    "outputs": [plain_output("crop2")]
+                })),
+            )
+            .await;
+            assert_eq!(code, 200, "UpdateFeed answers 200, got {code} with {body}");
+            id
+        }
         FeedStatus::Archived => {
             let id = create_feed(router, "released-feed", json!([plain_output("crop1")])).await;
             let (code, body) = associate(router, &id, "held-media").await;
@@ -133,11 +140,14 @@ async fn feed_in_status(router: &MultiServiceRouter, status: FeedStatus) -> Stri
 /// over every such status, and whatever name the request carried.
 #[tokio::test]
 async fn a_release_with_nothing_to_release_reports_the_feeds_own_status() {
-    // One row per status that holds no resource. CREATING and UPDATING are never
-    // reported by this service (a created feed is AVAILABLE at once, and UpdateFeed
-    // answers 200), and ACTIVE is the one status that DOES hold a resource.
+    // One row per status that holds no resource: a never-associated feed, one being
+    // reconfigured (`UpdateFeed` suspends the status it was in), one on its way out and
+    // one whose resource has been released. CREATING is never reported by this service
+    // (a created feed is AVAILABLE at once), and ACTIVE is the one status that DOES hold
+    // a resource.
     let statuses = [
         ("AVAILABLE", FeedStatus::Available),
+        ("UPDATING", FeedStatus::Updating),
         ("DELETING", FeedStatus::Deleting),
         ("ARCHIVED", FeedStatus::Archived),
     ];
@@ -184,7 +194,7 @@ async fn a_release_with_nothing_to_release_reports_the_feeds_own_status() {
                 !message.contains(name) && !message.contains(&id),
                 "case {case:?}: and echoes nothing the request carried, got {message:?}"
             );
-            by_status.push((wire, message));
+            by_status.push((wire, message.to_string()));
         }
     }
 
@@ -221,7 +231,7 @@ async fn the_release_refusal_follows_the_feed_through_the_store() {
     // AVAILABLE: nothing to release yet.
     let (code, error) = disassociate(&router, &id, "walked-media").await;
     assert_eq!(
-        (code, message_of(&error)),
+        (code, message_of(&error).to_string()),
         (400, feed_not_associated_message(FeedStatus::Available)),
         "case \"before the claim\": the refusal reports AVAILABLE, got {code} with {error}"
     );
@@ -238,7 +248,7 @@ async fn the_release_refusal_follows_the_feed_through_the_store() {
     // first call's success rather than any refusal (`feed_release_retry.rs`).
     let (code, error) = disassociate(&router, &id, "another-walked-media").await;
     assert_eq!(
-        (code, message_of(&error)),
+        (code, message_of(&error).to_string()),
         (400, feed_not_associated_message(FeedStatus::Archived)),
         "case \"after the release\": a release of another resource now reports ARCHIVED, got \
          {code} with {error}"
@@ -376,7 +386,7 @@ async fn the_reference_count_falls_as_each_referencing_feed_is_removed() {
         let case = format!("{remaining} referencing feeds left");
         let (code, answer) = delete_dictionary(&router, &dictionary).await;
         assert_eq!(
-            (code, message_of(&answer)),
+            (code, message_of(&answer).to_string()),
             (409, dictionary_referenced_message(remaining)),
             "case {case:?}: the refusal states the feeds that are left, got {code} with \
              {answer}"

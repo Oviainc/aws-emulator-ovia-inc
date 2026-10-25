@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     EncryptionConfiguration, EncryptionConfigurationForRepositoryCreationTemplate, ImageDetail,
-    ImageIdentifier, ImageScanFinding, ImageScanFindings, ImageScanStatus,
+    ImageIdentifier, ImageReplicationStatus, ImageScanFinding, ImageScanFindings, ImageScanStatus,
     ImageScanningConfiguration, ImageTagMutabilityExclusionFilter,
     LifecyclePolicyPreviewResult, LifecyclePolicyPreviewSummary, LifecyclePolicyRuleAction,
     PullThroughCacheRule, ReplicationConfiguration, ReplicationRule, Repository,
@@ -112,6 +112,39 @@ pub const IMAGE_RESTORE_DELAY: Duration = Duration::from_millis(400);
 /// with [`ARCHIVED_IMAGE_STATUS`], as a lifecycle policy preview spells it.
 pub const ARCHIVE_STORAGE_CLASS: &str = "ARCHIVE";
 
+/// The `ReplicationStatus` of a copy to one destination that is still being made.
+pub const REPLICATION_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The `ReplicationStatus` of a copy to one destination the clock has made due.
+pub const REPLICATION_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// How long after the push that starts it the clock owes one destination's copy of an
+/// image its `IN_PROGRESS` -> `COMPLETE` transition.
+///
+/// AWS publishes no duration for a replication, so this is a CHOSEN value inside the
+/// 250–750 ms band this project fixes for a clock-owed transition. Like
+/// [`IMAGE_RESTORE_DELAY`] it is never zero, so a caller reading the status straight after
+/// the push still meets `IN_PROGRESS`, and it is stored as a due instant and never slept
+/// for: the completion is owed whether or not anybody calls again.
+pub const IMAGE_REPLICATION_DELAY: Duration = Duration::from_millis(400);
+
+/// The only `RepositoryFilterType` the API defines: "The repository filter type. The only
+/// supported value is `PREFIX_MATCH`, which is a repository name prefix specified with the
+/// `filter` parameter." (`RepositoryFilter$filterType`).
+pub const PREFIX_MATCH_FILTER_TYPE: &str = "PREFIX_MATCH";
+
+/// See [`MAX_REPOSITORIES`]: the same reasoning for the replication records ONE stored
+/// image carries.
+///
+/// A replication configuration may hold 25 rules of 100 destinations each (`@length` on
+/// `ReplicationRuleList` and `ReplicationDestinationList`), and a destination's registry id
+/// is a caller-chosen account number, so without a bound one push could write thousands of
+/// records and the registry's image cap would multiply them. A push records at most this
+/// many destinations for an image; the number is the emulator's own bound, set at the
+/// per-rule destination maximum the model declares, which is far past the handful of
+/// Regions a real registry replicates to.
+pub const MAX_IMAGE_REPLICATIONS: usize = 100;
+
 /// The `ScanFrequency` of a repository whose scan on push is switched on: a push is what
 /// triggers its scan.
 pub const SCAN_ON_PUSH_FREQUENCY: &str = "SCAN_ON_PUSH";
@@ -188,9 +221,26 @@ pub const IMAGE_SCAN_DELAY: Duration = Duration::from_millis(400);
 /// The `ScanStatus` a basic scan carries while it is still running.
 pub const SCAN_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 
-/// The `ScanStatus` a basic scan carries once the clock has made its completion due:
-/// the state in which its findings are readable.
+/// The `ScanStatus` a basic scan carries once the clock has made its completion due AND
+/// the scanned image was one basic scanning could examine: the state in which its
+/// findings are readable.
 pub const SCAN_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// The terminal `ScanStatus` of a run that could not examine the image it was started
+/// on. It is a TERMINAL status like [`SCAN_STATUS_COMPLETE`] — the scan ran and is over
+/// — so a caller polling for an outcome stops here; what it reports is that no findings
+/// were produced. See [`basic_scan_outcome`].
+pub const SCAN_STATUS_FAILED: &str = "FAILED";
+
+/// The `imageScanStatus.description` of a run that examined the image and finished:
+/// stated in words beside [`SCAN_STATUS_COMPLETE`].
+pub const SCAN_COMPLETE_DESCRIPTION: &str = "The scan was completed successfully.";
+
+/// The `imageScanStatus.description` of a run whose image carries no operating system
+/// basic scanning can examine — the wording Amazon ECR reports for that outcome, which
+/// names the error and what about the image was not supported.
+pub const UNSUPPORTED_IMAGE_SCAN_DESCRIPTION: &str =
+    "UnsupportedImageError: The operating system and/or package manager are not supported.";
 
 /// How often one image may be scanned: "A basic image scan can only be started once per
 /// 24 hours on an individual image. This limit includes if an image was scanned on
@@ -416,6 +466,12 @@ pub struct ImageScan {
     /// completed scan reports it as `imageScanCompletedAt` — the same instant on every
     /// read.
     pub complete_due_at: SystemTime,
+    /// The status this run ends in once its completion is due, decided when the scan was
+    /// started from the image it was started on ([`basic_scan_outcome`]) and stored, so
+    /// the outcome is the run's own and every reader derives the same one. A scan is a
+    /// record of what examining THAT image came to, which is why the terminal status is
+    /// not re-derived — nor defaulted to success — on a read.
+    pub terminal: ImageScanStatus,
     /// What the scan found, computed once when it was started (see
     /// [`basic_scan_findings`]) and stored, so paging through the findings reports the
     /// run rather than a fresh evaluation. The order is the run's own and never changes
@@ -470,23 +526,24 @@ impl ImageScan {
             .collect()
     }
 
-    /// The `ImageScanStatus` every operation that reports this scan answers with.
-    ///
-    /// The description states the status in words: AWS's own wording for it is not
-    /// documented and no caller rule reads it, so it is this emulator's, derived from the
-    /// status rather than stored beside it.
+    /// The `ImageScanStatus` every operation that reports this scan answers with: the
+    /// run's own terminal status once the clock has made its completion due, and
+    /// `IN_PROGRESS` until then.
     pub fn to_status(&self, now: SystemTime) -> ImageScanStatus {
         if self.is_complete(now) {
-            ImageScanStatus {
-                status: Some(SCAN_STATUS_COMPLETE.to_string()),
-                description: Some("The scan was completed successfully.".to_string()),
-            }
+            self.terminal.clone()
         } else {
             ImageScanStatus {
                 status: Some(SCAN_STATUS_IN_PROGRESS.to_string()),
                 description: Some("The scan is in progress.".to_string()),
             }
         }
+    }
+
+    /// Whether this run examined the image and finished — the one terminal status whose
+    /// findings are a statement about the image.
+    pub fn examined_the_image(&self) -> bool {
+        self.terminal.status.as_deref() == Some(SCAN_STATUS_COMPLETE)
     }
 
     /// How many findings this scan reports per `FindingSeverity`, counted from the
@@ -516,6 +573,12 @@ impl ImageScan {
         now: SystemTime,
         page: Vec<ImageScanFinding>,
     ) -> Option<ImageScanFindings> {
+        if !self.examined_the_image() {
+            // A run that could not examine the image found nothing to report: its status
+            // is the whole answer, and a findings block would state a scan of content
+            // nothing read.
+            return None;
+        }
         self.completed_at(now).map(|completed_at| ImageScanFindings {
             image_scan_completed_at: Some(::aws_smithy_types::DateTime::from(completed_at)),
             vulnerability_source_updated_at: None,
@@ -545,6 +608,58 @@ impl ImageScan {
 pub fn basic_scan_findings(image: &ImageRecord) -> Vec<ImageScanFinding> {
     let _ = image;
     Vec::new()
+}
+
+/// Where a basic scan of `image` ENDS: the terminal `ImageScanStatus` the run reports
+/// once the clock has made its completion due.
+///
+/// A scan is an examination of the image it was started on, so its outcome follows from
+/// that image: a run reaches `COMPLETE`, the status whose findings are a statement about
+/// the image, only where the scan identified the operating system and package manager
+/// whose packages it reports on ([`scanned_operating_system`]); an image it could identify
+/// none for is one basic scanning does not support, and the run ends `FAILED` with
+/// [`UNSUPPORTED_IMAGE_SCAN_DESCRIPTION`]. Success is therefore never the default: an
+/// image nothing examined is reported as the unsupported image it is, rather than as the
+/// clean scan a CI gate would read as a pass.
+pub fn basic_scan_outcome(image: &ImageRecord) -> ImageScanStatus {
+    match scanned_operating_system(image) {
+        Some(_) => ImageScanStatus {
+            status: Some(SCAN_STATUS_COMPLETE.to_string()),
+            description: Some(SCAN_COMPLETE_DESCRIPTION.to_string()),
+        },
+        None => ImageScanStatus {
+            status: Some(SCAN_STATUS_FAILED.to_string()),
+            description: Some(UNSUPPORTED_IMAGE_SCAN_DESCRIPTION.to_string()),
+        },
+    }
+}
+
+/// The operating system a basic scan of `image` identifies, and therefore the package
+/// manager whose installed packages it would report findings for.
+///
+/// An image's operating system release and its package database live in the image's
+/// FILESYSTEM LAYERS, which is why a basic scan reads them: the layers are what the image
+/// is made of. So the search is over the layers the stored manifest declares — one of them
+/// carries the release file that names the operating system — and
+/// [`operating_system_in_layer`] is what reads one.
+fn scanned_operating_system(image: &ImageRecord) -> Option<String> {
+    manifest_layer_descriptors(&image.manifest)
+        .iter()
+        .find_map(operating_system_in_layer)
+}
+
+/// The operating system identified inside ONE filesystem layer.
+///
+/// `None` for every layer this registry holds. A layer's record is its digest, its size
+/// and its media type — what `CompleteLayerUpload` registers ([`Repo::layer_blobs`]) — and
+/// the registry deliberately keeps none of the layer's bytes, so the operating-system
+/// release file and the package database inside it are not observable here: nothing has
+/// read the layer's content, and an operating system is never assumed for content nothing
+/// read. This is the one place a registry that held layer content would read them from,
+/// and the one place to change when it does.
+fn operating_system_in_layer(layer: &LayerBlob) -> Option<String> {
+    let _ = layer;
+    None
 }
 
 /// Whether `manifest` describes something a basic scan can examine: a container image
@@ -689,6 +804,48 @@ pub fn manifest_artifact_media_type(manifest: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// One replication of a stored image to ONE destination registry: the copy the push
+/// started under the registry's replication configuration.
+///
+/// A replication is the record of a copy that was started, not a projection of the
+/// registry's rules: it exists because a push happened while a rule matched the
+/// repository, which is why a rule stored afterwards adds none ("replication is not
+/// retroactive"). Its status follows from the instant the clock owes the copy its
+/// completion, so every reader derives the same answer and no read has to write.
+#[derive(Debug, Clone)]
+pub struct ImageReplication {
+    /// The destination Region the image is copied to.
+    pub region: String,
+    /// The destination registry's account id.
+    pub registry_id: String,
+    /// When the push that started this copy was made.
+    pub started_at: SystemTime,
+    /// When the clock owes this copy its `IN_PROGRESS` -> `COMPLETE` transition:
+    /// `started_at` + [`IMAGE_REPLICATION_DELAY`].
+    pub complete_due_at: SystemTime,
+}
+
+impl ImageReplication {
+    /// The `ImageReplicationStatus` `DescribeImageReplicationStatus` reports for this
+    /// copy.
+    ///
+    /// `failureCode` is "the failure code for a replication that has failed", so it is
+    /// absent: nothing failed, and a code would state a failure that did not happen.
+    pub fn to_status(&self, now: SystemTime) -> ImageReplicationStatus {
+        let status = if self.complete_due_at <= now {
+            REPLICATION_STATUS_COMPLETE
+        } else {
+            REPLICATION_STATUS_IN_PROGRESS
+        };
+        ImageReplicationStatus {
+            region: Some(self.region.clone()),
+            registry_id: Some(self.registry_id.clone()),
+            status: Some(status.to_string()),
+            failure_code: None,
+        }
+    }
+}
+
 /// One stored image: the manifest as pushed, its digest, and every tag pointing at it.
 #[derive(Debug, Clone)]
 pub struct ImageRecord {
@@ -728,6 +885,11 @@ pub struct ImageRecord {
     /// When the `ACTIVATING` -> `ACTIVE` transition a restore started falls due, or `None`
     /// when no restore is in flight. See [`IMAGE_RESTORE_DELAY`].
     pub activate_due_at: Option<SystemTime>,
+    /// The copies of this image the push that stored it started, one per destination the
+    /// registry's replication configuration sent this repository's images to at that
+    /// instant — what `DescribeImageReplicationStatus` reports. Empty for an image pushed
+    /// while no rule matched its repository.
+    pub replications: Vec<ImageReplication>,
 }
 
 impl ImageRecord {
@@ -752,6 +914,11 @@ impl ImageRecord {
             last_archived_at: None,
             last_activated_at: None,
             activate_due_at: None,
+            // The copies a push starts are decided by the registry's replication
+            // configuration, which this record knows nothing about: `PutImage` reads the
+            // rules and sets them (see
+            // [`ComAmazonawsEcrAmazonec2containerregistryV20150921State::planned_replications`]).
+            replications: Vec::new(),
             // A scan is started by `StartImageScan`, never by a push: a freshly stored
             // image carries none, which is what `DescribeImageScanFindings` reports
             // `ScanNotFoundException` for.
@@ -795,10 +962,11 @@ impl ImageRecord {
 
     /// The byte length of the stored manifest document — `imageManifestSize`, the size of
     /// the manifest a read returns, as distinct from [`Self::size_in_bytes`], the size of
-    /// the image content that manifest references.
+    /// the image content that manifest references. An answer that serves the manifest in
+    /// another schema reports ITS length through the same function
+    /// ([`manifest_document_size`]).
     pub fn manifest_size(&self) -> i64 {
-        // `imageManifest` is modelled `@length(1..4194304)`, far inside `i64`.
-        i64::try_from(self.manifest.len()).unwrap_or(i64::MAX)
+        manifest_document_size(&self.manifest)
     }
 
     /// Whether this image's storage class is Amazon ECR archive — including while a
@@ -1211,8 +1379,21 @@ impl PreviewedImage {
 /// `state::identifier_description`); the two are separate functions only because
 /// `ImageIdentifier` is generated per service crate. Keep them in step.
 pub fn identifier_description(id: &ImageIdentifier) -> String {
+    format!("imageId {}", identifier_members(id))
+}
+
+/// The BRACE EXPRESSION alone of [`identifier_description`]: both members of the
+/// requested `ImageIdentifier` spelled out, an absent one as `null`, with no `imageId`
+/// label in front of it.
+///
+/// The label belongs to the SENTENCE rather than to the identifier, and ECR words the
+/// two sentences differently: one names the identifier (`The image with imageId
+/// {…}`), the other quotes the expression itself (`… for the image with '{…}'`). Both
+/// render the identifier from this one function, so the two cannot drift apart in how a
+/// digest or a tag is spelled.
+pub fn identifier_members(id: &ImageIdentifier) -> String {
     format!(
-        "imageId {{imageDigest:'{}', imageTag:'{}'}}",
+        "{{imageDigest:'{}', imageTag:'{}'}}",
         id.image_digest.as_deref().unwrap_or("null"),
         id.image_tag.as_deref().unwrap_or("null")
     )
@@ -2497,6 +2678,49 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
         })
     }
 
+    /// The copies a push of an image into the repository named `repository_name` starts:
+    /// one per destination of every stored replication rule whose repository filters match
+    /// that repository, as of `now`.
+    ///
+    /// Which images are copied is decided by the registry's replication configuration:
+    /// "Specifying a repository filter for a replication rule provides a method for
+    /// controlling which repositories in a private registry are replicated. If no filters
+    /// are added, the contents of all repositories are replicated."
+    /// ([`RepositoryFilter`]'s own documentation). The set is decided at the PUSH and kept
+    /// on the image, because replication copies an image as it arrives: a rule stored after
+    /// a push does not reach back for an image the registry already holds.
+    ///
+    /// Two rules naming one destination are one copy of the image, so the destinations are
+    /// de-duplicated by the (Region, registry) pair they name, and no more than
+    /// [`MAX_IMAGE_REPLICATIONS`] of them are recorded for one image.
+    pub fn planned_replications(
+        &self,
+        repository_name: &str,
+        now: SystemTime,
+    ) -> Vec<ImageReplication> {
+        let mut planned: BTreeMap<(String, String), ImageReplication> = BTreeMap::new();
+        for rule in &self.replication_rules {
+            if !replication_rule_covers(rule, repository_name) {
+                continue;
+            }
+            for destination in &rule.destinations {
+                if planned.len() >= MAX_IMAGE_REPLICATIONS {
+                    break;
+                }
+                planned.insert(
+                    (destination.region.clone(), destination.registry_id.clone()),
+                    ImageReplication {
+                        region: destination.region.clone(),
+                        registry_id: destination.registry_id.clone(),
+                        started_at: now,
+                        complete_due_at: now + IMAGE_REPLICATION_DELAY,
+                    },
+                );
+            }
+        }
+        planned.into_values().collect()
+    }
+
     /// Drop every in-flight upload nothing has touched for [`ABANDONED_UPLOAD_AGE`] as of
     /// `now`.
     ///
@@ -2576,6 +2800,27 @@ pub fn pull_through_cache_rule_not_found_message(prefix: &str) -> String {
          the registry with id '{}'",
         registry_id()
     )
+}
+
+/// Whether `rule` covers the repository named `repository_name`, so that a push into it
+/// starts a copy to each of the rule's destinations.
+///
+/// A rule carrying no `repositoryFilters` covers every repository of the registry ("If no
+/// filters are added, the contents of all repositories are replicated"), and a
+/// `PREFIX_MATCH` filter covers the repositories whose name starts with the filter's value
+/// ("the repository name prefix to configure replication for"). The filters of one rule
+/// are alternatives: a repository one of them names is replicated by that rule. A
+/// `filterType` the model widens the enum with later covers nothing until it is read here,
+/// so a filter this code does not understand never silently replicates a repository.
+pub fn replication_rule_covers(rule: &ReplicationRule, repository_name: &str) -> bool {
+    match rule.repository_filters.as_deref() {
+        None => true,
+        Some([]) => true,
+        Some(filters) => filters.iter().any(|filter| {
+            filter.filter_type == PREFIX_MATCH_FILTER_TYPE
+                && repository_name.starts_with(&filter.filter)
+        }),
+    }
 }
 
 /// The wording ECR uses when no repository creation template answers to a prefix: the
@@ -3009,6 +3254,19 @@ pub fn lifecycle_policy_preview_not_found_message(name: &str) -> String {
 pub fn scan_not_found_message(id: &ImageIdentifier, repository_name: &str) -> String {
     format!(
         "Image scan does not exist for the image with '{}' in the repository with name \
+         '{repository_name}' in the registry with id '{}'",
+        identifier_members(id),
+        registry_id()
+    )
+}
+
+/// The wording ECR uses when the image an identifier names is in Amazon ECR archive and
+/// the call needs it in standard storage — the state `ImageArchivedException` reports
+/// ("The specified image is archived and cannot be scanned"). Built from the request: the
+/// identifier it sent, the repository it named and the registry that holds it.
+pub fn image_archived_message(id: &ImageIdentifier, repository_name: &str) -> String {
+    format!(
+        "The image with {} is archived within the repository with name \
          '{repository_name}' in the registry with id '{}'",
         identifier_description(id),
         registry_id()
@@ -3522,6 +3780,16 @@ pub fn manifest_digest(manifest: &str) -> String {
     content_digest(manifest.as_bytes())
 }
 
+/// The byte length an answer advertises for the manifest document it carries —
+/// `imageManifestSize`, whether that document is the stored one
+/// ([`ImageRecord::manifest_size`]) or the same manifest served in another schema.
+pub fn manifest_document_size(manifest: &str) -> i64 {
+    // `imageManifest` is modelled `@length(1..4194304)`, far inside `i64`, and a served
+    // document is a re-spelling of one, so the conversion cannot be reached — it saturates
+    // rather than wrapping or panicking if it ever is.
+    i64::try_from(manifest.len()).unwrap_or(i64::MAX)
+}
+
 /// The media type a manifest declares about itself, for a push that named none.
 ///
 /// Both the Docker image manifest V2 schema 2 and the OCI image manifest carry their own
@@ -3532,6 +3800,146 @@ pub fn manifest_media_type(manifest: &str) -> Option<String> {
         .get("mediaType")?
         .as_str()
         .map(ToString::to_string)
+}
+
+/// The media type of a Docker image manifest V2 schema 2 \u2014 one of the two interchangeable
+/// image-manifest schemas, and one of the values `BatchGetImage`'s `acceptedMediaTypes`
+/// documents.
+pub const DOCKER_V2_MANIFEST_MEDIA_TYPE: &str =
+    "application/vnd.docker.distribution.manifest.v2+json";
+
+/// The media type of an OCI image manifest \u2014 the other of the two. See
+/// [`DOCKER_V2_MANIFEST_MEDIA_TYPE`].
+pub const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+/// The DESCRIPTOR media types the two interchangeable schemas spell the same content
+/// with, as `(Docker, OCI)` pairs: the image configuration blob, the gzipped filesystem
+/// layer, and the layer a registry does not redistribute.
+///
+/// The Docker image manifest V2 schema 2 and the OCI image manifest describe an image the
+/// same way \u2014 a `config` descriptor and an ordered `layers` list, each descriptor
+/// carrying `digest`, `size` and `mediaType` \u2014 and differ only in the media types they
+/// spell those parts with (the Docker Registry HTTP API V2 manifest specification and the
+/// OCI image-spec manifest/layer media types). Rendering a manifest in the other schema is
+/// therefore a re-spelling of these names and of the document's own `mediaType`: no
+/// digest, size or order changes, so the two documents reference exactly the same blobs.
+const INTERCHANGEABLE_DESCRIPTOR_MEDIA_TYPES: [(&str, &str); 3] = [
+    (
+        "application/vnd.docker.container.image.v1+json",
+        "application/vnd.oci.image.config.v1+json",
+    ),
+    (
+        "application/vnd.docker.image.rootfs.diff.tar.gzip",
+        "application/vnd.oci.image.layer.v1.tar+gzip",
+    ),
+    (
+        "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip",
+        "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
+    ),
+];
+
+/// The manifest document to serve for `image`, and the media type it is served as, for a
+/// request whose `acceptedMediaTypes` is `accepted`.
+///
+/// `acceptedMediaTypes` names the manifest schemas the client understands, so a registry
+/// serves the image in one of them: the stored manifest when the client accepts its media
+/// type, and otherwise the same manifest rendered in an accepted schema. The two
+/// interchangeable image-manifest schemas are the Docker image manifest V2 schema 2 and
+/// the OCI image manifest (see [`INTERCHANGEABLE_DESCRIPTOR_MEDIA_TYPES`]); a schema
+/// nothing can render the stored document in \u2014 a manifest list, a V2 schema 1, a document
+/// stored under no media type at all \u2014 leaves the stored manifest as the only thing the
+/// registry holds to serve, and it is reported under the media type it really has.
+pub fn negotiated_manifest(
+    image: &ImageRecord,
+    accepted: Option<&[String]>,
+) -> (String, Option<String>) {
+    let as_stored = || (image.manifest.clone(), image.manifest_media_type.clone());
+    // A request that names no accepted media type accepts whatever the registry holds.
+    let Some(accepted) = accepted.filter(|types| !types.is_empty()) else {
+        return as_stored();
+    };
+    let Some(media_type) = image.manifest_media_type.as_deref() else {
+        return as_stored();
+    };
+    if accepted.iter().any(|wanted| wanted == media_type) {
+        return as_stored();
+    }
+    let Some(target) = counterpart_manifest_schema(media_type)
+        .filter(|schema| accepted.iter().any(|wanted| wanted == schema))
+    else {
+        return as_stored();
+    };
+    match rendered_in_schema(&image.manifest, target) {
+        Some(rendered) => (rendered, Some(target.to_string())),
+        None => as_stored(),
+    }
+}
+
+/// The other of the two interchangeable image-manifest schemas, or `None` for a media type
+/// that is neither of them.
+fn counterpart_manifest_schema(media_type: &str) -> Option<&'static str> {
+    match media_type {
+        DOCKER_V2_MANIFEST_MEDIA_TYPE => Some(OCI_IMAGE_MANIFEST_MEDIA_TYPE),
+        OCI_IMAGE_MANIFEST_MEDIA_TYPE => Some(DOCKER_V2_MANIFEST_MEDIA_TYPE),
+        _ => None,
+    }
+}
+
+/// `manifest` rendered in the image-manifest schema `target` names: its own `mediaType`
+/// and the media type of every descriptor it carries re-spelled in that schema's
+/// vocabulary, and everything else \u2014 every digest, every size, the order of the layers \u2014
+/// left exactly as stored.
+///
+/// `None` when the document cannot be rendered in it: anything that is not a JSON object,
+/// or one naming more blob descriptors than [`MAX_MANIFEST_BLOB_ENTRIES`], which is read
+/// no further here than anywhere else.
+fn rendered_in_schema(manifest: &str, target: &str) -> Option<String> {
+    let mut document: serde_json::Value = serde_json::from_str(manifest).ok()?;
+    let object = document.as_object_mut()?;
+    object.insert(
+        "mediaType".to_string(),
+        serde_json::Value::String(target.to_string()),
+    );
+    let to_oci = target == OCI_IMAGE_MANIFEST_MEDIA_TYPE;
+    if let Some(config) = object.get_mut("config") {
+        respell_descriptor(config, to_oci);
+    }
+    if let Some(layers) = object
+        .get_mut("layers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        if layers.len() > MAX_MANIFEST_BLOB_ENTRIES {
+            return None;
+        }
+        for layer in layers.iter_mut() {
+            respell_descriptor(layer, to_oci);
+        }
+    }
+    serde_json::to_string(&document).ok()
+}
+
+/// Re-spell one content descriptor's `mediaType` in the other schema's vocabulary. A media
+/// type that schema does not define \u2014 including one already spelled in the target
+/// vocabulary \u2014 is left as it is: only the names the two schemas share a meaning for are
+/// translated.
+fn respell_descriptor(descriptor: &mut serde_json::Value, to_oci: bool) {
+    let Some(media_type) = descriptor.get("mediaType").and_then(|value| value.as_str()) else {
+        return;
+    };
+    let translated = INTERCHANGEABLE_DESCRIPTOR_MEDIA_TYPES
+        .iter()
+        .find_map(|(docker, oci)| {
+            let (source, rendered) = if to_oci { (docker, oci) } else { (oci, docker) };
+            (*source == media_type).then_some(*rendered)
+        });
+    if let Some(translated) = translated {
+        if let Some(object) = descriptor.as_object_mut() {
+            object.insert(
+                "mediaType".to_string(),
+                serde_json::Value::String(translated.to_string()),
+            );
+        }
+    }
 }
 
 /// Every blob an image manifest references: its filesystem layers in the order the

@@ -17,6 +17,8 @@ mod applied_quota_records;
 mod auto_management;
 #[path = "all/auto_management_configuration.rs"]
 mod auto_management_configuration;
+#[path = "all/catalog_identity.rs"]
+mod catalog_identity;
 #[path = "all/catalog_pagination.rs"]
 mod catalog_pagination;
 #[path = "all/default_quota_catalog.rs"]
@@ -41,5 +43,7 @@ mod support_case_and_templates;
 mod support_cases;
 #[path = "all/tags.rs"]
 mod tags;
+#[path = "all/unasked_page_size.rs"]
+mod unasked_page_size;
 #[path = "all/utilization_report.rs"]
 mod utilization_report;

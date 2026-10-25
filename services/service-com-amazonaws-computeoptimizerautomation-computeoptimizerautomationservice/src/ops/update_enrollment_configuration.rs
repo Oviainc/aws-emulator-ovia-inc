@@ -258,6 +258,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             enrollment.last_updated_timestamp = Some(stored_at);
         }
 
+        // "Active - Enables the Automation feature for your account": opting in
+        // is what starts the analysis of the account's resources, and a
+        // recommended action is what that analysis produces, so the account's
+        // inventory is recorded here — the one store `ListRecommendedActions`,
+        // the preview lists and `StartAutomationEvent` all read. Idempotent, so
+        // opting in again neither duplicates nor rewrites an action.
+        if input.status == crate::state::ENROLLED_STATUS {
+            guard.ensure_recommended_action_inventory(&account_id);
+        }
+
         // "Inactive - Disables the Automation feature for your account and stops
         // all of your automation rules. If you opt in again later, all rules will
         // be inactive" — so opting out deactivates every rule this account owns.

@@ -336,7 +336,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListServersErrorModeled::InternalServerException(
                 InternalServerException {
@@ -359,9 +358,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page = page_of(input.max_results, input.next_token, &selection)?;
 
         // A read: the store is only looked at here, so running ListServers changes
-        // nothing a later caller sees.
+        // nothing a later caller sees. The inventory is the one of the Region this
+        // request was signed for — a Region nothing was imported in reads as empty.
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         let selected: Vec<&ServerRecord> = store
+            .region(&region)
             .servers
             .values()
             // `groupIdFilter` scopes the list to the servers that came in with one of the

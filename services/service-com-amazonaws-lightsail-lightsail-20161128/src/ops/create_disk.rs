@@ -216,8 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // conversion every operation that creates a disk goes through, so this
         // operation and `CreateDiskFromSnapshot` admit exactly the same add-ons.
         let add_on_requests = input.add_ons.clone().unwrap_or_default();
-        let add_ons = crate::state::disk_add_ons_from_requests(&input.disk_name, &add_on_requests)
-            .map_err(invalid)?;
+        let add_ons = crate::state::disk_add_ons_from_requests(
+            crate::state::ADD_ONS_LIST_MEMBER,
+            &input.disk_name,
+            &add_on_requests,
+        )
+        .map_err(invalid)?;
 
         let name = input.disk_name;
         let location = crate::state::StoredLocation::zonal(&input.availability_zone, region);

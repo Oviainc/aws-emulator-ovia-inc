@@ -4,9 +4,9 @@
 //! Answers with the `NotebookExecution` the shared engine holds under the requested
 //! execution id. An id no execution carries is refused with `InvalidRequestException`.
 //!
-//! `StartNotebookExecution` is what puts an execution in the store, and it is still a
-//! scaffold stub (its own issue), so today every well-formed execution id reaches the
-//! lookup and is refused there rather than at a guess.
+//! `StartNotebookExecution` is what puts an execution in the store, so what this
+//! operation reports is that record, with whatever status the clock has since made due
+//! applied to it.
 //!
 //! ## Shape of an operation
 //!
@@ -137,17 +137,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Reporting only: this read changes nothing a later caller sees.
+        // Reporting only: the one write below is a status the clock already made due,
+        // which was owed at this instant whether or not anybody described it.
         let _ = ctx;
+        let now = ::std::time::SystemTime::now();
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DescribeNotebookExecutionErrorModeled::InternalServerError(
                 InternalServerError {},
             )
             .into());
         };
-        let store = state.lock();
+        let mut store = state.lock();
 
-        let Some(execution) = store.notebook_executions.get(&input.notebook_execution_id) else {
+        let Some(record) = store.notebook_execution_mut(&input.notebook_execution_id, now) else {
             return Err(
                 DescribeNotebookExecutionErrorModeled::InvalidRequestException(
                     InvalidRequestException {
@@ -163,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(DescribeNotebookExecutionOutput {
-            notebook_execution: Some(execution.clone()),
+            notebook_execution: Some(record.execution.clone()),
         })
     }
 }

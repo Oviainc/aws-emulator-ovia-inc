@@ -68,6 +68,9 @@ mod cluster_creation;
 #[path = "all/cluster_listing.rs"]
 mod cluster_listing;
 
+#[path = "all/cluster_update.rs"]
+mod cluster_update;
+
 #[path = "all/deleted_resource_mutation.rs"]
 mod deleted_resource_mutation;
 
@@ -103,6 +106,9 @@ mod input_device_streaming;
 
 #[path = "all/input_device_thumbnail.rs"]
 mod input_device_thumbnail;
+
+#[path = "all/input_device_transfer_accept.rs"]
+mod input_device_transfer_accept;
 
 #[path = "all/input_device_transfers.rs"]
 mod input_device_transfers;

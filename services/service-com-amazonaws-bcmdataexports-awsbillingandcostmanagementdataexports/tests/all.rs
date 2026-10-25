@@ -35,6 +35,8 @@ mod export_definition_validation;
 mod export_lifecycle;
 #[path = "all/front_door_authorization.rs"]
 mod front_door_authorization;
+#[path = "all/minted_export_arn.rs"]
+mod minted_export_arn;
 #[path = "all/not_found_message.rs"]
 mod not_found_message;
 #[path = "all/not_found_wire_status.rs"]
@@ -45,6 +47,8 @@ mod query_column_selection;
 mod query_statement_subset;
 #[path = "all/quota_service_code.rs"]
 mod quota_service_code;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
