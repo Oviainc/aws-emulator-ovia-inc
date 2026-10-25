@@ -119,6 +119,65 @@ impl ComAmazonawsSchemasSchemasState {
         };
         held.ok_or(ResourceArnError::NoSuchResource)
     }
+
+    /// The tag set a caller's WRITE reaches through a `ResourceArn`, as the resource
+    /// reports its ARN to a request signed for `region`.
+    ///
+    /// Which resource an ARN names is the READ's answer — this resolves through
+    /// [`Self::tags_for_arn`], so a write cannot reach a resource a read of the same
+    /// ARN would not, and the two can never disagree about which ARN names what.
+    ///
+    /// What a write adds is the one refusal a read does not have: what is in a
+    /// service-owned registry is AWS's, so a caller may read it but not write to it —
+    /// the same refusal every other write to one gets. A service-owned SCHEMA needs
+    /// no case here: it carries no ARN at all ([`Registry::schema_arn_in`]), so no
+    /// ARN names one and the resolve above already answers that nothing is there.
+    pub fn writable_tags_for_arn(
+        &mut self,
+        arn: &str,
+        region: &str,
+    ) -> Result<&mut BTreeMap<String, String>, ResourceArnWriteError> {
+        // Resolve as a read does, and refuse what a read refuses: this is what makes
+        // the write reach the same tag set a later read of the same ARN reports.
+        self.tags_for_arn(arn, region)?;
+        let resource = parse_resource_arn(arn).ok_or(ResourceArnWriteError::NotAResourceArn)?;
+        // The registry whose scope says whether AWS or the caller owns what the ARN
+        // names: the registry itself, or the registry a schema belongs to.
+        let owning_registry = match &resource {
+            TaggedResource::Registry { registry } | TaggedResource::Schema { registry, .. } => {
+                Some(registry.clone())
+            }
+            TaggedResource::Discoverer { .. } => None,
+        };
+        if let Some(registry) = owning_registry {
+            if self
+                .registries
+                .get(&registry)
+                .is_some_and(|held| held.scope.is_managed())
+            {
+                return Err(ResourceArnWriteError::ServiceOwned(registry));
+            }
+        }
+        // The resolve above already established that this store holds the resource
+        // this ARN names, so these lookups answer; they are fallible only because a
+        // map lookup is.
+        let held = match resource {
+            TaggedResource::Registry { registry } => self
+                .registries
+                .get_mut(&registry)
+                .map(|held| &mut held.tags),
+            TaggedResource::Schema { registry, schema } => self
+                .registries
+                .get_mut(&registry)
+                .and_then(|held| held.schemas.get_mut(&schema))
+                .map(|held| &mut held.tags),
+            TaggedResource::Discoverer { discoverer_id } => self
+                .discoverers
+                .get_mut(&discoverer_id)
+                .map(|held| &mut held.tags),
+        };
+        held.ok_or(ResourceArnWriteError::NoSuchResource)
+    }
 }
 
 /// A fresh store already holds the service-owned registries: they exist in every
@@ -2587,6 +2646,32 @@ pub enum ResourceArnError {
     NotAResourceArn,
     /// A resource ARN of this service, naming a resource this store does not hold.
     NoSuchResource,
+}
+
+/// Why a `ResourceArn` names no tag set a caller may WRITE.
+///
+/// The two refusals a read has ([`ResourceArnError`]), plus the one only a write can
+/// meet: the ARN names content AWS owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceArnWriteError {
+    /// The value is no resource ARN of this service: the request's own form is wrong.
+    NotAResourceArn,
+    /// A resource ARN of this service, naming a resource this store does not hold.
+    NoSuchResource,
+    /// A resource of a service-owned registry, named here — AWS owns what is in it,
+    /// so a caller may read it but not write to it.
+    ServiceOwned(String),
+}
+
+/// A write meets every refusal a read of the same ARN meets, and words it the same
+/// way, so the one resolution serves both.
+impl From<ResourceArnError> for ResourceArnWriteError {
+    fn from(error: ResourceArnError) -> Self {
+        match error {
+            ResourceArnError::NotAResourceArn => Self::NotAResourceArn,
+            ResourceArnError::NoSuchResource => Self::NoSuchResource,
+        }
+    }
 }
 
 /// The resource an ARN of THIS service names, or `None` for a value that names none of

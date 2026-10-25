@@ -49,6 +49,8 @@ mod lifecycle_policy;
 mod lifecycle_policy_document_identity;
 #[path = "all/lifecycle_policy_preview.rs"]
 mod lifecycle_policy_preview;
+#[path = "all/lifecycle_policy_validator_report.rs"]
+mod lifecycle_policy_validator_report;
 #[path = "all/manifest_media_type_negotiation.rs"]
 mod manifest_media_type_negotiation;
 #[path = "all/parameter_constraint_clauses.rs"]

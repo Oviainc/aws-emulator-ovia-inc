@@ -599,6 +599,37 @@ pub fn config_arn_parts(arn: &str) -> Option<(String, String)> {
         .then(|| (config_type.to_string(), config_id.to_string()))
 }
 
+/// The NODE of the config `arn` addresses, when the ARN names one: the optional segment
+/// the modelled `ConfigArn` pattern allows after the config's uuid (`config/<type>/<uuid>`
+/// followed by `(/.{1,256})?` — the pattern on `GetConfig`'s `configArn`).
+///
+/// A config can carry several outputs, and that trailing segment is how a reference picks
+/// ONE of them: it is what an `antenna-downlink-demod-decode` edge endpoint names when it
+/// is wired to a particular output node of that config, which is the `outputNode` a
+/// contact's dataflow details report for it.
+pub fn config_arn_node(arn: &str) -> Option<String> {
+    let (_, resource) = arn.split_once(":config/")?;
+    let mut segments = resource.splitn(3, '/');
+    segments.next()?;
+    segments.next()?;
+    let node = segments.next()?;
+    (!node.is_empty()).then(|| node.to_string())
+}
+
+/// Whether the `ConfigArn` `reference` addresses the config whose own ARN is
+/// `config_arn`: that ARN itself, or that ARN followed by one of the config's NODES.
+///
+/// The modelled `ConfigArn` pattern ends in `config/<type>/<uuid>(/.{1,256})?`, so a
+/// reference may address either the config as a whole or one named output of it (see
+/// [`config_arn_node`]) — both are references to that one config, which is what makes
+/// them resolve to it and what makes it in use.
+pub fn addresses_config(reference: &str, config_arn: &str) -> bool {
+    reference == config_arn
+        || reference
+            .strip_prefix(config_arn)
+            .is_some_and(|node| node.starts_with('/'))
+}
+
 /// What this service answers when a mission profile a request names does not exist: a
 /// fixed literal that discloses neither the id nor the ARN that was asked for.
 ///
@@ -849,12 +880,17 @@ impl MissionProfile {
     ///
     /// [`DeleteConfig`]: crate::ops::delete_config
     pub fn references_config(&self, config_arn: &str) -> bool {
-        self.tracking_config_arn == config_arn
-            || self.telemetry_sink_config_arn.as_deref() == Some(config_arn)
+        // Each reference is matched with [`addresses_config`], so an edge wired to one
+        // NODE of a config is as much a reference to it as one naming the config whole.
+        addresses_config(&self.tracking_config_arn, config_arn)
             || self
-                .dataflow_edges
-                .iter()
-                .any(|edge| edge.iter().any(|arn| arn == config_arn))
+                .telemetry_sink_config_arn
+                .as_deref()
+                .is_some_and(|arn| addresses_config(arn, config_arn))
+            || self.dataflow_edges.iter().any(|edge| {
+                edge.iter()
+                    .any(|arn| addresses_config(arn, config_arn))
+            })
     }
 }
 
@@ -963,6 +999,56 @@ pub const CONTACT_CANCELLED: &str = "CANCELLED";
 
 /// See [`CONTACT_CANCELLED`].
 pub const CONTACT_CANCELLING: &str = "CANCELLING";
+
+/// The `ContactStatus` a reservation is admitted in, and the one the scheduler moves it
+/// to once the contact holds its place in the schedule — both the model's own
+/// (`smithy_query(query="shape", shape="ContactStatus")`).
+pub const CONTACT_SCHEDULING: &str = "SCHEDULING";
+
+/// See [`CONTACT_SCHEDULING`].
+pub const CONTACT_SCHEDULED: &str = "SCHEDULED";
+
+/// The `ContactStatus` of a contact whose pre-pass period has begun, of one whose pass is
+/// running, of one in its post-pass period and of one whose pass has finished — the
+/// model's own values again, in the order a contact reaches them.
+pub const CONTACT_PREPASS: &str = "PREPASS";
+
+/// See [`CONTACT_PREPASS`].
+pub const CONTACT_PASS: &str = "PASS";
+
+/// See [`CONTACT_PREPASS`].
+pub const CONTACT_POSTPASS: &str = "POSTPASS";
+
+/// See [`CONTACT_PREPASS`].
+pub const CONTACT_COMPLETED: &str = "COMPLETED";
+
+/// The statuses a contact moves through as the clock crosses its OWN timestamps, in
+/// lifecycle order; it is also the set of statuses that move along it at all.
+///
+/// Every boundary is a timestamp the contact already carries and every read already
+/// reports: the pre-pass period starts at `prePassStartTime`, "at which you receive a
+/// CloudWatch event indicating an upcoming pass", the pass itself runs `startTime` to
+/// `endTime`, and the post-pass period ends at `postPassEndTime`, "at which you receive a
+/// CloudWatch event indicating the pass has finished" (`smithy_query(query="operation",
+/// operation="DescribeContact")`). The lifecycle is therefore owed by the contact's own
+/// window rather than by a span this emulator chooses, and a contact that is somewhere
+/// else entirely — still [`CONTACT_SCHEDULING`], being released, or already in one of
+/// [`TERMINAL_CONTACT_STATUSES`] — is not on it and is not carried along it.
+pub const CONTACT_PASS_LIFECYCLE: &[&str] = &[
+    CONTACT_SCHEDULED,
+    CONTACT_PREPASS,
+    CONTACT_PASS,
+    CONTACT_POSTPASS,
+    CONTACT_COMPLETED,
+];
+
+/// How far along [`CONTACT_PASS_LIFECYCLE`] `status` stands, or `None` when it is not on
+/// that lifecycle at all.
+pub fn pass_lifecycle_position(status: &str) -> Option<usize> {
+    CONTACT_PASS_LIFECYCLE
+        .iter()
+        .position(|stage| *stage == status)
+}
 
 /// The `ContactStatus` values in which a cancel releases a reservation whose pass has not
 /// begun, so the contact is `CANCELLED` outright.
@@ -1175,6 +1261,55 @@ impl Contact {
         }
         self.scheduling_settles_at = None;
         self.last_updated = now;
+    }
+
+    /// The stage of its own pass the clock has carried this contact to at `now` (epoch
+    /// seconds): [`CONTACT_SCHEDULED`] while its pre-pass period is still ahead,
+    /// [`CONTACT_PREPASS`] from `prePassStartTime`, [`CONTACT_PASS`] from `startTime`,
+    /// [`CONTACT_POSTPASS`] from `endTime` and [`CONTACT_COMPLETED`] from
+    /// `postPassEndTime`.
+    ///
+    /// A boundary two of the contact's timestamps share is a stage of no duration, which
+    /// the contact therefore never reports: a mission profile that widens the window by
+    /// nothing gives the contact no pre-pass period, so such a contact goes from
+    /// scheduled straight into its pass.
+    pub fn pass_stage(&self, now: f64) -> &'static str {
+        if now >= self.post_pass_end_time.as_secs_f64() {
+            CONTACT_COMPLETED
+        } else if now >= self.end_time.as_secs_f64() {
+            CONTACT_POSTPASS
+        } else if now >= self.start_time.as_secs_f64() {
+            CONTACT_PASS
+        } else if now >= self.pre_pass_start_time.as_secs_f64() {
+            CONTACT_PREPASS
+        } else {
+            CONTACT_SCHEDULED
+        }
+    }
+
+    /// Carry this contact to the stage of [`CONTACT_PASS_LIFECYCLE`] its own timestamps
+    /// have already made due at `now` (epoch seconds), and answer whether that moved it.
+    ///
+    /// The move only ever goes FORWARD along the lifecycle, and only for a contact that is
+    /// on it: a contact whose status the clock cannot explain — one still being scheduled
+    /// or released, one already terminal, or a window merely offered — keeps the status it
+    /// holds. A contact that has reached [`CONTACT_PREPASS`] or beyond has had the antenna
+    /// on the account's behalf, so the move also records the antenna time as spent
+    /// ([`Contact::antenna_time_spent`]), which no later status move gives back.
+    pub fn advance_pass_stage(&mut self, now: f64) -> bool {
+        let Some(reached) = pass_lifecycle_position(&self.contact_status) else {
+            return false;
+        };
+        let stage = self.pass_stage(now);
+        let Some(due) = pass_lifecycle_position(stage) else {
+            return false;
+        };
+        if due <= reached {
+            return false;
+        }
+        self.contact_status = stage.to_string();
+        self.antenna_time_spent = true;
+        true
     }
 
     /// The whole minutes of antenna time this contact is scheduled for: its own window,
@@ -1787,6 +1922,29 @@ pub fn endpoint_members(details: &EndpointDetails) -> Vec<(&'static str, Endpoin
         members.push(("downlinkAwsGroundStationAgentEndpoint", EndpointKind::Agent));
     }
     members
+}
+
+/// The NAME of the endpoint `details` describes, whichever member describes it.
+///
+/// Every endpoint member of `EndpointDetails` carries a name of its own (`name` on
+/// `DataflowEndpoint` and on each of the three agent-endpoint shapes —
+/// `smithy_query(query="shape", shape="EndpointDetails")`), and that name is what a
+/// `dataflowEndpointConfig` references an endpoint of this account by
+/// (`dataflowEndpointName`), so one reader answers it for all four.
+pub fn endpoint_name(details: &EndpointDetails) -> Option<&str> {
+    if let Some(endpoint) = details.endpoint.as_ref() {
+        return endpoint.name.as_deref();
+    }
+    if let Some(endpoint) = details.aws_ground_station_agent_endpoint.as_ref() {
+        return Some(endpoint.name.as_str());
+    }
+    if let Some(endpoint) = details.uplink_aws_ground_station_agent_endpoint.as_ref() {
+        return Some(endpoint.name.as_str());
+    }
+    details
+        .downlink_aws_ground_station_agent_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.name.as_str())
 }
 
 /// The `EndpointStatus` a dataflow endpoint carries while the service is still attaching
@@ -2721,13 +2879,24 @@ impl ComAmazonawsGroundstationGroundstationState {
     }
 
     /// The config `arn` names, if it names one.
+    ///
+    /// An ARN naming one NODE of a config resolves to that config too: the index holds
+    /// the ARN of each config this service minted, and the modelled `ConfigArn` pattern
+    /// lets a reference append a node to it ([`addresses_config`]), so such a reference is
+    /// resolved through the config it addresses rather than looked up as an ARN of its
+    /// own.
     pub fn config_by_arn(&self, arn: &str) -> Option<&Config> {
-        match self.arn_index.get(arn)? {
-            ResourceRef::Config {
+        match self.arn_index.get(arn) {
+            Some(ResourceRef::Config {
                 config_type,
                 config_id,
-            } => self.configs.get(&(config_type.clone(), config_id.clone())),
-            _ => None,
+            }) => self.configs.get(&(config_type.clone(), config_id.clone())),
+            Some(_) => None,
+            None => {
+                let (config_type, config_id) = config_arn_parts(arn)?;
+                let config = self.configs.get(&(config_type, config_id))?;
+                addresses_config(arn, &config.config_arn).then_some(config)
+            }
         }
     }
 
@@ -2828,6 +2997,24 @@ impl ComAmazonawsGroundstationGroundstationState {
             }
             _ => None,
         }
+    }
+
+    /// The dataflow endpoint of this account named `name`, as the group that holds it
+    /// stored it; `None` when no group of this account holds one by that name.
+    ///
+    /// A `dataflowEndpointConfig` names an endpoint by `dataflowEndpointName` rather than
+    /// by the group it belongs to, so the lookup is over every group's endpoints
+    /// ([`endpoint_name`] reads the name whichever member describes the endpoint). Groups
+    /// are taken in id order, so two endpoints sharing a name resolve to the same one on
+    /// every call whatever order the map iterates in.
+    pub fn dataflow_endpoint(&self, name: &str) -> Option<&EndpointDetails> {
+        let mut group_ids: Vec<&String> = self.dataflow_endpoint_groups.keys().collect();
+        group_ids.sort();
+        group_ids
+            .into_iter()
+            .filter_map(|id| self.dataflow_endpoint_groups.get(id))
+            .flat_map(|group| group.endpoint_details.iter())
+            .find(|details| endpoint_name(details) == Some(name))
     }
 
     /// The tags of the resource `arn` names, when this service holds one.
@@ -3078,12 +3265,16 @@ impl ComAmazonawsGroundstationGroundstationState {
     }
 
     /// Materialise every `SCHEDULING` -> `SCHEDULED` move, every `CANCELLING` ->
-    /// `CANCELLED` move and every `UPDATING` -> `ACTIVE` contact-version move the clock
-    /// has already made due. A reporting operation calls this before reading: the moves
-    /// were owed at this instant whether or not anybody called, so applying them changes
-    /// nothing a later caller could otherwise have seen.
+    /// `CANCELLED` move, every `UPDATING` -> `ACTIVE` contact-version move and every step
+    /// of the pass lifecycle ([`CONTACT_PASS_LIFECYCLE`]) the clock has already made due.
+    /// A reporting operation calls this before reading: the moves were owed at this
+    /// instant whether or not anybody called, so applying them changes nothing a later
+    /// caller could otherwise have seen.
     pub fn settle_due_contacts(&mut self) {
         let now = SystemTime::now();
+        let now_seconds = now
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |since| since.as_secs_f64());
         for contact in self.contacts.values_mut() {
             contact.apply_due_versions();
             if contact
@@ -3096,15 +3287,18 @@ impl ComAmazonawsGroundstationGroundstationState {
                 }
                 contact.cancellation_settles_at = None;
             }
-            let Some(due) = contact.scheduling_settles_at else {
-                continue;
-            };
-            if due <= now {
-                if contact.contact_status == "SCHEDULING" {
-                    contact.contact_status = "SCHEDULED".to_string();
+            if contact.scheduling_settles_at.is_some_and(|due| due <= now) {
+                if contact.contact_status == CONTACT_SCHEDULING {
+                    contact.contact_status = CONTACT_SCHEDULED.to_string();
                     contact.last_updated = now_timestamp();
                 }
                 contact.scheduling_settles_at = None;
+            }
+            // And then the pass itself: the stage of its window the clock has reached.
+            // Last, so a contact the scheduler has just confirmed is carried on to the
+            // stage its own timestamps owe it in the same settle.
+            if contact.advance_pass_stage(now_seconds) {
+                contact.last_updated = now_timestamp();
             }
         }
     }

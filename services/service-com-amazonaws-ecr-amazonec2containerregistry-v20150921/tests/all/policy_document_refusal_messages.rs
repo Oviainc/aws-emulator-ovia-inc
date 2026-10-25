@@ -53,9 +53,17 @@ const LIFECYCLE_PARSING: &str =
     "Lifecycle policy parsing failure: Could not map policyString into LifecyclePolicy.";
 
 /// The constraint a lifecycle document that maps onto the shape but breaks one of the
-/// policy format's constraints fails.
+/// policy format's constraints fails. `detail` is a sentence ECR words itself, for a rule
+/// it checks ACROSS the document's members once the document's schema has been checked.
 fn lifecycle_validation(detail: &str) -> String {
     format!("Lifecycle policy validation failure: {detail}")
+}
+
+/// The same constraint where the detail is the lifecycle SCHEMA validator's own report:
+/// the validator writes a failure as a line, so the quoted span reproduces that line with
+/// the newline that terminates it and the closing quote follows the newline.
+fn lifecycle_schema(report: &str) -> String {
+    lifecycle_validation(&format!("{report}\n"))
 }
 
 /// The modelled minimum length of `lifecyclePolicyText` (`@length(min: 100, max: 30720)`
@@ -403,7 +411,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
         (
             "no rules member",
             padded(r#"{"description": "a policy with no rules member"}"#),
-            lifecycle_validation(r#"object has missing required properties (["rules"])"#),
+            lifecycle_schema(r#"object has missing required properties (["rules"])"#),
         ),
         (
             "a rule with no rulePriority",
@@ -411,12 +419,12 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 "selection": count_selection("imageCountMoreThan", 5),
                 "action": expire(),
             }])),
-            lifecycle_validation(r#"object has missing required properties (["rulePriority"])"#),
+            lifecycle_schema(r#"object has missing required properties (["rulePriority"])"#),
         ),
         (
             "a rule with no selection",
             lifecycle_document(json!([{ "rulePriority": 1, "action": expire() }])),
-            lifecycle_validation(r#"object has missing required properties (["selection"])"#),
+            lifecycle_schema(r#"object has missing required properties (["selection"])"#),
         ),
         (
             "a selection with no tagStatus",
@@ -424,7 +432,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 json!({ "countType": "imageCountMoreThan", "countNumber": 5 }),
                 expire()
             )])),
-            lifecycle_validation(r#"object has missing required properties (["tagStatus"])"#),
+            lifecycle_schema(r#"object has missing required properties (["tagStatus"])"#),
         ),
         (
             "a selection with no countType",
@@ -432,7 +440,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 json!({ "tagStatus": "any", "countNumber": 5 }),
                 expire()
             )])),
-            lifecycle_validation(r#"object has missing required properties (["countType"])"#),
+            lifecycle_schema(r#"object has missing required properties (["countType"])"#),
         ),
         (
             "a selection with no countNumber",
@@ -440,7 +448,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 json!({ "tagStatus": "any", "countType": "imageCountMoreThan" }),
                 expire()
             )])),
-            lifecycle_validation(r#"object has missing required properties (["countNumber"])"#),
+            lifecycle_schema(r#"object has missing required properties (["countNumber"])"#),
         ),
         (
             "an age count with no countUnit",
@@ -448,7 +456,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 count_selection("sinceImagePushed", 5),
                 expire()
             )])),
-            lifecycle_validation(r#"object has missing required properties (["countUnit"])"#),
+            lifecycle_schema(r#"object has missing required properties (["countUnit"])"#),
         ),
         (
             "a rule with no action",
@@ -456,7 +464,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 "rulePriority": 1,
                 "selection": count_selection("imageCountMoreThan", 5),
             }])),
-            lifecycle_validation(r#"object has missing required properties (["action"])"#),
+            lifecycle_schema(r#"object has missing required properties (["action"])"#),
         ),
         (
             "an action with no type",
@@ -464,7 +472,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 count_selection("imageCountMoreThan", 5),
                 json!({})
             )])),
-            lifecycle_validation(r#"object has missing required properties (["type"])"#),
+            lifecycle_schema(r#"object has missing required properties (["type"])"#),
         ),
         (
             "a transition with no targetStorageClass",
@@ -472,37 +480,35 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 count_selection("imageCountMoreThan", 5),
                 json!({ "type": "transition" })
             )])),
-            lifecycle_validation(
-                r#"object has missing required properties (["targetStorageClass"])"#,
-            ),
+            lifecycle_schema(r#"object has missing required properties (["targetStorageClass"])"#),
         ),
         // Documents whose member is present and mappable but outside its bound.
         (
             // The recorded instance: a countNumber of zero.
             "a zero countNumber",
             lifecycle_document(json!([any_count_rule(1, 0)])),
-            lifecycle_validation(
+            lifecycle_schema(
                 "numeric instance is lower than the required minimum (minimum: 1, found: 0)",
             ),
         ),
         (
             "a negative countNumber",
             lifecycle_document(json!([any_count_rule(1, -7)])),
-            lifecycle_validation(
+            lifecycle_schema(
                 "numeric instance is lower than the required minimum (minimum: 1, found: -7)",
             ),
         ),
         (
             "a zero rulePriority",
             lifecycle_document(json!([any_count_rule(0, 5)])),
-            lifecycle_validation(
+            lifecycle_schema(
                 "numeric instance is lower than the required minimum (minimum: 1, found: 0)",
             ),
         ),
         (
             "rules holding no rule",
             lifecycle_document(json!([])),
-            lifecycle_validation(
+            lifecycle_schema(
                 "array is too short: must have at least 1 elements but instance has 0 elements",
             ),
         ),
@@ -517,7 +523,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 }),
                 expire()
             )])),
-            lifecycle_validation(
+            lifecycle_schema(
                 r#"instance value ("sometimes") not found in enum (possible values: ["any","tagged","untagged"])"#,
             ),
         ),
@@ -527,7 +533,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 count_selection("sinceImagePulled", 5),
                 expire()
             )])),
-            lifecycle_validation(
+            lifecycle_schema(
                 r#"instance value ("sinceImagePulled") not found in enum (possible values: ["imageCountMoreThan","sinceImagePushed"])"#,
             ),
         ),
@@ -542,7 +548,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 }),
                 expire()
             )])),
-            lifecycle_validation(
+            lifecycle_schema(
                 r#"instance value ("hours") not found in enum (possible values: ["days"])"#,
             ),
         ),
@@ -552,7 +558,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 count_selection("imageCountMoreThan", 5),
                 json!({ "type": "delete" })
             )])),
-            lifecycle_validation(
+            lifecycle_schema(
                 r#"instance value ("delete") not found in enum (possible values: ["expire","transition"])"#,
             ),
         ),
@@ -562,7 +568,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 count_selection("imageCountMoreThan", 5),
                 json!({ "type": "transition", "targetStorageClass": "GLACIER" })
             )])),
-            lifecycle_validation(
+            lifecycle_schema(
                 r#"instance value ("GLACIER") not found in enum (possible values: ["ARCHIVE"])"#,
             ),
         ),

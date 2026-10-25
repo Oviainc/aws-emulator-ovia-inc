@@ -284,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             antenna_name,
             // A reservation is admitted into SCHEDULING; the scheduler owes it the move
             // to SCHEDULED, which any later read materialises once it is due.
-            contact_status: "SCHEDULING".to_string(),
+            contact_status: crate::state::CONTACT_SCHEDULING.to_string(),
             region: crate::state::request_region(ctx.parts()),
             // The satellite and the tracking overrides the contact is reserved with are
             // its FIRST version: `UpdateContact` appends further ones, and the contact

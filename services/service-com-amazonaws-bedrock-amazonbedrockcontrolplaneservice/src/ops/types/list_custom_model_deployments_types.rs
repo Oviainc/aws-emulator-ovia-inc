@@ -32,7 +32,14 @@ pub struct ListCustomModelDeploymentsOutput {
     pub model_deployment_summaries: Option<Vec<CustomModelDeploymentSummary>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#CustomModelDeploymentSummary")]
+/// `CustomModelDeploymentSummary`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `lastUpdatedAt` both carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="CustomModelDeploymentSummary")`), which the derive
+/// does not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct CustomModelDeploymentSummary {
     pub custom_model_deployment_arn: String,
@@ -43,4 +50,47 @@ pub struct CustomModelDeploymentSummary {
     pub last_updated_at: Option<::aws_smithy_types::DateTime>,
     pub failure_message: Option<String>,
 }
+
+bedrock_schema_and_codec!(
+    CustomModelDeploymentSummary,
+    CUSTOM_MODEL_DEPLOYMENT_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrock#CustomModelDeploymentSummary",
+    "com.amazonaws.bedrock",
+    "CustomModelDeploymentSummary",
+    (
+        M_CUSTOM_MODEL_DEPLOYMENT_ARN,
+        custom_model_deployment_arn,
+        "customModelDeploymentArn",
+        0,
+        req,
+        string
+    ),
+    (
+        M_CUSTOM_MODEL_DEPLOYMENT_NAME,
+        custom_model_deployment_name,
+        "customModelDeploymentName",
+        1,
+        req,
+        string
+    ),
+    (M_MODEL_ARN, model_arn, "modelArn", 2, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 3, req, date_time),
+    (M_STATUS, status, "status", 4, req, string),
+    (
+        M_LAST_UPDATED_AT,
+        last_updated_at,
+        "lastUpdatedAt",
+        5,
+        opt,
+        date_time
+    ),
+    (
+        M_FAILURE_MESSAGE,
+        failure_message,
+        "failureMessage",
+        6,
+        opt,
+        string
+    ),
+);
 
