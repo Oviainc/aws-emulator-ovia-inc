@@ -5,11 +5,17 @@
 //! Removes the approval-team VERSION the request's `(Arn, VersionId)` pair names, when
 //! that version is one this service may delete directly: a version that has never been
 //! activated (the team is `PENDING` with `PENDING_ACTIVATION` — the team DRAFT the
-//! operation's own documentation names) or one that is no longer active (`INACTIVE`).
+//! operation's own documentation names) or one that is no longer active (`INACTIVE`),
+//! which is what a change the team was asked for and did not approve leaves behind.
 //! An `ACTIVE` team, and a team already inside a pending deletion window (`DELETING`),
 //! are refused with the modelled `ConflictException` (409): an active team is deleted
 //! through `StartActiveApprovalTeamDeletion`, which is the operation that opens that
-//! window.
+//! window. So is a version still awaiting the team's approval: that one is abandoned by
+//! cancelling its update session.
+//!
+//! Deleting the version a team was asked to approve leaves the team running on the
+//! version it already had; deleting the version it IS running on takes the team with it,
+//! the store holding one live version per team.
 //!
 //! A pair that names NOTHING this store holds — an ARN under which no team is stored, or
 //! a `VersionId` other than the stored team's current one — is a success that changes
@@ -183,16 +189,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // What the decision needs, read out of the store before anything is removed. A
         // pair naming no stored version — an ARN under which no team is stored, or a
-        // `VersionId` that is not the stored team's current one — leaves the caller in
-        // the state it asked for, so the idempotent delete answers success and writes
-        // nothing.
-        let Some(status) = state
+        // `VersionId` that is neither the stored team's current one nor the version it has
+        // been asked to approve — leaves the caller in the state it asked for, so the
+        // idempotent delete answers success and writes nothing.
+        let Some(team) = state.team(&input.arn) else {
+            return Ok(DeleteInactiveApprovalTeamVersionOutput {});
+        };
+
+        // The refusal this operation answers a version it may not delete with: the
+        // version's own status, and what the caller can do about it instead.
+        let conflict = |version_status: &str, remedy: &str| {
+            DeleteInactiveApprovalTeamVersionError::Modeled(
+                DeleteInactiveApprovalTeamVersionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "Approval team '{}' version '{}' is {version_status} and not {} or \
+                             {}, so it cannot be deleted by {}; {remedy}.",
+                            input.arn,
+                            input.version_id,
+                            crate::state::TeamStatus::Inactive.as_wire(),
+                            crate::state::TeamStatus::Pending.as_wire(),
+                            Self::NAME,
+                        ),
+                    },
+                ),
+            )
+        };
+
+        // A version the team was asked to approve is the other version it holds. Once it
+        // is one the team will never move to (`INACTIVE`) it is this operation's to
+        // delete — the team draft its own documentation names — and the team keeps the
+        // configuration and the version it is running on.
+        if let Some(requested) = team
+            .pending_update
+            .as_ref()
+            .filter(|update| update.version_id == input.version_id)
+        {
+            if requested.is_outstanding() {
+                return Err(conflict(
+                    requested.status.as_wire(),
+                    "a version awaiting the team's approval is abandoned by cancelling its \
+                     update session with CancelSession",
+                ));
+            }
+            if let Some(team) = state.team_mut(&input.arn) {
+                team.remove_pending_update();
+            }
+            return Ok(DeleteInactiveApprovalTeamVersionOutput {});
+        }
+
+        let Some((status, awaiting_approval)) = state
             .team(&input.arn)
             .filter(|team| team.version_id == input.version_id)
-            .map(|team| team.status)
+            .map(|team| (team.status, team.outstanding_update().is_some()))
         else {
             return Ok(DeleteInactiveApprovalTeamVersionOutput {});
         };
+
+        // A team waiting on its approvers' approval of a CHANGE has an activated version
+        // running: that version is not a draft, whatever the team's status reads.
+        if awaiting_approval {
+            return Err(conflict(
+                crate::state::TeamStatus::Active.as_wire(),
+                "an active team's deletion is started with StartActiveApprovalTeamDeletion",
+            ));
+        }
 
         match status {
             // A version that has never been activated (the team draft) or one that is no
@@ -201,24 +262,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An active team — and a team already inside the pending deletion window
             // that `StartActiveApprovalTeamDeletion` opened — is not deleted here.
             other => {
-                return Err(
-                    DeleteInactiveApprovalTeamVersionErrorModeled::ConflictException(
-                        ConflictException {
-                            message: format!(
-                                "Approval team '{}' version '{}' is {} and not {} or {}, so it \
-                                 cannot be deleted by {}; an active team's deletion is started \
-                                 with StartActiveApprovalTeamDeletion.",
-                                input.arn,
-                                input.version_id,
-                                other.as_wire(),
-                                crate::state::TeamStatus::Inactive.as_wire(),
-                                crate::state::TeamStatus::Pending.as_wire(),
-                                Self::NAME,
-                            ),
-                        },
-                    )
-                    .into(),
-                );
+                return Err(conflict(
+                    other.as_wire(),
+                    "an active team's deletion is started with StartActiveApprovalTeamDeletion",
+                ));
             }
         }
 
