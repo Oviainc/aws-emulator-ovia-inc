@@ -21,6 +21,13 @@
 //! by [`Queue::materialise_due`], so the three `ApproximateNumberOfMessages*`
 //! attributes are counts over real state rather than made-up values.
 //!
+//! Which of those messages a receive may hand over is [`Queue::delivery_order`]: on a
+//! standard queue whatever is visible, and on a FIFO queue each message group in strict
+//! send order, one group member in flight at a time. A FIFO send also remembers the
+//! deduplication token it accepted a message under, in [`Queue::deduplication`], so a
+//! resend inside the interval is accepted without delivering a second copy, and
+//! sequences the message from [`Queue::sequenced`].
+//!
 //! # Message movement tasks
 //!
 //! `StartMessageMoveTask` takes the messages a dead-letter queue can hand out and puts
@@ -42,6 +49,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use md5::{Digest, Md5};
+use sha2::Sha256;
 
 use crate::ops::types::{
     InvalidAddress, InvalidAttributeName, InvalidAttributeValue, ListMessageMoveTasksResultEntry,
@@ -86,6 +94,70 @@ pub const FIFO_QUEUE_NAME_SUFFIX: &str = ".fifo";
 
 /// The attribute that designates a queue as FIFO.
 pub const FIFO_QUEUE_ATTRIBUTE: &str = "FifoQueue";
+
+/// The attribute that makes a FIFO queue derive a message's deduplication token from
+/// its body: "Enables content-based deduplication."
+pub const CONTENT_BASED_DEDUPLICATION: &str = "ContentBasedDeduplication";
+
+/// The attribute that says whether deduplication is per message group or per queue:
+/// "Specifies whether message deduplication occurs at the message group or queue
+/// level. Valid values are messageGroup and queue."
+pub const DEDUPLICATION_SCOPE: &str = "DeduplicationScope";
+
+/// The [`DEDUPLICATION_SCOPE`] value that scopes a deduplication token to its message
+/// group; any other value (including none) scopes it to the whole queue, which is the
+/// level the attribute's own documentation names as the alternative.
+pub const DEDUPLICATION_SCOPE_MESSAGE_GROUP: &str = "messageGroup";
+
+/// How long a deduplication token suppresses a resend: a message carrying a
+/// `MessageDeduplicationId` already seen is "accepted successfully but aren't delivered
+/// during the 5-minute deduplication interval"
+/// (`SendMessageRequest$MessageDeduplicationId`).
+pub const DEDUPLICATION_INTERVAL: Duration = Duration::from_secs(300);
+
+/// The longest `MessageGroupId` / `MessageDeduplicationId` a message may carry: "The
+/// length of MessageGroupId is 128 characters" and "The maximum length of
+/// MessageDeduplicationId is 128 characters" (their own member documentation).
+pub const MAX_MESSAGE_TOKEN_LENGTH: usize = 128;
+
+/// The value the first sequence number a FIFO queue assigns counts up from.
+///
+/// `SendMessageResult$SequenceNumber` documents the value as "the large,
+/// non-consecutive number that Amazon SQS assigns to each message. The length of
+/// SequenceNumber is 128 bits. SequenceNumber continues to increase for a particular
+/// MessageGroupId" — so what a client may rely on is a decimal integer inside 128 bits
+/// that increases. Counting up from here makes them all the same width, which is what a
+/// client comparing them as text needs.
+pub const SEQUENCE_NUMBER_BASE: u128 = 10_u128.pow(19);
+
+/// Why the `MessageGroupId` / `MessageDeduplicationId` called `member` cannot be
+/// accepted, as the text of the refusal a caller has to fix the request from, or `None`
+/// when it can.
+///
+/// The rule is the one both members publish: at most [`MAX_MESSAGE_TOKEN_LENGTH`]
+/// characters, "alphanumeric characters and punctuation
+/// (!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~)" — which is exactly the ASCII punctuation set.
+/// An empty token names no group and no send attempt, so it is not one either.
+pub fn message_token_refusal(member: &str, token: &str) -> Option<String> {
+    let length = token.chars().count();
+    if length == 0 || length > MAX_MESSAGE_TOKEN_LENGTH {
+        return Some(format!(
+            "{member} must be between 1 and {MAX_MESSAGE_TOKEN_LENGTH} characters long, but was \
+             {length}."
+        ));
+    }
+    if let Some(character) = token
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()))
+    {
+        return Some(format!(
+            "{member} may hold only alphanumeric characters and punctuation, but holds \
+             U+{:04X}.",
+            character as u32
+        ));
+    }
+    None
+}
 
 /// How many cost allocation tags one queue may carry.
 ///
@@ -166,7 +238,7 @@ pub struct AttributeSpec {
 pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     AttributeSpec {
         // "Enables content-based deduplication. Valid values are true and false."
-        name: "ContentBasedDeduplication",
+        name: CONTENT_BASED_DEDUPLICATION,
         kind: AttributeKind::Boolean,
         create_only: false,
         fifo_only: true,
@@ -175,8 +247,8 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     AttributeSpec {
         // "Specifies whether message deduplication occurs at the message group or
         // queue level. Valid values are messageGroup and queue."
-        name: "DeduplicationScope",
-        kind: AttributeKind::OneOf(&["messageGroup", "queue"]),
+        name: DEDUPLICATION_SCOPE,
+        kind: AttributeKind::OneOf(&[DEDUPLICATION_SCOPE_MESSAGE_GROUP, "queue"]),
         create_only: false,
         fifo_only: true,
         default: None,
@@ -383,6 +455,16 @@ pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
 /// can have up to 10 attributes."
 pub const MAX_MESSAGE_ATTRIBUTES: usize = 10;
 
+/// How many deduplication tokens one queue remembers. A token outlives the message it
+/// suppressed ("Amazon SQS continues to keep track of the message deduplication ID even
+/// after the message is received and deleted"), so the message count does not bound it:
+/// past this, the queue forgets the oldest tokens first. Unlike a message, a token is
+/// derived data whose only effect is suppressing a resend inside
+/// [`DEDUPLICATION_INTERVAL`], so forgetting one loses nothing a client was told had
+/// been accepted — which is why this bound is enforced by eviction and the message
+/// bounds are not.
+pub const MAX_DEDUPLICATION_TOKENS_PER_QUEUE: usize = 1_000;
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -409,6 +491,17 @@ pub struct StoredMessage {
     pub md5_of_body: String,
     /// The message attributes the sender supplied.
     pub message_attributes: BTreeMap<String, MessageAttributeValue>,
+    /// The `MessageGroupId` the send carried, if any: the group whose messages a FIFO
+    /// queue hands over "one at a time, in strict order". A standard queue stores it
+    /// too — the send may carry it there — but does not order by it.
+    pub message_group_id: Option<String>,
+    /// The `MessageDeduplicationId` this message was accepted under, either the one the
+    /// send supplied or the one `ContentBasedDeduplication` derived from the body. Only
+    /// a FIFO queue has one, and it "is available to the consumer of the message".
+    pub message_deduplication_id: Option<String>,
+    /// The sequence number a FIFO queue assigned this message; `None` on a standard
+    /// queue, which assigns none.
+    pub sequence_number: Option<String>,
     /// When `SendMessage` accepted it.
     pub sent_at: SystemTime,
     /// `sent_at` + the effective `DelaySeconds`: before this instant the message is
@@ -445,6 +538,25 @@ impl StoredMessage {
             _ => Visibility::Visible,
         }
     }
+
+    /// The message group this message belongs to, as the empty group when it carries no
+    /// `MessageGroupId` — which is every message of a standard queue that named none.
+    pub fn group(&self) -> &str {
+        self.message_group_id.as_deref().unwrap_or_default()
+    }
+}
+
+/// What a queue remembers about a deduplication token it has already accepted: the
+/// message that token admitted, so a resend inside [`DEDUPLICATION_INTERVAL`] is
+/// "accepted successfully but aren't delivered" and still answers for that message.
+#[derive(Debug, Clone)]
+pub struct Deduplication {
+    /// The `MessageId` of the message the token first admitted.
+    pub message_id: String,
+    /// The sequence number that message was assigned.
+    pub sequence_number: String,
+    /// When the token was accepted; the interval runs from here.
+    pub accepted_at: SystemTime,
 }
 
 /// Per-service state for com-amazonaws-sqs-amazonsqs. A handler reaches it through [`service_state`].
@@ -490,6 +602,15 @@ pub struct Queue {
     /// handle is dropped with its message — so this map never holds more entries than
     /// [`messages`](Self::messages), whatever the receive count.
     pub handles: HashMap<String, String>,
+    /// The deduplication tokens this queue has accepted, keyed by
+    /// `(deduplication scope, token)` — see [`Queue::deduplication_key`]. Only a FIFO
+    /// queue writes here; entries lapse with [`DEDUPLICATION_INTERVAL`] and are bounded
+    /// by [`MAX_DEDUPLICATION_TOKENS_PER_QUEUE`].
+    pub deduplication: BTreeMap<(String, String), Deduplication>,
+    /// How many messages this queue has sequenced. The sequence number of the next one
+    /// is derived from it, so "SequenceNumber continues to increase" across the queue
+    /// and therefore across each of its message groups.
+    pub sequenced: u128,
     pub created_at: SystemTime,
     /// When an attribute of this queue last changed; equals `created_at` until a
     /// `SetQueueAttributes` changes something.
@@ -533,8 +654,14 @@ impl Queue {
     /// Whether this queue is a FIFO queue, which is what makes the FIFO-only
     /// attributes applicable to it.
     pub fn is_fifo(&self) -> bool {
+        self.boolean(FIFO_QUEUE_ATTRIBUTE)
+    }
+
+    /// Whether boolean attribute `name` is set on this queue. "Valid values are true
+    /// and false", so anything else — including no value at all — is false.
+    pub fn boolean(&self, name: &str) -> bool {
         self.attributes
-            .get(FIFO_QUEUE_ATTRIBUTE)
+            .get(name)
             .is_some_and(|value| value == "true")
     }
 
@@ -564,10 +691,95 @@ impl Queue {
         counts
     }
 
+    /// Whether this queue derives a message's deduplication token from its body rather
+    /// than requiring the sender to supply one.
+    pub fn content_based_deduplication(&self) -> bool {
+        self.boolean(CONTENT_BASED_DEDUPLICATION)
+    }
+
+    /// The key the deduplication token `token` of a message in group `group` is
+    /// remembered under.
+    ///
+    /// `DeduplicationScope` "specifies whether message deduplication occurs at the
+    /// message group or queue level": under `messageGroup` the same token in two groups
+    /// is two tokens, so the group is part of the key; at queue level — the default —
+    /// the token alone is the key, whatever group it arrived in.
+    pub fn deduplication_key(&self, group: &str, token: &str) -> (String, String) {
+        let per_group = self
+            .attributes
+            .get(DEDUPLICATION_SCOPE)
+            .is_some_and(|value| value == DEDUPLICATION_SCOPE_MESSAGE_GROUP);
+        let scope = if per_group {
+            group.to_string()
+        } else {
+            String::new()
+        };
+        (scope, token.to_string())
+    }
+
+    /// Remember that `key` admitted the message `record` names, forgetting the oldest
+    /// tokens if that takes the queue past
+    /// [`MAX_DEDUPLICATION_TOKENS_PER_QUEUE`](crate::state::MAX_DEDUPLICATION_TOKENS_PER_QUEUE).
+    pub fn record_deduplication(&mut self, key: (String, String), record: Deduplication) {
+        self.deduplication.insert(key, record);
+        while self.deduplication.len() > MAX_DEDUPLICATION_TOKENS_PER_QUEUE {
+            let Some(oldest) = self
+                .deduplication
+                .iter()
+                .min_by_key(|(_, remembered)| remembered.accepted_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.deduplication.remove(&oldest);
+        }
+    }
+
+    /// Mint the next sequence number for this queue: a decimal integer inside 128 bits
+    /// that is larger than every one it has already assigned.
+    pub fn next_sequence_number(&mut self) -> String {
+        self.sequenced = self.sequenced.saturating_add(1);
+        SEQUENCE_NUMBER_BASE
+            .saturating_add(self.sequenced)
+            .to_string()
+    }
+
+    /// The indexes, in the order they are to be handed over, of at most `max` messages
+    /// this queue may deliver at `now`.
+    ///
+    /// A standard queue hands over whatever is visible, oldest first. A FIFO queue
+    /// hands over each message group's messages "one at a time, in strict order,
+    /// ensuring that no two messages from the same group are processed simultaneously":
+    /// the oldest message of a group that is not visible — because it is in flight with
+    /// another consumer, or because its delay has not elapsed — stops that group, so
+    /// nothing behind it is handed over until it is deleted or becomes visible again.
+    /// Other groups are unaffected, which is what lets several ordered streams share
+    /// one queue.
+    pub fn delivery_order(&self, now: SystemTime, max: usize) -> Vec<usize> {
+        let fifo = self.is_fifo();
+        let mut stopped: BTreeSet<&str> = BTreeSet::new();
+        let mut taking: Vec<usize> = Vec::new();
+        for (index, message) in self.messages.iter().enumerate() {
+            if taking.len() >= max {
+                break;
+            }
+            if fifo && stopped.contains(message.group()) {
+                continue;
+            }
+            if message.visibility(now) == Visibility::Visible {
+                taking.push(index);
+            } else if fifo {
+                stopped.insert(message.group());
+            }
+        }
+        taking
+    }
+
     /// Materialise everything the CLOCK already made due on this queue: drop messages
-    /// whose retention period has elapsed, and return messages whose visibility
-    /// timeout has lapsed to the visible set. Both were owed at `now` whether or not
-    /// anybody called, which is why a reporting operation may apply them.
+    /// whose retention period has elapsed, return messages whose visibility timeout has
+    /// lapsed to the visible set, and forget deduplication tokens whose interval has
+    /// run out. All three were owed at `now` whether or not anybody called, which is
+    /// why a reporting operation may apply them.
     pub fn materialise_due(&mut self, now: SystemTime) {
         let retention = seconds(self.integer(MESSAGE_RETENTION_PERIOD));
         let mut expired: Vec<String> = Vec::new();
@@ -589,6 +801,14 @@ impl Queue {
                 message.invisible_until = None;
             }
         }
+        // A token suppresses a resend only "during the 5-minute deduplication
+        // interval"; past it, "Amazon SQS can't detect duplicate messages".
+        self.deduplication.retain(|_, remembered| {
+            remembered
+                .accepted_at
+                .checked_add(DEDUPLICATION_INTERVAL)
+                .is_none_or(|lapses| now < lapses)
+        });
     }
 
     /// Record the receipt handle a receive just minted for `message_id`, dropping the
@@ -1434,6 +1654,15 @@ pub fn new_identifier() -> String {
 /// MD5 hex digest of `body` — the value SQS returns as `MD5OfMessageBody`/`MD5OfBody`.
 pub fn md5_hex(body: &[u8]) -> String {
     hex::encode(Md5::digest(body))
+}
+
+/// The deduplication token a queue with `ContentBasedDeduplication` derives for a
+/// message: "Amazon SQS uses a SHA-256 hash to generate the MessageDeduplicationId
+/// using the body of the message (but not the attributes of the message)", so two sends
+/// of identical content inside the interval are "treated as duplicates and only one
+/// copy of the message is delivered".
+pub fn content_deduplication_token(body: &str) -> String {
+    hex::encode(Sha256::digest(body.as_bytes()))
 }
 
 /// MD5 hex digest of the message-attribute encoding SQS defines, or `None` when there

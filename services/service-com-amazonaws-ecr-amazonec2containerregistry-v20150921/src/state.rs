@@ -1218,6 +1218,36 @@ pub fn identifier_description(id: &ImageIdentifier) -> String {
     )
 }
 
+/// The lifecycle policy a repository carries: the document [`Repo`] was given, and the
+/// instant that policy was last evaluated.
+///
+/// The document is held as TEXT and never as a parsed value: `lifecyclePolicyText` is an
+/// opaque document (`ecr#LifecyclePolicyText`, a string), so what is stored is what every
+/// operation reporting this policy reports, down to the member order and the spelling of
+/// each token. The one thing ECR normalises is the whitespace between those tokens, which
+/// [`normalize_lifecycle_policy`] removes once, on the way in.
+/// [`parse_lifecycle_policy`] reads the document to validate it and to evaluate it, and
+/// throws the parse away.
+#[derive(Debug, Clone)]
+pub struct StoredLifecyclePolicy {
+    /// The document as ECR reports it: the document the `PutLifecyclePolicy` that stored
+    /// it supplied, with the whitespace between its JSON tokens removed
+    /// ([`normalize_lifecycle_policy`]). Every operation that reports this policy reports
+    /// these same bytes, so a read never differs from another read.
+    pub text: String,
+    /// The instant this policy was last evaluated — the `lastEvaluatedAt`
+    /// `GetLifecyclePolicy` and `DeleteLifecyclePolicy` report (`ecr#EvaluationTimestamp`,
+    /// "The time stamp of the last time that the lifecycle policy was run").
+    ///
+    /// Setting a policy is what evaluates it, so this is the instant of the
+    /// `PutLifecyclePolicy` that stored this document: ECR documents that the images an
+    /// evaluation claims are then acted on "within 24 hours" of it, which is longer than
+    /// any run of this emulator, so nothing here removes an image behind a caller's back
+    /// and `StartLifecyclePolicyPreview` stays the way to see what a policy would act on.
+    /// No read writes this instant, so two reads of one policy report the same one.
+    pub last_evaluated_at: SystemTime,
+}
+
 /// The lifecycle policy preview one `StartLifecyclePolicyPreview` call started.
 ///
 /// The evaluation is computed once, when the preview is started, from the images the
@@ -1282,6 +1312,28 @@ impl LifecyclePreview {
             },
         }
     }
+}
+
+/// The lifecycle policy document ECR reports back for `text`: the same JSON document with
+/// the insignificant whitespace between its tokens removed.
+///
+/// ECR does not echo the document a caller supplied byte for byte. It reports a MINIFIED
+/// rendering of it: replaying the recorded `PutLifecyclePolicy` while this service stored
+/// the submitted text verbatim diverges on `lifecyclePolicyText` on the put and on every
+/// later read of that policy, and reporting it minified is what agrees with the recording
+/// — so the document the recorded request carried was not the spelling ECR answered with.
+/// Nothing else about the document moves: the members keep the order they were given in,
+/// and every token — a string's escapes, a number's spelling — is reported as it arrived.
+///
+/// The scan this delegates to is TOTAL, so a text that is not JSON comes back with the
+/// whitespace outside its quotes dropped rather than refused here: every caller validates
+/// the document with [`parse_lifecycle_policy`] first, which is what refuses one.
+///
+/// The scan itself belongs to no one service — a document reported back keeps its bytes
+/// wherever it is reported — so it lives in `service_common::json_document` and is named
+/// here for the member it is the rendering of.
+pub fn normalize_lifecycle_policy(text: &str) -> String {
+    service_common::json_document::minified(text)
 }
 
 /// ECR's refusal of a parameter it will not accept, worded to the template it states
@@ -1757,10 +1809,10 @@ pub struct Repo {
     pub layer_blobs: BTreeMap<String, LayerBlob>,
     /// The repository's lifecycle policy, which `PutLifecyclePolicy` sets: the policy
     /// `StartLifecyclePolicyPreview` evaluates when the start call names none, and the
-    /// document `GetLifecyclePolicy` reports. `None` until a policy is put and again
-    /// once `DeleteLifecyclePolicy` removes it, which is what the two of them report
-    /// `LifecyclePolicyNotFoundException` for.
-    pub lifecycle_policy: Option<String>,
+    /// document and evaluation instant `GetLifecyclePolicy` reports. `None` until a
+    /// policy is put and again once `DeleteLifecyclePolicy` removes it, which is what the
+    /// two of them report `LifecyclePolicyNotFoundException` for.
+    pub lifecycle_policy: Option<StoredLifecyclePolicy>,
     /// The one lifecycle policy preview this repository carries; a later start replaces
     /// it.
     pub lifecycle_preview: Option<LifecyclePreview>,
@@ -1988,6 +2040,11 @@ impl Repo {
     /// `LayersNotFoundException` names. The same blob referenced twice is one missing
     /// blob, so it is named once. A document that is not a manifest at all references no
     /// blob ([`manifest_blobs`]), and so names no missing one.
+    ///
+    /// The digests already named are tracked in a SET beside the ordered list rather than
+    /// by scanning the list: `imageManifest` is modelled `@length(1..4194304)`, so one
+    /// request can reference on the order of a hundred thousand descriptors, and a linear
+    /// scan per descriptor would make the work quadratic in a number the caller chooses.
     pub fn missing_layers(&self, manifest: &str) -> Vec<String> {
         let mut missing: Vec<String> = Vec::new();
         // The digests already named, as a SET: a document naming one blob many times
@@ -2930,6 +2987,17 @@ pub fn lifecycle_policy_not_found_message(name: &str) -> String {
     format!(
         "Lifecycle policy does not exist for the repository with name '{name}' in the \
          registry with id '{}'",
+        registry_id()
+    )
+}
+
+/// The wording ECR uses when a repository carries no lifecycle policy PREVIEW: the same
+/// sentence as [`lifecycle_policy_not_found_message`], naming the preview as the thing
+/// that does not exist for the repository the request asked about.
+pub fn lifecycle_policy_preview_not_found_message(name: &str) -> String {
+    format!(
+        "Lifecycle policy preview does not exist for the repository with name '{name}' in \
+         the registry with id '{}'",
         registry_id()
     )
 }

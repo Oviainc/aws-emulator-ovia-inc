@@ -470,17 +470,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The account's job quota: the store holds at most
-        // `MAX_TRANSCRIPTION_JOBS` jobs, and a start beyond that is refused with
-        // the error this operation models for an exceeded quota rather than
-        // growing the store without bound.
-        if store.transcription_jobs.len() >= crate::state::MAX_TRANSCRIPTION_JOBS {
+        // The account's job quota is a CONCURRENCY one: the service runs at most
+        // `MAX_CONCURRENT_TRANSCRIPTION_JOBS` jobs of this family at a time, so only
+        // the jobs it is still working on count against it and a job that has reached
+        // a terminal status has released its slot (see
+        // [`crate::state::jobs_in_flight`], which materialises the transitions the
+        // clock already owed each record before counting). A start made while that
+        // many jobs are in flight is refused with the error this operation models for
+        // an exceeded quota.
+        if crate::state::jobs_in_flight(&mut store.transcription_jobs, now)
+            >= crate::state::MAX_CONCURRENT_TRANSCRIPTION_JOBS
+        {
             return Err(StartTranscriptionJobErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "You have reached the limit of {} transcription jobs for this account. \
-                         Delete a job you no longer need and try your request again.",
-                        crate::state::MAX_TRANSCRIPTION_JOBS
+                    message: Some(crate::state::concurrency_limit_message(
+                        crate::state::MAX_CONCURRENT_TRANSCRIPTION_JOBS,
+                        crate::state::FAMILY_TRANSCRIPTION_JOBS,
                     )),
                 },
             )
@@ -566,6 +571,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "transcription job started"
         );
         store.transcription_jobs.insert(record.name.clone(), record);
+        // The quota above counts only the jobs in flight, so it is this that keeps
+        // the store bounded: the oldest records the service has finished with make
+        // way for the new one (see [`crate::state::evict_oldest_finished_jobs`]).
+        crate::state::evict_oldest_finished_jobs(&mut store.transcription_jobs);
 
         Ok(StartTranscriptionJobOutput {
             transcription_job: Some(job),

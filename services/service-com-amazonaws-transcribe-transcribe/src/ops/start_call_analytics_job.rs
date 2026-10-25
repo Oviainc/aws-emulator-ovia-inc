@@ -348,17 +348,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The account's job quota: the store holds at most
-        // `MAX_CALL_ANALYTICS_JOBS` jobs of this family, and a start beyond that is
-        // refused with the error this operation models for an exceeded quota rather
-        // than growing the store without bound.
-        if store.call_analytics_jobs.len() >= crate::state::MAX_CALL_ANALYTICS_JOBS {
+        // The account's job quota is a CONCURRENCY one, as it is for every job family
+        // here: only the jobs the service is still working on count against
+        // `crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS`, and a job that has
+        // reached a terminal status has released its slot (see
+        // [`crate::state::jobs_in_flight`]).
+        if crate::state::jobs_in_flight(&mut store.call_analytics_jobs, now)
+            >= crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS
+        {
             return Err(StartCallAnalyticsJobErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "You have reached the limit of {} Call Analytics jobs for this \
-                         account. Delete a job you no longer need and try your request again.",
-                        crate::state::MAX_CALL_ANALYTICS_JOBS
+                    message: Some(crate::state::concurrency_limit_message(
+                        crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS,
+                        crate::state::FAMILY_CALL_ANALYTICS_JOBS,
                     )),
                 },
             )
@@ -396,6 +398,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "Call Analytics job started"
         );
         store.call_analytics_jobs.insert(record.name.clone(), record);
+        // What keeps the store bounded, since the quota above counts only the jobs in
+        // flight (see [`crate::state::evict_oldest_finished_jobs`]).
+        crate::state::evict_oldest_finished_jobs(&mut store.call_analytics_jobs);
 
         Ok(StartCallAnalyticsJobOutput {
             call_analytics_job: Some(job),

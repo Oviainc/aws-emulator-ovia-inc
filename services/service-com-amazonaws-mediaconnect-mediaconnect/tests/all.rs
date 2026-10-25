@@ -83,6 +83,8 @@ mod router_input_deletion;
 mod router_input_restart;
 #[path = "all/router_input_start.rs"]
 mod router_input_start;
+#[path = "all/router_network_interface_deletion.rs"]
+mod router_network_interface_deletion;
 #[path = "all/router_network_interfaces.rs"]
 mod router_network_interfaces;
 #[path = "all/router_output_lifecycle.rs"]

@@ -25,6 +25,8 @@ mod call_analytics_jobs;
 mod client_error_wire_status;
 #[path = "all/describe_language_model.rs"]
 mod describe_language_model;
+#[path = "all/job_concurrency_quota.rs"]
+mod job_concurrency_quota;
 #[path = "all/language_models.rs"]
 mod language_models;
 #[path = "all/medical_scribe_job_listing.rs"]

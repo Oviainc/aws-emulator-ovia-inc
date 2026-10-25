@@ -39,6 +39,8 @@ mod layer_upload_completion_digest_set;
 mod layer_upload_sessions;
 #[path = "all/lifecycle_policy.rs"]
 mod lifecycle_policy;
+#[path = "all/lifecycle_policy_document_identity.rs"]
+mod lifecycle_policy_document_identity;
 #[path = "all/lifecycle_policy_preview.rs"]
 mod lifecycle_policy_preview;
 #[path = "all/parameter_constraint_clauses.rs"]

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLifecyclePolicy
-//! Reports the lifecycle policy stored on a repository: the document `PutLifecyclePolicy`
-//! persisted, verbatim, and the instant the registry last evaluated it. A pure read — it
+//! Reports the lifecycle policy stored on a repository: the document
+//! `PutLifecyclePolicy` persisted — the one it reported, with the whitespace between its
+//! JSON tokens removed — and the instant the registry last evaluated it. A pure read — it
 //! stores nothing and expires no image.
 //!
 //! A repository that carries no policy is refused with `LifecyclePolicyNotFoundException`,
@@ -202,11 +203,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetLifecyclePolicyOutput {
             registry_id: Some(repo.registry_id.clone()),
             repository_name: Some(repo.name.clone()),
-            lifecycle_policy_text: Some(policy.clone()),
-            // "The time stamp of the last time that the lifecycle policy was run."
-            // Nothing in this emulator runs a policy on a schedule, so there is no such
-            // instant to report and the member is absent rather than invented.
-            last_evaluated_at: None,
+            lifecycle_policy_text: Some(policy.text.clone()),
+            // "The time stamp of the last time that the lifecycle policy was run." The
+            // policy was evaluated when it was set, so the stored record carries that
+            // instant and this read reports it; the read itself moves nothing, so a later
+            // caller sees the same instant.
+            last_evaluated_at: Some(::aws_smithy_types::DateTime::from(
+                policy.last_evaluated_at,
+            )),
         })
     }
 }

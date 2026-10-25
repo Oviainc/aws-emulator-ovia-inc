@@ -237,15 +237,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If you do not specify a policy, the current policy for the repository is
         // used" — and with neither, "the lifecycle policy could not be found, and no
         // policy is set to the repository".
-        let policy_text = match input.lifecycle_policy_text {
-            Some(text) => text,
-            None => repo.lifecycle_policy.clone().ok_or_else(|| {
-                fault_error(crate::state::Fault::LifecyclePolicyNotFound(
-                    crate::state::lifecycle_policy_not_found_message(&repo.name),
-                ))
-            })?,
+        //
+        // A document the CALL names is validated as the request sent it (so a text that is
+        // not a lifecycle policy is refused rather than normalised first) and then
+        // normalised, exactly as `PutLifecyclePolicy` normalises one it stores: what the
+        // preview stores and reports is the document ECR reports. The repository's own
+        // policy was normalised when it was stored, so it is taken as it stands — scanning
+        // it again could not change it.
+        let (policy_text, rules) = match input.lifecycle_policy_text {
+            Some(named) => {
+                let rules = crate::state::parse_lifecycle_policy(&named).map_err(fault_error)?;
+                (crate::state::normalize_lifecycle_policy(&named), rules)
+            }
+            None => {
+                let stored = repo
+                    .lifecycle_policy
+                    .as_ref()
+                    .map(|policy| policy.text.clone())
+                    .ok_or_else(|| {
+                        fault_error(crate::state::Fault::LifecyclePolicyNotFound(
+                            crate::state::lifecycle_policy_not_found_message(&repo.name),
+                        ))
+                    })?;
+                let rules = crate::state::parse_lifecycle_policy(&stored).map_err(fault_error)?;
+                (stored, rules)
+            }
         };
-        let rules = crate::state::parse_lifecycle_policy(&policy_text).map_err(fault_error)?;
 
         // The preview evaluates the repository as it stands now, and the evaluation is
         // stored: reading the preview back reports that record rather than computing a

@@ -357,17 +357,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The account's job quota: a start beyond
-        // `crate::state::MAX_MEDICAL_SCRIBE_JOBS` is refused with the error this
-        // operation models for an exceeded quota rather than growing the store
-        // without bound.
-        if store.medical_scribe_jobs.len() >= crate::state::MAX_MEDICAL_SCRIBE_JOBS {
+        // The account's job quota is a CONCURRENCY one, as it is for every job family
+        // here: only the jobs the service is still working on count against
+        // `crate::state::MAX_CONCURRENT_MEDICAL_SCRIBE_JOBS`, and a job that has
+        // reached a terminal status has released its slot (see
+        // [`crate::state::jobs_in_flight`]).
+        if crate::state::jobs_in_flight(&mut store.medical_scribe_jobs, now)
+            >= crate::state::MAX_CONCURRENT_MEDICAL_SCRIBE_JOBS
+        {
             return Err(StartMedicalScribeJobErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "You have reached the limit of {} Medical Scribe jobs for this account. \
-                         Delete a job you no longer need and try your request again.",
-                        crate::state::MAX_MEDICAL_SCRIBE_JOBS
+                    message: Some(crate::state::concurrency_limit_message(
+                        crate::state::MAX_CONCURRENT_MEDICAL_SCRIBE_JOBS,
+                        crate::state::FAMILY_MEDICAL_SCRIBE_JOBS,
                     )),
                 },
             )
@@ -410,6 +412,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "medical scribe job started"
         );
         store.medical_scribe_jobs.insert(record.name.clone(), record);
+        // What keeps the store bounded, since the quota above counts only the jobs in
+        // flight (see [`crate::state::evict_oldest_finished_jobs`]).
+        crate::state::evict_oldest_finished_jobs(&mut store.medical_scribe_jobs);
 
         Ok(StartMedicalScribeJobOutput {
             medical_scribe_job: Some(job),

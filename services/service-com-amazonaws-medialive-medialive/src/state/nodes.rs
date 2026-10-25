@@ -23,6 +23,13 @@
 //! ([`ComAmazonawsMedialiveMedialiveState::node_summary`]) — no operation builds
 //! a node out of its own request.
 //!
+//! A node's `State` is the one member a CALLER moves: `UpdateNodeState` is what
+//! commissions a node or isolates it
+//! ([`ComAmazonawsMedialiveMedialiveState::apply_node_state`]), and every other
+//! value of the `NodeState` enum is either where a create starts
+//! ([`node_state::CREATED`]), what a deletion walks through, or a state only the
+//! node's own hardware could reach (see [`node_state`]).
+//!
 //! A node's DELETION is a DEREGISTRATION: the `NodeState` enum models no
 //! `DELETING`/`DELETED` pair, it models `DEREGISTERING` and the terminal
 //! `DEREGISTERED`, which is what `DeleteNode`'s `202 Accepted` accepts and what
@@ -48,21 +55,34 @@ use super::{ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
 /// READY | IN_USE | DEREGISTERING | DRAINING | DEREGISTRATION_FAILED |
 /// DEREGISTERED).
 ///
-/// The nine the model declares but this slice does not name are the ones nothing
-/// here can reach. A node's registration, activation and encoding all happen on
-/// node HARDWARE running the Elemental Anywhere software, which this emulator
-/// does not run: nothing registers (`REGISTERING`, `READY_TO_ACTIVATE`,
-/// `REGISTRATION_FAILED`), nothing activates (`ACTIVE`, `ACTIVATION_FAILED`,
-/// `READY`), and no node ever encodes (`IN_USE`, `DRAINING`) — a channel placed
-/// in a ChannelPlacementGroup that names a node is an ASSOCIATION, which the
-/// node reports through its `ChannelPlacementGroups` and the group through its
-/// own `State`, not work running on the node. `DEREGISTRATION_FAILED` reports a
-/// failure of that same software, which this emulator never fabricates either.
+/// The seven the model declares but this slice does not name are the ones
+/// nothing here can reach. A node's registration, activation and encoding all
+/// happen on node HARDWARE running the Elemental Anywhere software, which this
+/// emulator does not run: nothing registers (`REGISTERING`,
+/// `READY_TO_ACTIVATE`, `REGISTRATION_FAILED`), nothing reports a readiness it
+/// learnt from that software (`ACTIVATION_FAILED`, `READY`), and no node ever
+/// encodes (`IN_USE`) — a channel placed in a ChannelPlacementGroup that names a
+/// node is an ASSOCIATION, which the node reports through its
+/// `ChannelPlacementGroups` and the group through its own `State`, not work
+/// running on the node. `DEREGISTRATION_FAILED` reports a failure of that same
+/// software, which this emulator never fabricates either.
+///
+/// `ACTIVE` and `DRAINING` are the two the CALLER asks for: they are exactly the
+/// value set of `UpdateNodeStateShape` (`smithy_query(query="shape",
+/// shape="UpdateNodeStateShape")`), the member that operation uses to commission
+/// a node or isolate it, so they are reached by that request rather than learnt
+/// from hardware.
 pub mod node_state {
     /// Where every created node starts: `CreateNode` "Create a Node in the
     /// specified Cluster", and the node then has to run its registration script
     /// on the hardware that will host it before it is anything else.
     pub const CREATED: &str = "CREATED";
+    /// A node the caller has COMMISSIONED: `UpdateNodeState`'s `State` "Set to
+    /// ACTIVE (COMMISSIONED) to indicate that the Node is deployable".
+    pub const ACTIVE: &str = "ACTIVE";
+    /// A node the caller has ISOLATED: `UpdateNodeState`'s `State` "Set to
+    /// DRAINING to isolate the Node so that MediaLive Anywhere won't use it".
+    pub const DRAINING: &str = "DRAINING";
     /// What `DeleteNode` accepts a node into, and what the clock settles.
     pub const DEREGISTERING: &str = "DEREGISTERING";
     /// The terminal state a deregistered node keeps.
@@ -111,6 +131,18 @@ pub const MAX_NODE_TOKENS: usize = MAX_NODES;
 /// models `BadRequestException`, which is the refusal for a request that is out
 /// of bounds.
 pub const MAX_NODE_INTERFACE_MAPPINGS: usize = 32;
+
+/// Why [`ComAmazonawsMedialiveMedialiveState::apply_node_state`] wrote nothing.
+/// Each variant leaves the stored node exactly as it was.
+#[derive(Debug)]
+pub enum NodeStateRefusal {
+    /// The cluster and node id pair names no node at all — an id no node ever
+    /// had, or one presented under a cluster it does not belong to.
+    NoSuchNode,
+    /// The node exists but its deregistration has already been accepted, so it
+    /// is readable and no longer writable.
+    DeleteAccepted,
+}
 
 /// Why [`ComAmazonawsMedialiveMedialiveState::insert_node`] stored nothing. Each
 /// variant is one refusal `CreateNode` models, and each leaves the store exactly
@@ -179,9 +211,10 @@ impl NodeRecord {
     /// writable: the tag writers resolve a node's ARN through
     /// `ComAmazonawsMedialiveMedialiveState::resource_tags_mut`, which does not
     /// hand out a node this answers `true` for, while the READ path goes on
-    /// reporting the record in its terminal state. A mutation the node slice
-    /// gains later (`UpdateNode`, `UpdateNodeState` \u2014 each its own issue)
-    /// resolves its node the same way.
+    /// reporting the record in its terminal state.
+    /// [`ComAmazonawsMedialiveMedialiveState::apply_node_state`] resolves its
+    /// node the same way, and so does a mutation the slice gains later
+    /// (`UpdateNode`, its own issue).
     pub fn is_delete_accepted(&self) -> bool {
         self.state == node_state::DEREGISTERING || self.state == node_state::DEREGISTERED
     }
@@ -201,6 +234,25 @@ impl NodeRecord {
             due: now + TRANSIENT_STATE_SPAN,
             to: node_state::DEREGISTERED,
         });
+    }
+
+    /// Put this node into the state its caller asked `UpdateNodeState` for.
+    ///
+    /// The state is the one the request named — the operation's `State` member
+    /// is what commissions a node (`ACTIVE`) or isolates it (`DRAINING`), and
+    /// both are states a node STAYS in until something asks for another one, so
+    /// the node is in it as of this call and the clock owes nothing after it.
+    /// Any transition still owed is dropped for that reason: the state the
+    /// caller asked for is the node's current one, and an older owed step must
+    /// not overwrite it later. Today no node this is reachable for has one — the
+    /// deregistration is the only transition a node records, and
+    /// [`ComAmazonawsMedialiveMedialiveState::apply_node_state`] refuses a node
+    /// whose deregistration was accepted — so the clear is what keeps the
+    /// invariant true of a transition kind the slice gains later rather than a
+    /// step it drops now.
+    fn set_requested_state(&mut self, state: &str) {
+        self.state = state.to_string();
+        self.transition = None;
     }
 
     /// Materialise the transition the clock has already made due: a node
@@ -429,6 +481,47 @@ impl ComAmazonawsMedialiveMedialiveState {
         node.begin_deregister(now);
         self.node_description(cluster_id, node_id)
     }
+
+    /// Put the node `node_id` of `cluster_id` into the state `state` asks for
+    /// and answer the node as that write left it — or refuse.
+    ///
+    /// `state` is `UpdateNodeState`'s own `State` member: `None` when the
+    /// request carried none, which changes NOTHING (the model marks the member
+    /// optional and documents no default, so a request that asks for no state
+    /// asks for no change) and still reports the stored node. A value it does
+    /// carry is one of `UpdateNodeStateShape`'s, refused at the request boundary
+    /// when it is not, and is stored verbatim because every value that shape
+    /// accepts is a `NodeState` the node can be in.
+    ///
+    /// The lookup and the write live together here, so the response reports the
+    /// state that was STORED rather than the one the request asked for, and a
+    /// node whose deregistration has already been accepted is refused rather
+    /// than written: an id whose delete the service accepted names no node a
+    /// caller may still change.
+    pub fn apply_node_state(
+        &mut self,
+        cluster_id: &str,
+        node_id: &str,
+        state: Option<&str>,
+    ) -> Result<DescribeNodeSummary, NodeStateRefusal> {
+        let node = self
+            .node_mut(cluster_id, node_id)
+            .ok_or(NodeStateRefusal::NoSuchNode)?;
+        if node.is_delete_accepted() {
+            return Err(NodeStateRefusal::DeleteAccepted);
+        }
+        if let Some(state) = state {
+            node.set_requested_state(state);
+        }
+        // Projected from the record this call just wrote, so the only outcomes
+        // are the two refusals above and the node as the write left it: there is
+        // no second lookup that could miss. The clone is what lets the summary
+        // (which reads the rest of the store for the derived
+        // `ChannelPlacementGroups`) be taken while the record itself is no
+        // longer borrowed.
+        let written = node.clone();
+        Ok(self.node_summary(&written))
+    }
 }
 
 /// One created node's interface mapping, projected from the CREATE REQUEST shape
@@ -464,8 +557,8 @@ fn node_token_key(cluster_id: &str, token: &str) -> String {
 
 /// Project a `DescribeNodeSummary` onto one of the structurally identical
 /// per-operation flat node output shapes (`CreateNodeOutput`,
-/// `DescribeNodeOutput`, `DeleteNodeOutput`, and `UpdateNode`'s and
-/// `UpdateNodeState`'s once those land).
+/// `DescribeNodeOutput`, `DeleteNodeOutput`, `UpdateNodeStateOutput`, and
+/// `UpdateNode`'s once that lands).
 ///
 /// One macro rather than a hand-written copy of the same member move per
 /// operation, so a create and the read that follows it cannot report the same

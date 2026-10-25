@@ -27,6 +27,8 @@ hex = { workspace = true }
 # `arn::parse_of` / `iam_role::role_name`: the tree's ONE resource-ARN parse and its one
 # IAM role-ARN reading, which this service's `resourceArn`, `credentialArn` and
 # `customRoleArn` readings go through rather than splitting an ARN of their own.
+# `json_document::minified`: the one minification of a JSON document a service reports
+# back, which the lifecycle policy document goes through.
 service-common = { path = "../common" }
 
 [build-dependencies]

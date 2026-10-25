@@ -18,13 +18,14 @@
 //! call arrives, whether the cluster is in Auto Mode, cluster name shape, update id
 //! shape, region); the recorded requests this fix was filed from are two of the rows.
 //!
-//! One row is an update minted by a REAL producer (`AssociateEncryptionConfig`, the only
-//! operation in this crate that starts one yet). The rest need a `VersionRollback`
-//! update, which no implemented operation mints — `UpdateClusterVersion` and friends are
-//! still 501 scaffolds with their own gap issues — so those rows write the update into
-//! the same `ClusterRecord::updates` map those producers write, through the crate's
-//! public `state` module; the call under test is always a real HTTP request, and what it
-//! persisted is read back through `DescribeUpdate` and `DescribeCluster`.
+//! One row is an update minted by a REAL producer (`AssociateEncryptionConfig`). The rest
+//! need a `VersionRollback` update at a precise AGE — inside or past its node rollback
+//! phase, or past the instant the clock owes it its terminal status — which a producer
+//! call cannot place, so those rows write the update into the same
+//! `ClusterRecord::updates` map the producers write (`UpdateClusterVersion` mints a
+//! `VersionRollback` there), through the crate's public `state` module; the call under
+//! test is always a real HTTP request, and what it persisted is read back through
+//! `DescribeUpdate` and `DescribeCluster`.
 //!
 //! It drives the crate's shared wire harness (`tests/all/wire.rs`), using the
 //! engine-returning emulator for the one thing it needs beyond a request: writing that

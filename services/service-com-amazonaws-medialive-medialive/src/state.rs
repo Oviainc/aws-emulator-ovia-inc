@@ -287,8 +287,8 @@ pub(crate) use multiplexes::{multiplex_description_output, multiplex_program_des
 pub mod nodes;
 
 pub use nodes::{
-    node_state, NodeRecord, NodeRefusal, MAX_NODES, MAX_NODE_INTERFACE_MAPPINGS, MAX_NODE_TOKENS,
-    NODE_CONNECTION_STATE,
+    node_state, NodeRecord, NodeRefusal, NodeStateRefusal, MAX_NODES,
+    MAX_NODE_INTERFACE_MAPPINGS, MAX_NODE_TOKENS, NODE_CONNECTION_STATE,
 };
 
 pub(crate) use nodes::node_description_output;

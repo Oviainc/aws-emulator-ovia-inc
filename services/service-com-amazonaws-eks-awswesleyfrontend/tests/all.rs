@@ -33,6 +33,8 @@ mod cluster_config_update;
 mod cluster_lifecycle;
 #[path = "all/cluster_version_catalog.rs"]
 mod cluster_version_catalog;
+#[path = "all/cluster_version_update.rs"]
+mod cluster_version_update;
 #[path = "all/cluster_versions.rs"]
 mod cluster_versions;
 #[path = "all/connected_clusters.rs"]

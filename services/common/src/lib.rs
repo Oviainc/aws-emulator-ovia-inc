@@ -198,6 +198,9 @@ pub mod iam_role;
 pub mod iam_trust_policy;
 pub mod iot_commands;
 pub mod iot_job_executions;
+/// The ONE minification of a JSON document a service takes as an opaque string member and
+/// reports back on every read, so no two services report one document's bytes differently.
+pub mod json_document;
 pub mod lex;
 pub mod management_events;
 pub mod network;

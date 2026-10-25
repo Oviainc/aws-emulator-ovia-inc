@@ -124,6 +124,154 @@ pub fn is_terminal_job_status(status: &str) -> bool {
     status == STATUS_COMPLETED || status == STATUS_FAILED
 }
 
+/// The two lifecycle facts every job family's record holds: the status it is in, and
+/// the clock-owed transitions that status still has to catch up with.
+///
+/// One trait rather than four copies of [`jobs_in_flight`], which is what every
+/// family's concurrency quota is measured against: the four job records differ in
+/// what a job IS, not in how its status moves.
+pub trait JobLifecycle {
+    /// Materialise every status transition the clock already owes this job — the
+    /// record's own `advance_clock`.
+    fn materialise_due_transitions(&mut self, now: SystemTime);
+
+    /// The job's current status, one of the four values its family's `*JobStatus`
+    /// enum models.
+    fn job_status(&self) -> &str;
+
+    /// The job's creation sequence number, so "the oldest record" is a total order
+    /// even for two jobs started in the same clock tick.
+    fn sequence(&self) -> u64;
+}
+
+impl JobLifecycle for TranscriptionJobRecord {
+    fn materialise_due_transitions(&mut self, now: SystemTime) {
+        self.advance_clock(now);
+    }
+
+    fn job_status(&self) -> &str {
+        &self.status
+    }
+
+    fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+impl JobLifecycle for MedicalTranscriptionJobRecord {
+    fn materialise_due_transitions(&mut self, now: SystemTime) {
+        self.advance_clock(now);
+    }
+
+    fn job_status(&self) -> &str {
+        &self.status
+    }
+
+    fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+impl JobLifecycle for CallAnalyticsJobRecord {
+    fn materialise_due_transitions(&mut self, now: SystemTime) {
+        self.advance_clock(now);
+    }
+
+    fn job_status(&self) -> &str {
+        &self.status
+    }
+
+    fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+impl JobLifecycle for MedicalScribeJobRecord {
+    fn materialise_due_transitions(&mut self, now: SystemTime) {
+        self.advance_clock(now);
+    }
+
+    fn job_status(&self) -> &str {
+        &self.status
+    }
+
+    fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+/// How many of `jobs` the service is still working on at `now`: the records whose
+/// status is not terminal ([`is_terminal_job_status`]), counted after every
+/// clock-owed transition has been materialised, so a job the clock already finished
+/// is not counted as running.
+///
+/// This — not how many records the account holds — is what a job family's ceiling
+/// bounds (see [`MAX_CONCURRENT_TRANSCRIPTION_JOBS`]), so a finished job releases its
+/// slot while staying listable.
+pub fn jobs_in_flight<R: JobLifecycle>(
+    jobs: &mut BTreeMap<String, R>,
+    now: SystemTime,
+) -> usize {
+    let mut in_flight = 0;
+    for record in jobs.values_mut() {
+        record.materialise_due_transitions(now);
+        if !is_terminal_job_status(record.job_status()) {
+            in_flight += 1;
+        }
+    }
+    in_flight
+}
+
+/// The most job records of one family this emulator KEEPS.
+///
+/// Not a quota and not a refusal: a start is never refused for it. It is the bound on
+/// this process's memory, since the quota above counts only the jobs in flight and so
+/// cannot cap how many records a caller that keeps starting jobs accumulates. A
+/// CHOSEN figure, several times the concurrency quota so recent history stays
+/// readable and listable; the real service keeps a job record far longer than any
+/// emulator run.
+pub const MAX_RETAINED_JOB_RECORDS: usize = 500;
+
+/// Keep a family's store at [`MAX_RETAINED_JOB_RECORDS`] records by dropping the
+/// OLDEST ones the service has already finished with, as a start that adds a record
+/// does.
+///
+/// Only a terminal record is ever dropped, so no job in flight and no job a caller
+/// could still be polling to completion disappears; a record is dropped exactly as a
+/// delete of that job would drop it. With the concurrency quota capping how many jobs
+/// can be in flight at once, the two together bound a family's store at
+/// [`MAX_RETAINED_JOB_RECORDS`] plus that quota.
+pub fn evict_oldest_finished_jobs<R: JobLifecycle>(jobs: &mut BTreeMap<String, R>) {
+    if jobs.len() <= MAX_RETAINED_JOB_RECORDS {
+        return;
+    }
+    let excess = jobs.len() - MAX_RETAINED_JOB_RECORDS;
+    let mut finished: Vec<(u64, String)> = jobs
+        .iter()
+        .filter(|(_, record)| is_terminal_job_status(record.job_status()))
+        .map(|(name, record)| (record.sequence(), name.clone()))
+        .collect();
+    finished.sort_unstable();
+    for (_, name) in finished.into_iter().take(excess) {
+        jobs.remove(&name);
+    }
+}
+
+/// The refusal text a start past a job family's concurrency ceiling carries:
+/// `limit` jobs of `family` are already running, so the caller has to wait for one to
+/// finish rather than delete a record.
+///
+/// One spelling for every family, since the condition is the same one in each: the
+/// modelled `LimitExceededException` itself documents the remedy as waiting ("Wait
+/// before retrying your request",
+/// `smithy_query(query="shape", shape="LimitExceededException")`).
+pub fn concurrency_limit_message(limit: usize, family: &str) -> String {
+    format!(
+        "You have reached the limit of {limit} concurrent {family} for this account. \
+         Wait for a running job to finish and try your request again."
+    )
+}
+
 /// The one language an AWS HealthScribe job runs in.
 ///
 /// `MedicalScribeLanguageCode` is modelled as an enum with the single value `en-US`
@@ -133,14 +281,19 @@ pub fn is_terminal_job_status(status: &str) -> bool {
 /// that value rather than anything the request chose.
 pub const MEDICAL_SCRIBE_LANGUAGE_CODE: &str = MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES[0];
 
-/// The most Medical Scribe jobs this emulator holds for an account.
+/// The most Medical Scribe jobs this emulator runs AT ONCE for an account.
 ///
-/// A CHOSEN ceiling, not a published one — AWS gives no per-account figure for
-/// HealthScribe jobs in the model — applying the same figure the other families use
-/// so the store stays bounded: a caller that never deletes cannot grow it without
-/// end, and `DeleteMedicalScribeJob` is what makes room again. A start beyond it
-/// answers the `LimitExceededException` the operation models for an exceeded quota.
-pub const MAX_MEDICAL_SCRIBE_JOBS: usize = MAX_TRANSCRIPTION_JOBS;
+/// A CHOSEN figure, not a published one — AWS gives no per-account number for
+/// HealthScribe jobs in the model — applying the same one the other families use. It
+/// bounds the jobs IN FLIGHT, like every other family's
+/// ([`MAX_CONCURRENT_TRANSCRIPTION_JOBS`]): a start made while that many jobs of this
+/// family are still running answers the `LimitExceededException` the operation models
+/// for an exceeded quota, and a job that has reached a terminal status releases its
+/// slot while its record stays readable and listable.
+pub const MAX_CONCURRENT_MEDICAL_SCRIBE_JOBS: usize = MAX_CONCURRENT_TRANSCRIPTION_JOBS;
+
+/// The family [`concurrency_limit_message`] names in a Medical Scribe start's refusal.
+pub const FAMILY_MEDICAL_SCRIBE_JOBS: &str = "Medical Scribe jobs";
 
 /// The object name of the transcript a completed Medical Scribe job reports, under
 /// the prefix [`medical_scribe_output_uri`] builds.
@@ -202,34 +355,49 @@ pub const DEFAULT_LIST_MAX_RESULTS: i32 = 5;
 /// refuses more than this before a handler runs.
 pub const MAX_LIST_MAX_RESULTS: usize = 100;
 
-/// The most transcription jobs this emulator holds for an account.
+/// The most transcription jobs this emulator runs AT ONCE for an account.
 ///
-/// Amazon Transcribe publishes a default quota of 100 batch transcription jobs per
-/// account and answers `LimitExceededException` ("You've either sent too many
-/// requests or your input file is too long") when a request would exceed a quota.
-/// Applying that published figure to the stored jobs keeps the store bounded: a
-/// caller that never deletes cannot grow it without end, and
-/// `DeleteTranscriptionJob` is what makes room again.
-pub const MAX_TRANSCRIPTION_JOBS: usize = 100;
+/// The quota Amazon Transcribe publishes for this family is a CONCURRENCY one — 100
+/// concurrent batch transcription jobs per account per Region — and the
+/// `LimitExceededException` a start past it answers documents its own remedy as
+/// waiting rather than deleting ("You've either sent too many requests or your input
+/// file is too long. Wait before retrying your request",
+/// `smithy_query(query="shape", shape="LimitExceededException")`); the model says the
+/// same from the other side, since `JobExecutionSettings$AllowDeferredExecution`
+/// queues a request "until the number of jobs falls below the concurrent request
+/// limit". So this figure bounds the jobs the service is still working on
+/// ([`jobs_in_flight`]), never the records an account holds: a job that reached a
+/// terminal status releases its slot and stays readable and listable, which is what
+/// makes `ListTranscriptionJobs`' documented `COMPLETED` status filter meaningful.
+pub const MAX_CONCURRENT_TRANSCRIPTION_JOBS: usize = 100;
 
-/// The most MEDICAL transcription jobs this emulator holds for an account.
+/// The family [`concurrency_limit_message`] names in a transcription start's refusal.
+pub const FAMILY_TRANSCRIPTION_JOBS: &str = "transcription jobs";
+
+/// The most MEDICAL transcription jobs this emulator runs AT ONCE for an account.
 ///
 /// Amazon Transcribe Medical answers the same `LimitExceededException` for an
-/// exceeded quota, so this family is bounded by the same published batch-job figure
-/// the non-medical family uses ([`MAX_TRANSCRIPTION_JOBS`]): a caller that never
-/// deletes cannot grow the store without end, and `DeleteMedicalTranscriptionJob` is
-/// what makes room again.
-pub const MAX_MEDICAL_TRANSCRIPTION_JOBS: usize = MAX_TRANSCRIPTION_JOBS;
+/// exceeded quota, so this family is bounded the same way the non-medical one is
+/// ([`MAX_CONCURRENT_TRANSCRIPTION_JOBS`]): by how many of its jobs are in flight,
+/// with a terminal job releasing its slot.
+pub const MAX_CONCURRENT_MEDICAL_TRANSCRIPTION_JOBS: usize = MAX_CONCURRENT_TRANSCRIPTION_JOBS;
 
+/// The family [`concurrency_limit_message`] names in a medical transcription start's
+/// refusal.
+pub const FAMILY_MEDICAL_TRANSCRIPTION_JOBS: &str = "medical transcription jobs";
 
-/// The most Call Analytics jobs this emulator holds for an account.
+/// The most Call Analytics jobs this emulator runs AT ONCE for an account.
 ///
-/// A CHOSEN ceiling, not a published one: the model carries no per-account figure for
-/// Call Analytics jobs. Applying the same figure the other job families use keeps the
-/// store bounded — a caller that never deletes cannot grow it without end — and a
-/// start beyond it answers the `LimitExceededException` the operation models for an
-/// exceeded quota. `DeleteCallAnalyticsJob` is what makes room again.
-pub const MAX_CALL_ANALYTICS_JOBS: usize = MAX_TRANSCRIPTION_JOBS;
+/// A CHOSEN figure, not a published one: the model carries no per-account number for
+/// Call Analytics jobs, but it does describe the ceiling this family has as a
+/// concurrency one — a start is queued when an account "exceeds your Concurrent Job
+/// Limit" (`smithy_query(query="operation", operation="StartCallAnalyticsJob")`). So
+/// the same figure the other families use bounds the jobs in flight
+/// ([`MAX_CONCURRENT_TRANSCRIPTION_JOBS`]), and a terminal job releases its slot.
+pub const MAX_CONCURRENT_CALL_ANALYTICS_JOBS: usize = MAX_CONCURRENT_TRANSCRIPTION_JOBS;
+
+/// The family [`concurrency_limit_message`] names in a Call Analytics start's refusal.
+pub const FAMILY_CALL_ANALYTICS_JOBS: &str = "Call Analytics jobs";
 
 /// `VocabularyState` values, from the model's enum
 /// (`smithy_query(query="shape", shape="VocabularyState")`).
@@ -2140,10 +2308,11 @@ impl MedicalScribeJobRecord {
 /// `StartCallAnalyticsJob` has no deferred-execution member
 /// (`smithy_query(query="operation", operation="StartCallAnalyticsJob")`) — the queue
 /// it documents is entered only when an account "exceeds your Concurrent Job Limit",
-/// a concurrency ceiling this emulator does not model — so a job of this family is
+/// which no member of the request opts into — so a job this emulator accepts is
 /// processing from the moment it is started and has exactly one clock-owed
 /// transition, `IN_PROGRESS` -> `COMPLETED`, like the Medical Scribe family
-/// ([`MedicalScribeJobRecord`]).
+/// ([`MedicalScribeJobRecord`]); a start made while that concurrent limit is already
+/// reached is refused instead ([`MAX_CONCURRENT_CALL_ANALYTICS_JOBS`]).
 ///
 /// WHAT IT EMULATES is the job RECORD (see the module header): no call is
 /// transcribed, no sentiment or call characteristic is derived and no category is

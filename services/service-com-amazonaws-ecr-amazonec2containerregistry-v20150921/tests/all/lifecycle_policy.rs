@@ -8,8 +8,9 @@
 //!
 //! The rule under test: a repository carries AT MOST ONE lifecycle policy; a put accepts
 //! a document exactly when it satisfies the ECR lifecycle policy template's schema,
-//! stores that text verbatim and replaces whatever was there, a read reports the stored
-//! text, and a delete removes it — with a repository that carries no policy refused by
+//! stores the document ECR reports for it (the same document with the whitespace between
+//! its JSON tokens removed) and replaces whatever was there, a read reports the stored
+//! document, and a delete removes it — with a repository that carries no policy refused by
 //! the read and the delete rather than answered with an empty success. So the table rows
 //! below differ along what the schema generalises over (which members are present, their
 //! types, their enumerated values, the counts and the rule ordering), not along the names
@@ -71,7 +72,7 @@ fn any_count_rule(priority: i64, count: i64) -> Value {
 }
 
 #[tokio::test]
-async fn a_lifecycle_policy_put_is_read_back_verbatim_and_then_deleted() {
+async fn a_lifecycle_policy_put_is_read_back_as_stored_and_then_deleted() {
     let router = emulator();
     let name = "platform/api";
     repository(&router, name).await;
@@ -88,13 +89,20 @@ async fn a_lifecycle_policy_put_is_read_back_verbatim_and_then_deleted() {
         .await;
     }
 
-    // Deliberately irregular whitespace and member order: what comes back must be the
-    // text that was put, not a re-rendering of the parsed document.
+    // Deliberately irregular whitespace: what comes back is the SAME document with the
+    // whitespace between its tokens removed, which is what ECR reports — the member order
+    // and every token are the ones that were put.
+    // `lifecycle_policy_document_identity` is where that spelling is pinned over a table
+    // of documents; here one document stands for it, to keep this suite about the
+    // policy's lifecycle.
     let text = policy_text(
         "{ \"rules\" : [ {\n  \"rulePriority\": 1,\n  \"description\": \"keep ten\",\n  \
          \"action\": {\"type\": \"expire\"},\n  \"selection\": {\"tagStatus\": \"any\", \
          \"countType\": \"imageCountMoreThan\", \"countNumber\": 10}\n} ] }",
     );
+    let reported = "{\"rules\":[{\"rulePriority\":1,\"description\":\"keep ten\",\"action\":\
+         {\"type\":\"expire\"},\"selection\":{\"tagStatus\":\"any\",\"countType\":\
+         \"imageCountMoreThan\",\"countNumber\":10}}]}";
 
     let put = ok(
         &router,
@@ -105,8 +113,8 @@ async fn a_lifecycle_policy_put_is_read_back_verbatim_and_then_deleted() {
     .await;
     assert_eq!(
         put["lifecyclePolicyText"].as_str(),
-        Some(text.as_str()),
-        "case {:?}: the put must report the text it stored, got {put:?}",
+        Some(reported),
+        "case {:?}: the put must report the document it stored, got {put:?}",
         "put"
     );
     assert_eq!(
@@ -131,8 +139,8 @@ async fn a_lifecycle_policy_put_is_read_back_verbatim_and_then_deleted() {
     .await;
     assert_eq!(
         got["lifecyclePolicyText"].as_str(),
-        Some(text.as_str()),
-        "case {:?}: the read must report the stored text, got {got:?}",
+        Some(reported),
+        "case {:?}: the read must report the stored document, got {got:?}",
         "read back"
     );
     assert_eq!(
@@ -147,11 +155,12 @@ async fn a_lifecycle_policy_put_is_read_back_verbatim_and_then_deleted() {
         "case {:?}: the read must report this registry, got {got:?}",
         "read back"
     );
-    // Nothing in this emulator runs the policy, so there is no evaluation instant to
-    // report: the field is absent rather than invented.
+    // Storing a policy evaluates it, so the read reports the instant it was last
+    // evaluated; `lifecycle_policy_document_identity` is where that instant is pinned to
+    // the put that set it.
     assert!(
-        got["lastEvaluatedAt"].is_null(),
-        "case {:?}: an unevaluated policy must report no lastEvaluatedAt, got {got:?}",
+        got["lastEvaluatedAt"].as_f64().is_some_and(|at| at > 0.0),
+        "case {:?}: the read must report the instant the policy was evaluated, got {got:?}",
         "read back"
     );
 

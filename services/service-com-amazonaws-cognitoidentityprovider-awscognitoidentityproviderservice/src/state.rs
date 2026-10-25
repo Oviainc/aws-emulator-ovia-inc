@@ -281,6 +281,13 @@ pub const MAX_RESOURCE_SERVERS_PER_POOL: usize = 1_000;
 /// The most identity providers one user pool holds.
 pub const MAX_IDENTITY_PROVIDERS_PER_POOL: usize = 1_000;
 
+/// The most custom (and developer-only) attributes one user pool's schema
+/// holds: Amazon Cognito's quota for custom attributes per user pool is 50 and
+/// cannot be raised (Amazon Cognito Developer Guide, "Quotas in Amazon
+/// Cognito"). The standard attributes every pool carries are not counted
+/// against it.
+pub const MAX_CUSTOM_ATTRIBUTES_PER_POOL: usize = 50;
+
 /// The most unexpired challenge sessions this emulator holds; the oldest are
 /// evicted past it.
 const MAX_AUTH_SESSIONS: usize = 10_000;
@@ -935,24 +942,44 @@ impl UserPool {
             .cloned()
     }
 
+    /// This pool's schema entry for the attribute STORED under `name` — the
+    /// prefixed name for a custom or developer-only attribute — or `None` when
+    /// the schema declares no such attribute.
+    pub fn schema_attribute(&self, name: &str) -> Option<&SchemaAttributeType> {
+        self.schema
+            .iter()
+            .find(|entry| entry.name.as_deref() == Some(name))
+    }
+
+    /// How many of this pool's schema entries are custom or developer-only
+    /// attributes: the ones added beyond the standard attributes every pool
+    /// carries.
+    pub fn custom_attribute_count(&self) -> usize {
+        self.schema
+            .iter()
+            .filter(|entry| {
+                entry
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| !is_standard_attribute(name))
+            })
+            .count()
+    }
+
     /// Whether this pool's schema lets `name`'s stored value be CHANGED:
     /// `SchemaAttributeType.Mutable` — "Specifies whether the value of the
     /// attribute can be changed" (this service's model). An attribute the
     /// schema does not declare has no entry to read, so it is reported
     /// unchangeable.
     pub fn attribute_mutable(&self, name: &str) -> bool {
-        self.schema
-            .iter()
-            .find(|entry| entry.name.as_deref() == Some(name))
+        self.schema_attribute(name)
             .and_then(|entry| entry.mutable)
             .unwrap_or(false)
     }
 
     /// Whether this pool's schema marks `name` a required attribute.
     pub fn attribute_required(&self, name: &str) -> bool {
-        self.schema
-            .iter()
-            .find(|entry| entry.name.as_deref() == Some(name))
+        self.schema_attribute(name)
             .and_then(|entry| entry.required)
             .unwrap_or(false)
     }
@@ -1919,30 +1946,58 @@ pub fn effective_schema(requested: Option<Vec<SchemaAttributeType>>) -> Vec<Sche
             }
             continue;
         }
-        let developer_only = attribute.developer_only_attribute.unwrap_or(false);
-        let prefix = if developer_only { "dev:" } else { "custom:" };
-        let stored_name = if name.starts_with("custom:") || name.starts_with("dev:") {
-            name
-        } else {
-            format!("{prefix}{name}")
-        };
-        schema.push(SchemaAttributeType {
-            name: Some(stored_name),
-            attribute_data_type: Some(
-                attribute
-                    .attribute_data_type
-                    .unwrap_or_else(|| "String".to_string()),
-            ),
-            developer_only_attribute: Some(developer_only),
-            // A custom attribute is mutable unless the request says otherwise;
-            // a custom attribute can never be required.
-            mutable: Some(attribute.mutable.unwrap_or(true)),
-            required: Some(false),
-            number_attribute_constraints: attribute.number_attribute_constraints,
-            string_attribute_constraints: attribute.string_attribute_constraints,
-        });
+        if let Some((_, entry)) = custom_schema_attribute(&attribute) {
+            schema.push(entry);
+        }
     }
     schema
+}
+
+/// The STORED NAME and the schema entry a requested CUSTOM attribute becomes,
+/// with the defaults a custom attribute carries filled in.
+///
+/// Its stored name is the requested name under the prefix Amazon Cognito gives
+/// it: "When you add an attribute with a `Name` value of `MyAttribute`, Amazon
+/// Cognito creates the custom attribute `custom:MyAttribute`. When
+/// `DeveloperOnlyAttribute` is `true`, Amazon Cognito creates your attribute as
+/// `dev:MyAttribute`" (`SchemaAttributeType.Name`, this service's model). A name
+/// that already carries one of those prefixes is stored as it is, so a schema
+/// read and a re-add agree on the stored name.
+///
+/// `None` when the request names no attribute: an entry with no name could never
+/// be found again. `CustomAttributeNameType` has a minimum length of 1, so only
+/// a request the model does not admit reaches that answer.
+pub fn custom_schema_attribute(
+    requested: &SchemaAttributeType,
+) -> Option<(String, SchemaAttributeType)> {
+    let name = requested.name.clone()?;
+    if name.is_empty() {
+        return None;
+    }
+    let developer_only = requested.developer_only_attribute.unwrap_or(false);
+    let prefix = if developer_only { "dev:" } else { "custom:" };
+    let stored_name = if name.starts_with("custom:") || name.starts_with("dev:") {
+        name
+    } else {
+        format!("{prefix}{name}")
+    };
+    let entry = SchemaAttributeType {
+        name: Some(stored_name.clone()),
+        attribute_data_type: Some(
+            requested
+                .attribute_data_type
+                .clone()
+                .unwrap_or_else(|| "String".to_string()),
+        ),
+        developer_only_attribute: Some(developer_only),
+        // A custom attribute is mutable unless the request says otherwise;
+        // a custom attribute can never be required.
+        mutable: Some(requested.mutable.unwrap_or(true)),
+        required: Some(false),
+        number_attribute_constraints: requested.number_attribute_constraints.clone(),
+        string_attribute_constraints: requested.string_attribute_constraints.clone(),
+    };
+    Some((stored_name, entry))
 }
 
 /// A new user pool with `name` in `region`, with every configuration default

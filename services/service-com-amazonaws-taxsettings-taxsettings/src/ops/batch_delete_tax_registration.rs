@@ -11,7 +11,9 @@
 //! is what `DeleteTaxRegistration` answers 404 for — is reported in the
 //! response's `errors` list naming that account, and the rest of the batch is
 //! still deleted. `accountIds` carries the model's `@length` 1..=5, which the
-//! boundary validator refuses outside of before this handler runs.
+//! boundary validator refuses outside of before this handler runs, and is a list
+//! of UNIQUE account identifiers: an id named more than once names one account
+//! and one deletion, so it is performed and reported once.
 //!
 //! ## Shape of an operation
 //!
@@ -156,7 +158,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut errors: Vec<BatchDeleteTaxRegistrationError2> = Vec::new();
         let mut store = state.lock();
+        let mut addressed: ::std::collections::BTreeSet<&str> =
+            ::std::collections::BTreeSet::new();
         for account_id in &input.account_ids {
+            // `accountIds` is "List of unique account identifiers", and the
+            // registration of every account the request names is removed once,
+            // so an id named twice names the SAME account and the SAME single
+            // deletion: it is performed and reported once rather than judged a
+            // second time against the record this very call just removed, which
+            // would report the deletion of that account as having failed with
+            // "not found" in the response that performed it.
+            if !addressed.insert(account_id.as_str()) {
+                continue;
+            }
             if store.registrations.remove(account_id).is_none() {
                 let missing = crate::state::no_tax_registration();
                 errors.push(BatchDeleteTaxRegistrationError2 {

@@ -44,7 +44,7 @@ const REGION: &str = "us-east-1";
 /// `smithy_query(query="shape", shape="EventType")`), each mapped to an
 /// `ObjectTypeName`. `count` of 0 is the empty map, which the shape admits: the
 /// member is required but carries no length bound.
-fn object_type_names(count: usize) -> Value {
+pub fn object_type_names(count: usize) -> Value {
     Value::Object(
         EVENT_TYPE_VALUES
             .iter()
@@ -60,7 +60,7 @@ fn object_type_names(count: usize) -> Value {
 /// ARNs and object-type maps take: no object types, one, and every value in
 /// `EventType`'s catalog; a commercial-partition ARN and a `aws-cn` one; a bare
 /// Lambda function ARN and one qualified with an alias.
-fn integration_configs() -> Vec<(&'static str, Value)> {
+pub fn integration_configs() -> Vec<(&'static str, Value)> {
     vec![
         (
             "customerProfiles with no object types",
@@ -117,7 +117,7 @@ fn integration_configs() -> Vec<(&'static str, Value)> {
 /// instant the job is due at: an instance is a target for integrations only once its
 /// onboarding job has finished. Nothing in the emulator sleeps for the transition —
 /// the record stores the instant — so a case only has to let the clock pass it.
-async fn onboard(router: &MultiServiceRouter, instance_id: &str) {
+pub async fn onboard(router: &MultiServiceRouter, instance_id: &str) {
     let (status, body) = call(
         router,
         REGION,
@@ -135,7 +135,7 @@ async fn onboard(router: &MultiServiceRouter, instance_id: &str) {
 }
 
 /// `PutConnectInstanceIntegration` for `instance_id` with `config`.
-async fn put_integration(
+pub async fn put_integration(
     router: &MultiServiceRouter,
     instance_id: &str,
     config: &Value,
@@ -152,7 +152,7 @@ async fn put_integration(
 
 /// `ListConnectInstanceIntegrations` for `instance_id`, with `query` appended to the
 /// URI (`""` for an unpaged call).
-async fn list_integrations(
+pub async fn list_integrations(
     router: &MultiServiceRouter,
     instance_id: &str,
     query: &str,
@@ -168,7 +168,7 @@ async fn list_integrations(
 }
 
 /// The `integrationSummaryList` a success body carries.
-fn summaries(body: &Value) -> Vec<Value> {
+pub fn summaries(body: &Value) -> Vec<Value> {
     body.get("integrationSummaryList")
         .and_then(Value::as_array)
         .cloned()

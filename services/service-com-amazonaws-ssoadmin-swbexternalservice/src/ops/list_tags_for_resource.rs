@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the tags the resource `ResourceArn` names carries, out of this
+//! service's state (`crate::state`). This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORT: it writes nothing of its own, beyond what the CLOCK already owes every
+//! instance (an instance whose deletion instant has passed is gone, and the resources
+//! held inside it with it). The resource is whichever of the four kinds the model's
+//! `TaggableResourceArn` admits the ARN names (an instance, a permission set, an
+//! application or a trusted token issuer), and the tags are exactly those a
+//! `TagResource` or a create stored on it — one entry per distinct `Tag$Key`, in key
+//! order, which is also the order the pagination cursor resumes in. An ARN this account
+//! holds nothing under, or holds under an instance other than the `InstanceArn` the
+//! request carried, is refused with the modelled `ResourceNotFoundException` rather than
+//! answered with an empty tag list; a `NextToken` this enumeration did not issue is
+//! refused with the modelled `ValidationException`. The operation models no `MaxResults`
+//! and a resource carries at most [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, fewer
+//! than this service's default page size, so today one page holds every tag a resource
+//! can carry: the cursor is here because the model declares the operation `@paginated`,
+//! not because a page is expected to truncate.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +170,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The cursor is scoped to THIS enumeration: the operation and the resource whose
+        // tags it walks.
+        let scope = crate::state::cursor_tags(&input.resource_arn);
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListTagsForResourceErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                    // The model's `ValidationExceptionReason` enum carries only KMS key
+                    // states, none of which this refusal is.
+                    reason: None,
+                })
+            },
+        )?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A READ, except for what the CLOCK already owes the instances themselves, and
+        // the account's ambient instance if nothing has enabled one yet.
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // When a caller sends the optional `InstanceArn`, it names the instance the
+        // resource is expected to live under: an ARN this account holds no instance for
+        // can hold no resource either.
+        if input
+            .instance_arn
+            .as_deref()
+            .is_some_and(|instance_arn| store.instance(instance_arn).is_none())
+        {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::instance_not_found_message(
+                        input.instance_arn.as_deref().unwrap_or_default(),
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // Never created, already deleted, gone with its instance, or held under another
+        // instance than the one the request named — the same answer either way: there is
+        // no such resource whose tags could be listed. A resource that exists and
+        // carries no tag is an EMPTY list, which is a different answer from this one.
+        let ordered = store
+            .taggable_resource_tags(input.instance_arn.as_deref(), &input.resource_arn)
+            .map(|tags| crate::state::tags_in_key_order(tags))
+            .ok_or_else(|| {
+                ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::taggable_resource_not_found_message(
+                            &input.resource_arn,
+                        )),
+                        reason: None,
+                    },
+                )
+            })?;
+
+        // The operation models no `MaxResults`, so the page size is this service's own
+        // default ceiling.
+        let (tags, next_token) = crate::state::page(&scope, ordered, after.as_deref(), None);
+        Ok(ListTagsForResourceOutput { tags: Some(tags), next_token })
     }
 }
