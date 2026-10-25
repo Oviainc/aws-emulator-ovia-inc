@@ -37,6 +37,8 @@ mod primary_email_update;
 mod primary_email_update_acceptance;
 #[path = "all/primary_email_update_in_flight.rs"]
 mod primary_email_update_in_flight;
+#[path = "all/primary_email_update_self_reaffirmation.rs"]
+mod primary_email_update_self_reaffirmation;
 #[path = "all/region_opt_in.rs"]
 mod region_opt_in;
 #[path = "all/region_opt_in_listing.rs"]
