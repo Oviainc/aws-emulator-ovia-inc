@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches an IAM resource-based policy to one Bedrock resource of this account.
+//!
+//! The document is stored against the ARN the request names, VERBATIM: a policy is text
+//! the caller wrote, so `GetResourcePolicy` hands back the same bytes rather than a
+//! re-rendering of them. A resource holds at most ONE resource policy, which is what
+//! makes this `@idempotent` put a REPLACEMENT — the last admitted put decides the policy
+//! in force, whichever order concurrent puts arrive in.
+//!
+//! Two preconditions, both refused 400 `ValidationException` (the only error this
+//! operation models for a bad request):
+//!
+//! * `resourcePolicy` must be an IAM resource-based policy document — the ONE grammar in
+//!   [`service_common::iam_policy`], so this service and every other handed the same
+//!   document agree about whether it is a policy. The member's `@length` and `@pattern`
+//!   are already enforced ahead of this handler, which is why only the grammar is read
+//!   here;
+//! * `resourceArn` must name a resource this account HOLDS
+//!   ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::policy_resource`]):
+//!   a resource policy is attached TO a resource, so an ARN of another vendor, another
+//!   region or account, or of a resource that was never created, has nothing to attach
+//!   to. The ARN is resolved through the ONE resolution of a caller-supplied resource ARN
+//!   in this service, the one a tagging call uses, so a policy reaches exactly the
+//!   resources that resource's own reads reach. The model declares no `@pattern` on
+//!   `ResourcePolicyResourceArn` and this operation models no not-found error, so the ARN
+//!   is read here rather than by the framework's constraint walk or by this service's
+//!   cross-region ARN check.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +133,16 @@ impl From<PutResourcePolicyErrorModeled> for PutResourcePolicyError {
     }
 }
 
+/// Refuse this request with the MODELLED `ValidationException` (HTTP 400) — the error
+/// this operation declares for a request it cannot accept, so the refusal carries the
+/// model's own shape rather than the scaffold channel's synthetic one.
+fn refused(message: String) -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `PutResourcePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,18 +179,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "resource policy state is not available on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A document that is not an IAM resource-based policy is not a policy, whatever
+        // else it is: accepting it would store text this service would then report as the
+        // resource's policy.
+        if let Some(defect) =
+            ::service_common::iam_policy::resource_policy_defect(&input.resource_policy)
+        {
+            return Err(refused(format!(
+                "resourcePolicy is not a resource-based policy document: {defect}"
+            )));
+        }
+
+        let mut store = state.lock();
+        let Some(resource) = store.policy_resource(&input.resource_arn, &region, now) else {
+            return Err(refused(format!(
+                "no Bedrock resource {} exists in this account",
+                input.resource_arn
+            )));
+        };
+        store.attach_resource_policy(resource, input.resource_policy);
+
+        // The resource the policy is now attached to, as the request spelled its ARN.
+        Ok(PutResourcePolicyOutput {
+            resource_arn: Some(input.resource_arn),
+        })
     }
 }
