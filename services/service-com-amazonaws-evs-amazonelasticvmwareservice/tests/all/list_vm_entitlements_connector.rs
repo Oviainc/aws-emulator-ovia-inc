@@ -116,8 +116,8 @@ fn assert_connector_not_found(case: &str, connector_id: &str, status: u16, body:
 }
 
 /// Force one stored connector of one environment to a `ConnectorState` and drop the
-/// change the clock owed it, so a state no implemented operation reaches on its own can
-/// be exercised too (`DeleteEnvironmentConnector` is still a stub).
+/// change the clock owed it, so a state is reached without the operation that reaches it
+/// having to run first (`DeleteEnvironmentConnector` is what a caller uses).
 fn force_connector_state(router: &Emulator, environment_id: &str, connector_id: &str, state: &str) {
     let store = evs::state::service_state(&*router.engine)
         .expect("the in-memory engine carries this service's store");

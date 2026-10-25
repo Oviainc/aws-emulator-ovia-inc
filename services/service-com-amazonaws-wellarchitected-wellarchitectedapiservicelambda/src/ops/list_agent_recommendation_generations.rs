@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAgentRecommendationGenerations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAgentRecommendationGenerations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAgentRecommendationGenerations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Lists recommendation generation processes for a specified profile": one page of the
+//! `AgentRecommendationGenerationSummary` projections of the generations
+//! `StartAgentRecommendationGeneration` recorded against the profile the path names, in
+//! generation-id order, optionally filtered to the generations asked for one
+//! `RecommendationType`, and resumed from the opaque `nextToken` a previous page issued.
+//! A reporting operation — modelled `@readonly` — so it writes nothing: each reported
+//! status is DERIVED from the instant the start stored on the record, which is why a
+//! generation's settle needs no write to become visible.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +154,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAgentRecommendationGenerations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAgentRecommendationGenerationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAgentRecommendationGenerationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Well-Architected Tool agent profile store is unavailable"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+
+        // "for a specified profile": the path's resource is resolved FIRST, before the
+        // query members are judged, because this operation DOES model
+        // `ResourceNotFoundException` (`smithy_query(query="operation",
+        // operation="ListAgentRecommendationGenerations")`) and a request against a
+        // profile that is not there is answered as the missing profile however its query
+        // string looks. A well-formed `profileArn` that names no stored profile is
+        // therefore that 404 rather than an empty page — unlike `ListAgentContexts`,
+        // which models no such error and so reports an empty page.
+        if !store.agent_profiles.contains_key(&input.profile_arn) {
+            return Err(
+                ListAgentRecommendationGenerationsErrorModeled::ResourceNotFoundException(
+                    crate::state::agent_profile_not_found(&input.profile_arn),
+                )
+                .into(),
+            );
+        }
+
+        // `maxResults` is modelled `@default(100)`, so it arrives as a value rather than
+        // an option; the clamp restates the member's `@range(min: 1, max: 1000)`.
+        let page_size = crate::state::agent_list_page_size(input.max_results);
+
+        // Defence in depth for a caller that builds the input in process (a test or
+        // another service's handler): over HTTP the boundary walk in `crate::service`
+        // already refuses a `RecommendationType` outside the enum's published set with
+        // this same 400 before this handler runs, so this branch is unreachable on the
+        // wire. It is kept so an unknown filter value can never be read as "no filter"
+        // and answered with every generation.
+        if let Some(filter) = input.recommendation_type.as_deref() {
+            if !RECOMMENDATION_TYPE_VALUES.contains(&filter) {
+                return Err(
+                    ListAgentRecommendationGenerationsErrorModeled::ValidationException(
+                        crate::state::member_constraint_exception(
+                            crate::state::RECOMMENDATION_TYPE_MEMBER,
+                            &format!(
+                                "Member must satisfy enum value set: [{}], got {filter}",
+                                RECOMMENDATION_TYPE_VALUES.join(", ")
+                            ),
+                        ),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // A token is this service's own cursor, not a value a caller composes: it cannot
+        // be corrected, only obtained again, so the refusal is classified `CANNOT_PARSE`
+        // ("restart the pagination") rather than as a field rule to fix — and it still
+        // names the member whose value could not be decoded.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_agent_generation_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(
+                        ListAgentRecommendationGenerationsErrorModeled::ValidationException(
+                            crate::state::cannot_parse_exception(
+                                crate::state::NEXT_TOKEN_MEMBER,
+                                crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                            ),
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // The generations of ONE profile: a generation is reached only through the profile
+        // it was started against, so another profile's generations are not reported here.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAgentRecommendationGenerations"))
+        // Generation ids are never reused, so the stored key order IS this service's list
+        // order and a cursor is a single id. It is start-EXCLUSIVE: the page resumes just
+        // past the last id already returned, so every generation is enumerated exactly
+        // once across the pages. The `recommendationType` filter is applied BEFORE the
+        // page is cut, so a filtered enumeration pages over the selected generations
+        // rather than over gaps in the unfiltered one.
+        //
+        // One record past the page is taken rather than the whole tail: that one record is
+        // exactly the evidence that a further page exists, so nothing longer than a page
+        // is ever materialised.
+        let mut selected: Vec<&crate::state::AgentGenerationRecord> = store
+            .agent_generations
+            .get(&input.profile_arn)
+            .map(|generations| {
+                generations
+                    .range::<String, _>((
+                        cursor.as_ref().map_or(::std::ops::Bound::Unbounded, |last| {
+                            ::std::ops::Bound::Excluded(last)
+                        }),
+                        ::std::ops::Bound::Unbounded,
+                    ))
+                    .map(|(_, record)| record)
+                    .filter(|record| {
+                        input
+                            .recommendation_type
+                            .as_deref()
+                            .is_none_or(|filter| record.covers_type(filter))
+                    })
+                    .take(page_size + 1)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // The extra record, if the walk reached one, is not part of this page: it only
+        // says a further page exists, and the page's last id is the cursor that resumes
+        // the enumeration just past it.
+        let has_more = selected.len() > page_size;
+        selected.truncate(page_size);
+        let next_token = match selected.last() {
+            Some(last) if has_more => {
+                Some(crate::state::encode_agent_generation_next_token(&last.id))
+            }
+            _ => None,
+        };
+
+        Ok(ListAgentRecommendationGenerationsOutput {
+            items: selected
+                .iter()
+                .map(|record| record.to_summary(now))
+                .collect(),
+            next_token,
+        })
     }
 }

@@ -5,8 +5,10 @@
 //! Reports the tags persisted on the resource the `@httpLabel` `resourceArn` names:
 //! the ARN is resolved to a stored resource of this service, and that resource's own
 //! tag map is the answer. A well-formed Aurora DSQL ARN naming a resource this
-//! service does not hold answers the modelled `ResourceNotFoundException` (404); an
-//! ARN that names no Aurora DSQL resource at all is refused as invalid input (400).
+//! service does not hold — including one scoped to another region, account or
+//! partition than the endpoint the request reached — answers the modelled
+//! `ResourceNotFoundException` (404); an ARN that names no Aurora DSQL resource at
+//! all is refused as invalid input (400).
 //! Reporting only: the sole write it performs is settling a status change the clock
 //! already owed at this instant, so a cluster whose deletion has come due is no
 //! longer there to list tags for.
@@ -146,7 +148,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -170,9 +171,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(std::time::SystemTime::now());
 
-        // The one resolution of a tagging ARN, shared with `UntagResource`, so a read
-        // and a write never disagree about which ARNs name something here.
-        let Some(tags) = state.resource_tags(&resource).cloned() else {
+        // The one resolution of a tagging ARN, shared with `TagResource` and
+        // `UntagResource`, so a read and a write never disagree about which ARNs name
+        // something here. It is scoped to the region this request reached: an ARN of
+        // another region, account or partition names a resource this endpoint does not
+        // serve, which is as absent here as an identifier that was never minted.
+        let Some(tags) = state
+            .resource_tags(&resource, &crate::state::request_region(ctx))
+            .cloned()
+        else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(
                     &input.resource_arn,

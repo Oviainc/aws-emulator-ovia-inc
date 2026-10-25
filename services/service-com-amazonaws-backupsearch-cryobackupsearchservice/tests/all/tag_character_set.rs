@@ -36,9 +36,6 @@ use crate::search_jobs::{call, emulator_with_engine, percent_encode, Answer};
 /// same region, so a seeded job and a called-for job are addressed alike.
 const REGION: &str = "us-west-2";
 
-/// The `SearchJobIdentifier` of the seeded, exportable search job the export rows name.
-const EXPORTABLE_JOB: &str = "exportable-job";
-
 /// Characters OUTSIDE the set `Tags` documents, one row of the table each.
 ///
 /// Source: the complement of the documented set — anything that is not a UTF-8 letter, a
@@ -333,7 +330,7 @@ async fn start_search_result_export_job_mints_no_job_carrying_a_tag_outside_the_
     let (emulator, engine) = emulator_with_engine();
     // One exportable search job for every row: what varies here is the tag set, not how
     // the search job reached a status an export may be started from.
-    seed_job(&engine, EXPORTABLE_JOB, state::COMPLETED, Vec::new());
+    let exportable_job = seed_job(&engine, state::COMPLETED, Vec::new());
     let mut expected_exports = 0usize;
     for case in tag_cases() {
         let started = call(
@@ -342,7 +339,7 @@ async fn start_search_result_export_job_mints_no_job_carrying_a_tag_outside_the_
             "PUT",
             "/export-search-jobs",
             Some(json!({
-                "SearchJobIdentifier": EXPORTABLE_JOB,
+                "SearchJobIdentifier": exportable_job,
                 "ExportSpecification": {
                     "s3ExportSpecification": {"DestinationBucket": "search-exports"}
                 },

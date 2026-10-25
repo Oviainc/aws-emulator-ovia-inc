@@ -3,7 +3,9 @@
 //! @op GetSearchJob
 //! Reports one persisted search job: the record `StartSearchJob` stored, with the
 //! status the clock has made due by the time of the call. An identifier this account
-//! holds no job for is a `ResourceNotFoundException` (404), never an empty 200.
+//! holds no job for is a `ResourceNotFoundException` (404), never an empty 200; one that
+//! is not a well-formed identifier at all is refused before the lookup as invalid input —
+//! `ValidationException` (400), see [`crate::state::check_job_identifier`].
 //!
 //! ## Shape of an operation
 //!
@@ -170,6 +172,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The identifier's SYNTAX is judged before any store lookup: a string that cannot
+        // be an identifier of this service is invalid input, not a missing resource.
+        crate::state::check_job_identifier(&input.search_job_identifier)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetSearchJobErrorModeled::InternalServerException(
                 InternalServerException {

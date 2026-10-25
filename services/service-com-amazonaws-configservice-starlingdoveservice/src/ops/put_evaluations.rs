@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutEvaluations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutEvaluations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Records the evaluation results a Config rule's own evaluation delivered: one
+//! [`crate::state::EvaluationResultEntry`] per `Evaluation` the request carries,
+//! against the rule the request's `ResultToken` identifies, which is what
+//! `GetComplianceDetailsByConfigRule`, the rule's compliance roll-up and every
+//! compliance summary built on it then report.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutEvaluations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The `ResultToken` is minted by Config when it invokes the rule it is going to
+//! evaluate ([`crate::state::ConfigRuleEntry::mint_evaluation_result_token`]), so a
+//! token this service did not issue, or one that is not the rule's current one, is
+//! refused with `InvalidResultTokenException`, and a token naming a rule this account
+//! no longer holds with `NoSuchConfigRuleException`. A delivery is all-or-nothing: an
+//! `Evaluation` carrying a `ComplianceType` Config does not accept from a caller, or an
+//! `OrderingTimestamp` it cannot place as an instant, is refused with
+//! `InvalidParameterValueException` and nothing is recorded.
+//!
+//! `TestMode` is the documented dry run ("You can verify whether your Lambda function
+//! will deliver evaluation results to Config. No updates occur to your existing
+//! evaluations"): the request is validated exactly as a live one, the `ResultToken` is
+//! not required to be valid, and NOTHING is written.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +162,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutEvaluations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutEvaluationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutEvaluations"))
+        // `ctx` carries request metadata only; what is recorded comes from the request
+        // and from the state the rule's invocation left behind.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // Every evaluation the delivery carries has to be one Config accepts BEFORE
+        // anything is written, so a delivery that is refused records nothing. The
+        // modelled 0..100 bound on the list is refused before this handler runs; a
+        // delivery that carries none is a delivery of nothing, not a bad request.
+        let delivered = input.evaluations.unwrap_or_default();
+        let mut placed = Vec::with_capacity(delivered.len());
+        for evaluation in delivered {
+            if !crate::state::DELIVERED_EVALUATION_COMPLIANCE_TYPES
+                .contains(&evaluation.compliance_type.as_str())
+            {
+                return Err(invalid_parameter(crate::state::unaccepted_value_message(
+                    "Evaluation.ComplianceType",
+                    &evaluation.compliance_type,
+                    &crate::state::DELIVERED_EVALUATION_COMPLIANCE_TYPES,
+                )));
+            }
+            // The ordering timestamp is "the time of the event that triggered the
+            // evaluation", and an instant is what this service stores, so a value it
+            // cannot place is refused rather than recorded as something else.
+            let Some(ordered_at) = crate::state::instant(evaluation.ordering_timestamp) else {
+                return Err(invalid_parameter(
+                    crate::state::unplaceable_timestamp_message(
+                        "Evaluation.OrderingTimestamp",
+                        evaluation.ordering_timestamp,
+                    ),
+                ));
+            };
+            placed.push((evaluation, ordered_at));
+        }
+
+        // "No updates occur to your existing evaluations, and evaluation results are
+        // not sent to Config. When TestMode is true, PutEvaluations doesn't require a
+        // valid value for the ResultToken parameter" — so a test run is the validation
+        // above and nothing else: it neither reads a rule nor writes a result.
+        if input.test_mode {
+            return Ok(PutEvaluationsOutput {
+                failed_evaluations: Some(Vec::new()),
+            });
+        }
+
+        let recorded_at = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The token is what "identifies the rule and the event that triggered the
+        // evaluation": a value Config did not mint names no rule and no event.
+        let named = crate::state::result_token_rule(&input.result_token)
+            .ok_or_else(invalid_result_token)?;
+        let rule = store.config_rules.get_mut(&named).ok_or_else(|| {
+            PutEvaluationsError::from(PutEvaluationsErrorModeled::NoSuchConfigRuleException(
+                NoSuchConfigRuleException {
+                    message: Some(crate::state::no_such_config_rule_message(&named)),
+                },
+            ))
+        })?;
+        // A token that is not the one Config minted for this rule's last invocation
+        // belongs to no evaluation Config is waiting for.
+        if rule.evaluation.result_token.as_deref() != Some(input.result_token.as_str()) {
+            return Err(invalid_result_token());
+        }
+
+        // Config invoked the rule; the delivery is the answer to THAT invocation, which
+        // is what `ConfigRuleInvokedTime` reports. The instant comes from the rule's own
+        // invocation history, never from the request.
+        let invoked_at = rule
+            .evaluation
+            .invoked_at
+            .or(rule.evaluation.last_successful_invocation_at)
+            .unwrap_or(recorded_at);
+        for (evaluation, ordered_at) in placed {
+            // The rule was invoked to evaluate resources Config has recorded, which is
+            // a DETECTIVE evaluation: Config, not the caller, chooses the mode.
+            let mut result = crate::state::EvaluationResultEntry::new(
+                &evaluation.compliance_resource_type,
+                &evaluation.compliance_resource_id,
+                crate::state::EVALUATION_MODE_DETECTIVE,
+                &evaluation.compliance_type,
+                ordered_at,
+            );
+            result.annotation = evaluation.annotation;
+            result.result_recorded_time = recorded_at;
+            result.config_rule_invoked_time = invoked_at;
+            rule.record_evaluation_result(result);
+        }
+
+        // "Requests that failed because of a client or server error": every evaluation
+        // of a delivery that got this far was recorded, and one that cannot be is what
+        // the refusals above answer, so there is nothing to report back as failed.
+        Ok(PutEvaluationsOutput {
+            failed_evaluations: Some(Vec::new()),
+        })
     }
+}
+
+/// Refuse the request with this operation's modelled `InvalidParameterValueException`
+/// (HTTP 400) — "One or more of the specified parameters are not valid" — with a message
+/// BUILT FROM THE REQUEST.
+fn invalid_parameter(message: String) -> PutEvaluationsError {
+    PutEvaluationsErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request with the modelled `InvalidResultTokenException` ("The specified
+/// ResultToken is not valid").
+///
+/// The message quotes NOTHING of the token: the token is opaque to its holder, so
+/// echoing it back says nothing a caller can act on, and the member it names is the one
+/// to fix.
+fn invalid_result_token() -> PutEvaluationsError {
+    PutEvaluationsErrorModeled::InvalidResultTokenException(InvalidResultTokenException {
+        message: Some(
+            "The specified ResultToken is not valid. Use the ResultToken Config \
+             delivered with the evaluation event for the rule you are evaluating."
+                .to_string(),
+        ),
+    })
+    .into()
 }

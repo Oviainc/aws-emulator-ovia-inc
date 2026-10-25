@@ -148,16 +148,20 @@ pub const RESOURCE_TYPE_CONNECTOR: &str = "connector";
 ///
 /// The model declares `CREATING | CREATE_FAILED | ACTIVE | UPDATING | UPDATE_FAILED |
 /// DELETING | DELETED` (`smithy_query(query="shape", shape="ConnectorState")`). The
-/// three named here are the ones the implemented connector operations produce: a
+/// five named here are the ones the implemented connector operations produce: a
 /// connector is `CREATING` while `CreateEnvironmentConnector`'s connection is being
 /// established, `UPDATING` while `UpdateEnvironmentConnector`'s new metadata is being
-/// applied, and `ACTIVE` once either has settled. The rest belong to the operations
-/// that produce them (`DeleteEnvironmentConnector` still answers 501).
+/// applied, `ACTIVE` once either has settled, `DELETING` while
+/// `DeleteEnvironmentConnector`'s teardown of the connection is in flight, and
+/// `DELETED` once that teardown has settled. The two `_FAILED` values belong to
+/// failures this emulator stages none of.
 pub const CONNECTOR_CREATING: &str = "CREATING";
 /// See [`CONNECTOR_CREATING`].
 pub const CONNECTOR_UPDATING: &str = "UPDATING";
 /// See [`CONNECTOR_CREATING`].
 pub const CONNECTOR_ACTIVE: &str = "ACTIVE";
+/// See [`CONNECTOR_CREATING`].
+pub const CONNECTOR_DELETING: &str = "DELETING";
 /// See [`CONNECTOR_CREATING`].
 pub const CONNECTOR_DELETED: &str = "DELETED";
 
@@ -186,6 +190,18 @@ pub const CONNECTOR_TYPE_VCENTER: &str = "VCENTER";
 pub const ENTITLEMENT_CREATING: &str = "CREATING";
 /// See [`ENTITLEMENT_CREATING`].
 pub const ENTITLEMENT_CREATED: &str = "CREATED";
+
+/// The `EntitlementStatus` values in which an entitlement tracks a virtual machine's
+/// Windows Server usage NO LONGER — the two the same enum declares for a record that is
+/// finished with ([`StoredEnvironment::live_entitlements`] is what reads them).
+///
+/// No operation of this crate writes either one yet, because `DeleteEntitlement` — the
+/// operation that stops usage tracking — is still a scaffold. They are named here
+/// because what they mean is a property of the RECORD rather than of one operation's
+/// output: an entitlement in one of them holds its connector no longer.
+pub const ENTITLEMENT_DELETED: &str = "DELETED";
+/// See [`ENTITLEMENT_DELETED`].
+pub const ENTITLEMENT_REMOVED: &str = "ENTITLEMENT_REMOVED";
 
 /// How long after the call that starts it a lifecycle transition comes due
 /// (`CREATING` -> `CREATED` after `CreateEnvironment`, `DELETING` -> `DELETED`
@@ -1062,11 +1078,13 @@ pub struct StoredEnvironment {
     /// The connectors created in this environment, keyed by `connectorId`. A
     /// `BTreeMap` so `ListEnvironmentConnectors` has one stable order to page over.
     ///
-    /// Bounded by the connector rule itself rather than by a cap of its own: at most
-    /// one LIVE connector of each `ConnectorType` exists per environment ("You can
-    /// create only one connector of each type per environment",
-    /// `CreateEnvironmentConnector` doc), so the map holds at most as many live
-    /// records as the model declares types.
+    /// At most one LIVE connector of each `ConnectorType` exists per environment ("You
+    /// can create only one connector of each type per environment",
+    /// `CreateEnvironmentConnector` doc), so the map holds at most as many live records
+    /// as the model declares types. The records `DeleteEnvironmentConnector` has
+    /// finished with are kept beside them so a later read still reports the deletion,
+    /// bounded by [`MAX_CONNECTORS_PER_ENVIRONMENT`]
+    /// ([`StoredEnvironment::purge_finished_connectors`]).
     pub connectors: BTreeMap<String, StoredConnector>,
     /// The ESX hosts added to this environment, keyed by `hostName` — the handle a host
     /// is addressed by, and unique across environments. A `BTreeMap` so
@@ -1215,6 +1233,78 @@ impl StoredEnvironment {
     /// How many hosts still occupy this environment ([`Self::live_hosts`]).
     pub fn live_host_count(&self) -> usize {
         self.live_hosts().count()
+    }
+
+    /// The entitlements of this environment that still TRACK a virtual machine's usage:
+    /// every stored entitlement whose `EntitlementStatus` has reached neither
+    /// [`ENTITLEMENT_DELETED`] nor [`ENTITLEMENT_REMOVED`].
+    ///
+    /// An entitlement that is still being validated (`CREATING`) is as present as one
+    /// that is `CREATED`: both are entitlements a caller has to remove before the
+    /// connector they were created through can be deleted
+    /// ([`Self::entitlements_sharing_vcenter`]).
+    pub fn live_entitlements(&self) -> impl Iterator<Item = &StoredEntitlement> {
+        self.entitlements.values().filter(|entitlement| {
+            entitlement.status != ENTITLEMENT_DELETED && entitlement.status != ENTITLEMENT_REMOVED
+        })
+    }
+
+    /// How many live entitlements of this environment are associated with the same
+    /// vCenter as the connector `connector_id` names — the entitlements in the way of
+    /// that connector's deletion: "Before deleting a connector, you must remove all
+    /// entitlements that are associated with the same vCenter"
+    /// (`DeleteEnvironmentConnector` doc).
+    ///
+    /// The vCenter is the APPLIANCE the connector targets, not the connector record, so
+    /// every connector of this environment reaching the same `applianceFqdn` counts —
+    /// an entitlement created through a connector that was replaced by a new one for
+    /// the same appliance is associated with that same vCenter. The comparison is
+    /// case-insensitive because a DNS name is.
+    ///
+    /// Zero for an id this environment holds no connector for: there is no vCenter to
+    /// compare against, and the caller is told about the connector instead.
+    pub fn entitlements_sharing_vcenter(&self, connector_id: &str) -> usize {
+        let Some(connector) = self.connectors.get(connector_id) else {
+            return 0;
+        };
+        let same_vcenter: BTreeSet<&str> = self
+            .connectors
+            .values()
+            .filter(|other| {
+                other
+                    .appliance_fqdn
+                    .eq_ignore_ascii_case(&connector.appliance_fqdn)
+            })
+            .map(|other| other.connector_id.as_str())
+            .collect();
+        self.live_entitlements()
+            .filter(|entitlement| same_vcenter.contains(entitlement.connector_id.as_str()))
+            .count()
+    }
+
+    /// Drop the oldest connector records this environment is FINISHED with, until it
+    /// holds no more than [`MAX_CONNECTORS_PER_ENVIRONMENT`].
+    ///
+    /// The retention rule for the one connector record kind nothing reads for its own
+    /// sake any more: a `DELETED` connector is kept so a later read still reports the
+    /// deletion, but only until the store needs the room, and a read of a purged id
+    /// then answers `ResourceNotFoundException`, which that error's own doc sanctions
+    /// ("The resource might not be specified correctly, or it may have a `state` of
+    /// `DELETED`"). A live record is never dropped, so a create/delete loop cannot grow
+    /// the map without bound.
+    pub fn purge_finished_connectors(&mut self) {
+        while self.connectors.len() > MAX_CONNECTORS_PER_ENVIRONMENT {
+            let Some(longest_deleted) = self
+                .connectors
+                .values()
+                .filter(|connector| connector.state == CONNECTOR_DELETED)
+                .min_by_key(|connector| connector.modified_at_ms)
+                .map(|connector| connector.connector_id.clone())
+            else {
+                return;
+            };
+            self.connectors.remove(&longest_deleted);
+        }
     }
 
     /// `environmentStatus`: the roll-up of the environment's `checks`, which
@@ -1473,6 +1563,23 @@ pub const MAX_ENVIRONMENTS: usize = 256;
 /// per-environment entitlement quota, and this is far above the VM count of any
 /// ordinary workflow.
 pub const MAX_ENTITLEMENTS_PER_ENVIRONMENT: usize = 1024;
+
+/// The most connector records one environment keeps — the cap that bounds caller-driven
+/// growth of an environment's connector map.
+///
+/// At most one LIVE connector of each `ConnectorType` exists per environment, so the
+/// live population is bounded by the model itself; what needs a cap is the records
+/// `DeleteEnvironmentConnector` has finished with, because a create of a type whose
+/// connector was deleted mints a fresh `connectorId` and a create/delete loop would
+/// otherwise keep every one of them. The retention rule is the one
+/// [`MAX_ENVIRONMENTS`] states: at the cap the longest-deleted record is purged
+/// ([`StoredEnvironment::purge_finished_connectors`]), and a live record is never
+/// dropped.
+///
+/// The number is the emulator's own bound, not a contract: Amazon EVS publishes no
+/// per-environment connector quota, and this is far above the deletions of any ordinary
+/// workflow.
+pub const MAX_CONNECTORS_PER_ENVIRONMENT: usize = 64;
 
 /// The most Elastic IP associations one VLAN subnet holds — the cap that bounds
 /// caller-driven growth of a VLAN's association list.
@@ -2304,7 +2411,9 @@ pub fn depot_url(region: &str, environment_id: &str, token: &str) -> String {
 /// (`CreateEnvironmentConnector` doc) allows at most one of.
 ///
 /// A connector that has reached `DELETED` does not count, exactly as a deleted
-/// environment does not hold its name: the type is free for a new connector again.
+/// environment does not hold its name: the type is free for a new connector again. One
+/// that is still `DELETING` does count — its connection to the appliance is still being
+/// torn down, so the type is not free yet.
 pub fn live_connector_of_type<'a>(
     environment: &'a StoredEnvironment,
     connector_type: &str,
@@ -2315,14 +2424,20 @@ pub fn live_connector_of_type<'a>(
 }
 
 /// The live connector `connector_id` names in this environment, if any: the record a
-/// request that addresses a connector by id resolves to.
+/// request that wants to USE a connector resolves to.
 ///
 /// The id is scoped to the environment, exactly as `UpdateEnvironmentConnector` reads
-/// it, and a connector that has reached `DELETED` resolves to nothing: "The resource
-/// might not be specified correctly, or it may have a `state` of `DELETED`"
-/// (`ResourceNotFoundException` doc). Every other `ConnectorState` is live — the
+/// it, and a connector the service has started deleting resolves to nothing: a
+/// `DELETING` connector's connection to the appliance is being torn down and a
+/// `DELETED` one is gone, so neither is a connector new work can be tracked through
+/// ("The resource might not be specified correctly, or it may have a `state` of
+/// `DELETED`", `ResourceNotFoundException` doc). The other three states are live — the
 /// connection is being established (`CREATING`), reconfigured (`UPDATING`) or up
 /// (`ACTIVE`) — so the record exists and is the one the request named.
+///
+/// [`live_connector_of_type`] draws the line one state later on purpose: a type whose
+/// connector is still being deleted is not free for a new connector yet, while the
+/// connector itself can no longer be used.
 pub fn live_connector<'a>(
     environment: &'a StoredEnvironment,
     connector_id: &str,
@@ -2330,7 +2445,9 @@ pub fn live_connector<'a>(
     environment
         .connectors
         .get(connector_id)
-        .filter(|connector| connector.state != CONNECTOR_DELETED)
+        .filter(|connector| {
+            connector.state != CONNECTOR_DELETING && connector.state != CONNECTOR_DELETED
+        })
 }
 
 /// The largest page a `@paginated` operation of this service returns when the caller

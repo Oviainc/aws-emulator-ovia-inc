@@ -2751,10 +2751,16 @@ impl Detector {
     /// Scoped to the THREAT sets: a token resolves to a resource of the type the
     /// create that carried it made, so one token replayed across the two
     /// entity-set creates never hands back the other one's id.
+    ///
+    /// A set whose delete has already been accepted
+    /// ([`EntitySetRecord::is_deleting`]) resolves to nothing, so a replayed
+    /// create never answers with a set the service is no longer keeping — the
+    /// same rule [`Self::trusted_entity_set_for_token`] follows for a deleted
+    /// trusted set and [`Self::ip_set_for_token`] for a deleted IPSet.
     pub fn threat_entity_set_for_token(&self, token: &str) -> Option<&EntitySetRecord> {
         self.threat_entity_sets
             .values()
-            .find(|set| set.client_token.as_deref() == Some(token))
+            .find(|set| set.client_token.as_deref() == Some(token) && !set.is_deleting())
     }
 
     /// The ids of the LIVE threat entity sets this detector holds, in
@@ -2774,6 +2780,32 @@ impl Detector {
             .filter(|set| !set.is_deleting())
             .map(|set| set.id.clone())
             .collect()
+    }
+
+    /// How many of this detector's threat entity sets are LIVE — held and not
+    /// being deleted.
+    ///
+    /// This is the count [`THREAT_ENTITY_SETS_PER_DETECTOR`] bounds: a set whose
+    /// delete has been accepted is only still REPORTED, never used, so it
+    /// occupies none of the detector's slots — the same rule
+    /// [`Self::live_ip_set_count`] applies to a deleted IPSet and
+    /// [`Self::live_trusted_entity_set`] to a deleted trusted set.
+    pub fn live_threat_entity_set_count(&self) -> usize {
+        self.threat_entity_sets
+            .values()
+            .filter(|set| !set.is_deleting())
+            .count()
+    }
+
+    /// Accept the deletion of the threat entity set `id` names.
+    ///
+    /// `None` when this detector holds no such set at all; `Some(true)` when this
+    /// call is the one that accepted the deletion, and `Some(false)` when a delete
+    /// had already been accepted for it — the caller needs that distinction because
+    /// only the first delete changes the set of LIVE sub-resources the detector
+    /// holds, and so only the first moves the detector's own `UpdatedAt`.
+    pub fn delete_threat_entity_set(&mut self, id: &str, now: i64) -> Option<bool> {
+        delete_entity_set(&mut self.threat_entity_sets, id, now)
     }
 
     /// The IPSet a create already minted for `token`, if any — the seam that makes

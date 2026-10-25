@@ -3,8 +3,9 @@
 //! @op ListMembers
 //! Implemented: pages `MemberSummary` entries out of the members stored on one network in
 //! [`crate::state`], honouring the `name`, `status` and `isOwned` filters; a `NetworkId`
-//! that resolves to no stored network is refused with this operation's own
-//! `InvalidRequestException`.
+//! that resolves to no stored network is answered with the service's
+//! `ResourceNotFoundException` (HTTP 404), the same not-found sentence the id-addressed
+//! reads of a network answer with.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +79,11 @@
 //!   of an unknown error, exception or failure.
 //! * `InvalidRequestException` (HTTP 400) — The action or operation requested is invalid.
 //!   Verify that the action is typed correctly.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see
+//!   below): a resource the request named by id that this service does not hold. The
+//!   shape is the SERVICE's own (`com.amazonaws.managedblockchain#ResourceNotFoundException`,
+//!   `@httpError(404)`, members `Message` and `ResourceName`), which the sibling network
+//!   reads declare.
 //! * `ThrottlingException` (HTTP 429) — The request or operation couldn't be performed
 //!   because a service is throttling requests. The most common source of throttling errors is
 //!   creating resources that exceed your service limit for this resource type. Request a
@@ -100,12 +106,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-managedblockchain-taiga
 //
 // Nothing is widened in: this list is exactly what the model declares for this
 // operation, which is what a generated client's error union for it holds.
-#[smithy_macros::operation_error("com.amazonaws.managedblockchain#ListMembers")]
+//
+// `ResourceNotFoundException` is the one widening, through `extra_errors`: it is a shape
+// the SERVICE models (and every id-addressed network read declares) that this operation's
+// own list omits, and the service is observed to answer a `NetworkId` it cannot resolve
+// with it rather than folding the condition into request validation.
+#[smithy_macros::operation_error(
+    "com.amazonaws.managedblockchain#ListMembers",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListMembersErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServiceErrorException(InternalServiceErrorException),
     InvalidRequestException(InvalidRequestException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
 }
 
@@ -124,19 +139,22 @@ impl From<ListMembersErrorModeled> for ListMembersError {
     }
 }
 
-/// This operation models NO `ResourceNotFoundException` (its client errors are
-/// `AccessDeniedException`, `InvalidRequestException` and `ThrottlingException`), so a
-/// network scope it cannot resolve is an invalid REQUEST — never a 404 the model does not
-/// declare, which no generated client could catch, and never an empty page, which would
-/// claim the network exists and holds no members. `ListNodes` and `ListProposalVotes`
-/// answer an unresolvable scope the same way; the prose is the service's one not-found
-/// sentence, so only the shape carrying it differs from `ListProposals`, which does
-/// declare the 404.
+/// A `NetworkId` this service holds no network for: the service's `ResourceNotFoundException`
+/// (HTTP 404) carrying its one not-found sentence, exactly as `GetNetwork` and
+/// `ListProposals` answer the same id.
+///
+/// A resource that does not exist is a not-found condition, not a malformed request: a
+/// caller branches on the two differently (retry while a network is not yet visible,
+/// swallow the 404 on a teardown), and a request-validation code cannot be told apart from
+/// a genuinely bad request — which this operation does answer, for a `Status` outside its
+/// enum or a forged `NextToken`. The shape is reached through `extra_errors` above, since
+/// this operation's own modelled list omits it; it is never an empty page either, which
+/// would claim the network exists and holds no members.
 fn network_not_found(network_id: &str) -> ListMembersError {
-    ListMembersErrorModeled::InvalidRequestException(crate::state::not_found_invalid_request(
-        crate::state::RESOURCE_NETWORK,
-        network_id,
-    ))
+    ListMembersErrorModeled::ResourceNotFoundException(
+        // Named by id, so `ResourceName` is omitted — see `crate::state::not_found`.
+        crate::state::not_found(crate::state::RESOURCE_NETWORK, network_id),
+    )
     .into()
 }
 
@@ -209,10 +227,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        // A `NetworkId` that names no network of this Region is refused naming that
-        // network, rather than answered with an empty page that would claim the network
-        // exists and holds no members — in the shape this operation's own error list
-        // declares for it.
+        // A `NetworkId` that names no network of this Region is reported as not found,
+        // naming that network, rather than answered with an empty page that would claim
+        // the network exists and holds no members. Every request-shape fault is already
+        // behind this point: the boundary walk refuses a `Status` outside `MemberStatus`
+        // and a `MaxResults` outside its range before the handler runs, and the forged
+        // `NextToken` above is refused ahead of this lookup.
         let Some(network) = guard.network(&region, &input.network_id) else {
             return Err(network_not_found(&input.network_id));
         };
