@@ -712,6 +712,9 @@ pub const OPERATION_TYPE_UNPEER_VPC: &str = "UnpeerVpc";
 pub const OPERATION_TYPE_DISABLE_ADD_ON: &str = "DisableAddOn";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_ENABLE_ADD_ON: &str = "EnableAddOn";
+/// The `operationType` the log entry of a `SetIpAddressType` call carries, the
+/// modelled `OperationType` enum's own `SetIpAddressType` member.
+pub const OPERATION_TYPE_SET_IP_ADDRESS_TYPE: &str = "SetIpAddressType";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -10171,6 +10174,19 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// The static IP `name` names, for a reporting operation.
     pub fn static_ip(&self, name: &str) -> Option<&StoredStaticIp> {
         self.static_ips.get(name)
+    }
+
+    /// The static IP attached to the instance `instance_name`, while one is.
+    ///
+    /// The attachment lives on the STATIC IP record — the address is what is
+    /// attached, exactly as a disk names the instance it is attached to — so the
+    /// one way to find it is to ask the static IPs, and this is where that walk
+    /// lives rather than in each handler that needs it. The walk is bounded by
+    /// [`MAX_STATIC_IPS`].
+    pub fn attached_static_ip(&self, instance_name: &str) -> Option<&StoredStaticIp> {
+        self.static_ips
+            .values()
+            .find(|static_ip| static_ip.attached_to.as_deref() == Some(instance_name))
     }
 
     /// Store a newly allocated static IP.
