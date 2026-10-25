@@ -253,6 +253,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
 
+        // The association is a REFERENCE to a stage of this same service, so one this
+        // account holds no stage for is refused with the modelled `ValidationException`
+        // rather than persisted — the same rule, resolved the same way, as the storage
+        // configuration a stage records into (`crate::state::resolved_recording_configuration`).
+        // Refused before anything is minted or persisted, and before the store bound is
+        // consulted, so a request this operation cannot satisfy leaves no configuration
+        // behind and is answered as the bad input it is.
+        let stage_arn =
+            crate::state::resolved_stage_association(&store, Self::NAME, input.stage_arn)
+                .map_err(|message| {
+                    crate::state::validation_failed(
+                        CreateIngestConfigurationErrorModeled::ValidationException,
+                        message,
+                    )
+                })?;
+
         // The store grows only here, and a record is reclaimed only by an explicit
         // `DeleteIngestConfiguration`, so the bound is checked before anything is minted
         // or persisted.
@@ -310,15 +326,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             ingest_protocol: input.ingest_protocol,
             stream_key: primary.stream_key,
-            // The stage the request named, or the empty ARN the model's own reading of
-            // "no stage" is: `crate::state::NO_ASSOCIATED_STAGE_ARN`. The association is
-            // recorded as the request gave it — `UpdateIngestConfiguration` is what moves
-            // a configuration to another stage — and this operation models no
-            // `ResourceNotFoundException`, so a stage ARN this store does not hold is
-            // persisted rather than refused with an error the model does not declare.
-            stage_arn: input
-                .stage_arn
-                .unwrap_or_else(|| crate::state::NO_ASSOCIATED_STAGE_ARN.to_string()),
+            // The stage the request named, resolved above: a stage this account holds,
+            // or the empty ARN the model's own reading of "no stage" is
+            // (`crate::state::NO_ASSOCIATED_STAGE_ARN`). A configuration is moved to
+            // another stage by `UpdateIngestConfiguration`.
+            stage_arn,
             participant_id: primary.participant_id,
             user_id: input.user_id,
             redundant_ingest: input.redundant_ingest,
