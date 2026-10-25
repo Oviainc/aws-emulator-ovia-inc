@@ -550,6 +550,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ... and no provisioned concurrency on any of its qualifiers until
             // `PutProvisionedConcurrencyConfig` adds a configuration to one.
             provisioned_concurrency_configs: ::std::collections::BTreeMap::new(),
+            // ... and no scaling configuration on any of its qualifiers until
+            // `PutFunctionScalingConfig` sets one for one of them.
+            function_scaling_configs: ::std::collections::BTreeMap::new(),
         };
 
         // "Use the Publish parameter to create version 1 of your function from its

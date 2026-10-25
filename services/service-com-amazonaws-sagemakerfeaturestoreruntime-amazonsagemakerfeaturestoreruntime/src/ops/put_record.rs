@@ -202,13 +202,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // OnlineStore" and silently turn the write into a no-op success. The boundary
         // validator refuses an undeclared enum value first; this is the handler's own
         // guard, against the model's own value list (`TARGET_STORE_VALUES`).
-        if let Some(stores) = input.target_stores.as_ref() {
-            if let Some(unknown) = crate::state::undeclared_value(stores, TARGET_STORE_VALUES) {
-                return Err(validation(format!(
-                    "TargetStores: '{unknown}' is not a TargetStore; expected one of {}",
-                    TARGET_STORE_VALUES.join(", ")
-                )));
-            }
+        if let Some(message) = crate::state::undeclared_target_store(input.target_stores.as_ref()) {
+            return Err(validation(message));
         }
 
         // The feature group must RESOLVE before anything is written: a `FeatureGroupName`
@@ -233,88 +228,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // `Record` is modelled `len 1..` and refused at the boundary; read it
-        // fallibly all the same, so a handler reached with an empty list answers the
-        // modelled error instead of panicking. Every check from here to the store lock is
-        // on the REQUEST, so it answers the same whatever stores the caller named and
-        // whichever stores the feature group has: a record this operation cannot read is a
-        // request defect, not something an OfflineStore-only write excuses.
-        if input.record.is_empty() {
-            return Err(validation("Record must carry at least one FeatureValue"));
-        }
         let key = definition.name.clone();
 
-        // Which feature identifies the record, and which carries its event time, are the
-        // group's DEFINITION — `RecordIdentifierFeatureName` and `EventTimeFeatureName`,
-        // as the control plane recorded them — never the order or the names of the
-        // features this one request happens to post.
-        let identifier_feature_name = definition.record_identifier_feature_name.clone();
-
-        let identifier = match input
-            .record
-            .iter()
-            .find(|feature| feature.feature_name == identifier_feature_name)
-        {
-            Some(FeatureValue {
-                value_as_string: Some(value),
-                ..
-            }) => value.clone(),
-            Some(_) => {
-                return Err(validation(format!(
-                    "the record identifier feature '{identifier_feature_name}' must carry \
-                     ValueAsString, not ValueAsStringList"
-                )))
-            }
-            None => {
-                return Err(validation(format!(
-                    "Record is missing the record identifier feature \
-                     '{identifier_feature_name}' of feature group '{key}'"
-                )))
-            }
-        };
-
-        // Likewise for the event-time feature: the group's own `EventTimeFeatureName`.
-        // A record that carries no value for it has no event time, so neither the
-        // historic-record rule nor a TTL has anything to compute from.
-        let event_time_feature_name = definition.event_time_feature_name.clone();
-        let event_time = input
-            .record
-            .iter()
-            .find(|feature| feature.feature_name == event_time_feature_name)
-            .and_then(|feature| feature.value_as_string.clone());
-
-        // An event time the group identified must be a timestamp: the TTL and the
-        // historic-record rule are both computed from it, so a value in neither
-        // accepted format is refused rather than silently disabling both.
-        let posted_secs = match event_time.as_deref() {
-            Some(at) => match crate::state::parse_event_time_secs(at) {
-                Some(secs) => Some(secs),
-                None => {
-                    return Err(validation(format!(
-                        "EventTime: the event time feature '{event_time_feature_name}' must \
-                         carry an ISO-8601 timestamp or seconds since the epoch, not '{at}'"
-                    )));
-                }
-            },
-            None => None,
-        };
-
-        // The record-level TTL, in seconds: `ExpiresAt = EventTime + TtlDuration`, per
-        // the `TtlDuration` shape's doc. The unit is a modelled enum, refused at the
-        // boundary, so a value outside it only reaches here if the walk let it through.
-        let ttl_secs = match input.ttl_duration.as_ref() {
-            None => None,
-            Some(ttl) => match crate::state::ttl_seconds(ttl) {
-                Some(secs) => Some(secs),
-                None => {
-                    return Err(validation(format!(
-                        "TtlDuration.Unit: '{}' is not a TtlDurationUnit; expected one of {}",
-                        ttl.unit,
-                        TTL_DURATION_UNIT_VALUES.join(", ")
-                    )))
-                }
-            },
-        };
+        // The posted record is read against the group's DEFINITION — its
+        // `RecordIdentifierFeatureName`, its `EventTimeFeatureName` and the TTL the
+        // request names — by the one preparation every whole-record write of this data
+        // plane shares (`crate::state::prepare_record`). Every check it makes is on the
+        // REQUEST, so it answers the same whatever stores the caller named and whichever
+        // stores the feature group has: a record this operation cannot read is a request
+        // defect, not something an OfflineStore-only write excuses.
+        let prepared =
+            crate::state::prepare_record(&definition, &input.record, input.ttl_duration.as_ref())
+                .map_err(validation)?;
 
         // `TargetStores` is "A list of stores to which you're adding the record. By
         // default, Feature Store adds the record to all of the stores that you're using
@@ -341,40 +266,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If a new record's EventTime is greater, the new record is written to both
         // the OnlineStore and OfflineStore. Otherwise, the record is a historic record
         // and it is written only to the OfflineStore." Only the OnlineStore is served
-        // here, so a historic record leaves the stored record standing.
-        if let (Some(posted), Some(stored)) = (
-            posted_secs,
-            group
-                .record(&identifier)
-                .and_then(crate::state::StoredRecord::event_time_secs),
-        ) {
-            if posted <= stored {
-                return Ok(PutRecordOutput);
+        // here, so a historic record leaves the stored record standing — the ingestion
+        // every whole-record write of this data plane shares.
+        match group.ingest(prepared) {
+            crate::state::Ingested::Stored | crate::state::Ingested::Historic => {
+                Ok(PutRecordOutput)
             }
-        }
-
-        let mut record = crate::state::StoredRecord {
-            identifier,
-            features: input
-                .record
-                .iter()
-                .map(crate::state::StoredFeatureValue::from)
-                .collect(),
-            event_time,
-            expires_at: None,
-            expires_at_secs: None,
-            ttl_secs,
-            soft_deleted: false,
-        };
-        record.recompute_expiry();
-        if !group.insert_record(record) {
-            return Err(at_capacity(format!(
+            crate::state::Ingested::AtCapacity => Err(at_capacity(format!(
                 "the online store of feature group '{key}' already holds {} records",
                 crate::state::MAX_RECORDS_PER_GROUP
-            )));
+            ))),
         }
-
-        Ok(PutRecordOutput)
     }
 }
 

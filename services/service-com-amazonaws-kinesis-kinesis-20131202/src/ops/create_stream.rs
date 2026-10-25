@@ -439,8 +439,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         created_at, index,
                     ),
                     // A shard a create laid down is OPEN, so it has no ending sequence
-                    // number.
+                    // number and no close instant.
                     ending_sequence_number: None,
+                    created_at,
+                    closed_at: None,
                 }
             })
             .collect();
