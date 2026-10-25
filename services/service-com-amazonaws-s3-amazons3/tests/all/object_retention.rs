@@ -44,8 +44,8 @@ use service_com_amazonaws_s3_amazons3::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{router, send, Answer};
-use super::object_and_tagging_roundtrip::{bucket, get_object, put_object, text};
-use super::object_versioning::set_versioning;
+use super::object_and_tagging_roundtrip::{get_object, put_object, text};
+use super::object_legal_hold::lock_enabled_bucket;
 
 /// An account id that is NOT the one account this emulator serves, so an
 /// `x-amz-expected-bucket-owner` carrying it names an owner no bucket here has. Asserted
@@ -54,11 +54,15 @@ const NOT_THE_OWNER: &str = "123456789012";
 
 /// One hour in seconds — the step the shortening and lengthening rows move a retention
 /// period by.
-const ONE_HOUR: i64 = 3_600;
+///
+/// `pub(crate)`, like the four helpers below it: the legal-hold suite
+/// ([`super::object_legal_hold`]) drives the retention half of the Object Lock family
+/// through these rather than forking a second copy of them.
+pub(crate) const ONE_HOUR: i64 = 3_600;
 
 /// `PUT /<bucket>/<key>?retention` — `PutObjectRetention`, with whatever extra query
 /// parameters and headers the case carries and `payload` as the `Retention` container.
-async fn put_object_retention(
+pub(crate) async fn put_object_retention(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
@@ -78,7 +82,7 @@ async fn put_object_retention(
 
 /// `GET /<bucket>/<key>?retention` — `GetObjectRetention`, with whatever extra query
 /// parameters and headers the case carries.
-async fn get_object_retention(
+pub(crate) async fn get_object_retention(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
@@ -99,7 +103,7 @@ async fn get_object_retention(
 ///
 /// An empty container (both members `None`) is a container that describes no period, which
 /// is how a caller asks for the retention to be taken away.
-fn retention_payload(mode: Option<&str>, retain_until_seconds: Option<i64>) -> String {
+pub(crate) fn retention_payload(mode: Option<&str>, retain_until_seconds: Option<i64>) -> String {
     let mut body = String::from("<Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
     if let Some(mode) = mode {
         body.push_str(&format!("<Mode>{mode}</Mode>"));
@@ -138,7 +142,7 @@ fn epoch_seconds(rendered: &str) -> i64 {
 }
 
 /// Now, in epoch seconds: what every row's retention date is an offset from.
-fn now_seconds() -> i64 {
+pub(crate) fn now_seconds() -> i64 {
     DateTime::from(SystemTime::now()).secs()
 }
 
@@ -152,7 +156,11 @@ fn reported_retention(answer: &Answer) -> Option<(String, i64)> {
 
 /// An object written at `key`, so a retention call has a version to act on. Reports the
 /// version id the write minted, when the bucket's versioning state made it mint one.
-async fn object(router: &MultiServiceRouter, bucket_name: &str, key: &str) -> Option<String> {
+pub(crate) async fn object(
+    router: &MultiServiceRouter,
+    bucket_name: &str,
+    key: &str,
+) -> Option<String> {
     let written = put_object(router, bucket_name, key, b"payload", &[]).await;
     assert_eq!(
         written.status, 200,
@@ -233,7 +241,7 @@ fn round_trip_rows() -> Vec<RoundTripRow> {
 #[tokio::test]
 async fn a_retention_round_trips_through_put_and_get_object_retention() {
     let router = router();
-    bucket(&router, "object-retention").await;
+    lock_enabled_bucket(&router, "object-retention").await;
 
     // The rows span the whole published mode catalog, so the table cannot quietly stop
     // covering a value the model declares.
@@ -391,7 +399,7 @@ fn weakening_rows() -> Vec<WeakeningRow> {
 #[tokio::test]
 async fn a_call_that_protects_a_version_less_needs_a_governance_bypass() {
     let router = router();
-    bucket(&router, "retention-bypass").await;
+    lock_enabled_bucket(&router, "retention-bypass").await;
 
     for in_force in OBJECT_LOCK_RETENTION_MODE_VALUES {
         for (index, (case, asked_mode, offset, weakens)) in weakening_rows().iter().enumerate() {
@@ -502,7 +510,7 @@ async fn a_call_that_protects_a_version_less_needs_a_governance_bypass() {
 #[tokio::test]
 async fn a_retention_whose_date_has_passed_restricts_nothing() {
     let router = router();
-    bucket(&router, "expired-retention").await;
+    lock_enabled_bucket(&router, "expired-retention").await;
 
     // A retention placed with a date that has already gone by is a period that is over, so
     // it protects the version no longer — in either mode, and whether the call that
@@ -555,8 +563,7 @@ type VersionReadRow = (String, String, Option<(String, i64)>);
 #[tokio::test]
 async fn a_retention_belongs_to_one_object_version() {
     let router = router();
-    bucket(&router, "retention-versions").await;
-    set_versioning(&router, "retention-versions", "Enabled").await;
+    lock_enabled_bucket(&router, "retention-versions").await;
 
     // Two versions of one key, and a second key beside it: each write mints an id of its
     // own, which is what a retention is addressed by.
@@ -670,7 +677,7 @@ async fn a_retention_belongs_to_one_object_version() {
 #[tokio::test]
 async fn a_retention_call_this_emulator_cannot_serve_answers_what_is_wrong() {
     let router = router();
-    bucket(&router, "held-retention-bucket").await;
+    lock_enabled_bucket(&router, "held-retention-bucket").await;
     object(&router, "held-retention-bucket", "held").await;
     let retain_until = now_seconds() + 24 * ONE_HOUR;
     let payload = retention_payload(Some(GOVERNANCE_RETENTION_MODE), Some(retain_until));
@@ -765,10 +772,10 @@ async fn a_retention_call_this_emulator_cannot_serve_answers_what_is_wrong() {
 
     // A `versionId` the bucket holds no version of that key for: the key itself is there,
     // so what is missing is the version. The ids below are the shapes a client sends — a
-    // generated-looking one and the literal `null` of a version written before versioning
-    // was enabled, which this never-versioned bucket's object is NOT addressed by here
-    // because `null` names its one stored version.
-    for missing in ["3HL4kqtJlcpXroDTDmjVBH40Nrjfkd", "not-a-minted-id"] {
+    // generated-looking one, one that is not a minted id at all, and the literal `null` of
+    // a version written before versioning was enabled, which this Object Lock enabled
+    // bucket (and so versioning-enabled from the moment it existed) has never held.
+    for missing in ["3HL4kqtJlcpXroDTDmjVBH40Nrjfkd", "not-a-minted-id", "null"] {
         for (operation, answer) in [
             (
                 "PutObjectRetention",
