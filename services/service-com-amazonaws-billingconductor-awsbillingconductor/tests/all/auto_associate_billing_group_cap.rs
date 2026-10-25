@@ -248,11 +248,11 @@ fn transfer_arn(suffix: &str) -> String {
 }
 
 /// The group that holds the election in each test below: a plain group created with the
-/// flag on.
+/// flag on, whose primary account is one of its own linked accounts.
 async fn elected_holder(em: &Emulator, plan: &str) -> String {
     em.created(&json!({
         "Name": "ElectedGroup",
-        "AccountGrouping": { "LinkedAccountIds": [], "AutoAssociate": true },
+        "AccountGrouping": { "LinkedAccountIds": ["111111111111"], "AutoAssociate": true },
         "ComputationPreference": { "PricingPlanArn": plan },
         "PrimaryAccountId": "111111111111",
     }))
@@ -273,10 +273,10 @@ async fn a_second_create_asking_for_auto_associate_is_refused() {
     // transfer relationship, neither), and the optional members it carries.
     let refused: Vec<(&str, Value)> = vec![
         (
-            "no accounts and a primary account",
+            "one account, which is also the primary account",
             json!({
                 "Name": "Auto2",
-                "AccountGrouping": { "LinkedAccountIds": [], "AutoAssociate": true },
+                "AccountGrouping": { "LinkedAccountIds": ["222222222222"], "AutoAssociate": true },
                 "ComputationPreference": { "PricingPlanArn": plan },
                 "PrimaryAccountId": "222222222222",
             }),
@@ -320,7 +320,7 @@ async fn a_second_create_asking_for_auto_associate_is_refused() {
             json!({
                 "Name": "Auto6",
                 "ClientToken": "auto-associate-cap-token",
-                "AccountGrouping": { "LinkedAccountIds": [], "AutoAssociate": true },
+                "AccountGrouping": { "LinkedAccountIds": ["777777777777"], "AutoAssociate": true },
                 "ComputationPreference": { "PricingPlanArn": plan },
                 "PrimaryAccountId": "777777777777",
             }),
@@ -496,7 +496,7 @@ async fn handing_the_election_back_frees_it_for_the_next_group() {
     let other = em
         .created(&json!({
             "Name": "Successor",
-            "AccountGrouping": { "LinkedAccountIds": [] },
+            "AccountGrouping": { "LinkedAccountIds": ["222233334444"] },
             "ComputationPreference": { "PricingPlanArn": plan },
             "PrimaryAccountId": "222233334444",
         }))
@@ -567,7 +567,7 @@ async fn handing_the_election_back_frees_it_for_the_next_group() {
     let fresh = em
         .created(&json!({
             "Name": "CreatedAfterHandover",
-            "AccountGrouping": { "LinkedAccountIds": [], "AutoAssociate": true },
+            "AccountGrouping": { "LinkedAccountIds": ["555566667777"], "AutoAssociate": true },
             "ComputationPreference": { "PricingPlanArn": plan },
             "PrimaryAccountId": "555566667777",
         }))
@@ -617,7 +617,7 @@ async fn an_update_cannot_elect_a_second_group_whatever_else_it_carries() {
         UpdateCase {
             case: "only AutoAssociate, on a group with a primary account",
             group: json!({
-                "AccountGrouping": { "LinkedAccountIds": [] },
+                "AccountGrouping": { "LinkedAccountIds": ["222233334444"] },
                 "PrimaryAccountId": "222233334444",
             }),
             patch: json!({ "AccountGrouping": { "AutoAssociate": true } }),
@@ -638,7 +638,7 @@ async fn an_update_cannot_elect_a_second_group_whatever_else_it_carries() {
         UpdateCase {
             case: "AutoAssociate beside a description and another pricing plan",
             group: json!({
-                "AccountGrouping": {},
+                "AccountGrouping": { "LinkedAccountIds": ["444455556666"] },
                 "Description": "the description the group already holds",
                 "PrimaryAccountId": "444455556666",
             }),
@@ -652,7 +652,7 @@ async fn an_update_cannot_elect_a_second_group_whatever_else_it_carries() {
         UpdateCase {
             case: "AutoAssociate beside a Status the group's billing owner admits",
             group: json!({
-                "AccountGrouping": { "LinkedAccountIds": [] },
+                "AccountGrouping": { "LinkedAccountIds": ["555566667777"] },
                 "PrimaryAccountId": "555566667777",
             }),
             patch: json!({
@@ -691,7 +691,7 @@ async fn an_update_cannot_elect_a_second_group_whatever_else_it_carries() {
         UpdateCase {
             case: "a group that already carries the flag as false asks for true",
             group: json!({
-                "AccountGrouping": { "LinkedAccountIds": [], "AutoAssociate": false },
+                "AccountGrouping": { "LinkedAccountIds": ["111100002222"], "AutoAssociate": false },
                 "PrimaryAccountId": "111100002222",
             }),
             patch: json!({ "AccountGrouping": { "AutoAssociate": true } }),
@@ -773,7 +773,7 @@ async fn an_update_that_does_not_raise_the_enabled_count_is_served() {
         (
             "AutoAssociate false beside a rename",
             json!({
-                "AccountGrouping": { "LinkedAccountIds": [] },
+                "AccountGrouping": { "LinkedAccountIds": ["222233334444"] },
                 "PrimaryAccountId": "222233334444",
             }),
             json!({
@@ -792,15 +792,18 @@ async fn an_update_that_does_not_raise_the_enabled_count_is_served() {
             None,
         ),
         (
-            "an empty AccountGrouping",
-            json!({ "AccountGrouping": {}, "PrimaryAccountId": "444455556666" }),
+            "an AccountGrouping carrying only the primary account",
+            json!({
+                "AccountGrouping": { "LinkedAccountIds": ["444455556666"] },
+                "PrimaryAccountId": "444455556666",
+            }),
             json!({ "AccountGrouping": {} }),
             None,
         ),
         (
             "a group that already has the flag off restating false",
             json!({
-                "AccountGrouping": { "LinkedAccountIds": [], "AutoAssociate": false },
+                "AccountGrouping": { "LinkedAccountIds": ["555566667777"], "AutoAssociate": false },
                 "PrimaryAccountId": "555566667777",
             }),
             json!({ "AccountGrouping": { "AutoAssociate": false } }),
