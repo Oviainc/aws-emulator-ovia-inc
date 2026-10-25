@@ -43,3 +43,22 @@ None of the three carried an ALREADY FILED or OWNED-by marker in the replay repo
 3. GET the invoke URL the emulator announced for that api id and stage, once for each route key. Expect HTTP 200 with the integration's response and the path parameter present in the event; observe no answer at all.
 4. ImportApi with an OpenAPI body carrying x-amazon-apigateway-integration payloadFormatVersion, deploy it, and GET the announced invoke URL; then ReimportApi with a changed body and GET again. Expect the served route/event shape to follow the imported document.
 5. Re-replay the three check ids in trace_ids.
+
+## Status note (resolved IN PART, remainder carried forward)
+
+What landed for this report: the invoke URL this control plane announces is served from the api's
+own records — the claim, stage resolution, the deployment gate, route-key matching with precedence
+and the authorization step
+(`services/service-com-amazonaws-apigatewayv2-apigatewayv2/src/service/invoke.rs`) — `ImportApi`
+persists one route per declared operation and one integration per
+`x-amazon-apigateway-integration` (with that extension's `payloadFormatVersion`), and `ReimportApi`
+is implemented: it PUTs the definition over the api, replacing its routes and integrations, so a
+reimported document changes which route answers. Two suites pin those rules end-to-end:
+`tests/all/http_api_route_precedence.rs` and `tests/all/api_reimport.rs`.
+
+What is NOT done, and is not claimed here: the three checks of this report still time out, because
+each polls the invoke URL for HTTP 200 and its matched route fronts an `AWS_PROXY` (Lambda)
+integration, which cannot answer while there is no in-process runtime for a deployment package
+(`services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/invoke.rs` answers 501). Their
+three replay keys are carried forward, with that cause, in
+`issues/things-that-do-not-work/20261025T030504Z-apigatewayv2-lambda-an-aws-proxy-route-cannot-answer-200-until-a.md`.

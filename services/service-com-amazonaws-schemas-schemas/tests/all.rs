@@ -57,6 +57,8 @@ mod search_keyword_index;
 mod search_schemas;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stop_discoverer.rs"]
+mod stop_discoverer;
 #[path = "all/update_description.rs"]
 mod update_description;
 #[path = "all/update_schema_versions.rs"]

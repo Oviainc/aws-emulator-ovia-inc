@@ -164,12 +164,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let guard = state.lock();
 
-        if !guard.servers.contains_key(&input.server_id) {
+        // The server is resolved first — its configuration is what decides whether an
+        // access grant can exist at all — and an id the store does not hold is not
+        // found, exactly as for every other operation of this service.
+        let Some(server) = guard.servers.get(&input.server_id) else {
             return Err(st::not_found(
                 DescribeAccessErrorModeled::ResourceNotFoundException(st::unknown_server(
                     &input.server_id,
                 )),
             ));
+        };
+
+        // The server-type gate precedes the `ExternalId` lookup, exactly as in
+        // `CreateAccess` and `DeleteAccess`: on a server with no directory the request
+        // names a group that cannot exist, which is a malformed request rather than a
+        // missing grant — so an `ExternalId` that was never granted on such a server is
+        // told that, and the two cases stay distinguishable.
+        if server.identity_provider_type != st::IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE {
+            return Err(DescribeAccessErrorModeled::InvalidRequestException(
+                st::accesses_require_directory_provider(
+                    st::ACCESS_ACTION_DESCRIBE,
+                    &server.identity_provider_type,
+                ),
+            )
+            .into());
         }
 
         let key = (input.server_id.clone(), input.external_id.clone());

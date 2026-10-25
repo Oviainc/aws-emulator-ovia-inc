@@ -88,8 +88,10 @@ pub const DNS_PORT: i32 = 53;
 /// Do53." `Do53` is a member of the model's `Protocol` enum.
 pub const DEFAULT_PROTOCOL: &str = "Do53";
 
-/// How long a Resolver endpoint (and each IP address being attached) reports
-/// its transient status before the clock owes the move to the settled one.
+/// How long a resource with a transition in flight (a Resolver endpoint and
+/// each IP address being attached, a rule association, a firewall domain list
+/// whose domains were just updated) reports its transient status before the
+/// clock owes the move to the settled one.
 ///
 /// AWS answers `CreateResolverEndpoint` with `Status: CREATING` and takes
 /// minutes to reach `OPERATIONAL`; an emulator must not make a caller wait that
@@ -254,6 +256,31 @@ pub const MAX_STORED_RULE_ASSOCIATIONS: usize = 1_000;
 /// firewall domain list", which is settled the moment it exists, so the clock
 /// owes it no transition.
 pub const FIREWALL_DOMAIN_LIST_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// The `FirewallDomainListStatus` a domain list reports while a change to its
+/// domains is still settling, the model's `UPDATING`: it is what
+/// `UpdateFirewallDomains` reports as "the status of the UpdateFirewallDomains
+/// request". The move to [`FIREWALL_DOMAIN_LIST_STATUS_COMPLETE`] is the one
+/// the clock owes, [`PROVISIONING_DELAY`] after the call that started it.
+pub const FIREWALL_DOMAIN_LIST_STATUS_UPDATING: &str = "UPDATING";
+
+/// The most domains one `UpdateFirewallDomains` request may carry.
+///
+/// `UpdateFirewallDomains$Domains`'s doc states it: "There is a limit of 1000
+/// domains per request." A request past it is refused with the
+/// `LimitExceededException` the operation models, before the store is locked,
+/// so nothing is written.
+pub const MAX_DOMAINS_PER_UPDATE: usize = 1_000;
+
+/// The most domains one stored domain list holds.
+///
+/// Not a published AWS quota — the same reasoning as [`MAX_SECURITY_GROUP_IDS`]:
+/// one call adds at most [`MAX_DOMAINS_PER_UPDATE`] domains and may be repeated
+/// without limit, so without this bound a caller looping updates would grow one
+/// emulator process without limit. An update that would carry a list past it is
+/// refused with the `LimitExceededException` the operation models, and the
+/// stored list is left exactly as it was.
+pub const MAX_DOMAINS_PER_LIST: usize = 10_000;
 
 /// `ResourceNotFoundException$ResourceType` for a firewall domain list: the
 /// modelled shape name of the resource, as for
@@ -430,6 +457,47 @@ pub fn firewall_domain_list_not_found(
     }
 }
 
+/// The key a firewall domain list decides membership on: the domain name, case
+/// folded.
+///
+/// DNS names are case-insensitive (RFC 4343 §1), so `Example.com` and
+/// `example.com` name ONE domain: adding the second to a list that already
+/// holds the first adds nothing, and removing either removes the entry. Only
+/// the comparison is folded — a stored domain keeps the text the request wrote.
+pub fn firewall_domain_key(domain: &str) -> String {
+    domain.to_ascii_lowercase()
+}
+
+/// Whether `domain` satisfies the requirements
+/// `UpdateFirewallDomains$Domains`'s doc states for "each domain specification
+/// in your domain list": "It can optionally start with * (asterisk). With the
+/// exception of the optional starting asterisk, it must only contain the
+/// following characters: A-Z, a-z, 0-9, - (hyphen)."
+///
+/// The doc's character list omits the two separators a domain name is written
+/// with, which its own wildcard form (`*.example.com`) requires, so a name is
+/// read as DNS labels: the optional leading asterisk, then labels of the
+/// documented characters (plus the underscore of an underscored service name,
+/// RFC 8552 §1) separated by dots, each label non-empty and within the 63
+/// octets RFC 1035 §2.3.4 allows, optionally ending in the root label written
+/// as a trailing dot (RFC 1035 §3.1). The length is the model's own
+/// (`FirewallDomainName`, 1..255), already enforced before a handler runs.
+pub fn firewall_domain_is_wellformed(domain: &str) -> bool {
+    let name = match domain.strip_prefix('*') {
+        Some(rest) => rest.strip_prefix('.').unwrap_or(rest),
+        None => domain,
+    };
+    let labels = name.strip_suffix('.').unwrap_or(name);
+    !labels.is_empty()
+        && labels.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        })
+}
+
 /// The `ManagedOwnerName` of every domain list DNS Firewall itself publishes.
 ///
 /// `FirewallDomainList$ManagedOwnerName`'s doc states it: "the managed domain
@@ -594,6 +662,10 @@ pub struct FirewallDomainListRecord {
     pub tags: Vec<Tag>,
     pub creation_time: String,
     pub modification_time: String,
+    /// The instant at which the move from the transient [`Self::status`] to
+    /// `COMPLETE` is owed, or `None` for a list with no transition in flight
+    /// (one nobody has changed since it was created empty).
+    pub settled_at: Option<Instant>,
 }
 
 impl FirewallDomainListRecord {
@@ -603,14 +675,25 @@ impl FirewallDomainListRecord {
         i32::try_from(self.domains.len()).unwrap_or(i32::MAX)
     }
 
+    /// This list's `FirewallDomainListStatus` as of `now`: the transient status
+    /// until the transition the clock owes falls due,
+    /// [`FIREWALL_DOMAIN_LIST_STATUS_COMPLETE`] after it — the same shape as
+    /// [`ResolverEndpointRecord::status_at`].
+    pub fn status_at(&self, now: Instant) -> &str {
+        match self.settled_at {
+            Some(due) if now < due => &self.status,
+            _ => FIREWALL_DOMAIN_LIST_STATUS_COMPLETE,
+        }
+    }
+
     /// Project the record onto the modelled `FirewallDomainList`.
-    pub fn to_domain_list(&self) -> FirewallDomainList {
+    pub fn to_domain_list(&self, now: Instant) -> FirewallDomainList {
         FirewallDomainList {
             id: Some(self.id.clone()),
             arn: Some(self.arn.clone()),
             name: Some(self.name.clone()),
             domain_count: Some(self.domain_count()),
-            status: Some(self.status.clone()),
+            status: Some(self.status_at(now).to_string()),
             status_message: self.status_message.clone(),
             // `ManagedOwnerName`, `Category` and `ManagedListType` describe "the
             // managed domain list" kinds AWS itself publishes; a list this
@@ -1368,12 +1451,25 @@ pub fn paginate<T>(
     max_results: Option<i32>,
     next_token: Option<&str>,
 ) -> Option<Page<T>> {
+    paginate_up_to(all, scope, max_results, next_token, MAX_RESULTS_RANGE.1)
+}
+
+/// [`paginate`] for a list operation whose `MaxResults` range is not the usual
+/// 1..100: `largest_page` is the maximum THAT operation's range declares, so a
+/// page is never cut shorter than a caller the model lets ask for more.
+pub fn paginate_up_to<T>(
+    all: Vec<T>,
+    scope: &str,
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+    largest_page: i32,
+) -> Option<Page<T>> {
     let offset = match next_token {
         Some(token) => parse_page_token(scope, token)?,
         None => 0,
     };
     let page_size = max_results
-        .map(|requested| requested.clamp(MAX_RESULTS_RANGE.0, MAX_RESULTS_RANGE.1))
+        .map(|requested| requested.clamp(MAX_RESULTS_RANGE.0, largest_page.max(MAX_RESULTS_RANGE.0)))
         .and_then(|bounded| usize::try_from(bounded).ok())
         .unwrap_or(DEFAULT_PAGE_SIZE);
 

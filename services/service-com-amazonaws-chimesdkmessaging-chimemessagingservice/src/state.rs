@@ -17,9 +17,10 @@ use std::collections::{HashMap, VecDeque};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    Channel, ChannelFlow, ChannelFlowSummary, ChannelMessage, ChannelMessageStatusStructure,
-    ChannelMessageSummary, ChannelSummary, ElasticChannelConfiguration, ExpirationSettings,
-    Identity, MessageAttributeValue, Processor, Tag, Target,
+    Channel, ChannelBan, ChannelBanSummary, ChannelFlow, ChannelFlowSummary, ChannelMembership,
+    ChannelMembershipSummary, ChannelMessage, ChannelMessageStatusStructure, ChannelMessageSummary,
+    ChannelModerator, ChannelModeratorSummary, ChannelSummary, ElasticChannelConfiguration,
+    ExpirationSettings, Identity, MessageAttributeValue, Processor, Tag, Target,
 };
 
 /// How many `CreateChannel` idempotency records this emulator keeps.
@@ -81,6 +82,25 @@ pub const MAX_STORED_CHANNEL_FLOWS: usize = 256;
 /// retention path respects, because a message larger than [`MAX_MESSAGE_BYTES`] is
 /// refused rather than stored.
 pub const MAX_STORED_CHANNELS: usize = 256;
+
+/// How many memberships one channel keeps.
+///
+/// `CreateChannelMembership` is the only way to add one and `DeleteChannelMembership` /
+/// `CreateChannelBan` the only ways to remove one, and that reclamation is the CALLER's
+/// option — so the collection needs a bound of its own. Past this many members
+/// `CreateChannelMembership` answers the modelled `ResourceLimitExceededException`
+/// instead of adding another, which is also how the real service reports a quota it will
+/// not exceed. This emulator's own choice, not a modelled or documented service limit.
+pub const MAX_MEMBERSHIPS_PER_CHANNEL: usize = 256;
+
+/// How many bans one channel keeps, for the same reason and with the same refusal as
+/// [`MAX_MEMBERSHIPS_PER_CHANNEL`] — `DeleteChannelBan` is the only way one leaves.
+pub const MAX_BANS_PER_CHANNEL: usize = 256;
+
+/// How many moderators one channel keeps, for the same reason and with the same refusal
+/// as [`MAX_MEMBERSHIPS_PER_CHANNEL`] — `DeleteChannelModerator` is the only way one
+/// leaves.
+pub const MAX_MODERATORS_PER_CHANNEL: usize = 64;
 
 /// How many messages one channel keeps.
 ///
@@ -350,6 +370,44 @@ pub struct ChannelRecord {
     pub messages: Vec<ChannelMessageRecord>,
     /// `ClientRequestToken -> MessageId` for this channel's `SendChannelMessage` calls.
     pub message_idempotency: HashMap<String, String>,
+    /// The channel's members, in the order they were added — the set `SendChannelMessage`
+    /// and the privacy rule read, `ListChannelMemberships` pages and `SearchChannels`
+    /// matches on.
+    pub memberships: Vec<ChannelMembershipRecord>,
+    /// The members banned from the channel, in the order they were banned.
+    pub bans: Vec<ChannelBanRecord>,
+    /// The channel's moderators, in the order they were added. The `AppInstanceUser` that
+    /// created the channel is its first one.
+    pub moderators: Vec<ChannelModeratorRecord>,
+}
+
+/// One member added to a channel by `CreateChannelMembership`.
+#[derive(Debug, Clone)]
+pub struct ChannelMembershipRecord {
+    pub member_arn: String,
+    /// `ChannelMembershipType` wire value — see `CHANNEL_MEMBERSHIP_TYPE_VALUES`.
+    pub r#type: String,
+    /// The caller that added this member, which the model calls `InvitedBy`.
+    pub invited_by: Identity,
+    pub created_millis: i64,
+    pub last_updated_millis: i64,
+}
+
+/// One member banned from a channel by `CreateChannelBan`.
+#[derive(Debug, Clone)]
+pub struct ChannelBanRecord {
+    pub member_arn: String,
+    pub created_by: Identity,
+    pub created_millis: i64,
+}
+
+/// One moderator of a channel: the caller that created it, or one added by
+/// `CreateChannelModerator`.
+#[derive(Debug, Clone)]
+pub struct ChannelModeratorRecord {
+    pub moderator_arn: String,
+    pub created_by: Identity,
+    pub created_millis: i64,
 }
 
 /// One message appended to a channel by `SendChannelMessage`.
@@ -412,6 +470,70 @@ impl ChannelRecord {
         self.messages.iter().find(|m| m.message_id == message_id)
     }
 
+    /// The membership of `member_arn`, if this channel holds one.
+    pub fn membership(&self, member_arn: &str) -> Option<&ChannelMembershipRecord> {
+        self.memberships
+            .iter()
+            .find(|m| m.member_arn == member_arn)
+    }
+
+    /// Whether `member_arn` is a member of this channel.
+    pub fn is_member(&self, member_arn: &str) -> bool {
+        self.membership(member_arn).is_some()
+    }
+
+    /// The moderator record of `moderator_arn`, if this channel holds one.
+    pub fn moderator(&self, moderator_arn: &str) -> Option<&ChannelModeratorRecord> {
+        self.moderators
+            .iter()
+            .find(|m| m.moderator_arn == moderator_arn)
+    }
+
+    /// Whether `moderator_arn` moderates this channel.
+    pub fn is_moderator(&self, moderator_arn: &str) -> bool {
+        self.moderator(moderator_arn).is_some()
+    }
+
+    /// The ban on `member_arn`, if this channel holds one.
+    pub fn ban(&self, member_arn: &str) -> Option<&ChannelBanRecord> {
+        self.bans.iter().find(|b| b.member_arn == member_arn)
+    }
+
+    /// Whether `member_arn` is banned from this channel.
+    pub fn is_banned(&self, member_arn: &str) -> bool {
+        self.ban(member_arn).is_some()
+    }
+
+    /// Whether `caller` may READ this channel's messages.
+    ///
+    /// The model states the rule on `CreateChannelMembership`: a PUBLIC channel's messages
+    /// can be listed without a membership, a PRIVATE channel's only by its members. A
+    /// moderator of the channel reads it the way a member does.
+    pub fn readable_by(&self, caller: &str) -> bool {
+        self.privacy != "PRIVATE" || self.is_member(caller) || self.is_moderator(caller)
+    }
+
+    /// The `Message` a read of this channel by `caller` is refused with, or `None` when
+    /// the caller may read it.
+    ///
+    /// One function, so every reporting operation on a channel refuses for the same two
+    /// reasons and words each one the same way: a member BANNED from the channel is out
+    /// of it altogether, whatever the channel's privacy, and a caller that is not a member
+    /// cannot read a PRIVATE one.
+    pub fn read_refusal(&self, caller: &str) -> Option<&'static str> {
+        if self.is_banned(caller) {
+            return Some(BANNED_MESSAGE);
+        }
+        (!self.readable_by(caller)).then_some(INSUFFICIENT_ACCESS_MESSAGE)
+    }
+
+    /// Drop `member_arn`'s membership, answering whether this channel held one.
+    pub fn remove_membership(&mut self, member_arn: &str) -> bool {
+        let before = self.memberships.len();
+        self.memberships.retain(|m| m.member_arn != member_arn);
+        self.memberships.len() != before
+    }
+
     /// Append `message`, recording `client_request_token` as the token that produced it.
     ///
     /// The OLDEST messages are then dropped until the channel is inside both
@@ -454,11 +576,14 @@ impl ChannelMessageRecord {
     /// The modelled `ChannelMessage` this record describes, as `GetChannelMessage`
     /// returns it. The channel ARN is the owning channel's, which the record does not
     /// repeat.
+    ///
+    /// A REDACTED message carries no `Content` and no `MessageAttributes`: redaction
+    /// removes what the message carried while the message itself stays in the channel.
     pub fn to_channel_message(&self, channel_arn: &str) -> ChannelMessage {
         ChannelMessage {
             channel_arn: Some(channel_arn.to_string()),
             message_id: Some(self.message_id.clone()),
-            content: Some(self.content.clone()),
+            content: self.visible_content(),
             metadata: self.metadata.clone(),
             r#type: Some(self.r#type.clone()),
             created_timestamp: Some(date_time(self.created_millis)),
@@ -468,7 +593,7 @@ impl ChannelMessageRecord {
             redacted: self.redacted,
             persistence: Some(self.persistence.clone()),
             status: Some(self.status_structure()),
-            message_attributes: self.message_attributes.clone(),
+            message_attributes: self.visible_attributes(),
             // Sub-channels belong to elastic channels, which this slice does not serve.
             sub_channel_id: None,
             content_type: self.content_type.clone(),
@@ -480,7 +605,7 @@ impl ChannelMessageRecord {
     pub fn to_summary(&self) -> ChannelMessageSummary {
         ChannelMessageSummary {
             message_id: Some(self.message_id.clone()),
-            content: Some(self.content.clone()),
+            content: self.visible_content(),
             metadata: self.metadata.clone(),
             r#type: Some(self.r#type.clone()),
             created_timestamp: Some(date_time(self.created_millis)),
@@ -489,10 +614,35 @@ impl ChannelMessageRecord {
             sender: Some(self.sender.clone()),
             redacted: self.redacted,
             status: Some(self.status_structure()),
-            message_attributes: self.message_attributes.clone(),
+            message_attributes: self.visible_attributes(),
             content_type: self.content_type.clone(),
             target: self.target.clone(),
         }
+    }
+
+    /// The `Content` a reader sees: the content as sent, or none once the message was
+    /// redacted.
+    fn visible_content(&self) -> Option<String> {
+        (!self.redacted).then(|| self.content.clone())
+    }
+
+    /// The `MessageAttributes` a reader sees, which redaction removes with the content.
+    fn visible_attributes(&self) -> Option<HashMap<String, MessageAttributeValue>> {
+        if self.redacted {
+            return None;
+        }
+        self.message_attributes.clone()
+    }
+
+    /// Redact this message: its content, metadata and attributes are dropped from the
+    /// store and the message itself stays in the channel, so every later reader reports
+    /// the message with `Redacted` true and none of what it carried.
+    pub fn redact(&mut self, now: i64) {
+        self.content.clear();
+        self.metadata = None;
+        self.message_attributes = None;
+        self.redacted = true;
+        self.last_updated_millis = now;
     }
 
     /// This message's delivery status as the modelled structure.
@@ -519,6 +669,96 @@ impl ChannelMessageRecord {
             )
     }
 }
+
+impl ChannelMembershipRecord {
+    /// The modelled `ChannelMembership`, as `DescribeChannelMembership` returns it.
+    pub fn to_channel_membership(&self, channel_arn: &str) -> ChannelMembership {
+        ChannelMembership {
+            invited_by: Some(self.invited_by.clone()),
+            r#type: Some(self.r#type.clone()),
+            member: Some(identity_of(&self.member_arn)),
+            channel_arn: Some(channel_arn.to_string()),
+            created_timestamp: Some(date_time(self.created_millis)),
+            last_updated_timestamp: Some(date_time(self.last_updated_millis)),
+            // Sub-channels belong to elastic channels, which this slice does not serve.
+            sub_channel_id: None,
+        }
+    }
+
+    /// The modelled `ChannelMembershipSummary`, as `ListChannelMemberships` returns it.
+    pub fn to_summary(&self) -> ChannelMembershipSummary {
+        ChannelMembershipSummary {
+            member: Some(identity_of(&self.member_arn)),
+        }
+    }
+}
+
+impl ChannelBanRecord {
+    /// The modelled `ChannelBan`, as `DescribeChannelBan` returns it.
+    pub fn to_channel_ban(&self, channel_arn: &str) -> ChannelBan {
+        ChannelBan {
+            member: Some(identity_of(&self.member_arn)),
+            channel_arn: Some(channel_arn.to_string()),
+            created_timestamp: Some(date_time(self.created_millis)),
+            created_by: Some(self.created_by.clone()),
+        }
+    }
+
+    /// The modelled `ChannelBanSummary`, as `ListChannelBans` returns it.
+    pub fn to_summary(&self) -> ChannelBanSummary {
+        ChannelBanSummary {
+            member: Some(identity_of(&self.member_arn)),
+        }
+    }
+}
+
+impl ChannelModeratorRecord {
+    /// The modelled `ChannelModerator`, as `DescribeChannelModerator` returns it.
+    pub fn to_channel_moderator(&self, channel_arn: &str) -> ChannelModerator {
+        ChannelModerator {
+            moderator: Some(identity_of(&self.moderator_arn)),
+            channel_arn: Some(channel_arn.to_string()),
+            created_timestamp: Some(date_time(self.created_millis)),
+            created_by: Some(self.created_by.clone()),
+        }
+    }
+
+    /// The modelled `ChannelModeratorSummary`, as `ListChannelModerators` returns it.
+    pub fn to_summary(&self) -> ChannelModeratorSummary {
+        ChannelModeratorSummary {
+            moderator: Some(identity_of(&self.moderator_arn)),
+        }
+    }
+}
+
+/// The `Message` this service answers an authorization refusal with.
+///
+/// Amazon Chime SDK Messaging words every `ForbiddenException` the same way, whatever
+/// the caller's role and whichever resource it asked for — so the sentence is stated
+/// ONCE here and every operation's refusal reads it, rather than each one inventing its
+/// own wording. The reason a particular request was refused stays in the comment at the
+/// refusal, which is where a maintainer needs it; a client branches on the `Code`, which
+/// is `Forbidden`.
+pub const INSUFFICIENT_ACCESS_MESSAGE: &str =
+    "You do not have sufficient access to perform this action.";
+
+/// The `Message` a request by a member BANNED from the channel is refused with.
+///
+/// A ban is the one refusal this service words for its reason rather than with
+/// [`INSUFFICIENT_ACCESS_MESSAGE`]: a banned member is out of the channel, so every
+/// operation on it — sending a message as much as reading one — tells them the ban is
+/// why.
+pub const BANNED_MESSAGE: &str = "App instance user is banned from Channel.";
+
+/// The `Message` a request whose `@idempotencyToken` was already used for a DIFFERENT
+/// request is refused with, beside the modelled `ConflictException`.
+///
+/// One token stands for one request: replaying it answers with the resource the first
+/// request produced, and reusing it for another request is a conflict rather than a second
+/// resource. Stated once here so `CreateChannel` and `SendChannelMessage` refuse a reused
+/// token identically.
+pub const TOKEN_CONFLICT_MESSAGE: &str =
+    "The provided ClientRequestToken is already associated with an existing resource.";
 
 /// Now, as epoch milliseconds — the resolution the restJson1 timestamps carry.
 pub fn now_millis() -> i64 {
@@ -585,6 +825,39 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsChimesdkmessagingChimemessagingserviceState>)
+}
+
+/// The SHARED app-instance ADMIN directory in the shared engine: call it with a
+/// handler's `&*self.engine`.
+///
+/// An `AppInstanceAdmin` is a resource of the Chime SDK Identity service, which records
+/// every promotion in ONE directory under one shared type
+/// ([`::service_common::chime_app_instance_admins::AppInstanceAdminDirectory`]); this
+/// service READS it, because the model reserves two of its actions for an administrator
+/// of the app instance — listing an account's PRIVATE channels (`ListChannels`) and
+/// deleting a channel message (`DeleteChannelMessage`). The engine keys state by TYPE, so
+/// a copy of its own inside
+/// [`ComAmazonawsChimesdkmessagingChimemessagingserviceState`] would never see what the
+/// identity service wrote.
+///
+/// LOCK ORDER: a reader takes [`service_state`] first and this directory second, and
+/// never the other way round, so the order cannot invert.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn app_instance_admins<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<
+        ::service_common::chime_app_instance_admins::AppInstanceAdminDirectory,
+    >,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::chime_app_instance_admins::AppInstanceAdminDirectory,
+            >,
+        )
 }
 
 /// The `aws.api#service$arnNamespace` a `LambdaFunctionArn` carries, which is what

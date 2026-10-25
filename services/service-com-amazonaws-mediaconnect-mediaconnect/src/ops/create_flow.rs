@@ -104,10 +104,6 @@ use crate::state::{StoredFlow, StoredMediaStream, StoredOutput, StoredSource};
 /// minting side and the ARN-recognising side name it once.
 use crate::state::SERVICE_NAMESPACE;
 
-/// `NetworkInterfaceType` (`ena | efa`) applied when a VPC interface request omits one;
-/// `ena` is the standard elastic network adapter.
-const NETWORK_INTERFACE_TYPE_ENA: &str = "ena";
-
 /// Refuse the request with the service's own client-input error, `BadRequestException`
 /// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
 /// unacceptable; the message carries it inside this service's refusal envelope
@@ -180,22 +176,6 @@ fn requested_ndi_feature(input: &CreateFlowInput, sources: &[SetSourceRequest]) 
         });
     }
     None
-}
-
-/// Materialise one `VpcInterfaceRequest` into the VPC interface the flow carries.
-fn materialise_vpc_interface(request: &VpcInterfaceRequest, suffix: u64) -> VpcInterface {
-    VpcInterface {
-        name: request.name.clone(),
-        // The elastic network interface the service creates in the caller's subnet.
-        network_interface_ids: vec![format!("eni-{suffix:017x}")],
-        network_interface_type: request
-            .network_interface_type
-            .clone()
-            .unwrap_or_else(|| NETWORK_INTERFACE_TYPE_ENA.to_string()),
-        role_arn: request.role_arn.clone(),
-        security_group_ids: request.security_group_ids.clone(),
-        subnet_id: request.subnet_id.clone(),
-    }
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -533,10 +513,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             media_streams.push(crate::state::materialise_media_stream(request, fmt));
         }
 
+        // A VPC interface is addressed by name within its flow and its name "has to be a
+        // unique against other VpcInterfaces in this Flow", so the ones this request
+        // creates are named against each other — and materialised through `crate::state`, so
+        // a VPC interface this create stores is indistinguishable from one
+        // AddFlowVpcInterfaces appends later, and both refuse the same requests.
         let mut vpc_interfaces = Vec::new();
+        let mut vpc_interface_names: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
         for request in input.vpc_interfaces.iter().flatten() {
+            if let Some(rejection) =
+                crate::state::vpc_interface_rejection(request, &vpc_interface_names)
+            {
+                return Err(bad_request(rejection));
+            }
+            vpc_interface_names.insert(request.name.clone());
             let suffix = store.next_suffix();
-            vpc_interfaces.push(materialise_vpc_interface(request, suffix));
+            vpc_interfaces.push(crate::state::materialise_vpc_interface(request, suffix));
         }
 
         let stored = StoredFlow {

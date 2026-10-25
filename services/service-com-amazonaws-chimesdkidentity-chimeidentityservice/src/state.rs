@@ -238,6 +238,37 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsChimesdkidentityChimeidentityserviceState>)
 }
 
+/// The SHARED app-instance ADMIN directory in the shared engine: call it with a
+/// handler's `&*self.engine`.
+///
+/// An `AppInstanceAdmin` is promoted here and the role it grants is read by Chime SDK
+/// Messaging, which reserves an app instance's private-channel listing and its message
+/// deletion for an administrator. The engine keys state by TYPE, so the promotions live
+/// in ONE directory under one shared type
+/// ([`::service_common::chime_app_instance_admins::AppInstanceAdminDirectory`]) rather
+/// than in a copy inside [`ComAmazonawsChimesdkidentityChimeidentityserviceState`],
+/// which the messaging service could not see.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this directory second, and no
+/// reader holds this one while taking another store, so the order cannot invert.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn app_instance_admins<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<
+        ::service_common::chime_app_instance_admins::AppInstanceAdminDirectory,
+    >,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::chime_app_instance_admins::AppInstanceAdminDirectory,
+            >,
+        )
+}
+
 /// The region to mint an ARN in: the one the caller signed for, else
 /// [`DEFAULT_REGION`]. Read from the SigV4 credential scope, the same signal the
 /// router routes on, so an ARN is in the region the client addressed.
@@ -311,6 +342,21 @@ pub fn wire_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
         .duration_since(UNIX_EPOCH)
         .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0);
+    ::aws_smithy_types::DateTime::from_millis(millis)
+}
+
+/// Now, as epoch MILLISECONDS — the resolution the shared app-instance admin directory
+/// records a promotion at, so both services that read it agree on the instant without
+/// either having to agree on a Rust clock type.
+pub fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// An epoch-milliseconds instant as the wire timestamp the model declares.
+pub fn wire_timestamp_of_millis(millis: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis(millis)
 }
 

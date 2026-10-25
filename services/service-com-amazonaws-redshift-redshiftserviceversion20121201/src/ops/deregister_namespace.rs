@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases one namespace registration: the namespace the request names stops being
+//! registered to the consumer account it names, and the call reports the release as
+//! under way. The record this service stored for that pair leaves the store once the
+//! release falls due, so a namespace nothing registered cannot be released. The cluster
+//! of a provisioned namespace is being modified from this call until the change falls
+//! due, applied by the store's clock-owed settle.
 //!
 //! ## Shape of an operation
 //!
@@ -88,12 +85,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DeregisterNamespaceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeregisterNamespace")]
+// `DependentServiceUnavailableFault` is widened in, exactly as `RebootCluster`
+// widens it: the model does not list it for this operation, but the service
+// declares the shape, and it is the only modelled way to say "the control-plane
+// store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeregisterNamespace",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeregisterNamespaceErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     InvalidClusterStateFault(InvalidClusterStateFault),
     InvalidNamespaceFault(InvalidNamespaceFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,23 +147,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DEREGISTER_NAMESPACE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Release the registration of the namespace the request names to the
+    /// consumer account it names.
+    ///
+    /// A MUTATION, and the INVERSE of `RegisterNamespace`: the stored
+    /// registration for that pair is reported `Deregistering` from this call
+    /// and is gone a span later, applied by the store's clock-owed settle
+    /// rather than by this call. A pair this service holds no registration for
+    /// is a namespace there is nothing to release, which is the modelled
+    /// invalid-namespace refusal rather than a release of nothing.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterNamespace"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeregisterNamespaceErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "An array containing the ID of the consumer account": the same one
+        // entry `RegisterNamespace` registers the namespace to, so the two read
+        // the request alike.
+        let Some(requested_consumer) = input.consumer_identifiers.first() else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "ConsumerIdentifiers must carry exactly one consumer account identifier.",
+            ));
+        };
+        let consumer_identifier = st::consumer_account_id(requested_consumer)
+            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
+
+        let started = ::std::time::Instant::now();
+        let mut store = state.lock();
+        store.settle(started);
+
+        // The same precondition rule `RegisterNamespace` applies, so a
+        // namespace that could take no registration cannot take its release
+        // either, and both answer the same error for the same cause.
+        let namespace = store
+            .registration_target(&input.namespace_identifier)
+            .map_err(refused)?;
+
+        let Some(position) = store.namespace_registration_position(&namespace, &consumer_identifier)
+        else {
+            return Err(refused(st::NamespaceRefusal::InvalidNamespace(format!(
+                "The namespace of {} is not registered to consumer account {consumer_identifier}.",
+                namespace.described()
+            ))));
+        };
+
+        let stored = &mut store.namespace_registrations[position];
+        stored.status = st::NAMESPACE_DEREGISTERING.to_string();
+        // The release is not instantaneous: the registration is gone a span
+        // from this call, so a caller acting straight afterwards still observes
+        // it leaving. The due instant is stored and nothing sleeps for it.
+        stored.removed_at = Some(started + st::NAMESPACE_REGISTRATION_SPAN);
+
+        // Releasing a provisioned cluster's namespace registration is a change
+        // to that cluster, exactly as making it is, so the cluster is being
+        // modified from this call until the change falls due.
+        store.begin_namespace_registration_change(&namespace, started);
+
+        Ok(DeregisterNamespaceOutput {
+            status: Some(st::NAMESPACE_DEREGISTERING.to_string()),
+        })
     }
+}
+
+/// The modelled error this operation answers a namespace that can take no
+/// registration change with — the same cause-to-error mapping
+/// `RegisterNamespace` uses, because the two declare the same three errors.
+fn refused(refusal: crate::state::NamespaceRefusal) -> DeregisterNamespaceError {
+    use crate::state::NamespaceRefusal as Refusal;
+    match refusal {
+        Refusal::ClusterNotFound(message) => {
+            DeregisterNamespaceErrorModeled::ClusterNotFoundFault(ClusterNotFoundFault {
+                message: Some(message),
+            })
+        }
+        Refusal::InvalidClusterState(message) => {
+            DeregisterNamespaceErrorModeled::InvalidClusterStateFault(InvalidClusterStateFault {
+                message: Some(message),
+            })
+        }
+        Refusal::InvalidNamespace(message) => {
+            DeregisterNamespaceErrorModeled::InvalidNamespaceFault(InvalidNamespaceFault {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

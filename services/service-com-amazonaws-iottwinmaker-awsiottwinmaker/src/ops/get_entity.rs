@@ -4,7 +4,9 @@
 //! Reads a stored entity back. Every required output member comes from the
 //! stored record or is derived from it: `hasChildEntities` by scanning the
 //! workspace for entities that name this one as parent, and `status.state` from
-//! the state the stored record carries. The
+//! the state the stored record carries, with the transition the clock has
+//! already made due applied (an update in flight is reported `UPDATING` until
+//! its span has elapsed; see `crate::state::Entity::state_at`). The
 //! `components` map is truncated at the documented limits
 //! (`crate::state::MAX_COMPONENTS_RETURNED` components, and
 //! `crate::state::MAX_PROPERTIES_RETURNED` properties per component), with
@@ -216,10 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `status` carries BOTH its modelled members: the entity's stored
-        // state, and the `error` structure every reported status carries (empty
-        // while nothing has failed). See `crate::state::status`.
-        let status = entity.status();
+        // `status` carries BOTH its modelled members: the entity's state as of
+        // now — the stored state with the transition the clock has already made
+        // due applied, which a read reports rather than writes back — and the
+        // `error` structure every reported status carries (empty while nothing
+        // has failed). See `crate::state::Entity::state_at`.
+        let status = entity.status(::std::time::SystemTime::now());
 
         Ok(GetEntityOutput {
             entity_id: entity.entity_id.clone(),

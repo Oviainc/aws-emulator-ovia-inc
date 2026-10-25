@@ -157,11 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Retrieves the specified firewall domain list": a pure read, so the
         // store is only locked for the lookup and nothing is written.
+        let now = ::std::time::Instant::now();
         let stored = state
             .lock()
             .firewall_domain_lists
             .get(&input.firewall_domain_list_id)
-            .map(crate::state::FirewallDomainListRecord::to_domain_list);
+            .map(|record| record.to_domain_list(now));
         if let Some(domain_list) = stored {
             return Ok(GetFirewallDomainListOutput {
                 firewall_domain_list: Some(domain_list),

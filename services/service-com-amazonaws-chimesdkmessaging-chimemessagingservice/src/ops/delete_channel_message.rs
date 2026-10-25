@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteChannelMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteChannelMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteChannelMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a message from its channel, so `GetChannelMessage` and `ListChannelMessages`
+//! stop reporting it — deletion makes a message inaccessible, as the model documents.
+//!
+//! Deleting is an ADMINISTRATOR's action: the model's own documentation for this operation
+//! is that only admins can perform it, so neither the message's sender nor a moderator of
+//! the channel may delete it. An `AppInstanceAdmin` is promoted by the Chime SDK Identity
+//! service and read here through the shared directory
+//! ([`crate::state::app_instance_admins`]): a caller that administers the channel's app
+//! instance deletes the message, and every other caller is refused with the modelled
+//! `ForbiddenException`. A member that wants its own message gone redacts it through
+//! `RedactChannelMessage`, which the model does let a sender or a moderator do.
 //!
 //! ## Shape of an operation
 //!
@@ -119,10 +122,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteChannelMessageOutp
 // here — hence the `DeleteChannelMessageError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#DeleteChannelMessage")]
+// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
+// (`GetChannelMessage` lists it) that this operation's own error list omits: a delete for
+// a channel ARN that names no channel has to say the channel is not there, and answering
+// 400 would tell the caller its REQUEST was malformed when it was not.
+#[smithy_macros::operation_error(
+    "com.amazonaws.chimesdkmessaging#DeleteChannelMessage",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum DeleteChannelMessageErrorModeled {
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -179,20 +190,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteChannelMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteChannelMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteChannelMessage"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteChannelMessageErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+        let directory = crate::state::app_instance_admins(&*self.engine).ok_or_else(|| {
+            DeleteChannelMessageErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstanceAdmin directory is unavailable".to_string()),
+            })
+        })?;
+
+        // Sub-channels exist only on elastic channels, which this slice does not serve.
+        if let Some(sub_channel_id) = &input.sub_channel_id {
+            return Err(DeleteChannelMessageErrorModeled::BadRequestException(
+                BadRequestException {
+                    code: Some("BadRequest".to_string()),
+                    message: Some(format!(
+                        "SubChannelId {sub_channel_id:?} is not supported: this emulator does not serve elastic channels"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
+            DeleteChannelMessageErrorModeled::NotFoundException(NotFoundException {
+                code: Some("NotFound".to_string()),
+                message: Some(format!("channel {} not found", input.channel_arn)),
+            })
+        })?;
+
+        // Only an administrator of the channel's app instance deletes a message: the
+        // caller's role on the CHANNEL — sender, member or moderator — does not carry the
+        // action.
+        let administers = directory
+            .lock()
+            .administers(&channel.app_instance_arn, &input.chime_bearer);
+        if !administers {
+            return Err(DeleteChannelMessageErrorModeled::ForbiddenException(
+                ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Deletion makes the message inaccessible immediately, so the record and the
+        // idempotency entry that named it both go: a `ClientRequestToken` whose message is
+        // gone can mint another rather than resolve to a message no reader can see.
+        let before = channel.messages.len();
+        channel
+            .messages
+            .retain(|message| message.message_id != input.message_id);
+        if channel.messages.len() == before {
+            // This operation models no `NotFoundException` for a message, so a message
+            // the channel does not hold is refused at the message level with the
+            // modelled `ForbiddenException`, as the other message operations do.
+            return Err(DeleteChannelMessageErrorModeled::ForbiddenException(
+                ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        channel
+            .message_idempotency
+            .retain(|_, message_id| *message_id != input.message_id);
+
+        Ok(DeleteChannelMessageOutput)
     }
 }

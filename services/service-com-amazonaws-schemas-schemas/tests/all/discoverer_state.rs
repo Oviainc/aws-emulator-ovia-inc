@@ -27,10 +27,10 @@ use service_com_amazonaws_schemas_schemas::state::{
 use crate::registry_schema_lifecycle::{Answer, Emulator, ACCOUNT, REGION};
 
 /// `CreateDiscoverer`'s route (`POST /v1/discoverers -> 201`).
-const DISCOVERERS_URI: &str = "/v1/discoverers";
+pub(crate) const DISCOVERERS_URI: &str = "/v1/discoverers";
 
 /// `DescribeDiscoverer`'s route.
-fn discoverer_uri(discoverer_id: &str) -> String {
+pub(crate) fn discoverer_uri(discoverer_id: &str) -> String {
     format!("/v1/discoverers/id/{discoverer_id}")
 }
 
@@ -40,19 +40,19 @@ fn start_uri(discoverer_id: &str) -> String {
 }
 
 /// `StopDiscoverer`'s route.
-fn stop_uri(discoverer_id: &str) -> String {
+pub(crate) fn stop_uri(discoverer_id: &str) -> String {
     format!("{}/stop", discoverer_uri(discoverer_id))
 }
 
 /// An event-bus ARN to discover from. One per case, because a source may be discovered
 /// by at most one discoverer.
-fn source_arn(bus: &str) -> String {
+pub(crate) fn source_arn(bus: &str) -> String {
     format!("arn:aws:events:{REGION}:{ACCOUNT}:event-bus/{bus}")
 }
 
 /// Create a discoverer for `bus`, asserting the create succeeded, and return its
 /// minted `DiscovererId`.
-async fn create_discoverer(emulator: &Emulator, case: &str, bus: &str) -> String {
+pub(crate) async fn create_discoverer(emulator: &Emulator, case: &str, bus: &str) -> String {
     let created = emulator
         .call(
             "POST",
@@ -69,7 +69,7 @@ async fn create_discoverer(emulator: &Emulator, case: &str, bus: &str) -> String
 }
 
 /// The `State` a response reports.
-fn state_of(answer: &Answer, case: &str) -> String {
+pub(crate) fn state_of(answer: &Answer, case: &str) -> String {
     let state = answer.str_at("State");
     assert!(
         DISCOVERER_STATE_VALUES.contains(&state.as_str()),
@@ -80,14 +80,14 @@ fn state_of(answer: &Answer, case: &str) -> String {
 
 /// One call of the start/stop pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Move {
+pub(crate) enum Move {
     Start,
     Stop,
 }
 
 impl Move {
     /// The route this call is served on.
-    fn uri(self, discoverer_id: &str) -> String {
+    pub(crate) fn uri(self, discoverer_id: &str) -> String {
         match self {
             Self::Start => start_uri(discoverer_id),
             Self::Stop => stop_uri(discoverer_id),
@@ -96,7 +96,7 @@ impl Move {
 
     /// The state the discoverer is in once this call has been answered — one of
     /// [`DISCOVERER_STATE_VALUES`], whatever state it was in before.
-    fn leaves(self) -> &'static str {
+    pub(crate) fn leaves(self) -> &'static str {
         match self {
             Self::Start => "STARTED",
             Self::Stop => "STOPPED",
