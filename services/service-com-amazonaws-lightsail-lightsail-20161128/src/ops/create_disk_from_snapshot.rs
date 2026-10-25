@@ -240,6 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The same add-on conversion `CreateDisk` goes through, so a disk this
         // operation creates carries exactly the add-ons one created directly can.
         let add_ons = crate::state::disk_add_ons_from_requests(
+            crate::state::ADD_ONS_LIST_MEMBER,
             &input.disk_name,
             &input.add_ons.clone().unwrap_or_default(),
         )
