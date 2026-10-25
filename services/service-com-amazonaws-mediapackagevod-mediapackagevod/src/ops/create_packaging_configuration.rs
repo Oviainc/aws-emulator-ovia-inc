@@ -3,7 +3,9 @@
 //! @op CreatePackagingConfiguration
 //! IMPLEMENTED: mints a PackagingConfiguration against an existing PackagingGroup.
 //! Refuses a `PackagingGroupId` that resolves to nothing, a request that does
-//! not carry exactly one package block, and a `SpekeKeyProvider$RoleArn` that is not
+//! not carry exactly one package block, a package block whose `required` manifest list
+//! carries no manifest configuration ([`crate::state::check_manifest_lists`]), and a
+//! `SpekeKeyProvider$RoleArn` that is not
 //! the ARN of an IAM role, and a `Tags` map that breaks AWS's resource-tagging
 //! restrictions ([`crate::state::check_tags`]) — each as a request-parameter violation,
 //! `UnprocessableEntityException` (422); resolves the package block's server-side
@@ -206,6 +208,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A packaging configuration is defined by its manifests, so the manifest list
+        // of the chosen format's block must carry at least one manifest configuration.
+        // Read after the one-block rule, so a request carrying several blocks is still
+        // answered by the rule about the request as a whole, and before anything is
+        // stored, so a configuration describing no output manifest never exists.
+        crate::state::check_manifest_lists(
+            input.hls_package.as_ref(),
+            input.dash_package.as_ref(),
+            input.cmaf_package.as_ref(),
+            input.mss_package.as_ref(),
+        )?;
         // Tag-on-create is still tagging: the map is judged against AWS's resource
         // tagging restrictions before the store is touched, so a refused request leaves
         // no configuration and no tag behind.
