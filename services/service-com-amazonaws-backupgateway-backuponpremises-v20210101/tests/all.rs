@@ -53,6 +53,8 @@ mod put_hypervisor_property_mappings;
 mod resource_untagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/virtual_machine_inventory_sync.rs"]
+mod virtual_machine_inventory_sync;
 #[path = "all/virtual_machine_listing.rs"]
 mod virtual_machine_listing;
 #[path = "all/virtual_machine_reads.rs"]
