@@ -23,9 +23,11 @@
 //!
 //! The tagging operations address a resource by a caller-supplied `resourceArn`
 //! rather than by identifier, so the read of that ARN ([`parse_resource_arn`]), the
-//! tags it resolves to ([`ComAmazonawsDsqlDsqlState::resource_tags_mut`]) and the
-//! refusal of a value that names no resource of this service
-//! ([`invalid_resource_arn`]) live here too, for the same reason.
+//! check that the ARN is the one this endpoint serves and the one its resource was
+//! minted with ([`ArnResource::is_scoped_to`] / [`ArnResource::is_arn_of`]), the tags
+//! it resolves to ([`ComAmazonawsDsqlDsqlState::resource_tags_mut`]) and the refusal
+//! of a value that names no resource of this service ([`invalid_resource_arn`]) live
+//! here too, for the same reason.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,6 +78,12 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The service segment of every ARN this service mints and resolves
 /// (`ClusterArn`'s pattern fixes it: `^arn:aws(-[^:]+)?:dsql:...$`).
 pub const ARN_SERVICE: &str = "dsql";
+
+/// The partition segment of every ARN this emulator mints: `::engine::emulator_arn`
+/// builds `arn:aws:{service}:...`, so a resource this emulator holds is always in
+/// this partition. `ClusterArn`'s pattern admits others (`aws(-[^:]+)?`), so an ARN
+/// naming one of them reaches a handler and names a resource held elsewhere.
+pub const ARN_PARTITION: &str = "aws";
 
 /// The resource-type segment of a cluster ARN (`...:cluster/{identifier}`), and
 /// the `resourceType` a cluster's `ResourceNotFoundException` carries.
@@ -647,13 +655,23 @@ impl ComAmazonawsDsqlDsqlState {
     /// a stream arrives as the type `cluster` with the id `{cluster}/stream/{stream}`.
     /// Anything else addresses nothing here.
     ///
+    /// An ARN scoped to another endpoint addresses nothing here either
+    /// ([`ArnResource::is_scoped_to`]): `endpoint_region` is the region the request
+    /// reached, and only resources minted for it live in this store.
+    ///
     /// `None` here is a resource that is ABSENT, not a request that is malformed:
     /// the ARN does name this service and one of its resource types, so a sub-path
     /// this service mints no resource for (`cluster/{id}/foo/bar`, or a stream path
     /// carrying more segments) belongs with an unknown identifier — the modelled
     /// 404 — rather than with [`invalid_resource_arn`]'s 400, which is reserved for
     /// a value that names no Aurora DSQL resource at all.
-    fn addressed_resource(resource: &ArnResource) -> Option<(&str, Option<&str>)> {
+    fn addressed_resource<'a>(
+        resource: &'a ArnResource,
+        endpoint_region: &str,
+    ) -> Option<(&'a str, Option<&'a str>)> {
+        if !resource.is_scoped_to(endpoint_region) {
+            return None;
+        }
         if resource.resource_type != RESOURCE_TYPE_CLUSTER {
             return None;
         }
@@ -673,19 +691,27 @@ impl ComAmazonawsDsqlDsqlState {
     /// The one place a parsed `resourceArn` becomes the tag map it addresses, so
     /// every tagging operation agrees about which ARNs name something here: a
     /// cluster, a stream of a cluster (see [`Self::addressed_resource`]), and
-    /// nothing else — a well-formed ARN of any other Aurora DSQL resource type
+    /// nothing else — a well-formed ARN of any other Aurora DSQL resource type, or
+    /// one scoped to another region, account or partition than the one this endpoint
+    /// serves, or one whose scope is not the scope the resource was MINTED in,
     /// answers `None` exactly as an unknown cluster id does. A retired (deleted)
     /// cluster is not addressable either; its tombstone exists only for delete
     /// idempotency.
-    pub fn resource_tags(&self, resource: &ArnResource) -> Option<&BTreeMap<String, String>> {
-        let (cluster_identifier, stream_identifier) = Self::addressed_resource(resource)?;
+    pub fn resource_tags(
+        &self,
+        resource: &ArnResource,
+        endpoint_region: &str,
+    ) -> Option<&BTreeMap<String, String>> {
+        let (cluster_identifier, stream_identifier) =
+            Self::addressed_resource(resource, endpoint_region)?;
         let cluster = self.clusters.get(cluster_identifier)?;
         match stream_identifier {
             Some(stream_identifier) => cluster
                 .streams
                 .get(stream_identifier)
+                .filter(|stream| resource.is_arn_of(&stream.arn))
                 .map(|stream| &stream.tags),
-            None => Some(&cluster.tags),
+            None => resource.is_arn_of(&cluster.arn).then_some(&cluster.tags),
         }
     }
 
@@ -695,15 +721,18 @@ impl ComAmazonawsDsqlDsqlState {
     pub fn resource_tags_mut(
         &mut self,
         resource: &ArnResource,
+        endpoint_region: &str,
     ) -> Option<&mut BTreeMap<String, String>> {
-        let (cluster_identifier, stream_identifier) = Self::addressed_resource(resource)?;
+        let (cluster_identifier, stream_identifier) =
+            Self::addressed_resource(resource, endpoint_region)?;
         let cluster = self.clusters.get_mut(cluster_identifier)?;
         match stream_identifier {
             Some(stream_identifier) => cluster
                 .streams
                 .get_mut(stream_identifier)
+                .filter(|stream| resource.is_arn_of(&stream.arn))
                 .map(|stream| &mut stream.tags),
-            None => Some(&mut cluster.tags),
+            None => resource.is_arn_of(&cluster.arn).then_some(&mut cluster.tags),
         }
     }
 
@@ -777,16 +806,58 @@ pub fn cluster_arn(region: &str, identifier: &str) -> String {
     )
 }
 
-/// The resource an Aurora DSQL ARN names: the region it is scoped to, its type
-/// segment and the id after it.
+/// The resource an Aurora DSQL ARN names: the scope it is in — partition, region
+/// and account — plus its type segment and the id after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArnResource {
+    /// The partition segment, as the ARN spells it.
+    pub partition: String,
     /// The region segment, as the ARN spells it (empty when the ARN carries none).
     pub region: String,
+    /// The account segment, as the ARN spells it (empty when the ARN carries none).
+    pub account: String,
     /// The resource type, e.g. [`RESOURCE_TYPE_CLUSTER`].
     pub resource_type: String,
     /// The resource's own identifier.
     pub resource_id: String,
+}
+
+impl ArnResource {
+    /// Whether this ARN names a resource the endpoint serving the request could
+    /// hold: one in this partition, in `endpoint_region`, and in the account this
+    /// emulator serves.
+    ///
+    /// Aurora DSQL is a regional service and every ARN it mints carries the region
+    /// the minting request was signed for, the account that owns the resource and
+    /// the partition it lives in ([`cluster_arn`], [`stream_arn`]); `ClusterArn`'s
+    /// pattern pins all three segments
+    /// (`^arn:aws(-[^:]+)?:dsql:[a-z0-9-]{1,20}:[0-9]{12}:cluster/[a-z0-9]{26}$`),
+    /// so they are part of the resource's identity rather than decoration. An ARN
+    /// differing in any of them therefore names a resource of some OTHER region,
+    /// account or partition — one this endpoint holds none of, and must neither read
+    /// nor write.
+    pub fn is_scoped_to(&self, endpoint_region: &str) -> bool {
+        self.partition == ARN_PARTITION
+            && self.region == endpoint_region
+            && self.account == ::engine::emulator_account_id()
+    }
+
+    /// Whether this ARN is the ARN `minted` is — the one a stored resource was
+    /// minted with.
+    ///
+    /// A resource is created in ONE region, under ONE account, in ONE partition, and
+    /// the ARN this service hands back carries all three ([`cluster_arn`],
+    /// [`stream_arn`]). The type and the id are what resolved a stored resource, so
+    /// what remains to agree on is that scope: an ARN that spells it differently
+    /// names some other region's, account's or partition's resource that happens to
+    /// share an identifier, and no identifier makes those the same resource.
+    pub fn is_arn_of(&self, minted: &str) -> bool {
+        parse_resource_arn(minted).is_some_and(|minted| {
+            self.partition == minted.partition
+                && self.region == minted.region
+                && self.account == minted.account
+        })
+    }
 }
 
 /// The resource a tagging ARN names, or `None` when the ARN names no Aurora DSQL
@@ -798,11 +869,12 @@ pub struct ArnResource {
 /// service field that is not this service's, a resource field with no type —
 /// names nothing here.
 ///
-/// The partition and account fields take no part in the lookup: this emulator
-/// serves a single account, and a resource id already names at most one stored
-/// resource, so the type and the id are what resolve it. The region is reported
-/// rather than matched on, for a caller that needs the region an ARN was minted
-/// in (see [`arn_region`]).
+/// Every field is reported, because an ARN's partition, region and account are part
+/// of the resource's identity rather than decoration: a caller needs the region an
+/// ARN was minted in (see [`arn_region`]), and the resolution of a tagging ARN
+/// matches all three against the endpoint's own scope
+/// ([`ArnResource::is_scoped_to`]) and against the scope the resource it names was
+/// minted in ([`ArnResource::is_arn_of`]).
 pub fn parse_resource_arn(arn: &str) -> Option<ArnResource> {
     // `splitn(6, ..)` keeps the resource field whole: it is the only field that
     // may itself contain a colon.
@@ -810,18 +882,20 @@ pub fn parse_resource_arn(arn: &str) -> Option<ArnResource> {
     if fields.next()? != "arn" {
         return None;
     }
-    let _partition = fields.next()?;
+    let partition = fields.next()?;
     if fields.next()? != ARN_SERVICE {
         return None;
     }
     let region = fields.next()?;
-    let _account = fields.next()?;
+    let account = fields.next()?;
     let (resource_type, resource_id) = fields.next()?.split_once(['/', ':'])?;
     if resource_type.is_empty() || resource_id.is_empty() {
         return None;
     }
     Some(ArnResource {
+        partition: partition.to_string(),
         region: region.to_string(),
+        account: account.to_string(),
         resource_type: resource_type.to_string(),
         resource_id: resource_id.to_string(),
     })
