@@ -10,8 +10,9 @@
 //!   exists — `EndTime` has to be later than `StartTime`, the window may span at most
 //!   `MAX_FORECAST_WINDOW_DAYS` days and `StartTime` may be at most
 //!   `MAX_FORECAST_HISTORY_DAYS` days before the current date and time, both bounds
-//!   measured in the whole hourly forecast periods the data exists at. Nothing bounds how
-//!   far AHEAD a window reaches;
+//!   measured in the whole hourly forecast periods the data exists at — whatever
+//!   sub-second precision the window's endpoints carry. Nothing bounds how far AHEAD a
+//!   window reaches;
 //! * a request that passes those checks is looked up by (`ScalingPlanName`,
 //!   `ScalingPlanVersion`), and a lookup that finds no stored plan has no forecast to
 //!   report: HTTP 200 with an empty `Datapoints` list, because this operation models no
@@ -90,15 +91,21 @@ const ASG_RESOURCE: Resource<'static> = (
 
 /// One forecast request, with every member the model marks required: a plan name and
 /// version, a scalable resource, a forecast data type and the window `[start, end)`.
-fn forecast_request(
+///
+/// The window endpoints are generic over how they go on the wire, because the `awsJson1_1`
+/// `TimestampType` is carried as epoch SECONDS and a caller may send either a whole count
+/// (`i64`) or a fractional one (`f64`): both reach the same handler, so both are driven
+/// through this one request builder.
+fn forecast_request<T: Into<Value>>(
     plan: &str,
     version: i64,
     resource: Resource<'_>,
     data_type: &str,
-    window: (i64, i64),
+    window: (T, T),
 ) -> Value {
     let (namespace, resource_id, dimension) = resource;
     let (start, end) = window;
+    let (start, end) = (start.into(), end.into());
     json!({
         "ScalingPlanName": plan,
         "ScalingPlanVersion": version,
@@ -112,7 +119,12 @@ fn forecast_request(
 }
 
 /// A forecast request for the Auto Scaling group resource, over `[start, end)`.
-fn asg_request(plan: &str, version: i64, data_type: &str, window: (i64, i64)) -> Value {
+fn asg_request<T: Into<Value>>(
+    plan: &str,
+    version: i64,
+    data_type: &str,
+    window: (T, T),
+) -> Value {
     forecast_request(plan, version, ASG_RESOURCE, data_type, window)
 }
 
@@ -173,7 +185,8 @@ fn current_hour_start() -> i64 {
     now_secs().div_euclid(HOUR) * HOUR
 }
 
-/// Assert the verdict of one window on one plan name.
+/// Assert the verdict of one window on one plan name, the window carried as the whole
+/// epoch seconds most rows here use.
 async fn assert_window_verdict(
     emulator: &Emulator,
     label: &str,
@@ -183,16 +196,31 @@ async fn assert_window_verdict(
     verdict: Verdict,
 ) {
     let body = asg_request(plan, ONLY_VERSION, "CapacityForecast", window);
-    let (status, parsed) = emulator.call(OPERATION, &body).await;
+    assert_verdict(emulator, label, held, &format!("{window:?}"), &body, verdict).await;
+}
+
+/// Assert the verdict of one forecast request, however its window went on the wire.
+///
+/// `window` is that window as the row sent it, so a failure names the request that earned
+/// the wrong answer.
+async fn assert_verdict(
+    emulator: &Emulator,
+    label: &str,
+    held: &str,
+    window: &str,
+    body: &Value,
+    verdict: Verdict,
+) {
+    let (status, parsed) = emulator.call(OPERATION, body).await;
     if verdict == Verdict::Accepted {
         assert_eq!(
             status, 200,
-            "case {label:?} on {held} ({window:?}): expected HTTP 200, got {status} \
+            "case {label:?} on {held} ({window}): expected HTTP 200, got {status} \
              with {parsed}"
         );
         assert!(
             datapoints(&parsed).is_empty(),
-            "case {label:?} on {held} ({window:?}): expected no data points, got {parsed}"
+            "case {label:?} on {held} ({window}): expected no data points, got {parsed}"
         );
         return;
     }
@@ -200,7 +228,7 @@ async fn assert_window_verdict(
     assert_eq!(
         (status, error_code(&parsed)),
         (400, "ValidationException"),
-        "case {label:?} on {held} ({window:?}): expected HTTP 400 ValidationException, \
+        "case {label:?} on {held} ({window}): expected HTTP 400 ValidationException, \
          got {status} with {parsed}"
     );
     let message = error_message(&parsed);
@@ -218,7 +246,7 @@ async fn assert_window_verdict(
     };
     assert_eq!(
         named, expected,
-        "case {label:?} on {held} ({window:?}): expected the refusal for {verdict:?}, \
+        "case {label:?} on {held} ({window}): expected the refusal for {verdict:?}, \
          got {message:?}"
     );
 }
@@ -415,6 +443,186 @@ async fn a_start_further_back_than_the_documented_span_is_refused() {
             let start = now_secs() + start_offset;
             assert_window_verdict(&emulator, label, held, plan, (start, start + DAY), verdict)
                 .await;
+        }
+    }
+}
+
+/// Milliseconds in a second, for the rows that place a window endpoint INSIDE a second.
+const MILLIS_PER_SECOND: i64 = 1_000;
+
+/// `millis` since the epoch as the fractional epoch seconds an `awsJson1_1` timestamp is
+/// carried as: the finest precision a caller can ask a window with over this protocol.
+fn epoch_seconds(millis: i64) -> f64 {
+    millis as f64 / MILLIS_PER_SECOND as f64
+}
+
+/// Assert the verdict of one window whose endpoints are given in epoch MILLISECONDS, so
+/// each one may sit inside a second.
+async fn assert_sub_second_window_verdict(
+    emulator: &Emulator,
+    label: &str,
+    held: &str,
+    plan: &str,
+    window_millis: (i64, i64),
+    verdict: Verdict,
+) {
+    let (start, end) = window_millis;
+    let window = (epoch_seconds(start), epoch_seconds(end));
+    let body = asg_request(plan, ONLY_VERSION, "CapacityForecast", window);
+    let shown = format!("[{}, {})", window.0, window.1);
+    assert_verdict(emulator, label, held, &shown, &body, verdict).await;
+}
+
+#[tokio::test]
+async fn the_sub_second_part_of_a_window_adds_no_forecast_period_to_its_width() {
+    let week = MAX_FORECAST_WINDOW_DAYS * DAY * MILLIS_PER_SECOND;
+    let period = HOUR * MILLIS_PER_SECOND;
+    // The same width rule as the whole-second rows above, driven at the finest precision
+    // the wire carries: an `awsJson1_1` `TimestampType` is epoch SECONDS, so a fractional
+    // number is a window endpoint inside a second. Rows differ along the WIDTH (shorter
+    // than a second, at the documented maximum, part of a forecast period past it, a
+    // period past it), along the ORDER of the two endpoints, and along where inside its
+    // second and its clock hour each endpoint sits — the sub-second part never decides a
+    // row, because the bound is measured in whole forecast periods.
+    //
+    // A row whose verdict turns on a boundary sits a whole SECOND clear of it: a
+    // present-day instant carried as fractional epoch seconds resolves to about a
+    // microsecond, so a row balanced exactly on a period boundary would be deciding on
+    // the float's rounding rather than on the rule.
+    //
+    // `(label, offset of the start inside the current hour in millis, width in millis,
+    // verdict)`.
+    let cases: [(&str, i64, i64, Verdict); 11] = [
+        ("a one-millisecond window", 250, 1, Verdict::Accepted),
+        ("a half-second window", 500, 500, Verdict::Accepted),
+        (
+            "a window whose endpoints are the same instant to the millisecond",
+            250,
+            0,
+            Verdict::RefusedAsOutOfOrder,
+        ),
+        (
+            "a window ending a millisecond before it starts",
+            250,
+            -1,
+            Verdict::RefusedAsOutOfOrder,
+        ),
+        (
+            "a window ending half a second before it starts",
+            500,
+            -500,
+            Verdict::RefusedAsOutOfOrder,
+        ),
+        (
+            "the documented maximum width, both endpoints a quarter second into a second",
+            250,
+            week,
+            Verdict::Accepted,
+        ),
+        (
+            "half a second past the maximum width",
+            0,
+            week + 500,
+            Verdict::Accepted,
+        ),
+        (
+            "a minute and a half second past the maximum width",
+            125,
+            week + 60 * MILLIS_PER_SECOND + 500,
+            Verdict::Accepted,
+        ),
+        (
+            "half a second short of a whole forecast period past the maximum width",
+            750,
+            week + period - 500,
+            Verdict::Accepted,
+        ),
+        (
+            "a second past a whole forecast period past the maximum width",
+            250,
+            week + period + MILLIS_PER_SECOND,
+            Verdict::RefusedAsTooWide,
+        ),
+        (
+            "ten days and half a second",
+            400,
+            10 * DAY * MILLIS_PER_SECOND + 500,
+            Verdict::RefusedAsTooWide,
+        ),
+    ];
+
+    let emulator = with_stored_plan().await;
+    // Both plan names again: the window checks read request members only, so a row earns
+    // the same verdict whether or not the named plan is held.
+    for (plan, held) in [(STORED_PLAN, "a stored plan"), (ABSENT_PLAN, "an absent plan")] {
+        for (label, start_offset, width, verdict) in cases {
+            let start = current_hour_start() * MILLIS_PER_SECOND + start_offset;
+            assert_sub_second_window_verdict(
+                &emulator,
+                label,
+                held,
+                plan,
+                (start, start + width),
+                verdict,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_sub_second_part_of_a_start_adds_no_forecast_period_to_its_history_span() {
+    let history = MAX_FORECAST_HISTORY_DAYS * DAY * MILLIS_PER_SECOND;
+    let period = HOUR * MILLIS_PER_SECOND;
+    // The other documented day bound, at the same precision: how far before the current
+    // date and time the start may sit is measured in the same whole forecast periods, so a
+    // start part of a period past the span is served and one a whole period past it is
+    // refused. Rows differ along how far past the span the start sits and along its
+    // sub-second part. Each row's width is a day, well inside the maximum width, so the
+    // width rule cannot be what answers it.
+    //
+    // `(label, offset of the start from now in millis, verdict)`.
+    let cases: [(&str, i64, Verdict); 5] = [
+        (
+            "a start half a second inside the documented span",
+            -history + 500,
+            Verdict::Accepted,
+        ),
+        (
+            "a start half a second past the documented span",
+            -history - 500,
+            Verdict::Accepted,
+        ),
+        (
+            "a start a minute and a half second past the documented span",
+            -history - CLOCK_MARGIN_SECONDS * MILLIS_PER_SECOND - 500,
+            Verdict::Accepted,
+        ),
+        (
+            "a start a whole forecast period and a minute past the documented span",
+            -history - period - CLOCK_MARGIN_SECONDS * MILLIS_PER_SECOND,
+            Verdict::RefusedAsTooOld,
+        ),
+        (
+            "a start a day and half a second past the documented span",
+            -history - DAY * MILLIS_PER_SECOND - 500,
+            Verdict::RefusedAsTooOld,
+        ),
+    ];
+
+    let emulator = with_stored_plan().await;
+    for (plan, held) in [(STORED_PLAN, "a stored plan"), (ABSENT_PLAN, "an absent plan")] {
+        for (label, start_offset, verdict) in cases {
+            let start = now_secs() * MILLIS_PER_SECOND + start_offset;
+            assert_sub_second_window_verdict(
+                &emulator,
+                label,
+                held,
+                plan,
+                (start, start + DAY * MILLIS_PER_SECOND),
+                verdict,
+            )
+            .await;
         }
     }
 }

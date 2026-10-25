@@ -10,6 +10,11 @@
 //! is a `DuplicateRecordException`, and the documented notification and per-type
 //! subscriber limits are answered with `CreationLimitExceededException`.
 //!
+//! A subscriber carries no id either, so the `Subscribers` supplied for the notification
+//! are a SET: a repeat of one the same list already names is collapsed into it
+//! ([`crate::state::distinct_subscribers`]) before the per-type limits are counted and
+//! before anything is stored.
+//!
 //! A notification attached in the `ALARM` state has passed its threshold, so the alert
 //! it exists to deliver is published to each `SNS` subscriber's topic
 //! ([`crate::state::alerts`]).
@@ -189,11 +194,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
+        // A subscriber's subscription type and address are its whole identity, so the
+        // subscribers of a notification are a SET: a repeat of one the same list already
+        // names is that one subscriber named twice, collapsed into it here
+        // ([`crate::state::distinct_subscribers`]) before it is counted or stored.
+        let subscribers = crate::state::distinct_subscribers(input.subscribers);
+
         // "A notification can have one SNS subscriber and up to 10 email subscribers,
         // for a total of 11 subscribers" — the PER-TYPE halves, which no constraint
-        // trait can express. The total and the at-least-one are the modelled
-        // `@length(1, 11)` on `Subscribers`, already refused before this handler runs.
-        crate::state::subscriber_limit_violation(&input.subscribers).map_err(|message| {
+        // trait can express, counted over the set this write establishes. The total and
+        // the at-least-one are the modelled `@length(1, 11)` on `Subscribers`, already
+        // refused before this handler runs.
+        crate::state::subscriber_limit_violation(&subscribers).map_err(|message| {
             CreateNotificationErrorModeled::CreationLimitExceededException(
                 CreationLimitExceededException {
                     message: Some(message),
@@ -262,11 +274,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let alerts = crate::state::alerts::owed(
                 &crate::state::alerts::source(&input.account_id, &stored.budget),
                 &notification,
-                &input.subscribers,
+                &subscribers,
             );
             stored.notifications.push(crate::state::StoredNotification {
                 notification,
-                subscribers: input.subscribers,
+                subscribers,
             });
             alerts
         };

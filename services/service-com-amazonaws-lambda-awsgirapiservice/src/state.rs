@@ -915,15 +915,22 @@ pub fn pattern_violation_message(path: &str, value: &str, pattern: &str) -> Stri
     )
 }
 
-/// The message a function-URL operation refuses with when the qualifier it resolved
-/// holds no function URL: `ResourceNotFoundException`'s own wording, naming no resource.
+/// `ResourceNotFoundException`'s own wording, naming no resource: the one fixed sentence
+/// an operation refuses with when the resource the request NAMES resolves but the thing it
+/// asked about — the resource policy it reads or edits, the function URL it addresses — is
+/// not held there.
 ///
-/// Lambda's function-URL operations answer this one fixed sentence for a function URL
-/// that does not exist — the request already names which one it asked about — rather than
-/// the `Function not found: <arn>` form the function-lifecycle operations build when it
-/// is the FUNCTION that is missing. [`resolve_function`] still produces the latter, so a
-/// caller can tell "no such function" from "that function has no URL".
-pub const FUNCTION_URL_NOT_FOUND_MESSAGE: &str = "The resource you requested does not exist.";
+/// It carries nothing from the request because the request already names what it asked
+/// about; the resource-identifying forms ([`resolve_function`]'s `Function not found:
+/// <arn>`, [`resolve_layer_version_ref`]'s `Layer version <name>:<n> does not exist`) are
+/// reserved for a request whose own resource does not resolve. Keeping the two apart is
+/// what lets a caller tell "no such function" from "that function holds no policy", which
+/// is the distinction a permission-bootstrapping loop branches on.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The resource you requested does not exist.";
+
+/// The message a function-URL operation refuses with when the qualifier it resolved
+/// holds no function URL: [`RESOURCE_NOT_FOUND_MESSAGE`], by the same rule.
+pub const FUNCTION_URL_NOT_FOUND_MESSAGE: &str = RESOURCE_NOT_FOUND_MESSAGE;
 
 /// The qualifier a `FunctionName`/`Qualifier` pair NAMES, as opposed to the
 /// [`VERSION_LATEST`] an unqualified request resolves to. It may come from either, and

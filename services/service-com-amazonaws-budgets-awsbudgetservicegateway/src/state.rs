@@ -892,6 +892,34 @@ pub fn same_subscriber(left: &Subscriber, right: &Subscriber) -> bool {
     left.subscription_type == right.subscription_type && left.address == right.address
 }
 
+/// Whether `set` already holds the subscriber `candidate` names ([`same_subscriber`]) —
+/// the one place the set rule is applied, by both the helper that builds a set
+/// ([`distinct_subscribers`]) and the one that counts its capacities
+/// ([`subscriber_limit_violation`]).
+fn set_holds<'a>(set: impl IntoIterator<Item = &'a Subscriber>, candidate: &Subscriber) -> bool {
+    set.into_iter()
+        .any(|held| same_subscriber(held, candidate))
+}
+
+/// The subscriber SET that `supplied` names: the same subscribers, with every repeat of
+/// one already in the set collapsed into it, in the order they were first supplied.
+///
+/// A subscriber's two members ARE its identity ([`same_subscriber`]) — nothing else
+/// distinguishes one — so two entries that agree on both name the SAME subscriber, and
+/// the set a notification or an action ends up holding can hold it once. A repeat is
+/// therefore not a second subscriber: every write that establishes a subscriber set from
+/// a supplied list passes it through here, so no read reports one subscriber twice and
+/// nothing a later `DeleteSubscriber` / `UpdateSubscriber` could never name is stored.
+pub fn distinct_subscribers(supplied: impl IntoIterator<Item = Subscriber>) -> Vec<Subscriber> {
+    let mut set: Vec<Subscriber> = Vec::new();
+    for subscriber in supplied {
+        if !set_holds(set.iter(), &subscriber) {
+            set.push(subscriber);
+        }
+    }
+    set
+}
+
 /// "A budget can have up to ten notifications" (`Notification`), which is also the
 /// modelled `@length(max: 10)` of `NotificationWithSubscribersList` — the list a single
 /// `CreateBudget` attaches. It is a capacity of the BUDGET, so it is the same ceiling
@@ -932,12 +960,22 @@ const SUBSCRIPTION_TYPE_EMAIL: &str = "EMAIL";
 ///
 /// Takes any iterator of subscribers, so a caller that grows a stored set by one
 /// (`CreateSubscriber`) checks the set it would leave behind without building it.
+///
+/// The limits are capacities of a SET, so they are counted over DISTINCT subscribers
+/// ([`same_subscriber`]): a repeat names a subscriber the set already holds
+/// ([`distinct_subscribers`] collapses it on the way in), so it occupies no capacity of
+/// its own.
 pub fn subscriber_limit_violation<'a>(
     subscribers: impl IntoIterator<Item = &'a Subscriber>,
 ) -> Result<(), String> {
     let mut sns = 0_usize;
     let mut email = 0_usize;
+    let mut counted: Vec<&Subscriber> = Vec::new();
     for subscriber in subscribers {
+        if set_holds(counted.iter().copied(), subscriber) {
+            continue;
+        }
+        counted.push(subscriber);
         match subscriber.subscription_type.as_str() {
             SUBSCRIPTION_TYPE_SNS => sns += 1,
             SUBSCRIPTION_TYPE_EMAIL => email += 1,
@@ -961,7 +999,7 @@ pub fn subscriber_limit_violation<'a>(
         if supplied > limit {
             return Err(format!(
                 "A set of subscribers can have at most {limit} {kind} subscriber(s), and \
-                 {supplied} were supplied."
+                 {supplied} distinct {kind} subscriber(s) were supplied."
             ));
         }
     }

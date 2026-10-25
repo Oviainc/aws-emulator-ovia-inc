@@ -13,9 +13,8 @@
 //! `ResourceNotFoundException` and an absent user a 404 `UserNotFoundException`,
 //! and a refused request persists nothing.
 //!
-//! The stored membership is read back through the only implemented reader of it
-//! — the issued tokens' claim — because `AdminListGroupsForUser` and
-//! `ListUsersInGroup` are still scaffold stubs with issues of their own.
+//! The stored membership is read back here through the issued tokens'
+//! `cognito:groups` claim; the membership listings have suites of their own.
 //!
 //! Each table row names the case it asserts.
 

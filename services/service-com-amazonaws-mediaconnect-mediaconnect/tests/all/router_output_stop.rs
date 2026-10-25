@@ -20,9 +20,7 @@
 //! router outputs the store holds beside it, how many times the same output is stopped, and
 //! whether the clock has settled the stop yet.
 //!
-//! StartRouterOutput is still scaffolded
-//! (`issues/things-that-do-not-work/20261024T010542Z-mediaconnect-startrouteroutput-stub.md`),
-//! so the operational states an output other than a freshly created one is in are seeded
+//! The operational states an output other than a freshly created one is in are seeded
 //! through the store, exactly as `tests/all/router_input_restart.rs` seeds them for the
 //! router input side of the same rule. The record is left SETTLED, as a created output is
 //! once the clock has settled it.
@@ -96,9 +94,12 @@ fn reported_state(body: &Value) -> &str {
 /// Put the stored router output `arn` in `state` with NOTHING owed by the clock — the shape
 /// a record has once a transition has settled.
 ///
-/// StartRouterOutput is still scaffolded, so the operational states a stop can arrive in
-/// are reached through the store rather than through a call that answers 501.
-fn settle_router_output_in(emulator: &Emulator, arn: &str, state: &str) {
+/// The operational states a stop can arrive in are reached through the store, so a case is
+/// about the one state member it names rather than about the calls that led there.
+///
+/// `pub(crate)` because `tests/all/router_output_start.rs` seeds the states a START arrives
+/// in the same way: one notion of a "settled" record for both suites.
+pub(crate) fn settle_router_output_in(emulator: &Emulator, arn: &str, state: &str) {
     let store = emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();
@@ -111,8 +112,9 @@ fn settle_router_output_in(emulator: &Emulator, arn: &str, state: &str) {
     router_output.pending = None;
 }
 
-/// The state the store holds for `arn`, read straight from the record.
-fn stored_state(emulator: &Emulator, arn: &str) -> String {
+/// The state the store holds for `arn`, read straight from the record. `pub(crate)` for the
+/// same reason as [`settle_router_output_in`].
+pub(crate) fn stored_state(emulator: &Emulator, arn: &str) -> String {
     let store = emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();

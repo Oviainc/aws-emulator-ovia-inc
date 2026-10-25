@@ -219,13 +219,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let resource = record.versioned_arn(&version);
+        // The resource the request named resolved, so what is missing is the POLICY: the
+        // refusal is the fixed sentence that names no resource, leaving the
+        // resource-identifying form to a request that resolves to nothing.
         let Some(policy) = record.policies.get_mut(&version) else {
             return Err(RemovePermissionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,
-                    message: Some(format!(
-                        "The resource you requested does not exist. Resource: {resource}"
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

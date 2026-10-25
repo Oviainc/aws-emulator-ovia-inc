@@ -137,8 +137,9 @@ pub(crate) fn summary(answer: &Answer) -> &Value {
         .unwrap_or_else(|| panic!("expected a context member in {answer:?}"))
 }
 
-/// The `items` a `ListAgentContexts` answer carries.
-fn items(answer: &Answer) -> &[Value] {
+/// The `items` a list answer carries. `pub(crate)` because the generation suite beside
+/// this one pages over its own list the same way.
+pub(crate) fn items(answer: &Answer) -> &[Value] {
     answer
         .body
         .get("items")
@@ -147,6 +148,7 @@ fn items(answer: &Answer) -> &[Value] {
         .unwrap_or_else(|| panic!("expected an items list in {answer:?}"))
 }
 
+/// The `id` a summary carries. `pub(crate)` for the reason [`items`] gives.
 pub(crate) fn id_of(value: &Value) -> String {
     value
         .get("id")
@@ -155,9 +157,10 @@ pub(crate) fn id_of(value: &Value) -> String {
         .to_string()
 }
 
-/// A context id, checked against the modelled `UUID` pattern
-/// (`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).
-fn assert_uuid(id: &str, case: &str) {
+/// An id the service minted, checked against the modelled `UUID` pattern
+/// (`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`). `pub(crate)` for
+/// the reason [`items`] gives: every agent resource of this service is identified by one.
+pub(crate) fn assert_uuid(id: &str, case: &str) {
     let groups: Vec<&str> = id.split('-').collect();
     assert!(
         groups.len() == 5
@@ -166,15 +169,16 @@ fn assert_uuid(id: &str, case: &str) {
                 .zip(&groups)
                 .all(|(len, group)| group.len() == *len
                     && group.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))),
-        "case {case:?}: context id must match the modelled UUID pattern, got {id:?}"
+        "case {case:?}: an id the service minted must match the modelled UUID pattern, \
+         got {id:?}"
     );
 }
 
-/// The instant a create happened. The WIRE form belongs to the framework's timestamp
+/// The instant a call happened. The WIRE form belongs to the framework's timestamp
 /// serializer (epoch seconds for a number, ISO-8601 for a string); what this suite pins
 /// is that the stamp is the moment of the CALL rather than a constant, checked against
-/// the test's own clock.
-fn assert_create_instant(value: Option<&Value>, case: &str, label: &str) {
+/// the test's own clock. `pub(crate)` for the reason [`items`] gives.
+pub(crate) fn assert_create_instant(value: Option<&Value>, case: &str, label: &str) {
     match value {
         Some(Value::Number(number)) => {
             let seconds = number.as_f64().unwrap_or_default();

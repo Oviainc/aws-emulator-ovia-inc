@@ -677,6 +677,19 @@
 //! is account-wide because this store is per ACCOUNT and not per Region (see "The default
 //! VPC's default subnets" below).
 //!
+//! The account-level instance metadata service (IMDS) defaults are the same kind of thing,
+//! with one difference: each of their settings can also be in NO state at all. "To remove a
+//! parameter's account-level default setting, specify `no-preference`. If an account-level
+//! setting is cleared with `no-preference`, then the instance launch considers the other
+//! instance metadata settings" (`ModifyInstanceMetadataDefaults`) — so a setting is either
+//! a member of its own catalog or absent, which is what
+//! [`ComAmazonawsEc2Amazonec2State::instance_metadata_defaults`] holds as an
+//! [`AccountInstanceMetadataDefaults`] of `Option`s. The enum settings hold `&'static str`
+//! catalog members for the same reason the snapshot setting does, and
+//! [`AccountInstanceMetadataDefaults::account_level`] is the one projection into the
+//! modelled `InstanceMetadataDefaultsResponse`, so `ModifyInstanceMetadataDefaults` and
+//! `GetInstanceMetadataDefaults` cannot disagree about what the account's defaults are.
+//!
 //! ## The Spot Instance data feed
 //!
 //! [`ComAmazonawsEc2Amazonec2State::spot_datafeed_subscription`] is a single
@@ -2768,6 +2781,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::set_snapshot_block_public_access_state`], so the operations that report and
     /// the operations that change it cannot disagree.
     snapshot_block_public_access: &'static str,
+    /// The account's instance metadata service (IMDS) defaults — see the module docs.
+    ///
+    /// Read it through [`Self::instance_metadata_defaults`] and write it through
+    /// [`Self::set_instance_metadata_defaults`], so `ModifyInstanceMetadataDefaults` and
+    /// `GetInstanceMetadataDefaults` cannot disagree about one account's defaults.
+    instance_metadata_defaults: AccountInstanceMetadataDefaults,
     /// The account's Spot Instance data feed subscription, and `None` when it holds none —
     /// see the module docs.
     ///
@@ -2964,6 +2983,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
             snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
+            // An account that has never called `ModifyInstanceMetadataDefaults` has no
+            // account-level IMDS default at all: every setting is absent, which is what
+            // `AccountInstanceMetadataDefaults::default()` is.
+            instance_metadata_defaults: AccountInstanceMetadataDefaults::default(),
             // A fresh account has no Spot Instance data feed: one is created by
             // `CreateSpotDatafeedSubscription` and by nothing else.
             spot_datafeed_subscription: None,
@@ -23041,6 +23064,11 @@ pub const SNAPSHOT_BLOCK_PUBLIC_ACCESS_MODES: [&str; 2] = [
 /// it has never changed. The enum's other member, `declarative-policy`, names a state set
 /// OUTSIDE EC2 — by an Organizations declarative policy — and "can't be modified by the
 /// account", so no operation of this API can put the setting into it.
+///
+/// The same `ManagedBy` enum carries `InstanceMetadataDefaultsResponse$ManagedBy` ("the
+/// entity that manages the IMDS default settings"), which
+/// [`AccountInstanceMetadataDefaults::account_level`] reports from this same constant for
+/// the same reason: the account's own writers are the only ones this emulator has.
 pub const MANAGED_BY_ACCOUNT: &str = "account";
 
 /// The [`SNAPSHOT_BLOCK_PUBLIC_ACCESS_MODES`] member `requested` names, or `None` when it
@@ -23048,11 +23076,12 @@ pub const MANAGED_BY_ACCOUNT: &str = "account";
 ///
 /// Answering a `&'static str` out of this module's own constants is what keeps request
 /// text out of the store: a writer stores what this returns, so the stored word is always
-/// a modelled catalog member.
+/// a modelled catalog member. One line over [`catalog_member`], the module's single
+/// catalog resolver, so this and the IMDS defaults resolve a request word the same way;
+/// the catalog it searches is the documented SUBSET an enable accepts, not the whole
+/// `SnapshotBlockPublicAccessState` enum.
 pub fn snapshot_block_public_access_mode(requested: &str) -> Option<&'static str> {
-    SNAPSHOT_BLOCK_PUBLIC_ACCESS_MODES
-        .into_iter()
-        .find(|mode| *mode == requested)
+    catalog_member(&SNAPSHOT_BLOCK_PUBLIC_ACCESS_MODES, requested)
 }
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -23072,6 +23101,107 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn set_snapshot_block_public_access_state(&mut self, state: &'static str) -> &'static str {
         self.snapshot_block_public_access = state;
         self.snapshot_block_public_access
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Account-level instance metadata (IMDS) defaults
+// ---------------------------------------------------------------------------
+
+/// The word every IMDS default setting accepts for "this account states no default":
+/// "To remove a parameter's account-level default setting, specify `no-preference`"
+/// (`ModifyInstanceMetadataDefaults`). It is a member of each of that request's own enums
+/// (`MetadataDefaultHttpTokensState`, `DefaultInstanceMetadataEndpointState`,
+/// `DefaultInstanceMetadataTagsState`, `DefaultHttpTokensEnforcedState`) and of NONE of the
+/// enums the response reports, because a setting with no preference is not reported at all.
+pub const METADATA_NO_PREFERENCE: &str = "no-preference";
+
+/// The hop limit that states no preference: "The maximum number of hops that the metadata
+/// token can travel. To indicate no preference, specify `-1`"
+/// (`ModifyInstanceMetadataDefaultsRequest$HttpPutResponseHopLimit`).
+pub const METADATA_HOP_LIMIT_NO_PREFERENCE: i32 = -1;
+
+/// The smallest hop limit a request may set: "Possible values: Integers from `1` to `64`,
+/// and `-1` to indicate no preference"
+/// (`ModifyInstanceMetadataDefaultsRequest$HttpPutResponseHopLimit`). `BoxedInteger`
+/// carries no modelled `@range`, so the handler is the only place this bound can live.
+pub const MIN_METADATA_HOP_LIMIT: i32 = 1;
+
+/// The largest hop limit a request may set, from the same documented range as
+/// [`MIN_METADATA_HOP_LIMIT`].
+pub const MAX_METADATA_HOP_LIMIT: i32 = 64;
+
+/// The member of `catalog` that `requested` names, or `None` when it names none.
+///
+/// Answering a `&'static str` out of the GENERATED catalog (`crate::ops::types`'s
+/// `*_VALUES`, which is the model's own member list) is what keeps request text out of the
+/// store: a writer stores what this returns, so the stored word is always a modelled
+/// catalog member. The same reason [`snapshot_block_public_access_mode`] exists, written
+/// once for every catalog rather than once per member.
+pub fn catalog_member(catalog: &'static [&'static str], requested: &str) -> Option<&'static str> {
+    catalog.iter().copied().find(|member| *member == requested)
+}
+
+/// The account's IMDS default settings: each one either a value this account set or ABSENT.
+///
+/// Absent is a state of its own, not a value: "If an account-level setting is cleared with
+/// `no-preference`, then the instance launch considers the other instance metadata
+/// settings" (`ModifyInstanceMetadataDefaults`), and `GetInstanceMetadataDefaults` reports
+/// only the settings that have a default. So every setting is an `Option`, and a fresh
+/// account's defaults are [`Default`] — all absent.
+///
+/// The enum settings hold `&'static str` so only a member of the modelled catalog the
+/// response reports them from can be stored ([`catalog_member`] against that catalog is
+/// what turns a request's word into one), never the request's own text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountInstanceMetadataDefaults {
+    /// `HttpTokensState`: whether IMDSv2 is required.
+    pub http_tokens: Option<&'static str>,
+    /// The maximum number of hops the metadata token may travel, within
+    /// [`MIN_METADATA_HOP_LIMIT`]..=[`MAX_METADATA_HOP_LIMIT`].
+    pub http_put_response_hop_limit: Option<i32>,
+    /// `InstanceMetadataEndpointState`: whether the IMDS endpoint is enabled.
+    pub http_endpoint: Option<&'static str>,
+    /// `InstanceMetadataTagsState`: whether instance tags are readable from the metadata.
+    pub instance_metadata_tags: Option<&'static str>,
+    /// `HttpTokensEnforcedState`: whether IMDSv2 is enforced at launch.
+    pub http_tokens_enforced: Option<&'static str>,
+}
+
+impl AccountInstanceMetadataDefaults {
+    /// Whether this account states no IMDS default at all — a fresh account, or one that
+    /// has cleared every setting it had set with `no-preference`.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// These defaults as the modelled `InstanceMetadataDefaultsResponse`
+    /// `GetInstanceMetadataDefaults` reports under `AccountLevel`.
+    ///
+    /// The ONE projection, so every operation that reports the account's defaults reports
+    /// them identically. A setting with no default is left out of the shape rather than
+    /// reported as a word, because the response's own enums have no word for it.
+    ///
+    /// `ManagedBy` is reported only when the account HAS a default to report: it names "the
+    /// entity that manages the IMDS default settings" (`InstanceMetadataDefaultsResponse$`
+    /// `ManagedBy`), and the settings this emulator can hold are always the account's own —
+    /// the enum's other member, `declarative-policy`, names settings managed outside EC2
+    /// that "can't be modified by the account", which no operation of this API can put the
+    /// account into. `ManagedExceptionMessage` is "the customized exception message that is
+    /// specified in the declarative policy", so it is never reported for the same reason.
+    ///
+    /// The shape is named by its full path rather than imported at the top of this module,
+    /// so this section needs no line in the shared import list.
+    pub fn account_level(&self) -> crate::ops::types::InstanceMetadataDefaultsResponse {
+        crate::ops::types::InstanceMetadataDefaultsResponse {
+            http_tokens: self.http_tokens.map(str::to_string),
+            http_put_response_hop_limit: self.http_put_response_hop_limit,
+            http_endpoint: self.http_endpoint.map(str::to_string),
+            instance_metadata_tags: self.instance_metadata_tags.map(str::to_string),
+            managed_by: (!self.is_empty()).then(|| MANAGED_BY_ACCOUNT.to_string()),
+            managed_exception_message: None,
+            http_tokens_enforced: self.http_tokens_enforced.map(str::to_string),
+        }
     }
 }
 
@@ -23260,6 +23390,24 @@ impl StoreImageTaskRecord {
             store_task_state: Some(self.state_at(now).to_string()),
             store_task_failure_reason: None,
         }
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The account's IMDS defaults as they stand.
+    ///
+    /// A pure read: the defaults have no clock-owed move — a modify's own response reports
+    /// the settings it just put in place — so nothing about them changes with time.
+    pub fn instance_metadata_defaults(&self) -> AccountInstanceMetadataDefaults {
+        self.instance_metadata_defaults.clone()
+    }
+
+    /// Put the account's IMDS defaults at `defaults`.
+    ///
+    /// The one writer, so what a later `GetInstanceMetadataDefaults` reports is always what
+    /// a modify left here.
+    pub fn set_instance_metadata_defaults(&mut self, defaults: AccountInstanceMetadataDefaults) {
+        self.instance_metadata_defaults = defaults;
     }
 }
 

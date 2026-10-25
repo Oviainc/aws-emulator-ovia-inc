@@ -40,11 +40,11 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::stack_lifecycle::{call, member, router_with_engine, store, xml_text, xml_texts, REGION};
 
 /// Another Region's registry, for the row that reads a record registered elsewhere.
-const OTHER_REGION: &str = "us-west-2";
+pub(crate) const OTHER_REGION: &str = "us-west-2";
 
 /// The publisher of the public third-party record (`PublisherId` is
 /// `@pattern("^[0-9a-zA-Z]{12,40}$")`).
-const PUBLISHER_ID: &str = "abcdef123456";
+pub(crate) const PUBLISHER_ID: &str = "abcdef123456";
 
 /// An instant to register the seeded versions at, so every timestamp a case asserts comes
 /// from the record rather than from the clock.
@@ -184,7 +184,10 @@ fn other_region_resource() -> StoredExtension {
 }
 
 /// A router over a store seeded with every record above.
-fn router_with_registry() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// This crate's ONE registry fixture: `list_types.rs` lists the same records this suite
+/// describes one at a time, so the two reads are held to one set of records.
+pub(crate) fn router_with_registry() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = router_with_engine();
     {
         let state = store(&engine);

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssetModels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssetModels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssetModels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation enumerates the stored asset models from the shared
+//! engine store (`crate::state`); this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +154,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // A listing needs no request metadata: the enumeration is a function of the
+        // store and the query parameters alone.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssetModels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssetModelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssetModels"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAssetModelsError::Modeled(ListAssetModelsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // "If you don't provide an assetModelTypes, all types of asset models are
+        // returned": an absent list is no type constraint, and an empty one states
+        // the same thing.
+        let types = input
+            .asset_model_types
+            .as_deref()
+            .filter(|types| !types.is_empty());
+        // `assetModelVersion` selects the LATEST (the documented default) or the
+        // ACTIVE version; it carries the modelled pattern `^(LATEST|ACTIVE)$`, which
+        // the runtime validates BEFORE this handler runs, so an alias that arrives
+        // here is one of those two and nothing else falls through to LATEST.
+        // This emulator keeps ONE version of an asset model, so
+        // ACTIVE resolves to it once the transition the clock owes has fallen due,
+        // and to nothing while the model is still settling — the same rule
+        // `crate::state::asset_model_target_etag` and
+        // `DescribeAssetModelCompositeModel` hold a version alias to. A list
+        // reports absence by leaving the model out, not by refusing.
+        let version = input
+            .asset_model_version
+            .as_deref()
+            .unwrap_or(crate::state::VERSION_TYPE_LATEST);
+
+        let store = state.lock();
+
+        let mut matching: Vec<&crate::state::AssetModelRecord> = store
+            .asset_models
+            .values()
+            .filter(|model| types.is_none_or(|types| types.contains(&model.model_type)))
+            .filter(|model| {
+                version != crate::state::VERSION_TYPE_ACTIVE
+                    || model.state(now) == crate::state::STATE_ACTIVE
+            })
+            .collect();
+        // A stable order is what makes `nextToken` resumable: oldest first, ties
+        // broken by id so two models created in the same instant still order
+        // deterministically. The same order `ListAssets` enumerates in.
+        matching.sort_by(|left, right| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the id of the first asset
+        // model of the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration
+        // is refused rather than answered with an empty page, which would report
+        // absence as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                matching
+                    .iter()
+                    .position(|model| model.id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total. The default is the one AWS documents for this operation.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(matching.len());
+
+        let next_token = matching
+            .get(end)
+            .map(|model| ::hex::encode(model.id.as_bytes()));
+        let asset_model_summaries = matching[start..end]
+            .iter()
+            .map(|model| summary(model, now))
+            .collect();
+
+        Ok(ListAssetModelsOutput {
+            asset_model_summaries,
+            next_token,
+        })
     }
+}
+
+/// The page size AWS documents for this operation when the caller gives no
+/// `maxResults`.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// One stored asset model as this operation's summary, as of `now`.
+///
+/// Every member is read from the stored record, so a listed model reports what
+/// `DescribeAssetModel` reports for it: the status is the same derived one, and
+/// the version is the same stored counter. `description` is modelled required
+/// here while the stored one is optional, which is the same `unwrap_or_default`
+/// `DescribeAssetModel` answers a model created without a description with.
+fn summary(
+    record: &crate::state::AssetModelRecord,
+    now: ::std::time::SystemTime,
+) -> AssetModelSummary {
+    AssetModelSummary {
+        id: record.id.clone(),
+        external_id: record.external_id.clone(),
+        arn: record.arn.clone(),
+        name: record.name.clone(),
+        asset_model_type: Some(record.model_type.clone()),
+        description: record.description.clone().unwrap_or_default(),
+        creation_date: crate::state::to_date_time(record.creation_date),
+        last_update_date: crate::state::to_date_time(record.last_update_date),
+        status: record.status(now),
+        version: Some(record.version.to_string()),
+    }
+}
+
+/// Decode a `nextToken` back into the asset model id it resumes from.
+fn decode_token(token: &str) -> Result<String, ListAssetModelsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListAssetModelsError {
+    ListAssetModelsError::Modeled(ListAssetModelsErrorModeled::InvalidRequestException(
+        InvalidRequestException {
+            message: "The nextToken is not a token this operation issued.".to_string(),
+        },
+    ))
 }

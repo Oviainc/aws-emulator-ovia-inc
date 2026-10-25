@@ -188,7 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         DescribeConfigurationRecordersErrorModeled::NoSuchConfigurationRecorderException(
                             NoSuchConfigurationRecorderException {
                                 message: Some(
-                                    crate::state::NO_SUCH_CONFIGURATION_RECORDER.to_string(),
+                                    crate::state::no_such_configuration_recorder_message(
+                                        crate::state::RecorderSelector::Name,
+                                    ),
                                 ),
                             },
                         )
@@ -201,7 +203,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `Arn` names one recorder, so an ARN that matches none is the same failure as
-        // a name that matches none.
+        // a name that matches none — stated for the member the request actually
+        // carried, which for a service-linked recorder is the only member there is.
         if let Some(arn) = input.arn.as_deref() {
             selected.retain(|recorder| recorder.arn.as_deref() == Some(arn));
             if selected.is_empty() {
@@ -209,7 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     DescribeConfigurationRecordersErrorModeled::NoSuchConfigurationRecorderException(
                         NoSuchConfigurationRecorderException {
                             message: Some(
-                                crate::state::NO_SUCH_CONFIGURATION_RECORDER.to_string(),
+                                crate::state::no_such_configuration_recorder_message(
+                                    crate::state::RecorderSelector::Arn,
+                                ),
                             ),
                         },
                     )

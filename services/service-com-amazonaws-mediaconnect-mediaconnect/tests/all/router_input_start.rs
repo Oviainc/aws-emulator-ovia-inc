@@ -59,9 +59,12 @@ async fn delete_router_input(emulator: &Emulator, arn: &str) -> (u16, Option<Str
 
 /// Seconds in an hour and in a day, the units the assertions below state a time of day and a
 /// weekday in.
-const SECONDS_PER_HOUR: i64 = 60 * 60;
+///
+/// `pub(crate)` here and below because `tests/all/router_output_start.rs` asserts the SAME
+/// window rule for a router output: one reading of a scheduled window for both suites.
+pub(crate) const SECONDS_PER_HOUR: i64 = 60 * 60;
 /// See [`SECONDS_PER_HOUR`].
-const SECONDS_PER_DAY: i64 = 24 * SECONDS_PER_HOUR;
+pub(crate) const SECONDS_PER_DAY: i64 = 24 * SECONDS_PER_HOUR;
 
 /// The epoch second of a modelled `Timestamp` as the response carries it.
 ///
@@ -92,7 +95,7 @@ fn instant_secs(case: &str, value: &Value) -> i64 {
 /// `MaintenanceSchedule` is a union whose only member is `Window`
 /// (`smithy_query(query="shape",shape="MaintenanceSchedule")`), read under either key the
 /// crate's union codec can answer with (see [`union_member`]).
-fn window_secs(case: &str, schedule: &Value) -> (i64, i64, i64) {
+pub(crate) fn window_secs(case: &str, schedule: &Value) -> (i64, i64, i64) {
     let window = union_member(schedule, "Window", "window");
     assert!(
         window.is_object(),
@@ -108,7 +111,7 @@ fn window_secs(case: &str, schedule: &Value) -> (i64, i64, i64) {
 /// Assert the window `schedule` reports is a well-formed maintenance window as of `called_at`:
 /// it opens in the future, it lasts exactly one [`mc::MAINTENANCE_WINDOW_SPAN`], and the
 /// maintenance it schedules falls inside it.
-fn assert_window_shape(case: &str, schedule: &Value, called_at: i64) -> (i64, i64, i64) {
+pub(crate) fn assert_window_shape(case: &str, schedule: &Value, called_at: i64) -> (i64, i64, i64) {
     let (start, end, scheduled_time) = window_secs(case, schedule);
     assert!(
         start > called_at,
@@ -129,7 +132,7 @@ fn assert_window_shape(case: &str, schedule: &Value, called_at: i64) -> (i64, i6
 }
 
 /// The instant the test calls an operation at, in epoch seconds.
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -143,12 +146,12 @@ fn now_secs() -> i64 {
 ///
 /// Computed here from the epoch second itself — 1970-01-01 was a Thursday, the fourth day of
 /// such a week — so this check does not run through the same function the handler does.
-fn day_of_week(instant: i64) -> i64 {
+pub(crate) fn day_of_week(instant: i64) -> i64 {
     (instant.div_euclid(SECONDS_PER_DAY) + 3).rem_euclid(7)
 }
 
 /// The distance from midnight UTC of `instant`, in seconds.
-fn time_of_day(instant: i64) -> i64 {
+pub(crate) fn time_of_day(instant: i64) -> i64 {
     instant.rem_euclid(SECONDS_PER_DAY)
 }
 

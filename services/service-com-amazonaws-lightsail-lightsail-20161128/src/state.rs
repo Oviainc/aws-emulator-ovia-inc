@@ -11293,6 +11293,12 @@ impl ComAmazonawsLightsailLightsail20161128State {
         if let Some(record) = self.distributions.get_mut(name) {
             return Some(body(record, RESOURCE_TYPE_DISTRIBUTION));
         }
+        // A certificate is held under its name alone, the name
+        // `GetCertificates` serves it by, so a tag change resolves it that way
+        // too — exactly like the distribution it is attached to.
+        if let Some(record) = self.certificates.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_CERTIFICATE));
+        }
         // Only the Region-keyed maps need the pair, so it is built here rather
         // than above: a name the maps keyed by name alone hold never allocates
         // it.
@@ -11480,6 +11486,7 @@ tagged_records!(
     StoredAlarm,
     StoredContactMethod,
     StoredDistribution,
+    StoredCertificate,
     StoredBucket,
     StoredContainerService,
     StoredLoadBalancer,

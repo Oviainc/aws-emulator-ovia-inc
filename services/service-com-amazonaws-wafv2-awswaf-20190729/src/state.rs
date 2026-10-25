@@ -286,6 +286,58 @@ pub fn api_key_cursor(sequence: u64) -> String {
     format!("{sequence:0width$}", width = API_KEY_CURSOR_WIDTH)
 }
 
+/// How many characters a well-formed API key value carries: the 256 bits of the
+/// digest [`new_api_key`] renders, two hex characters per byte.
+const API_KEY_RENDERED_LENGTH: usize = 64;
+
+/// A fresh API key value for a key defined in `scope` over `token_domains`.
+///
+/// `CreateAPIKey` answers "the generated, encrypted API key", an `APIKey`
+/// (`@length(1..2048)`, `@pattern(\S)` —
+/// `smithy_query(query="shape",shape="APIKey")`), and the model gives the value no
+/// further form: a client never parses it, it copies it into its JavaScript
+/// CAPTCHA integration and hands it back to this service. So the value this
+/// service mints is opaque — a 256-bit payload rendered in hex (the `hex` crate,
+/// as [`new_uuid`] renders its own bytes), [`API_KEY_RENDERED_LENGTH`]
+/// characters, every one of them non-whitespace.
+///
+/// The bytes are a SHA-256 digest (the `sha2` crate, as [`new_uuid`] uses it) over
+/// a fresh [`new_uuid`] and the key's own definition, so a key is unique and
+/// unpredictable per call: two keys defined over the same domains in the same
+/// scope are two different keys, as two separate mints should be. What the key
+/// DECRYPTS to is never recovered from the value — the token domains and the
+/// creation instant are read back out of the store
+/// ([`ComAmazonawsWafv2Awswaf20190729State::api_key`]), which is the only place
+/// they are kept.
+pub fn new_api_key(scope: &str, token_domains: &[String]) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(new_uuid().as_bytes());
+    hasher.update(scope.as_bytes());
+    for domain in token_domains {
+        // A separator no `TokenDomain` can contain (`^[\w\.\-/]+$`), so two
+        // different domain lists cannot hash the same bytes.
+        hasher.update([0_u8]);
+        hasher.update(domain.as_bytes());
+    }
+    ::hex::encode(hasher.finalize())
+}
+
+/// `true` when `value` has the form this service mints an API key in:
+/// [`API_KEY_RENDERED_LENGTH`] lowercase hex characters.
+///
+/// A key is "the generated, encrypted API key", so a value that does not even
+/// decode to a payload of the right size is not a key WAF could decrypt, whatever
+/// the store holds — which is the difference between a key that is not valid and a
+/// well-formed key naming nothing stored.
+pub fn is_api_key_shaped(value: &str) -> bool {
+    value.len() == API_KEY_RENDERED_LENGTH
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// One request a web ACL evaluated, as WAF's bot visibility recorded it: the URI
 /// path the request asked for and the bot that sent it.
 ///
@@ -445,6 +497,15 @@ impl ComAmazonawsWafv2Awswaf20190729State {
         };
         self.api_keys.insert(key, entry.clone());
         Some(entry)
+    }
+
+    /// The API key `api_key` stored under `scope`, or `None` when the scope holds
+    /// no key with that value.
+    ///
+    /// A key value is the key's identity within its scope, and a scope is a
+    /// namespace, so the key value of one scope names no key of the other.
+    pub fn api_key(&self, scope: &str, api_key: &str) -> Option<&ApiKeyEntry> {
+        self.api_keys.get(&(scope.to_string(), api_key.to_string()))
     }
 
     /// How many API keys this scope already holds. See
@@ -902,6 +963,13 @@ pub const MAX_REGEX_PATTERN_SETS_PER_SCOPE: usize = 10;
 /// for a test to reach it. It is per scope because a scope is a namespace, like
 /// every other bound in this module.
 pub const MAX_API_KEYS_PER_SCOPE: usize = 10;
+
+/// The most token domains ONE API key carries: "You can use a single key for up to
+/// 5 domains" (`CreateAPIKey`'s own documentation,
+/// `smithy_query(query="doc",shape="CreateAPIKey")`). A request naming more is
+/// refused rather than stored, because a key that carries them could not be used
+/// for all of them.
+pub const MAX_TOKEN_DOMAINS_PER_API_KEY: usize = 5;
 
 /// The most addresses one IP set holds: WAF's published quota is 10,000 IP
 /// addresses or ranges per IP set. It bounds how large a single stored entry can
@@ -2724,6 +2792,10 @@ pub const FIELD_IP_ADDRESS: &str = "IP_ADDRESS";
 /// [`FIELD_RESOURCE_ARN`].
 pub const FIELD_ENTITY_LIMIT: &str = "ENTITY_LIMIT";
 
+/// The `ParameterExceptionField` value naming a token domain. See
+/// [`FIELD_RESOURCE_ARN`].
+pub const FIELD_TOKEN_DOMAIN: &str = "TOKEN_DOMAIN";
+
 /// The `ErrorReason` WAF carries for an ARN it will not accept, as the recorded
 /// WAF responses show it.
 ///
@@ -2782,6 +2854,31 @@ pub fn invalid_parameter_exception(
 /// [`ARN_NOT_VALID_REASON`].
 pub fn invalid_arn_exception(arn: &str) -> WAFInvalidParameterException {
     invalid_parameter_exception(FIELD_RESOURCE_ARN, arn, ARN_NOT_VALID_REASON)
+}
+
+/// The `ErrorReason` WAF carries for a value it cannot decode as an API key, as the
+/// recorded WAF responses show it.
+pub const KEY_FORMAT_NOT_VALID_REASON: &str = "The parameter contains formatting \
+     that is not valid.";
+
+/// [`invalid_parameter_exception`] for an API key value WAF cannot decode: the
+/// rejected value as `Parameter`, [`KEY_FORMAT_NOT_VALID_REASON`] as `Reason` and NO
+/// `Field` — `ParameterExceptionField` declares no value naming an API key
+/// (`smithy_query(query="shape",shape="ParameterExceptionField")`), so WAF leaves the
+/// member out, which its message renders as `field: null`.
+///
+/// A value that does not decode to a key ([`is_api_key_shaped`]) is refused this way
+/// by every operation that takes one, and is a different failure from a well-formed
+/// key naming nothing stored, which is [`nonexistent_item_exception`].
+pub fn invalid_key_format_exception(api_key: &str) -> WAFInvalidParameterException {
+    WAFInvalidParameterException {
+        message: Some(format!(
+            "Error reason: {KEY_FORMAT_NOT_VALID_REASON}, field: null, parameter: {api_key}"
+        )),
+        field: None,
+        parameter: Some(api_key.to_string()),
+        reason: Some(KEY_FORMAT_NOT_VALID_REASON.to_string()),
+    }
 }
 
 /// The largest page a paginated WAFv2 list answers with when the request names no

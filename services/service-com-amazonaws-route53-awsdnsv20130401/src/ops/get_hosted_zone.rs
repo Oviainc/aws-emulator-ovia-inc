@@ -158,7 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetHostedZoneOutput {
             hosted_zone: zone.to_hosted_zone(),
-            delegation_set: Some(zone.to_delegation_set()),
+            // The reusable delegation set the zone was created in, when it
+            // names one, so the `Id` and `CallerReference` reported are the
+            // set's own; otherwise the zone's own four name servers.
+            delegation_set: Some(store.zone_delegation_set(zone)),
             // Read off the zone, so a zone whose deletion protection is on
             // would report it on.
             hosted_zone_deletion_protection_enabled: Some(zone.deletion_protection_enabled),

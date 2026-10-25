@@ -388,6 +388,67 @@ pub const SCOPE_EMPTY: &str =
 /// different refusal and keep their own.)
 pub const RESOURCE_NOT_FOUND: &str = "Resource is not found";
 
+/// The text this service's `ValidationException` carries when a job identifier is not a
+/// well-formed one, so the request is refused as INVALID INPUT and never reported as a
+/// missing resource.
+///
+/// The model documents `ValidationException$message` only as "The input fails to satisfy
+/// the constraints specified by an Amazon service", so it states no text — but the
+/// service's recordings do: this request-independent sentence, carrying none of the
+/// request's data, is what a malformed job identifier comes back with. It is therefore
+/// the service's fixed template for this refusal rather than one call's example text,
+/// and every identifier guard here answers with it ([`check_job_identifier`]).
+pub const INVALID_JOB_ID: &str = "Invalid Job Id";
+
+/// The group widths of the shape a job identifier of this service has: `8-4-4-4-12` hex
+/// digits, the canonical rendering of a UUID.
+///
+/// Source: what this service MINTS — [`new_uuid`], the single mint behind
+/// [`ComAmazonawsBackupsearchCryobackupsearchserviceState::mint_identifier`] and
+/// [`ComAmazonawsBackupsearchCryobackupsearchserviceState::mint_export_identifier`] —
+/// which is the only shape a `GenericId` of this service ever takes. The model puts no
+/// `@pattern` on `GenericId`, so the boundary validator cannot refuse a string outside
+/// that shape and the service does ([`check_job_identifier`]).
+const JOB_IDENTIFIER_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// Whether `identifier` has the SHAPE a job identifier of this service has: five
+/// hyphen-separated groups of [`JOB_IDENTIFIER_GROUPS`] hex digits.
+///
+/// Only the shape is judged, not which record it names: a hex digit's CASE is not part
+/// of the shape, so an upper-case rendering is well formed and simply resolves to no
+/// record (this service mints the lower-case one), while a string that cannot be an
+/// identifier at all — any other length, a group of the wrong width, a non-hex
+/// character, a missing or extra group — is not well formed.
+pub fn job_identifier_well_formed(identifier: &str) -> bool {
+    let mut groups = identifier.split('-');
+    for width in JOB_IDENTIFIER_GROUPS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != width || !group.bytes().all(|digit| digit.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
+/// Refuse a job identifier that is not well formed, BEFORE any store lookup.
+///
+/// Every operation that resolves a job identifier to a record goes through here — the
+/// two `Get`s, the two bound listings, `StopSearchJob` and `StartSearchResultExportJob` —
+/// so the two refusals stay apart service-wide: a string that cannot be an identifier is
+/// invalid input ([`INVALID_JOB_ID`], HTTP 400), and a well-formed identifier that names
+/// nothing is a missing resource ([`RESOURCE_NOT_FOUND`], HTTP 404). A member that is a
+/// FILTER rather than a resource to resolve (`ListSearchResultExportJobs`'s
+/// `SearchJobIdentifier`) is not an identifier this rule covers: it narrows a listing and
+/// is never looked up, so it answers an empty page.
+pub fn check_job_identifier(identifier: &str) -> Result<(), String> {
+    if job_identifier_well_formed(identifier) {
+        return Ok(());
+    }
+    Err(INVALID_JOB_ID.to_string())
+}
+
 /// The Region an unsigned request is attributed to.
 pub const DEFAULT_REGION: &str = "us-east-1";
 

@@ -387,17 +387,25 @@ async fn an_export_job_identifier_no_export_job_exists_for_is_not_found() {
         started.status, started.body
     );
 
-    // Identifiers that name no export job: an unknown opaque string, a UUID of the shape
-    // the service's own corpus uses, one that differs from the minted id only in its
-    // digits, and a SEARCH job's identifier — the two id spaces are separate.
+    // Identifiers that name no export job, each WELL-FORMED (the shape this service
+    // mints, which is the only shape its syntax guard admits): a uuid no call minted, the
+    // nil uuid, an upper-case rendering, and a SEARCH job's identifier — the two id spaces
+    // are separate. A string outside that shape is an input refusal instead; its table is
+    // `tests/all/job_identifier_syntax.rs`.
     let minted = started.string("ExportJobIdentifier");
     let cases: Vec<(&str, String)> = vec![
-        ("unknown opaque string", "does-not-exist".to_string()),
         (
-            "well-formed uuid",
+            "a uuid no call minted",
             "48434c42-40a0-4057-b04d-3b484c610e2b".to_string(),
         ),
-        ("minted id with other digits", "exportjob-000000009999".to_string()),
+        (
+            "the nil uuid",
+            "00000000-0000-0000-0000-000000000000".to_string(),
+        ),
+        (
+            "an upper-case rendering",
+            "48434C42-40A0-4057-B04D-3B484C610E2B".to_string(),
+        ),
         ("a search job's identifier", search_job_identifier.clone()),
     ];
     for (case, identifier) in cases {
@@ -437,9 +445,9 @@ async fn an_export_job_identifier_no_export_job_exists_for_is_not_found() {
 async fn starting_an_export_for_a_search_job_that_does_not_exist_is_not_found_and_writes_nothing() {
     let (emulator, engine) = emulator_with_engine();
     let cases = [
-        ("unknown opaque string", "does-not-exist"),
-        ("well-formed uuid", "48434c42-40a0-4057-b04d-3b484c610e2b"),
-        ("a minted id no job holds", "searchjob-000000004242"),
+        ("a uuid no call minted", "48434c42-40a0-4057-b04d-3b484c610e2b"),
+        ("the nil uuid", "00000000-0000-0000-0000-000000000000"),
+        ("every digit f", "ffffffff-ffff-ffff-ffff-ffffffffffff"),
     ];
     for (case, search_job_identifier) in cases {
         let answer = call(
