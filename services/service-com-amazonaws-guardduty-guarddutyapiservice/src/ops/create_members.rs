@@ -194,10 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         for detail in &input.account_details {
-            if !crate::state::is_account_id(&detail.account_id) {
-                return Err(crate::scaffolded::Scaffolded::invalid_input(
-                    crate::state::invalid_parameter_message(crate::state::ACCOUNT_ID_MEMBER),
-                ));
+            // The same account-id rule the operations taking an `AccountIds` list
+            // apply, read from the one place it lives — here one entry at a time,
+            // because the email rule below is checked per entry beside it.
+            if let Some(message) = crate::state::account_ids_rejection([&detail.account_id]) {
+                return Err(crate::scaffolded::Scaffolded::invalid_input(message));
             }
             if !crate::state::is_member_email(&detail.email) {
                 // The email rule has GuardDuty's own wording, which names the
