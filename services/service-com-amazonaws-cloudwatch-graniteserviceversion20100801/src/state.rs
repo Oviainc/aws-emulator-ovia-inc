@@ -26,7 +26,7 @@
 //! without a field-by-field copy that can silently drop one. A metric stream is stored the
 //! same way, as the modelled [`GetMetricStreamOutput`] its reader returns.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::serde_json::{Map, Value};
@@ -36,6 +36,13 @@ use crate::ops::types::{
     EvaluationWindow, GetMetricStreamOutput, LogAlarm, MetricAlarm, MetricDataQuery,
     ScheduledQueryConfiguration, Tag, WarmUpConfiguration,
 };
+
+/// The action notifications an alarm state transition owes, and how they are delivered to
+/// the ARNs the alarm names.
+pub mod alarm_actions;
+
+/// A metric alarm's `StateValue`, computed from the datapoints this store holds.
+pub mod alarm_evaluation;
 
 /// A dimension set, normalised: dimension name to value, ordered by name, so the same set
 /// keys the same time series whatever order a request listed it in.
@@ -416,6 +423,17 @@ pub struct StoredAlarm {
     pub alarm: MetricAlarm,
     /// The tags `PutMetricAlarm` was given for this alarm.
     pub tags: Vec<Tag>,
+    /// The instant, in epoch seconds, from which this alarm's next evaluation against the
+    /// stored metric data is owed
+    /// ([`ComAmazonawsCloudwatchGraniteserviceversion20100801State::evaluate_metric_alarms`]).
+    ///
+    /// "When this operation creates an alarm, the alarm state is immediately set to
+    /// INSUFFICIENT_DATA. The alarm is then evaluated and its state is set appropriately."
+    /// (`PutMetricAlarm`) — so a write starts a span during which the alarm still reports the
+    /// state the write left it in, and the evaluation becomes due at its end. `SetAlarmState`
+    /// starts a longer one: the state it forces stands until the next periodic evaluation is
+    /// due ([`alarm_evaluation::forced_state_span_secs`]).
+    pub evaluation_due_secs: f64,
 }
 
 /// A stored composite alarm: the modelled shape `DescribeAlarms` returns, plus what the
@@ -520,6 +538,11 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     pub next_history_sequence: u64,
     /// Metric streams by stream name.
     pub metric_streams: HashMap<String, StoredMetricStream>,
+    /// The action notifications the alarm state transitions this store has materialised owe
+    /// but nothing has delivered yet, oldest first. Bounded by
+    /// [`alarm_evaluation::MAX_PENDING_NOTIFICATIONS`]; drained by
+    /// [`alarm_actions::settle_alarms`], which is what delivers them.
+    pub pending_notifications: VecDeque<alarm_actions::AlarmNotification>,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -979,7 +1002,11 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// [`COMPOSITE_EVALUATION_DELAY_SECS`] after the call that configured the alarm, and
     /// from then on the outcome depends only on the stored alarm states — so whichever call
     /// materialises it, every later caller sees the same thing.
-    pub fn evaluate_composite_alarms(&mut self, now_secs: f64) {
+    pub fn evaluate_composite_alarms(
+        &mut self,
+        now_secs: f64,
+        budget: &mut alarm_evaluation::EvaluationBudget,
+    ) {
         // A composite alarm's rule can reference another composite alarm, so one alarm's new
         // state can change its parent's outcome too; one pass settles one level of that
         // chain. The number of passes is bounded by [`MAX_COMPOSITE_EVALUATION_PASSES`] as
@@ -995,9 +1022,12 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
             .composite_alarms
             .len()
             .min(MAX_COMPOSITE_EVALUATION_PASSES);
-        let mut budget = MAX_COMPOSITE_EVALUATION_NODES;
+        let mut nodes = MAX_COMPOSITE_EVALUATION_NODES;
         for _ in 0..passes {
-            if !self.evaluate_composite_alarms_once(now_secs, &mut budget) || budget == 0 {
+            if budget.spent()
+                || !self.evaluate_composite_alarms_once(now_secs, &mut nodes, budget)
+                || nodes == 0
+            {
                 break;
             }
         }
@@ -1005,16 +1035,22 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
 
     /// One evaluation pass over every composite alarm, reporting whether any alarm's state
     /// value changed. Alarms are visited in name order, so the pass is deterministic, and the
-    /// pass stops as soon as `budget` is spent.
-    fn evaluate_composite_alarms_once(&mut self, now_secs: f64, budget: &mut usize) -> bool {
+    /// pass stops as soon as `nodes` or the request's own `budget` is spent.
+    fn evaluate_composite_alarms_once(
+        &mut self,
+        now_secs: f64,
+        nodes: &mut usize,
+        budget: &mut alarm_evaluation::EvaluationBudget,
+    ) -> bool {
         let mut names: Vec<String> = self.composite_alarms.keys().cloned().collect();
         names.sort();
         let mut changed = false;
         for name in names {
-            if *budget == 0 {
+            if *nodes == 0 || budget.spent() {
                 break;
             }
-            changed |= self.evaluate_composite_alarm(&name, now_secs, budget);
+            budget.charge_alarm();
+            changed |= self.evaluate_composite_alarm(&name, now_secs, nodes);
         }
         changed
     }
@@ -1103,6 +1139,14 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         // (`CompositeAlarm$StateTransitionedTimestamp`) — this call changed it.
         stored.alarm.state_transitioned_timestamp = Some(to_timestamp(now_secs));
         let updated = AlarmStateSnapshot::of_composite_alarm(&stored.alarm);
+        // The actions this transition fires, queued for the call that materialised it to
+        // deliver: "the actions to execute when this alarm transitions to the ALARM state"
+        // holds for a composite alarm exactly as it does for a metric alarm.
+        let notification = alarm_actions::AlarmNotification::of_composite_transition(
+            &stored.alarm,
+            previous.state_value.as_deref(),
+            now_secs,
+        );
         let item = AlarmHistoryItem {
             alarm_name: Some(name.to_string()),
             alarm_contributor_id: None,
@@ -1114,6 +1158,9 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
             alarm_contributor_attributes: None,
         };
         self.record_history(name, now_secs, item);
+        if let Some(notification) = notification {
+            self.enqueue_notification(notification);
+        }
         true
     }
 }

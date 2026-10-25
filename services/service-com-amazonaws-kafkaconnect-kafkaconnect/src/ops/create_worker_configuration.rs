@@ -6,7 +6,9 @@
 //! worker configuration, so a repeat of a stored name is a `ConflictException`. The
 //! configuration is nothing but stored properties, so it is answered `ACTIVE` at once:
 //! `WorkerConfigurationState` has no creating value (only `ACTIVE` and `DELETING`),
-//! hence no transition for the clock to owe.
+//! hence no transition for the clock to owe. The properties the request carries are
+//! base64-encoded content the service decodes to read them, so a body it cannot
+//! decode is a `BadRequestException` and nothing is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -193,6 +195,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "tags",
                         &breach.reason(),
                     )),
+                })
+                .into(),
+            );
+        }
+
+        // `propertiesFileContent` is documented "Base64 encoded contents of
+        // connect-distributed.properties file", and `__sensitiveString` cannot
+        // express an encoding, so the handler is where the encoding is read: a
+        // value the service could not decode carries no properties file at all,
+        // so the create is refused on that member and nothing is stored (the
+        // same check any base64 member of this service is held to,
+        // `crate::state::base64_content_refusal`).
+        if let Some(message) = crate::state::base64_content_refusal(
+            "propertiesFileContent",
+            &input.properties_file_content,
+        ) {
+            return Err(
+                CreateWorkerConfigurationErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
                 })
                 .into(),
             );

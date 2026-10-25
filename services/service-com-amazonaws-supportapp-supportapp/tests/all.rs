@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/channel_role_account.rs"]
+mod channel_role_account;
 #[path = "all/delete_slack_workspace_configuration.rs"]
 mod delete_slack_workspace_configuration;
 #[path = "all/error_message_templates.rs"]

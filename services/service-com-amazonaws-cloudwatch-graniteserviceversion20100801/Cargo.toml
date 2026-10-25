@@ -24,12 +24,31 @@ tracing = { workspace = true }
 # Opaque pagination cursors: hex makes a token this service did not mint detectable,
 # which is what lets DescribeAlarms refuse a malformed NextToken.
 hex = { workspace = true }
+# `arn`: the ONE parse of a caller-supplied resource ARN, shared with every other service —
+# an alarm action's ARN (and the Region and account of the alarm's own ARN) is read through
+# it rather than split here.
+service-common = { path = "../common" }
+# The AWS SDK for SNS, driven over the in-process callback
+# (`OperationContext::callback`): an alarm state transition executes its SNS topic actions
+# with `Publish` (`state::alarm_actions::settle_alarms`). Only the generated client is
+# needed — the emulator supplies the transport, so the SDK's own HTTPS stack and runtime are
+# left out.
+aws-sdk-sns = { version = "1", default-features = false }
 # GetMetricData's cursor carries a fixed-size digest of the request it was minted for, so a
 # token replayed against a different request is refused at constant token size.
 sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# SNS is mounted beside CloudWatch on one engine in the alarm-action tests, because an
+# alarm's action is an SNS topic and a notification is asserted where a client sees it: on
+# the topic's subscription.
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+# SQS is mounted with them, because the subscriber of the alarm's topic is a queue and that
+# is where the delivered notification is read.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true
