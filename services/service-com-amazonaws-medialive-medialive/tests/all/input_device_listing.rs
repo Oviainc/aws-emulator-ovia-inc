@@ -30,7 +30,10 @@ const DEVICES: &str = "/prod/inputDevices";
 
 /// Every member `InputDeviceSummary` and `DescribeInputDeviceResponse` carry, by
 /// its wire name (`smithy_query(query="shape", shape="InputDeviceSummary")`).
-const MEMBERS: [&str; 16] = [
+///
+/// Shared with the `input_device_description` suite, so the two readers' suites
+/// cannot disagree about which members a device carries.
+pub(crate) const MEMBERS: [&str; 16] = [
     "arn",
     "connectionState",
     "deviceSettingsSyncState",
