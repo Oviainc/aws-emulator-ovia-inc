@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUsersInGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUsersInGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUsersInGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -175,20 +166,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUsersInGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUsersInGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUsersInGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // A read: this handler takes the lock to READ and writes nothing.
+        let guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // The group must be one the pool holds: this operation is "given a user
+        // pool ID and a group name", so a name the pool does not hold names no
+        // membership to report. `GroupNameType` carries no case-insensitivity
+        // trait, so the name is matched exactly as `CreateGroup` stored it.
+        if !pool.groups.contains_key(&input.group_name) {
+            return Err(group_not_found());
+        }
+
+        // The stored members, in ascending stored-key order — the stable order
+        // the page token indexes into.
+        let keys = pool.group_member_keys(&input.group_name);
+
+        // The listing a page token belongs to: this operation, over this pool's
+        // membership of this group, so a token names no page of another group's
+        // or another pool's listing.
+        let scope = format!("{}|{}|{}", Self::NAME, pool.id, input.group_name);
+        let page = crate::state::page_of(&scope, &keys, input.limit, input.next_token.as_deref())
+            .ok_or_else(invalid_next_token)?;
+
+        // Rendered from the STORED users, so an entry is what a later read of
+        // that one user sees.
+        let users: Vec<UserType> = page
+            .keys
+            .iter()
+            .filter_map(|key| pool.users.get(key))
+            .map(crate::state::User::to_user_type)
+            .collect();
+
+        // A listing's result member is PRESENT and empty when the group holds no
+        // member, which is what a paginating client reads.
+        Ok(ListUsersInGroupOutput {
+            users: Some(users),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> ListUsersInGroupError {
+    ListUsersInGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a group the pool does not
+/// hold. Carries the fixed message of
+/// [`crate::state::GROUP_NOT_FOUND_MESSAGE`], which names no group.
+fn group_not_found() -> ListUsersInGroupError {
+    ListUsersInGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a `NextToken` that names no
+/// page of this listing.
+fn invalid_next_token() -> ListUsersInGroupError {
+    ListUsersInGroupErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(
+            "NextToken is not a pagination token this operation issued for this group".to_string(),
+        ),
+        // `reasonCode` is AWS's own classification of the bad parameter and
+        // this service's model documents no value for it, so nothing is
+        // invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ListUsersInGroupError {
+    ListUsersInGroupErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
