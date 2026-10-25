@@ -41,12 +41,16 @@ mod minted_export_arn;
 mod not_found_message;
 #[path = "all/not_found_wire_status.rs"]
 mod not_found_wire_status;
+#[path = "all/page_token_refusal.rs"]
+mod page_token_refusal;
 #[path = "all/query_column_selection.rs"]
 mod query_column_selection;
 #[path = "all/query_statement_subset.rs"]
 mod query_statement_subset;
 #[path = "all/quota_service_code.rs"]
 mod quota_service_code;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

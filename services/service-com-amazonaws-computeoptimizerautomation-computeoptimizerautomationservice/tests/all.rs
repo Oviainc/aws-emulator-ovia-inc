@@ -41,6 +41,8 @@ mod enum_parameter_rejection;
 mod error_payloads;
 #[path = "all/not_found_wording.rs"]
 mod not_found_wording;
+#[path = "all/recommended_action_inventory.rs"]
+mod recommended_action_inventory;
 #[path = "all/recommended_action_summaries.rs"]
 mod recommended_action_summaries;
 #[path = "all/recommended_actions.rs"]

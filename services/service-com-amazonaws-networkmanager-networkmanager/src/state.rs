@@ -73,6 +73,9 @@ pub const STATE_PENDING: &str = "PENDING";
 pub const STATE_AVAILABLE: &str = "AVAILABLE";
 /// See [`STATE_PENDING`].
 pub const STATE_DELETING: &str = "DELETING";
+/// See [`STATE_PENDING`]. The state a resource of one of those kinds is in between the
+/// update that reconfigures it and the instant that reconfiguration is applied.
+pub const STATE_UPDATING: &str = "UPDATING";
 
 /// The state a freshly created CORE network is in. `CoreNetworkState` is a different enum
 /// from the three above — CREATING, UPDATING, AVAILABLE, DELETING (`smithy_query
@@ -344,6 +347,9 @@ pub const FIELD_CONNECT_ATTACHMENT_ID: &str = "connectAttachmentId";
 pub const FIELD_INSIDE_CIDR_BLOCKS: &str = "insideCidrBlocks";
 /// See [`FIELD_CONNECT_ATTACHMENT_ID`].
 pub const FIELD_SUBNET_ARN: &str = "subnetArn";
+/// See [`FIELD_GLOBAL_NETWORK_ID`]: the same lowerCamelCase spelling of the request
+/// member, for the version id a put of a core network policy asserts the history ends at.
+pub const FIELD_LATEST_VERSION_ID: &str = "latestVersionId";
 
 /// How a resource kind of this service reads in prose: the ARN resource type
 /// ([`GLOBAL_NETWORK_KIND`] and friends) with its hyphens as spaces and a leading
@@ -611,6 +617,37 @@ pub const MAX_CONNECTIONS_PER_GLOBAL_NETWORK: usize = 100;
 /// sentence for `Model` and `SerialNumber`) — a bound the modelled `ConstrainedString`
 /// (len 0..256) does not express, so it is checked by the handler instead.
 pub const MAX_DEVICE_DESCRIPTOR_CHARS: usize = 128;
+
+/// The documented maximum length, in characters, of a link's `Type` and `Provider`, and
+/// the characters the documentation forbids in them: "Constraints: Maximum length of 128
+/// characters. Cannot include the following characters: | \ ^" (`smithy_query query="doc"
+/// shape="CreateLinkRequest" member="Provider"`, the same sentence for `Type` and for
+/// both members of `UpdateLinkRequest`) — neither of which the modelled
+/// `ConstrainedString` (len 0..256, pattern `^[\s\S]*$`) expresses, so they are checked
+/// by [`link_descriptor_problem`] instead.
+pub const MAX_LINK_DESCRIPTOR_CHARS: usize = 128;
+/// See [`MAX_LINK_DESCRIPTOR_CHARS`].
+pub const FORBIDDEN_LINK_DESCRIPTOR_CHARS: [char; 3] = ['|', '\\', '^'];
+
+/// Check one free-form link descriptor against the two constraints
+/// [`MAX_LINK_DESCRIPTOR_CHARS`] documents.
+///
+/// Answers `None` when `value` satisfies both, otherwise the member-level reason the
+/// refusal reports. Shared by every operation that takes those descriptors, so a value a
+/// create refuses an update refuses too.
+pub fn link_descriptor_problem(value: &str) -> Option<String> {
+    let max = MAX_LINK_DESCRIPTOR_CHARS;
+    let length = value.chars().count();
+    if length > max {
+        return Some(format!("must be at most {max} characters, but is {length}"));
+    }
+    value
+        .chars()
+        .find(|candidate| FORBIDDEN_LINK_DESCRIPTOR_CHARS.contains(candidate))
+        .map(|found| {
+            format!("must not include any of the characters | \\ ^, but includes {found:?}")
+        })
+}
 
 /// How many core networks one global network may hold.
 ///
@@ -903,16 +940,28 @@ pub struct LinkRecord {
     pub created_at: SystemTime,
     /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
     pub available_at: SystemTime,
+    /// The instant the `UPDATING` -> `AVAILABLE` transition the clock owes becomes due,
+    /// set by the update that reconfigured the link and `None` while no update has ever
+    /// touched it. See [`LinkRecord::state_at`].
+    pub updating_until: Option<SystemTime>,
     pub tags: Vec<Tag>,
 }
 
 impl LinkRecord {
     /// This link's lifecycle state as of `now`.
+    ///
+    /// Both transitions are a function of the clock, so reading one never writes: a link
+    /// is `UPDATING` from an update until that reconfiguration is applied, `PENDING` until
+    /// the create settles, and `AVAILABLE` once neither is outstanding. An update
+    /// OUTSTANDING is what the link reports even when the create has not settled yet,
+    /// since that update is the later of the two requests the link is still working on.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
-        if now >= self.available_at {
-            STATE_AVAILABLE
-        } else {
+        if self.updating_until.is_some_and(|due| now < due) {
+            STATE_UPDATING
+        } else if now < self.available_at {
             STATE_PENDING
+        } else {
+            STATE_AVAILABLE
         }
     }
 
@@ -3079,9 +3128,33 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         record
     }
 
-    /// The ARN of a resource of this service: `arn:aws:networkmanager::<account>:<kind>/<id>`.
+    /// The ARN of a resource of this service that stands on its own — one whose identity
+    /// needs no parent to be unique: `arn:aws:networkmanager::<account>:<kind>/<id>`.
+    ///
+    /// That is the form for the kinds this service identifies account-wide: a global
+    /// network ([`GLOBAL_NETWORK_KIND`]), a core network ([`CORE_NETWORK_KIND`]) and an
+    /// attachment ([`ATTACHMENT_KIND`]). A resource that exists only INSIDE a global
+    /// network is named by [`Self::scoped_resource_arn`] instead.
     pub fn resource_arn(kind: &str, id: &str) -> String {
         ::engine::emulator_arn(ARN_NAMESPACE, ARN_REGION, &format!("{kind}/{id}"))
+    }
+
+    /// The ARN of a resource of this service that exists only inside a SCOPE — for every
+    /// such kind here, the global network that owns it:
+    /// `arn:aws:networkmanager::<account>:<kind>/<scope-id>/<id>`.
+    ///
+    /// The owner's id is part of the name because the resource has no identity outside it:
+    /// a site ([`SITE_KIND`]), a link ([`LINK_KIND`]), a device ([`DEVICE_KIND`]) and a
+    /// connection ([`CONNECTION_KIND`]) are each addressed through the global network that
+    /// holds them, so their ARN names that global network ahead of their own id — which
+    /// stays the LAST path segment, and is what [`parse_resource_arn`] reads back as the id
+    /// a lookup keys on.
+    pub fn scoped_resource_arn(kind: &str, scope_id: &str, id: &str) -> String {
+        ::engine::emulator_arn(
+            ARN_NAMESPACE,
+            ARN_REGION,
+            &format!("{kind}/{scope_id}/{id}"),
+        )
     }
 
     /// How many sites `global_network_id` owns, for the per-global-network quota.
@@ -3788,27 +3861,38 @@ fn resource_definition(
 }
 
 /// The resource an ARN of this service names: the ARN resource type (which is also the
-/// resource-id prefix this service mints, see [`GLOBAL_NETWORK_KIND`]) and the id.
+/// resource-id prefix this service mints, see [`GLOBAL_NETWORK_KIND`]), the id, and —
+/// for a kind that exists only inside a parent — the id of that parent.
 #[derive(Debug, Clone, Copy)]
 pub struct ArnParts<'a> {
     /// The ARN resource type, e.g. `global-network`.
     pub kind: &'a str,
-    /// The resource id inside that type.
+    /// The resource id inside that type: the LAST path segment of the ARN.
     pub id: &'a str,
+    /// The id the ARN names ahead of `id`, for a resource whose name carries its owner
+    /// (see [`ComAmazonawsNetworkmanagerNetworkmanagerState::scoped_resource_arn`]);
+    /// `None` for an ARN whose resource path is just `<kind>/<id>`.
+    pub scope: Option<&'a str>,
 }
 
 /// Split a Network Manager resource ARN into its kind and id.
 ///
-/// Every ARN this service mints reads `arn:<partition>:networkmanager::<account>:<kind>/<id>`
-/// (see [`ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn`]). Answers `None`
-/// when the string is not an ARN of this service in that `<kind>/<id>` form at all — the
-/// caller refuses that as a `ValidationException` on the ARN member, which is a different
-/// answer from a well-formed ARN naming a resource that does not exist.
+/// Every ARN this service mints reads
+/// `arn:<partition>:networkmanager::<account>:<kind>/<id>`, or
+/// `arn:<partition>:networkmanager::<account>:<kind>/<owner-id>/<id>` for a kind that
+/// exists only inside an owning resource (see
+/// [`ComAmazonawsNetworkmanagerNetworkmanagerState::scoped_resource_arn`]). The resource's
+/// own id is the LAST path segment either way, which is the id a lookup keys on and the
+/// `ResourceId` a refusal reports. Answers `None` when the string is not an ARN of this
+/// service in one of those forms at all — the caller refuses that as a
+/// `ValidationException` on the ARN member, which is a different answer from a well-formed
+/// ARN naming a resource that does not exist.
 ///
-/// Only the form is judged here, not which account, partition or region the ARN carries:
-/// an ARN of this service that names another account's resource, or carries a region this
-/// global service does not use, parses and then matches no stored record, so the caller
-/// answers it as NOT FOUND rather than as a malformed request.
+/// Only the form is judged here, not which account, partition or region the ARN carries,
+/// nor whether the owner it names really owns the resource: an ARN of this service that
+/// names another account's resource, carries a region this global service does not use, or
+/// names the wrong owner, parses and then matches no stored record, so the caller answers
+/// it as NOT FOUND rather than as a malformed request.
 pub fn parse_resource_arn(arn: &str) -> Option<ArnParts<'_>> {
     let mut fields = arn.splitn(6, ':');
     if fields.next()? != "arn" {
@@ -3826,11 +3910,17 @@ pub fn parse_resource_arn(arn: &str) -> Option<ArnParts<'_>> {
     if fields.next()?.is_empty() {
         return None;
     }
-    let (kind, id) = fields.next()?.split_once('/')?;
-    if kind.is_empty() || id.is_empty() {
+    let (kind, path) = fields.next()?.split_once('/')?;
+    // The resource's own id is the last path segment; anything ahead of it names the
+    // resource that owns it.
+    let (scope, id) = match path.split_once('/') {
+        Some((scope, id)) => (Some(scope), id),
+        None => (None, path),
+    };
+    if kind.is_empty() || id.is_empty() || scope.is_some_and(str::is_empty) || id.contains('/') {
         return None;
     }
-    Some(ArnParts { kind, id })
+    Some(ArnParts { kind, id, scope })
 }
 
 /// The `Reason` a `ValidationException` of this service carries when one input MEMBER is
@@ -3991,9 +4081,13 @@ fn parse_foreign_arn<'a>(
     if found_kind != kind || !is_id(id) {
         return None;
     }
+    // A resource of another service is identified account-wide here: none of the forms this
+    // walk serves names an owning resource ahead of the id, so the resource path is just
+    // `<kind>/<id>` and the scope [`ArnParts`] carries is `None`.
     Some(ArnParts {
         kind: found_kind,
         id,
+        scope: None,
     })
 }
 

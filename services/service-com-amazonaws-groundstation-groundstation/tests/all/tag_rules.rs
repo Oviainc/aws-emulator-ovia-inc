@@ -77,11 +77,16 @@ impl Target {
 
 /// A create against `target`, carrying `tags` when the row names one, with whatever
 /// prerequisite resources that path needs created first.
+///
+/// `slot` moves a reserved contact's window a day per row, so each row of a table holds a
+/// window of its own: an antenna serves one pass at a time, so a second reservation of the
+/// SAME window at one ground station is refused.
 async fn create_tagged(
     router: &MultiServiceRouter,
     target: Target,
     name: &str,
     tags: Option<&Value>,
+    slot: usize,
 ) -> Reply {
     let (path, mut body) = match target {
         Target::Config => (
@@ -119,13 +124,15 @@ async fn create_tagged(
         Target::Contact => {
             let profile_arn =
                 crate::scheduling_loop::create_mission_profile(router, name, 180, None, None).await;
+            let start =
+                1_800_000_000_i64 + i64::try_from(slot).expect("a row index fits in i64") * 86_400;
             (
                 "/contact",
                 json!({
                     "missionProfileArn": profile_arn,
                     "groundStation": "Ohio-1",
-                    "startTime": 1_800_000_000_i64,
-                    "endTime": 1_800_000_600_i64,
+                    "startTime": start,
+                    "endTime": start + 600,
                 }),
             )
         }
@@ -326,7 +333,7 @@ async fn an_illegal_tag_map_is_refused_on_every_create_path_and_stores_nothing()
             let case = format!("{} / {row}", target.label());
             let before = stored_count(&engine, target);
             let name = format!("tag-refusal-{index}");
-            let reply = create_tagged(&router, target, &name, Some(&tags)).await;
+            let reply = create_tagged(&router, target, &name, Some(&tags), index).await;
 
             assert_eq!(
                 reply.status, 431,
@@ -377,7 +384,7 @@ async fn a_legal_tag_map_is_created_and_reads_back_verbatim_on_every_create_path
             let case = format!("{} / {row}", target.label());
             let before = stored_count(&engine, target);
             let name = format!("tag-accepted-{index}");
-            let created = create_tagged(&router, target, &name, tags.as_ref()).await;
+            let created = create_tagged(&router, target, &name, tags.as_ref(), index).await;
 
             assert_eq!(
                 created.status, 200,

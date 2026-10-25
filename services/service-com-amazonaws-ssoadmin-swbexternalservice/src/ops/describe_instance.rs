@@ -18,6 +18,11 @@
 //! an instance that is no longer there: "DELETE_IN_PROGRESS — … Returns
 //! AccessDeniedException after the delete operation completes").
 //!
+//! `EncryptionConfigurationDetails` is reported for EVERY instance: an instance's data at
+//! rest is encrypted from the moment it exists, under the Amazon Web Services owned key
+//! default ([`crate::state::EncryptionConfigurationRecord::aws_owned_default`]) until an
+//! `UpdateInstance` replaces that configuration with a customer managed key.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -238,14 +243,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(crate::state::Region::to_shape)
                     .collect(),
             ),
-            // The encryption configuration `UpdateInstance` stored, if any: its
-            // `EncryptionStatus` is derived from the instant that update becomes
-            // effective, so this stays a pure READ. An instance nothing has configured
-            // reports no details rather than an invented key type or ARN.
-            encryption_configuration_details: instance
-                .encryption
-                .as_ref()
-                .map(|encryption| encryption.to_shape(::std::time::SystemTime::now())),
+            // The configuration the instance's data at rest is encrypted under — always
+            // present, since every instance is encrypted: the Amazon Web Services owned
+            // key default until an `UpdateInstance` replaced it. Its `EncryptionStatus`
+            // is derived from the instant a replacement becomes effective, so this stays
+            // a pure READ.
+            encryption_configuration_details: Some(
+                instance
+                    .encryption
+                    .to_shape(::std::time::SystemTime::now()),
+            ),
             // A property of the INSTANCE: permission sets are a feature of an
             // organization instance, and an account instance serves none of that surface
             // until an `UpdateInstance` enables them on it.

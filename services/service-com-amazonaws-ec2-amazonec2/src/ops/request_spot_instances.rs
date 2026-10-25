@@ -375,12 +375,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .and_then(|placement| placement.availability_zone.as_deref())
         {
-            if !zones.iter().any(|zone| zone.zone_name == requested) {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value '{requested}' for availabilityZone. \
-                     Region '{region}' has no such Availability Zone"
-                )));
-            }
+            crate::state::availability_zone_of_region(
+                &zones,
+                &region,
+                "availabilityZone",
+                requested,
+                |zone| zone.zone_name.as_str(),
+            )?;
         }
 
         // The request's own window. "The request becomes active at this date and time"

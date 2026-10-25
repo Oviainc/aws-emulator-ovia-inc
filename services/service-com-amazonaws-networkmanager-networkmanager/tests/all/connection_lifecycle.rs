@@ -23,39 +23,41 @@
 use serde_json::{json, Value};
 
 use crate::device_lifecycle::create_device_ok;
-use crate::global_network_lifecycle::{error_code, expected_arn, is_minted_id, Emulator, PAST_SETTLE};
+use crate::global_network_lifecycle::{
+    error_code, expected_scoped_arn, is_minted_id, Emulator, PAST_SETTLE,
+};
 use crate::link_lifecycle::{create_link_ok, plain_link};
 
 /// The `Description` every seeded connection starts with, so a row that supplies no
 /// `Description` has a value to leave alone.
-const BASE_DESCRIPTION: &str = "baseline description";
+pub(crate) const BASE_DESCRIPTION: &str = "baseline description";
 
 /// The text every `ResourceNotFoundException` of this service carries
 /// (`crate::state::RESOURCE_NOT_FOUND_MESSAGE`, pinned by `resource_not_found_message`).
-const NOT_FOUND_MESSAGE: &str = "Resource not found.";
+pub(crate) const NOT_FOUND_MESSAGE: &str = "Resource not found.";
 
 /// The ARN resource types a refusal or an ARN of this suite reports.
-const GLOBAL_NETWORK: &str = "global-network";
+pub(crate) const GLOBAL_NETWORK: &str = "global-network";
 /// See [`GLOBAL_NETWORK`].
-const CONNECTION: &str = "connection";
+pub(crate) const CONNECTION: &str = "connection";
 
 /// The `Tags` every seeded connection carries, which no update may rewrite.
-fn base_tags() -> Value {
+pub(crate) fn base_tags() -> Value {
     json!([{ "Key": "env", "Value": "test" }])
 }
 
 /// The resources a connection needs: a global network, a site to hang links off, two
 /// devices to tie together and two links to tie them over.
-struct Fixture {
-    network: String,
-    device: String,
-    connected_device: String,
-    link: String,
-    connected_link: String,
+pub(crate) struct Fixture {
+    pub(crate) network: String,
+    pub(crate) device: String,
+    pub(crate) connected_device: String,
+    pub(crate) link: String,
+    pub(crate) connected_link: String,
 }
 
 /// Create the resources of [`Fixture`] in one global network of `emulator`.
-async fn fixture(emulator: &Emulator, label: &str) -> Fixture {
+pub(crate) async fn fixture(emulator: &Emulator, label: &str) -> Fixture {
     let network = emulator.create_global_network(label).await;
     let site = emulator.create_site(&network, &format!("{label}-site")).await;
     Fixture {
@@ -134,7 +136,7 @@ pub(crate) fn ids_in(body: &Value) -> Vec<String> {
 
 /// Read one connection back through `GetConnections`, the implemented reader for this
 /// resource.
-async fn read_connection(emulator: &Emulator, network: &str, connection: &str) -> Value {
+pub(crate) async fn read_connection(emulator: &Emulator, network: &str, connection: &str) -> Value {
     let (status, body) =
         get_connections(emulator, network, &format!("connectionIds={connection}")).await;
     assert_eq!(
@@ -154,7 +156,7 @@ async fn read_connection(emulator: &Emulator, network: &str, connection: &str) -
 
 /// A `Connection` without its `State`, so a create answer and a later read can be compared
 /// member for member without racing the `PENDING` -> `AVAILABLE` transition the clock owes.
-fn without_state(connection: &Value) -> Value {
+pub(crate) fn without_state(connection: &Value) -> Value {
     let mut copy = connection.clone();
     if let Some(object) = copy.as_object_mut() {
         object.remove("State");
@@ -278,7 +280,7 @@ async fn create_connection_stores_every_member_and_get_connections_answers_from_
         );
         assert_eq!(
             connection["ConnectionArn"],
-            json!(expected_arn(CONNECTION, &connection_id)),
+            json!(expected_scoped_arn(CONNECTION, &seed.network, &connection_id)),
             "case {}: wrong ARN in {connection}",
             row.case
         );
@@ -553,7 +555,7 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
 
 /// Create a connection seeded with [`BASE_DESCRIPTION`], both of the fixture's links and
 /// [`base_tags`], and answer its minted id.
-async fn create_seeded_connection(emulator: &Emulator, seed: &Fixture) -> String {
+pub(crate) async fn create_seeded_connection(emulator: &Emulator, seed: &Fixture) -> String {
     let connection = create_connection_ok(
         emulator,
         &seed.network,
@@ -626,7 +628,7 @@ async fn update_connection_writes_only_the_supplied_members_and_round_trips_thro
         );
         assert_eq!(
             connection["ConnectionArn"],
-            json!(expected_arn(CONNECTION, connection_id)),
+            json!(expected_scoped_arn(CONNECTION, &seed.network, connection_id)),
             "case {}: the ARN must not be rewritten, got {connection}",
             row.case
         );

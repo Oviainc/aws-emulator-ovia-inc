@@ -17,6 +17,11 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The virtual private gateway slice: create, read back, delete. Declared here rather than in
+// sorted position for the reason given above — the sorted neighbourhood is the contended
+// region of this file, and this suite lost several serialized squash merges to it.
+#[path = "all/vpn_gateways.rs"]
+mod vpn_gateways;
 // What `DescribeClientVpnTargetNetworks` reports for the target networks associated with one
 // Client VPN endpoint, and how the ids, the filters and the page size narrow it. Declared
 // here rather than in sorted position, for the reason the note above gives.
@@ -224,6 +229,9 @@ mod stale_security_groups;
 mod state_roundtrip;
 #[path = "all/store_image_tasks.rs"]
 mod store_image_tasks;
+// Reserving part of a subnet's CIDR range, and reading the reservations of one subnet back.
+#[path = "all/subnet_cidr_reservations.rs"]
+mod subnet_cidr_reservations;
 #[path = "all/transit_gateway_acceptance.rs"]
 mod transit_gateway_acceptance;
 #[path = "all/transit_gateway_lifecycle.rs"]

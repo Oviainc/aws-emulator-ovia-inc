@@ -2,9 +2,14 @@
 
 //! @op GetResourceMetadata
 //! IMPLEMENTED: answers the metadata of the addressed data source — the
-//! `Identifier` it was asked about, and the features this emulator observes on it.
+//! `Identifier` it was asked about, and the features this emulator can report on it.
+//! A pure REPORTING operation — it writes nothing, so two calls in a row answer
+//! identically.
 //!
-//! Two gates decide whether there is anything to report, in this order: the
+//! Three gates decide whether there is anything to report, in this order: a
+//! CALLER whose identity-based policies do not allow `pi:GetResourceMetadata` is
+//! refused before anything else, with `AccessDeniedException`
+//! ([`crate::state::identity_based_denial`]); then the
 //! request's `ServiceType` must be the service that OWNS the data source its
 //! `Identifier` names (the modelled `InvalidArgumentException`, see
 //! [`crate::state::service_type_refusal`]), and the identifier must address a data
@@ -182,23 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.service_type,
             &input.identifier,
         ) {
-            return Err(GetResourceMetadataErrorModeled::InvalidArgumentException(
-                InvalidArgumentException {
-                    message: Some(message),
-                },
-            )
-            .into());
+            return Err(invalid_argument(message));
         }
         // The service-wide authorization gate: a value that addresses no data
         // source this account may see is refused identically on every operation,
         // under one message that discloses nothing.
         if !crate::state::is_data_source_identifier(&input.identifier) {
-            return Err(GetResourceMetadataErrorModeled::NotAuthorizedException(
-                NotAuthorizedException {
-                    message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
-                },
-            )
-            .into());
+            return Err(not_authorized());
         }
 
         // The data source is served, so its metadata is the identifier it is
@@ -214,4 +209,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )),
         })
     }
+}
+
+/// `InvalidArgumentException` (HTTP 400), the modelled refusal for a
+/// `(ServiceType, Identifier)` pair that names no data source because the
+/// identifier belongs to the other service's namespace.
+fn invalid_argument(message: String) -> GetResourceMetadataError {
+    GetResourceMetadataErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// `NotAuthorizedException` (HTTP 400), the uniform refusal this service answers
+/// for a request that addresses a data source this account may not read.
+fn not_authorized() -> GetResourceMetadataError {
+    GetResourceMetadataErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
 }

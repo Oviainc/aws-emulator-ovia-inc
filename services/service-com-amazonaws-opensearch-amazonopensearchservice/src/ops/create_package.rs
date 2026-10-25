@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints one [`crate::state::Package`] record for this account and answers with it
+//! through the same `PackageDetails` projection `DescribePackages` reports it with,
+//! so the create's answer and a later read of the package cannot disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +91,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    new_package_id, package_name_exists, OwedStatus, Package, FIRST_PACKAGE_VERSION, PACKAGE_QUOTA,
+    PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING, PACKAGE_TYPE_ZIP_PLUGIN, PROVISIONING,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -170,18 +170,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePackage"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+
+        // `EngineVersion` is "the version of the Amazon OpenSearch Service engine for
+        // which is compatible with the package", and it "can only be specified for
+        // package type ZIP-PLUGIN": a package of any other type has no engine to be
+        // compatible with, so a create that pairs the two asks for something the type
+        // it named does not support, which is the modelled invalid-type refusal rather
+        // than a stored package carrying a version nothing would read.
+        if input.engine_version.is_some() && input.package_type != PACKAGE_TYPE_ZIP_PLUGIN {
+            return Err(CreatePackageErrorModeled::InvalidTypeException(
+                InvalidTypeException {
+                    message: Some(format!(
+                        "EngineVersion can only be specified for package type \
+                         {PACKAGE_TYPE_ZIP_PLUGIN}, not {}",
+                        input.package_type
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // `PackageName` is the "unique name for the package", so a second create of
+        // the same name is the modelled already-exists refusal: the existing record
+        // stays exactly as it is rather than becoming a second package a caller could
+        // not tell apart by name.
+        if store.package_named(&input.package_name).is_some() {
+            return Err(CreatePackageErrorModeled::ResourceAlreadyExistsException(
+                package_name_exists(&input.package_name),
+            )
+            .into());
+        }
+
+        // The store is bounded: past its quota a create is refused rather than adding
+        // another record, so a caller looping with fresh names cannot grow the state
+        // (or the listing's answer) without end. `LimitExceededException` is the
+        // modelled refusal for "trying to create more than the allowed number of
+        // resources or sub-resources".
+        if store.packages.len() >= PACKAGE_QUOTA {
+            return Err(CreatePackageErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {PACKAGE_QUOTA} packages"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let package = Package {
+            package_id: new_package_id(),
+            package_name: input.package_name,
+            package_type: input.package_type,
+            description: input.package_description,
+            source: input.package_source,
+            // The package's content is not in place the instant the create returns:
+            // it is being COPIED out of the Amazon S3 location the request named, and
+            // the clock owes the package the status that copy leaves it in once the
+            // copy span has passed.
+            status: PACKAGE_STATUS_COPYING.to_string(),
+            owed: Some(OwedStatus {
+                status: PACKAGE_STATUS_AVAILABLE.to_string(),
+                message: None,
+                due: now + PROVISIONING,
+            }),
+            version: FIRST_PACKAGE_VERSION,
+            engine_version: input.engine_version,
+            configuration: input.package_configuration,
+            vending_options: input.package_vending_options,
+            encryption_options: input.package_encryption_options,
+            // Which accounts the package is vended to is set by a later scope update;
+            // a package nobody has been granted is shared with nobody.
+            allow_listed_users: Vec::new(),
+            // The package belongs to the account that created it, which is the account
+            // this emulator serves.
+            owner: ::engine::emulator_account_id().to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        // Answered from the STORED record, through the projection every read path
+        // reports a package with.
+        Ok(CreatePackageOutput {
+            package_details: Some(store.insert_package(package).to_details()),
+        })
     }
 }

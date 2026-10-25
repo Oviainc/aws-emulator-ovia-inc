@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +149,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLink"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateLinkErrorModeled::InternalServerException(InternalServerException {
+                message: "the networkmanager store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // The two free-form descriptors carry documented constraints the model's own
+        // `ConstrainedString` (len 0..256, pattern `^[\s\S]*$`) does not express, so they
+        // are refused here rather than by the pre-handler constraint walk — the same
+        // check `CreateLink` applies, from the one shared helper.
+        for (member, value) in [("Type", &input.r#type), ("Provider", &input.provider)] {
+            if let Some(problem) = value
+                .as_deref()
+                .and_then(crate::state::link_descriptor_problem)
+            {
+                return Err(UpdateLinkErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!("{member} {problem}"),
+                        reason: Some(crate::state::REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: member.to_string(),
+                            message: problem,
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        // The update acts on an EXISTING resource addressed by its path, so a parent the
+        // store does not hold is the missing-resource answer (404), not a field failure.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(UpdateLinkErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::GLOBAL_NETWORK_KIND,
+                    &input.global_network_id,
+                ),
+            )
+            .into());
+        }
+
+        // A link is addressed through its global network, so one stored under a different
+        // parent is not found here either.
+        let record = store
+            .links
+            .get_mut(&input.link_id)
+            .filter(|record| record.global_network_id == input.global_network_id)
+            .ok_or_else(|| {
+                UpdateLinkErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+                    crate::state::LINK_KIND,
+                    &input.link_id,
+                ))
+            })?;
+
+        // Only the members the request supplied are changed: "To remove information for
+        // any of the parameters, specify an empty string" (`smithy_query query="doc"
+        // shape="UpdateLink"`), so an absent member leaves the stored value alone and a
+        // supplied one — empty string included — replaces it. The ids, the ARN,
+        // `CreatedAt`, the tags and the clock-derived lifecycle state are never rewritten,
+        // so the link keeps the identity and the history it was created with.
+        if input.description.is_some() {
+            record.description = input.description;
+        }
+        if input.r#type.is_some() {
+            record.link_type = input.r#type;
+        }
+        if input.provider.is_some() {
+            record.provider = input.provider;
+        }
+        if let Some(bandwidth) = input.bandwidth {
+            record.bandwidth = bandwidth;
+        }
+        // An update is not applied instantly: AWS answers the reconfigured link in the
+        // non-terminal `UPDATING` state, so the clock owes the `UPDATING` -> `AVAILABLE`
+        // transition and a caller reading straight after this call still observes it. The
+        // due instant is stored and compared against the clock; nothing sleeps for it.
+        let now = ::std::time::SystemTime::now();
+        record.updating_until = Some(now + crate::state::SETTLE_DELAY);
+        let link = record.to_shape(now);
+
+        Ok(UpdateLinkOutput { link: Some(link) })
     }
 }

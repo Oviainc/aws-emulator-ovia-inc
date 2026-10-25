@@ -21,6 +21,8 @@ mod budget_action_execution;
 mod budget_action_history;
 #[path = "all/budget_action_lifecycle.rs"]
 mod budget_action_lifecycle;
+#[path = "all/budget_action_lock.rs"]
+mod budget_action_lock;
 #[path = "all/budget_action_read_purity.rs"]
 mod budget_action_read_purity;
 #[path = "all/budget_action_settle_history.rs"]
@@ -43,6 +45,8 @@ mod budget_validation_rules;
 mod calculated_spend;
 #[path = "all/client_error_envelopes.rs"]
 mod client_error_envelopes;
+#[path = "all/notification_alert_delivery.rs"]
+mod notification_alert_delivery;
 #[path = "all/notification_deletion.rs"]
 mod notification_deletion;
 #[path = "all/notification_lifecycle.rs"]

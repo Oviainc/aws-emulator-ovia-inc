@@ -153,6 +153,12 @@ pub(crate) fn expected_arn(kind: &str, id: &str) -> String {
     )
 }
 
+/// The ARN of a resource that exists only inside a global network — a site, a link, a
+/// device: the global network's id is part of the name, ahead of the resource's own id.
+pub(crate) fn expected_scoped_arn(kind: &str, global_network_id: &str, id: &str) -> String {
+    expected_arn(kind, &format!("{global_network_id}/{id}"))
+}
+
 /// The wire error code of a failed response (restJson1 carries it as `__type`).
 pub(crate) fn error_code(body: &Value) -> &str {
     body["__type"].as_str().unwrap_or("<no __type>")
@@ -261,8 +267,8 @@ async fn global_network_and_site_lifecycle_round_trips_through_stored_state() {
     );
     assert_eq!(
         site["SiteArn"],
-        json!(expected_arn("site", &site_id)),
-        "CreateSite: ARN must name the minted id, got {site}"
+        json!(expected_scoped_arn("site", &network_id, &site_id)),
+        "CreateSite: ARN must name the global network and the minted id, got {site}"
     );
     assert_eq!(
         site["GlobalNetworkId"],
@@ -835,8 +841,8 @@ async fn minted_ids_and_arns_are_unique_and_independent_of_the_request_body() {
         );
         assert_eq!(
             site["SiteArn"],
-            json!(expected_arn("site", &site_id)),
-            "case {case}: ARN must name the minted id, got {site}"
+            json!(expected_scoped_arn("site", &network_id, &site_id)),
+            "case {case}: ARN must name the global network and the minted id, got {site}"
         );
         assert!(
             !site_ids.contains(&site_id),

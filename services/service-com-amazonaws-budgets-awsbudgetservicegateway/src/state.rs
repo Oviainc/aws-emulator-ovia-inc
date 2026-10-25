@@ -31,6 +31,11 @@ use crate::ops::types::{
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
+/// The alert a notification in alarm delivers to the subscribers held with it — the
+/// only part of this service that calls another service, so it is kept apart from the
+/// store itself.
+pub mod alerts;
+
 /// Per-service state for com-amazonaws-budgets-awsbudgetservicegateway. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBudgetsAwsbudgetservicegatewayState {
@@ -233,8 +238,9 @@ pub struct ActionExecution {
 /// already started and has not settled yet.
 ///
 /// An action in one of them is the locked resource `ResourceLockedException` ("the
-/// server rejected that particular method for the requested resource") names: a second
-/// execution cannot be started over work that is still running.
+/// server rejected that particular method for the requested resource") names: while the
+/// work runs, none of the methods that mutate the action — a second execution, an update
+/// of its members, its deletion — is accepted.
 pub fn action_is_in_progress(status: &str) -> bool {
     matches!(
         status,
@@ -403,6 +409,10 @@ pub const HEALTH_STATUS_HEALTHY: &str = "HEALTHY";
 /// "Specifies whether this notification is in alarm. If a budget notification is in the
 /// `ALARM` state, you passed the set threshold for the budget."
 pub const NOTIFICATION_STATE_OK: &str = "OK";
+
+/// `NotificationState$ALARM` — a notification whose threshold has been passed, which is
+/// the state that owes its subscribers an alert ([`alerts`]).
+pub const NOTIFICATION_STATE_ALARM: &str = "ALARM";
 
 /// Seconds since the Unix epoch at `at`, clamped at the epoch for an earlier instant.
 fn unix_secs(at: SystemTime) -> i64 {
