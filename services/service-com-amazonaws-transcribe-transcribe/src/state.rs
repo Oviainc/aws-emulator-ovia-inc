@@ -1255,14 +1255,17 @@ impl ComAmazonawsTranscribeTranscribeState {
         })
     }
 
-    /// The tag set of the resource `resource` names, or `None` when this account holds
-    /// no such resource.
+    /// The tag set of the resource `resource` names to a request served in `region`, or
+    /// `None` when that ARN names no resource this call can reach.
     ///
     /// The read-only half of [`Self::tags_mut`], so a reporting operation
     /// (`ListTagsForResource`) takes no mutable borrow for a read. The two must agree
-    /// about which ARN names which stored record, so both match on the same resource
-    /// types.
-    pub fn tags(&self, resource: &ResourceRef) -> Option<&Vec<Tag>> {
+    /// about which ARN names which stored record, so both read the same ARN qualifiers
+    /// ([`ResourceRef::is_served_in`]) and match on the same resource types.
+    pub fn tags(&self, resource: &ResourceRef, region: &str) -> Option<&Vec<Tag>> {
+        if !resource.is_served_in(region) {
+            return None;
+        }
         let family = ResourceFamily::from_resource_type(&resource.resource_type)?;
         self.tags_of(family, &resource.name)
     }
@@ -1312,8 +1315,15 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// accepts `Tags`, so each of their records carries a tag set the standard tagging
     /// API owns. An ARN whose `<type>` segment names no family this emulator stores, or
     /// whose `<name>` names no stored record of that family, answers `None`, which the
-    /// caller renders as the modelled not-found error — never as an empty tag set.
-    pub fn tags_mut(&mut self, resource: &ResourceRef) -> Option<&mut Vec<Tag>> {
+    /// caller renders as the modelled not-found error — never as an empty tag set. So
+    /// does an ARN qualified for another partition, Region or account than the request
+    /// is served in ([`ResourceRef::is_served_in`]): the record a local ARN of the same
+    /// `<type>/<name>` would reach is a DIFFERENT resource from the one that ARN names,
+    /// so a write through it would mutate a resource the caller did not address.
+    pub fn tags_mut(&mut self, resource: &ResourceRef, region: &str) -> Option<&mut Vec<Tag>> {
+        if !resource.is_served_in(region) {
+            return None;
+        }
         match ResourceFamily::from_resource_type(&resource.resource_type)? {
             ResourceFamily::TranscriptionJob => self
                 .transcription_jobs
@@ -1351,13 +1361,42 @@ impl ComAmazonawsTranscribeTranscribeState {
     }
 }
 
-/// The resource an Amazon Transcribe ARN names: its type and its name.
+/// The resource an Amazon Transcribe ARN names: the partition, Region and account that
+/// QUALIFY it, plus its type and its name.
+///
+/// Every segment is kept, because every segment is part of what the ARN names: the
+/// `<type>/<name>` pair identifies a resource only within one partition, one Region and
+/// one account. Which of those an ARN has to carry to name a resource a given request
+/// can reach is [`Self::is_served_in`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRef {
+    /// The ARN's partition segment (`aws`, `aws-cn`, `aws-us-gov`, …).
+    pub partition: String,
+    /// The ARN's Region segment: the one Region the resource it names lives in.
+    pub region: String,
+    /// The ARN's account segment: the one account that holds the resource it names.
+    pub account: String,
     /// The ARN's resource type, e.g. [`RESOURCE_TYPE_VOCABULARY`].
     pub resource_type: String,
     /// The resource's name, which is also its key in the store that holds it.
     pub name: String,
+}
+
+impl ResourceRef {
+    /// Whether this ARN names a resource of the partition, Region and account a request
+    /// served in `region` addresses.
+    ///
+    /// An AWS resource ARN is partition-, Region- and account-qualified, so a resource
+    /// is identified by those three segments TOGETHER with its type and name: an ARN
+    /// that changes any of them names a different resource — one that lives where this
+    /// request is not served and whose tags are therefore not this store's to report or
+    /// to write. True exactly when the ARN is the one [`resource_arn`] hands out for the
+    /// same type and name to a request served in `region`, so what a caller may ask
+    /// about and what this service would hand it are the same rule rather than two.
+    pub fn is_served_in(&self, region: &str) -> bool {
+        parse_resource_arn(&resource_arn(&self.resource_type, &self.name, region))
+            .is_some_and(|served| served == *self)
+    }
 }
 
 /// The resource `arn` names, or `None` when it is not an Amazon Transcribe resource
@@ -1369,9 +1408,14 @@ pub struct ResourceRef {
 /// another service, or a string that merely has six `:`-separated fields, names
 /// nothing. The constraint trait has already refused anything outside that pattern
 /// before a handler runs; parsing here is what turns the matched ARN into a lookup.
+///
+/// This is the SHAPE of the ARN only: an ARN of this form is still refused when its
+/// qualifiers are not the ones the request is served in (see
+/// [`ResourceRef::is_served_in`]), because a well-formed ARN of another Region or
+/// account names a resource no request served here holds.
 pub fn parse_resource_arn(arn: &str) -> Option<ResourceRef> {
     let fields: Vec<&str> = arn.split(':').collect();
-    let [prefix, _partition, service, _region, _account, resource] = fields.as_slice() else {
+    let [prefix, partition, service, region, account, resource] = fields.as_slice() else {
         return None;
     };
     if !prefix.eq_ignore_ascii_case("arn") || !service.eq_ignore_ascii_case("transcribe") {
@@ -1382,13 +1426,20 @@ pub fn parse_resource_arn(arn: &str) -> Option<ResourceRef> {
         return None;
     }
     Some(ResourceRef {
+        partition: (*partition).to_string(),
+        region: (*region).to_string(),
+        account: (*account).to_string(),
         resource_type: resource_type.to_string(),
         name: name.to_string(),
     })
 }
 
 /// The ARN of one Amazon Transcribe resource, built through the framework's own ARN
-/// helper so the account segment is the canonical emulator account.
+/// helper so the partition and account segments are the canonical emulator ones.
+///
+/// Also the authority on which ARN names that resource at all: a caller-supplied ARN
+/// resolves only when it is this one ([`ResourceRef::is_served_in`]), so the ARN this
+/// service would hand out and the ARN it accepts cannot drift apart.
 pub fn resource_arn(resource_type: &str, name: &str, region: &str) -> String {
     ::engine::emulator_arn("transcribe", region, &format!("{resource_type}/{name}"))
 }

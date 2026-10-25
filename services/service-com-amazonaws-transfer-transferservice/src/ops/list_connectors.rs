@@ -165,9 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
-                ListConnectorsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
-                    message: "The NextToken is not valid".to_string(),
-                })
+                ListConnectorsErrorModeled::InvalidNextTokenException(st::invalid_next_token())
             })?),
             None => None,
         };

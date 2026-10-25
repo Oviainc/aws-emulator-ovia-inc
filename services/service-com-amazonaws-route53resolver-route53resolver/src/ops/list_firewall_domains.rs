@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFirewallDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFirewallDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFirewallDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the domains stored for one DNS Firewall domain list, one
+//! `@paginated` page at a time: the reader that `UpdateFirewallDomains`'s
+//! writes are read back through.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +89,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The cursor scope of one `ListFirewallDomains` query, completed with the id of
+/// the domain list being paged: the collection is that list's domains, so a
+/// cursor only means anything for the list it was minted over.
+const PAGE_SCOPE: &str = "ListFirewallDomains/v1";
+
+/// The largest page this operation returns: the maximum of its own modelled
+/// `MaxResults` range (`ListDomainMaxResults`, range 1..5000,
+/// `smithy_query(query="shape",shape="ListDomainMaxResults")`), which is wider
+/// than the 1..100 the other list operations of this service declare.
+const LARGEST_PAGE: i32 = 5_000;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -166,18 +172,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFirewallDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFirewallDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFirewallDomains"))
+        // The engine is reachable from `&self` (constructor-injected); this
+        // operation reports no ARN, so it takes nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListFirewallDomainsErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Retrieves the domains that you have defined for the specified
+        // firewall domain list": a pure read of what the writes persisted, in
+        // the order they put them there, so a page cut at an offset means the
+        // same thing on every call.
+        let all: Vec<String> = {
+            let store = state.lock();
+            match store.firewall_domain_lists.get(&input.firewall_domain_list_id) {
+                Some(record) => record.domains.clone(),
+                None => {
+                    // The domains of a list DNS Firewall publishes itself are
+                    // the service's, not this account's, and nothing here holds
+                    // them: the id resolves (it is a list every account sees),
+                    // and no `Domains` member is reported for it rather than an
+                    // empty one, which would claim the published list holds no
+                    // domain. The same reasoning leaves its `DomainCount`
+                    // unset.
+                    if crate::state::managed_firewall_domain_list(
+                        &input.firewall_domain_list_id,
+                    )
+                    .is_some()
+                    {
+                        return Ok(ListFirewallDomainsOutput {
+                            domains: None,
+                            next_token: None,
+                        });
+                    }
+                    return Err(ListFirewallDomainsErrorModeled::ResourceNotFoundException(
+                        crate::state::firewall_domain_list_not_found(
+                            &input.firewall_domain_list_id,
+                        ),
+                    )
+                    .into());
+                }
+            }
+        };
+
+        // The cursor is scoped to THIS list's collection, so one minted for
+        // another domain list is not a cursor this collection accepts.
+        let scope = format!("{PAGE_SCOPE}/{}", input.firewall_domain_list_id);
+        let Some(page) = crate::state::paginate_up_to(
+            all,
+            &scope,
+            input.max_results,
+            input.next_token.as_deref(),
+            LARGEST_PAGE,
+        ) else {
+            // This operation models no `InvalidNextTokenException`, so a cursor
+            // this service did not mint for this collection is refused with the
+            // `ValidationException` it does model, rather than being read as
+            // "start from the beginning" and silently repeating page one.
+            return Err(ListFirewallDomainsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "The NextToken you provided was not issued by this service for this \
+                         firewall domain list"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListFirewallDomainsOutput {
+            // "A list of the domains in the firewall domain list": a page is
+            // always reported as a list, so a caller iterating it needs no
+            // special case for a list nobody has added a domain to.
+            domains: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

@@ -20,5 +20,8 @@ mod malformed_session_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/sts_authorization.rs"]
+mod sts_authorization;
+
 #[path = "all/sts_sessions.rs"]
 mod sts_sessions;

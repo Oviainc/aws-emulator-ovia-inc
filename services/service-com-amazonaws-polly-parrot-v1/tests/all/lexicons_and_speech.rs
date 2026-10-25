@@ -1165,73 +1165,29 @@ async fn describe_voices_filters_the_catalog() {
     );
 }
 
-/// RULE: a `DescribeVoices` `NextToken` resumes the query it was issued for and no
-/// other, so replaying it under different filters is `InvalidNextTokenException`
-/// rather than a page of the wrong voices.
-#[tokio::test]
-async fn a_voice_page_token_only_resumes_its_own_query() {
-    let polly = Polly::new();
-    let first = json(&polly.describe_voices("").await);
-    let token = first["NextToken"]
-        .as_str()
-        .expect("the seeded catalog spans more than one page")
-        .to_string();
-
-    // The same query resumes, and the two pages do not overlap.
-    let page_one = ids(first["Voices"].as_array().expect("Voices is a list"));
-    let resumed = polly.describe_voices(&format!("?NextToken={token}")).await;
-    assert_eq!(resumed.status(), 200, "the same query must resume");
-    let page_two = ids(json(&resumed)["Voices"].as_array().expect("Voices is a list"));
-    assert!(
-        page_one.is_disjoint(&page_two),
-        "the second page repeats voices from the first: {:?}",
-        page_one.intersection(&page_two).collect::<Vec<_>>()
-    );
-
-    // A different query is refused rather than resumed at the same offset.
-    for mismatched in [
-        format!("?LanguageCode=en-US&NextToken={token}"),
-        format!("?Engine=standard&NextToken={token}"),
-        format!("?IncludeAdditionalLanguageCodes=true&NextToken={token}"),
-    ] {
-        let response = polly.describe_voices(&mismatched).await;
-        assert_eq!(
-            (response.status().as_u16(), error_code(&response)),
-            (400, "InvalidNextTokenException".to_string()),
-            "query {mismatched:?}: a token from another query must be refused"
-        );
-    }
-}
-
-/// Every voice a `DescribeVoices` query reports, following `NextToken` to the end.
+/// Every voice a `DescribeVoices` query reports, from the one response that carries
+/// them all.
 ///
-/// `pub(crate)` so the catalog suite pages the same way this one does rather than
-/// standing up a second pager.
+/// `pub(crate)` so the catalog suite reads the catalog the same way this one does.
+/// The read asserts the listing is not truncated, so every caller of this helper also
+/// pins the rule that this operation sends no `NextToken`.
 pub(crate) async fn voices(polly: &Polly, query: &str) -> Vec<serde_json::Value> {
-    let mut all: Vec<serde_json::Value> = Vec::new();
-    let mut token: Option<String> = None;
-    loop {
-        let paged = match &token {
-            Some(token) if query.is_empty() => format!("?NextToken={token}"),
-            Some(token) => format!("{query}&NextToken={token}"),
-            None => query.to_string(),
-        };
-        let response = polly.describe_voices(&paged).await;
-        assert_eq!(
-            response.status(),
-            200,
-            "DescribeVoices{paged}: body {:?}",
-            String::from_utf8_lossy(response.body())
-        );
-        let body = json(&response);
-        all.extend(body["Voices"].as_array().expect("Voices is a list").clone());
-        match body["NextToken"].as_str() {
-            Some(next) => token = Some(next.to_string()),
-            None => break,
-        }
-        assert!(all.len() < 1_000, "DescribeVoices pagination did not terminate");
-    }
-    all
+    let response = polly.describe_voices(query).await;
+    assert_eq!(
+        response.status(),
+        200,
+        "DescribeVoices{query}: body {:?}",
+        String::from_utf8_lossy(response.body())
+    );
+    let body = json(&response);
+    assert_eq!(
+        body["NextToken"].as_str(),
+        None,
+        "case {query:?}: the whole catalog is in the response, so no NextToken is owed, \
+         got {:?}",
+        body["NextToken"]
+    );
+    body["Voices"].as_array().expect("Voices is a list").clone()
 }
 
 pub(crate) fn ids(voices: &[serde_json::Value]) -> BTreeSet<String> {

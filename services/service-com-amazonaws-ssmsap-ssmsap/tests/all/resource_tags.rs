@@ -46,14 +46,14 @@ const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
 /// The longest `TagValue` the model admits
 /// (`smithy_query(query="shape", shape="TagValue")`: length 1..256).
-const TAG_VALUE_MAX_LENGTH: usize = 256;
+pub(crate) const TAG_VALUE_MAX_LENGTH: usize = 256;
 
 /// Key forms drawn from the modelled `TagKey` character class
 /// (`smithy_query(query="shape", shape="TagKey")`: `^(?!aws:)[a-zA-Z+-=._:/]+$`, whose
 /// `+-=` range spans `+ , - . / 0-9 : ; < =`), so the rule is read off the class rather
 /// than off one key: lower and upper case letters, a dot, an underscore, a slash, a
 /// colon, a hyphen, a plus, an equals sign and a digit.
-const TAG_KEY_FORMS: &[&str] = &[
+pub(crate) const TAG_KEY_FORMS: &[&str] = &[
     "env",
     "Owner",
     "cost.center",
@@ -125,12 +125,16 @@ fn cases() -> Vec<Case> {
 }
 
 /// The ARN `RegisterApplication` mints for `application_id` in `region`.
-fn application_arn(region: &str, application_id: &str) -> String {
+///
+/// `pub(crate)` because the suites of this target share one harness:
+/// `tests/all/tag_resource.rs` names the SAME resources through the same `/tags`
+/// route.
+pub(crate) fn application_arn(region: &str, application_id: &str) -> String {
     format!("arn:aws:ssm-sap:{region}:{ACCOUNT}:application/{application_id}")
 }
 
 /// The ARN the database `database_id` of `application_id` carries in `region`.
-fn database_arn(region: &str, application_id: &str, database_id: &str) -> String {
+pub(crate) fn database_arn(region: &str, application_id: &str, database_id: &str) -> String {
     format!("arn:aws:ssm-sap:{region}:{ACCOUNT}:database/{application_id}/{database_id}")
 }
 
@@ -138,7 +142,7 @@ fn database_arn(region: &str, application_id: &str, database_id: &str) -> String
 ///
 /// `resourceArn` is a NON-greedy `@httpLabel`, so it is one path segment: the `:` and
 /// `/` of an ARN travel as `%3A` and `%2F` or the request addresses a different route.
-fn tags_path(resource_arn: &str) -> String {
+pub(crate) fn tags_path(resource_arn: &str) -> String {
     format!(
         "/tags/{}",
         resource_arn.replace(':', "%3A").replace('/', "%2F")
@@ -147,14 +151,18 @@ fn tags_path(resource_arn: &str) -> String {
 
 /// `ListTagsForResource` for `resource_arn`, read at `region`'s endpoint: the modelled
 /// `GET /tags/{resourceArn}`, which carries no body at all.
-async fn list_tags_in_region(emulator: &Emulator, region: &str, resource_arn: &str) -> Reply {
+pub(crate) async fn list_tags_in_region(
+    emulator: &Emulator,
+    region: &str,
+    resource_arn: &str,
+) -> Reply {
     emulator
         .send_request("GET", region, &tags_path(resource_arn), None)
         .await
 }
 
 /// `ListTagsForResource` for `resource_arn` at [`REGION`]'s endpoint.
-async fn list_tags(emulator: &Emulator, resource_arn: &str) -> Reply {
+pub(crate) async fn list_tags(emulator: &Emulator, resource_arn: &str) -> Reply {
     list_tags_in_region(emulator, REGION, resource_arn).await
 }
 
@@ -179,7 +187,7 @@ fn credentials(database_names: &[&str]) -> Value {
 
 /// A `RegisterApplication` body for a HANA application carrying `tags`, and the
 /// databases `database_names` names when the row asks for its own.
-fn registration(
+pub(crate) fn registration(
     application_id: &str,
     tags: &[(String, String)],
     database_names: Option<&[&str]>,
@@ -202,7 +210,7 @@ fn registration(
 }
 
 /// Register `body`, asserting the registration itself was accepted.
-async fn register(emulator: &Emulator, case: &str, body: Value) {
+pub(crate) async fn register(emulator: &Emulator, case: &str, body: Value) {
     let reply = emulator.send("/register-application", body).await;
     assert_eq!(
         reply.status, 200,

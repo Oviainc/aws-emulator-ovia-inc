@@ -276,30 +276,29 @@ fn bare_id(arn: &str) -> String {
 /// admits: what is persisted and read back is the resource, not the spelling.
 #[tokio::test]
 async fn a_batch_association_persists_one_association_per_resource_however_it_is_named() {
-    // (case, how many billing groups to use, how many custom line items to use, name
-    // them by bare id rather than by full ARN)
-    let cases: [(&str, usize, usize, bool); 6] = [
-        ("one billing group by ARN", 1, 0, false),
-        ("one billing group by bare id", 1, 0, true),
-        ("one custom line item by ARN", 0, 1, false),
-        ("one custom line item by bare id", 0, 1, true),
-        ("two of each class by ARN", 2, 2, false),
-        ("two of each class by bare id", 2, 2, true),
+    // (case, name the item's OWN billing group as a resource, how many custom line
+    // items of that group to use, name them by bare id rather than by full ARN)
+    let cases: [(&str, bool, usize, bool); 6] = [
+        ("the own billing group by ARN", true, 0, false),
+        ("the own billing group by bare id", true, 0, true),
+        ("one custom line item by ARN", false, 1, false),
+        ("one custom line item by bare id", false, 1, true),
+        ("the group and two items by ARN", true, 2, false),
+        ("the group and two items by bare id", true, 2, true),
     ];
 
-    for (case, groups, items, by_id) in cases {
+    for (case, own_group, items, by_id) in cases {
         let emulator = Emulator::new();
         let home = emulator.billing_group("home").await;
         let target = emulator.percentage_item(&home, "target").await;
 
-        // The resources to associate: billing groups are PARENTs of a custom line
-        // item, other custom line items are CHILDren of it.
+        // The resources to associate: the item's own billing group is a PARENT of it,
+        // custom line items of that same group are CHILDren of it.
         let mut expected: Vec<(String, String)> = Vec::new();
         let mut requested: Vec<String> = Vec::new();
-        for index in 0..groups {
-            let arn = emulator.billing_group(&format!("group{index}")).await;
-            requested.push(if by_id { bare_id(&arn) } else { arn.clone() });
-            expected.push((arn, "PARENT".to_string()));
+        if own_group {
+            requested.push(if by_id { bare_id(&home) } else { home.clone() });
+            expected.push((home.clone(), "PARENT".to_string()));
         }
         for index in 0..items {
             let arn = emulator.percentage_item(&home, &format!("item{index}")).await;
@@ -345,7 +344,9 @@ async fn re_associating_a_resource_is_idempotent() {
     let emulator = Emulator::new();
     let home = emulator.billing_group("home").await;
     let target = emulator.percentage_item(&home, "target").await;
-    let group = emulator.billing_group("group").await;
+    // The two resources in scope of the target: its own billing group, and another
+    // custom line item of that same group.
+    let group = home.clone();
     let item = emulator.percentage_item(&home, "item").await;
 
     // Rows: one request naming a resource twice, the same request sent twice, and the
@@ -402,7 +403,9 @@ async fn a_resource_that_cannot_be_associated_fails_as_its_own_element() {
     let emulator = Emulator::new();
     let home = emulator.billing_group("home").await;
     let target = emulator.percentage_item(&home, "target").await;
-    let good = emulator.billing_group("good").await;
+    // A resource the target CAN hold, so every row shows one failure beside one
+    // association: the billing group the target itself applies to.
+    let good = home.clone();
 
     // The ways ONE resource fails: an id no resource has, a full custom line item ARN
     // and a full billing group ARN of resources that do not exist (so the class of
@@ -470,10 +473,15 @@ async fn an_association_past_the_modelled_maximum_is_refused_for_that_resource()
     let home = emulator.billing_group("home").await;
     let target = emulator.percentage_item(&home, "target").await;
 
-    // One more resource than the item can hold.
-    let mut resources: Vec<String> = Vec::new();
-    for index in 0..=MAX_ASSOCIATED_RESOURCES {
-        resources.push(emulator.billing_group(&format!("group{index}")).await);
+    // One more resource than the item can hold, every one of them in scope of the
+    // billing group the item applies to: that group, and custom line items of it.
+    let mut resources: Vec<String> = vec![home.clone()];
+    for index in 1..=MAX_ASSOCIATED_RESOURCES {
+        resources.push(
+            emulator
+                .percentage_item(&home, &format!("item{index}"))
+                .await,
+        );
     }
 
     // One resource at a time: every one up to the bound succeeds, the one past it
@@ -658,7 +666,9 @@ async fn a_read_reports_the_associations_the_request_asks_for() {
     let emulator = Emulator::new();
     let home = emulator.billing_group("home").await;
     let target = emulator.percentage_item(&home, "target").await;
-    let bounded = emulator.billing_group("bounded").await;
+    // The bounded association names the billing group the target applies to, the open
+    // one a custom line item of that same group.
+    let bounded = home.clone();
     let open = emulator.percentage_item(&home, "open").await;
 
     // One association bounded to 2026-1..2026-4, one with no range at all.

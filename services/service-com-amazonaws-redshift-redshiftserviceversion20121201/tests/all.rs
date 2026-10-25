@@ -45,6 +45,8 @@ mod maintenance_tracks;
 mod modify_cluster_parameter_group;
 #[path = "all/modify_cluster_snapshot.rs"]
 mod modify_cluster_snapshot;
+#[path = "all/namespace_registration.rs"]
+mod namespace_registration;
 #[path = "all/orderable_cluster_options.rs"]
 mod orderable_cluster_options;
 #[path = "all/qev2_idc_applications.rs"]

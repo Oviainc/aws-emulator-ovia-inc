@@ -15,6 +15,8 @@
 mod firewall_domain_list_listing;
 #[path = "all/firewall_domain_lists.rs"]
 mod firewall_domain_lists;
+#[path = "all/firewall_domains.rs"]
+mod firewall_domains;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/outpost_resolvers.rs"]

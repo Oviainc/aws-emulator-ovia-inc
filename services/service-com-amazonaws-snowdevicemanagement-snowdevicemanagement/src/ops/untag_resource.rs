@@ -225,17 +225,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Removes a tag from a device or task." Removal is by key and idempotent: a
         // key the resource does not carry leaves the record as it is, so the answer
-        // does not depend on how often the request was sent.
-        let tags = match resource.kind {
-            crate::state::TaggedResourceKind::Device => store
-                .devices
-                .get_mut(&resource.id)
-                .map(|device| &mut device.tags),
-            crate::state::TaggedResourceKind::Task => {
-                store.tasks.get_mut(&resource.id).map(|task| &mut task.tags)
-            }
-        };
-        let Some(tags) = tags else {
+        // does not depend on how often the request was sent. Which stored record the
+        // `resourceArn` resolves to is the state's own rule (its `tags_of_mut`), shared
+        // with `TagResource` and the mutable counterpart of the `tags_of` a tag read
+        // goes through.
+        let Some(tags) = store.tags_of_mut(&resource) else {
             // The recorded answer of the tagging APIs for a `resourceArn` that parses
             // but names no device and no task is HTTP 404 `NotFoundException` — not the
             // model's `ResourceNotFoundException`, which is what the device and task
