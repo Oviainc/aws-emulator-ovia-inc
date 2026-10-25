@@ -146,7 +146,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StopAssessmentErrorModeled::InternalServerException(
                 InternalServerException {
@@ -159,11 +158,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // Settling first is what keeps the stop honest: an assessment whose completion
         // was already due finished before this call, so the stop finds it terminal and
-        // leaves the status the clock gave it.
-        let Some(assessment) = store.settled_assessment_mut(&input.assessment_id, now) else {
+        // leaves the status the clock gave it. The assessment is looked up in the Region
+        // this request was signed for: an id minted through another Region's endpoint
+        // names nothing here.
+        let found = store
+            .region_mut(&region)
+            .and_then(|portfolio| portfolio.settled_assessment_mut(&input.assessment_id, now));
+        let Some(assessment) = found else {
             // The condition is a resource that is not there, so the answer is the
             // service's not-found (HTTP 404) — widened in above, because this
             // operation's own error list omits it.

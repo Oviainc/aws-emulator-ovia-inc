@@ -391,16 +391,29 @@ async fn associate_is_refused_from_every_status_that_takes_no_association() {
     let feed_outputs = json!([output("crop1", "cropping", "ENABLED")]);
 
     // One row per non-associable status the service produces (`FeedStatus`: DELETING,
-    // ARCHIVED — AVAILABLE and ACTIVE are the associable ones, covered above; CREATING
-    // is never reported, because a created feed is AVAILABLE at once, and UPDATING is
-    // never reported either, because UpdateFeed answers 200 and so leaves the feed
-    // settled).
-    for status_under_test in ["DELETING", "ARCHIVED"] {
+    // UPDATING, ARCHIVED — AVAILABLE and ACTIVE are the associable ones, covered above;
+    // CREATING is never reported, because a created feed is AVAILABLE at once). The
+    // UPDATING row is a feed whose reconfiguration is still in flight, which is pinned
+    // in `feed_reconfiguration_status` and is here so the table spans the whole status
+    // dimension.
+    for status_under_test in ["DELETING", "UPDATING", "ARCHIVED"] {
         let id = match status_under_test {
             "DELETING" => {
                 let id = available_feed(&router, "deleting-feed", feed_outputs.clone()).await;
                 let (status, _) = call(&router, "DELETE", &format!("/v1/feed/{id}"), None).await;
                 assert_eq!(status, 202, "case {status_under_test:?}: DeleteFeed answers 202");
+                id
+            }
+            "UPDATING" => {
+                let id = available_feed(&router, "updating-feed", feed_outputs.clone()).await;
+                let (status, _) = call(
+                    &router,
+                    "PUT",
+                    &format!("/v1/feed/{id}"),
+                    Some(json!({"name": "updating-feed", "outputs": feed_outputs.clone()})),
+                )
+                .await;
+                assert_eq!(status, 200, "case {status_under_test:?}: UpdateFeed answers 200");
                 id
             }
             "ARCHIVED" => {

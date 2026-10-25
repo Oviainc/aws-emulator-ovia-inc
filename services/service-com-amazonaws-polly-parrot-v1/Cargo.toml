@@ -29,6 +29,10 @@ hex = { workspace = true }
 quick-xml = "0.41"
 # Ogg bitstream framing (pages, lacing, CRC) for the ogg_opus output format.
 ogg = "0.9"
+# `TaskId`s are UUIDs: mint and recognise them with a real UUID implementation
+# rather than scanning the text by hand. `v5` is for the deterministic task ids
+# the test fixtures derive from a label.
+uuid = { version = "1", features = ["v4", "v5"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

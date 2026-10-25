@@ -20,7 +20,7 @@ use bytes::Bytes;
 use service_com_amazonaws_polly_parrot_v1::state::{PendingTaskStatus, TASK_COMPLETION_DELAY};
 
 use crate::lexicons_and_speech::{error_code, json, Polly};
-use crate::support::{seed_task, stored_task};
+use crate::support::{fixture_task_id, seed_task, stored_task};
 
 /// One `ListSpeechSynthesisTasks` call with the given query string.
 async fn list(polly: &Polly, query: &str) -> http::Response<Bytes> {
@@ -335,7 +335,8 @@ async fn a_report_settles_only_the_transition_the_clock_already_owed() {
     let now = SystemTime::now();
 
     // Due in the past, so the report must show the status the clock owed.
-    let mut due = stored_task("dueTask", now - Duration::from_secs(30));
+    let due_id = fixture_task_id("due");
+    let mut due = stored_task(&due_id, now - Duration::from_secs(30));
     due.task_status = "inProgress".to_string();
     due.pending_status = Some(PendingTaskStatus {
         due_at: now - TASK_COMPLETION_DELAY,
@@ -346,7 +347,8 @@ async fn a_report_settles_only_the_transition_the_clock_already_owed() {
 
     // Due far in the future, so the report must leave it where it is however often it
     // is polled.
-    let mut pending = stored_task("pendingTask", now - Duration::from_secs(20));
+    let pending_id = fixture_task_id("pending");
+    let mut pending = stored_task(&pending_id, now - Duration::from_secs(20));
     pending.task_status = "scheduled".to_string();
     pending.pending_status = Some(PendingTaskStatus {
         due_at: now + Duration::from_secs(3_600),
@@ -356,16 +358,17 @@ async fn a_report_settles_only_the_transition_the_clock_already_owed() {
     seed_task(&polly, &pending);
 
     // A task already terminal stays terminal, with its reason.
-    let mut failed = stored_task("failedTask", now - Duration::from_secs(10));
+    let failed_id = fixture_task_id("failed");
+    let mut failed = stored_task(&failed_id, now - Duration::from_secs(10));
     failed.task_status = "failed".to_string();
     failed.task_status_reason = Some("the output bucket is not writable".to_string());
     seed_task(&polly, &failed);
 
     let expected = [
-        ("dueTask", "completed", None),
-        ("pendingTask", "scheduled", None),
+        (due_id.as_str(), "completed", None),
+        (pending_id.as_str(), "scheduled", None),
         (
-            "failedTask",
+            failed_id.as_str(),
             "failed",
             Some("the output bucket is not writable"),
         ),
