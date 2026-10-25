@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the tags supplied here are merged into the persisted customer managed
+//! policy in this service's state (`crate::state`) and read back by `GetPolicy`.
+//!
+//! A 501 from an operation in this service means "nobody has written it yet", never
+//! "the emulator is broken".
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +182,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagPolicy"))
+        // `ctx` carries request metadata only; tagging a policy depends on nothing in
+        // it — IAM is global, and the policy is named by the request's ARN.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagPolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A value that is not a managed-policy ARN at all is an invalid input
+        // parameter, which is a different refusal from an ARN the account does not
+        // hold: `arnType` constrains only the length, so the form is checked here,
+        // through the one definition of the ARN grammar this crate holds — the same
+        // one `GetPolicy` reads a `PolicyArn` with.
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            return Err(TagPolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!("ARN {} is not valid.", input.policy_arn)),
+                },
+            )
+            .into());
+        }
+
+        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
+        // "invalid … value … for an input parameter". Checked through the one
+        // definition of that rule in `crate::state`, the same one `CreatePolicy` uses,
+        // and checked before anything is written: "if any one of the tags is invalid
+        // … then the entire request fails".
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(input.tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(TagPolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // This operation "adds one or more tags to an IAM customer managed policy":
+        // an ARN in AWS's own managed-policy namespace names a policy AWS owns and an
+        // account cannot change, so such an ARN is an out-of-range value for this
+        // parameter rather than a missing entity. The refusal does not depend on
+        // whether this emulator's catalog carries that entry, because no entry of it
+        // could be tagged either.
+        if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
+            return Err(TagPolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Policy {} is an AWS managed policy, which cannot be tagged.",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // The write is addressed exactly as a read of the same ARN is, so it reaches
+        // the one record `GetPolicy` reports; an ARN the account holds no policy under
+        // "referenced a resource entity that does not exist".
+        let Some(held) = store.policy_by_arn_mut(&input.policy_arn) else {
+            return Err(TagPolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!("Policy {} does not exist.", input.policy_arn)),
+                },
+            )
+            .into());
+        };
+
+        // "If a tag with the same key name already exists, then that tag is
+        // overwritten with the new value" — the merge, and the per-resource tag bound
+        // it is taken against, are the one shared rule in `crate::state`. Nothing is
+        // stored when the bound is passed: "if you exceed the allowed maximum number
+        // of tags, then the entire request fails".
+        let Some(merged) = crate::state::merge_tags(held.policy.tags.as_ref(), input.tags) else {
+            return Err(TagPolicyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot assign more than {} tags to IAM policy {}",
+                        crate::state::MAX_TAGS_PER_ENTITY,
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // An empty tag set is the same as no tags, which is how `CreatePolicy` stores
+        // one: the member is reported only when the policy actually carries tags. The
+        // policy's `UpdateDate` is left alone — it reports when the policy's CONTENT
+        // was last updated, and a tag call creates no policy version.
+        held.policy.tags = (!merged.is_empty()).then_some(merged);
+        Ok(TagPolicyOutput)
     }
 }

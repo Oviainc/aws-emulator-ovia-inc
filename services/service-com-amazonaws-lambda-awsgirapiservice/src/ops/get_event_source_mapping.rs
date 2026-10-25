@@ -253,7 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx);
+        // A mapping is addressed by its own `UUID` and reports the ARNs it was created
+        // with, so no request metadata takes part in this report.
+        let _ = ctx;
         let mut store = state.lock();
 
         // A read reports the mapping as of now, so the store is first brought up to
@@ -266,10 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetEventSourceMappingErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,
-                    message: Some(format!(
-                        "Event source mapping not found: {}",
-                        crate::state::event_source_mapping_arn(&region, &input.uuid)
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

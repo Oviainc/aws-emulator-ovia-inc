@@ -193,10 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetLayerVersionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     r#type: None,
-                    message: Some(format!(
-                        "Layer version {name}:{} does not exist",
-                        input.version_number
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 })
             })?;
         Ok(detail)
