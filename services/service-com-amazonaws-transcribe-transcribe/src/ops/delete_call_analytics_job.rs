@@ -7,8 +7,10 @@
 //! trying to delete doesn't exist or if it's in a non-terminal state (such as IN
 //! PROGRESS)". After a successful delete `GetCallAnalyticsJob` answers that same
 //! not-found refusal, the job is gone from `ListCallAnalyticsJobs`, and the name is
-//! free for a new `StartCallAnalyticsJob` (which also makes room under this family's
-//! stored-job ceiling, [`crate::state::MAX_CALL_ANALYTICS_JOBS`]).
+//! free for a new `StartCallAnalyticsJob`. A delete frees a NAME, not a quota slot:
+//! this family's ceiling counts the jobs still running
+//! ([`crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS`]), which a deletable job —
+//! one in a terminal status — has already released.
 //!
 //! ## Shape of an operation
 //!
