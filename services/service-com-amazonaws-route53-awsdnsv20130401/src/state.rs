@@ -717,6 +717,19 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
         Some((count_as_i64(limit), count_as_i64(count)))
     }
 
+    /// How many hosted zones the account holds right now, public and private
+    /// together, as the `long` a count shape carries.
+    ///
+    /// COUNTED off the store on every call rather than tracked beside it, for
+    /// the same reason [`Self::account_limit_usage`] counts: creating or
+    /// deleting a zone moves the number by itself, so no reporting operation
+    /// has to be told about it and none can disagree with the zones a listing
+    /// returns. A borrow, not a mutation — reporting the count leaves the store
+    /// exactly as it was.
+    pub fn hosted_zone_count(&self) -> i64 {
+        count_as_i64(self.zones.len())
+    }
+
     /// The zone OTHER than `excluding_zone_id` that carries the same DNS name
     /// as `zone_name` and is already associated with `vpc_id`, if there is one.
     ///
