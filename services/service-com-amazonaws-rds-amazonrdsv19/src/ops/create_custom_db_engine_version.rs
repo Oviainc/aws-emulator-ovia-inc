@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomDBEngineVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCustomDBEngineVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation stores a custom DB engine version (CEV) in this service's
+//! state and answers with it, so `DescribeDBEngineVersions` reports the engine version the
+//! account just created. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCustomDBEngineVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A CEV is the one engine version that is ACCOUNT state: it is created from
+//! customer-supplied installation media (the `custom-oracle-*` engines and the RDS for SQL
+//! Server bring-your-own-media engines) or from an Amazon Machine Image (RDS Custom for
+//! SQL Server), it is "unique per customer per Amazon Web Services Regions"
+//! (`EngineVersion`), and its CORE attributes — the engine, the CEV name, the manifest,
+//! the installation files, the AMI and the KMS key — are fixed when it is created: a
+//! second create naming the same `(Engine, EngineVersion)` is refused with
+//! `CustomDBEngineVersionAlreadyExistsFault` rather than rewriting the stored record, and
+//! `ModifyCustomDBEngineVersion` takes only a `Description` and a `Status`.
+//!
+//! The record itself, its quota and the engines it can be created for live in
+//! `crate::state::custom_engine_versions`; the projection onto the `DBEngineVersion` wire
+//! shape lives beside the engine-version catalogue in
+//! `crate::ops::describe_db_engine_versions`, so this answer and that report cannot
+//! disagree about one record.
 //!
 //! ## Shape of an operation
 //!
@@ -304,18 +314,235 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCustomDBEngineVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCustomDBEngineVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCustomDBEngineVersion"))
+        let region = crate::state::request_region(ctx)
+            .map_err(CreateCustomDBEngineVersionError::validation)?;
+
+        // `Engine`'s pattern admits any name, so the SET of engines a CEV can be created
+        // for is checked here. Engine names are published lowercase and compared that way
+        // everywhere in this crate, so the request's value is folded once and the folded
+        // value is what is stored and keyed by.
+        let engine = input.engine.to_ascii_lowercase();
+        crate::state::check_custom_engine(&engine)
+            .map_err(CreateCustomDBEngineVersionError::invalid_parameter_value)?;
+        let engine_version = input.engine_version.clone();
+
+        // The two combinations the operation documents as unserveable, refused before
+        // anything is resolved: each value is fine on its own, so what fails is the pair.
+        if input.image_id.is_some() && input.use_aws_provided_latest_image == Some(true) {
+            return Err(
+                CreateCustomDBEngineVersionError::invalid_parameter_combination(
+                    "UseAwsProvidedLatestImage and ImageId cannot both be specified: the \
+                     service-provided latest AMI and a named AMI are two different images",
+                ),
+            );
+        }
+        if input.manifest.is_some() && input.source_custom_db_engine_version_identifier.is_some() {
+            return Err(
+                CreateCustomDBEngineVersionError::invalid_parameter_combination(
+                    "Manifest cannot be specified with SourceCustomDbEngineVersionIdentifier: a \
+                     CEV created from a source CEV carries that source's manifest",
+                ),
+            );
+        }
+
+        // "A symmetric encryption KMS key is required for RDS Custom, but optional for
+        // Amazon RDS": a KMS key the request names has to BE a key identifier, and an RDS
+        // Custom engine has to have been given one.
+        if let Some(kms_key_id) = &input.kms_key_id {
+            if let Err(message) = crate::state::check_kms_key_id(kms_key_id) {
+                return Err(
+                    CreateCustomDBEngineVersionErrorModeled::KMSKeyNotAccessibleFault(
+                        KMSKeyNotAccessibleFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        } else if crate::ops::describe_db_engine_versions::is_rds_custom_engine(&engine) {
+            return Err(CreateCustomDBEngineVersionError::invalid_parameter_value(
+                format!(
+                    "KMSKeyId must be specified for engine {engine}: a symmetric encryption \
+                     KMS key is required for an RDS Custom engine version"
+                ),
+            ));
+        }
+
+        // "For RDS Custom for SQL Server, an AMI ID is required to create a CEV": that
+        // engine family's CEV is an image, so the request has to say WHICH image — a named
+        // AMI, the service-provided latest one, or the one a source CEV already carries.
+        let names_an_image = input.image_id.is_some()
+            || input.use_aws_provided_latest_image == Some(true)
+            || input.source_custom_db_engine_version_identifier.is_some();
+        if crate::state::is_ami_backed_custom_engine(&engine) && !names_an_image {
+            return Err(CreateCustomDBEngineVersionError::invalid_parameter_value(
+                format!(
+                    "ImageId must be specified for engine {engine}: an AMI ID is required to \
+                     create a CEV for RDS Custom for SQL Server, unless \
+                     UseAwsProvidedLatestImage or SourceCustomDbEngineVersionIdentifier \
+                     names the image"
+                ),
+            ));
+        }
+
+        // Nothing caller-sized reaches the store unchecked: the installation file list
+        // publishes no bound of its own, so its entry count and every entry are bounded,
+        // and the tag list is count- and length-bounded. Every other stored member carries
+        // a modelled length the boundary has already enforced.
+        let installation_files = input.database_installation_files.unwrap_or_default();
+        crate::state::check_request_list_len(
+            "DatabaseInstallationFiles",
+            installation_files.len(),
+            crate::state::MAX_COLLECTION_ENTRIES,
+        )
+        .map_err(CreateCustomDBEngineVersionError::invalid_parameter_value)?;
+        for file in &installation_files {
+            crate::state::check_free_form("DatabaseInstallationFiles", file)
+                .map_err(CreateCustomDBEngineVersionError::invalid_parameter_value)?;
+        }
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(CreateCustomDBEngineVersionError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated engine version.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // `SourceCustomDbEngineVersionIdentifier` is "the ARN of a CEV to use as a source
+        // for creating a new CEV", resolved in this service's own store: a source can only
+        // name a CEV some create really stored, and the new CEV inherits that source's
+        // media rather than being given any of its own.
+        let source = match &input.source_custom_db_engine_version_identifier {
+            None => None,
+            Some(named) => {
+                let Some(found) = store.resolve_custom_db_engine_version_arn(&region, named) else {
+                    return Err(
+                        CreateCustomDBEngineVersionErrorModeled::CustomDBEngineVersionNotFoundFault(
+                            CustomDBEngineVersionNotFoundFault {
+                                message: Some(format!(
+                                    "Custom engine version {named} not found"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                Some(found.clone())
+            }
+        };
+
+        // One `(Engine, EngineVersion)` names one engine version in a region, and the name
+        // has to be free among ALL of that engine's versions: a version this service
+        // publishes as reference data is one the account already has, so it cannot be
+        // minted as a CEV either.
+        let key = (
+            region.clone(),
+            crate::state::custom_db_engine_version_key(&engine, &engine_version),
+        );
+        if store
+            .resolve_custom_db_engine_version(&region, &engine, &engine_version)
+            .is_some()
+            || crate::ops::describe_db_engine_versions::publishes_engine_version(
+                &engine,
+                &engine_version,
+            )
+        {
+            return Err(
+                CreateCustomDBEngineVersionErrorModeled::CustomDBEngineVersionAlreadyExistsFault(
+                    CustomDBEngineVersionAlreadyExistsFault {
+                        message: Some(format!(
+                            "Custom engine version {engine_version} already exists for engine \
+                             {engine}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.custom_db_engine_versions_in(&region).len()
+            >= crate::state::CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(
+                CreateCustomDBEngineVersionErrorModeled::CustomDBEngineVersionQuotaExceededFault(
+                    CustomDBEngineVersionQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} custom engine versions in {region}",
+                            crate::state::CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The CEV name decides the major version and the DB parameter group family, both
+        // read from the engine-version catalogue — see `custom_version_basis`.
+        let basis = crate::ops::describe_db_engine_versions::custom_version_basis(
+            &engine,
+            &engine_version,
+        );
+        let mint = store.next_mint();
+        // A CEV is usable as soon as it is created: the create answers with it already in
+        // the status an RDS Custom DB instance can be created from, so nothing about it is
+        // owed later.
+        let record = crate::state::CustomDbEngineVersionRecord {
+            engine,
+            engine_version,
+            region: region.clone(),
+            cev_id: crate::state::mint_uuid_token("cev", mint),
+            major_engine_version: basis.major_engine_version,
+            parameter_group_family: basis.parameter_group_family,            description: input.description,
+            manifest: input
+                .manifest
+                .or_else(|| source.as_ref().and_then(|source| source.manifest.clone())),
+            image_id: input
+                .image_id
+                .or_else(|| source.as_ref().and_then(|source| source.image_id.clone())),
+            kms_key_id: input.kms_key_id,
+            database_installation_files_s3_bucket_name: input
+                .database_installation_files_s3_bucket_name
+                .or_else(|| {
+                    source
+                        .as_ref()
+                        .and_then(|source| source.database_installation_files_s3_bucket_name.clone())
+                }),
+            database_installation_files_s3_prefix: input
+                .database_installation_files_s3_prefix
+                .or_else(|| {
+                    source
+                        .as_ref()
+                        .and_then(|source| source.database_installation_files_s3_prefix.clone())
+                }),
+            database_installation_files: if installation_files.is_empty() {
+                source
+                    .as_ref()
+                    .map(|source| source.database_installation_files.clone())
+                    .unwrap_or_default()
+            } else {
+                installation_files
+            },
+            status: crate::state::CUSTOM_ENGINE_VERSION_STATUS_AVAILABLE.to_string(),
+            create_time: crate::state::now_as_wire_timestamp(),
+            tags,
+        };
+        let certificates = crate::state::supported_ca_certificate_identifiers();
+        // The answer is the stored record projected onto the wire, through the SAME
+        // projection `DescribeDBEngineVersions` reports it with. That report's own
+        // character-set and time-zone flags are a property of the request that asks for
+        // them, and this request carries none, so none of those lists is reported here.
+        let version = crate::ops::describe_db_engine_versions::custom_version_to_wire(
+            &record,
+            basis.profile,
+            &DescribeDBEngineVersionsInput::default(),
+            &certificates,
+        );
+        store.custom_db_engine_versions.insert(key, record);
+        Ok(version)
     }
 }

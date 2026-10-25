@@ -23,8 +23,14 @@ mod create_repository_contract;
 mod error_message_construction;
 #[path = "all/image_metadata.rs"]
 mod image_metadata;
+#[path = "all/image_replication_status.rs"]
+mod image_replication_status;
 #[path = "all/image_scan.rs"]
 mod image_scan;
+#[path = "all/image_scan_outcome.rs"]
+mod image_scan_outcome;
+#[path = "all/image_storage_class_transitions.rs"]
+mod image_storage_class_transitions;
 #[path = "all/image_tag_mutability.rs"]
 mod image_tag_mutability;
 #[path = "all/layer_availability.rs"]
@@ -43,6 +49,8 @@ mod lifecycle_policy;
 mod lifecycle_policy_document_identity;
 #[path = "all/lifecycle_policy_preview.rs"]
 mod lifecycle_policy_preview;
+#[path = "all/manifest_media_type_negotiation.rs"]
+mod manifest_media_type_negotiation;
 #[path = "all/parameter_constraint_clauses.rs"]
 mod parameter_constraint_clauses;
 #[path = "all/policy_document_canonical_form.rs"]

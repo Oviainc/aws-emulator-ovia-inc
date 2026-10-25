@@ -2,7 +2,9 @@
 
 //! @op DeleteDictionary
 //! Implements `DeleteDictionary`: the delete is ACCEPTED (202), the dictionary enters
-//! `DELETING`, and the clock removes it, after which `GetDictionary` answers 404.
+//! `DELETING`, and the clock completes the deletion, after which `GetDictionary` answers
+//! 404 and a retry of this `@idempotent` call reports the completed deletion as
+//! `DELETED`.
 //!
 //! A dictionary a feed still references is refused with the modelled
 //! `ConflictException` (409), and that refusal REPORTS HOW MANY feeds reference it
@@ -184,8 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The dictionary is resolved WITHIN the request's Region: a delete may only
         // accept the removal of a dictionary this endpoint holds, so an id naming
-        // another Region's dictionary earns the modelled not-found refusal.
-        let Some(dictionary) = state.dictionary_mut(&region, &input.id) else {
+        // another Region's dictionary earns the modelled not-found refusal. A
+        // dictionary whose deletion this store has already COMPLETED resolves here too,
+        // and only here: this call is `@idempotent`, so a retry of a deletion the
+        // service accepted is answered with that deletion's own outcome.
+        let Some(dictionary) = state.dictionary_including_deleted_mut(&region, &input.id) else {
             return Err(DeleteDictionaryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::NOT_FOUND_MESSAGE.to_string(),
@@ -193,6 +198,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A deletion that has already SUCCEEDED is reported as such ("The status of the
+        // dictionary after deletion", `DeleteDictionaryResponse$status`): the retry
+        // repeats the answer the served deletion earned, so nothing decided about a live
+        // dictionary — the reference conflict below included — applies to it.
+        if dictionary.is_deleted() {
+            return Ok(DeleteDictionaryOutput {
+                arn: dictionary.arn.clone(),
+                id: dictionary.id.clone(),
+                status: dictionary.status.as_wire().to_string(),
+            });
+        }
 
         // "You cannot delete a dictionary that is referenced by a feed. You must first
         // remove the dictionary reference from the feed's subtitling configuration." —
@@ -208,11 +225,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // 202: the deletion is accepted, not completed. The dictionary reports DELETING
-        // until the clock makes the removal due, after which it is gone and
-        // GetDictionary answers ResourceNotFoundException. Repeating the call inside
-        // that window is idempotent (the operation is `@idempotent`): the removal stays
-        // due at the instant the first call set, so polling DeleteDictionary cannot
-        // postpone it.
+        // until the clock makes the deletion due, after which GetDictionary answers
+        // ResourceNotFoundException and a retry of this delete reports DELETED.
+        // Repeating the call inside that window is idempotent (the operation is
+        // `@idempotent`): the deletion stays due at the instant the first call set, so
+        // polling DeleteDictionary cannot postpone it.
         let due = match (dictionary.status, dictionary.transition_due_at) {
             (crate::state::DictionaryStatus::Deleting, Some(due)) => due,
             _ => dictionary.enter_transient(crate::state::DictionaryStatus::Deleting, now),

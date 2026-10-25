@@ -353,9 +353,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|token| crate::state::ClientToken::minted(token, now)),
             request_fingerprint: fingerprint,
             owed_statuses: VecDeque::from([
-                (now + crate::state::CREATING_DELAY, crate::state::RUNNING, None),
                 (
-                    now + crate::state::TRANSITION_DELAY,
+                    crate::state::due_at(now, crate::state::CREATING_DELAY),
+                    crate::state::RUNNING,
+                    None,
+                ),
+                (
+                    crate::state::due_at(now, crate::state::TRANSITION_DELAY),
                     owed_status,
                     owed_message,
                 ),

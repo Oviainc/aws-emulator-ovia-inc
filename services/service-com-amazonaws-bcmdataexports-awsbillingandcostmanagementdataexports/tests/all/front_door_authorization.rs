@@ -372,9 +372,14 @@ pub(crate) fn create_request(name: &str) -> Value {
     request
 }
 
-/// The ARN this service mints for the export called `name` in [`REGION`].
-pub(crate) fn export_arn(name: &str) -> String {
-    ::engine::emulator_arn("bcm-data-exports", REGION, &format!("export/{name}"))
+/// The resource an IAM policy names to cover the export called `name` in [`REGION`].
+///
+/// The ARN this service mints for an export carries a per-export generated id after the
+/// name (`export/<name>/<id>`), which no policy author — and no test — can predict before
+/// the create, so a policy scoped to one export names it with the resource wildcard IAM
+/// provides for exactly that.
+pub(crate) fn export_arn_pattern(name: &str) -> String {
+    ::engine::emulator_arn("bcm-data-exports", REGION, &format!("export/{name}/*"))
 }
 
 #[tokio::test]
@@ -407,7 +412,7 @@ async fn a_create_is_served_only_to_a_principal_whose_policy_allows_it() {
                         "bcmde-allowed",
                         Some(&allow(
                             "bcm-data-exports:CreateExport",
-                            &export_arn("role_allowed_export"),
+                            &export_arn_pattern("role_allowed_export"),
                         )),
                     )
                     .await,
@@ -449,7 +454,7 @@ async fn a_create_is_served_only_to_a_principal_whose_policy_allows_it() {
                         "bcmde-other-resource",
                         Some(&allow(
                             "bcm-data-exports:CreateExport",
-                            &export_arn("somebody_elses_export"),
+                            &export_arn_pattern("somebody_elses_export"),
                         )),
                     )
                     .await,

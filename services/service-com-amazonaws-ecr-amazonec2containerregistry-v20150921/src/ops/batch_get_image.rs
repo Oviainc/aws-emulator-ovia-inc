@@ -7,6 +7,7 @@
 //! one `failures` entry, carrying the identifier as requested, for each entry that does
 //! not. A batch call never fails as a whole for an unresolvable entry; it fails only
 //! when the repository itself is not here, or when the request names another registry.
+//! Each manifest is served in a schema the request's `acceptedMediaTypes` accepts.
 //!
 //! ## Shape of an operation
 //!
@@ -202,11 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
         // `acceptedMediaTypes` tells the registry which manifest schemas the client
-        // understands, so that it can convert a manifest between them. This emulator
-        // stores every manifest exactly as it was pushed and converts nothing, so the
-        // list changes neither which identifier resolves nor what is reported for it:
-        // each image is answered with the manifest and the media type the push stored.
-        let _ = &input.accepted_media_types;
+        // understands, and the registry serves each image in one of them: see
+        // [`crate::state::negotiated_manifest`], which is where the stored manifest is
+        // rendered in an accepted schema when the client does not accept the one it was
+        // pushed in. The list changes neither which identifier resolves nor which image is
+        // reported — only the document served for it and the media type that document is.
+        let accepted = input.accepted_media_types.as_deref();
 
         // `imageIds` is modelled `@length(1..100)`, so a batch asking for nothing, or
         // for more than the batch maximum, was already refused at the boundary.
@@ -221,19 +223,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every entry it was handed, including two entries that name one image.
         for id in &input.image_ids {
             match repo.lookup_image(id) {
-                Ok(stored) => images.push(Image {
-                    registry_id: Some(repo.registry_id.clone()),
-                    repository_name: Some(repo.name.clone()),
-                    // The stored image's own digest, plus the tag the request addressed
-                    // it by — the one rule for that identifier lives on the record.
-                    image_id: Some(stored.identifier(id.image_tag.as_deref())),
-                    image_manifest: Some(stored.manifest.clone()),
-                    image_manifest_media_type: stored.manifest_media_type.clone(),
-                    // The byte length of the manifest this entry carries: a client that
-                    // streams or verifies the document reads the advertised size rather
-                    // than trusting an unbounded read.
-                    image_manifest_size: Some(stored.manifest_size()),
-                }),
+                Ok(stored) => {
+                    let (manifest, media_type) =
+                        crate::state::negotiated_manifest(stored, accepted);
+                    images.push(Image {
+                        registry_id: Some(repo.registry_id.clone()),
+                        repository_name: Some(repo.name.clone()),
+                        // The stored image's own digest, plus the tag the request addressed
+                        // it by — the one rule for that identifier lives on the record. It
+                        // is the identity of the image in this repository, so it is the
+                        // same whichever schema the manifest is served in.
+                        image_id: Some(stored.identifier(id.image_tag.as_deref())),
+                        // The byte length of the manifest this entry CARRIES: a client that
+                        // streams or verifies the document reads the advertised size rather
+                        // than trusting an unbounded read, so it is the served document's
+                        // length and not the stored one's.
+                        image_manifest_size: Some(crate::state::manifest_document_size(&manifest)),
+                        image_manifest: Some(manifest),
+                        image_manifest_media_type: media_type,
+                    });
+                }
                 Err(failure) => failures.push(ImageFailure {
                     // The identifier is echoed exactly as requested: it is what lets a
                     // caller match the failure back to its own entry.

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOperationEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOperationEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOperationEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the milestones of ONE operation: the events of the operation record the
+//! request's `OperationId` names, in the Region the request was signed for. A milestone
+//! is derived from that record ([`crate::state::StoredOperation::events`]) and projected
+//! by [`crate::state::OperationEventRecord::view`], so the listing reports the start of
+//! the operation's work and — once the clock has brought the record to a terminal status
+//! — the instant it reached it, and nothing the operation did not pass. `Filters` narrow
+//! the result by the attributes this operation documents
+//! ([`crate::state::OPERATION_EVENT_FILTER_NAMES`]), and the page is taken by
+//! [`crate::state::page`] so a `NextToken` resumes exactly where the previous page
+//! stopped. The listing REPORTS: it materialises only the status changes the clock
+//! already owed ([`crate::state::ComAmazonawsSsmsapSsmsapState::settle`]), so it agrees
+//! with a `GetOperation` made at the same instant, and writes nothing else.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +156,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOperationEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOperationEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOperationEvents"))
+        // The Region this request was signed for: an operation record belongs to the
+        // Region the call that filed it was made in, so its milestones are reported at
+        // that regional endpoint alone.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListOperationEventsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+        // The record was due to reach its terminal status at its own instant whether or
+        // not anybody polled, so materialising that here reports the milestones the
+        // operation has already passed rather than changing it.
+        state.settle(::std::time::SystemTime::now());
+
+        let filters = input.filters.unwrap_or_default();
+        // The bounds the model declares on `FilterList`, `FilterName` and `FilterValue`,
+        // re-stated before any filtering runs so the work this request does is bounded by
+        // a check in this crate rather than by request size.
+        crate::state::filters_within_bounds(&filters)
+            .map_err(ListOperationEventsErrorModeled::ValidationException)?;
+        for filter in &filters {
+            // This operation documents ONE operator for every filter it takes, so any
+            // other is refused rather than silently applied as a comparison this listing
+            // does not offer.
+            if filter.operator != crate::state::FILTER_OPERATOR_EQUALS {
+                return Err(ListOperationEventsErrorModeled::ValidationException(
+                    crate::state::validation(format!(
+                        "Filter Operator must be {}, but was {}",
+                        crate::state::FILTER_OPERATOR_EQUALS,
+                        filter.operator
+                    )),
+                )
+                .into());
+            }
+            if !crate::state::OPERATION_EVENT_FILTER_NAMES.contains(&filter.name.as_str()) {
+                return Err(ListOperationEventsErrorModeled::ValidationException(
+                    crate::state::validation(format!(
+                        "Filter Name must be one of {}, but was {}",
+                        crate::state::OPERATION_EVENT_FILTER_NAMES.join(", "),
+                        filter.name
+                    )),
+                )
+                .into());
+            }
+        }
+
+        let Some(operation) = state.region(&region).operations.get(&input.operation_id) else {
+            // This operation models no `ResourceNotFoundException`, so an id that names
+            // no record of this account and Region is refused rather than answered with
+            // an empty list, which would report an operation that happened and passed no
+            // milestone.
+            return Err(ListOperationEventsErrorModeled::ValidationException(
+                crate::state::validation(crate::state::no_operation_message(&input.operation_id)),
+            )
+            .into());
+        };
+
+        // The record's milestones, narrowed by every filter the request carries (several
+        // filters narrow together), each paired with the key the listing is ordered and
+        // paged by.
+        let matching: Vec<(String, OperationEvent)> = operation
+            .events()
+            .into_iter()
+            .filter(|event| {
+                filters.iter().all(|filter| {
+                    crate::state::filter_matches_attribute(
+                        event.filter_attribute(&filter.name),
+                        filter,
+                    )
+                })
+            })
+            .map(|event| (event.page_key(), event.view()))
+            .collect();
+
+        let page = crate::state::page(matching, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListOperationEventsErrorModeled::ValidationException(
+                    crate::state::page_validation_exception(&error),
+                )
+            })?;
+
+        Ok(ListOperationEventsOutput {
+            operation_events: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }
+

@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_keyspaces_keyspacesservice::state as keyspaces;
 
 use crate::keyspace_table_lifecycle::{
-    assert_failure, assert_ok, keyspace_arn, Emulator, REGION,
+    assert_failure, assert_ok, keyspace_arn, settle_wait, Emulator, REGION,
 };
 
 /// The names of the keyspaces Amazon Keyspaces manages itself, which every account holds
@@ -254,14 +254,17 @@ async fn list_keyspaces_reports_each_stored_keyspace_with_its_replication() {
     }
 
     // RULE 1's other half: a keyspace removed from state is no longer reported, and the
-    // rest of the listing is untouched.
+    // rest of the listing is untouched. The delete is accepted once the create has
+    // settled, and the removal is the clock's a span later.
     let removed = cases[0].name;
+    tokio::time::sleep(settle_wait()).await;
     assert_ok(
         removed,
         emulator
             .call("DeleteKeyspace", json!({"keyspaceName": removed}))
             .await,
     );
+    tokio::time::sleep(settle_wait()).await;
     let after_delete = assert_ok(
         "after the delete",
         emulator.call("ListKeyspaces", json!({})).await,

@@ -187,6 +187,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The co-requirement each time-range shape a rule's filter can carry documents
+        // on both of its bounding members — see
+        // [`crate::state::rule_time_range_error`]. A rule that bounds its search with
+        // only one end of a custom segment is refused rather than stored, so no stored
+        // category reports a segment that starts nowhere or ends nowhere. Decided
+        // first, before the clock is read or the store is touched, because it is a
+        // property of the REQUEST alone.
+        if let Some(message) = crate::state::rule_time_range_error(&input.rules) {
+            return Err(bad_request(&message));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -260,4 +271,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(output)
     }
+}
+
+/// A `BadRequestException` refusing a request this operation cannot serve: one whose
+/// rules bound a search with only one end of a time range, which the model's own
+/// constraint traits cannot express (a conditional co-requirement is not a Smithy
+/// constraint, so the boundary validation never sees it).
+fn bad_request(message: &str) -> CreateCallAnalyticsCategoryError {
+    CreateCallAnalyticsCategoryErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
