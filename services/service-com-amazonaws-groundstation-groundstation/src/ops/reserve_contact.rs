@@ -198,6 +198,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A contact RESERVES antenna time, and antenna time that has already elapsed
+        // cannot be reserved: a window whose end the clock has already passed holds
+        // nothing left to hold, so it is refused rather than admitted, settled into
+        // `SCHEDULED` and counted as scheduled antenna time for its month. A window
+        // already under way still has time left in it, and is reserved for what remains.
+        let now = crate::state::now_timestamp();
+        if input.end_time.as_secs_f64() <= now.as_secs_f64() {
+            return Err(ReserveContactErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "endTime has already passed: a contact reserves antenna time that has \
+                         not elapsed yet"
+                            .to_string(),
+                    ),
+                    parameter_name: Some("endTime".to_string()),
+                },
+            )
+            .into());
+        }
+
         // The store this emulator keeps is bounded, so a caller cannot grow it without
         // limit; past the bound a reservation is refused the way the service refuses one
         // that runs past an account limit. Checked after the request itself, so what the
@@ -215,20 +235,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let now = crate::state::now_timestamp();
-        let contact_id = crate::state::new_uuid();
         // The antenna this pass is placed on. A reservation holds an antenna for its
         // window and an antenna serves one pass at a time, so the scheduler places the
         // contact on the first antenna of the ground station nothing else holds for that
         // window — recorded here, when the reservation is accepted, so every later read
         // of it (`ListGroundStationReservations`) reports the same antenna.
-        let antenna_name = guard.free_antenna(
+        //
+        // A ground station has a FINITE number of antennas, so when every one of them is
+        // already held for a window overlapping this one — by another contact of this
+        // account or by maintenance AWS scheduled — that antenna time is no longer
+        // reservable and the request is refused, before any contact id is minted.
+        let Some(antenna_name) = guard.free_antenna(
             &input.ground_station,
             (
                 input.start_time.as_secs_f64(),
                 input.end_time.as_secs_f64(),
             ),
-        );
+        ) else {
+            return Err(ReserveContactErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "every antenna at ground station {} is already held for a window \
+                         overlapping this one",
+                        input.ground_station
+                    )),
+                    parameter_name: Some("startTime".to_string()),
+                },
+            )
+            .into());
+        };
+        let contact_id = crate::state::new_uuid();
         let contact = crate::state::Contact {
             contact_id: contact_id.clone(),
             mission_profile_arn: input.mission_profile_arn,

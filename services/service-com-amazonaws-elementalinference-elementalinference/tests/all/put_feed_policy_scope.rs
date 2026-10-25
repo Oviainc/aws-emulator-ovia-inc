@@ -230,11 +230,12 @@ async fn the_same_put_repeated_leaves_one_policy_and_one_success() {
     }
 }
 
-/// One row per feed status this service reports (`FeedStatus`: `AVAILABLE`, `ACTIVE`,
-/// `DELETING`, `ARCHIVED`), with whether a put is accepted from it. A policy may be
-/// attached to a feed that exists; only a feed on its way out of the store refuses.
+/// One row per SETTLED feed status this service reports (`FeedStatus`: `AVAILABLE`,
+/// `ACTIVE`, `DELETING`, `ARCHIVED`), with whether a put is accepted from it. A policy may
+/// be attached to a feed that exists; only a feed on its way out of the store refuses.
 /// (The `DELETING` row is here so the table spans the whole status dimension; the
-/// refusal's own wording is pinned in `feed_policy.rs`.)
+/// refusal's own wording is pinned in `feed_policy.rs`, and the transient `UPDATING` in
+/// `feed_reconfiguration_status.rs`.)
 const STATUS_ROWS: [(&str, bool); 4] = [
     ("AVAILABLE", true),
     ("ACTIVE", true),

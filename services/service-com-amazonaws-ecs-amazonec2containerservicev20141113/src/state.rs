@@ -20,7 +20,17 @@
 //! the task entered the `PENDING` state"). The move to `RUNNING` is owed by the CLOCK,
 //! not by whoever reads next: [`TaskRecord::running_due_at`] records the instant it
 //! falls due and [`ComAmazonawsEcsAmazonec2containerservicev20141113State::advance_clock`]
-//! materialises it. `StopTask` is the same shape in reverse: the task goes to
+//! materialises it.
+//!
+//! A task whose placement still needs capacity ACQUIRED for it is one step earlier in
+//! that lifecycle: it is answered in `PROVISIONING` with no start owed at all (see
+//! [`awaits_provisioned_capacity`]), and it crosses `PROVISIONING` -> `PENDING` only once
+//! a container instance registers into its cluster —
+//! [`ComAmazonawsEcsAmazonec2containerservicev20141113State::place_tasks_awaiting_capacity`]
+//! records that instant in [`TaskRecord::pending_due_at`], and the same clock pass
+//! materialises it.
+//!
+//! `StopTask` is the same shape in reverse: the task goes to
 //! `DEACTIVATING` with `stoppingAt` set (the `Task$stoppingAt` doc: "the time when the
 //! task transitions from the `RUNNING` state to `STOPPING`") and reaches `STOPPED`
 //! [`TRANSITION_SPAN`] later. Nothing sleeps: the due instant is stored and compared.
@@ -339,6 +349,11 @@ pub const MAX_TASKS: usize = 512;
 /// lifecycle status a stopping task takes (`Task$stoppingAt`: "the time when the task
 /// transitions from the RUNNING state to STOPPING").
 pub const STATUS_PENDING: &str = "PENDING";
+/// The lifecycle status of a task Amazon ECS has accepted but still has to acquire
+/// resources for before it can place it — the status that precedes [`STATUS_PENDING`],
+/// which a task only reaches once it has been placed. See
+/// [`awaits_provisioned_capacity`].
+pub const STATUS_PROVISIONING: &str = "PROVISIONING";
 /// See [`STATUS_PENDING`].
 pub const STATUS_RUNNING: &str = "RUNNING";
 /// See [`STATUS_PENDING`].
@@ -1582,7 +1597,12 @@ pub struct TaskRecord {
     pub stopped_reason: Option<String>,
     pub stop_code: Option<String>,
     pub version: i64,
-    /// When `PENDING` -> `RUNNING` falls due; `None` once it has been materialised.
+    /// When `PROVISIONING` -> `PENDING` falls due: set when the capacity this task was
+    /// parked waiting for registers into its cluster, and `None` both for a task that was
+    /// placed straight away and for one still waiting for capacity to appear.
+    pub pending_due_at: Option<SystemTime>,
+    /// When `PENDING` -> `RUNNING` falls due; `None` once it has been materialised, and
+    /// `None` for a task that has not been placed yet.
     pub running_due_at: Option<SystemTime>,
     /// When `DEACTIVATING` -> `STOPPED` falls due; `None` once materialised.
     pub stopped_due_at: Option<SystemTime>,
@@ -1954,6 +1974,20 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             }
         }
         for task in self.tasks.values_mut() {
+            // The placement a parked task was owed from the instant capacity registered
+            // into its cluster: it has been placed, so it is `PENDING` and its start is
+            // owed from there like any other placed task's.
+            if let Some(due) = task.pending_due_at {
+                if due <= now {
+                    task.pending_due_at = None;
+                    task.last_status = STATUS_PENDING.to_string();
+                    for container in &mut task.containers {
+                        container.last_status = STATUS_PENDING.to_string();
+                    }
+                    task.running_due_at = Some(due + TRANSITION_SPAN);
+                    task.version += 1;
+                }
+            }
             if let Some(due) = task.running_due_at {
                 if due <= now {
                     task.running_due_at = None;
@@ -2321,6 +2355,25 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }
             })
             .collect()
+    }
+
+    /// Record the placement every task PARKED in `cluster_name` is now owed, because the
+    /// capacity its capacity provider had to acquire has just registered into the cluster.
+    ///
+    /// The transition falls due [`TRANSITION_SPAN`] from `now` and
+    /// [`Self::advance_clock`] materialises it, so nothing here moves a status that is not
+    /// owed yet. A task the caller has already asked to stop is not placed: its placement
+    /// was cancelled, not merely overtaken.
+    pub fn place_tasks_awaiting_capacity(&mut self, cluster_name: &str, now: SystemTime) {
+        for task in self.tasks.values_mut() {
+            if task.cluster_name == cluster_name
+                && task.last_status == STATUS_PROVISIONING
+                && task.desired_status == STATUS_RUNNING
+                && task.pending_due_at.is_none()
+            {
+                task.pending_due_at = Some(now + TRANSITION_SPAN);
+            }
+        }
     }
 
     /// How many container instances `cluster_name` holds in a registered status.
@@ -2736,7 +2789,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     }
 
     /// Place ONE task of `service`, `PENDING` with its start owed by the clock
-    /// [`TRANSITION_SPAN`] from now, exactly as `RunTask` leaves a task it placed.
+    /// [`TRANSITION_SPAN`] from now, exactly as `RunTask` leaves a task it placed — or
+    /// parked in [`STATUS_PROVISIONING`] when the strategy's provider still has to acquire
+    /// the capacity to place it on ([`awaits_provisioned_capacity`]).
     fn place_service_task(
         &mut self,
         service: &ServiceRecord,
@@ -2744,23 +2799,6 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         region: &str,
         now: SystemTime,
     ) {
-        let task_id = self.next_task_id();
-        let task_arn = task_arn(region, &service.cluster_name, &task_id);
-        let containers = self.mint_containers(
-            region,
-            &service.cluster_name,
-            &task_id,
-            &task_arn,
-            definition,
-            STATUS_PENDING,
-        );
-        // "Determines whether to propagate the tags from the task definition or the
-        // service to the task. If no value is specified, the tags aren't propagated."
-        let tags = match service.propagate_tags.as_str() {
-            PROPAGATE_TAGS_SERVICE => service.tags.clone(),
-            PROPAGATE_TAGS_TASK_DEFINITION => definition.tags.clone(),
-            _ => Vec::new(),
-        };
         let (launch_type, capacity_provider_name) = match &service.launch_type {
             Some(launch_type) => (Some(launch_type.clone()), None),
             None => (
@@ -2771,6 +2809,29 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     .map(|item| item.capacity_provider.clone()),
             ),
         };
+        let awaiting_capacity = awaits_provisioned_capacity(
+            capacity_provider_name
+                .as_deref()
+                .and_then(|name| self.capacity_providers.get(name)),
+            self.registered_container_instances(&service.cluster_name),
+        );
+        let task_id = self.next_task_id();
+        let task_arn = task_arn(region, &service.cluster_name, &task_id);
+        let containers = self.mint_containers(
+            region,
+            &service.cluster_name,
+            &task_id,
+            &task_arn,
+            definition,
+            initial_task_status(awaiting_capacity),
+        );
+        // "Determines whether to propagate the tags from the task definition or the
+        // service to the task. If no value is specified, the tags aren't propagated."
+        let tags = match service.propagate_tags.as_str() {
+            PROPAGATE_TAGS_SERVICE => service.tags.clone(),
+            PROPAGATE_TAGS_TASK_DEFINITION => definition.tags.clone(),
+            _ => Vec::new(),
+        };
         let record = TaskRecord {
             task_arn: task_arn.clone(),
             task_id,
@@ -2778,7 +2839,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             cluster_arn: service.cluster_arn.clone(),
             task_definition_arn: definition.arn.clone(),
             family: definition.family.clone(),
-            last_status: STATUS_PENDING.to_string(),
+            last_status: initial_task_status(awaiting_capacity).to_string(),
             desired_status: STATUS_RUNNING.to_string(),
             containers,
             cpu: definition.cpu.clone(),
@@ -2804,7 +2865,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             stopped_reason: None,
             stop_code: None,
             version: 1,
-            running_due_at: Some(now + TRANSITION_SPAN),
+            // A task that is not placed yet has no start owed: the clock owes it only
+            // once the capacity it waits for exists.
+            pending_due_at: None,
+            running_due_at: if awaiting_capacity {
+                None
+            } else {
+                Some(now + TRANSITION_SPAN)
+            },
             stopped_due_at: None,
         };
         self.tasks.insert(task_arn, record);
@@ -2825,9 +2893,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         task.stopped_reason = Some(reason.to_string());
         task.stop_code = Some(STOP_CODE_SERVICE_SCHEDULER.to_string());
         task.stopped_due_at = Some(now + TRANSITION_SPAN);
-        // A task asked to stop never reaches RUNNING: the start it was still waiting for
-        // is cancelled, not merely overtaken.
+        // A task asked to stop never reaches RUNNING: the start it was still waiting for,
+        // and the placement it was parked for, are cancelled rather than merely overtaken.
         task.running_due_at = None;
+        task.pending_due_at = None;
         task.version += 1;
         for container in &mut task.containers {
             container.last_status = STATUS_DEACTIVATING.to_string();
@@ -3526,6 +3595,40 @@ pub fn needs_registered_capacity_now(provider: &CapacityProviderRecord) -> bool 
         != Some(MANAGED_SCALING_ENABLED)
 }
 
+/// Whether a task routed through `provider` still has to have capacity ACQUIRED for it
+/// before Amazon ECS can place it, given the `registered_instances` its cluster holds.
+///
+/// It is the accepted half of [`needs_registered_capacity_now`]: an Auto Scaling group
+/// provider whose managed scaling Amazon ECS runs ("Amazon ECS manages the scale-in and
+/// scale-out actions of the Auto Scaling group") turns a placement into one ECS can
+/// satisfy by adding capacity, and until that capacity is registered as a container
+/// instance there is nothing to place the task ON. Such a task is accepted but not placed,
+/// which is what [`STATUS_PROVISIONING`] reports; a cluster that already holds registered
+/// capacity places the task now, and a provider that names no Auto Scaling group of this
+/// account (a predefined Fargate provider, a managed-instances provider) acquires no
+/// container instance for this cluster, so neither parks a task.
+pub fn awaits_provisioned_capacity(
+    provider: Option<&CapacityProviderRecord>,
+    registered_instances: usize,
+) -> bool {
+    registered_instances == 0
+        && provider.is_some_and(|provider| {
+            provider.auto_scaling_group_provider.is_some()
+                && !needs_registered_capacity_now(provider)
+        })
+}
+
+/// The `lastStatus` a task is placed with: [`STATUS_PROVISIONING`] while its capacity is
+/// still being acquired, else [`STATUS_PENDING`]. Shared by every path that places a task,
+/// so a task starts in the same lifecycle state whoever placed it.
+pub fn initial_task_status(awaiting_capacity: bool) -> &'static str {
+    if awaiting_capacity {
+        STATUS_PROVISIONING
+    } else {
+        STATUS_PENDING
+    }
+}
+
 /// `ManagedScaling$status` when Amazon ECS scales the Auto Scaling group itself, from the
 /// `ManagedScalingStatus` enum (`ENABLED` / `DISABLED`). The member is optional and the
 /// doc states the default is off ("the default is off"), so an absent or `DISABLED`
@@ -4186,16 +4289,36 @@ pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
 /// `Err` carries the message of the resource limit the merged set would break ("Maximum
 /// number of tags per resource - 50", [`MAX_TAGS_PER_RESOURCE`]); `stored` is left
 /// untouched in that case, so a refused write changes nothing.
+///
+/// The limit is what bounds the WORK one write may ask for: how many tags the write would
+/// leave the resource carrying is ONE entry per distinct key across the two lists, counted
+/// in one pass before anything is copied, so a write over the limit is refused before the
+/// merge is done; and the merge itself is keyed through an index over the stored keys, so
+/// applying the request costs one lookup per entry rather than a walk over the set it is
+/// growing.
 pub fn merge_tags(stored: &mut Vec<Tag>, requested: &[Tag]) -> Result<(), String> {
-    let mut merged = stored.clone();
-    for tag in requested {
-        match merged.iter_mut().find(|existing| existing.key == tag.key) {
-            Some(existing) => existing.value = tag.value.clone(),
-            None => merged.push(tag.clone()),
-        }
+    let merged_count = stored
+        .iter()
+        .chain(requested)
+        .map(|tag| tag.key.as_deref())
+        .collect::<HashSet<Option<&str>>>()
+        .len();
+    if merged_count > MAX_TAGS_PER_RESOURCE {
+        return Err(tags_per_resource_limit_message(merged_count));
     }
-    if merged.len() > MAX_TAGS_PER_RESOURCE {
-        return Err(tags_per_resource_limit_message(merged.len()));
+    let mut merged = stored.clone();
+    let mut positions: HashMap<Option<String>, usize> = HashMap::with_capacity(merged.len());
+    for (position, tag) in merged.iter().enumerate() {
+        positions.entry(tag.key.clone()).or_insert(position);
+    }
+    for tag in requested {
+        match positions.get(&tag.key) {
+            Some(&position) => merged[position].value = tag.value.clone(),
+            None => {
+                positions.insert(tag.key.clone(), merged.len());
+                merged.push(tag.clone());
+            }
+        }
     }
     *stored = merged;
     Ok(())

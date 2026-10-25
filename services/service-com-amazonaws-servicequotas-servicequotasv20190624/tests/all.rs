@@ -17,6 +17,8 @@ mod applied_quota_records;
 mod auto_management;
 #[path = "all/auto_management_configuration.rs"]
 mod auto_management_configuration;
+#[path = "all/catalog_identity.rs"]
+mod catalog_identity;
 #[path = "all/catalog_pagination.rs"]
 mod catalog_pagination;
 #[path = "all/default_quota_catalog.rs"]

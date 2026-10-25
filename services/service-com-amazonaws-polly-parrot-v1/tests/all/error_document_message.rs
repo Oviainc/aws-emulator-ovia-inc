@@ -24,23 +24,10 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use service_com_amazonaws_polly_parrot_v1::service::errors;
+use service_com_amazonaws_polly_parrot_v1::state::mint_task_id;
 
 use crate::lexicons_and_speech::{error_code, json, Polly};
-use crate::support::{seed_task, stored_task};
-
-/// The `message` slot of an error document: the JSON value under the key the error
-/// shape's member occupies, or `None` when the document carries NO such key at all —
-/// which is the difference this suite is about, and which the usual
-/// `body["message"].as_str()` reader cannot see.
-fn message_slot(response: &http::Response<Bytes>) -> Option<serde_json::Value> {
-    let body = json(response);
-    for key in ["message", "Message"] {
-        if let Some(value) = body.get(key) {
-            return Some(value.clone());
-        }
-    }
-    None
-}
+use crate::support::{fixture_task_id, get_task, message_slot, seed_task, stored_task};
 
 /// Assert one error document: the status and code it carries, that its `message`
 /// member is PRESENT, and that the member is exactly what this service words that code
@@ -97,26 +84,23 @@ fn pls_with_replacement(element: &str, length: usize) -> String {
 }
 
 /// RULE: the error document of the code Amazon Polly answers with NO message carries
-/// the `message` member as JSON null — for every identifier the model's `TaskId`
-/// pattern admits, and whatever else is in the store.
+/// the `message` member as JSON null — for every identifier of the form a `TaskId` is
+/// minted in, and whatever else is in the store.
 #[tokio::test]
 async fn the_not_found_task_error_carries_a_null_message_member() {
     let polly = Polly::new();
-    // The rows span `TaskId`'s pattern ^[a-zA-Z0-9_-]{1,100}$: its lower bound, its
-    // upper bound, the length the issue happened to quote, and each character class it
-    // admits. None of them names a stored task.
+    // The rows span the minted identifier form: identifiers from the service's own
+    // minter, the all-zero one, and one spelled with upper-case hex digits. None of
+    // them names a stored task.
     let unknown = [
-        "a".to_string(),
-        "a".repeat(40),
-        "a".repeat(100),
-        "0123456789".to_string(),
-        "Task_1-2".to_string(),
-        "ZZ-_zz99".to_string(),
+        mint_task_id(),
+        mint_task_id(),
+        fixture_task_id("never stored"),
+        "00000000-0000-0000-0000-000000000000".to_string(),
+        "6F3A1B2C-9D4E-4F5A-8B6C-7D8E9F0A1B2C".to_string(),
     ];
     for id in &unknown {
-        let response = polly
-            .call("GET", &format!("/v1/synthesisTasks/{id}"), "")
-            .await;
+        let response = get_task(&polly, id).await;
         assert_message_member(
             &format!("TaskId {id:?} with an empty store"),
             &response,
@@ -127,11 +111,12 @@ async fn the_not_found_task_error_carries_a_null_message_member() {
 
     // A store that HOLDS a task answers the same way for every id that is not it: the
     // member's presence is a property of the code, not of the store's contents.
-    seed_task(&polly, &stored_task("storedTask", SystemTime::now()));
+    seed_task(
+        &polly,
+        &stored_task(&fixture_task_id("stored"), SystemTime::now()),
+    );
     for id in &unknown {
-        let response = polly
-            .call("GET", &format!("/v1/synthesisTasks/{id}"), "")
-            .await;
+        let response = get_task(&polly, id).await;
         assert_message_member(
             &format!("TaskId {id:?} beside a stored task"),
             &response,
@@ -149,15 +134,23 @@ async fn every_error_document_carries_its_message_member() {
     let polly = Polly::new();
     let mut rows: Vec<(String, http::Response<Bytes>, u16, &str)> = Vec::new();
 
-    // The code with no message, beside the codes with one.
+    // The two codes with no message and with one, from the same operation: an
+    // identifier of the minted form that names no task, and a value that is no
+    // identifier at all.
+    for id in [mint_task_id(), fixture_task_id("absent")] {
+        rows.push((
+            format!("GetSpeechSynthesisTask {id:?}"),
+            get_task(&polly, &id).await,
+            400,
+            "SynthesisTaskNotFoundException",
+        ));
+    }
     for id in ["b", "unknown-task-id", &"z".repeat(100)] {
         rows.push((
             format!("GetSpeechSynthesisTask {id:?}"),
-            polly
-                .call("GET", &format!("/v1/synthesisTasks/{id}"), "")
-                .await,
+            get_task(&polly, id).await,
             400,
-            "SynthesisTaskNotFoundException",
+            "InvalidTaskIdException",
         ));
     }
 
@@ -348,9 +341,7 @@ async fn the_framework_documents_carry_a_string_message_member() {
     for bad in ["a".repeat(101), "bad!id".to_string(), "bad.id".to_string()] {
         rows.push((
             format!("GetSpeechSynthesisTask {bad:?}"),
-            polly
-                .call("GET", &format!("/v1/synthesisTasks/{bad}"), "")
-                .await,
+            get_task(&polly, &bad).await,
             400,
             "ValidationException",
         ));
@@ -408,7 +399,7 @@ async fn the_framework_documents_carry_a_string_message_member() {
 #[tokio::test]
 async fn a_success_body_omits_the_members_it_has_no_value_for() {
     let polly = Polly::new();
-    let mut task = stored_task("sparseTask", SystemTime::now());
+    let mut task = stored_task(&fixture_task_id("sparse"), SystemTime::now());
     task.task_status = "completed".to_string();
     task.sns_topic_arn = None;
     task.language_code = None;
@@ -416,7 +407,7 @@ async fn a_success_body_omits_the_members_it_has_no_value_for() {
     task.task_status_reason = None;
     seed_task(&polly, &task);
 
-    let response = polly.call("GET", "/v1/synthesisTasks/sparseTask", "").await;
+    let response = get_task(&polly, &task.task_id).await;
     assert_eq!(
         response.status(),
         200,
@@ -442,7 +433,7 @@ async fn a_success_body_omits_the_members_it_has_no_value_for() {
     // passing on an empty body.
     assert_eq!(
         reported["TaskId"].as_str(),
-        Some("sparseTask"),
+        Some(task.task_id.as_str()),
         "the task's own members must still be reported, got {reported:?}"
     );
 }
