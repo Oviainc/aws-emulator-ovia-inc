@@ -650,7 +650,7 @@ fn source_ids_params(name: &str, count: usize) -> Vec<(String, String)> {
     let mut params = vec![
         ("SubscriptionName".to_string(), name.to_string()),
         ("SnsTopicArn".to_string(), topic_arn(REGION)),
-        ("SourceType".to_string(), "db-cluster".to_string()),
+        ("SourceType".to_string(), "db-security-group".to_string()),
     ];
     for index in 0..count {
         params.push((

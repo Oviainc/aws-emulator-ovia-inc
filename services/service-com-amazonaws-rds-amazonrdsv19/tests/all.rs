@@ -59,6 +59,8 @@ mod engine_default_cluster_parameters;
 mod engine_default_parameters;
 #[path = "all/engine_version_families.rs"]
 mod engine_version_families;
+#[path = "all/event_subscription_sources.rs"]
+mod event_subscription_sources;
 #[path = "all/event_subscriptions.rs"]
 mod event_subscriptions;
 #[path = "all/existence_and_parameter_guards.rs"]

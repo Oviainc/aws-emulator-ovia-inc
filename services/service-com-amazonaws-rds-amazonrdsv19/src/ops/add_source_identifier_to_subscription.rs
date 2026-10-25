@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddSourceIdentifierToSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddSourceIdentifierToSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddSourceIdentifierToSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +138,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddSourceIdentifierToSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddSourceIdentifierToSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A subscription belongs to the region it was created in, so only that region's
+        // subscriptions are in scope for a call signed for it.
+        let region = crate::state::request_region(ctx)
+            .map_err(AddSourceIdentifierToSubscriptionError::validation)?;
+        let name = input.subscription_name;
+        let source_identifier = input.source_identifier;
+
+        // Both values the request names are checked BEFORE the store is touched, so a
+        // request this service refuses changes no subscription.
+        crate::state::check_subscription_name(&name)
+            .map_err(AddSourceIdentifierToSubscriptionError::invalid_parameter_value)?;
+        // "An identifier must begin with a letter and must contain only ASCII letters,
+        // digits, and hyphens. It can't end with a hyphen or contain two consecutive
+        // hyphens" — the rule the identifier members of this service share, and the one
+        // `CreateEventSubscription` applies to each `SourceIds` entry.
+        crate::state::check_identifier(
+            "SourceIdentifier",
+            &source_identifier,
+            crate::state::MAX_SOURCE_ID_LEN,
+        )
+        .map_err(AddSourceIdentifierToSubscriptionError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a fabricated subscription.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // A name this region holds no subscription under is the modelled 404.
+        let key = (region.clone(), name.clone());
+        let Some(record) = store.event_subscriptions.get(&key) else {
+            return Err(
+                AddSourceIdentifierToSubscriptionErrorModeled::SubscriptionNotFoundFault(
+                    SubscriptionNotFoundFault {
+                        message: Some(format!("Event Subscription {name} not found.")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "If the source type is a DB instance, a DBInstanceIdentifier value must be
+        // supplied" and so on for every published type: a source identifier names a value
+        // of ONE source type, so a subscription that names no source type — one that
+        // covers every source of the account — has no type for this identifier to belong
+        // to. That is the same combination `CreateEventSubscription` refuses when
+        // `SourceIds` arrives without `SourceType`.
+        let Some(source_type) = record.source_type.clone() else {
+            return Err(
+                AddSourceIdentifierToSubscriptionError::invalid_parameter_combination(format!(
+                    "event subscription {name} names no SourceType, so SourceIdentifier \
+                     {source_identifier} names no source of it: a source identifier is a \
+                     value of one source type"
+                )),
+            );
+        };
+        let already_subscribed = record.source_ids.contains(&source_identifier);
+        let subscribed_count = record.source_ids.len();
+
+        // The identifier is resolved against the stored resources of the subscription's
+        // source type: a source that does not exist is one no event could ever come from,
+        // which is the modelled `SourceNotFoundFault`.
+        if let Some(stored) = store.event_source_identifiers_in(&region, &source_type) {
+            if !stored.contains(&source_identifier) {
+                return Err(
+                    AddSourceIdentifierToSubscriptionErrorModeled::SourceNotFoundFault(
+                        SourceNotFoundFault {
+                            message: Some(format!(
+                                "{source_type} {source_identifier} not found in {region}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // Adding a source the subscription already covers leaves it exactly as it was: the
+        // subscription's sources are a SET, so the call is idempotent rather than storing
+        // the identifier twice.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddSourceIdentifierToSubscription"))
+        // The stored source list is otherwise bounded for the same reason the create
+        // bounds the one it stores: every entry is request data that enters the store, and
+        // for a source type this service resolves nothing against, nothing else would cap
+        // it.
+        if !already_subscribed && subscribed_count >= crate::state::MAX_SOURCE_IDS_PER_SUBSCRIPTION
+        {
+            return Err(
+                AddSourceIdentifierToSubscriptionError::invalid_parameter_value(format!(
+                    "event subscription {name} already covers {subscribed_count} sources: \
+                     this emulator stores at most {} per subscription",
+                    crate::state::MAX_SOURCE_IDS_PER_SUBSCRIPTION
+                )),
+            );
+        }
+
+        // The record was read above under this same lock, so it is still here; a store
+        // that lost it between the two reads is a failure of this emulator's own
+        // invariant, never of the request.
+        let Some(record) = store.event_subscriptions.get_mut(&key) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(format!(
+                "event subscription {name} was read and then gone under one lock"
+            )));
+        };
+        if !already_subscribed {
+            record.source_ids.push(source_identifier);
+        }
+
+        Ok(AddSourceIdentifierToSubscriptionOutput {
+            event_subscription: Some(record.to_wire()),
+        })
     }
 }
