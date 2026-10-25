@@ -101,6 +101,8 @@ mod object_content_type;
 mod object_default_encryption;
 #[path = "all/object_encryption.rs"]
 mod object_encryption;
+#[path = "all/object_legal_hold.rs"]
+mod object_legal_hold;
 #[path = "all/object_listing_and_deletion.rs"]
 mod object_listing_and_deletion;
 #[path = "all/object_listing_encoding.rs"]
