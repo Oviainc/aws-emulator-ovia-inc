@@ -207,8 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyCacheParameterGroupErrorModeled::CacheParameterGroupNotFoundFault(
                     CacheParameterGroupNotFoundFault {
-                        message: Some(format!(
-                            "CacheParameterGroup {requested_name} not found."
+                        message: Some(crate::state::parameter_writer_group_not_found_message(
+                            &requested_name,
                         )),
                     },
                 )
@@ -226,10 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A family's own default group is the service's, not the customer's: its
         // values ARE the engine defaults, so no parameter of it may be set.
         if name.starts_with(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX) {
-            return Err(invalid_parameter_value(format!(
-                "Invalid value {name} for CacheParameterGroupName: a cache parameter group \
-                 family's default group cannot be modified."
-            )));
+            return Err(invalid_parameter_value(
+                crate::state::DEFAULT_PARAMETER_GROUP_IMMUTABLE.to_string(),
+            ));
         }
 
         // A parameter of a group is a parameter of its FAMILY: the name has to

@@ -221,12 +221,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // has stopped existing. See
         // `crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::settle_users`.
         store.settle_users(now);
+        // A group whose deletion has fallen due is gone, so its id is free
+        // again: materialised before the collision check below, so a
+        // create-delete-recreate flow is not refused by a group that has
+        // stopped existing. See
+        // `crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::settle_user_groups`.
+        store.settle_user_groups(now);
 
         if store.user_groups.contains_key(&input.user_group_id) {
             return Err(CreateUserGroupErrorModeled::UserGroupAlreadyExistsFault(
                 UserGroupAlreadyExistsFault {
                     message: Some(format!(
-                        "User group {} already exists.",
+                        "User group {} already exists. Please retry with another name.",
                         input.user_group_id
                     )),
                 },
@@ -310,6 +316,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             user_ids: members.clone(),
             status: crate::state::STATUS_CREATING.to_string(),
             pending_status: crate::state::user_group_transition(now),
+            // Nothing has deleted a group that has just been created, so the
+            // clock owes it no removal; a `DeleteUserGroup` is what fills this.
+            pending_removal: None,
             // Nothing is pending on a group that has just been created: the
             // membership it was asked for IS its membership. A later
             // `ModifyUserGroup` is what fills these.

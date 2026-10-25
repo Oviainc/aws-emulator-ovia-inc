@@ -217,8 +217,22 @@ fn a_failed_job_reports_the_input_probe_failure_code_only_for_an_input_s3_could_
                 .expect("a current-thread runtime");
 
             // The bucket and the one object that exists, so the rows below differ in
-            // whether S3 really holds what the job names.
-            let (status, body) = s3(&router, &runtime, "PUT", &format!("/{BUCKET}"), b"");
+            // whether S3 really holds what the job names. The create names its
+            // `LocationConstraint`, which a create sent to a REGIONAL endpoint must: the
+            // unspecified constraint means us-east-1, and this suite signs for `REGION`.
+            let (status, body) = s3(
+                &router,
+                &runtime,
+                "PUT",
+                &format!("/{BUCKET}"),
+                format!(
+                    "<CreateBucketConfiguration \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <LocationConstraint>{REGION}</LocationConstraint>\
+                     </CreateBucketConfiguration>"
+                )
+                .as_bytes(),
+            );
             assert!(
                 (200..300).contains(&status),
                 "setup: CreateBucket must succeed, got {status} {body}"

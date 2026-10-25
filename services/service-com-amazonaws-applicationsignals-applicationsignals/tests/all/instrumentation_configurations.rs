@@ -847,26 +847,35 @@ async fn a_second_create_at_the_same_identity_conflicts() {
     assert_eq!(status, 200, "expected 200, got {status} with {answer:?}");
     let arn = answer["ARN"].as_str().unwrap_or_default().to_string();
 
-    let (status, answer) = create(&router, case.create_body()).await;
-    assert_eq!(
-        status, 409,
-        "expected the repeated create to conflict with 409, got {status} with {answer:?}"
-    );
-    assert!(
-        answer["Message"]
-            .as_str()
-            .or_else(|| answer["message"].as_str())
-            .is_some_and(|message| message.contains(&arn)),
-        "expected the conflict to identify the stored configuration by its ARN {arn:?}, got {answer:?}"
-    );
+    // The documented conflict key is the service, the environment, the signal type and the
+    // location — the four parts the ARN spells, and NOT the instrumentation type: so the
+    // same create repeated and a create of the other type at that same location are both
+    // refused, each identifying the one stored record by its own ARN.
+    let mut other_type = case.create_body();
+    other_type["InstrumentationType"] = json!(PROBE);
+    // `ExpiresAt` is not supported for PROBE, and the default-expiring row carries none.
+    for (label, body) in [
+        ("the same identity again", case.create_body()),
+        ("the other instrumentation type", other_type),
+    ] {
+        let (status, answer) = create(&router, body).await;
+        assert_eq!(
+            status, 409,
+            "case {label:?}: expected the create to conflict with 409, got {status} with {answer:?}"
+        );
+        assert!(
+            answer["Message"]
+                .as_str()
+                .or_else(|| answer["message"].as_str())
+                .is_some_and(|message| message.contains(&arn)),
+            "case {label:?}: expected the conflict to identify the stored configuration by its \
+             ARN {arn:?}, got {answer:?}"
+        );
+    }
 
     // The identity is the whole tuple, so a create that differs in ANY of its parts is a
     // different configuration rather than a conflict.
     let mut distinct: Vec<(&str, Value)> = Vec::new();
-    let mut other_type = case.create_body();
-    other_type["InstrumentationType"] = json!(PROBE);
-    // `ExpiresAt` is not supported for PROBE, and the default-expiring row carries none.
-    distinct.push(("another instrumentation type", other_type));
     let mut other_service = case.create_body();
     other_service["Service"] = json!("another-service");
     distinct.push(("another service", other_service));

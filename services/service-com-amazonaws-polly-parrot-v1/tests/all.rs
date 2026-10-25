@@ -38,6 +38,8 @@ mod synthesis_tasks;
 mod task_report_bounds;
 #[path = "all/task_id_validity.rs"]
 mod task_id_validity;
+#[path = "all/task_retention.rs"]
+mod task_retention;
 #[path = "all/voice_catalog.rs"]
 mod voice_catalog;
 #[path = "all/voice_catalog_is_not_paged.rs"]

@@ -25,6 +25,18 @@ pub const REGION: &str = "eu-west-1";
 /// The account id every ARN a generated emulator mints carries.
 pub const ACCOUNT_ID: &str = "000000000000";
 
+/// The `CreateBucketConfiguration` an S3 `CreateBucket` below carries.
+///
+/// A create that names NO `LocationConstraint` can only mean us-east-1 — the Region the
+/// unspecified constraint stands for — so S3 refuses one sent to any other Region's
+/// endpoint, and this suite signs for [`REGION`].
+pub fn create_bucket_payload() -> String {
+    format!(
+        "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <LocationConstraint>{REGION}</LocationConstraint></CreateBucketConfiguration>"
+    )
+}
+
 /// One emulator holding one Comprehend service over one shared engine.
 pub struct Comprehend {
     router: MultiServiceRouter,
@@ -136,8 +148,7 @@ impl Comprehend {
     }
 
     /// Call `operation` expecting success, returning the parsed output.
-    pub async fn ok(&self, operation: &str, body: &Value) -> Value {
-        let (status, parsed) = self.call(operation, body).await;
+    pub async fn ok(&self, operation: &str, body: &Value) -> Value {        let (status, parsed) = self.call(operation, body).await;
         assert_eq!(status, 200, "{operation}: expected 200, got {status}: {parsed}");
         parsed
     }

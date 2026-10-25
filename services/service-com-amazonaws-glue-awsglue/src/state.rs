@@ -26,6 +26,12 @@
 //! every operation that addresses a crawler does so by name alone, so a crawler's
 //! `CatalogId` says where its output goes, not where the crawler itself lives.
 //!
+//! COLUMN STATISTICS TASK RUNS — the runs `StartColumnStatisticsTaskRun` starts over one
+//! table — sit beside the tree in the same way, in a per-account list
+//! ([`ComAmazonawsGlueAwsglueState::column_statistics_task_runs`]): a run is ADDRESSED by
+//! the id the start mints (`GetColumnStatisticsTaskRun` takes that id and nothing else),
+//! so the table a run covers is recorded on the run rather than the run on the table.
+//!
 //! The SCHEMA REGISTRY is the store's second resource tree and is independent of the
 //! catalog: a registry (keyed by name, per account) holds schema sets, and a schema set
 //! holds the versions registered against it. It is keyed by name rather than by
@@ -56,14 +62,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CodeGenConfigurationNode, Column, Connection, ConnectionInput, ConnectionPasswordEncryption,
-    ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput, CreateCustomEntityTypeInput,
-    CreateJobInput, DataCatalogEncryptionSettings, DataLakePrincipal, Database, DatabaseIdentifier,
-    DatabaseInput, EncryptionAtRest, ErrorDetail, ExecutionProperty, FederatedDatabase,
-    FederatedTable, Job, JobCommand, JobRun, JobUpdate, LakeFormationConfiguration,
-    LineageConfiguration, NotificationProperty, PrincipalPermissions, RLSProperties, RecrawlPolicy,
-    RegistryId, Schedule, SchemaChangePolicy, SchemaId, SourceControlDetails, StartJobRunInput,
-    StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
+    CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, Connection, ConnectionInput,
+    ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
+    CreateCustomEntityTypeInput, CreateJobInput, DataCatalogEncryptionSettings, DataLakePrincipal,
+    Database, DatabaseIdentifier, DatabaseInput, EncryptionAtRest, ErrorDetail, ExecutionProperty,
+    FederatedDatabase, FederatedTable, Job, JobCommand, JobRun, JobUpdate,
+    LakeFormationConfiguration, LineageConfiguration, NotificationProperty, PrincipalPermissions,
+    RLSProperties, RecrawlPolicy, RegistryId, Schedule, SchemaChangePolicy, SchemaId,
+    SourceControlDetails, StartColumnStatisticsTaskRunInput, StartJobRunInput, StorageDescriptor,
+    Table, TableIdentifier, TableInput, TableVersion,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -430,9 +437,70 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// `DeleteFormType` take an `Identifier` targeting `FormTypeId`, the same shape
     /// `PutFormType`'s `Id` carries. [`Self::form_type_by_id`] is that resolution.
     pub form_types: BTreeMap<String, FormTypeEntry>,
+    /// Every column statistics task run this emulator holds, oldest first.
+    ///
+    /// A run lives BESIDE the catalog tree rather than on the table it was started for,
+    /// because `GetColumnStatisticsTaskRun` addresses one by `ColumnStatisticsTaskRunId`
+    /// alone, with no catalog, database or table member: the id is the whole address, so
+    /// the namespace is per account and the table a run covers is recorded ON the run
+    /// ([`ColumnStatisticsTaskRunEntry`]). Kept in start order, so
+    /// `ListColumnStatisticsTaskRuns` has one deterministic order to page over, and
+    /// bounded by [`MAX_COLUMN_STATISTICS_TASK_RUNS`].
+    pub column_statistics_task_runs: Vec<ColumnStatisticsTaskRunEntry>,
 }
 
 impl ComAmazonawsGlueAwsglueState {
+    /// Give every column statistics task run the state the CLOCK already owed it at
+    /// `now`.
+    ///
+    /// The one write a reporting operation performs, exactly as [`JobEntry::settle_due_runs`]
+    /// is for a job run: a run's next state was due at
+    /// [`ColumnStatisticsTaskRunEntry::settles_at`] whether or not anybody called, so
+    /// materialising it on read reports the state the clock had already reached.
+    pub fn settle_due_column_statistics_task_runs(&mut self, now: SystemTime) {
+        for run in &mut self.column_statistics_task_runs {
+            run.settle_if_due(now);
+        }
+    }
+
+    /// The stored column statistics task run with this id, or `None` when this account
+    /// holds no such run.
+    pub fn column_statistics_task_run(&self, id: &str) -> Option<&ColumnStatisticsTaskRunEntry> {
+        self.column_statistics_task_runs
+            .iter()
+            .find(|run| run.id == id)
+    }
+
+    /// The column statistics task run of this table that has not finished, if one has
+    /// not.
+    ///
+    /// Call [`Self::settle_due_column_statistics_task_runs`] first, or a run the clock has
+    /// already finished still counts as in flight. `database_name` and `table_name` are
+    /// matched folded, the way the catalog stores them.
+    pub fn running_column_statistics_task_run(
+        &self,
+        catalog_id: &str,
+        database_name: &str,
+        table_name: &str,
+    ) -> Option<&ColumnStatisticsTaskRunEntry> {
+        self.column_statistics_task_runs.iter().find(|run| {
+            !run.is_terminal()
+                && run.catalog_id == catalog_id
+                && run.database_name == fold_name(database_name)
+                && run.table_name == fold_name(table_name)
+        })
+    }
+
+    /// Append a column statistics task run, keeping at most
+    /// [`MAX_COLUMN_STATISTICS_TASK_RUNS`] of them.
+    pub fn record_column_statistics_task_run(&mut self, run: ColumnStatisticsTaskRunEntry) {
+        self.column_statistics_task_runs.push(run);
+        if self.column_statistics_task_runs.len() > MAX_COLUMN_STATISTICS_TASK_RUNS {
+            let overflow = self.column_statistics_task_runs.len() - MAX_COLUMN_STATISTICS_TASK_RUNS;
+            self.column_statistics_task_runs.drain(..overflow);
+        }
+    }
+
     /// The stored database, or `None` when either the catalog or the database is absent.
     pub fn database(&self, catalog_id: &str, name: &str) -> Option<&DatabaseEntry> {
         self.catalogs
@@ -2943,6 +3011,26 @@ pub mod messages {
     /// the requested name.
     pub const SCHEMA_ALREADY_EXISTS: &str = "Schema already exists.";
 
+    /// A column statistics task run lookup (`GetColumnStatisticsTaskRun`) for an id no
+    /// run in this account has. NOT recorded: the sentence follows the per-resource
+    /// template of the recorded crawler miss above, built from the requested id, which is
+    /// the whole address of a run.
+    pub fn column_statistics_task_run_not_found(run_id: &str) -> String {
+        format!("Column statistics task run with id {run_id} does not exist")
+    }
+
+    /// `StartColumnStatisticsTaskRun` for a table that already has a run in flight. NOT
+    /// recorded: what is pinned is the behaviour — 400 with the operation's modelled
+    /// `ColumnStatisticsTaskRunningException`, "thrown when you try to start another job
+    /// while running a column stats generation job" — and the sentence names the table the
+    /// request addressed, the way the recorded per-resource templates name their resource.
+    pub fn column_statistics_task_already_running(database_name: &str, table_name: &str) -> String {
+        format!(
+            "A column statistics generation job is already running for table \
+             {database_name}.{table_name}"
+        )
+    }
+
     /// `CreateRegistry` for a `RegistryName` this account already holds. NOT recorded
     /// either: inferred from the recorded `CreateDatabase` duplicate, like
     /// [`SCHEMA_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of the
@@ -3194,6 +3282,255 @@ pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+}
+
+/// The `ColumnStatisticsState` a column statistics task run is recorded in by
+/// `StartColumnStatisticsTaskRun`: the first of the modelled enum
+/// (`STARTING | RUNNING | SUCCEEDED | FAILED | STOPPED`), because the run has been
+/// accepted and nothing has begun generating statistics yet.
+pub const COLUMN_STATISTICS_TASK_RUN_STATE_STARTING: &str = "STARTING";
+/// See [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`].
+pub const COLUMN_STATISTICS_TASK_RUN_STATE_FAILED: &str = "FAILED";
+
+/// The `ColumnStatisticsState` values a column statistics task run never moves out of
+/// again: of the modelled enum quoted on
+/// [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`], the ones that name a finished run. The
+/// other two (`STARTING`, `RUNNING`) each still owe a further state.
+pub const TERMINAL_COLUMN_STATISTICS_TASK_RUN_STATES: [&str; 3] =
+    ["SUCCEEDED", "FAILED", "STOPPED"];
+
+/// How long a column statistics task run stays in
+/// [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`] before the clock owes it its terminal
+/// state.
+///
+/// CHOSEN, not documented: Glue publishes no duration for a column statistics task run,
+/// so this is the emulator's own span — deliberately not zero, so a caller that reads
+/// `GetColumnStatisticsTaskRun` straight after starting one still observes the run in
+/// flight, and the refusal that goes with a run in flight. The due instant is stored on
+/// the run and materialised by whichever later call reads it; nothing sleeps.
+pub const COLUMN_STATISTICS_TASK_RUN_SETTLES_AFTER: Duration = Duration::from_millis(500);
+
+/// `ColumnStatisticsTaskRun$ErrorMessage` for the terminal state the clock owes every
+/// column statistics task run.
+///
+/// This emulator is the Glue control plane: it records a task run faithfully, but it
+/// reads none of the table's underlying data and so computes no statistics from it — the
+/// run therefore ends in the modelled failure state carrying a reason that says exactly
+/// that, rather than reporting statistics nothing computed.
+pub const COLUMN_STATISTICS_TASK_RUN_NOT_EXECUTED_MESSAGE: &str =
+    "This emulator records column statistics task runs but reads none of the table's \
+     underlying data, so the run ended without generating statistics.";
+
+/// `ColumnStatisticsTaskRun$ComputationType` of a run `StartColumnStatisticsTaskRun`
+/// started: of the modelled `ComputationType` (`FULL | INCREMENTAL`), the full
+/// computation. The request carries no member that selects an incremental computation —
+/// it names the table and the columns to "generate statistics" for — so a run started
+/// this way computes the whole statistic set rather than an increment on an earlier one.
+pub const COLUMN_STATISTICS_COMPUTATION_TYPE_FULL: &str = "FULL";
+
+/// How many column statistics task runs this account keeps.
+///
+/// CHOSEN: Glue publishes no retention for these records, so this is the emulator's own
+/// window, for the same reason as [`MAX_RUNS_PER_JOB`]: it bounds
+/// [`ComAmazonawsGlueAwsglueState::column_statistics_task_runs`] and every walk over it.
+/// The OLDEST record is dropped first, so the runs a caller is most likely to read are
+/// kept.
+pub const MAX_COLUMN_STATISTICS_TASK_RUNS: usize = 100;
+
+/// How many column statistics task run ids this process has minted. A nonce source for
+/// [`new_column_statistics_task_run_id`], exactly as [`MINTED_JOB_RUN_IDS`] is for a job
+/// run id.
+static MINTED_COLUMN_STATISTICS_TASK_RUN_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh `ColumnStatisticsTaskRunId`: the id the service assigns a column statistics
+/// task run when it starts.
+///
+/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is inside `HashString`'s
+/// `length 1..255`. The bits come from [`mint_hex_id`], as a job run id's do, so two runs
+/// started in the same nanosecond cannot be given the same id. It is stored on the run,
+/// so every later read of that run reports the same id.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_column_statistics_task_run_id() -> String {
+    mint_hex_id(
+        &MINTED_COLUMN_STATISTICS_TASK_RUN_IDS,
+        COLUMN_STATISTICS_TASK_RUN_ID_WORDS,
+    )
+}
+
+/// How many 64-bit words a column statistics task run id carries: two, i.e. 128 bits
+/// rendered as 32 lowercase hexadecimal characters.
+const COLUMN_STATISTICS_TASK_RUN_ID_WORDS: usize = 2;
+
+/// One column statistics task run, as `StartColumnStatisticsTaskRun` recorded it.
+///
+/// A run carries the table it covers and the configuration the request named, plus the
+/// members only a run has: its id, its status and the instants it moved between
+/// statuses.
+#[derive(Debug, Clone)]
+pub struct ColumnStatisticsTaskRunEntry {
+    /// `ColumnStatisticsTaskRun$ColumnStatisticsTaskRunId`, minted by
+    /// [`new_column_statistics_task_run_id`].
+    pub id: String,
+    /// The catalog the covered table lives in, as [`resolve_catalog_id`] resolved it.
+    pub catalog_id: String,
+    /// The covered database's name, folded the way the catalog stores it.
+    pub database_name: String,
+    /// The covered table's name, folded the way the catalog stores it.
+    pub table_name: String,
+    /// The columns statistics are generated for: the ones the request listed, else every
+    /// column the stored table has ("If none is supplied, all column names for the table
+    /// will be used by default").
+    pub column_name_list: Vec<String>,
+    /// `ColumnStatisticsTaskRun$Role`: "The IAM role that the service assumes to generate
+    /// statistics."
+    pub role: String,
+    /// `ColumnStatisticsTaskRun$SampleSize`: "The percentage of rows used to generate
+    /// statistics", the request's value, whose own default of 0 means the entire table.
+    pub sample_size: f64,
+    pub security_configuration: Option<String>,
+    /// One of the modelled `ColumnStatisticsState` values.
+    pub status: String,
+    /// The instant the clock owes this run its next status; `None` once it has settled.
+    pub settles_at: Option<SystemTime>,
+    /// `CreationTime`: "The time that this task was created."
+    pub creation_time: SystemTime,
+    /// `StartTime`: "The start time of the task."
+    pub start_time: SystemTime,
+    /// `LastUpdated`: "The last point in time when this task was modified."
+    pub last_updated: SystemTime,
+    /// `EndTime`: "The end time of the task", absent until the run has finished.
+    pub end_time: Option<SystemTime>,
+    /// `ErrorMessage`: "The error message for the job", absent until one has failed.
+    pub error_message: Option<String>,
+}
+
+impl ColumnStatisticsTaskRunEntry {
+    /// Record a run of the stored table as the `StartColumnStatisticsTaskRun` request asks
+    /// for it, in [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`] with its next status due
+    /// [`COLUMN_STATISTICS_TASK_RUN_SETTLES_AFTER`] out.
+    ///
+    /// `table` is the stored table the request resolved to, which is where the default
+    /// column list comes from, and `catalog_id` the catalog it was resolved in.
+    pub fn start(
+        input: &StartColumnStatisticsTaskRunInput,
+        table: &TableEntry,
+        catalog_id: &str,
+        id: String,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            id,
+            catalog_id: catalog_id.to_string(),
+            database_name: table.database_name.clone(),
+            table_name: table.name.clone(),
+            // "If none is supplied, all column names for the table will be used by
+            // default": an EMPTY list supplies no column name either, so it takes the
+            // same default rather than recording a run that covers nothing.
+            column_name_list: input
+                .column_name_list
+                .clone()
+                .filter(|names| !names.is_empty())
+                .unwrap_or_else(|| table_column_names(table)),
+            role: input.role.clone(),
+            sample_size: input.sample_size,
+            security_configuration: input.security_configuration.clone(),
+            status: COLUMN_STATISTICS_TASK_RUN_STATE_STARTING.to_string(),
+            settles_at: Some(
+                now.checked_add(COLUMN_STATISTICS_TASK_RUN_SETTLES_AFTER)
+                    .unwrap_or(now),
+            ),
+            creation_time: now,
+            start_time: now,
+            last_updated: now,
+            end_time: None,
+            // Nothing has failed yet: a run carries an error message only once it has.
+            error_message: None,
+        }
+    }
+
+    /// Whether this run has finished, by [`TERMINAL_COLUMN_STATISTICS_TASK_RUN_STATES`].
+    pub fn is_terminal(&self) -> bool {
+        TERMINAL_COLUMN_STATISTICS_TASK_RUN_STATES.contains(&self.status.as_str())
+    }
+
+    /// Move this run into the status the clock owed it at `now`, if it owed one.
+    ///
+    /// The run was due to leave [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`] at
+    /// [`Self::settles_at`] whether or not anybody called, and the instants recorded are
+    /// that DUE instant, not the instant somebody read it — so two reads of a settled run
+    /// report the same run.
+    pub fn settle_if_due(&mut self, now: SystemTime) {
+        let Some(due) = self.settles_at else {
+            return;
+        };
+        if due > now {
+            return;
+        }
+        self.settles_at = None;
+        self.status = COLUMN_STATISTICS_TASK_RUN_STATE_FAILED.to_string();
+        self.error_message = Some(COLUMN_STATISTICS_TASK_RUN_NOT_EXECUTED_MESSAGE.to_string());
+        self.end_time = Some(due);
+        self.last_updated = due;
+    }
+
+    /// Rebuild the modelled `ColumnStatisticsTaskRun` output shape from what is stored.
+    pub fn to_column_statistics_task_run(&self) -> ColumnStatisticsTaskRun {
+        ColumnStatisticsTaskRun {
+            // "The Amazon Web Services account ID" the run belongs to.
+            customer_id: Some(::engine::emulator_account_id().to_string()),
+            column_statistics_task_run_id: Some(self.id.clone()),
+            database_name: Some(self.database_name.clone()),
+            table_name: Some(self.table_name.clone()),
+            column_name_list: Some(self.column_name_list.clone()),
+            catalog_id: Some(self.catalog_id.clone()),
+            role: Some(self.role.clone()),
+            sample_size: self.sample_size,
+            security_configuration: self.security_configuration.clone(),
+            // "The number of workers used to generate column statistics" and "the
+            // calculated DPU usage in seconds for all autoscaled workers": no worker ran,
+            // so neither figure has anything to report and each stays at the model's own
+            // default, and no `WorkerType` was used either.
+            number_of_workers: 0,
+            worker_type: None,
+            dpu_seconds: 0.0,
+            computation_type: Some(COLUMN_STATISTICS_COMPUTATION_TYPE_FULL.to_string()),
+            status: Some(self.status.clone()),
+            creation_time: Some(to_date_time(self.creation_time)),
+            last_updated: Some(to_date_time(self.last_updated)),
+            start_time: Some(to_date_time(self.start_time)),
+            end_time: self.end_time.map(to_date_time),
+            error_message: self.error_message.clone(),
+        }
+    }
+}
+
+/// Every column name the stored table has, in the order the table declares them: the
+/// default column list of a column statistics task run ("If none is supplied, all column
+/// names for the table will be used by default").
+///
+/// The names come from the table's `StorageDescriptor$Columns`, which is where "a list of
+/// the `Columns` in the table" lives; a table stored without a storage descriptor
+/// declares no columns and so yields none.
+///
+/// `PartitionKeys` are deliberately NOT part of the list. They are "a list of columns by
+/// which the table is partitioned", and the statistics of such a column are addressed per
+/// partition — `UpdateColumnStatisticsForPartition` and
+/// `GetColumnStatisticsForPartition` take `PartitionValues` — so they are not what a
+/// table-level statistics run covers.
+pub fn table_column_names(table: &TableEntry) -> Vec<String> {
+    table
+        .storage_descriptor
+        .as_ref()
+        .and_then(|descriptor| descriptor.columns.as_ref())
+        .map(|columns| {
+            columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

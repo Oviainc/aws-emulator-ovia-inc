@@ -171,8 +171,16 @@ async fn answer(emulator: &MultiServiceRouter, request: http::Request<bytes::Byt
 }
 
 /// `PUT /<bucket>` — `CreateBucket`.
+///
+/// The create names its `LocationConstraint`: a create that names none can only mean
+/// us-east-1, the Region the unspecified constraint stands for, so S3 refuses one sent to
+/// any other Region's endpoint and this suite signs for [`REGION`].
 async fn create_bucket(emulator: &MultiServiceRouter, bucket: &str) {
-    let answered = s3(emulator, "PUT", &format!("/{bucket}"), b"").await;
+    let payload = format!(
+        "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <LocationConstraint>{REGION}</LocationConstraint></CreateBucketConfiguration>"
+    );
+    let answered = s3(emulator, "PUT", &format!("/{bucket}"), payload.as_bytes()).await;
     assert_eq!(
         answered.status,
         200,

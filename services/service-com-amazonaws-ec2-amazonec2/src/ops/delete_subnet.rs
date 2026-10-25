@@ -167,8 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::invalid_subnet_id_not_found(&input.subnet_id));
         }
         // "You must terminate all running instances in the subnet before you can delete the
-        // subnet" (`DeleteSubnet`).
-        let dependencies = store.instances_in_subnet(&input.subnet_id);
+        // subnet" (`DeleteSubnet`) — and a network interface created in the subnet holds a
+        // place in it the same way an instance does, so it blocks the delete too
+        // (`crate::state::ComAmazonawsEc2Amazonec2State::subnet_dependencies`).
+        let dependencies = store.subnet_dependencies(&input.subnet_id);
         if !dependencies.is_empty() {
             return Err(state::dependency_violation(format!(
                 "The subnet '{subnet_id}' has dependencies and cannot be deleted: {held}",

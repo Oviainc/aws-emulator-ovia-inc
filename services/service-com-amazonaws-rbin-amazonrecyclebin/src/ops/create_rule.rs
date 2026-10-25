@@ -219,9 +219,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // constraint takes: the member that cannot hold, and what it must satisfy.
             return Err(CreateRuleErrorModeled::ValidationException(
                 crate::state::member_validation_failed(
-                    "excludeResourceTags",
-                    "Member must not be specified for a tag-level retention rule",
+                    crate::state::EXCLUDE_RESOURCE_TAGS_MEMBER,
+                    crate::state::EXCLUDE_RESOURCE_TAGS_REQUIREMENT,
                 ),
+            )
+            .into());
+        }
+        // Recycle Bin holds a lock only on a Region-level rule that carries no exclusion
+        // tags, so a create that asks to lock any other rule cannot be served and is
+        // refused BEFORE anything is minted — the same invariant `LockRule` enforces on
+        // an existing rule, so no door leaves behind a locked rule the service could
+        // never have produced.
+        let unlockable = input
+            .lock_configuration
+            .as_ref()
+            .and_then(|_| crate::state::unlockable_rule(&resource_tags, &exclude_resource_tags));
+        if let Some(blocker) = unlockable {
+            return Err(CreateRuleErrorModeled::ValidationException(
+                crate::state::lock_configuration_not_allowed(blocker),
             )
             .into());
         }
@@ -276,8 +291,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let identifier = store.mint_identifier();
         let rule_arn = ::engine::emulator_arn("rbin", &region, &format!("rule/{identifier}"));
-        // A rule created WITH a lock configuration starts out `locked`; one created
-        // without one has never been locked, which the model renders as an ABSENT
+        // A rule created WITH a lock configuration starts out `locked` — the guard above
+        // has already refused every rule a lock cannot hold on, so only a Region-level
+        // rule with no exclusion tags reaches here with one. A rule created without a
+        // lock configuration has never been locked, which the model renders as an ABSENT
         // `LockState` — a state a rule can never return to once locked.
         let lock_state = input
             .lock_configuration

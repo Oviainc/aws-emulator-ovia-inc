@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetComplianceSummaryByResourceType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetComplianceSummaryByResourceType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetComplianceSummaryByResourceType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports how many of this account's RESOURCES are compliant and how many are
+//! noncompliant, computed from the evaluation results the rules in [`crate::state`]
+//! recorded against each resource: one summary per resource type the request names,
+//! and a single summary over every resource type when it names none.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +139,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetComplianceSummaryByResourceType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetComplianceSummaryByResourceTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetComplianceSummaryByResourceType"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // The instant Config created this summary, which is now
+        // (`ComplianceSummary$ComplianceSummaryTimestamp`: "the time that Config
+        // created the compliance summary").
+        let created_at = ::std::time::SystemTime::now();
+
+        // A reporting operation: the counts are computed over the evaluation results
+        // already in state and nothing is written. The store is read under the lock and
+        // NOTHING else happens there — the verdicts come back owned, so the guard is
+        // released before the request's own narrowing runs over them.
+        let placed = crate::state::resource_compliance(state.lock().config_rules.values());
+
+        // The resources one summary covers are counted up to
+        // [`crate::state::COMPLIANCE_RESOURCE_CAP`]: a `ComplianceSummary` reports "the
+        // number of Config rules or Amazon Web Services resources that are compliant,
+        // up to a maximum of 25 for rules and 100 for resources", and what is counted
+        // here is resources.
+        let summarise = |verdicts: Vec<&str>| {
+            Some(crate::state::summarise_compliance(
+                verdicts.into_iter(),
+                crate::state::COMPLIANCE_RESOURCE_CAP,
+                created_at,
+            ))
+        };
+
+        // "You can specify one or more resource types to get these numbers for each
+        // resource type": a request that names resource types is answered with one
+        // summary per type it named, each carrying that `ResourceType`, while one that
+        // names none is answered with a SINGLE summary over every resource type, which
+        // belongs to no one type and so carries no `ResourceType` at all.
+        let requested = input.resource_types.unwrap_or_default();
+        let summaries = if requested.is_empty() {
+            vec![ComplianceSummaryByResourceType {
+                resource_type: None,
+                compliance_summary: summarise(placed.values().copied().collect()),
+            }]
+        } else {
+            let mut summaries: Vec<ComplianceSummaryByResourceType> =
+                Vec::with_capacity(requested.len());
+            for resource_type in &requested {
+                // A type the request names twice is one resource type: it is reported
+                // once, where it was first named.
+                if summaries.iter().any(|summary| {
+                    summary.resource_type.as_deref() == Some(resource_type.as_str())
+                }) {
+                    continue;
+                }
+                let verdicts: Vec<&str> = placed
+                    .iter()
+                    .filter(|((placed_type, _), _)| placed_type == resource_type)
+                    .map(|(_, verdict)| *verdict)
+                    .collect();
+                summaries.push(ComplianceSummaryByResourceType {
+                    resource_type: Some(resource_type.clone()),
+                    compliance_summary: summarise(verdicts),
+                });
+            }
+            summaries
+        };
+
+        Ok(GetComplianceSummaryByResourceTypeOutput {
+            compliance_summaries_by_resource_type: Some(summaries),
+        })
     }
 }

@@ -628,14 +628,15 @@ async fn a_group_the_account_cannot_reset_is_refused() {
 
     // Every family's own default group is the service's, not the customer's:
     // its values ARE the engine defaults, so none of its parameters can be put
-    // back to one, in either form of the request.
+    // back to one, in either form of the request. The refusal states the rule
+    // rather than the group, which is how the service words it.
     for family in state::PARAMETER_GROUP_FAMILIES {
         let group = format!("default.{family}");
         let named = reset(&emulator, &group, &["maxmemory-policy"]).await;
         let message = refused(&group, &named, 400, "InvalidParameterValue").to_string();
-        assert!(
-            message.contains(&group),
-            "case {group}: the refusal must name the group asked for, got {message}"
+        assert_eq!(
+            message, "Cannot modify a default parameter group.",
+            "case {group}: expected the service's default-group sentence, got {message}"
         );
         let whole = reset_all(&emulator, &group).await;
         refused(&group, &whole, 400, "InvalidParameterValue");

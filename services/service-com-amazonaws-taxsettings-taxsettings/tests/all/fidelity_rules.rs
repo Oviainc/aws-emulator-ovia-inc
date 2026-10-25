@@ -16,13 +16,14 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    parameter_name, DEFAULT_HERITAGE_STATUS, HERITAGE_STATUS_OPT_IN, HERITAGE_STATUS_OPT_OUT,
+    parameter_name, type_with_derived_legal_address, DEFAULT_HERITAGE_STATUS,
+    DERIVED_MEMBER_UNKNOWN, HERITAGE_STATUS_OPT_IN, HERITAGE_STATUS_OPT_OUT,
     MANAGEMENT_ACCOUNT_ONLY, SETTLED_REGISTRATION_STATUS, STATUS_DELETED, STATUS_PENDING,
-    STATUS_REJECTED, STATUS_VERIFIED, TRN_VALIDATION_DELAY, TYPES_WITH_DERIVED_LEGAL_ADDRESS,
+    STATUS_REJECTED, STATUS_VERIFIED, TRN_VALIDATION_DELAY,
 };
 
 use crate::tax_registration_lifecycle::{
-    call, emulator, emulator_with_engine, hold_validations_open, make_validations_due, Answer,
+    call, emulator, emulator_with_engine, field_list, hold_validations_open, make_validations_due,
 };
 
 /// Every value of the model's `TaxRegistrationType` enum
@@ -73,31 +74,33 @@ fn entry_of_type(registration_type: &str, with_address: bool) -> Value {
 /// Whether AWS derives this registration type's legal address from the tax
 /// number itself, with the country whose rule it is.
 fn derived_address_country(registration_type: &str) -> Option<&'static str> {
-    TYPES_WITH_DERIVED_LEGAL_ADDRESS
-        .iter()
-        .find(|(declared, _)| *declared == registration_type)
-        .map(|(_, country)| *country)
+    type_with_derived_legal_address(registration_type).map(|(_, country)| country)
 }
 
-/// The `name`s a refusal's `fieldList` carries.
-fn field_list(answer: &Answer) -> Vec<String> {
-    answer
-        .get("fieldList")
-        .as_array()
-        .map(|fields| {
-            fields
-                .iter()
-                .filter_map(|field| field.get("name").and_then(Value::as_str))
-                .map(std::string::ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+/// The `TaxRegistrationType` values an entry may omit the legal address for, with
+/// the `Address$countryCode` the stored record is then held in: India's `PAN`,
+/// whose address AWS reads off the tax number, and Brazil's `CNPJ` ("If you're
+/// setting a TRN in Brazil for the CNPJ tax type, you don't need to specify the
+/// legal address",
+/// `smithy_query(query="doc",shape="com.amazonaws.taxsettings#TaxRegistrationEntry",member="legalAddress")`).
+/// Every other type the model lists must carry one — including Brazil's `CPF`,
+/// which the same sentence excludes ("for CPF tax types Brazil, you must specify
+/// the legal address").
+const TYPES_NEEDING_NO_LEGAL_ADDRESS: &[(&str, &str)] = &[("PAN", "IN"), ("CNPJ", "BR")];
+
+/// The jurisdiction a record of `registration_type` is held in when its entry
+/// carried no legal address, or `None` when such an entry is refused.
+fn jurisdiction_without_a_legal_address(registration_type: &str) -> Option<&'static str> {
+    TYPES_NEEDING_NO_LEGAL_ADDRESS
+        .iter()
+        .find(|(declared, _)| *declared == registration_type)
+        .map(|(_, country_code)| *country_code)
 }
 
 /// RULE: a registration type whose legal address AWS derives from the tax number
 /// itself does not take one from the request — submitting one is refused with
 /// `ValidationException` / `FieldValidationFailed` naming that parameter — while
-/// every other type both requires one and stores it.
+/// every other type takes the address it was given and stores it.
 #[tokio::test]
 async fn a_type_whose_address_is_derived_refuses_a_submitted_legal_address() {
     // The one row the recorded behaviour pins: India's `PAN` is a type whose
@@ -164,27 +167,61 @@ async fn a_type_whose_address_is_derived_refuses_a_submitted_legal_address() {
                         answer.body
                     );
                 }
-                // Every shape that REPORTS a registration requires a legal
-                // address, so an entry that carries none cannot be stored.
-                (_, false) => {
-                    assert_eq!(
-                        (answer.status, answer.error_code.as_str()),
-                        (400, "ValidationException"),
-                        "case {case:?}: expected 400 ValidationException, got {answer:?}"
-                    );
-                    assert_eq!(
-                        answer.get("errorCode").as_str(),
-                        Some("MissingInput"),
-                        "case {case:?}: expected the MissingInput code, got {:?}",
-                        answer.body
-                    );
-                    assert_eq!(
-                        field_list(&answer),
-                        vec!["LEGAL_ADDRESS".to_string()],
-                        "case {case:?}: expected the refusal to name the missing parameter, got {:?}",
-                        answer.body
-                    );
-                }
+                // An entry that carries no address is stored where the service
+                // fills the address in, and refused where the jurisdiction it
+                // identifies requires one.
+                (_, false) => match jurisdiction_without_a_legal_address(registration_type) {
+                    Some(country_code) => {
+                        assert_eq!(
+                            answer.status, 200,
+                            "case {case:?}: expected the entry to be stored, got {answer:?}"
+                        );
+                        let got = call(
+                            &router,
+                            "GetTaxRegistration",
+                            &json!({ "accountId": "000000000001" }),
+                        )
+                        .await;
+                        let address = got
+                            .get("taxRegistration")
+                            .get("legalAddress")
+                            .cloned()
+                            .unwrap_or_default();
+                        assert_eq!(
+                            address.get("countryCode").and_then(Value::as_str),
+                            Some(country_code),
+                            "case {case:?}: expected the record held in {country_code}, got {:?}",
+                            got.body
+                        );
+                        assert_eq!(
+                            address.get("postalCode").and_then(Value::as_str),
+                            Some(DERIVED_MEMBER_UNKNOWN),
+                            "case {case:?}: expected the filled-in address to report what no \
+                             registry here can supply, got {:?}",
+                            got.body
+                        );
+                    }
+                    None => {
+                        assert_eq!(
+                            (answer.status, answer.error_code.as_str()),
+                            (400, "ValidationException"),
+                            "case {case:?}: expected 400 ValidationException, got {answer:?}"
+                        );
+                        assert_eq!(
+                            answer.get("errorCode").as_str(),
+                            Some("MissingInput"),
+                            "case {case:?}: expected the MissingInput code, got {:?}",
+                            answer.body
+                        );
+                        assert_eq!(
+                            field_list(&answer),
+                            vec!["LEGAL_ADDRESS".to_string()],
+                            "case {case:?}: expected the refusal to name the missing parameter, \
+                             got {:?}",
+                            answer.body
+                        );
+                    }
+                },
                 // Every other type takes the address it was given and stores it.
                 (None, true) => {
                     assert_eq!(

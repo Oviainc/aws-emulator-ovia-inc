@@ -21,6 +21,8 @@ mod api_lifecycle;
 mod api_reimport;
 #[path = "all/api_update.rs"]
 mod api_update;
+#[path = "all/authorizer_deletion.rs"]
+mod authorizer_deletion;
 #[path = "all/authorizer_lifecycle.rs"]
 mod authorizer_lifecycle;
 #[path = "all/cors_configuration.rs"]

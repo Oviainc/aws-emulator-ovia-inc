@@ -19,6 +19,8 @@ mod batch_tax_registration;
 mod country_requirements;
 #[path = "all/country_rules.rs"]
 mod country_rules;
+#[path = "all/derived_registration_members.rs"]
+mod derived_registration_members;
 #[path = "all/fidelity_rules.rs"]
 mod fidelity_rules;
 #[path = "all/listing_page_bounds.rs"]

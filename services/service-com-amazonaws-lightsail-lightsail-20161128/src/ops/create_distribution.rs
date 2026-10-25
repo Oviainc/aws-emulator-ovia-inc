@@ -231,8 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // range, a default cache behaviour has to say what it is, the bundle
         // has to be a plan a new distribution may use, the caller-sized lists
         // have to be within their bounds, private origin access is only for a
-        // bucket origin, and the name must still be free. Each is checked
-        // BEFORE the first write, so a refused request creates nothing.
+        // bucket origin, a certificate the request names has to be an issued
+        // certificate of this account, and the name must still be free. Each is
+        // checked BEFORE the first write, so a refused request creates nothing.
         let Some(origin_name) = input.origin.name.clone() else {
             return Err(invalid(
                 "origin.name must name the Lightsail instance, bucket, container service or \
@@ -353,6 +354,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::MAX_DISTRIBUTIONS
                 )));
             }
+            // A distribution serves HTTPS traffic with the certificate its
+            // record names, so a certificate this request names has to be one
+            // this account holds and one the certificate authority has already
+            // issued — the same rule `AttachCertificateToDistribution` applies
+            // to the attachment it makes, asked of the store's one owner of it.
+            // Checked BEFORE the first write, so a refused request creates no
+            // distribution naming a certificate that secures nothing.
+            if let Some(certificate_name) = &input.certificate_name {
+                store
+                    .attachable_certificate(certificate_name)
+                    .map_err(|refusal| certificate_refusal(certificate_name, refusal))?;
+            }
 
             let id = store.mint_uuid();
             // A new distribution is not serving yet: the clock owes it
@@ -379,7 +392,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Nothing has moved this distribution between bundles yet, so
                 // its one monthly bundle change is still available.
                 able_to_update_bundle: true,
-                // The certificate the request named is recorded as asked for.
+                // The certificate the request named is recorded as asked for,
+                // after the store confirmed it is one a distribution may serve
+                // HTTPS traffic with.
                 // `AttachCertificateToDistribution` /
                 // `DetachCertificateFromDistribution` are what change it later.
                 certificate_name: input.certificate_name.clone(),
@@ -455,6 +470,37 @@ fn invalid(message: String) -> CreateDistributionError {
 /// origin was meant to be is exactly what could not be established.
 fn not_found(message: String) -> CreateDistributionError {
     crate::scaffolded::Scaffolded::does_not_exist(message)
+}
+
+/// This operation's rendering of a certificate the store says no distribution
+/// may serve HTTPS traffic with: a name this account holds no certificate under
+/// is the `DoesNotExist` envelope, and a certificate that is not issued yet is
+/// the modelled `OperationFailureException` carrying the store's message.
+fn certificate_refusal(
+    certificate_name: &str,
+    refusal: crate::state::CertificateNotAttachable,
+) -> CreateDistributionError {
+    match refusal {
+        crate::state::CertificateNotAttachable::DoesNotExist => {
+            crate::scaffolded::Scaffolded::resource_does_not_exist(
+                crate::state::RESOURCE_TYPE_CERTIFICATE,
+                certificate_name,
+            )
+        }
+        crate::state::CertificateNotAttachable::NotIssued(message) => operation_failure(message),
+    }
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// resource that is in the way and the state it is in.
+fn operation_failure(message: String) -> CreateDistributionError {
+    CreateDistributionErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

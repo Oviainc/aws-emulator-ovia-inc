@@ -1442,6 +1442,20 @@ pub fn api_destination_arn(region: &str, name: &str, id: &str) -> String {
     )
 }
 
+/// The name of the API destination an `ApiDestinationArn` names, or `None` when
+/// the text is not one at all.
+///
+/// The counterpart of [`api_destination_arn`], and the ONE place an
+/// `ApiDestinationArn` is read back: the name is the segment between the
+/// `api-destination/` resource type and the unique id that follows it, which is
+/// what [`ComAmazonawsEventbridgeAwseventsState::api_destination`] holds the
+/// record under.
+pub fn api_destination_name_in_arn(arn: &str) -> Option<&str> {
+    let (prefix, resource) = arn.split_once(":api-destination/")?;
+    let (name, id) = resource.split_once('/')?;
+    (prefix.starts_with("arn:") && !name.is_empty() && !id.is_empty()).then_some(name)
+}
+
 /// The name of the event bus an `EventBusArn` names, or `None` when the text is
 /// not an event-bus ARN at all.
 ///
@@ -3505,13 +3519,34 @@ pub mod event_pattern {
     /// valid. Reason: <what is wrong>", so the reason this module computes is
     /// stated after it and the whole message is the one
     /// `InvalidEventPatternException` carries, whichever operation was given the
-    /// pattern.
+    /// pattern. A caller therefore never restates the opening itself — the
+    /// message this module answers with is already the whole one.
     const INVALID_PATTERN: &str = "Event pattern is not valid. Reason:";
+
+    /// A term object names ONE match type, so one carrying several names no
+    /// single one; this is the reason EventBridge gives for it.
+    const ONE_KEY_ONLY: &str = "Only one key allowed in match expression";
+
+    /// A list with no member lists no value to match, and an object with no
+    /// member names no match type: neither is a term EventBridge admits.
+    const EMPTY_ARRAY: &str = "Empty arrays are not allowed";
+    const EMPTY_OBJECT: &str = "Empty objects are not allowed";
+
+    /// `exists` compares against the PRESENCE of a leaf, so its argument is a
+    /// boolean and nothing else; this is the reason EventBridge gives for any
+    /// other argument.
+    const EXISTS_NOT_BOOLEAN: &str = "exists match pattern must be either true or false.";
+
+    /// The character `wildcard` matches any run of characters with.
+    const WILDCARD: char = '*';
 
     /// Parse `pattern` as an event pattern, reporting why it is not one.
     ///
-    /// The reason is the message of the `InvalidEventPatternException` a caller
-    /// answers with, so it names the offending field path.
+    /// What comes back is the WHOLE message of the `InvalidEventPatternException`
+    /// a caller answers with: the opening ([`INVALID_PATTERN`]) and then the
+    /// reason. A reason the service words for the offending CONSTRUCT carries
+    /// that wording and no field path; one this module words for itself names the
+    /// field path, so a caller can find what to change.
     pub fn parse(pattern: &str) -> Result<Map<String, Value>, String> {
         parse_reason(pattern).map_err(|reason| format!("{INVALID_PATTERN} {reason}"))
     }
@@ -3642,13 +3677,19 @@ pub mod event_pattern {
                 format!("{path}.{key}")
             };
             if key == "$or" {
-                let Some(branches) = spec.as_array().filter(|list| !list.is_empty()) else {
-                    return Err(format!("\"{field}\" must be a non-empty array of patterns"));
+                let Some(branches) = spec.as_array() else {
+                    return Err(format!("\"{field}\" must be an array of patterns"));
                 };
+                if branches.is_empty() {
+                    return Err(EMPTY_ARRAY.to_string());
+                }
                 for branch in branches {
-                    let Some(object) = branch.as_object().filter(|map| !map.is_empty()) else {
+                    let Some(object) = branch.as_object() else {
                         return Err(format!("every branch of {field} must be a pattern object"));
                     };
+                    if object.is_empty() {
+                        return Err(EMPTY_OBJECT.to_string());
+                    }
                     validate_object(object, &field, depth + 1)?;
                 }
                 continue;
@@ -3656,7 +3697,7 @@ pub mod event_pattern {
             match spec {
                 Value::Array(terms) => {
                     if terms.is_empty() {
-                        return Err("Empty arrays are not allowed".to_string());
+                        return Err(EMPTY_ARRAY.to_string());
                     }
                     for term in terms {
                         validate_term(term, &field)?;
@@ -3664,7 +3705,7 @@ pub mod event_pattern {
                 }
                 Value::Object(child) => {
                     if child.is_empty() {
-                        return Err(format!("\"{field}\" must name at least one field"));
+                        return Err(EMPTY_OBJECT.to_string());
                     }
                     validate_object(child, &field, depth + 1)?;
                 }
@@ -3675,6 +3716,10 @@ pub mod event_pattern {
     }
 
     /// One match term: a literal value, or a single-key operator object.
+    ///
+    /// A term object is a MATCH EXPRESSION, which names one match type: an
+    /// object carrying several keys names several ([`ONE_KEY_ONLY`]) and one
+    /// carrying none names no match type at all ([`EMPTY_OBJECT`]).
     fn validate_term(term: &Value, field: &str) -> Result<(), String> {
         match term {
             Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => Ok(()),
@@ -3685,6 +3730,8 @@ pub mod event_pattern {
                     .expect("a single-entry map has a first entry");
                 validate_operator(operator, argument, field)
             }
+            Value::Object(map) if map.is_empty() => Err(EMPTY_OBJECT.to_string()),
+            Value::Object(_) => Err(ONE_KEY_ONLY.to_string()),
             _ => Err(format!(
                 "\"{field}\" admits literal values and single-operator objects only"
             )),
@@ -3699,7 +3746,7 @@ pub mod event_pattern {
                 if argument.is_boolean() {
                     Ok(())
                 } else {
-                    bad("true or false")
+                    Err(EXISTS_NOT_BOOLEAN.to_string())
                 }
             }
             "prefix" | "suffix" => match argument {
@@ -3717,15 +3764,25 @@ pub mod event_pattern {
                 }
                 _ => bad("a string, or {\"equals-ignore-case\": \"<string>\"}"),
             },
-            "equals-ignore-case" | "wildcard" => {
+            "equals-ignore-case" => {
                 if argument.is_string() {
                     Ok(())
                 } else {
                     bad("a string")
                 }
             }
+            // A wildcard value is a string whose `*` stands for any run of
+            // characters, and the language admits no two of them in a row.
+            "wildcard" => match argument.as_str() {
+                Some(text) => wildcard_violation(text).map_or(Ok(()), Err),
+                None => bad("a string"),
+            },
             "cidr" => match argument.as_str().map(parse_cidr) {
-                Some(Some(_)) => Ok(()),
+                Some(Ok(_)) => Ok(()),
+                // The mask width is a rule of the CIDR notation itself, and the
+                // service words it for the notation; text that is no block at
+                // all is this operator's own argument check.
+                Some(Err(CidrRefusal::MaskNotNarrowerThanTheFamily(reason))) => Err(reason),
                 _ => bad("an IPv4 or IPv6 CIDR block"),
             },
             "anything-but" => match argument {
@@ -3764,15 +3821,31 @@ pub mod event_pattern {
                 let Some(terms) = argument.as_array() else {
                     return bad("an array of operator/value pairs");
                 };
-                if terms.is_empty() || terms.len() % 2 != 0 {
-                    return bad("an array of operator/value pairs");
+                if terms.is_empty() {
+                    return Err(EMPTY_ARRAY.to_string());
                 }
+                // The list is read as the operator/value PAIRS it is: an
+                // operator the comparison set does not hold, and a bound that
+                // is not a number (a bound the list stops short of included),
+                // are each named for what they are.
                 for pair in terms.chunks(2) {
-                    let operator_ok = pair[0]
+                    // `chunks` never yields an empty chunk; reading the
+                    // operator as an OPTION keeps that a fact about this code
+                    // rather than an assumption about a caller's list.
+                    let Some(spelled) = pair.first() else {
+                        continue;
+                    };
+                    let Some(comparison) = spelled
                         .as_str()
-                        .is_some_and(|op| NUMERIC_OPERATORS.contains(&op));
-                    if !operator_ok || !pair[1].is_number() {
-                        return bad("an array of operator/value pairs");
+                        .filter(|operator| NUMERIC_OPERATORS.contains(operator))
+                    else {
+                        return Err(format!(
+                            "Unrecognized numeric range operator: {}",
+                            spelled_out(spelled)
+                        ));
+                    };
+                    if !pair.get(1).is_some_and(Value::is_number) {
+                        return Err(format!("Value of {comparison} must be numeric"));
                     }
                 }
                 // A range whose bottom is not below its top admits no number at
@@ -3787,6 +3860,33 @@ pub mod event_pattern {
         }
     }
 
+    /// A pattern value as the refusal spells it back: a string as its own text,
+    /// anything else as the JSON it was written as.
+    fn spelled_out(value: &Value) -> String {
+        match value.as_str() {
+            Some(text) => text.to_string(),
+            None => value.to_string(),
+        }
+    }
+
+    /// Why `value` is not a wildcard value the language admits, or `None` when
+    /// it is one.
+    ///
+    /// A `*` stands for any run of characters, so two in a row ask for nothing
+    /// the one does not: EventBridge refuses them and names the POSITION of the
+    /// second of the pair, counted in characters from the start of the value.
+    fn wildcard_violation(value: &str) -> Option<String> {
+        let mut previous_was_wildcard = false;
+        for (at, character) in value.chars().enumerate() {
+            let is_wildcard = character == WILDCARD;
+            if is_wildcard && previous_was_wildcard {
+                return Some(format!("Consecutive wildcard characters at pos {at}"));
+            }
+            previous_was_wildcard = is_wildcard;
+        }
+        None
+    }
+
     /// Why the bounds of a `numeric` term list admit no number, or `None` when at
     /// least one number satisfies all of them.
     ///
@@ -3798,7 +3898,10 @@ pub mod event_pattern {
         let mut lower: Option<(f64, bool)> = None;
         let mut upper: Option<(f64, bool)> = None;
         for pair in terms.chunks(2) {
-            let (Some(operator), Some(bound)) = (pair[0].as_str(), pair[1].as_f64()) else {
+            let (Some(operator), Some(bound)) = (
+                pair.first().and_then(Value::as_str),
+                pair.get(1).and_then(Value::as_f64),
+            ) else {
                 continue;
             };
             let tighten = |held: Option<(f64, bool)>, bound: f64, exclusive: bool, upwards: bool| {
@@ -3987,7 +4090,7 @@ pub mod event_pattern {
             },
             "cidr" => match (
                 leaf.as_str().and_then(|text| text.parse::<IpAddr>().ok()),
-                argument.as_str().and_then(parse_cidr),
+                argument.as_str().and_then(|block| parse_cidr(block).ok()),
             ) {
                 (Some(address), Some((network, bits))) => in_cidr(address, network, bits),
                 _ => false,
@@ -4139,22 +4242,55 @@ pub mod event_pattern {
         true
     }
 
-    /// Split `a.b.c.d/len` into its network address and prefix length,
-    /// rejecting a length wider than the address family admits and an address
-    /// carrying bits outside that prefix.
+    /// Why text is not a CIDR block this language compares against.
     ///
-    /// A CIDR block names a NETWORK, so every bit beyond its prefix is zero;
-    /// text whose address sets one of them names a host inside a block rather
-    /// than the block, which is not a block to compare an address against.
-    fn parse_cidr(block: &str) -> Option<(IpAddr, u8)> {
-        let (address, length) = block.split_once('/')?;
-        let network: IpAddr = address.parse().ok()?;
-        let bits: u8 = length.parse().ok()?;
-        let width = if network.is_ipv4() { 32 } else { 128 };
-        if bits > width || !is_network_address(network, bits) {
-            return None;
+    /// The two cases are refused by DIFFERENT wordings, so they are kept apart
+    /// rather than flattened into one message: a mask too wide is a rule of the
+    /// notation, which the service states for the notation, while text that is
+    /// no block at all is the `cidr` operator's own argument check (see
+    /// [`validate_operator`]).
+    enum CidrRefusal {
+        /// The mask leaves no RANGE of addresses, carrying the reason that
+        /// states the family's width.
+        MaskNotNarrowerThanTheFamily(String),
+        /// The text is not an address and a mask length at all.
+        NotABlock,
+    }
+
+    /// Split `a.b.c.d/len` into its network address and prefix length, or say
+    /// why the text is not a CIDR block this language compares against.
+    ///
+    /// The mask must leave a RANGE of addresses for the comparison to be a
+    /// range comparison at all, so it is narrower than the address family's
+    /// width — a mask as wide as the family names one address rather than a
+    /// block, and EventBridge refuses it naming that width. A CIDR block also
+    /// names a NETWORK, so every bit beyond its prefix is zero; text whose
+    /// address sets one of them names a host inside a block rather than the
+    /// block.
+    fn parse_cidr(block: &str) -> Result<(IpAddr, u8), CidrRefusal> {
+        let Some((address, length)) = block.split_once('/') else {
+            return Err(CidrRefusal::NotABlock);
+        };
+        let Ok(network) = address.parse::<IpAddr>() else {
+            return Err(CidrRefusal::NotABlock);
+        };
+        let Ok(bits) = length.parse::<u8>() else {
+            return Err(CidrRefusal::NotABlock);
+        };
+        let (family, width) = if network.is_ipv4() {
+            ("IPv4", 32u8)
+        } else {
+            ("IPv6", 128u8)
+        };
+        if bits >= width {
+            return Err(CidrRefusal::MaskNotNarrowerThanTheFamily(format!(
+                "{family} mask bits must be < {width}"
+            )));
         }
-        Some((network, bits))
+        if !is_network_address(network, bits) {
+            return Err(CidrRefusal::NotABlock);
+        }
+        Ok((network, bits))
     }
 
     /// Whether every bit of `network` outside its first `bits` is zero.

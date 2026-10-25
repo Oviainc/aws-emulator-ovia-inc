@@ -648,10 +648,10 @@ async fn a_refused_notification_configuration_changes_nothing() {
     // Two codes appear, and which one a row carries says WHERE the request is refused:
     // `Event` and `FilterRuleName` are modelled enums and `Events` is a modelled required
     // member, so a row breaking one of those is refused by the boundary validator before
-    // the handler runs and goes out as the framework's `ValidationException`; every other
-    // row breaks a rule the model cannot state, which the handler refuses with the code S3
-    // publishes for an argument it cannot accept, `InvalidArgument`. Both are HTTP 400 —
-    // the status AWS answers every row with.
+    // the handler runs — inside the request's XML document, which S3 answers
+    // `MalformedXML`; every other row breaks a rule the model cannot state, which the
+    // handler refuses with the code S3 publishes for an argument it cannot accept,
+    // `InvalidArgument`. Both are HTTP 400 — the status AWS answers every row with.
     let past_the_bound: Vec<Configuration> = (0..=MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET)
         .map(|index| {
             Configuration::new(Destination::Queue, &["s3:ObjectCreated:Put"])
@@ -665,7 +665,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                 Destination::Queue,
                 &["s3:ObjectCreated:Rename"],
             )],
-            "ValidationException",
+            "MalformedXML",
         ),
         (
             "a published event differing only in case",
@@ -673,7 +673,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                 Destination::Queue,
                 &["S3:ObjectCreated:Put"],
             )],
-            "ValidationException",
+            "MalformedXML",
         ),
         (
             "one unpublished event among events that are fine",
@@ -681,12 +681,12 @@ async fn a_refused_notification_configuration_changes_nothing() {
                 Destination::Topic,
                 &["s3:ObjectCreated:Put", "s3:ObjectVanished"],
             )],
-            "ValidationException",
+            "MalformedXML",
         ),
         (
             "a configuration naming no event at all",
             vec![Configuration::new(Destination::Topic, &[])],
-            "ValidationException",
+            "MalformedXML",
         ),
         (
             "a filter rule name outside FilterRuleName",
@@ -694,7 +694,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                 Configuration::new(Destination::Queue, &["s3:ObjectCreated:Put"])
                     .with_filter_rules(&[("Prefix", "logs/")]),
             ],
-            "ValidationException",
+            "MalformedXML",
         ),
         (
             "a filter rule naming an unknown attribute",
@@ -702,7 +702,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                 Configuration::new(Destination::LambdaFunction, &["s3:ObjectCreated:Put"])
                     .with_filter_rules(&[("prefix", "ok/"), ("extension", ".json")]),
             ],
-            "ValidationException",
+            "MalformedXML",
         ),
         (
             "one id used by two configurations of the same kind",

@@ -106,8 +106,8 @@ fn header_rows() -> Vec<HeaderRow> {
         ),
         (
             "escaped reserved characters survive decoding",
-            "expression=a%20%3C%20b%20%26%20c%3Dd".to_string(),
-            vec![tag("expression", "a < b & c=d")],
+            "expression=a%20%2B%20b%20%3D%20c%2Fd".to_string(),
+            vec![tag("expression", "a + b = c/d")],
         ),
         (
             "a percent-escaped non-ASCII key and value",
@@ -346,15 +346,19 @@ async fn a_header_tag_set_past_a_published_limit_is_refused_and_stores_nothing()
         text(&held)
     );
 
-    // One row per published bound, each ONE past it, plus the key-uniqueness the set has
-    // and the empty key the modelled `Tag$Key` (`length {min 1}`) could never carry.
-    let rows: Vec<(&str, String)> = vec![
+    // One row per published bound, each ONE past it, plus the key-uniqueness the set has,
+    // the empty key the modelled `Tag$Key` (`length {min 1}`) could never carry, and the
+    // character class every tag shares. The code says WHICH class of restriction broke: a
+    // set bigger than the resource may hold is `BadRequest`, and an individual tag that
+    // does not pass input validation is `InvalidTag`.
+    let rows: Vec<(&str, String, &str)> = vec![
         (
             "one pair past the per-object count bound",
             (0..=MAX_TAGS_PER_OBJECT)
                 .map(|index| format!("key-{index}=v"))
                 .collect::<Vec<_>>()
                 .join("&"),
+            "BadRequest",
         ),
         (
             "many times the per-object count bound",
@@ -362,24 +366,37 @@ async fn a_header_tag_set_past_a_published_limit_is_refused_and_stores_nothing()
                 .map(|index| format!("key-{index}=v"))
                 .collect::<Vec<_>>()
                 .join("&"),
+            "BadRequest",
         ),
         (
             "a key one character past its bound",
             format!("{}=v", "k".repeat(MAX_TAG_KEY_CHARS + 1)),
+            "InvalidTag",
         ),
         (
             "a value one character past its bound",
             format!("key={}", "v".repeat(MAX_TAG_VALUE_CHARS + 1)),
+            "InvalidTag",
         ),
-        ("the same key twice", "duplicate=first&duplicate=second".to_string()),
+        (
+            "the same key twice",
+            "duplicate=first&duplicate=second".to_string(),
+            "InvalidTag",
+        ),
         (
             "the same key twice among pairs that are fine",
             "alpha=1&beta=2&alpha=3".to_string(),
+            "InvalidTag",
         ),
-        ("an empty key", "=value".to_string()),
+        ("an empty key", "=value".to_string(), "InvalidTag"),
+        (
+            "a percent-escaped astral-plane symbol as the value",
+            "mood=%F0%9F%98%80".to_string(),
+            "InvalidTag",
+        ),
     ];
 
-    for (case, header) in rows {
+    for (case, header, code) in rows {
         let refused = put_object_tagged(
             &router,
             "tagged-write-refusals",
@@ -396,9 +413,8 @@ async fn a_header_tag_set_past_a_published_limit_is_refused_and_stores_nothing()
         );
         assert_eq!(
             refused.error_code(),
-            "ValidationException",
-            "case {case:?}: expected the framework's refusal code for AWS's unmodelled \
-             InvalidTag, got {:?}",
+            code,
+            "case {case:?}: expected the code S3 refuses this restriction with, got {:?}",
             refused.error_code()
         );
 
