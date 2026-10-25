@@ -251,6 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::DictionaryStatus::Creating,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             transition_due_at: Some(due),
+            // A dictionary that has just been created holds no completed deletion to
+            // report.
+            deleted_at: None,
         };
 
         // Which feeds reference a dictionary is derived from the feed store, and the

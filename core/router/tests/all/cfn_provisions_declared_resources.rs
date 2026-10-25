@@ -55,6 +55,25 @@ const MIN_BUCKET_NAME_LEN: usize = 3;
 /// See [`MIN_BUCKET_NAME_LEN`].
 const MAX_BUCKET_NAME_LEN: usize = 63;
 
+/// The EC2 instance profile every `AWS::EMR::Cluster` below names as its `JobFlowRole`.
+///
+/// EMR resolves a cluster's `JobFlowRole` to an instance profile of the account when it
+/// LAUNCHES the cluster and refuses the launch when there is none, so this account holds
+/// it before any stack declaring a cluster is deployed — the same prerequisite a template
+/// naming `EMR_EC2_DefaultRole` has on AWS.
+const CLUSTER_INSTANCE_PROFILE: &str = "EMR_EC2_DefaultRole";
+
+/// The Region the account-wide IAM setup below is driven through; IAM is global, so the
+/// profile it creates is the one EMR resolves in every Region this suite uses.
+const IAM_REGION: &str = "us-east-1";
+
+/// An EC2 trust policy, so the role the instance profile carries is one EC2 may assume.
+///
+/// Written compactly and with no `&`, `=`, `+` or `%`, so it travels in an `awsQuery`
+/// form body as written.
+const EC2_TRUST_POLICY: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+     \"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}";
+
 /// A SigV4 `Authorization` header whose credential scope names `signing_name` in `region`.
 /// The signature is never checked: this router runs with authentication off.
 fn authorization(signing_name: &str, region: &str) -> String {
@@ -76,11 +95,60 @@ impl Emulator {
         let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
         let mut router = build_router(engine);
         router.set_request_authentication(false);
-        Self {
+        let emulator = Self {
             router,
             runtime: tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("a current-thread runtime"),
+        };
+        // The prerequisite every cluster below has: the instance profile its `JobFlowRole`
+        // names has to exist before EMR will launch it.
+        emulator.create_instance_profile(CLUSTER_INSTANCE_PROFILE);
+        emulator
+    }
+
+    /// One `awsQuery` IAM action: `POST /` with the members form-encoded.
+    fn iam(&self, action: &str, members: &[(&str, &str)]) -> (u16, String) {
+        let mut body = format!("Action={action}&Version=2010-05-08");
+        for (key, value) in members {
+            body.push('&');
+            body.push_str(&form_encode(key));
+            body.push('=');
+            body.push_str(&form_encode(value));
+        }
+        let (status, _, payload) = self.send(
+            "iam",
+            IAM_REGION,
+            "POST",
+            "/",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            body.into_bytes(),
+        );
+        (status, String::from_utf8_lossy(&payload).into_owned())
+    }
+
+    /// Create the EC2 instance profile `name` the way AWS builds one: a role EC2 may
+    /// assume, the profile itself, and the role added to the profile.
+    fn create_instance_profile(&self, name: &str) {
+        for (action, members) in [
+            (
+                "CreateRole",
+                vec![
+                    ("RoleName", name),
+                    ("AssumeRolePolicyDocument", EC2_TRUST_POLICY),
+                ],
+            ),
+            ("CreateInstanceProfile", vec![("InstanceProfileName", name)]),
+            (
+                "AddRoleToInstanceProfile",
+                vec![("InstanceProfileName", name), ("RoleName", name)],
+            ),
+        ] {
+            let (status, body) = self.iam(action, &members);
+            assert_eq!(
+                status, 200,
+                "setup: IAM {action} for {name} must succeed, got {status} with body {body}"
+            );
         }
     }
 

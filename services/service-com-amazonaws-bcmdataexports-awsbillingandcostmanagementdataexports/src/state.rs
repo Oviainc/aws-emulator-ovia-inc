@@ -105,7 +105,7 @@ pub const EXPORT_RESOURCE_TYPE: &str = "Export";
 pub const EXECUTION_RESOURCE_TYPE: &str = "Execution";
 
 /// The resource-ARN segment every export of this service is named under:
-/// `export/<Export.Name>`.
+/// `export/<Export.Name>/<generated id>` (see [`export_arn`]).
 pub const EXPORT_RESOURCE_PREFIX: &str = "export/";
 
 /// The `ExportStatusCode` reported for an export that is operating normally. One of
@@ -274,11 +274,11 @@ pub struct StoredExport {
 
 /// Per-service state for com-amazonaws-bcmdataexports-awsbillingandcostmanagementdataexports. A handler reaches it through [`service_state`].
 ///
-/// There is ONE store, and no second index beside it: the ARN [`export_arn`] mints is a
-/// function of the region and `Export.Name`, so the key of this map already IS the name
-/// index, and `CreateExport` refuses a name in use by looking the minted ARN up here. A
-/// second map keyed by the bare name would also refuse a name already used in a
-/// DIFFERENT region, which the ARN says is a different export.
+/// There is ONE store, and no second index beside it: the ARN [`export_arn`] mints carries
+/// the region and `Export.Name` ahead of the export's generated id, so the key of this map
+/// already IS the name index and [`Self::export_named`] reads it as one. A second map keyed
+/// by the bare name would also refuse a name already used in a DIFFERENT region, which the
+/// ARN says is a different export.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState {
     /// The primary store, keyed by the minted export ARN. `BTreeMap` so every list
@@ -292,6 +292,23 @@ pub struct ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState
 }
 
 impl ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState {
+    /// The export called `name` in `region`, whatever generated id its ARN carries.
+    ///
+    /// The name a caller chooses is unique among the exports a region HOLDS, while the ARN
+    /// is not a function of it (see [`export_arn`]), so a lookup by name is a walk of the
+    /// ARNs minted under [`export_arn_prefix`] rather than a `get` of one key. `Export.Name`
+    /// cannot carry a `/` (smithy_query shape `Export`, member `Name`: `pattern
+    /// ^[0-9A-Za-z\-_]+$`) and neither can a generated id, so exactly one segment follows
+    /// that prefix for an export of this name and a longer tail belongs to another one.
+    pub fn export_named(&self, region: &str, name: &str) -> Option<&StoredExport> {
+        let prefix = export_arn_prefix(region, name);
+        self.exports
+            .range(prefix.clone()..)
+            .take_while(|(arn, _)| arn.starts_with(&prefix))
+            .find(|(arn, _)| !arn[prefix.len()..].contains('/'))
+            .map(|(_, export)| export)
+    }
+
     /// The recorded execution `execution_id` of the export `export_arn`, if there is one.
     pub fn execution(&self, export_arn: &str, execution_id: &str) -> Option<&StoredExecution> {
         self.executions
@@ -547,18 +564,85 @@ fn is_arn_region_segment(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// The ARN of the export called `name` in `region`:
-/// `arn:aws:bcm-data-exports:<region>:<account>:export/<name>`.
+/// The ARN of the export called `name` in `region` whose generated id is `export_id`:
+/// `arn:aws:bcm-data-exports:<region>:<account>:export/<name>/<export_id>`.
+///
+/// An export is identified by the ARN the SERVICE mints for it, and that ARN carries a
+/// server-generated id after the caller's name: the name is only unique among the exports a
+/// region currently holds, so a name alone cannot identify the export it named yesterday as
+/// well as the one holding it now. Because the id enters the ARN, a name freed by a delete
+/// and taken again by a later create belongs to a DIFFERENT export with an ARN of its own,
+/// and no ARN this service ever minted names a resource it did not mint it for.
 ///
 /// Built through `engine::emulator_arn`, so the account segment is the one canonical
 /// emulator account id rather than a literal.
-pub fn export_arn(region: &str, name: &str) -> String {
+pub fn export_arn(region: &str, name: &str, export_id: &str) -> String {
+    format!("{}{export_id}", export_arn_prefix(region, name))
+}
+
+/// Everything of an [`export_arn`] in `region` for `name` but the generated id: the prefix
+/// every ARN this service has ever minted for that name in that region starts with, and
+/// which [`ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState::export_named`]
+/// looks the current one up by.
+pub fn export_arn_prefix(region: &str, name: &str) -> String {
     ::engine::emulator_arn(
         SIGNING_NAME,
         region,
-        &format!("{EXPORT_RESOURCE_PREFIX}{name}"),
+        &format!("{EXPORT_RESOURCE_PREFIX}{name}/"),
     )
 }
+
+/// Domain separator for a minted export id, so the digest behind one cannot be read as any
+/// other value this service derives with the same hash.
+const EXPORT_ID_DOMAIN: &[u8] = b"bcm-data-exports/export-id/v1\0";
+
+/// How many export ids this process has minted. Every mint takes the next number, so two
+/// mints never share a preimage even when the clock does not advance between them — which
+/// is what makes the id unique rather than merely unlikely to repeat.
+static EXPORT_IDS_MINTED: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+
+/// A fresh generated id for an export the service is about to mint an ARN for.
+///
+/// Derived from NOTHING THE REQUEST CARRIES: the id is what makes an export's ARN its own,
+/// so two exports created under the same name — a create, a delete, and a create of that
+/// name again — must not share one, and any value computed from the name, the region or the
+/// definition would repeat for exactly that case. What it is computed from is this process's
+/// own mint counter and the instant of the mint, digested with the hash this crate already
+/// mints its other opaque ids with ([`execution_id`], and the page tokens below), rather
+/// than a second mechanism beside them.
+///
+/// It is laid out in the form this service's export ARNs carry after the name — the 8-4-4-4-12
+/// hex of a version 4 UUID, with that version's own version and variant bits set — and
+/// satisfies the resource segment of the modelled `Arn` pattern (`[-a-zA-Z0-9/:_]+`).
+pub fn new_export_id() -> String {
+    use ::sha2::Digest;
+    let sequence = EXPORT_IDS_MINTED.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_nanos());
+    let mut hasher = ::sha2::Sha256::new();
+    hasher.update(EXPORT_ID_DOMAIN);
+    hasher.update(sequence.to_be_bytes());
+    hasher.update(nanos.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; EXPORT_ID_BYTES];
+    bytes.copy_from_slice(&digest[..EXPORT_ID_BYTES]);
+    // The version nibble (4) and the variant bits (0b10) of the form above.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = ::hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
+/// Bytes of digest an export id is laid out from: the 16 a UUID carries.
+const EXPORT_ID_BYTES: usize = 16;
 
 /// The `Message` a `ResourceNotFoundException` of the EXPORT-DEFINITION operations
 /// carries (`GetExport`, `UpdateExport`, `DeleteExport`).

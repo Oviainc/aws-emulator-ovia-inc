@@ -155,7 +155,7 @@
 use super::types::*;
 
 use crate::state::{
-    normalize_dns_name, resource_location, vpc_id_is_well_formed, vpc_region_is_modelled,
+    canonical_dns_name, resource_location, vpc_id_is_well_formed, vpc_region_is_modelled,
     RecordKey, StoredZone, HOSTED_ZONE_ALREADY_EXISTS_MESSAGE, MAX_HOSTED_ZONES,
 };
 use std::collections::BTreeMap;
@@ -300,7 +300,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let name = normalize_dns_name(&input.name);
+        // A hosted zone is stored and reported under the ONE canonical form of
+        // its name, whatever spelling it was created with.
+        let name = canonical_dns_name(&input.name);
         // "You can't create a hosted zone for a top-level domain (TLD) such as
         // .com." A zone name therefore needs at least two labels.
         if name.trim_end_matches('.').split('.').count() < 2 {

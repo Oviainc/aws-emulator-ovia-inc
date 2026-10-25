@@ -4,7 +4,9 @@
 //! Transitions one stored image between Amazon ECR standard storage and Amazon ECR
 //! archive, recording the instant of the transition on the image, and answers with the
 //! status the image is in after the call. An `imageId` that names no stored image, or a
-//! repository that does not exist, is refused.
+//! repository that does not exist, is refused — and so is a target storage class the
+//! image has no transition to, which is the `ImageStorageClassUpdateNotSupportedException`
+//! the operation models.
 //!
 //! ## Shape of an operation
 //!
@@ -243,15 +245,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The transition is recorded on the image itself, so it moves that image's status
-        // and nothing else in the repository. Asking for the storage class the image is
-        // already in, or re-asking for a restore that is already running, transitions
-        // nothing: the request is already satisfied, so the stored instants are left as
-        // the last real transition set them.
+        // and nothing else in the repository. A storage class update is supported only
+        // where there is a transition to make: an image in Amazon ECR standard storage can
+        // be archived and an image in Amazon ECR archive can be restored, while a target
+        // the image's storage class already is — and a transition out of a storage class
+        // the image is still leaving — is not a supported update and is refused with the
+        // error the operation models for exactly that.
+        let supported = if to_archive {
+            image.status == crate::state::ACTIVE_IMAGE_STATUS
+        } else {
+            image.status == crate::state::ARCHIVED_IMAGE_STATUS
+        };
+        if !supported {
+            return Err(
+                UpdateImageStorageClassErrorModeled::ImageStorageClassUpdateNotSupportedException(
+                    ImageStorageClassUpdateNotSupportedException {
+                        // Built from the request and the image: the storage class that was
+                        // asked for, and the state the image is in that has no transition
+                        // to it.
+                        message: Some(format!(
+                            "Image cannot be updated to {} storage class when it is in {} \
+                             state",
+                            input.target_storage_class, image.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
         if to_archive {
-            if !image.is_archived() || image.is_activating() {
-                image.archive(now);
-            }
-        } else if image.is_archived() && !image.is_activating() {
+            image.archive(now);
+        } else {
             image.activate(now);
         }
         let image_status = image.status.clone();

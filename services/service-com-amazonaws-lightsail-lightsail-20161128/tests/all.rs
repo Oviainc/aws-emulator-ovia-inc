@@ -33,6 +33,8 @@ mod bundle_catalog;
 mod contact_method_notifications;
 #[path = "all/container_image_registry.rs"]
 mod container_image_registry;
+#[path = "all/container_image_registry_login.rs"]
+mod container_image_registry_login;
 #[path = "all/container_service_lifecycle.rs"]
 mod container_service_lifecycle;
 #[path = "all/container_service_metric_data.rs"]

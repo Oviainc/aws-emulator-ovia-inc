@@ -3027,6 +3027,13 @@ pub fn cursor_managed_policies(instance_arn: &str, permission_set_arn: &str) -> 
     format!("managedPolicies|{instance_arn}|{permission_set_arn}")
 }
 
+/// Cursor scope of a `ListApplicationGrants` enumeration: the operation and the
+/// application whose grants it walks, since the key (the grant's type) only
+/// distinguishes rows WITHIN one application.
+pub fn cursor_application_grants(application_arn: &str) -> String {
+    format!("applicationGrants|{application_arn}")
+}
+
 /// Cursor scope of a `ListTagsForResource` enumeration: the operation and the resource
 /// whose tags it walks, which is the whole filter that selected the rows.
 pub fn cursor_tags(resource_arn: &str) -> String {

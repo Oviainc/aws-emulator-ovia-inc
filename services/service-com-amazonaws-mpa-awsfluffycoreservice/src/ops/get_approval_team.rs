@@ -9,10 +9,16 @@
 //! `@readonly`: this handler writes nothing of its own. It calls
 //! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] first, which applies only what the
 //! CLOCK already owed at this instant (an invitation response that has come due, a
-//! pending deletion window that has run out) — changes a caller who never polled would
+//! pending deletion window that has run out, the approval and activation of a change the
+//! team was asked for) — changes a caller who never polled would
 //! have seen anyway. Each approver's `MfaMethods` is reported off the stored record too,
 //! so a read never synchronizes an MFA device: `UpdateApprovalTeam`'s
 //! `SYNCHRONIZE_MFA_DEVICES` action is what does.
+//!
+//! A change an active team's approvers have still to approve is NOT part of the team's
+//! live configuration, so the members above report the configuration the team runs on and
+//! `PendingUpdate` / `UpdateSessionArn` report the version it is moving to and the session
+//! that decides it ([`crate::state::PendingTeamUpdate`]).
 //!
 //! ## Shape of an operation
 //!
@@ -234,43 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             approvers: Some(
                 team.approvers
                     .iter()
-                    .map(|approver| GetApprovalTeamResponseApprover {
-                        approver_id: Some(approver.approver_id.clone()),
-                        primary_identity_id: Some(approver.primary_identity_id.clone()),
-                        primary_identity_source_arn: Some(
-                            approver.primary_identity_source_arn.clone(),
-                        ),
-                        primary_identity_status: Some(
-                            approver.primary_identity_status.as_wire().to_string(),
-                        ),
-                        response_time: approver
-                            .response_time
-                            .map(::aws_smithy_types::DateTime::from),
-                        last_activity: approver
-                            .last_activity
-                            .map(|activity| activity.as_wire().to_string()),
-                        last_activity_time: approver
-                            .last_activity_time
-                            .map(::aws_smithy_types::DateTime::from),
-                        // The baseline session this approver still has to answer, read
-                        // off the stored sessions.
-                        pending_baseline_session_arn: pending_baselines
-                            .get(approver.approver_id.as_str())
-                            .cloned(),
-                        // The approver's MFA devices, each with the synchronization
-                        // state the stored record carries. A read never synchronizes
-                        // one: `UpdateApprovalTeam`'s update action is what does.
-                        mfa_methods: Some(
-                            approver
-                                .mfa_methods
-                                .iter()
-                                .map(|method| MfaMethod {
-                                    r#type: method.mfa_type.as_wire().to_string(),
-                                    sync_status: method.sync_status.as_wire().to_string(),
-                                })
-                                .collect(),
-                        ),
-                    })
+                    .map(|approver| reported_approver(approver, &pending_baselines))
                     .collect(),
             ),
             policies: Some(
@@ -285,10 +255,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: Some(team.status.as_wire().to_string()),
             status_code: team.status_code.map(|code| code.as_wire().to_string()),
             status_message: team.status_message.clone(),
-            // An update is applied in place by `UpdateApprovalTeam`, so no update
-            // session is ever outstanding and there is never a pending update to report.
-            update_session_arn: None,
-            pending_update: None,
+            // The change this team's approvers were asked to approve, read off the stored
+            // record: `UpdateApprovalTeam` records one rather than applying it to an
+            // active team, so until it is approved and activated the members above are
+            // the configuration the team still runs on and these two report the version
+            // it is moving to and the session that decides it.
+            update_session_arn: team
+                .pending_update
+                .as_ref()
+                .map(|update| update.update_session_arn.clone()),
+            pending_update: team.pending_update.as_ref().map(|update| {
+                let crate::state::StoredApprovalStrategy::MofN {
+                    min_approvals_required,
+                } = update.approval_strategy;
+                PendingUpdate {
+                    version_id: Some(update.version_id.clone()),
+                    description: Some(update.description.clone()),
+                    approval_strategy: Some(ApprovalStrategyResponse::MofN(
+                        MofNApprovalStrategy {
+                            min_approvals_required,
+                        },
+                    )),
+                    number_of_approvers: Some(update.number_of_approvers()),
+                    status: Some(update.status.as_wire().to_string()),
+                    status_code: update.status_code.map(|code| code.as_wire().to_string()),
+                    status_message: update.status_message.clone(),
+                    approvers: Some(
+                        update
+                            .approvers
+                            .iter()
+                            .map(|approver| reported_approver(approver, &pending_baselines))
+                            .collect(),
+                    ),
+                    update_initiation_time: Some(::aws_smithy_types::DateTime::from(
+                        update.update_initiation_time,
+                    )),
+                }
+            }),
         })
+    }
+}
+
+/// One approver as this read reports it, off the stored record.
+///
+/// The same rendering serves the team's own approvers and the approvers of the change it
+/// has been asked to approve (`PendingUpdate$Approvers`), so the two cannot disagree about
+/// what one approver looks like.
+fn reported_approver(
+    approver: &crate::state::Approver,
+    pending_baselines: &::std::collections::BTreeMap<&str, String>,
+) -> GetApprovalTeamResponseApprover {
+    GetApprovalTeamResponseApprover {
+        approver_id: Some(approver.approver_id.clone()),
+        primary_identity_id: Some(approver.primary_identity_id.clone()),
+        primary_identity_source_arn: Some(approver.primary_identity_source_arn.clone()),
+        primary_identity_status: Some(approver.primary_identity_status.as_wire().to_string()),
+        response_time: approver
+            .response_time
+            .map(::aws_smithy_types::DateTime::from),
+        last_activity: approver
+            .last_activity
+            .map(|activity| activity.as_wire().to_string()),
+        last_activity_time: approver
+            .last_activity_time
+            .map(::aws_smithy_types::DateTime::from),
+        // The baseline session this approver still has to answer, read off the stored
+        // sessions.
+        pending_baseline_session_arn: pending_baselines
+            .get(approver.approver_id.as_str())
+            .cloned(),
+        // The approver's MFA devices, each with the synchronization state the stored
+        // record carries. A read never synchronizes one: `UpdateApprovalTeam`'s update
+        // action is what does.
+        mfa_methods: Some(
+            approver
+                .mfa_methods
+                .iter()
+                .map(|method| MfaMethod {
+                    r#type: method.mfa_type.as_wire().to_string(),
+                    sync_status: method.sync_status.as_wire().to_string(),
+                })
+                .collect(),
+        ),
     }
 }

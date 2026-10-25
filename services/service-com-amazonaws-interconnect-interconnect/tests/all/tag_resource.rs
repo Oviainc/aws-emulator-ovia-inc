@@ -8,7 +8,9 @@
 //! the resource already holds takes the new value and every key the request does not
 //! name keeps the value it had — so the call is a MERGE, is idempotent, and changes
 //! nothing else about the resource. An `arn` that names no resource of this service
-//! is refused with the modelled 404, and one that is not a connection ARN at all is
+//! is refused with HTTP 400 — the client fault for an in-scope ARN naming nothing,
+//! the validation fault for one outside the scope the request addresses — and one
+//! that is not a connection ARN at all is
 //! refused as invalid input (HTTP 400), never with a 501. A resource's tag set is
 //! also bounded: a write that would leave it holding more tags than one resource
 //! holds is refused and changes nothing, on this operation and on tag-on-create
@@ -428,10 +430,13 @@ async fn tag_resource_touches_only_the_resource_its_arn_names() {
     }
 }
 
-/// RULE: an `arn` that names no resource of this store is refused with the modelled
-/// `ResourceNotFoundException` (HTTP 404) and creates nothing — tagging never brings
-/// a resource into existence; an `arn` that is not a connection ARN at all is refused
-/// as invalid input (HTTP 400). Neither is ever a 501.
+/// RULE: an `arn` that names no resource of this store is refused with HTTP 400 and
+/// creates nothing — tagging never brings a resource into existence — with DIFFERENT
+/// codes for the two ways it can name none: `InterconnectValidationException` for an
+/// ARN outside the partition, Region and account this request addresses, and
+/// `InterconnectClientException` for an in-scope ARN that names no connection. An
+/// `arn` that is not a connection ARN at all is likewise invalid input (HTTP 400).
+/// None of them is ever a 404 or a 501.
 #[tokio::test]
 async fn tag_resource_refuses_an_arn_that_names_no_connection() {
     let emulator = Emulator::new();
@@ -442,37 +447,45 @@ async fn tag_resource_refuses_an_arn_that_names_no_connection() {
     let live_arn = text(&live, "arn");
     let written = map(&[("team", "network")]);
 
-    // A well-formed connection ARN that names something this store does not hold:
-    // an unallocated id, another account, another region, another partition — each
-    // of which is a different resource than the one the store holds.
+    // In-scope, well-formed connection ARNs that name nothing this account holds
+    // (the client fault), then ARNs outside the scope this request addresses (the
+    // validation fault): two negative classes with two codes.
     let elsewhere = vec![
         (
             "an id that was never allocated",
             format!("arn:aws:interconnect:{REGION}:{ACCOUNT_ID}:connection/mcc-00000000"),
+            "InterconnectClientException",
         ),
         (
             "the other id prefix, never allocated",
             format!("arn:aws:interconnect:{REGION}:{ACCOUNT_ID}:connection/lmcc-zzzzzzzz"),
+            "InterconnectClientException",
         ),
         (
             "another account",
             live_arn.replace(ACCOUNT_ID, "123456789012"),
+            "InterconnectValidationException",
         ),
-        ("another region", live_arn.replace(REGION, "eu-west-3")),
+        (
+            "another region",
+            live_arn.replace(REGION, "eu-west-3"),
+            "InterconnectValidationException",
+        ),
         (
             "another partition",
             live_arn.replace("arn:aws:", "arn:aws-cn:"),
+            "InterconnectValidationException",
         ),
     ];
-    for (name, arn) in elsewhere {
+    for (name, arn, expected_code) in elsewhere {
         let (status, body) = tag(&emulator, &arn, &written).await;
         assert_eq!(
-            status, 404,
-            "case {name:?}: expected the modelled 404 for an ARN naming no connection, got {status} with {body:?}"
+            status, 400,
+            "case {name:?}: expected HTTP 400 for an ARN naming no connection, got {status} with {body:?}"
         );
         assert!(
-            code(&body).contains("ResourceNotFoundException"),
-            "case {name:?}: expected ResourceNotFoundException, got {body:?}"
+            code(&body).contains(expected_code),
+            "case {name:?}: expected {expected_code}, got {body:?}"
         );
         assert!(
             message(&body).contains(&arn),
@@ -484,7 +497,7 @@ async fn tag_resource_refuses_an_arn_that_names_no_connection() {
             .ic("ListTagsForResource", json!({ "arn": arn }))
             .await;
         assert_eq!(
-            listed_status, 404,
+            listed_status, 400,
             "case {name:?}: expected the refused ARN to still name no resource, got {listed_status} with {listed:?}"
         );
     }
@@ -645,7 +658,8 @@ async fn tag_resource_bounds_the_tags_one_resource_holds() {
 
 /// RULE: a resource exists until its delete completes — tagging a connection that is
 /// still `deleting` succeeds, and once the clock has settled it into the terminal
-/// `deleted` state the resource is gone and tagging it is a 404.
+/// `deleted` state the resource is gone and tagging it is refused as the client
+/// fault for an in-scope ARN that names no connection.
 #[tokio::test]
 async fn tag_resource_follows_the_resource_out_of_existence() {
     let emulator = Emulator::new();
@@ -689,11 +703,11 @@ async fn tag_resource_follows_the_resource_out_of_existence() {
 
     let (status, body) = tag(&emulator, &arn, &map(&[("owner", "ops")])).await;
     assert_eq!(
-        status, 404,
-        "case \"after the delete settles\": expected the modelled 404 for a deleted resource, got {status} with {body:?}"
+        status, 400,
+        "case \"after the delete settles\": expected HTTP 400 for a deleted resource, got {status} with {body:?}"
     );
     assert!(
-        code(&body).contains("ResourceNotFoundException"),
-        "case \"after the delete settles\": expected ResourceNotFoundException, got {body:?}"
+        code(&body).contains("InterconnectClientException"),
+        "case \"after the delete settles\": expected InterconnectClientException, got {body:?}"
     );
 }
