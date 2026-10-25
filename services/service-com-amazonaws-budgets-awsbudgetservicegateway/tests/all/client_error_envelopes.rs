@@ -13,12 +13,12 @@
 //!    validation: HTTP 400, error code `ValidationException`, and a message built from
 //!    the request that names the failing member path and the constraint it violated.
 //!
-//! The harness (`router`, `call`, `is_error`, `account`) is the lifecycle suite's, so
-//! both suites drive the service exactly the same way.
+//! The harness (`router`, `call`, `is_error`, `caller_account`) is the lifecycle
+//! suite's, so both suites drive the service exactly the same way.
 
 use serde_json::{json, Value};
 
-use super::budget_lifecycle::{account, call, is_error, router};
+use super::budget_lifecycle::{caller_account, call, is_error, router};
 
 /// A budget that satisfies every modelled constraint and every documented
 /// cross-member rule, so a row can vary ONE thing and know that is what was refused.
@@ -65,10 +65,12 @@ struct Refusal {
 /// The rows differ along the error shape and so along the modelled status folded in
 /// (404, 409, 402) as well as the statuses already at 400 (400 shapes, and the
 /// framework's own `ValidationException`), and along the operation that answers it.
+/// `AccessDeniedException` is the one refusal NOT folded in — it keeps its modelled
+/// 403, which `account_scoping.rs` asserts.
 #[tokio::test]
 async fn every_request_refusal_is_answered_at_http_400() {
     let router = router();
-    let account_id = account(212_121_212);
+    let account_id = caller_account();
 
     // One stored budget, so the duplicate row has something to collide with and the
     // not-found rows name something that really is absent.
@@ -115,9 +117,9 @@ async fn every_request_refusal_is_answered_at_http_400() {
             modeled_status: 404,
         },
         Refusal {
-            case: "DescribeBudget for an account that holds nothing",
+            case: "DescribeBudget for a name no budget was stored under",
             operation: "DescribeBudget",
-            request: json!({"AccountId": account(313_131_313), "BudgetName": "stored"}),
+            request: json!({"AccountId": &account_id, "BudgetName": "stored-elsewhere"}),
             exception: "NotFoundException",
             modeled_status: 404,
         },
@@ -197,7 +199,7 @@ async fn every_request_refusal_is_answered_at_http_400() {
 #[tokio::test]
 async fn a_scaffolded_operation_still_answers_501() {
     let router = router();
-    let account_id = account(414_141_414);
+    let account_id = caller_account();
     // Every one of these is still a stub under its own issue, and each request
     // satisfies every modelled constraint on its input so that it reaches the stub
     // rather than the validation layer in front of it.
@@ -256,7 +258,7 @@ struct Rejected {
 #[tokio::test]
 async fn a_modelled_constraint_violation_names_its_member_and_constraint() {
     let router = router();
-    let account_id = account(515_151_515);
+    let account_id = caller_account();
     // The constraint clauses, as `aws_smithy_schema_server`'s validation renderer
     // words them; the bounds are the modelled ones
     // (`smithy_query(query="shape",shape="BudgetName,MaxResults,Notification")`).
@@ -447,7 +449,7 @@ const LONG_NAME: &str = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn
 #[tokio::test]
 async fn a_budget_name_refused_for_its_content_is_not_echoed_back() {
     let router = router();
-    let account_id = account(717_171_717);
+    let account_id = caller_account();
     for (case, name) in [
         ("a script element", "<script>alert(1)</script>"),
         (
@@ -503,7 +505,7 @@ async fn a_budget_name_refused_for_its_content_is_not_echoed_back() {
 #[tokio::test]
 async fn names_the_modelled_pattern_allows_are_accepted() {
     let router = router();
-    let account_id = account(616_161_616);
+    let account_id = caller_account();
     // Each row satisfies `^(?![^:\]*/action/|(?i).*<script>.*</script>.*)[^:\]+$` while
     // sitting as close to one of its rejections as a legal name can.
     for (case, name) in [

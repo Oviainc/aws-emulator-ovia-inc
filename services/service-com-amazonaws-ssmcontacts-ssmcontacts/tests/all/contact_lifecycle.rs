@@ -37,6 +37,23 @@ pub(crate) struct Emulator {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
+        let emulator = Self::fresh();
+        // Amazon SSM Contacts is fronted by the account's Incident Manager replication
+        // set: a contact resource lives in that set's Regions, so a write is refused
+        // until the account has an ACTIVE one (`tests/all/replication_set_precondition.rs`
+        // is the suite about that rule). This suite is about the contact lifecycle on an
+        // ONBOARDED account, so it installs the set through the one shared fixture every
+        // suite uses — a suite that varies the account's state installs its own.
+        crate::contact_updates::onboard(&emulator);
+        emulator
+    }
+
+    /// The emulator with NOTHING written into its store: the account exactly as a client
+    /// reaching a freshly started emulator finds it.
+    ///
+    /// `tests/all/default_onboarding.rs` asserts what that account can do, so it must be
+    /// handed no fixture at all; every other suite goes through [`Emulator::new`].
+    pub(crate) fn fresh() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite drives unsigned requests, so signature verification is off; the
@@ -46,15 +63,7 @@ impl Emulator {
         router.register_service(
             service_com_amazonaws_ssmcontacts_ssmcontacts::EmulatedService::new(engine.clone()),
         );
-        let emulator = Self { router, engine };
-        // Amazon SSM Contacts is fronted by the account's Incident Manager replication
-        // set: a contact resource lives in that set's Regions, so a write is refused
-        // until the account has an ACTIVE one (`tests/all/replication_set_precondition.rs`
-        // is the suite about that rule). This suite is about the contact lifecycle on an
-        // ONBOARDED account, so it installs the set through the one shared fixture every
-        // suite uses.
-        crate::contact_updates::onboard(&emulator);
-        emulator
+        Self { router, engine }
     }
 
     /// How many entries the idempotency-replay ledger holds right now.
@@ -1107,19 +1116,34 @@ async fn a_repeated_create_with_the_same_idempotency_token_mints_nothing_new() {
         "case {case:?}: a retried CreateContactChannel must answer the first ARN"
     );
 
-    // Without a token the same channel request names a SECOND channel: nothing in the
-    // model makes a channel's name unique within its contact.
+    // Without a token the same channel request is not a replay — but it names a channel
+    // name the contact already holds, so it is refused as a conflict rather than minting a
+    // second channel of that name (`tests/all/contact_channel_name_uniqueness.rs` is the
+    // suite about that rule). Two untokened creates are two channels only while they name
+    // two names.
     let untokened = json!({
         "ContactId": first,
         "Name": "email",
         "Type": "EMAIL",
         "DeliveryAddress": {"SimpleAddress": "ops@example.com"},
     });
-    let one = emulator.create_channel(untokened.clone(), case).await;
-    let two = emulator.create_channel(untokened, case).await;
+    let (status, body) = emulator
+        .call("CreateContactChannel", untokened.clone())
+        .await;
+    assert_eq!(
+        status, 409,
+        "case {case:?}: an untokened repeat of a held channel name must conflict, \
+         got {status} {body:?}"
+    );
+    let mut second_name = untokened.clone();
+    second_name["Name"] = json!("email backup");
+    let mut third_name = untokened;
+    third_name["Name"] = json!("email archive");
+    let one = emulator.create_channel(second_name, case).await;
+    let two = emulator.create_channel(third_name, case).await;
     assert_ne!(
         one, two,
-        "case {case:?}: two untokened creates are two channels"
+        "case {case:?}: two untokened creates of two names are two channels"
     );
 
     let seen = emulator
@@ -1128,7 +1152,7 @@ async fn a_repeated_create_with_the_same_idempotency_token_mints_nothing_new() {
     assert_eq!(
         seen,
         vec![channel, one, two],
-        "case {case:?}: expected the tokened channel once and the untokened ones twice"
+        "case {case:?}: expected the tokened channel once and each named channel once"
     );
 
     // A token does not excuse a request that names something else. Reused against an

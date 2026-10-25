@@ -17,8 +17,9 @@
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
-//!   request's resolved route key against this service's signing name. Edit it
-//!   for anything the model does not express: a signing name shared by several
+//!   request's resolved route key against this service's signing name, which this
+//!   service widens to the two names ONE awsJson endpoint answers on (see the method).
+//!   Edit it for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
@@ -74,13 +75,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service speaks `awsJson1_1` and several of its operations are called
+        // with NO SigV4 credentials — `GetId`, `GetOpenIdToken` and
+        // `GetCredentialsForIdentity` are the credential exchange a client performs
+        // BEFORE it holds any Amazon Web Services credential, so the model marks them
+        // anonymous. The framework resolves a routing key from the SigV4 credential
+        // scope FIRST and from `X-Amz-Target` only when there is no scope, and those
+        // two carry different names: the scope carries the signing name
+        // (`cognito-identity`), the target carries the model's service shape name
+        // (`AWSCognitoIdentityService.<Operation>`). Claiming the signing name alone
+        // therefore serves every SIGNED call and leaves every unsigned one unclaimed,
+        // which the router answers `UnknownService` — the service is mounted, but
+        // nothing claims the request.
+        //
+        // Both names address this one endpoint, so both are its routing keys, and the
+        // framework's own resolver still decides which one a given request resolves
+        // to: a request signed for ANOTHER service resolves to that service's signing
+        // name and is not claimed here however it is addressed. This service's signing
+        // name is its own, so the claim needs no further discriminator.
+        routes_to_signing_name(parts, self.entry.identity().signing_name())
+            || unsigned_target_names_shape(parts, self.entry.identity().shape_id())
     }
 
     fn override_operation(
@@ -143,5 +157,216 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+/// Whether the routing key the framework resolves for `parts` is `signing_name`.
+///
+/// This is `emulator_server::can_handle_based_on_route_key`'s rule applied over
+/// `Parts`: that helper takes a whole buffered `http::Request`, which the
+/// `Service::can_handle` seam does not receive. Comparison is case-insensitive on a
+/// trimmed name, as there. It answers for every SIGNED request (the credential scope
+/// carries the signing name) and for one addressed by this service's endpoint host.
+fn routes_to_signing_name(parts: &http::request::Parts, signing_name: &str) -> bool {
+    smithy_server_runtime::resolve_route_key(parts)
+        .is_some_and(|key| key.eq_ignore_ascii_case(signing_name.trim()))
+}
+
+/// Whether `parts` carries NO SigV4 credential scope, names the service whose shape id
+/// is `service_shape_id` in its `X-Amz-Target`, and arrives on the path this service's
+/// protocol uses.
+///
+/// The three conjuncts, each for its own reason:
+///
+/// * NO credential scope — neither an `Authorization` header nor a presigned
+///   `X-Amz-Credential` query parameter. The framework resolves a routing key from the
+///   scope FIRST (`emulator_server::resolve_route_key`), so a request signed for another
+///   service resolves to that service and must not be claimed here however it is
+///   targeted; reading the target only in the scope's absence keeps the framework's
+///   precedence instead of competing with it.
+/// * the target NAMES this service — read with the framework's own
+///   `service_from_target`, which takes the segment before the first dot and normalises
+///   it the way a routing key is normalised. This service's published target prefix is a
+///   single Smithy identifier (`AWSCognitoIdentityService`), so that segment IS the
+///   shape's local name; the comparison is therefore against the shape id the generated
+///   identity states, with its namespace dropped, and nothing is written out here that
+///   the model does not state.
+/// * the ROOT path, which is the only path an `awsJson` operation posts to. A request
+///   that names this service out of band while addressing some other model's REST path
+///   contradicts itself, so it must reach NOBODY rather than a handler picked off the
+///   target alone.
+fn unsigned_target_names_shape(parts: &http::request::Parts, service_shape_id: &str) -> bool {
+    if emulator_server::service_from_sigv4(&parts.headers).is_some()
+        || emulator_server::service_from_sigv4_query(&parts.uri).is_some()
+    {
+        return false;
+    }
+    let shape_name = service_shape_id
+        .split('#')
+        .next_back()
+        .unwrap_or(service_shape_id)
+        .trim();
+    emulator_server::service_from_target(&parts.headers)
+        .is_some_and(|named| named.eq_ignore_ascii_case(shape_name))
+        && parts.uri.path().trim_matches('/').is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    //! The two names this ONE `awsJson` endpoint answers on, over the signals a request
+    //! can carry. `tests/all/anonymous_credential_exchange.rs` asserts the same rule on
+    //! the wire, through the router; this table is the rule itself, row by row.
+
+    use super::{routes_to_signing_name, unsigned_target_names_shape};
+
+    /// This service's SigV4 signing name and Smithy shape id, as the generated identity
+    /// states them (`smithy_query(query="service_info")`: `sigv4Name` `cognito-identity`,
+    /// service shape `com.amazonaws.cognitoidentity#AWSCognitoIdentityService`).
+    const SIGNING_NAME: &str = "cognito-identity";
+    const SHAPE_ID: &str = "com.amazonaws.cognitoidentity#AWSCognitoIdentityService";
+
+    /// A credential scope naming `signing_name`, the primary routing signal.
+    fn authorization(signing_name: &str) -> String {
+        format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/{signing_name}/aws4_request, \
+             SignedHeaders=host, Signature=abc"
+        )
+    }
+
+    /// One row: how the request is addressed — its credential scope, its `X-Amz-Target`,
+    /// its `Host` and its request URI, each absent as `None` — and whether this service
+    /// claims it.
+    struct Row {
+        case: &'static str,
+        scope: Option<&'static str>,
+        target: Option<&'static str>,
+        host: Option<&'static str>,
+        uri: &'static str,
+        expected: bool,
+    }
+
+    /// The path every `awsJson` operation posts to.
+    const ROOT: &str = "/";
+
+    #[test]
+    fn this_endpoint_answers_on_its_signing_name_and_on_its_shape_name() {
+        let rows = [
+            Row {
+                case: "signed for it, targeted at it",
+                scope: Some(SIGNING_NAME),
+                target: Some("AWSCognitoIdentityService.DescribeIdentityPool"),
+                host: None,
+                uri: ROOT,
+                expected: true,
+            },
+            Row {
+                // The unsigned credential-exchange call this rule exists for: no
+                // credential scope, so the target is all that names the service.
+                case: "unsigned, targeted at it",
+                scope: None,
+                target: Some("AWSCognitoIdentityService.GetId"),
+                host: None,
+                uri: ROOT,
+                expected: true,
+            },
+            Row {
+                case: "unsigned, targeted at it, on the emulator's own host",
+                scope: None,
+                target: Some("AWSCognitoIdentityService.GetCredentialsForIdentity"),
+                host: Some("127.0.0.1:9297"),
+                uri: ROOT,
+                expected: true,
+            },
+            Row {
+                // The target tier outranks the `Host` tier in the framework's own
+                // resolver, so the peer that host names resolves the same
+                // target-derived key and does not claim this request either.
+                case: "unsigned, targeted at it, on another service's endpoint host",
+                scope: None,
+                target: Some("AWSCognitoIdentityService.GetId"),
+                host: Some("lambda.us-east-1.amazonaws.com"),
+                uri: ROOT,
+                expected: true,
+            },
+            Row {
+                case: "unsigned, lower-cased target prefix",
+                scope: None,
+                target: Some("awscognitoidentityservice.GetId"),
+                host: None,
+                uri: ROOT,
+                expected: true,
+            },
+            Row {
+                case: "unsigned, targeted at the separate Cognito user-pools service",
+                scope: None,
+                target: Some("AWSCognitoIdentityProviderService.InitiateAuth"),
+                host: None,
+                uri: ROOT,
+                expected: false,
+            },
+            Row {
+                // The credential scope outranks the target, so a request signed for
+                // another service does not reach this one.
+                case: "signed for another service, targeted at it",
+                scope: Some("lambda"),
+                target: Some("AWSCognitoIdentityService.GetId"),
+                host: None,
+                uri: ROOT,
+                expected: false,
+            },
+            Row {
+                // A request that names this service out of band while addressing
+                // another model's REST path contradicts itself: it reaches nobody.
+                case: "unsigned, targeted at it, on a REST path",
+                scope: None,
+                target: Some("AWSCognitoIdentityService.GetId"),
+                host: None,
+                uri: "/identitypools/pool-1",
+                expected: false,
+            },
+            Row {
+                case: "unsigned, addressed by its endpoint host",
+                scope: None,
+                target: None,
+                host: Some("cognito-identity.us-east-1.amazonaws.com"),
+                uri: ROOT,
+                expected: true,
+            },
+            Row {
+                case: "no routing signal at all",
+                scope: None,
+                target: None,
+                host: None,
+                uri: ROOT,
+                expected: false,
+            },
+        ];
+
+        for row in rows {
+            let mut builder = super::http::Request::builder()
+                .method("POST")
+                .uri(row.uri);
+            if let Some(scope) = row.scope {
+                builder = builder.header("authorization", authorization(scope));
+            }
+            if let Some(target) = row.target {
+                builder = builder.header("x-amz-target", target);
+            }
+            if let Some(host) = row.host {
+                builder = builder.header("host", host);
+            }
+            let parts = builder
+                .body(())
+                .expect("a well-formed test request")
+                .into_parts()
+                .0;
+            let actual = routes_to_signing_name(&parts, SIGNING_NAME)
+                || unsigned_target_names_shape(&parts, SHAPE_ID);
+            assert_eq!(
+                actual, row.expected,
+                "case {:?}: expected this service to claim it == {}, got {actual}",
+                row.case, row.expected
+            );
+        }
     }
 }

@@ -255,7 +255,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The tag set the new connection would carry, judged by the one rule every
         // writer of a connection's tags uses: each entry inside the lengths the model
-        // gives `TagKey` and `TagValue`, and no more entries than a resource holds.
+        // gives `TagKey` and `TagValue`, no key in the namespace AWS reserves for its
+        // own system tags, and no more entries than a resource holds.
         // A resource created with tags is therefore bounded the same way one tagged
         // later is, so neither path can store a set the other would refuse.
         if let Some(message) = input

@@ -214,8 +214,8 @@ pub use account_configuration::{
 };
 
 pub use schedules::{
-    parse_action_time, AppliedSchedule, ChannelSchedule, ScheduleActionRecord, ScheduleRefusal,
-    MAX_SCHEDULE_ACTIONS, SCHEDULE_ACTION_RETENTION,
+    parse_action_time, AppliedSchedule, ChannelSchedule, ChannelScheduleScope, ScheduleActionRecord,
+    ScheduleRefusal, MAX_SCHEDULE_ACTIONS, SCHEDULE_ACTION_RETENTION,
 };
 
 pub(crate) use alarm_template_groups::alarm_template_group_output;
@@ -436,6 +436,24 @@ pub mod network_state {
 pub mod channel_class {
     pub const STANDARD: &str = "STANDARD";
     pub const SINGLE_PIPELINE: &str = "SINGLE_PIPELINE";
+}
+
+/// The pipeline a `PipelineId` / `ChannelPipelineIdToRestart` value names, as
+/// [`PipelineDetail`]`$PipelineId` numbers it.
+///
+/// Both enums declare exactly `PIPELINE_0` and `PIPELINE_1`
+/// (`smithy_query(query="shape", shape="PipelineId")`, and the `PipelineIds`
+/// member's own doc: "Format PIPELINE_0 or PIPELINE_1"), so they are matched
+/// exactly rather than by parsing the suffix: a spelling the enums do not
+/// declare names no pipeline. `None` for anything else, which every caller
+/// refuses. Whether the pipeline it names is one the CHANNEL has is
+/// [`ChannelRecord::has_pipeline`], since that depends on the channel's class.
+pub fn pipeline_index(id: &str) -> Option<i32> {
+    match id {
+        "PIPELINE_0" => Some(0),
+        "PIPELINE_1" => Some(1),
+        _ => None,
+    }
 }
 
 /// The `SignalMapStatus` values this slice uses, spelled exactly as the model
@@ -961,6 +979,17 @@ impl ChannelRecord {
         }
     }
 
+    /// The pipelines this channel's class gives it, numbered as
+    /// `PipelineDetail$PipelineId` numbers them (the `ChannelClass` doc: a
+    /// `STANDARD` channel has two, a `SINGLE_PIPELINE` channel one).
+    ///
+    /// The one place the class-to-pipeline rule lives: every other reading of it
+    /// — whether a request may name a pipeline, which of them are up, how a
+    /// schedule action's pause target is resolved — derives from here.
+    pub fn pipelines(&self) -> ::std::ops::Range<i32> {
+        0..self.pipeline_count()
+    }
+
     /// The pipelines of this channel that are up right now, numbered as
     /// `PipelineDetail$PipelineId` numbers them.
     ///
@@ -974,7 +1003,7 @@ impl ChannelRecord {
         if !running && !recovering {
             return Vec::new();
         }
-        (0..self.pipeline_count())
+        self.pipelines()
             .filter(|pipeline| !self.restarting_pipelines.contains(pipeline))
             .collect()
     }
@@ -1006,10 +1035,9 @@ impl ChannelRecord {
     }
 
     /// Whether `pipeline` is one of the pipelines this channel's class gives it
-    /// (the `ChannelClass` doc: a `STANDARD` channel has two, a
-    /// `SINGLE_PIPELINE` channel one), so a request may name it.
+    /// ([`Self::pipelines`]), so a request may name it.
     pub fn has_pipeline(&self, pipeline: i32) -> bool {
-        (0..self.pipeline_count()).contains(&pipeline)
+        self.pipelines().contains(&pipeline)
     }
 
     /// How many of this channel's pipelines are healthy — the

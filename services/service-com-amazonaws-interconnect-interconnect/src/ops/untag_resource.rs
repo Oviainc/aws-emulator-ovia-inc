@@ -132,7 +132,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// does not carry is removed from nothing, so the call is idempotent: repeating
     /// it, or naming a key that was never applied, succeeds and changes nothing.
     /// An `arn` that names no resource of this service is a 404 — untagging never
-    /// brings a resource into existence.
+    /// brings a resource into existence. A key in the namespace AWS reserves for its
+    /// own system tags is not the caller's to remove, so a request naming one is
+    /// refused on the input and the tag set is left exactly as it was.
     async fn handle(
         &self,
         input: Self::Input,
@@ -159,6 +161,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 InterconnectValidationException {
                     message: crate::state::not_a_connection_arn_message(&input.arn),
                 },
+            )
+            .into());
+        }
+
+        // What the request itself names is judged before any resource is looked up,
+        // and nothing is written when it is refused: a key AWS reserves for its own
+        // system tags is not the caller's to remove, whatever the `arn` names, so the
+        // refusal is the modelled 400 on the input rather than a 404 masking it. The
+        // same rule judges the writers of a tag set, so a key a caller can never
+        // create is also one it can never delete.
+        if let Some(message) =
+            crate::state::reserved_tag_key_violation(input.tag_keys.iter().map(String::as_str))
+        {
+            return Err(UntagResourceErrorModeled::InterconnectValidationException(
+                InterconnectValidationException { message },
             )
             .into());
         }

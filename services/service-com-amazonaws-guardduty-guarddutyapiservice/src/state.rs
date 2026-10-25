@@ -151,6 +151,22 @@ pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// BOUNDED exactly as the association map is, by the same create-time guard.
     pub custom_detection_rule_org_configurations:
         BTreeMap<(String, String, String), DetectionRuleOrgConfigurationRecord>,
+    /// The GuardDuty delegated administrator the organization has, keyed by the
+    /// Region the designating request was signed for.
+    ///
+    /// At most ONE record per Region: the list of delegated administrators a read
+    /// reports is `len 0..1`
+    /// (`smithy_query(operation="ListOrganizationAdminAccounts")`), so a Region's
+    /// organization has one delegated administrator or none. Regional because every
+    /// GuardDuty resource is — the designation is made through one Region's
+    /// endpoint and only that endpoint reports it
+    /// ([`Self::organization_admin_account_in`]).
+    ///
+    /// BOUNDED at one record per Region across at most
+    /// [`MAX_ORGANIZATION_ADMIN_REGIONS`] Regions, which the designation enforces
+    /// before it writes ([`Self::organization_admin_regions_exhausted`]), so the
+    /// map is finite whatever Region a caller signs for.
+    pub organization_admin_accounts: BTreeMap<String, OrganizationAdminAccountRecord>,
     /// Last instant handed out by [`Self::tick_millis`], so two mutations in the
     /// same millisecond still get strictly increasing timestamps.
     last_millis: i64,
@@ -756,6 +772,81 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             regions.insert(record.region.as_str());
         }
         !regions.contains(region) && regions.len() >= MAX_DETECTION_RULE_REGIONS
+    }
+
+    /// The delegated administrator `region`'s endpoint holds, if any.
+    ///
+    /// A designation is made through one Region's endpoint, so a designation made
+    /// through another Region's is not visible here — the same rule
+    /// [`Self::detector_in`] applies to a detector.
+    pub fn organization_admin_account_in(
+        &self,
+        region: &str,
+    ) -> Option<&OrganizationAdminAccountRecord> {
+        self.organization_admin_accounts.get(region)
+    }
+
+    /// Designate `admin_account_id` as the delegated administrator `region`'s
+    /// endpoint serves, replacing nothing: the caller has already established that
+    /// the Region holds no administrator.
+    pub fn designate_organization_admin_account(&mut self, region: &str, admin_account_id: &str) {
+        self.organization_admin_accounts.insert(
+            region.to_string(),
+            OrganizationAdminAccountRecord {
+                admin_account_id: admin_account_id.to_string(),
+                disable_due_millis: None,
+            },
+        );
+    }
+
+    /// Accept the removal of the delegated administrator `region`'s endpoint holds,
+    /// through [`OrganizationAdminAccountRecord::begin_disable`].
+    ///
+    /// `None` when that endpoint holds no delegated administrator at all;
+    /// `Some(false)` when the one it holds is a different account than
+    /// `admin_account_id`, which is not a removal this call may make; `Some(true)`
+    /// when the removal was accepted. The mutation clock is read only on the path
+    /// that writes, so neither refusal advances it — the shape
+    /// [`Self::disassociate_detector_from_administrator`] uses.
+    pub fn disable_organization_admin_account(
+        &mut self,
+        region: &str,
+        admin_account_id: &str,
+    ) -> Option<bool> {
+        if self.organization_admin_account_in(region)?.admin_account_id != admin_account_id {
+            return Some(false);
+        }
+        let now = self.tick_millis();
+        if let Some(record) = self.organization_admin_accounts.get_mut(region) {
+            record.begin_disable(now);
+        }
+        Some(true)
+    }
+
+    /// Materialise the removal the CLOCK already owes every delegated
+    /// administrator whose disable has fallen due.
+    ///
+    /// Each removal was owed at that record's own
+    /// [`OrganizationAdminAccountRecord::disable_due_millis`] whether or not
+    /// anybody called, which is why a reporting operation may apply it — the same
+    /// reason [`Self::settle_malware_scans`] may.
+    pub fn settle_organization_admin_accounts(&mut self) {
+        let now = now_millis();
+        self.organization_admin_accounts
+            .retain(|_, record| !record.disable_settled(now));
+    }
+
+    /// Would a designation through `region`'s endpoint partition this store into
+    /// one Region more than it will hold ([`MAX_ORGANIZATION_ADMIN_REGIONS`])?
+    ///
+    /// The Region is request-chosen ([`request_region`]), so the per-Region ceiling
+    /// of one record needs a ceiling on the number of PARTITIONS to bound the whole
+    /// map — exactly as [`Self::detection_rule_regions_exhausted`] does for the
+    /// rule stores. A Region the store already holds a record for is never refused
+    /// by it.
+    pub fn organization_admin_regions_exhausted(&self, region: &str) -> bool {
+        !self.organization_admin_accounts.contains_key(region)
+            && self.organization_admin_accounts.len() >= MAX_ORGANIZATION_ADMIN_REGIONS
     }
 }
 
@@ -6862,6 +6953,131 @@ const fn is_rule_id_pattern(rule_id: &str) -> bool {
     }
     segment_len > 0
 }
+
+/// The account one Region's organization has designated as its GuardDuty
+/// delegated administrator.
+///
+/// The record carries only what a read reports plus the instant a removal falls
+/// due: `AdminAccount` has an account id and a status and nothing else
+/// (`smithy_query(shape="AdminAccount")`), and the status is a FUNCTION of the
+/// pending removal ([`Self::status`]) rather than a field a caller can set to a
+/// third value.
+#[derive(Debug, Clone)]
+pub struct OrganizationAdminAccountRecord {
+    /// The designated account, as the designating request named it.
+    pub admin_account_id: String,
+    /// When a removal has been accepted, the instant the CLOCK owes it — until
+    /// then the record reports the transient status, and from then on it is gone.
+    /// `None` while no removal is pending.
+    pub disable_due_millis: Option<i64>,
+}
+
+impl OrganizationAdminAccountRecord {
+    /// `AdminAccount.AdminStatus` — "whether the account is enabled as the
+    /// delegated administrator" (`smithy_query(shape="AdminAccount")`): the
+    /// transient status while a removal is pending, [`ENABLED`] otherwise.
+    pub fn status(&self) -> &'static str {
+        if self.disable_due_millis.is_some() {
+            ADMIN_DISABLE_IN_PROGRESS
+        } else {
+            ENABLED
+        }
+    }
+
+    /// Has the removal this record carries fallen due by `now`?
+    ///
+    /// `false` while no removal is pending, and `false` for one still inside its
+    /// span: that record is reported with the transient status instead.
+    pub fn disable_settled(&self, now: i64) -> bool {
+        self.disable_due_millis.is_some_and(|due| now >= due)
+    }
+
+    /// Accept a removal of this delegated administrator, due
+    /// [`ADMIN_DISABLE_SPAN_MILLIS`] after `now`.
+    ///
+    /// Idempotent: a second removal of the same administrator leaves the instant
+    /// the first one made due where it was, so repeating the call cannot postpone
+    /// the removal for ever.
+    pub fn begin_disable(&mut self, now: i64) {
+        if self.disable_due_millis.is_none() {
+            self.disable_due_millis = Some(now.saturating_add(ADMIN_DISABLE_SPAN_MILLIS));
+        }
+    }
+}
+
+/// The modelled `AdminAccount` a read reports for one delegated administrator.
+///
+/// Both members are optional and both are facts the record holds, so the
+/// projection fills them and lives here once.
+pub fn organization_admin_account_view(
+    record: &OrganizationAdminAccountRecord,
+) -> crate::ops::types::list_organization_admin_accounts_types::AdminAccount {
+    crate::ops::types::list_organization_admin_accounts_types::AdminAccount {
+        admin_account_id: Some(record.admin_account_id.clone()),
+        admin_status: Some(record.status().to_string()),
+    }
+}
+
+/// `AdminStatus.DISABLE_IN_PROGRESS`: the status a delegated administrator whose
+/// removal has been accepted reports until the removal falls due. See
+/// [`ENABLED`] for the other member of the enum.
+pub const ADMIN_DISABLE_IN_PROGRESS: &str = "DISABLE_IN_PROGRESS";
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::ADMIN_STATUS_VALUES,
+    ADMIN_DISABLE_IN_PROGRESS
+));
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::ADMIN_STATUS_VALUES,
+    ENABLED
+));
+
+/// How long a delegated administrator whose removal was accepted stays
+/// [`ADMIN_DISABLE_IN_PROGRESS`] before the CLOCK owes its removal.
+///
+/// AWS documents no duration for removing a delegated administrator, so this span
+/// is CHOSEN — the same one [`ENTITY_SET_TRANSITION_MILLIS`] uses, and non-zero
+/// for the same reason: a caller that lists the administrators straight after
+/// asking for the removal still observes the transient status.
+pub const ADMIN_DISABLE_SPAN_MILLIS: i64 = ENTITY_SET_TRANSITION_MILLIS;
+
+/// How many Regions this store will hold a delegated administrator for.
+///
+/// Per Region the store holds at most one record, but the Region is read from the
+/// request's credential scope ([`request_region`]), so without a ceiling on the
+/// number of partitions a caller signing for invented Region names could make the
+/// process retain a record per distinct Region string. Emulator-chosen, like
+/// [`MAX_DETECTION_RULE_REGIONS`], and enforced before the designation writes
+/// ([`ComAmazonawsGuarddutyGuarddutyapiserviceState::organization_admin_regions_exhausted`]).
+pub const MAX_ORGANIZATION_ADMIN_REGIONS: usize = MAX_DETECTION_RULE_REGIONS;
+
+/// The wire name of the `AdminAccountId` member, as both the designation and the
+/// removal carry it (`smithy_query(operation="EnableOrganizationAdminAccount")`
+/// renders the `jsonName` `adminAccountId`). It is what a rejection names.
+pub const ADMIN_ACCOUNT_ID_MEMBER: &str = "adminAccountId";
+
+/// Refusal of a designation made while the Region's organization already has a
+/// delegated administrator.
+///
+/// A read reports `len 0..1` administrators
+/// (`smithy_query(operation="ListOrganizationAdminAccounts")`), so there is room
+/// for one: changing it means removing the current one first. The message states
+/// the rule and quotes neither the caller's account id nor the stored one.
+pub const ORGANIZATION_ADMIN_ALREADY_DESIGNATED_MESSAGE: &str = "The request is rejected because the organization already has a GuardDuty delegated administrator. Remove the current delegated administrator before designating another account.";
+
+/// Refusal of a removal asked for while the Region's organization has no
+/// delegated administrator at all.
+pub const NO_ORGANIZATION_ADMIN_MESSAGE: &str =
+    "The request is rejected because the organization has no GuardDuty delegated administrator.";
+
+/// Refusal of a removal naming an account that is not the delegated administrator
+/// the organization has.
+pub const NOT_THE_ORGANIZATION_ADMIN_MESSAGE: &str = "The request is rejected because the given account ID is not the organization's GuardDuty delegated administrator.";
+
+/// Refusal of a designation that would partition the delegated-administrator
+/// store into one Region more than it holds
+/// ([`MAX_ORGANIZATION_ADMIN_REGIONS`]). States the rule without quoting the
+/// caller's Region back, like [`DETECTOR_REGION_LIMIT_MESSAGE`].
+pub const ORGANIZATION_ADMIN_REGION_LIMIT_MESSAGE: &str = "The request is rejected because this emulator will not hold a GuardDuty delegated administrator for any further Regions.";
 
 /// The AWS Region a request was signed for, which is the Region the resources it
 /// creates live in. Falls back to the emulator's default Region for an unsigned

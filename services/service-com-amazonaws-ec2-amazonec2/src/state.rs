@@ -2219,6 +2219,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// entry has had no application status check reported for it, which is exactly the
     /// `not-applicable` instance-level status `DescribeApplicationStatus` answers with.
     pub application_status: BTreeMap<String, InstanceApplicationStatusRecord>,
+    /// The CONFIGURATION of every application status check the account holds, by
+    /// `ApplicationStatusCheckId` — see [`application_status_checks`], the submodule that
+    /// owns this slice. Ordered by id in a [`BTreeMap`], the arrangement every other store
+    /// here uses: that id order is the one stable order the describe reports and pages over,
+    /// so a pagination token can name the id the next page starts at.
+    pub application_status_checks:
+        BTreeMap<String, crate::ops::types::ApplicationStatusCheckResponseObject>,
     /// The Windows fast launch configuration of every image that has one, by `ImageId` —
     /// see the module docs. Ordered by id, which is the order
     /// `DescribeFastLaunchImages` reports and pages over.
@@ -2645,6 +2652,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             interruptible_allocation_client_tokens: HashMap::new(),
             capacity_reservation_client_tokens: HashMap::new(),
             application_status: BTreeMap::new(),
+            application_status_checks: BTreeMap::new(),
             fast_launch_images: BTreeMap::new(),
             store_image_tasks: BTreeMap::new(),
             addresses: BTreeMap::new(),
@@ -12408,6 +12416,18 @@ impl ComAmazonawsEc2Amazonec2State {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Application status checks: the configurations `DescribeApplicationStatusChecks` reports
+// ---------------------------------------------------------------------------
+
+/// This service's application status CHECK slice: the store's id prefix, the refusal a
+/// request naming an unknown check answers, and what tells an active check from one inside
+/// its deletion grace period. A SUBMODULE, so that surface grows without touching the parts
+/// of this file the other resource kinds own; `pub use` keeps every name reachable as
+/// `crate::state::<name>`, which is where each handler names it.
+pub mod application_status_checks;
+pub use application_status_checks::*;
 
 // ---------------------------------------------------------------------------
 // Pagination tokens

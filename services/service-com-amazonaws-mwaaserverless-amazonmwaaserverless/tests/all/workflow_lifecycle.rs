@@ -1147,6 +1147,10 @@ async fn deleting_one_named_version_keeps_the_workflow_until_no_version_is_left(
                 .engine
                 .state::<ComAmazonawsMwaaserverlessAmazonmwaaserverlessState>();
             let mut store = state.lock();
+            // The append position the seeded version takes, from the same monotonic
+            // counter a minted version takes it from, so it sorts after the created one.
+            store.mint_seq += 1;
+            let sequence = store.mint_seq;
             let workflow = store.workflows.get_mut(&arn).expect("the created workflow");
             let created_at = workflow.created_at + Duration::from_secs(1);
             for record in &mut workflow.versions {
@@ -1156,6 +1160,7 @@ async fn deleting_one_named_version_keeps_the_workflow_until_no_version_is_left(
                 version: second.clone(),
                 created_at,
                 is_latest: true,
+                sequence,
                 snapshot: WorkflowSnapshot {
                     definition_s3_location: DefinitionS3Location {
                         bucket: "defs".to_string(),

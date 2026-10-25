@@ -281,6 +281,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let nonce = store.next_nonce(now);
         let version = crate::state::mint_workflow_version(&arn, &fingerprint, &nonce);
         let revision_id = crate::state::mint_revision_id(&arn, &version);
+        // The append position this version keeps: the mint counter the nonce above
+        // just advanced, which is what a version listing pages over.
+        let sequence = store.mint_seq;
 
         // The configuration the new version freezes: what this request supplies, plus the
         // encryption configuration an update cannot express. The code is copied "at the
@@ -310,6 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             is_latest: true,
             snapshot,
+            sequence,
         });
         workflow.current_version = version;
         workflow.revision_id = revision_id;

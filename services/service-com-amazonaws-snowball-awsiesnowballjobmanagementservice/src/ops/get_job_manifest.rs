@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetJobManifest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetJobManifest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetJobManifest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The manifest file of one job: the Amazon S3 URL `GetJobManifest` publishes for the
+//! encrypted manifest of a job whose device is in the caller's hands, read out of the
+//! grant this service records when it publishes that URL — this is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +150,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetJobManifest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetJobManifestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetJobManifest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        // The URL addresses a bucket in the Region the request was signed for: the
+        // credential scope is the only Region a request carries.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let Some(job) = store.jobs.get(&input.job_id) else {
+            return Err(GetJobManifestErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The job ID {} can't be found. Check the information you provided in \
+                         your last request, and try again.",
+                        input.job_id
+                    )),
+                    resource_type: Some("job".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The manifest is one half of the pair that secures a DEVICE: it "is decrypted by
+        // using the UnlockCode code value, when you pass both values to the Snow device
+        // through the Snowball client". "Main jobs aren't associated with any Snowballs.
+        // Instead, each main job will have at least one job part, and each job part is
+        // associated with a Snowball" (`JobListEntry$IsMaster`): the manifest of an export
+        // order's main job is a resource no record answers to, which is what
+        // `InvalidResourceException` states, and its job parts are what carry one.
+        if job.is_master() {
+            return Err(GetJobManifestErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The job {} is the main job of an export order and is associated with \
+                         no Snowball, so it has no manifest file. Request the manifest of one \
+                         of its job parts instead.",
+                        job.job_id
+                    )),
+                    resource_type: Some("job".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The manifest is an encrypted file that you can download after your job enters
+        // the WithCustomer status. This is the only valid status for calling this API as
+        // the manifest and UnlockCode code value are used for securing your device and
+        // should only be used when you have the device": from any other state the job's
+        // device is not in the caller's hands, which is a property of where the job GOT TO
+        // and so is what `InvalidJobStateException` states.
+        if !job.job_state.releases_device_credentials() {
+            return Err(GetJobManifestErrorModeled::InvalidJobStateException(
+                InvalidJobStateException {
+                    message: Some(format!(
+                        "The job {} is in state {}, and its manifest file can only be \
+                         requested while the job is in state {}.",
+                        job.job_id,
+                        job.job_state.as_wire(),
+                        crate::state::JobState::WithCustomer.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The credentials of a given job, including its manifest file and unlock code,
+        // expire 360 days after the job is created": past that window the job's credentials
+        // are gone, so there is no manifest left to publish a URL for — a resource no
+        // record answers to, rather than a state the job is in, since the job itself is
+        // unchanged and the window is fixed by its creation instant.
+        if !job.device_credentials_are_readable(now) {
+            return Err(GetJobManifestErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The manifest file of job {} can't be found: a job's credentials \
+                         expire {} days after the job is created, and that window has closed.",
+                        job.job_id,
+                        crate::state::DEVICE_CREDENTIAL_VALIDITY.as_secs() / (24 * 60 * 60)
+                    )),
+                    resource_type: Some("job".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Issuing the grant is what this operation DOES — it hands the caller a URL
+        // available for the 60 minutes the operation documents, after which "you'll have
+        // to make another call to the GetJobManifest action" — so the store records the URL
+        // it published, and the response is read back out of that record.
+        let grant = store.issue_job_file_grant(crate::state::JobFile::Manifest, &input.job_id, now);
+
+        Ok(GetJobManifestOutput {
+            manifest_uri: Some(grant.uri(&region)),
+        })
     }
 }

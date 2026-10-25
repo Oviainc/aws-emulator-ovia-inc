@@ -171,6 +171,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata.
         let _ = ctx;
+        // The budgets control plane is scoped to the account the caller signed with, so
+        // an `AccountId` naming any other account is refused with the modelled 403
+        // before anything is read or written (`crate::state::foreign_account_refusal`).
+        if let Some(message) = crate::state::foreign_account_refusal(&input.account_id) {
+            return Err(DeleteBudgetActionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteBudgetActionErrorModeled::InternalErrorException(InternalErrorException {
                 message: Some(

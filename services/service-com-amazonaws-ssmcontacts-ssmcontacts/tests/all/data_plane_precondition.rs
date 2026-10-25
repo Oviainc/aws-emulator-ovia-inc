@@ -70,7 +70,7 @@ fn epoch_seconds_now() -> f64 {
 
 /// The resources the gated operations name when the target EXISTS, and the never-created
 /// ARNs they name when it does not.
-struct Targets {
+pub(crate) struct Targets {
     contact: String,
     channel: String,
     rotation: String,
@@ -141,7 +141,7 @@ impl Targets {
     }
 
     /// Well-formed ARNs naming resources nothing ever created.
-    fn absent() -> Self {
+    pub(crate) fn absent() -> Self {
         Self {
             contact: format!("arn:aws:ssm-contacts:{REGION}:{ACCOUNT}:contact/never-created"),
             channel: format!(
@@ -235,15 +235,20 @@ pub(crate) async fn activation_status(
 
 /// One gated operation: how to build its request, and what an ONBOARDED account gets when
 /// that request names a resource nothing created.
-struct GatedOperation {
-    operation: &'static str,
-    body: fn(&Targets) -> Value,
+///
+/// `pub(crate)` with the table below because `tests/all/default_onboarding.rs` asserts the
+/// other side of this rule — that the account a client finds is already onboarded, so each
+/// of these operations answers about its own subject — over the SAME table, which is what
+/// keeps the two suites' idea of "the gated surface" from drifting apart.
+pub(crate) struct GatedOperation {
+    pub(crate) operation: &'static str,
+    pub(crate) body: fn(&Targets) -> Value,
     /// 404 for an operation that resolves a resource; 200 for the listing, which resolves
     /// none — an empty page is the right answer to "list what is not there".
-    absent_status: u16,
+    pub(crate) absent_status: u16,
 }
 
-const GATED_OPERATIONS: &[GatedOperation] = &[
+pub(crate) const GATED_OPERATIONS: &[GatedOperation] = &[
     GatedOperation {
         operation: "ActivateContactChannel",
         body: |targets| json!({"ContactChannelId": targets.channel, "ActivationCode": "000000"}),

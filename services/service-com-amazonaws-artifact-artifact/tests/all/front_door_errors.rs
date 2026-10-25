@@ -618,13 +618,25 @@ async fn a_body_that_binds_reaches_the_operation() {
     // Every value the model admits for `supportMode`, plus the member left out
     // entirely ("Defaults to AI_ONLY if not specified"): the front door passes each
     // one, so none of them is answered as a refusal of the request.
-    for support_mode in [Some("AI_ONLY"), Some("FULL_SUPPORT"), None] {
-        let body = match support_mode {
-            Some(mode) => create_body(json!({ "supportMode": mode })),
-            None => create_body(json!({ "supportMode": null })),
-        };
+    //
+    // `FULL_SUPPORT` is "[o]nly supported for file upload mode", so the row carrying it
+    // submits an upload — the front door's job is to BIND the member, and what the
+    // operation then does with the pair is asserted in
+    // `compliance_inquiry_support_mode.rs`.
+    let rows = [
+        ("AI_ONLY", create_body(json!({ "supportMode": "AI_ONLY" }))),
+        (
+            "FULL_SUPPORT",
+            create_body(json!({
+                "supportMode": "FULL_SUPPORT",
+                // Base64 of an uploaded document's bytes, as restJson1 carries a blob.
+                "inquiryContent": { "fileContent": { "content": "cXVlc3Rpb25uYWlyZQ==" } },
+            })),
+        ),
+        ("absent", create_body(json!({ "supportMode": null }))),
+    ];
+    for (case, body) in rows {
         let answer = call(&router, "POST", "/v1/compliance-inquiry/create", Some(body)).await;
-        let case = support_mode.unwrap_or("absent");
         assert_ne!(
             answer.status,
             INVALID_BODY.0,

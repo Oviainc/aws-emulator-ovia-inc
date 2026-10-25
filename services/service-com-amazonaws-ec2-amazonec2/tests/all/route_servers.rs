@@ -848,3 +848,594 @@ async fn pages_are_served_in_id_order() {
          got body {body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// What `DescribeRouteServers` REPORTS out of the store
+//
+// RULE 1's reporting half, driven over the same wire and the same helpers as the rows
+// above, but written along what it generalises over where the tables above do not: how
+// many values ONE filter carries, EC2's `*`/`?` wildcards, case sensitivity, a member the
+// route server has not got, a filter name the operation does not answer, how many ids are
+// named and in which order, each published `MaxResults` bound and one past it, and a page
+// cut from the FILTERED set rather than from the whole store. Every route server is still
+// minted by `CreateRouteServer`, so each row round-trips through the two operations.
+// ---------------------------------------------------------------------------
+
+/// One row of a report table: `(case, the request parameters, the fixture indices it
+/// selects)`. The expectation is an index into the seeded fixtures, never a literal id: the
+/// ids are the service's to mint.
+type ReportRow = (&'static str, Params, Vec<usize>);
+
+/// What one seeded route server is created with, beside the id the service mints.
+struct ReportFixture {
+    /// "The Border Gateway Protocol (BGP) Autonomous System Number (ASN) for the appliance"
+    /// (`CreateRouteServerRequest$AmazonSideAsn`).
+    asn: i64,
+    /// The minutes of route persistence to ask for, or `None` for a route server that asks
+    /// for none — which then carries no `PersistRoutesDuration` at all.
+    persist_duration: Option<i64>,
+    /// Whether SNS notifications are enabled, which is also what decides whether the route
+    /// server carries an `SnsTopicArn`.
+    sns: bool,
+    /// The tags the create applies.
+    tags: &'static [(&'static str, &'static str)],
+}
+
+/// The route servers the report tables are written against. They differ along every member
+/// a filter selects on — the ASN, the persistence duration, the SNS flag and the tags — and
+/// along whether the optional members are carried at all.
+fn report_fixtures() -> Vec<ReportFixture> {
+    vec![
+        ReportFixture {
+            asn: 64_512,
+            persist_duration: Some(1),
+            sns: true,
+            tags: &[("Name", "edge"), ("Tier", "prod")],
+        },
+        ReportFixture {
+            asn: 64_513,
+            persist_duration: None,
+            sns: false,
+            tags: &[],
+        },
+        ReportFixture {
+            // A 32-bit ASN, the other range the member recommends.
+            asn: 4_200_000_000,
+            persist_duration: None,
+            sns: false,
+            tags: &[("Name", "lab")],
+        },
+        ReportFixture {
+            asn: 65_534,
+            // The top of the published duration range.
+            persist_duration: Some(5),
+            sns: true,
+            tags: &[("Name", "edge")],
+        },
+        ReportFixture {
+            asn: 64_999,
+            persist_duration: None,
+            sns: false,
+            tags: &[("Tier", "prod")],
+        },
+        ReportFixture {
+            // The bottom of the published ASN range.
+            asn: 1,
+            persist_duration: Some(2),
+            sns: false,
+            tags: &[("Name", "edge-2")],
+        },
+    ]
+}
+
+/// The create parameters one fixture is asked for, beside its ASN.
+fn report_create_params(fixture: &ReportFixture) -> Params {
+    let mut params = Params::new();
+    if let Some(duration) = fixture.persist_duration {
+        params.push(p("PersistRoutes", "enable"));
+        params.push(p("PersistRoutesDuration", duration.to_string()));
+    }
+    if fixture.sns {
+        params.push(p("SnsNotificationsEnabled", "true"));
+    }
+    if !fixture.tags.is_empty() {
+        params.push(p("TagSpecification.1.ResourceType", "route-server"));
+        for (ordinal, (key, value)) in fixture.tags.iter().enumerate() {
+            let nth = ordinal + 1;
+            params.push(p(&format!("TagSpecification.1.Tag.{nth}.Key"), *key));
+            params.push(p(&format!("TagSpecification.1.Tag.{nth}.Value"), *value));
+        }
+    }
+    params
+}
+
+/// Mint every report fixture and answer the ids in FIXTURE order, which the tables index
+/// into.
+async fn seed_reports(router: &MultiServiceRouter) -> Vec<String> {
+    let mut ids = Vec::new();
+    for (ordinal, fixture) in report_fixtures().iter().enumerate() {
+        let case = format!("the fixture at {ordinal}");
+        ids.push(created_id(router, &case, fixture.asn, report_create_params(fixture)).await);
+    }
+    ids
+}
+
+/// The fixtures at `indices`, in the `RouteServerId` order the report is served in — the
+/// ids are minted by the service, so the expectation is sorted rather than assumed to
+/// follow the order the fixtures were created in.
+fn reported_ids(seeded: &[String], indices: &[usize]) -> Vec<String> {
+    let mut ids: Vec<String> = indices.iter().map(|index| seeded[*index].clone()).collect();
+    ids.sort();
+    ids
+}
+
+/// One filter as request parameters: the filter `name` carrying `values`.
+fn one_filter(name: &str, values: &[&str]) -> Params {
+    filters(&[(name, values)])
+}
+
+/// RULE 1, reporting half: each filter selects on the member it names, over as many values
+/// as the request carries, with EC2's wildcards, case-sensitively; filters are AND'ed with
+/// one another; a member the route server does not carry selects it never; and a filter name
+/// the operation does not answer is refused rather than read as "no results".
+#[tokio::test]
+async fn one_filter_selects_over_its_values_wildcards_and_absent_members() {
+    let router = emulator();
+    let seeded = seed_reports(&router).await;
+    let all: Vec<usize> = (0..seeded.len()).collect();
+    // Every row below selects on a member that is settled once the clock has run, so the
+    // table cannot read a transient word; the tables above pin the transient ones.
+    past_the_transition().await;
+
+    let cases: Vec<ReportRow> = vec![
+        (
+            "one value selects the route server carrying it",
+            one_filter("amazon-side-asn", &["64512"]),
+            vec![0],
+        ),
+        (
+            "two values of one filter are OR'd",
+            one_filter("amazon-side-asn", &["64512", "65534"]),
+            vec![0, 3],
+        ),
+        (
+            "three values of one filter are OR'd",
+            one_filter("amazon-side-asn", &["1", "64999", "4200000000"]),
+            vec![2, 4, 5],
+        ),
+        (
+            "a `*` wildcard matches a run of characters",
+            one_filter("amazon-side-asn", &["645*"]),
+            vec![0, 1],
+        ),
+        (
+            "a `?` wildcard matches exactly one character",
+            one_filter("amazon-side-asn", &["6451?"]),
+            vec![0, 1],
+        ),
+        (
+            "a value nothing carries selects nothing",
+            one_filter("amazon-side-asn", &["64514"]),
+            vec![],
+        ),
+        (
+            "persist-routes-duration OR's its values too",
+            one_filter("persist-routes-duration", &["2", "5"]),
+            vec![3, 5],
+        ),
+        (
+            "a route server that persists no routes carries no duration, so no value of \
+             that filter can select it",
+            one_filter("persist-routes-duration", &["*"]),
+            vec![0, 3, 5],
+        ),
+        (
+            "a route server with notifications off carries no topic ARN",
+            one_filter("sns-topic-arn", &["*"]),
+            vec![0, 3],
+        ),
+        (
+            "the other wire rendering of a boolean member selects the rest",
+            one_filter("sns-notifications-enabled", &["false"]),
+            vec![1, 2, 4, 5],
+        ),
+        (
+            "tag-key selects every route server carrying that key, whatever its value",
+            one_filter("tag-key", &["Name"]),
+            vec![0, 2, 3, 5],
+        ),
+        (
+            "tag-key on a key only some carry",
+            one_filter("tag-key", &["Tier"]),
+            vec![0, 4],
+        ),
+        (
+            "tag-key on a key nothing carries",
+            one_filter("tag-key", &["Owner"]),
+            vec![],
+        ),
+        (
+            "tag:<key> takes a wildcard as well",
+            one_filter("tag:Name", &["edge*"]),
+            vec![0, 3, 5],
+        ),
+        (
+            "tag:<key> on another key's value selects nothing",
+            one_filter("tag:Name", &["prod"]),
+            vec![],
+        ),
+        (
+            // "Filter values are case-sensitive" (`Filter$Values`).
+            "a filter value is case-sensitive",
+            one_filter("tag:Name", &["EDGE"]),
+            vec![],
+        ),
+        (
+            "persist-routes-state selects the ones that asked for no persistence",
+            one_filter("persist-routes-state", &["disabled"]),
+            vec![1, 2, 4],
+        ),
+        (
+            "route-server-id takes a wildcard over the minted ids",
+            one_filter("route-server-id", &["rs-*"]),
+            all.clone(),
+        ),
+        (
+            "an id-shaped value nothing was minted selects nothing",
+            one_filter("route-server-id", &["rs-0ffffffffffffffff"]),
+            vec![],
+        ),
+        // Two and three filters in ONE request: the filters are AND'ed, so the answer is
+        // the intersection of what each of them selects, never the union.
+        (
+            "two filters are AND'ed",
+            filters(&[
+                ("sns-notifications-enabled", &["true"]),
+                ("tag:Name", &["edge"]),
+            ]),
+            vec![0, 3],
+        ),
+        (
+            "two filters whose selections overlap in one route server",
+            filters(&[
+                ("persist-routes-state", &["enabled"]),
+                ("tag:Tier", &["prod"]),
+            ]),
+            vec![0],
+        ),
+        (
+            "three filters are AND'ed too",
+            filters(&[
+                ("state", &["available"]),
+                ("sns-notifications-enabled", &["false"]),
+                ("tag-key", &["Name"]),
+            ]),
+            vec![2, 5],
+        ),
+        (
+            "two filters with no route server in common select nothing",
+            filters(&[("amazon-side-asn", &["64512"]), ("tag:Name", &["lab"])]),
+            vec![],
+        ),
+    ];
+
+    for (case, params, indices) in cases {
+        let reported = described_ids(&router, case, &params).await;
+        let expected = reported_ids(&seeded, &indices);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {expected:?}, got {reported:?}"
+        );
+    }
+
+    // A filter name this operation does not answer is REFUSED, whether or not a route server
+    // would have matched it — and a `tag:` prefix with no key names no tag, so it is as
+    // undocumented as a misspelling.
+    for (case, name) in [
+        (
+            "a filter naming no member of the described shape",
+            "route-server-arn",
+        ),
+        ("a member of another resource", "vpc-id"),
+        ("the right member in the wrong spelling", "amazonSideAsn"),
+        ("a tag filter carrying no key", "tag:"),
+    ] {
+        let (status, body) = describe(&router, &one_filter(name, &["*"])).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the filter {name:?} to be refused with HTTP 400, got \
+             {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValue",
+            "case {case:?}: expected InvalidParameterValue for the filter {name:?}, got body \
+             {body}"
+        );
+    }
+}
+
+/// `RouteServerIds` narrows the report to the ids named — in `RouteServerId` order whatever
+/// order they were asked for, however many are named and however often one repeats — and
+/// composes with the filters the same call carries.
+#[tokio::test]
+async fn route_server_ids_narrow_the_report_however_they_are_named() {
+    let router = emulator();
+    let seeded = seed_reports(&router).await;
+    past_the_transition().await;
+
+    // Rows differ in how many ids are named, in the order they are asked for, and in whether
+    // one repeats.
+    let cases: Vec<(&str, Vec<usize>, Vec<usize>)> = vec![
+        ("one id", vec![0], vec![0]),
+        ("another single id", vec![5], vec![5]),
+        ("two ids", vec![2, 4], vec![2, 4]),
+        (
+            "the same two, asked for the other way round",
+            vec![4, 2],
+            vec![2, 4],
+        ),
+        ("three ids out of order", vec![5, 1, 3], vec![1, 3, 5]),
+        ("one id named twice", vec![3, 3], vec![3]),
+        (
+            "every id the account holds",
+            vec![0, 1, 2, 3, 4, 5],
+            vec![0, 1, 2, 3, 4, 5],
+        ),
+    ];
+    for (case, asked, indices) in cases {
+        let ids: Vec<String> = asked.iter().map(|index| seeded[*index].clone()).collect();
+        let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let reported =
+            described_ids(&router, case, &indexed("RouteServerId", borrowed.as_slice())).await;
+        let expected = reported_ids(&seeded, &indices);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {expected:?}, got {reported:?}"
+        );
+    }
+
+    // The ids named and the filters carried narrow the SAME report: the answer is their
+    // intersection, not one or the other.
+    let named = [0usize, 1, 2];
+    let ids: Vec<String> = named.iter().map(|index| seeded[*index].clone()).collect();
+    let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let mut params = indexed("RouteServerId", borrowed.as_slice());
+    params.extend(one_filter("sns-notifications-enabled", &["false"]));
+    let case = "three ids and a filter";
+    let reported = described_ids(&router, case, &params).await;
+    let expected = reported_ids(&seeded, &[1, 2]);
+    assert_eq!(
+        reported, expected,
+        "case {case:?}: expected the named route servers that also match, got {reported:?}"
+    );
+}
+
+/// One row of the `MaxResults` table: `(case, the page size asked for, the status it is
+/// answered with, and — when that status is 200 — the rows the page must hold and whether a
+/// token is due)`.
+type PageBoundRow = (&'static str, i64, u16, Option<(usize, bool)>);
+
+/// `MaxResults` is accepted at each bound the model publishes — cutting the page to that
+/// many rows, with a token exactly when a row follows — and refused one past either bound:
+/// `RouteServerMaxResults` is modelled `range 5..1000`
+/// (`smithy_query(query="operation",operation="DescribeRouteServers")`), which the boundary
+/// validator holds a request to before the handler runs.
+#[tokio::test]
+async fn max_results_is_accepted_at_each_published_bound_and_refused_past_it() {
+    let router = emulator();
+    let seeded = seed_reports(&router).await;
+
+    // Six route servers are seeded, so the published minimum leaves a remainder and the
+    // published maximum holds the lot.
+    let cases: [PageBoundRow; 4] = [
+        ("one below the published minimum", 4, 400, None),
+        ("the published minimum", 5, 200, Some((5, true))),
+        ("the published maximum", 1000, 200, Some((seeded.len(), false))),
+        ("one above the published maximum", 1001, 400, None),
+    ];
+    for (case, max_results, expected_status, page) in cases {
+        let (status, body) = describe(&router, &[p("MaxResults", max_results.to_string())]).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status} for MaxResults={max_results}, \
+             got {status} with body {body}"
+        );
+        match page {
+            // The modelled `@range` is enforced by the boundary validator, which answers the
+            // service's validation code naming the member and the constraint it failed —
+            // not the handler's own parameter refusal.
+            None => {
+                assert_eq!(
+                    error_code(&body),
+                    "ValidationError",
+                    "case {case:?}: expected the modelled range refusal, got body {body}"
+                );
+                assert!(
+                    body.contains("maxResults"),
+                    "case {case:?}: expected the refusal to name the member, got body {body}"
+                );
+            }
+            Some((rows, token_due)) => {
+                let reported = elements(&body, "routeServerId");
+                assert_eq!(
+                    reported.len(),
+                    rows,
+                    "case {case:?}: expected the page to hold {rows} route servers, got \
+                     {reported:?}"
+                );
+                assert_eq!(
+                    element(&body, "nextToken").is_some(),
+                    token_due,
+                    "case {case:?}: expected a token to be due: {token_due}, got body {body}"
+                );
+            }
+        }
+    }
+}
+
+/// Walking the pages covers every route server the request selects EXACTLY ONCE, in
+/// `RouteServerId` order, for every page size — and a page is cut from the FILTERED set, so
+/// `MaxResults`, a filter and the token compose.
+#[tokio::test]
+async fn paging_walks_the_selected_set_exactly_once_for_every_page_size() {
+    let router = emulator();
+    // A store large enough for the published minimum page size to leave a remainder, with a
+    // filterable split: the even-numbered route servers ask for SNS notifications.
+    let mut all_ids: Vec<String> = Vec::new();
+    let mut notified: Vec<String> = Vec::new();
+    for nth in 0..13i64 {
+        let notify = nth % 2 == 0;
+        let extra = if notify {
+            vec![p("SnsNotificationsEnabled", "true")]
+        } else {
+            Params::new()
+        };
+        let id = created_id(&router, "the seed", 64_512 + nth, extra).await;
+        if notify {
+            notified.push(id.clone());
+        }
+        all_ids.push(id);
+    }
+    all_ids.sort();
+    notified.sort();
+
+    /// Walk every page of `base` at `page_size` and answer the ids, in the order the service
+    /// reported them.
+    async fn walk(
+        router: &MultiServiceRouter,
+        case: &str,
+        base: &[(String, String)],
+        page_size: i64,
+        expected_total: usize,
+    ) -> Vec<String> {
+        let cap = usize::try_from(page_size).expect("the page size fits a usize");
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        for page in 0..=expected_total {
+            let mut params = base.to_vec();
+            params.push(p("MaxResults", page_size.to_string()));
+            if let Some(cursor) = token.as_ref() {
+                params.push(p("NextToken", cursor.clone()));
+            }
+            let (status, body) = describe(router, &params).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 on page {page}, got {status} with body {body}"
+            );
+            let reported = elements(&body, "routeServerId");
+            assert!(
+                reported.len() <= cap,
+                "case {case:?}: page {page} may hold at most {page_size} ids, got {reported:?}"
+            );
+            walked.extend(reported);
+            token = element(&body, "nextToken");
+            if token.is_none() {
+                return walked;
+            }
+        }
+        panic!("case {case:?}: paging did not terminate, walked {walked:?}");
+    }
+
+    // Rows: the published minimum page size, one that does not divide the store, one that
+    // holds all but one, the exact size of the store, and the published maximum.
+    for page_size in [5i64, 6, 12, 13, 1000] {
+        let case = format!("the whole store at MaxResults={page_size}");
+        let walked = walk(&router, &case, &[], page_size, all_ids.len()).await;
+        assert_eq!(
+            walked, all_ids,
+            "case {case:?}: expected every route server exactly once in id order, got \
+             {walked:?}"
+        );
+    }
+
+    // The same walk over a FILTERED set: the pages cover exactly the route servers the
+    // filter selects, and the token resumes inside that set rather than in the whole store.
+    let filtered = one_filter("sns-notifications-enabled", &["true"]);
+    for page_size in [5i64, 6, 1000] {
+        let case = format!("the filtered set at MaxResults={page_size}");
+        let walked = walk(&router, &case, &filtered, page_size, notified.len()).await;
+        assert_eq!(
+            walked, notified,
+            "case {case:?}: expected exactly the route servers the filter selects, got \
+             {walked:?}"
+        );
+    }
+
+    // A set that fits in one page carries no token at all: "This value is null when there
+    // are no more results to return" (`DescribeRouteServersResult$NextToken`).
+    let mut params = filtered.clone();
+    params.push(p("MaxResults", notified.len().to_string()));
+    let (status, body) = describe(&router, &params).await;
+    assert_eq!(
+        status, 200,
+        "case \"a page that holds the whole filtered set\": got {status} with body {body}"
+    );
+    assert!(
+        element(&body, "nextToken").is_none(),
+        "case \"a page that holds the whole filtered set\": nothing follows it, so no token \
+         is due, got body {body}"
+    );
+}
+
+/// Describing is a READ: two identical calls answer the same — the same ids AND the same
+/// words — and a route server created after them is reported by the next, so the answer is
+/// computed from the store rather than fixed.
+#[tokio::test]
+async fn describing_changes_nothing_and_a_later_create_is_reported() {
+    let router = emulator();
+    let seeded = seed_reports(&router).await;
+    let every_id = reported_ids(&seeded, &(0..seeded.len()).collect::<Vec<usize>>());
+
+    let first = described_ids(&router, "the first read", &[]).await;
+    assert_eq!(
+        first, every_id,
+        "case \"the first read\": expected every route server in id order, got {first:?}"
+    );
+    let second = described_ids(&router, "the second read", &[]).await;
+    assert_eq!(
+        second, first,
+        "case \"the second read\": a read must not change what a later caller sees, got \
+         {second:?}"
+    );
+
+    // Not just the ids: the WORDS each read reports are identical too, so a read can neither
+    // advance a clock-owed state nor write a default into the store. The clock-owed moves
+    // are settled FIRST, so a `pending` -> `available` the clock owed — which is correct —
+    // cannot fall between the two reads and read as a read-side write.
+    past_the_transition().await;
+    let (_, first_body) = describe(&router, &[]).await;
+    let (_, second_body) = describe(&router, &[]).await;
+    for member in [
+        "state",
+        "persistRoutesState",
+        "persistRoutesDuration",
+        "amazonSideAsn",
+        "snsNotificationsEnabled",
+        "snsTopicArn",
+    ] {
+        let before = elements(&first_body, member);
+        let after = elements(&second_body, member);
+        assert_eq!(
+            before, after,
+            "case \"two reads of {member}\": a read must not change what a later caller sees, \
+             got {before:?} then {after:?}"
+        );
+    }
+
+    let late = created_id(
+        &router,
+        "a route server created after the reads",
+        65_000,
+        Params::new(),
+    )
+    .await;
+    let mut expected = every_id.clone();
+    expected.push(late.clone());
+    expected.sort();
+    let after = described_ids(&router, "after the later create", &[]).await;
+    assert_eq!(
+        after, expected,
+        "case \"after the later create\": expected {late:?} to be reported too, got {after:?}"
+    );
+}

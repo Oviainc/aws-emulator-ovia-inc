@@ -41,6 +41,8 @@ mod harness;
 mod import_tasks;
 #[path = "all/index_policies.rs"]
 mod index_policies;
+#[path = "all/index_policy_puts.rs"]
+mod index_policy_puts;
 #[path = "all/ingestion_window.rs"]
 mod ingestion_window;
 #[path = "all/integrations.rs"]

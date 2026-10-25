@@ -3135,6 +3135,33 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         stored.etag = etag;
         Some(stored)
     }
+
+    /// Replace the configuration of the origin access identity `id` names, and report the
+    /// record as it now stands.
+    ///
+    /// The submitted configuration becomes the stored one WHOLE, and the version token is
+    /// freshly minted, so the token the caller matched on no longer satisfies an
+    /// `If-Match` against this identity. Nothing else about an identity changes: the id it
+    /// was created under and the Amazon S3 canonical user id minted with it are fixed for
+    /// its whole life, and an identity carries neither a status nor a propagation deadline,
+    /// so the clock owes it nothing.
+    ///
+    /// `None` when the store holds no such identity, checked BEFORE the mint so a version
+    /// token is never spent on an identity that is not there.
+    pub fn apply_origin_access_identity_config(
+        &mut self,
+        id: &str,
+        config: CloudFrontOriginAccessIdentityConfig,
+    ) -> Option<&StoredOriginAccessIdentity> {
+        if !self.origin_access_identities.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.origin_access_identities.get_mut(id)?;
+        stored.config = config;
+        stored.etag = etag;
+        Some(stored)
+    }
 }
 
 /// Why a create was refused, for the calling operation to report as its own modelled

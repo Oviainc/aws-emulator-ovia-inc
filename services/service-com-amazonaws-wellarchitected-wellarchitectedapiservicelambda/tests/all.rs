@@ -42,6 +42,9 @@ mod answer_updates;
 #[path = "all/custom_lens_import.rs"]
 mod custom_lens_import;
 
+#[path = "all/custom_lens_review_answers.rs"]
+mod custom_lens_review_answers;
+
 #[path = "all/custom_lens_versions.rs"]
 mod custom_lens_versions;
 
@@ -143,6 +146,9 @@ mod workload_computed_members;
 
 #[path = "all/workload_harness.rs"]
 mod workload_harness;
+
+#[path = "all/workload_lens_association.rs"]
+mod workload_lens_association;
 
 #[path = "all/workload_lifecycle.rs"]
 mod workload_lifecycle;

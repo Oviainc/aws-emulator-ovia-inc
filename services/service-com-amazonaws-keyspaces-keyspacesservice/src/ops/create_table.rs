@@ -327,19 +327,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource might not be specified correctly, or its status might not be ACTIVE"
         // (`ResourceNotFoundException`), and nothing is stored. Checked after the keyspace
         // is resolved, because its own types are what a reference resolves against, and
-        // exactly as `CreateType` checks a field's type.
+        // exactly as `CreateType` checks a field's type and `UpdateTable` an added column.
+        let usable_type_names = keyspace.usable_type_names();
         for column in &input.schema_definition.all_columns {
-            for referenced in crate::state::referenced_type_names(&column.r#type) {
-                let usable = keyspace
-                    .types
-                    .get(&referenced)
-                    .is_some_and(|udt| udt.status == crate::state::TYPE_STATUS_ACTIVE);
-                if !usable {
-                    return Err(CreateTableErrorModeled::ResourceNotFoundException(
-                        crate::state::type_not_found(&region, &input.keyspace_name, &referenced),
-                    )
-                    .into());
-                }
+            if let Some(referenced) =
+                crate::state::unresolvable_type_reference(&column.r#type, &usable_type_names)
+            {
+                return Err(CreateTableErrorModeled::ResourceNotFoundException(
+                    crate::state::type_not_found(&region, &input.keyspace_name, &referenced),
+                )
+                .into());
             }
         }
 

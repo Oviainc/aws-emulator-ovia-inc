@@ -11,6 +11,11 @@
 //! * a `ContextId` for a quota that is only adjustable at the account level is
 //!   `IllegalArgumentException` — there is no resource context to read a value for.
 //!
+//! A `ContextId` on a quota AWS publishes as adjustable per resource SELECTS that
+//! resource's plane: the answer is the value in force for that resource, reported at
+//! the `RESOURCE` level with the `QuotaContext` describing it. With no `ContextId` the
+//! account-wide record comes back, which is the level this operation defaults to.
+//!
 //! Before answering it materialises the increase decisions the clock has already made
 //! due, so the value is the one in force at the instant of the call.
 //!
@@ -119,10 +124,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let account_level_only = default.adjustable_at_level == crate::state::LEVEL_ACCOUNT;
+        let resource_adjustable = default.resource_adjustable();
 
         if let Some(context_id) = input.context_id.as_deref() {
-            if account_level_only {
+            if !resource_adjustable {
                 return Err(GetServiceQuotaErrorModeled::IllegalArgumentException(
                     IllegalArgumentException {
                         message: Some(format!(
@@ -136,7 +141,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let quota = quotas_state.applied_quota_view(&region, &input.service_code, &input.quota_code);
+        let quota = quotas_state.applied_quota_view(
+            &region,
+            &input.service_code,
+            &input.quota_code,
+            input.context_id.as_deref(),
+        );
 
         Ok(GetServiceQuotaOutput { quota })
     }

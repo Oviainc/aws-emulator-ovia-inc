@@ -7,9 +7,12 @@
 //! a route, a label, a status code and a serialized body are all exercised, not
 //! just a handler body.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{ResourceRef, SyncJob};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request here signs for; it must show up in every minted ARN.
@@ -389,6 +392,17 @@ impl Emulator {
         .await
     }
 
+    /// `DeleteSyncJob`: DELETE on the sync job's own path, with both the
+    /// workspace and the sync source as `@httpLabel`s and no body.
+    pub(crate) async fn delete_sync_job(&self, workspace_id: &str, sync_source: &str) -> Resp {
+        self.call(
+            "DELETE",
+            &format!("/workspaces/{workspace_id}/sync-jobs/{sync_source}"),
+            None,
+        )
+        .await
+    }
+
     /// `ListSyncJobs`: POST /workspaces/{workspaceId}/sync-jobs-list, with the
     /// workspace as the only `@httpLabel` and the page members (`maxResults`,
     /// `nextToken`) carried in the body.
@@ -440,6 +454,46 @@ impl Emulator {
         )
         .await
     }
+}
+
+/// The `syncRole` a seeded sync job carries, and the one a suite that does not
+/// care which role it names sends on a create: the modelled `RoleArn` pattern
+/// `^arn:((aws)|(aws-cn)|(aws-us-gov)):iam::[0-9]{12}:role/` with this
+/// emulator's own account segment.
+pub(crate) const SYNC_ROLE: &str = "arn:aws:iam::000000000000:role/TwinMakerSyncRole";
+
+/// Store one sync job for `sync_source` in `workspace_id`, written into the very
+/// store the handlers read, exactly as `CreateSyncJob` writes one: the job
+/// record under its source, and its ARN in the service's index.
+///
+/// Used for the sources the create path refuses (it supports one), so a suite
+/// can build the multi-job workspace a listing or an isolation rule is about.
+pub(crate) fn seed_sync_job(emulator: &Emulator, workspace_id: &str, sync_source: &str) {
+    let arn = sync_job_arn(workspace_id, sync_source);
+    let state = emulator.state();
+    let mut state = state.lock();
+    let workspace = state
+        .workspaces
+        .get_mut(workspace_id)
+        .unwrap_or_else(|| panic!("the workspace {workspace_id:?} must exist before it is seeded"));
+    workspace.sync_jobs.insert(
+        sync_source.to_string(),
+        SyncJob::accepted(
+            sync_source.to_string(),
+            arn.clone(),
+            workspace_id.to_string(),
+            SYNC_ROLE.to_string(),
+            BTreeMap::new(),
+            SystemTime::now(),
+        ),
+    );
+    state.arn_index.insert(
+        arn,
+        ResourceRef::SyncJob {
+            workspace_id: workspace_id.to_string(),
+            sync_source: sync_source.to_string(),
+        },
+    );
 }
 
 pub(crate) fn workspace_arn(workspace_id: &str) -> String {

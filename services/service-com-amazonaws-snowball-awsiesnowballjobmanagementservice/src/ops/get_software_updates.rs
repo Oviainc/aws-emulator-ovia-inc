@@ -207,10 +207,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Issuing the grant is what this operation DOES — it hands the caller a URL that
         // is available for the two days `UpdatesURI` documents — so the store records the
         // URL it published, and the response is read back out of that record.
-        let grant = store.issue_software_update_grant(&input.job_id, ::std::time::SystemTime::now());
+        let grant = store.issue_job_file_grant(
+            crate::state::JobFile::SoftwareUpdate,
+            &input.job_id,
+            ::std::time::SystemTime::now(),
+        );
 
         Ok(GetSoftwareUpdatesOutput {
-            updates_uri: Some(grant.updates_uri(&region)),
+            updates_uri: Some(grant.uri(&region)),
         })
     }
 }

@@ -5,7 +5,7 @@
 //! `CalculatedSpend$ActualSpend` makes `@required`, so every read carries it.
 //!
 //! Every test states a RULE and asserts it over a table; the request the issue recorded
-//! is one row. The harness (`router`, `call`, `account`, `same`) is the one
+//! is one row. The harness (`router`, `call`, `caller_account`, `same`) is the one
 //! `tests/all/budget_lifecycle.rs` already builds, and the planned-period keys come from
 //! the calendar walk in `tests/all/budget_read_projection.rs`.
 
@@ -20,7 +20,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     ATTRIBUTED_SPEND_AMOUNT, PERCENTAGE_LIMIT_BUDGET_TYPES, PERCENTAGE_LIMIT_UNIT,
 };
 
-use super::budget_lifecycle::{account, call, router, same};
+use super::budget_lifecycle::{caller_account, call, router, same};
 use super::budget_read_projection::month_start_offset;
 
 /// Create one budget, which must be accepted.
@@ -246,10 +246,11 @@ fn rows() -> Vec<Row> {
 /// again reports the same figure.
 #[tokio::test]
 async fn a_read_reports_the_computed_spend_in_the_unit_the_budget_tracks() {
-    let router = router();
-    // One account per row, so rows cannot see each other's budgets.
-    for (index, row) in rows().into_iter().enumerate() {
-        let account_id = account(760_000_000 + index as u64);
+    // One store per row, so rows cannot see each other's budgets: every request names
+    // the one account this service serves.
+    for row in rows() {
+        let router = router();
+        let account_id = caller_account();
         let name = row.budget["BudgetName"]
             .as_str()
             .expect("every row names its budget")
@@ -285,8 +286,7 @@ async fn a_read_reports_the_computed_spend_in_the_unit_the_budget_tracks() {
 /// documented default.
 #[tokio::test]
 async fn every_modelled_budget_type_and_granularity_reports_the_spend() {
-    let router = router();
-    for (index, budget_type) in BUDGET_TYPE_VALUES.iter().enumerate() {
+    for budget_type in BUDGET_TYPE_VALUES.iter() {
         // A unit per budget type, so the assertion cannot pass on a single unit the
         // service might report for everything.
         let (limit, unit) = if PERCENTAGE_LIMIT_BUDGET_TYPES.contains(budget_type) {
@@ -296,9 +296,10 @@ async fn every_modelled_budget_type_and_granularity_reports_the_spend() {
         } else {
             (json!({"Amount": "100", "Unit": "USD"}), "USD")
         };
-        for (unit_index, time_unit) in TIME_UNIT_VALUES.iter().enumerate() {
+        for time_unit in TIME_UNIT_VALUES.iter() {
             let case = format!("{budget_type} / {time_unit}");
-            let account_id = account(770_000_000 + (index * 100 + unit_index) as u64);
+            let router = router();
+            let account_id = caller_account();
             let mut budget = json!({
                 "BudgetName": "catalog-spend",
                 "TimeUnit": time_unit,
@@ -321,7 +322,7 @@ async fn every_modelled_budget_type_and_granularity_reports_the_spend() {
 #[tokio::test]
 async fn the_spend_follows_the_unit_the_budget_tracks_across_updates() {
     let router = router();
-    let account_id = account(780_000_000);
+    let account_id = caller_account();
     let name = "updated-spend";
     let created = json!({
         "BudgetName": name,

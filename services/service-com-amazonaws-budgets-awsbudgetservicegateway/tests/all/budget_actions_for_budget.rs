@@ -49,7 +49,7 @@ use super::budget_action_execution::{
     create_body, definition_for, describe_action, email_subscriber, execute_action, is_action_id,
     seed_action, seed_budget, sns_subscriber,
 };
-use super::budget_lifecycle::{account, call, is_error, router, same};
+use super::budget_lifecycle::{caller_account, call, is_error, router, same};
 
 /// One row of the action table: a case name and the `CreateBudgetAction` body it creates.
 struct Row {
@@ -221,7 +221,7 @@ async fn walk_action_pages(
 #[tokio::test]
 async fn the_list_reports_every_action_of_the_budget_as_a_read_reports_it() {
     let router = router();
-    let account_id = account(981_818_181);
+    let account_id = caller_account();
     let budget_name = "listed";
     seed_budget(&router, &account_id, budget_name).await;
 
@@ -275,7 +275,7 @@ async fn the_list_reports_every_action_of_the_budget_as_a_read_reports_it() {
 #[tokio::test]
 async fn a_budget_holding_no_actions_is_served_as_an_empty_list() {
     let router = router();
-    let account_id = account(982_828_282);
+    let account_id = caller_account();
 
     seed_budget(&router, &account_id, "never-had-one").await;
     seed_budget(&router, &account_id, "had-one").await;
@@ -327,7 +327,7 @@ async fn a_budget_holding_no_actions_is_served_as_an_empty_list() {
 #[tokio::test]
 async fn max_results_partitions_the_budgets_actions_in_creation_order() {
     let router = router();
-    let account_id = account(983_838_383);
+    let account_id = caller_account();
     let table = action_rows(&account_id, "placeholder");
 
     for total in [0_usize, 1, 2, table.len()] {
@@ -354,31 +354,26 @@ async fn max_results_partitions_the_budgets_actions_in_creation_order() {
     }
 }
 
-/// RULE 3: an action is a resource OF one budget of one account, so the list names only
-/// the actions of the budget it names — another account's budget of the same name and
-/// another budget of the same account report their own — and a budget the account does
-/// not hold is refused with `NotFoundException` (HTTP 400, the status this service sends
-/// for it). A `BudgetName` outside its modelled `@pattern` is the request-validation
-/// refusal it is.
+/// RULE 3: an action is a resource OF one budget of the account, so the list names only
+/// the actions of the budget it names — another budget of the same account reports its
+/// own — and a name the account holds no budget under is refused with
+/// `NotFoundException` (HTTP 400, the status this service sends for it). A `BudgetName`
+/// outside its modelled `@pattern` is the request-validation refusal it is.
 #[tokio::test]
 async fn actions_are_listed_only_through_the_budget_that_owns_them() {
     let router = router();
-    let owner = account(984_848_484);
-    let other = account(985_858_585);
+    let owner = caller_account();
 
     seed_budget(&router, &owner, "owning").await;
     seed_budget(&router, &owner, "sibling").await;
-    seed_budget(&router, &other, "owning").await;
     let owned = seed_action(&router, &owner, "owning").await;
     let sibling = seed_action(&router, &owner, "sibling").await;
-    let foreign = seed_action(&router, &other, "owning").await;
 
-    for (case, account_id, budget_name, expected) in [
-        ("the owning budget", &owner, "owning", &owned),
-        ("another budget of the same account", &owner, "sibling", &sibling),
-        ("another account's budget of the same name", &other, "owning", &foreign),
+    for (case, budget_name, expected) in [
+        ("the owning budget", "owning", &owned),
+        ("another budget of the same account", "sibling", &sibling),
     ] {
-        let actions = listed_actions(&router, account_id, budget_name).await;
+        let actions = listed_actions(&router, &owner, budget_name).await;
         assert_eq!(
             ids_of(&actions),
             vec![expected.clone()],
@@ -386,11 +381,11 @@ async fn actions_are_listed_only_through_the_budget_that_owns_them() {
         );
     }
 
-    for (case, account_id, budget_name) in [
-        ("a budget nobody created", &owner, "never-created"),
-        ("a name only another account holds", &other, "sibling"),
+    for (case, budget_name) in [
+        ("a budget nobody created", "never-created"),
+        ("a stored name in another case", "OWNING"),
     ] {
-        let (status, body) = list_actions(&router, account_id, budget_name, None, None).await;
+        let (status, body) = list_actions(&router, &owner, budget_name, None, None).await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected the list to be refused, got {status} {body}"
@@ -427,7 +422,7 @@ async fn actions_are_listed_only_through_the_budget_that_owns_them() {
 #[tokio::test]
 async fn a_token_this_list_never_minted_and_a_page_size_out_of_range_are_refused() {
     let router = router();
-    let account_id = account(986_868_686);
+    let account_id = caller_account();
     seed_budget(&router, &account_id, "tokens").await;
     seed_action(&router, &account_id, "tokens").await;
 
@@ -499,7 +494,7 @@ async fn a_token_this_list_never_minted_and_a_page_size_out_of_range_are_refused
 #[tokio::test]
 async fn the_list_reports_the_status_the_clock_owes() {
     let router = router();
-    let account_id = account(987_878_787);
+    let account_id = caller_account();
     let table = action_rows(&account_id, "placeholder");
 
     for target in 0..table.len() {

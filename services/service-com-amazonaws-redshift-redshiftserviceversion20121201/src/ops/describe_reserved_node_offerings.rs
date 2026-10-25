@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReservedNodeOfferings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReservedNodeOfferings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReservedNodeOfferings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the catalog of reserved node offerings this service publishes: for
+//! every node type a cluster can be created with, every term it can be reserved
+//! for, under every offering type, each offering carrying the id a
+//! `PurchaseReservedNodeOffering` names it by and the fixed, usage and recurring
+//! charges of the term. `ReservedNodeOfferingId` selects the one offering it
+//! names and refuses an id the catalog does not publish; the page is cut by the
+//! same `MaxRecords` window and opaque `Marker` cursor as the other `Describe*`
+//! operations. Writes NOTHING: no transition is ever owed on the catalog.
 //!
 //! ## Shape of an operation
 //!
@@ -162,20 +162,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReservedNodeOfferings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReservedNodeOfferingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReservedNodeOfferings"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeReservedNodeOfferingsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure read of the seeded offering catalog: no transition is ever owed
+        // on it, so this operation settles nothing and writes nothing.
+        let store = state.lock();
+
+        // "The unique identifier for the offering": an id names ONE offering, so
+        // a request carrying one reports just that offering, and an id the
+        // catalog does not publish is refused with the modelled
+        // `ReservedNodeOfferingNotFoundFault` ("Specified offering does not
+        // exist") rather than served as an empty list.
+        let offerings: Vec<ReservedNodeOffering> = match input.reserved_node_offering_id.as_deref()
+        {
+            Some(offering_id) => match store.reserved_node_offering(offering_id) {
+                Some(offering) => vec![offering.clone()],
+                None => {
+                    return Err(
+                        DescribeReservedNodeOfferingsErrorModeled::ReservedNodeOfferingNotFoundFault(
+                            ReservedNodeOfferingNotFoundFault {
+                                message: Some(format!(
+                                    "Reserved node offering not found: '{offering_id}'."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+            None => store.reserved_node_offerings.clone(),
+        };
+
+        // The same `MaxRecords` window and opaque cursor every paginated Redshift
+        // `Describe*` shares, so a marker one page hands out resumes the next.
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, offerings.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeReservedNodeOfferingsOutput {
+            reserved_node_offerings: Some(offerings[start..end].to_vec()),
+            marker: next_marker,
+        })
     }
 }

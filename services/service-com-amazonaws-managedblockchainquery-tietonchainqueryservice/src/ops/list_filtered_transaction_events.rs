@@ -319,6 +319,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|sort| sort.sort_order.as_deref())
             .is_some_and(|order| order == crate::state::SORT_DESCENDING);
 
+        // The statuses the request OPTED IN to beyond finality, absent when it carried
+        // no filter; what each one admits is [`crate::state::confirmation_status_listed`].
         let wanted_statuses = input
             .confirmation_status_filter
             .as_ref()
@@ -344,13 +346,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_default()
         {
             let instant = transaction.transaction_timestamp;
-            // `ConfirmationStatusFilter$include`: "Transactions that have reached
-            // finality are always part of the response", so the filter decides only
-            // whether the ones that have NOT reached it are included too.
-            let refused_status = transaction.confirmation_status != crate::state::CONFIRMATION_FINAL
-                && wanted_statuses
-                    .as_ref()
-                    .is_some_and(|wanted| !wanted.contains(&transaction.confirmation_status));
+            // An event is listed only where the transaction that emitted it is: the
+            // event carries that transaction's own `confirmationStatus`, so the finality
+            // rule is decided once per transaction and every event of it follows.
+            let refused_status = !crate::state::confirmation_status_listed(
+                &transaction.confirmation_status,
+                wanted_statuses.as_deref(),
+            );
             if from.is_some_and(|earliest| instant < earliest)
                 || to.is_some_and(|latest| instant > latest)
                 || refused_status

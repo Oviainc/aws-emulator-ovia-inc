@@ -9,7 +9,9 @@
 //! 1. The read reports, for every budget of the named account that carries at least one
 //!    notification, that budget's name and the notifications stored on it — the same
 //!    notifications the per-budget read reports — ordered by `BudgetName`; a budget
-//!    with no notification is not reported, and another account's budgets never are.
+//!    with no notification is not reported. (A request naming an account other than the
+//!    one this service answers for is refused before it reads anything —
+//!    `tests/all/account_scoping.rs`.)
 //! 2. What it reports follows the stored state: a notification created after the budget
 //!    appears, and one deleted disappears.
 //! 3. It is paginated over budgets by `MaxResults` (default 50) with an opaque
@@ -18,7 +20,7 @@
 //! 4. It is a pure read: repeating it, and the per-budget read after it, report the
 //!    same thing.
 //!
-//! The harness (`router`, `call`, `is_error`, `account`, `same`) is the lifecycle
+//! The harness (`router`, `call`, `is_error`, `caller_account`, `same`) is the lifecycle
 //! suite's, so every suite in this target drives the service exactly the same way.
 
 use serde_json::{json, Value};
@@ -28,7 +30,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// of the right FORM pointing at an offset this listing never had does not re-type it.
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::encode_next_token;
 
-use super::budget_lifecycle::{account, call, is_error, router, same};
+use super::budget_lifecycle::{caller_account, call, is_error, router, same};
 
 /// The notification members a caller supplies. `Threshold` is what makes two
 /// notifications of one budget distinct, so each row varies it.
@@ -181,11 +183,11 @@ fn grouping_rows() -> Vec<Row> {
 /// none.
 #[tokio::test]
 async fn an_account_read_groups_every_stored_notification_under_its_budget() {
-    for (index, row) in grouping_rows().into_iter().enumerate() {
+    for row in grouping_rows() {
         let Row { case, budgets } = row;
-        // One account per row, so a row sees only its own budgets.
+        // One store per row, so a row sees only its own budgets.
         let router = router();
-        let account_id = account(100_000_000_000 + index as u64);
+        let account_id = caller_account();
         for (name, count) in &budgets {
             seed_budget(&router, &account_id, name, *count).await;
         }
@@ -236,52 +238,42 @@ async fn an_account_read_groups_every_stored_notification_under_its_budget() {
     }
 }
 
-/// RULE: an account read reports only the named account's budgets, so two accounts
-/// holding budgets of the same name report their own notifications and nothing else.
+/// RULE: the read reports every budget of the account that holds a notification, so a
+/// budget whose notifications are all gone is not reported while its neighbours still
+/// are.
 #[tokio::test]
-async fn an_account_read_reports_only_the_named_account() {
+async fn an_account_read_reports_every_notified_budget_of_the_account() {
     let router = router();
-    let shared_name = "same-name";
-    // Rows differ in how many notifications the account's copy of the shared budget
-    // carries, including none at all.
-    let rows = [
-        (account(210_000_000_001), 1_u64),
-        (account(210_000_000_002), 4),
-        (account(210_000_000_003), 0),
-    ];
-    for (account_id, count) in &rows {
-        seed_budget(&router, account_id, shared_name, *count).await;
-        // A second, differently named budget per account, so a leak would be visible as
-        // an extra name rather than only as an extra notification.
-        seed_budget(&router, account_id, &format!("own-{account_id}"), 1).await;
+    let account_id = caller_account();
+    // Rows differ in how many notifications a budget carries, including none at all.
+    let rows = [("one", 1_u64), ("four", 4), ("none", 0)];
+    for (name, count) in &rows {
+        seed_budget(&router, &account_id, name, *count).await;
     }
 
-    for (account_id, count) in &rows {
-        let found = entries(&router, account_id).await;
-        let mut expected: Vec<String> = vec![format!("own-{account_id}")];
-        if *count > 0 {
-            expected.push(shared_name.to_string());
-        }
-        expected.sort();
+    let found = entries(&router, &account_id).await;
+    let mut expected: Vec<String> = rows
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        reported_names(&found),
+        expected,
+        "case the notified budgets of the account: expected {expected:?}, got {found:?}"
+    );
+    for (name, count) in rows.iter().filter(|(_, count)| *count > 0) {
+        let entry = found
+            .iter()
+            .find(|entry| entry["BudgetName"] == json!(name))
+            .cloned()
+            .unwrap_or(Value::Null);
         assert_eq!(
-            reported_names(&found),
-            expected,
-            "case account {account_id} holding {count} shared notifications: \
-             expected {expected:?}, got {found:?}"
+            entry["Notifications"].as_array().map(Vec::len),
+            Some(*count as usize),
+            "case budget {name:?}: expected its own {count} notifications, got {entry:?}"
         );
-        if *count > 0 {
-            let entry = found
-                .iter()
-                .find(|entry| entry["BudgetName"] == json!(shared_name))
-                .cloned()
-                .unwrap_or(Value::Null);
-            assert_eq!(
-                entry["Notifications"].as_array().map(Vec::len),
-                Some(*count as usize),
-                "case account {account_id}: expected its own {count} notifications on \
-                 {shared_name:?}, got {entry:?}"
-            );
-        }
     }
 }
 
@@ -291,7 +283,7 @@ async fn an_account_read_reports_only_the_named_account() {
 #[tokio::test]
 async fn an_account_read_follows_what_is_stored() {
     let router = router();
-    let account_id = account(220_000_000_000);
+    let account_id = caller_account();
     let name = "late";
     seed_budget(&router, &account_id, name, 0).await;
     assert!(
@@ -375,7 +367,7 @@ const DEFAULT_PAGE: usize = 50;
 #[tokio::test]
 async fn the_account_listing_is_paginated_over_budgets() {
     let router = router();
-    let account_id = account(230_000_000_000);
+    let account_id = caller_account();
     // One more budget than the documented default page, so the default is observable,
     // and each with its own notification count so a mis-paged entry is visible.
     let total = DEFAULT_PAGE + 1;
@@ -447,7 +439,7 @@ async fn the_account_listing_is_paginated_over_budgets() {
 #[tokio::test]
 async fn the_account_listing_refuses_a_token_or_page_size_it_never_minted() {
     let router = router();
-    let account_id = account(240_000_000_000);
+    let account_id = caller_account();
     for index in 0..3 {
         seed_budget(&router, &account_id, &format!("token-{index}"), 1).await;
     }
@@ -507,7 +499,7 @@ async fn the_account_listing_refuses_a_token_or_page_size_it_never_minted() {
 #[tokio::test]
 async fn the_account_listing_is_a_pure_read() {
     let router = router();
-    let account_id = account(250_000_000_000);
+    let account_id = caller_account();
     // Rows: a budget with one notification, one with several, and one with none.
     for (name, count) in [("a", 1_u64), ("b", 3), ("c", 0)] {
         seed_budget(&router, &account_id, name, count).await;

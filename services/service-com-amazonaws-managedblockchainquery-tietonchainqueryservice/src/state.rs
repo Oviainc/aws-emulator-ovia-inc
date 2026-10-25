@@ -78,6 +78,23 @@ pub const CONFIRMATION_FINAL: &str = "FINAL";
 /// See [`CONFIRMATION_FINAL`].
 pub const CONFIRMATION_NONFINAL: &str = "NONFINAL";
 
+/// Whether a record whose `confirmationStatus` is `status` belongs in a listing whose
+/// request carried `include` as its `ConfirmationStatusFilter$include` (`None` when the
+/// request carried no filter at all).
+///
+/// `ConfirmationStatusFilter$include` is documented "The container to determine whether
+/// to list results that have only reached finality. Transactions that have reached
+/// finality are always part of the response", and the member that carries the filter
+/// states the same rule from the other side: "This filter is used to include
+/// transactions in the response that haven't reached finality." So the filter only ever
+/// ADDS results: [`CONFIRMATION_FINAL`] is listed whatever the request carries, anything
+/// that has not reached finality is listed only where the request names its status, and
+/// a request carrying no filter lists what has reached finality and nothing else.
+pub fn confirmation_status_listed(status: &str, include: Option<&[String]>) -> bool {
+    status == CONFIRMATION_FINAL
+        || include.is_some_and(|wanted| wanted.iter().any(|value| value == status))
+}
+
 /// `ExecutionStatus` values, from the model's own
 /// [`crate::ops::types::EXECUTION_STATUS_VALUES`].
 pub const EXECUTION_SUCCEEDED: &str = "SUCCEEDED";

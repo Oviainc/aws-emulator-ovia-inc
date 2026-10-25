@@ -15,6 +15,8 @@
 mod arn_read_precondition;
 #[path = "all/contact_channel_deactivation.rs"]
 mod contact_channel_deactivation;
+#[path = "all/contact_channel_name_uniqueness.rs"]
+mod contact_channel_name_uniqueness;
 #[path = "all/contact_lifecycle.rs"]
 mod contact_lifecycle;
 #[path = "all/contact_updates.rs"]
@@ -23,6 +25,8 @@ mod contact_updates;
 mod cross_service_onboarding;
 #[path = "all/data_plane_precondition.rs"]
 mod data_plane_precondition;
+#[path = "all/default_onboarding.rs"]
+mod default_onboarding;
 #[path = "all/engagement_lifecycle.rs"]
 mod engagement_lifecycle;
 #[path = "all/onboarding.rs"]

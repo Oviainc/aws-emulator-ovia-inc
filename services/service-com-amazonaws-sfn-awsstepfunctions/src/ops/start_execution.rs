@@ -5,7 +5,11 @@
 //! States Language definition through [`crate::state::asl`], parking the terminal
 //! outcome the walk computed until the clock makes it due — or, where the walk
 //! reached an activity task, queueing that task for a worker to claim with
-//! `GetActivityTask` and leaving the execution waiting at that state.//!
+//! `GetActivityTask` and leaving the execution waiting at that state. The
+//! `stateMachineArn` may be unqualified, a version ARN or an alias ARN; the last two
+//! are resolved through
+//! [`crate::state::ComAmazonawsSfnAwsstepfunctionsState::read_run_target`] and
+//! recorded on the execution.//!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
 //!
@@ -286,10 +290,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Phase 1, under the lock: resolve the state machine and read what the run
         // needs. The lock is released before the walk, so no other request waits on
         // an interpretation.
-        let (machine_arn, machine_name, machine_type, definition, role_arn, execution_name) = {
+        let (target, execution_name) = {
             let mut store = state.lock();
             store.settle(started);
-            let Some(machine) = store.state_machines.get(&input.state_machine_arn) else {
+            // "The `stateMachineArn` parameter accepts one of the following inputs:
+            // an unqualified state machine ARN [...] a state machine version ARN
+            // [...] a state machine alias ARN." All three are resolved through the
+            // ONE reader in the state layer: a version ARN runs that version's
+            // snapshot, and an alias ARN runs the version its routing configuration
+            // draws. Only an ARN no record answers for is a state machine that does
+            // not exist.
+            let Some(target) = store.read_run_target(&input.state_machine_arn, &parsed) else {
                 return Err(StartExecutionErrorModeled::StateMachineDoesNotExist(
                     StateMachineDoesNotExist {
                         message: Some(crate::state::resource_error_message(
@@ -300,7 +311,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            if machine.is_deleting() {
+            if store
+                .state_machines
+                .get(&target.state_machine_arn)
+                .is_none_or(crate::state::StateMachine::is_deleting)
+            {
                 return Err(StartExecutionErrorModeled::StateMachineDeleting(
                     StateMachineDeleting {
                         message: Some(crate::state::resource_error_message(
@@ -311,13 +326,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            let (arn, name, sm_type, definition, role_arn) = (
-                machine.arn.clone(),
-                machine.name.clone(),
-                machine.sm_type.clone(),
-                machine.definition.clone(),
-                machine.role_arn.clone(),
-            );
             // "If you don't provide a name for the execution, Step Functions
             // automatically generates a universally unique identifier (UUID) as the
             // execution name." The store mints it, so its counter keeps two mints in
@@ -326,8 +334,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(name) => name,
                 None => store.fresh_execution_name(),
             };
-            (arn, name, sm_type, definition, role_arn, execution_name)
+            (target, execution_name)
         };
+        let crate::state::RunTarget {
+            state_machine_arn: machine_arn,
+            name: machine_name,
+            sm_type: machine_type,
+            definition,
+            role_arn,
+            version_arn,
+            alias_arn,
+        } = target;
 
         // The execution ARN is built in the state machine's OWN region, so the two
         // ARNs always agree however the request was signed.
@@ -388,6 +405,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // (preferred) over the value in the request body" — the one rule both start
             // operations state, applied through [`crate::state::effective_trace_header`].
             trace_header: crate::state::effective_trace_header(ctx.parts(), input.trace_header),
+            // "Step Functions associates executions that you start with an alias ARN
+            // with that alias and the state machine version used for that execution",
+            // and an execution started with a version ARN with that version alone —
+            // which is what `DescribeExecution` and `ListExecutions` report, and what
+            // `ListExecutions` on a qualified ARN selects by.
+            state_machine_version_arn: version_arn.clone(),
+            state_machine_alias_arn: alias_arn.clone(),
             redrive_count: 0,
             redrive_date: None,
             redrive_tokens: Vec::new(),

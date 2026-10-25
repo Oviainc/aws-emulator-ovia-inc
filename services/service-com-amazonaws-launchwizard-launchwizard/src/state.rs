@@ -1841,6 +1841,43 @@ pub fn tagging_invalid_resource_arn<E>() -> crate::scaffolded::Scaffolded<E> {
     )
 }
 
+/// The wire error code a `dryRun` pre-flight is answered with when the caller holds
+/// the permissions the operation needs.
+///
+/// `dryRun` is documented as a pre-flight that "provides an error response": it never
+/// answers success, because a success answer carries no way to tell a checked request
+/// from a performed one. The code is the one that documentation names, which this
+/// service's model declares no shape for, so it is answered through
+/// [`crate::scaffolded::Scaffolded::unmodeled`] — the same channel the tagging codes
+/// above use.
+pub const DRY_RUN_OPERATION_CODE: &str = "DryRunOperation";
+
+/// The HTTP status a dry-run error response carries: the request was refused because
+/// the caller asked for a check rather than the action, not because anything about it
+/// was wrong. 412 is the status AWS puts on this answer wherever a model declares a
+/// shape for it (AppStream's `DryRunOperationException` is `@httpError(412)`), and the
+/// status the EC2-style `DryRunOperation` this member's documentation describes is
+/// answered with.
+pub const DRY_RUN_OPERATION_STATUS: u16 = 412;
+
+/// What a dry-run error response says: the checks all passed and nothing was done.
+pub const DRY_RUN_OPERATION_MESSAGE: &str =
+    "Request would have succeeded, but DryRun flag is set.";
+
+/// The answer to a `dryRun` request that passed every check the real request would
+/// have been judged by: HTTP 412 [`DRY_RUN_OPERATION_CODE`], with nothing persisted.
+///
+/// Answered AFTER those checks and BEFORE anything is written, so a pre-flight of a
+/// request the service would refuse reports THAT refusal instead — the point of the
+/// pre-flight is the outcome the real request would have had.
+pub fn dry_run_operation<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::unmodeled(
+        DRY_RUN_OPERATION_CODE,
+        DRY_RUN_OPERATION_STATUS,
+        DRY_RUN_OPERATION_MESSAGE,
+    )
+}
+
 /// The modelled `TagKey` rules, from
 /// `smithy_query(query="shape", shape="Tags,TagKeyList")`: a `Tags` key (and a
 /// `TagKeyList` member) targets `TagKey`, which is `@length(min: 1, max: 128)` with

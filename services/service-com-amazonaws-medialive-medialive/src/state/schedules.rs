@@ -27,6 +27,38 @@
 //!   that exists once the request has been applied.
 //! * `ScheduleActionSettings`: "Holds the settings for a single schedule action."
 //!   — exactly one action type per action.
+//!
+//! A created action is also validated against the CHANNEL it is being added to,
+//! because several of its members do not describe the action at all: they name an
+//! element of the channel's own configuration, which only the channel record
+//! holds. [`ChannelScheduleScope`] is that record's side of the check, and the
+//! members are documented as channel-scoped:
+//!
+//! * `InputSwitchScheduleActionSettings$InputAttachmentNameReference`: "The name
+//!   of the input attachment (not the name of the input!) to switch to. The name
+//!   is specified in the channel configuration." — and the names are
+//!   `InputAttachment$InputAttachmentName`, "User-specified name for the
+//!   attachment. This is required if the user wants to use this input in an input
+//!   switch action." The same reference is carried by
+//!   `InputPrepareScheduleActionSettings` and `Scte35InputScheduleActionSettings`
+//!   ("the name of the input attachment that you want to use as a SCTE-35
+//!   input").
+//! * `StaticImageOutputActivateScheduleActionSettings$OutputNames` and its
+//!   deactivate counterpart: "The name(s) of the output(s) the activation should
+//!   apply to." — the outputs are `Output$OutputName`, "The name used to identify
+//!   an output", declared in `EncoderSettings$OutputGroups`.
+//! * `FeatureActivations$InputPrepareScheduleActions`: "You can create Input
+//!   Prepare actions in the schedule only if this feature is enabled."
+//! * `FeatureActivations$OutputStaticImageOverlayScheduleActions`: "Enabling this
+//!   feature allows you to send channel schedule updates to display/clear/modify
+//!   image overlays on an output-by-output bases."
+//! * `EncoderSettings$MotionGraphicsConfiguration` is what a motion graphics
+//!   activate action renders into ("Settings to specify the rendering of motion
+//!   graphics into the video stream"), so a channel that declares no such
+//!   configuration, or declares it `DISABLED`, renders none.
+//! * `PipelinePauseStateSettings$PipelineId`: "Pipeline ID to pause ("PIPELINE_0"
+//!   or "PIPELINE_1")" — of the channel, which has two pipelines only in the
+//!   `STANDARD` class ("a single pipeline channel only has one").
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -49,6 +81,256 @@ pub const SCHEDULE_ACTION_RETENTION: Duration = Duration::from_secs(60 * 60);
 /// names the limit rather than a per-account quota. `BatchUpdateSchedule` models
 /// `TooManyRequestsException`, which is that refusal once the schedule is full.
 pub const MAX_SCHEDULE_ACTIONS: usize = 500;
+
+/// The value a channel-configuration flag carries when the feature is on.
+/// `FeatureActivationsInputPrepareScheduleActions`,
+/// `FeatureActivationsOutputStaticImageOverlayScheduleActions` and
+/// `MotionGraphicsInsertion` are all enums over `DISABLED` and `ENABLED`
+/// (`smithy_query(query="shape", shape="MotionGraphicsInsertion")`), so one
+/// spelling serves all three.
+const FEATURE_ENABLED: &str = "ENABLED";
+
+/// The same flags' off value, which is what a configuration present but turned
+/// off carries.
+const FEATURE_DISABLED: &str = "DISABLED";
+
+/// What a created schedule action may reference IN THE CHANNEL it is being added
+/// to: the names and the features the stored channel configuration declares.
+///
+/// Taken from [`super::ChannelRecord`] before anything is written, because the
+/// schedule store holds only actions: an action's channel-scoped members ("The
+/// name is specified in the channel configuration") are resolvable against the
+/// channel record alone, and a reference the channel does not declare names
+/// nothing the channel could ever execute.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelScheduleScope {
+    /// Every `InputAttachment$InputAttachmentName` the channel declares. An
+    /// attachment the channel left unnamed is not in here: a name "is required if
+    /// the user wants to use this input in an input switch action", so an unnamed
+    /// attachment is not referenceable at all.
+    attachment_names: BTreeSet<String>,
+    /// Every `Output$OutputName` the channel's `EncoderSettings$OutputGroups`
+    /// declare — the outputs an output-by-output static image action may name.
+    output_names: BTreeSet<String>,
+    /// The pipelines this channel's class gives it, as
+    /// [`super::ChannelRecord::pipelines`] numbers them, so a pause action's
+    /// target is resolved against the same rule every other reading uses.
+    pipelines: BTreeSet<i32>,
+    /// Whether `FeatureActivations$InputPrepareScheduleActions` is enabled.
+    input_prepare_actions: bool,
+    /// Whether `FeatureActivations$OutputStaticImageOverlayScheduleActions` is
+    /// enabled.
+    output_static_image_overlay_actions: bool,
+    /// Whether the channel's `EncoderSettings` declare motion graphics the
+    /// activate action could render into.
+    motion_graphics: bool,
+}
+
+impl ChannelScheduleScope {
+    /// The channel configuration a request's created actions are resolved
+    /// against, read off the channel record that owns the schedule.
+    pub fn of(channel: &super::ChannelRecord) -> Self {
+        let encoder = channel.encoder_settings.as_ref();
+        let features = encoder.and_then(|settings| settings.feature_activations.as_ref());
+        Self {
+            attachment_names: channel
+                .input_attachments
+                .iter()
+                .filter_map(|attachment| attachment.input_attachment_name.clone())
+                .collect(),
+            output_names: encoder
+                .map(|settings| settings.output_groups.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .flat_map(|group| group.outputs.iter())
+                .filter_map(|output| output.output_name.clone())
+                .collect(),
+            // The channel's own pipelines, so `PIPELINE_1` names one of them
+            // only in the two-pipeline class.
+            pipelines: channel.pipelines().collect(),
+            input_prepare_actions: features
+                .and_then(|features| features.input_prepare_schedule_actions.as_deref())
+                == Some(FEATURE_ENABLED),
+            output_static_image_overlay_actions: features
+                .and_then(|features| {
+                    features.output_static_image_overlay_schedule_actions.as_deref()
+                })
+                == Some(FEATURE_ENABLED),
+            // A configuration that is there and not turned off: the member is
+            // what declares the feature on the channel, and its own flag can
+            // turn it back off.
+            motion_graphics: encoder
+                .and_then(|settings| settings.motion_graphics_configuration.as_ref())
+                .is_some_and(|configuration| {
+                    configuration.motion_graphics_insertion.as_deref() != Some(FEATURE_DISABLED)
+                }),
+        }
+    }
+
+    /// The problem with `reference` as an input attachment name of this channel,
+    /// if any: a reference "specified in the channel configuration" that the
+    /// channel does not declare names no attachment the channel can switch to or
+    /// prepare.
+    fn unknown_attachment(&self, element_path: &str, reference: &str) -> Option<ValidationError> {
+        (!self.attachment_names.contains(reference)).then(|| {
+            problem(
+                element_path,
+                &format!(
+                    "{reference} is not the name of an input attachment of this channel"
+                ),
+            )
+        })
+    }
+
+    /// The problem with `reference` as an output name of this channel, if any.
+    fn unknown_output(&self, element_path: &str, reference: &str) -> Option<ValidationError> {
+        (!self.output_names.contains(reference)).then(|| {
+            problem(
+                element_path,
+                &format!("{reference} is not the name of an output of this channel"),
+            )
+        })
+    }
+
+    /// The problem with `reference` as a pipeline of this channel, if any: the
+    /// class fixes how many pipelines a channel has ("a single pipeline channel
+    /// only has one"), so a pipeline it does not have names nothing that could
+    /// pause.
+    fn unknown_pipeline(&self, element_path: &str, reference: &str) -> Option<ValidationError> {
+        let known = super::pipeline_index(reference)
+            .is_some_and(|pipeline| self.pipelines.contains(&pipeline));
+        (!known).then(|| {
+            problem(
+                element_path,
+                &format!(
+                    "{reference} is not a pipeline of this channel, which has {} pipeline(s)",
+                    self.pipelines.len()
+                ),
+            )
+        })
+    }
+}
+
+/// The problem with an action type the channel has not declared the feature for,
+/// if `available` says it has not. A free function, because the answer is in the
+/// flag the caller already read off the scope.
+fn unavailable_feature(
+    available: bool,
+    element_path: &str,
+    feature: &str,
+) -> Option<ValidationError> {
+    (!available).then(|| {
+        problem(
+            element_path,
+            &format!("this channel's configuration does not enable {feature}"),
+        )
+    })
+}
+
+/// Every problem the channel has with one created action's settings, in the order
+/// `ScheduleActionSettings` declares its members. `settings_path` is the path of
+/// the action's settings member, so each entry's `ElementPath` — "Path to the
+/// source of the error" — names the channel-scoped member the request got wrong
+/// rather than the action as a whole.
+fn channel_problems(
+    settings_path: &str,
+    settings: &ScheduleActionSettings,
+    scope: &ChannelScheduleScope,
+) -> Vec<ValidationError> {
+    let mut problems: Vec<ValidationError> = Vec::new();
+
+    if let Some(prepare) = settings.input_prepare_settings.as_ref() {
+        let path = format!("{settings_path}/inputPrepareSettings");
+        problems.extend(unavailable_feature(
+            scope.input_prepare_actions,
+            &path,
+            "input prepare schedule actions",
+        ));
+        // The reference is optional here, and absent means the action names no
+        // attachment at all: "If no name is provided, the action will stop the
+        // most recent prepare (if any) when activated."
+        if let Some(reference) = prepare.input_attachment_name_reference.as_deref() {
+            problems.extend(scope.unknown_attachment(
+                &format!("{path}/inputAttachmentNameReference"),
+                reference,
+            ));
+        }
+    }
+
+    if let Some(switch) = settings.input_switch_settings.as_ref() {
+        problems.extend(scope.unknown_attachment(
+            &format!("{settings_path}/inputSwitchSettings/inputAttachmentNameReference"),
+            &switch.input_attachment_name_reference,
+        ));
+    }
+
+    if settings.motion_graphics_image_activate_settings.is_some() {
+        problems.extend(unavailable_feature(
+            scope.motion_graphics,
+            &format!("{settings_path}/motionGraphicsImageActivateSettings"),
+            "motion graphics insertion",
+        ));
+    }
+
+    if let Some(pause) = settings.pause_state_settings.as_ref() {
+        for (index, pipeline) in pause.pipelines.as_deref().unwrap_or_default().iter().enumerate() {
+            problems.extend(scope.unknown_pipeline(
+                &format!("{settings_path}/pauseStateSettings/pipelines/{index}/pipelineId"),
+                &pipeline.pipeline_id,
+            ));
+        }
+    }
+
+    if let Some(scte35) = settings.scte35_input_settings.as_ref() {
+        // "In fixed mode, enter the name of the input attachment that you want to
+        // use as a SCTE-35 input": a request that carries the reference is naming
+        // an attachment, whatever mode it asked for.
+        if let Some(reference) = scte35.input_attachment_name_reference.as_deref() {
+            problems.extend(scope.unknown_attachment(
+                &format!("{settings_path}/scte35InputSettings/inputAttachmentNameReference"),
+                reference,
+            ));
+        }
+    }
+
+    // The two output-by-output static image actions are the ones
+    // `OutputStaticImageOverlayScheduleActions` gates, and the ones that name the
+    // channel's outputs; the layer-scoped `StaticImageActivateSettings` /
+    // `StaticImageDeactivateSettings` carry no channel-scoped member, so nothing
+    // about them is resolved against the channel.
+    let output_actions: [(&str, Option<&Vec<String>>); 2] = [
+        (
+            "staticImageOutputActivateSettings",
+            settings
+                .static_image_output_activate_settings
+                .as_ref()
+                .map(|activate| &activate.output_names),
+        ),
+        (
+            "staticImageOutputDeactivateSettings",
+            settings
+                .static_image_output_deactivate_settings
+                .as_ref()
+                .map(|deactivate| &deactivate.output_names),
+        ),
+    ];
+    for (member, names) in output_actions {
+        let Some(names) = names else {
+            continue;
+        };
+        let path = format!("{settings_path}/{member}");
+        problems.extend(unavailable_feature(
+            scope.output_static_image_overlay_actions,
+            &path,
+            "output static image overlay schedule actions",
+        ));
+        for (index, name) in names.iter().enumerate() {
+            problems.extend(scope.unknown_output(&format!("{path}/outputNames/{index}"), name));
+        }
+    }
+
+    problems
+}
 
 /// Why [`ChannelSchedule::apply`] stored nothing. The whole request is one
 /// update: either every create and delete in it applies, or none does.
@@ -196,10 +478,15 @@ impl ChannelSchedule {
     /// one bad action changes nothing. Deletes are applied before creates, which
     /// is what lets one request free a name and reuse it — the name is "unique if
     /// it is no longer in the schedule".
+    ///
+    /// `scope` is the CHANNEL the schedule belongs to: a created action's
+    /// channel-scoped members are resolved against it, so an action the channel
+    /// could never execute is refused here instead of being stored.
     pub fn apply(
         &mut self,
         creates: &[ScheduleAction],
         deletes: &[String],
+        scope: &ChannelScheduleScope,
         now: SystemTime,
     ) -> Result<AppliedSchedule, ScheduleRefusal> {
         let mut problems: Vec<ValidationError> = Vec::new();
@@ -280,6 +567,15 @@ impl ChannelSchedule {
                     ),
                 ));
             }
+
+            // What the action references in the channel it is being added to: a
+            // reference the channel does not declare names nothing the channel
+            // could execute, so the request is refused rather than stored.
+            problems.extend(channel_problems(
+                &format!("{path}/scheduleActionSettings"),
+                &action.schedule_action_settings,
+                scope,
+            ));
 
             let start = &action.schedule_action_start_settings;
             let modes = usize::from(start.fixed_mode_schedule_action_start_settings.is_some())

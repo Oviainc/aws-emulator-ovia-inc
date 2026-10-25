@@ -24,7 +24,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::MAX_EMAIL_SUBSCRIBERS_PER_NOTIFICATION;
 
-use super::budget_lifecycle::{account, call, is_error, router, same};
+use super::budget_lifecycle::{caller_account, call, is_error, router, same};
 use super::client_error_envelopes::message;
 use super::notification_lifecycle::seed_budget;
 
@@ -149,31 +149,30 @@ struct Scope {
 /// budget the request addresses, in stored order — and a triple the store does not hold
 /// is `NotFoundException`, not another triple's subscribers.
 ///
-/// The rows span what the addressing generalises over: two accounts holding a budget of
-/// the SAME name, one account holding two budgets, and each budget holding a different
-/// subset of the notification catalog, every cell with its own subscriber set.
+/// The rows span what the addressing generalises over: one account holding two budgets,
+/// each budget holding a different subset of the notification catalog, every cell with
+/// its own subscriber set.
 #[tokio::test]
 async fn subscribers_are_reported_for_the_addressed_notification_only() {
     let router = router();
     let catalog = notification_catalog();
-    let first = account(901_010_101_010);
-    let second = account(902_020_202_020);
+    let only = caller_account();
     let scopes = [
         Scope {
-            case: "the first account's budget",
-            account_id: first.clone(),
-            budget_name: "shared-name",
+            case: "the account's first budget",
+            account_id: only.clone(),
+            budget_name: "first-name",
             held: vec![0, 1],
         },
         Scope {
-            case: "another account's budget of the same name",
-            account_id: second,
-            budget_name: "shared-name",
+            case: "a second budget of the same account",
+            account_id: only.clone(),
+            budget_name: "second-name",
             held: vec![0, 2],
         },
         Scope {
-            case: "a second budget of the first account",
-            account_id: first.clone(),
+            case: "a third budget of the same account",
+            account_id: only.clone(),
             budget_name: "other-name",
             held: vec![2],
         },
@@ -232,17 +231,13 @@ async fn subscribers_are_reported_for_the_addressed_notification_only() {
         }
     }
 
-    // The budget itself has to be the one this account holds.
-    for (case, account_id, budget_name) in [
-        ("a budget name no account holds", first, "absent-name"),
-        (
-            "an account holding no budget at all",
-            account(903_030_303_030),
-            "shared-name",
-        ),
+    // The budget itself has to be one this account holds.
+    for (case, budget_name) in [
+        ("a budget name the account holds nothing under", "absent-name"),
+        ("a stored name in another case", "FIRST-NAME"),
     ] {
         let (status, body) =
-            read_subscribers(&router, &account_id, budget_name, &catalog[0], None, None).await;
+            read_subscribers(&router, &only, budget_name, &catalog[0], None, None).await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected the refusal at 400, got {status} {body}"
@@ -265,7 +260,7 @@ async fn subscribers_are_reported_for_the_addressed_notification_only() {
 #[tokio::test]
 async fn the_page_size_bounds_and_the_token_scope_are_the_modelled_ones() {
     let router = router();
-    let account_id = account(904_040_404_040);
+    let account_id = caller_account();
     let name = "paged-bounds";
     seed_budget(&router, &account_id, name).await;
 

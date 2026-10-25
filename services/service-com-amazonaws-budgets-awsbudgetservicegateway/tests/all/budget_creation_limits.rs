@@ -18,7 +18,7 @@
 //!
 //! Each table's rows differ along the count, the subscription type and the position of
 //! the offending notification inside the batch; the harness (`router`, `call`,
-//! `is_error`, `account`, `same`) is the lifecycle suite's, so every suite in this
+//! `is_error`, `caller_account`, `same`) is the lifecycle suite's, so every suite in this
 //! target drives the service identically.
 
 use serde_json::{json, Value};
@@ -31,7 +31,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION,
 };
 
-use super::budget_lifecycle::{account, call, is_error, router, same};
+use super::budget_lifecycle::{caller_account, call, is_error, router, same};
 
 /// This service answers every 4xx refusal with HTTP 400 whatever `@httpError` the
 /// modelled shape declares (`crate::scaffolded::modeled_error_status`), so the status
@@ -183,7 +183,6 @@ async fn reported_notifications(
 /// capacity, one under it, the capacity itself, and one past the modelled bound.
 #[tokio::test]
 async fn a_create_attaches_as_many_notifications_as_the_budget_can_hold() {
-    let router = router();
     // `NotificationWithSubscribersList` is modelled @length(0, 10) — the same ten
     // `Notification`'s doc gives as a budget's capacity, so the wire bound and the
     // capacity coincide and the table is built from one figure.
@@ -204,8 +203,10 @@ async fn a_create_attaches_as_many_notifications_as_the_budget_can_hold() {
 
     for (count, refusal) in rows {
         let case = format!("{count} notifications");
-        // One account per row, so no row can see another's budget.
-        let account_id = account(610_000_000 + count as u64);
+        // One store per row, so no row can see another's budget: every request names
+        // the one account this service serves.
+        let router = router();
+        let account_id = caller_account();
         let name = "limits";
         let attached = notifications_with_subscribers(count);
         let (status, body) = create(&router, &account_id, name, &attached).await;
@@ -264,12 +265,12 @@ async fn a_create_attaches_as_many_notifications_as_the_budget_can_hold() {
 /// form, from all-appended to all-batched.
 #[tokio::test]
 async fn the_notification_capacity_is_the_same_batched_or_appended() {
-    let router = router();
     for batched in 0..=MAX_NOTIFICATIONS_PER_BUDGET {
         let appended = MAX_NOTIFICATIONS_PER_BUDGET - batched;
         let case = format!("{batched} batched, {appended} appended");
-        // One account per row, so no row can see another's budget.
-        let account_id = account(640_000_000 + batched as u64);
+        // One store per row, so no row can see another's budget.
+        let router = router();
+        let account_id = caller_account();
         let name = "capacity-splits";
         let (status, body) = create(
             &router,
@@ -334,7 +335,6 @@ async fn the_notification_capacity_is_the_same_batched_or_appended() {
 /// the modelled total and one past that.
 #[tokio::test]
 async fn a_created_notification_holds_at_most_the_documented_subscribers_of_each_type() {
-    let router = router();
     let sns_and_email = [
         sns_subscribers(MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION),
         email_subscribers(MAX_EMAIL_SUBSCRIBERS_PER_NOTIFICATION),
@@ -392,8 +392,9 @@ async fn a_created_notification_holds_at_most_the_documented_subscribers_of_each
     ];
 
     for (index, (case, subscribers, refusal)) in rows.into_iter().enumerate() {
-        // One account per row, so no row can see another's budget.
-        let account_id = account(620_000_000 + index as u64);
+        // One store per row, so no row can see another's budget.
+        let router = router();
+        let account_id = caller_account();
         let name = "subscriber-limits";
         let attached = vec![json!({
             "Notification": notification(index),
@@ -454,11 +455,12 @@ async fn a_created_notification_holds_at_most_the_documented_subscribers_of_each
 /// The rows are each position of a three-notification batch in turn.
 #[tokio::test]
 async fn a_notification_above_its_subscriber_limit_refuses_the_whole_create() {
-    let router = router();
     let batch = 3;
     for offending in 0..batch {
         let case = format!("offending notification at position {offending} of {batch}");
-        let account_id = account(630_000_000 + offending as u64);
+        // One store per row, so no row can see another's budget.
+        let router = router();
+        let account_id = caller_account();
         let name = "batch-limits";
         let attached: Vec<Value> = (0..batch)
             .map(|index| {

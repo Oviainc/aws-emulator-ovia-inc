@@ -298,10 +298,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `dryRun` checks the request without making it: every check above has run and,
-        // by definition, NOTHING is persisted — so there is no updated deployment to
-        // report either, which is the answer `CreateDeployment` gives a dry run too.
+        // by definition, NOTHING is persisted. The member is documented to answer with
+        // an ERROR RESPONSE — `DryRunOperation` for a caller who holds the permissions
+        // the action needs — and never with success, which is the answer
+        // `CreateDeployment` gives a dry run too (see `state::dry_run_operation` for
+        // the code and status, and why they go out through the unmodeled channel).
         if input.dry_run {
-            return Ok(UpdateDeploymentOutput { deployment: None });
+            return Err(crate::state::dry_run_operation());
         }
 
         let Some(deployment) = store.deployments.get_mut(&input.deployment_id) else {

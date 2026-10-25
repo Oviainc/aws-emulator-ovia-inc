@@ -11,6 +11,13 @@
 //! So a register is observable by every later read, a deregister by every later call,
 //! and an `OperationId` handed to a caller always names a record that exists.
 //!
+//! Those calls are ASYNCHRONOUS, so what they start is a change the CLOCK owes the
+//! application ([`PendingTransition`]): the next status it takes, or — for a
+//! deregistration — the removal that ends it. Until that change falls due the
+//! application resolves in the transient status the call gave it (`REGISTERING`,
+//! `STARTING`, `STOPPING`, `DELETING`), and [`RegionState::settle`] materialises the
+//! change for every reader at the same instant without anything ever sleeping.
+//!
 //! Those records are held PER REGION: the service is regional, so the store is a
 //! [`RegionState`] per Region ([`ComAmazonawsSsmsapSsmsapState::region`]) and a handler
 //! only ever reaches the partition of the Region its request was signed for
@@ -85,6 +92,10 @@ pub const APPLICATION_STATUS_STOPPING: &str = "STOPPING";
 /// `ApplicationStatus` for an application that has been stopped.
 pub const APPLICATION_STATUS_STOPPED: &str = "STOPPED";
 
+/// `ApplicationStatus` between `DeregisterApplication` and the application being gone:
+/// the status a deregistration that is still running reports.
+pub const APPLICATION_STATUS_DELETING: &str = "DELETING";
+
 /// `ApplicationDiscoveryStatus` while the registration's discovery is still running.
 /// One of the model's `ApplicationDiscoveryStatus` values (see
 /// [`crate::ops::types::APPLICATION_DISCOVERY_STATUS_VALUES`]).
@@ -92,6 +103,9 @@ pub const DISCOVERY_STATUS_REGISTERING: &str = "REGISTERING";
 
 /// `ApplicationDiscoveryStatus` once discovery has completed.
 pub const DISCOVERY_STATUS_SUCCESS: &str = "SUCCESS";
+
+/// `ApplicationDiscoveryStatus` while the application's deregistration is running.
+pub const DISCOVERY_STATUS_DELETING: &str = "DELETING";
 
 /// `OperationStatus` for an operation that has not reached its terminal status yet.
 /// One of the model's `OperationStatus` values (see
@@ -117,6 +131,9 @@ pub const OPERATION_TYPE_START_APPLICATION: &str = "START_APPLICATION";
 
 /// `Operation$Type` for the operation `StopApplication` files.
 pub const OPERATION_TYPE_STOP_APPLICATION: &str = "STOP_APPLICATION";
+
+/// `Operation$Type` for the operation `DeregisterApplication` files.
+pub const OPERATION_TYPE_DEREGISTER_APPLICATION: &str = "DEREGISTER_APPLICATION";
 
 /// `Operation$ResourceType`: the kind of resource an operation acted on.
 ///
@@ -231,16 +248,39 @@ pub fn permission_policy_action(action_type: &str) -> String {
     format!("{ARN_SERVICE}:{action_type}")
 }
 
-/// A status change the clock owes an application: at `due_at` the application takes
-/// `status`/`discovery_status`, whether or not anybody called.
+/// A change the clock owes an application: at `due_at` the application takes `change`,
+/// whether or not anybody called.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
     /// When the change falls due. See [`TRANSITION_SPAN`].
     pub due_at: SystemTime,
-    /// The `ApplicationStatus` the application takes at `due_at`.
-    pub status: String,
-    /// The `ApplicationDiscoveryStatus` it takes at `due_at`.
-    pub discovery_status: String,
+    /// What the application becomes at `due_at`.
+    pub change: PendingChange,
+}
+
+impl PendingTransition {
+    /// Whether the change this application is under is its removal — which is what a
+    /// deregistration still running owes it.
+    pub fn removes(&self) -> bool {
+        matches!(self.change, PendingChange::Removal)
+    }
+}
+
+/// What the clock owes an application: the asynchronous calls of this service either
+/// move the application to another status or, for a deregistration, end it.
+#[derive(Debug, Clone)]
+pub enum PendingChange {
+    /// The application takes these `ApplicationStatus`/`ApplicationDiscoveryStatus`
+    /// values — what registering, starting and stopping owe it.
+    Status {
+        /// The `ApplicationStatus` the application takes when the change falls due.
+        status: String,
+        /// The `ApplicationDiscoveryStatus` it takes then.
+        discovery_status: String,
+    },
+    /// The application stops existing: what a deregistration owes it, materialised by
+    /// [`RegionState::settle`].
+    Removal,
 }
 
 /// A registered SAP application: the state `Application` and `ApplicationSummary` are
@@ -286,6 +326,10 @@ impl StoredApplication {
     /// called, so applying it on a read reports what the resource already is rather
     /// than changing it — and `LastUpdated` is stamped with the due instant, not with
     /// the time of the call that happened to observe it.
+    ///
+    /// A removal that has fallen due is left in place here, because a record cannot drop
+    /// itself: [`RegionState::settle`] is what forgets it, and until it does this
+    /// application still reports the `DELETING` status its deregistration gave it.
     pub fn settle(&mut self, now: SystemTime) {
         let Some(pending) = self.pending.as_ref() else {
             return;
@@ -293,10 +337,31 @@ impl StoredApplication {
         if now < pending.due_at {
             return;
         }
+        let PendingChange::Status {
+            status,
+            discovery_status,
+        } = pending.change.clone()
+        else {
+            return;
+        };
         let pending = self.pending.take().expect("checked present just above");
-        self.status = pending.status;
-        self.discovery_status = pending.discovery_status;
+        self.status = status;
+        self.discovery_status = discovery_status;
         self.last_updated = pending.due_at.max(self.last_updated);
+    }
+
+    /// Whether a deregistration is running against this application: it reports
+    /// `DELETING` and its removal is the change the clock owes it.
+    pub fn is_deregistering(&self) -> bool {
+        self.pending.as_ref().is_some_and(PendingTransition::removes)
+    }
+
+    /// Whether the deregistration running against this application has completed by
+    /// `now`, so the application no longer exists at that instant.
+    pub fn removal_due(&self, now: SystemTime) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.removes() && now >= pending.due_at)
     }
 
     /// Project the stored application onto the modelled `Application`.
@@ -822,14 +887,33 @@ pub struct RegionState {
 }
 
 impl RegionState {
-    /// Materialise every status change the clock already owes, on applications and on
-    /// operations alike.
+    /// Materialise every change the clock already owes, on applications and on
+    /// operations alike — the status an asynchronous call moves an application to, and
+    /// the removal a deregistration ends one with.
     ///
     /// Every handler calls this first, so each one reports the same thing about a
     /// resource at the same instant.
     pub fn settle(&mut self, now: SystemTime) {
         for application in self.applications.values_mut() {
             application.settle(now);
+        }
+        // A deregistration whose removal has fallen due is COMPLETE: from that instant
+        // the application stops resolving, whether or not anybody called, and what was
+        // held FOR it goes with it — its tags, keyed by its ARN, and the configuration
+        // check runs that inspected it, which describe a configuration that no longer
+        // exists. Its `Operation` records stay: they are the history of calls already
+        // made, which `GetOperation` resolves by id, and [`MAX_RETAINED_OPERATIONS`] is
+        // what bounds them.
+        let completed: Vec<(String, String)> = self
+            .applications
+            .values()
+            .filter(|application| application.removal_due(now))
+            .map(|application| (application.id.clone(), application.arn.clone()))
+            .collect();
+        for (id, arn) in completed {
+            self.applications.remove(&id);
+            self.tags_by_arn.remove(&arn);
+            self.forget_configuration_checks_for(&id);
         }
         for operation in self.operations.values_mut() {
             operation.settle(now);
@@ -1157,12 +1241,11 @@ impl RegionState {
         kept
     }
 
-    /// Drop every operation record filed against `application_id`, configuration check
-    /// operations included — used when the application is deregistered, since nothing
-    /// else would ever reclaim them and the resource they describe no longer exists.
-    pub fn forget_operations_for(&mut self, application_id: &str) {
-        self.operations
-            .retain(|_, record| record.resource_id != application_id);
+    /// Drop every configuration check operation filed against `application_id`, and with
+    /// it every result those runs produced — used when a deregistration completes, since
+    /// a check run reports the configuration of an application that no longer exists and
+    /// nothing else would ever reclaim it.
+    pub fn forget_configuration_checks_for(&mut self, application_id: &str) {
         self.configuration_check_operations
             .retain(|_, record| record.application_id != application_id);
     }
@@ -1209,7 +1292,7 @@ pub struct ComAmazonawsSsmsapSsmsapState {
 }
 
 impl ComAmazonawsSsmsapSsmsapState {
-    /// Materialise every status change the clock already owes, in every Region.
+    /// Materialise every change the clock already owes, in every Region.
     ///
     /// Every handler calls this first. It is not restricted to the request's Region
     /// because the change was due at its own instant everywhere, whether or not
@@ -1218,6 +1301,11 @@ impl ComAmazonawsSsmsapSsmsapState {
         for region in self.regions.values_mut() {
             region.settle(now);
         }
+        // Settling a Region can empty it (the last deregistration it held completed), and
+        // a partition that holds nothing is not one this store has to keep: an absent
+        // partition and an empty one read the same ([`Self::region`]), so this is the same
+        // reclamation [`Self::forget_region_if_empty`] makes, for every Region at once.
+        self.regions.retain(|_, region| !region.is_empty());
     }
 
     /// What a request signed for `region` may observe: that Region's partition, and

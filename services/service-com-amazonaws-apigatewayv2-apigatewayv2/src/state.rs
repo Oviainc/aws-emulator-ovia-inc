@@ -207,6 +207,19 @@ pub const EMPTY_DOMAIN_NAME_CONFIGURATIONS: &str =
 /// end — every call mints a new authorizer, so nothing else bounds it.
 pub const MAX_AUTHORIZERS_PER_API: usize = 10;
 
+/// The most `IdentitySource` entries one authorizer may carry, after which
+/// CreateAuthorizer is refused.
+///
+/// An EMULATOR growth bound, not a figure AWS publishes: `IdentitySourceList` carries no
+/// modelled length constraint, so nothing otherwise bounds the list one request stores —
+/// and every request a WebSocket api's authorization step serves then reads the whole of
+/// it (`crate::service`'s connection-request authorization), which is what makes an
+/// unbounded list per-request work rather than only stored bytes. The figure is set far
+/// above the one to three identity sources a real authorizer names, so what it refuses is
+/// an absurd list rather than a configuration a caller would write. Do not cite it as a
+/// published quota.
+pub const MAX_IDENTITY_SOURCES_PER_AUTHORIZER: usize = 100;
+
 /// The `AuthorizerType` value that selects a JWT authorizer, from the generated
 /// `AUTHORIZER_TYPE_VALUES` catalog (`JWT | REQUEST`); the integration test
 /// `the_authorizer_type_names_are_the_modelled_catalog` pins these two names against

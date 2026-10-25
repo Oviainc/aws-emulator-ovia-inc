@@ -37,6 +37,10 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// every suite drives the one restJson1 path rather than building its own.
 pub(crate) struct Emulator {
     router: smithy_server_runtime::MultiServiceRouter,
+    /// The one engine every registered operation was constructed from, kept so a
+    /// suite can inspect the store the requests wrote, or move a due instant the
+    /// store holds instead of sleeping for the span it names.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -47,8 +51,13 @@ impl Emulator {
         // `authorization` header below is only how a request names its service
         // and region.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The shared engine this emulator's service was built from.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// Dispatch `POST <path>` with `body` as the restJson1 payload, signed (in
@@ -1486,6 +1495,26 @@ async fn state_changing_operations_emit_one_audit_record_each() {
         );
     }
 
+    // The account-settings write is a state change too, and it addresses no group, so
+    // its record is found by operation and region. The region is this test's own,
+    // because the capture is installed for the whole test binary and the sibling
+    // account-settings suite writes settings in regions of its own.
+    let settings_region = "eu-north-1";
+    for (path, body) in [
+        (
+            "/update-account-settings",
+            json!({ "GroupLifecycleEventsDesiredStatus": "ACTIVE" }),
+        ),
+        // A read emits no access record here either.
+        ("/get-account-settings", json!({})),
+    ] {
+        let (status, answered) = emulator.call_in(settings_region, path, &body).await;
+        assert_eq!(
+            status, 200,
+            "setup {path}: expected 200 before asserting on audit records, got {status} {answered}",
+        );
+    }
+
     // (label, the operation that must have recorded, the outcome it must name)
     let cases = [
         ("the create", "CreateGroup", "created"),
@@ -1515,7 +1544,37 @@ async fn state_changing_operations_emit_one_audit_record_each() {
             );
         }
     }
-    for reporting in ["GetGroup", "ListGroups", "ListGroupResources"] {
+    // The account-settings write carries the same who/where/outcome fields.
+    let settings_records: Vec<_> = capture
+        .records_of("UpdateAccountSettings")
+        .into_iter()
+        .filter(|event| event.field("region") == Some(settings_region))
+        .collect();
+    assert_eq!(
+        settings_records.len(),
+        1,
+        "case \"the account-settings write\": expected exactly one audit record for \
+         UpdateAccountSettings in {settings_region}, captured {settings_records:?}",
+    );
+    for (field, expected) in [
+        ("caller", "AKIDEXAMPLE"),
+        ("region", settings_region),
+        ("outcome", "requested"),
+    ] {
+        assert_eq!(
+            settings_records[0].field(field),
+            Some(expected),
+            "case \"the account-settings write\": expected {field}={expected:?}, \
+             got {:?}",
+            settings_records[0],
+        );
+    }
+    for reporting in [
+        "GetGroup",
+        "ListGroups",
+        "ListGroupResources",
+        "GetAccountSettings",
+    ] {
         assert!(
             capture.records_of(reporting).is_empty(),
             "case {reporting:?}: a read is not a state change and must emit no access \

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateCustomerGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateCustomerGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateCustomerGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -151,17 +142,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateCustomerGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateCustomerGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateCustomerGateway"))
+        // request metadata.
+        let _ = ctx;
+
+        // `CustomerGatewayArn` is modelled free-form (it arrives in a path label, which
+        // the pattern `^[\s\S]*$` does not constrain), so the form of the ARN is judged
+        // here, the same way the associate judges it: a string that names no customer
+        // gateway at all is a field failure on the member that carried it, a different
+        // answer from a well-formed ARN this global network holds no association for.
+        if crate::state::parse_customer_gateway_arn(&input.customer_gateway_arn).is_none() {
+            return Err(DisassociateCustomerGatewayErrorModeled::ValidationException(
+                crate::state::malformed_customer_gateway_arn(
+                    crate::state::FIELD_CUSTOMER_GATEWAY_ARN,
+                ),
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateCustomerGatewayErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // "Disassociates a customer gateway from a device and a link" (`smithy_query
+        // query="doc" shape="DisassociateCustomerGateway"`): the association is addressed
+        // THROUGH the global network in the path, so an unknown global network is the
+        // missing-resource answer whatever customer gateway the request names.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(
+                DisassociateCustomerGatewayErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::GLOBAL_NETWORK_KIND,
+                        &input.global_network_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // The association the request addresses is the global network / customer gateway
+        // PAIR, so a pair that holds no association — one never made, one already removed,
+        // or one made in a DIFFERENT global network — is the missing-resource answer,
+        // naming the pair as the resource because an association carries no id of its own.
+        // Removing it is what makes a second disassociate of the same pair a 404, and what
+        // frees the gateway to be associated with another device.
+        let key = crate::state::customer_gateway_association_key(
+            &input.global_network_id,
+            &input.customer_gateway_arn,
+        );
+        let removed = store
+            .customer_gateway_associations
+            .remove(&key)
+            .ok_or_else(|| {
+                DisassociateCustomerGatewayErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::CUSTOMER_GATEWAY_ASSOCIATION_KIND,
+                        &key,
+                    ),
+                )
+            })?;
+
+        // The removed association is reported as `DELETING`, the way every other removal of
+        // an association of this service reports the record it just removed; a later read
+        // no longer lists it.
+        Ok(DisassociateCustomerGatewayOutput {
+            customer_gateway_association: Some(
+                removed.to_shape_with_state(crate::state::STATE_DELETING),
+            ),
+        })
     }
 }
+

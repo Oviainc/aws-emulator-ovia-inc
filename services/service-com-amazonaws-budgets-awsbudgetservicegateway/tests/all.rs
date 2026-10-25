@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_notification_listing.rs"]
 mod account_notification_listing;
+#[path = "all/account_scoping.rs"]
+mod account_scoping;
 #[path = "all/budget_action_execution.rs"]
 mod budget_action_execution;
 #[path = "all/budget_action_history.rs"]

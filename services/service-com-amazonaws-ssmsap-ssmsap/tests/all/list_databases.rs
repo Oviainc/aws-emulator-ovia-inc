@@ -25,7 +25,7 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::DATABASE_TYPE_VALUES;
 use service_com_amazonaws_ssmsap_ssmsap::state::MAX_PAGE_SIZE;
 
-use crate::application_lifecycle::{valid_registration, Emulator, Reply};
+use crate::application_lifecycle::{settle, valid_registration, Emulator, Reply};
 use crate::validation_message_rendering::{message, VALIDATION_EXCEPTION};
 
 /// The region the suite signs for; it is the region every expected ARN carries.
@@ -635,6 +635,9 @@ async fn an_application_not_registered_here_is_not_found() {
                 json!({"ApplicationId": "hdb-present"}),
             )
             .await;
+        // Deregistration is asynchronous: the application (and so its databases) stops
+        // resolving when the removal the clock owes it falls due.
+        settle().await;
         list(&emulator, json!({"ApplicationId": "hdb-present"})).await
     };
 

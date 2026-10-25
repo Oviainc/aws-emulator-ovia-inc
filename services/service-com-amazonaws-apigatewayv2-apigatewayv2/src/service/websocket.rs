@@ -33,12 +33,23 @@
 //!    it; a step that resolves nothing is `403` `{"message":"Forbidden"}`, which is what
 //!    API Gateway answers for an api id it does not serve and for a stage that has no
 //!    deployment (the `execute-api` status taxonomy the REST data plane already states,
-//!    `service-com-amazonaws-apigateway-backplanecontrolservice/src/service/invoke.rs`).
+//!    `service-com-amazonaws-apigateway-backplanecontrolservice/src/service/invoke.rs`);
+//! 4. the AUTHORIZATION of the route that serves the connection request is applied before
+//!    anything that route fronts ([`connect_authorization_refusal`]): when that route's
+//!    `AuthorizationType` names an `Authorizer` of the api, every one of that authorizer's
+//!    `IdentitySource` expressions must be "present in the request, not null, and
+//!    non-empty" — "only when this is true does the authorizer invoke the authorizer
+//!    Lambda function. Otherwise, it returns a 401 Unauthorized response without calling
+//!    the Lambda function" (`Authorizer$IdentitySource`) — so a handshake missing one is
+//!    `401` `{"message":"Unauthorized"}`, and a route naming an authorizer the api does
+//!    not hold is a configuration this endpoint cannot serve, `500`
+//!    `{"message":"Internal server error"}`.
 //!
 //! # What it does not do, and what it answers instead
 //!
-//! A DEPLOYED WebSocket stage is answered `501` `NotImplemented` with the sentence
-//! [`NO_WEBSOCKET_TRANSPORT_MESSAGE`], and NOT with `101 Switching Protocols`.
+//! A DEPLOYED WebSocket stage whose authorization step let the handshake through is
+//! answered `501` `NotImplemented` with the sentence [`NO_WEBSOCKET_TRANSPORT_MESSAGE`],
+//! and NOT with `101 Switching Protocols`.
 //!
 //! The emulator's front door serves one BUFFERED request per call — `emulator_server`'s
 //! production listener hands each request to the router and writes the one response it
@@ -56,6 +67,16 @@
 //! which refuses the upgrade with its operation's own modelled error). `501` is this
 //! emulator's "not implemented" channel (`crate::scaffolded`), and it is not a retryable
 //! 5xx: a client learns the capability is absent rather than retrying for ever.
+//!
+//! Nor is an authorizer's own ALLOW/DENY decision computed: a `REQUEST` authorizer's
+//! decision is the answer of the Lambda function its `AuthorizerUri` names, and no
+//! deployment package runs in this emulator (`Invoke` itself refuses to run one), so a
+//! policy document invented here would be indistinguishable from the function's. What step
+//! 4 above applies is the part of the authorization that is the SERVICE's own and is
+//! computed from stored records — the identity-source precondition the authorizer is only
+//! invoked past, and a route whose authorizer the api does not hold.
+
+use std::collections::BTreeMap;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
@@ -77,6 +98,49 @@ pub const EXECUTE_API_LABEL: &str = "execute-api";
 /// stage and is left to the service that models it. Claiming it here would make two
 /// services claim one request, which the router answers `500 AmbiguousService`.
 const CONNECTIONS_SEGMENT: &str = "@connections";
+
+/// The `RouteKey` of the route a WebSocket api serves the CONNECTION REQUEST with — the
+/// opening handshake this module answers.
+///
+/// A reserved route key of the WebSocket protocol rather than a value the model
+/// enumerates (`RouteKey` is an unconstrained string): AWS documents `$connect` as the
+/// route "API Gateway invokes when a client connects to your API", which is why the
+/// authorization configured on it is what decides a handshake. The other two reserved keys
+/// (`$disconnect`, `$default`) are reached over an established socket, which this emulator
+/// has none of.
+const CONNECT_ROUTE_KEY: &str = "$connect";
+
+/// The status a request whose authorizer was not even invoked is refused with: "it returns
+/// a 401 Unauthorized response without calling the Lambda function"
+/// (`Authorizer$IdentitySource`).
+const UNAUTHORIZED_STATUS: u16 = 401;
+
+/// The sentence that status carries, in the `{"message": …}` envelope an `execute-api`
+/// endpoint answers in.
+const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
+
+/// The identity-source spellings that name a REQUEST HEADER, from
+/// `Authorizer$IdentitySource`: "this value is route.request.header.Auth … for WebSocket
+/// APIs. For HTTP APIs, use selection expressions prefixed with $, for example,
+/// $request.header.Auth".
+const HEADER_IDENTITY_SOURCES: &[&str] = &["route.request.header.", "$request.header."];
+
+/// The identity-source spellings that name a QUERY STRING PARAMETER; the same member's
+/// `route.request.querystring.Name` and `$request.querystring.Name`.
+const QUERY_IDENTITY_SOURCES: &[&str] = &[
+    "route.request.querystring.",
+    "$request.querystring.",
+];
+
+/// The identity-source spellings that name a STAGE VARIABLE — "the identity source can be
+/// headers, query string parameters, stage variables, and context parameters"
+/// (`Authorizer$IdentitySource`), read from the stage this handshake addresses.
+const STAGE_VARIABLE_IDENTITY_SOURCES: &[&str] = &["stagevariables.", "$stagevariables."];
+
+/// The identity-source spellings that name a CONTEXT parameter, the fourth part the same
+/// member names. The service computes one for every call, so a request cannot be missing
+/// it, and this data plane neither reads nor refuses on one.
+const CONTEXT_IDENTITY_SOURCES: &[&str] = &["context.", "$context."];
 
 /// The `Connection` field token that asks for a protocol upgrade (RFC 6455 §4.1).
 const UPGRADE_TOKEN: &str = "upgrade";
@@ -355,8 +419,12 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
         );
         return forbidden();
     }
-    // A deployed stage: the handshake is the capability this emulator does not have. See
-    // the module docs for why this is not a `101`.
+    // A deployed stage: the handshake is authorized by the route that serves the
+    // connection request, and only then met by the capability this emulator does not
+    // have. See the module docs for why this is not a `101`.
+    if let Some(refusal) = connect_authorization_refusal(resolved.api, stage, req) {
+        return refusal;
+    }
     tracing::info!(
         api_id = %resolved.api.api_id,
         stage = %stage.stage_name,
@@ -367,6 +435,189 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
         NO_WEBSOCKET_TRANSPORT_MESSAGE,
         Some(NOT_IMPLEMENTED_CODE),
     )
+}
+
+/// The refusal the CONNECTION REQUEST's authorization owes this handshake, or `None` when
+/// the route that serves it lets the handshake through to the next step.
+///
+/// The authorization of a route is applied before anything that route fronts, so this is
+/// what makes a refusal observable without a socket: nothing the `$connect` route targets
+/// is reached by a handshake refused here. Two answers are computed from the api's own
+/// records:
+///
+/// * an authorizer-backed route ([`crate::state::AUTHORIZER_BACKED_AUTHORIZATION_TYPES`])
+///   whose `AuthorizerId` names no authorizer of this api cannot be served at all — the
+///   decision has no configuration to come from — which is a fault of the api's
+///   configuration and not of the caller: `500`. The writers of a route refuse that
+///   association ([`crate::state::UNRESOLVED_AUTHORIZER_MESSAGE`]), so this is a store
+///   that lost the authorizer some other way and not a route a caller can create;
+/// * an authorizer whose `IdentitySource` list is not satisfied by the request is `401`,
+///   and its Lambda is NOT invoked: "These parameters are used to perform runtime
+///   validation … by verifying all of the identity-related request parameters are present
+///   in the request, not null, and non-empty. Only when this is true does the authorizer
+///   invoke the authorizer Lambda function. Otherwise, it returns a 401 Unauthorized
+///   response without calling the Lambda function" (`Authorizer$IdentitySource`).
+///
+/// An authorizer whose identity sources ARE satisfied is one this emulator would have to
+/// INVOKE to decide, which it cannot (see the module docs), so the handshake falls through
+/// to the transport refusal rather than being allowed or denied here.
+///
+/// The records read are the api's current ones: a `Deployment` of this service carries no
+/// configuration snapshot of its own (it is an id, a status and a date — see
+/// [`crate::state::Deployment`]), so what a released stage serves is the api as it stands.
+///
+/// The work this adds per handshake is bounded, and so is the PRODUCT of its two factors:
+/// the route is found by one scan of `api.routes`, capped at
+/// [`crate::state::MAX_ROUTES_PER_API`]; the request's query string is decoded ONCE into
+/// [`query_parameters`], never once per identity source; and the identity sources then
+/// looked up in it are capped at [`crate::state::MAX_IDENTITY_SOURCES_PER_AUTHORIZER`] by
+/// the create that stored them.
+fn connect_authorization_refusal(api: &Api, stage: &Stage, req: &RtRequest) -> Option<RtResponse> {
+    let route = api
+        .routes
+        .values()
+        .find(|route| route.route_key == CONNECT_ROUTE_KEY)?;
+    if !crate::state::AUTHORIZER_BACKED_AUTHORIZATION_TYPES
+        .contains(&route.authorization_type.as_str())
+    {
+        // `NONE` is "open access" and `AWS_IAM` is decided by an IAM policy this emulator
+        // holds no records of, so neither has an authorization this module can apply. The
+        // other value of that constant, `JWT`, cannot reach this data plane: a JWT
+        // authorizer is "supported only for HTTP APIs" and `validate_authorizer_config`
+        // refuses one on a WEBSOCKET api, so the identity-source rule below is only ever
+        // applied to the `REQUEST` authorizers it is the rule for.
+        return None;
+    }
+    let Some(authorizer) = route
+        .authorizer_id
+        .as_deref()
+        .and_then(|authorizer_id| api.authorizers.get(authorizer_id))
+    else {
+        tracing::warn!(
+            api_id = %api.api_id,
+            route_key = %route.route_key,
+            authorization_type = %route.authorization_type,
+            authorizer_id = ?route.authorizer_id,
+            "the connection request's route is authorized by an authorizer this api does \
+             not hold"
+        );
+        return Some(json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None));
+    };
+    let query_parameters = query_parameters(req.uri());
+    let absent: Vec<&str> = authorizer
+        .identity_source
+        .iter()
+        .filter(|identity_source| {
+            !presents_identity_source(
+                identity_source,
+                |name: &str| req.headers().get(name).map(str::to_string),
+                &query_parameters,
+                &stage.stage_variables,
+            )
+        })
+        .map(String::as_str)
+        .collect();
+    if absent.is_empty() {
+        return None;
+    }
+    tracing::info!(
+        api_id = %api.api_id,
+        stage = %stage.stage_name,
+        authorizer_id = %authorizer.authorizer_id,
+        absent = ?absent,
+        "refusing a WebSocket opening handshake: an identity source of the connection \
+         request's authorizer is absent, so the authorizer is not invoked"
+    );
+    Some(json_response(
+        UNAUTHORIZED_STATUS,
+        UNAUTHORIZED_MESSAGE,
+        None,
+    ))
+}
+
+/// Whether the request presents a non-empty value for the request part `identity_source`
+/// names.
+///
+/// `Authorizer$IdentitySource` calls each entry "a set of one or more mapping expressions
+/// of the specified request parameters", whose parts are "headers, query string
+/// parameters, stage variables, and context parameters", and requires each to be "present
+/// in the request, not null, and non-empty" — so a value that is only whitespace counts as
+/// absent, exactly as a missing one does.
+///
+/// A CONTEXT parameter answers `true`: the service computes one for every call, so no
+/// request can be missing it. (A context key an AUTHORIZER produces — `context.authorizer.`
+/// — exists only once one has run, so it cannot be an identity source of the authorizer
+/// that produces it; nothing here reads one, and an authorizer configured over one is a
+/// configuration this step does not refuse.) Every OTHER spelling — one no part of this
+/// request can be read from, and one naming an empty parameter — is NOT satisfied, so an
+/// expression this data plane cannot evaluate never passes the precondition it is a
+/// precondition of. (The REST data plane reaches the same conclusion by a different route:
+/// an expression matching neither of the two prefixes it reads leaves its authorizer
+/// undecided and is answered through `AUTHORIZER_CONFIGURATION_ERROR`,
+/// `service-com-amazonaws-apigateway-backplanecontrolservice/src/service/invoke.rs` — a
+/// refusal either way, never an allow.)
+fn presents_identity_source(
+    identity_source: &str,
+    header: impl Fn(&str) -> Option<String>,
+    query_parameters: &BTreeMap<String, String>,
+    stage_variables: &BTreeMap<String, String>,
+) -> bool {
+    let source = identity_source.trim();
+    if let Some(name) = parameter_name(source, HEADER_IDENTITY_SOURCES) {
+        return header(name).is_some_and(|value| !value.trim().is_empty());
+    }
+    if let Some(name) = parameter_name(source, QUERY_IDENTITY_SOURCES) {
+        return query_parameters
+            .get(name)
+            .is_some_and(|value| !value.trim().is_empty());
+    }
+    if let Some(name) = parameter_name(source, STAGE_VARIABLE_IDENTITY_SOURCES) {
+        return stage_variables
+            .get(name)
+            .is_some_and(|value| !value.trim().is_empty());
+    }
+    parameter_name(source, CONTEXT_IDENTITY_SOURCES).is_some()
+}
+
+/// The parameter name `source` carries after whichever of `prefixes` it begins with, or
+/// `None` when it begins with none of them or names an empty parameter.
+///
+/// The prefix is compared case-insensitively, because the same member documents one of
+/// these parts under two spellings (`stagevariables.` and `$stageVariables.`), while the
+/// parameter name itself is carried through as written — a query-string parameter name is
+/// case-sensitive, and a header name is matched case-insensitively by the header map.
+fn parameter_name<'s>(source: &'s str, prefixes: &[&str]) -> Option<&'s str> {
+    prefixes
+        .iter()
+        .filter_map(|prefix| {
+            let head = source.get(..prefix.len())?;
+            head.eq_ignore_ascii_case(prefix)
+                .then(|| &source[prefix.len()..])
+        })
+        .find(|name| !name.is_empty())
+}
+
+/// The query parameters of a request URI, decoded ONCE per handshake so that reading N
+/// identity sources costs N lookups rather than N scans of the query string.
+///
+/// The query is decoded as `application/x-www-form-urlencoded` — the form a URI's query
+/// carries — through the framework's own decoder for that grammar
+/// (`aws_smithy_schema_server::query::parse_form_urlencoded`, which turns `+` into a space
+/// and `%XX` into its byte, and reads a pair with no `=` as the empty value), so this file
+/// states no grammar of its own and cannot disagree with the rest of the tree about one.
+/// A name the query repeats keeps its FIRST value, the one a reader of the query meets
+/// first.
+fn query_parameters(uri: &str) -> BTreeMap<String, String> {
+    let mut parameters = BTreeMap::new();
+    let Some(query) = query_of(uri) else {
+        return parameters;
+    };
+    for (name, value) in
+        ::aws_smithy_schema_server::query::parse_form_urlencoded(query.as_bytes())
+    {
+        parameters.entry(name).or_insert(value);
+    }
+    parameters
 }
 
 /// `403` `{"message":"Forbidden"}` — the answer an `execute-api` endpoint gives for an api
@@ -475,6 +726,12 @@ fn path_of(uri: &str) -> &str {
         },
         None => without_query,
     }
+}
+
+/// The raw query string of a request URI, or `None` when it carries none. The query is
+/// where an identity source of the `querystring` form is read from.
+fn query_of(uri: &str) -> Option<&str> {
+    uri.split_once('?').map(|(_before, query)| query)
 }
 
 #[cfg(test)]
@@ -631,5 +888,98 @@ mod tests {
         assert_eq!(path_of("/prod/sub"), "/prod/sub");
         assert_eq!(first_segment("/prod/sub"), Some("prod"));
         assert_eq!(first_segment("/"), None);
+        assert_eq!(query_of("https://host/prod?token=abc"), Some("token=abc"));
+        assert_eq!(query_of("/prod?a=1&b=2"), Some("a=1&b=2"));
+        assert_eq!(query_of("/prod"), None);
+    }
+
+    #[test]
+    fn a_query_string_is_decoded_once_into_its_parameters() {
+        let parameters =
+            query_parameters("https://host/prod?token=abc&Name=&flag&my%20token=space&padded=+++");
+        assert_eq!(parameters.get("token").map(String::as_str), Some("abc"));
+        // Present with no value, and present with no `=` at all: both empty.
+        assert_eq!(parameters.get("Name").map(String::as_str), Some(""));
+        assert_eq!(parameters.get("flag").map(String::as_str), Some(""));
+        // A query parameter name is case-sensitive, unlike a header's.
+        assert_eq!(parameters.get("name"), None);
+        assert_eq!(parameters.get("absent"), None);
+        // Decoded as the client wrote it: a percent-encoded name, and a `+`-spelled space.
+        assert_eq!(parameters.get("my token").map(String::as_str), Some("space"));
+        assert_eq!(parameters.get("padded").map(String::as_str), Some("   "));
+        // A repeated name keeps the value a reader meets first.
+        assert_eq!(
+            query_parameters("/prod?token=first&token=second")
+                .get("token")
+                .map(String::as_str),
+            Some("first")
+        );
+        assert!(query_parameters("/prod").is_empty());
+    }
+
+    /// Each identity-source form, against a request that presents the part it names and a
+    /// request that does not. The rule is `Authorizer$IdentitySource`'s: present in the
+    /// request, not null and non-empty.
+    #[test]
+    fn an_identity_source_is_satisfied_only_by_a_non_empty_value() {
+        let headers: BTreeMap<&str, &str> = BTreeMap::from([("auth", "t0ken"), ("blank", "   ")]);
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| (*value).to_string())
+        };
+        let query = query_parameters("/prod?token=t0ken&empty=&my%20token=decoded&padded=+");
+        let stage_variables = BTreeMap::from([
+            ("tenant".to_string(), "acme".to_string()),
+            ("blank".to_string(), " ".to_string()),
+        ]);
+
+        let cases: &[(&str, &str, bool)] = &[
+            // The WebSocket spelling the member documents, and the HTTP one.
+            ("a header the request carries", "route.request.header.Auth", true),
+            ("the same header, HTTP spelling", "$request.header.auth", true),
+            ("a header the request does not carry", "route.request.header.Missing", false),
+            ("a header carrying only whitespace", "route.request.header.blank", false),
+            ("a query parameter the request carries", "route.request.querystring.token", true),
+            ("the same parameter, HTTP spelling", "$request.querystring.token", true),
+            (
+                "a query parameter the request does not carry",
+                "route.request.querystring.missing",
+                false,
+            ),
+            ("a query parameter with an empty value", "route.request.querystring.empty", false),
+            (
+                "a query parameter whose name the request percent-encoded",
+                "route.request.querystring.my token",
+                true,
+            ),
+            (
+                "a query parameter whose value decodes to whitespace",
+                "route.request.querystring.padded",
+                false,
+            ),
+            ("a stage variable the stage holds", "stagevariables.tenant", true),
+            ("the same variable, HTTP spelling", "$stageVariables.tenant", true),
+            ("a stage variable the stage does not hold", "stagevariables.missing", false),
+            ("a stage variable holding only whitespace", "stagevariables.blank", false),
+            // Computed by the service for every call, so no request can be missing it.
+            ("a context parameter", "context.identity.sourceIp", true),
+            ("a context parameter, HTTP spelling", "$context.requestId", true),
+            // Nothing in the request can be read for these, so neither is satisfied.
+            ("a form this data plane does not read", "route.request.body.action", false),
+            ("a prefix naming no parameter", "route.request.header.", false),
+            ("an empty expression", "", false),
+            // Surrounding whitespace in the stored expression is not part of the name.
+            ("the expression with surrounding spaces", "  route.request.header.Auth  ", true),
+        ];
+
+        for (case, identity_source, expected) in cases {
+            assert_eq!(
+                presents_identity_source(identity_source, header, &query, &stage_variables),
+                *expected,
+                "case {case:?}: expected {identity_source:?} to be presented: {expected}"
+            );
+        }
     }
 }

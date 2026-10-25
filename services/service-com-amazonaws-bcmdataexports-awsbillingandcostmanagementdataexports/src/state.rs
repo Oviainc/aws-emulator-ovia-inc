@@ -125,8 +125,17 @@ pub const EXPORT_STATUS_HEALTHY: &str = "HEALTHY";
 /// grow the store without limit.
 pub const MAX_EXPORTS: usize = 1000;
 
-/// The `ServiceCode` a quota failure reports: this service's endpoint prefix.
-pub const SERVICE_CODE: &str = SIGNING_NAME;
+/// The `ServiceCode` a quota failure reports.
+///
+/// The model does not leave this one to the emulator: it states the single value the
+/// member always carries — "The service code that exceeded quota. It will always be
+/// “AWSBillingAndCostManagementDataExports”" (smithy_query query="doc"
+/// shape="ServiceQuotaExceededException" member="ServiceCode"), and `ThrottlingException`'s
+/// own `ServiceCode` is documented with the same fixed value — so that value is what the
+/// member carries, whatever the request. It is this service's Smithy service name, NOT its
+/// endpoint prefix / SigV4 signing name ([`SIGNING_NAME`]), which is what ARNs and the
+/// credential scope are built from.
+pub const SERVICE_CODE: &str = "AWSBillingAndCostManagementDataExports";
 
 /// The quota a `ServiceQuotaExceededException` from `CreateExport` names.
 pub const EXPORTS_PER_ACCOUNT_QUOTA_CODE: &str = "ExportsPerAccount";

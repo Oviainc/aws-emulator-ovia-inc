@@ -729,6 +729,9 @@ async fn deregistering_an_application_forgets_its_results() {
         deregistered.status, 200,
         "expected 200 from DeregisterApplication, got {deregistered:?}"
     );
+    // The deregistration is asynchronous: the runs are dropped with the application, when
+    // the removal the clock owes it falls due.
+    settle().await;
 
     for (application_id, operation_id, sub_check_result_id) in &runs {
         let expected = if *application_id == "HDB-GONE" { 400 } else { 200 };

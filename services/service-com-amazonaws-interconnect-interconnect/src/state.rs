@@ -507,6 +507,43 @@ pub const TAG_KEY_LENGTH: (usize, usize) = (1, 128);
 /// `@length(min: 0, max: 256)`, so a value may be empty but not longer than 256.
 pub const TAG_VALUE_LENGTH: (usize, usize) = (0, 256);
 
+/// The tag-key namespace a caller does not own.
+///
+/// AWS assigns its own system tags keys that begin with this prefix and reserves it:
+/// a tagging call may not create, change or remove a key inside it, so the tags a
+/// request can touch are only the caller's own. `TagKey` carries no `@pattern`, so
+/// the reservation is a service-level rule rather than a modelled constraint, and it
+/// is matched without regard to case the way the reservation is stated.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+///
+/// The head is taken with `get` rather than by slicing, so a key whose opening bytes
+/// are part of a multi-byte character answers `false` instead of panicking.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// Why `keys` are not keys this caller may write or remove, worded for the caller —
+/// or `None` when none of them is reserved.
+///
+/// Every tagging path judges its keys here — tag-on-create, the tagging operation and
+/// the untagging one — so the reservation holds however a key reached the request, and
+/// a refused call writes nothing. The lowest reserved key decides the message, so the
+/// same request is always refused for the same key, and that key and the reserved
+/// prefix are what the message names.
+pub fn reserved_tag_key_violation<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    keys.into_iter()
+        .filter(|key| is_reserved_tag_key(key))
+        .min()
+        .map(|key| {
+            format!(
+                "{REFUSAL_ENVELOPE}the tag key {key} is in the {RESERVED_TAG_KEY_PREFIX} namespace that AWS reserves for its own tags, which a caller cannot create, change or remove"
+            )
+        })
+}
+
 /// Why a `TagMap` the request carries does not satisfy the lengths the model gives
 /// `TagKey` and `TagValue`, worded for the caller — or `None` when every entry is
 /// inside them. The entry-count half of the rule lives in [`tag_write_violation`],
@@ -572,7 +609,8 @@ fn merged_tag_count(
 /// Both of this service's tag writers (tag-on-create and the tagging operation) judge
 /// their input here, so one rule decides what a stored tag set can be however it was
 /// reached: every entry inside the lengths the model gives `TagKey` and `TagValue`,
-/// and at most [`MAX_TAGS_PER_RESOURCE`] entries on the resource once the write is
+/// no key in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace, and at most
+/// [`MAX_TAGS_PER_RESOURCE`] entries on the resource once the write is
 /// merged. A request outside either bound is a fault in the INPUT — the 400 the
 /// service models for one, never a missing resource and never a 501 — and is refused
 /// before anything is written, so a refused write leaves the resource exactly as it
@@ -583,6 +621,9 @@ pub fn tag_write_violation(
     incoming: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
     if let Some(message) = tag_length_violation(incoming) {
+        return Some(message);
+    }
+    if let Some(message) = reserved_tag_key_violation(incoming.keys().map(String::as_str)) {
         return Some(message);
     }
     let merged = merged_tag_count(existing, incoming);

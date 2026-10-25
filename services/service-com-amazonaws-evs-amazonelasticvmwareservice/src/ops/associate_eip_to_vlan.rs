@@ -21,6 +21,11 @@
 //!    already associated with is REFUSED with the modelled `ValidationException`: one
 //!    Elastic IP address carries one association at a time, which is EC2's own
 //!    single-use rule for an Elastic IP address (`Resource.AlreadyAssociated`).
+//! 6. `allocationId` is "the Elastic IP address allocation ID" of the caller's own Amazon
+//!    EC2 account, so an id that account holds no Elastic IP allocation for is REFUSED
+//!    with the modelled `ValidationException` and nothing is recorded — the same reading
+//!    `CreateEnvironment` takes of the `vpcId` and `serviceAccessSubnetId` it is given,
+//!    which also name EC2 resources the account has to hold already.
 //!
 //! The association is a change to the caller's Amazon EC2 resource, not only to this
 //! service's records: `allocationId` is "the Elastic IP address allocation ID" of the
@@ -31,8 +36,10 @@
 //! `DisassociateEipFromVlan` gives it back.
 //!
 //! The association's `ipAddress` is the Elastic IP address the account's Amazon EC2
-//! store holds for the allocation. An allocation that store does not hold leaves the
-//! member absent, because this service has no address of its own to report for it.
+//! store holds for the allocation. An EC2 store this emulator cannot read AT ALL is
+//! evidence of nothing and so refuses nothing: the association is then named from this
+//! service's own id source and the member stays absent, because there is no store to
+//! take an address from.
 //!
 //! ## Shape of an operation
 //!
@@ -357,12 +364,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
-                // The account's EC2 store holds no such allocation, or carries no
-                // readable store at all: there is no `Address` record to associate and no
-                // address to report, so the association is named from this service's own
-                // id source. Whether an allocation that does not exist is refused at all
-                // is a question of its own, and not this one.
-                Recorded::NoSuchAllocation | Recorded::NoEc2Store => Some(EipAssociation {
+                // The account's EC2 store holds no allocation of that id: the member
+                // names an Elastic IP address of the caller's own account that the
+                // account does not hold, so there is nothing to associate and the
+                // request is refused with the operation's modelled ValidationException,
+                // naming the member that carried it. Nothing was written to either
+                // store, so the refusal leaves both as they were.
+                Recorded::NoSuchAllocation => {
+                    return Err(AssociateEipToVlanErrorModeled::ValidationException(
+                        crate::state::aggregate_validation_error(vec![
+                            crate::state::ec2_resources::invalid_allocation_clause(
+                                &input.allocation_id,
+                            ),
+                        ]),
+                    )
+                    .into());
+                }
+                // No readable EC2 store on this engine at all: evidence of nothing, so
+                // nothing is refused on its account. There is no `Address` record to
+                // associate and no address to report, so the association is named from
+                // this service's own id source and carries none.
+                Recorded::NoEc2Store => Some(EipAssociation {
                     association_id: Some(state.mint_eip_association_id()),
                     allocation_id: Some(input.allocation_id.clone()),
                     ip_address: None,

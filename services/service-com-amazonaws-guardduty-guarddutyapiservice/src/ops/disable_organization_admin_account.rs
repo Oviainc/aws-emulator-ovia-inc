@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableOrganizationAdminAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableOrganizationAdminAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableOrganizationAdminAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the account the Region the request was signed for holds as its GuardDuty
+//! delegated administrator. The removal is accepted here and falls due a short span
+//! later, so a read straight afterwards still reports the designation under its
+//! transient status.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +130,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableOrganizationAdminAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableOrganizationAdminAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableOrganizationAdminAccount"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisableOrganizationAdminAccountErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // `AdminAccountId` names the delegated administrator to remove and targets a
+        // plain `String` (`smithy_query(operation="DisableOrganizationAdminAccount")`),
+        // so a value that cannot be an account id at all is the parameter failure,
+        // refused before anything is looked up.
+        if !crate::state::is_account_id(&input.admin_account_id) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::ADMIN_ACCOUNT_ID_MEMBER),
+            ));
+        }
+
+        let mut state = state.lock();
+        // A removal the clock already owes is materialised first, so this call sees
+        // the designations a read would report.
+        state.settle_organization_admin_accounts();
+
+        match state.disable_organization_admin_account(&region, &input.admin_account_id) {
+            // No designation to remove at all.
+            None => Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::NO_ORGANIZATION_ADMIN_MESSAGE,
+            )),
+            // A designation, but of another account: this request names an account
+            // that is not the delegated administrator.
+            Some(false) => Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::NOT_THE_ORGANIZATION_ADMIN_MESSAGE,
+            )),
+            // The response models no members (`smithy_query(operation="DisableOrganizationAdminAccount")`):
+            // `ListOrganizationAdminAccounts` is what reports the removal taking
+            // effect.
+            Some(true) => Ok(DisableOrganizationAdminAccountOutput {}),
+        }
     }
 }

@@ -311,6 +311,112 @@ impl ComAmazonawsGlueAwsglueState {
     pub fn can_store_job(&self) -> bool {
         self.jobs.len() < MAX_JOBS
     }
+
+    /// The tag set of the resource `resource` names, or `None` when this store holds no
+    /// such resource.
+    ///
+    /// The ONE resolution every tag READ goes through, so an ARN names the same record
+    /// whichever operation — this service's own `GetTags`, or the account-wide tagging
+    /// API that projects this store — resolved it.
+    pub fn resource_tags(&self, resource: &TaggedResource) -> Option<&HashMap<String, String>> {
+        match resource.kind {
+            // A database and a connection live INSIDE a catalog, so the ARN's account
+            // segment is the `CatalogId` they are looked for under.
+            TaggedResourceKind::Database => self
+                .catalogs
+                .get(&resource.account_id)
+                .and_then(|catalog| catalog.databases.get(&resource.name))
+                .map(|database| &database.tags),
+            TaggedResourceKind::Connection => self
+                .catalogs
+                .get(&resource.account_id)
+                .and_then(|catalog| catalog.connections.get(&resource.name))
+                .map(|connection| &connection.tags),
+            // A crawler and a job definition live BESIDE the catalog tree in one
+            // per-account namespace, so the account segment is what decides whether this
+            // emulator could hold them at all.
+            TaggedResourceKind::Crawler => is_served_account(&resource.account_id)
+                .then(|| self.crawlers.get(&resource.name).map(|crawler| &crawler.tags))
+                .flatten(),
+            TaggedResourceKind::Job => is_served_account(&resource.account_id)
+                .then(|| self.jobs.get(&resource.name).map(|job| &job.tags))
+                .flatten(),
+        }
+    }
+
+    /// [`Self::resource_tags`] mutably: the ONE record every tag WRITE lands in, so a tag
+    /// written through this service's own `TagResource` and one written through the
+    /// account-wide tagging API are the same tag.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource: &TaggedResource,
+    ) -> Option<&mut HashMap<String, String>> {
+        match resource.kind {
+            TaggedResourceKind::Database => self
+                .catalogs
+                .get_mut(&resource.account_id)
+                .and_then(|catalog| catalog.databases.get_mut(&resource.name))
+                .map(|database| &mut database.tags),
+            TaggedResourceKind::Connection => self
+                .catalogs
+                .get_mut(&resource.account_id)
+                .and_then(|catalog| catalog.connections.get_mut(&resource.name))
+                .map(|connection| &mut connection.tags),
+            TaggedResourceKind::Crawler => {
+                if !is_served_account(&resource.account_id) {
+                    return None;
+                }
+                self.crawlers
+                    .get_mut(&resource.name)
+                    .map(|crawler| &mut crawler.tags)
+            }
+            TaggedResourceKind::Job => {
+                if !is_served_account(&resource.account_id) {
+                    return None;
+                }
+                self.jobs.get_mut(&resource.name).map(|job| &mut job.tags)
+            }
+        }
+    }
+
+    /// Every resource this store holds a tag set for, as `(ARN, tags)`.
+    ///
+    /// This is the account's tag-store rows for this service: the tags a create recorded
+    /// are the resource's own, so the account-wide tagging API projects THESE records
+    /// rather than keeping a second copy that a create would have to be taught to write.
+    /// Resources carrying NO tag are included — the caller decides what to do with an
+    /// untagged resource — and `region` is the Region the ARNs are minted for, for the
+    /// reason [`request_region`] gives.
+    pub fn tagged_resources(&self, region: &str) -> Vec<(String, HashMap<String, String>)> {
+        let mut found: Vec<(String, HashMap<String, String>)> = Vec::new();
+        for catalog in self.catalogs.values() {
+            for database in catalog.databases.values() {
+                found.push((
+                    TaggedResourceKind::Database.arn(region, &database.name),
+                    database.tags.clone(),
+                ));
+            }
+            for connection in catalog.connections.values() {
+                found.push((
+                    TaggedResourceKind::Connection.arn(region, &connection.name),
+                    connection.tags.clone(),
+                ));
+            }
+        }
+        for crawler in self.crawlers.values() {
+            found.push((
+                TaggedResourceKind::Crawler.arn(region, &crawler.name),
+                crawler.tags.clone(),
+            ));
+        }
+        for job in self.jobs.values() {
+            found.push((
+                TaggedResourceKind::Job.arn(region, &job.name),
+                job.tags.clone(),
+            ));
+        }
+        found
+    }
 }
 
 /// One Data Catalog: the databases stored under a single `CatalogId`.
@@ -1724,6 +1830,191 @@ pub fn resolve_catalog_id(catalog_id: Option<&String>) -> String {
 /// miss rather than quietly given a new, empty catalog.
 pub fn is_known_catalog(catalog_id: &str) -> bool {
     catalog_id == ::engine::emulator_account_id()
+}
+
+/// Whether `account_id` — field 5 of an ARN — is the account this emulator serves, and
+/// so the only account whose Glue resources this store can hold. An ARN naming any other
+/// account names a resource of another account's estate, which this process does not
+/// hold.
+pub fn is_served_account(account_id: &str) -> bool {
+    account_id == ::engine::emulator_account_id()
+}
+
+/// The Region a request is scoped to: the one its SigV4 credential scope names, or
+/// [`DEFAULT_REGION`] for a request that carries no scope (an unsigned call).
+///
+/// A Glue record carries no Region of its own — every operation that addresses a resource
+/// names it by name — so the Region a resource's ARN is minted for, and compared against,
+/// is the one its request is served in.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The Region a request with no SigV4 credential scope is scoped to. Matches the Region
+/// the emulator's own generated client config defaults to.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The ARN service namespace every Glue resource lives in, as the modelled
+/// `GlueResourceArn` pattern spells it
+/// (`^arn:aws(-(cn|us-gov|iso(-[bef])?))?:glue:`).
+pub const ARN_NAMESPACE: &str = "glue";
+
+/// One kind of Glue resource that carries its OWN tag set, and so can be named by a
+/// tagging call's `ResourceArn`.
+///
+/// The kinds are the ones whose create carries a `Tags` map and whose record in this
+/// store therefore holds a tag set: a Data Catalog database (`CreateDatabase$Tags`), a
+/// connection (`CreateConnection$Tags`), a crawler (`CreateCrawler$Tags`) and a job
+/// definition (`CreateJob$Tags`). A table is NOT one of them — `CreateTable` models no
+/// `Tags` member — and a Glue resource this emulator does not store yet has no tag set
+/// to name either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResourceKind {
+    /// `connection/<name>`.
+    Connection,
+    /// `crawler/<name>`.
+    Crawler,
+    /// `database/<name>`.
+    Database,
+    /// `job/<name>`.
+    Job,
+}
+
+/// The ARN resource-type segment each taggable kind carries: the catalog
+/// [`parse_tagged_resource`] resolves an ARN against and [`TaggedResourceKind::arn`]
+/// mints one from.
+///
+/// Source: the resource portion of each resource's documented Glue ARN
+/// (`database/<name>`, `connection/<name>`, `crawler/<name>`, `job/<name>`). The model
+/// states only the prefix every Glue ARN shares (`GlueResourceArn`'s pattern, see
+/// [`ARN_NAMESPACE`]), so the segments are listed here once and every mint and every
+/// lookup goes through this one table.
+pub const TAGGED_RESOURCE_TYPES: [(&str, TaggedResourceKind); 4] = [
+    ("connection", TaggedResourceKind::Connection),
+    ("crawler", TaggedResourceKind::Crawler),
+    ("database", TaggedResourceKind::Database),
+    ("job", TaggedResourceKind::Job),
+];
+
+impl TaggedResourceKind {
+    /// This kind's ARN resource-type segment, from [`TAGGED_RESOURCE_TYPES`].
+    pub fn arn_segment(self) -> &'static str {
+        TAGGED_RESOURCE_TYPES
+            .iter()
+            .find(|(_, kind)| *kind == self)
+            .map(|(segment, _)| *segment)
+            // Every variant has a row above, so this is unreachable; answering the
+            // service namespace rather than panicking keeps a request path alive.
+            .unwrap_or(ARN_NAMESPACE)
+    }
+
+    /// The ARN of the resource `name` of this kind, as served in `region`.
+    ///
+    /// The account segment is this emulator's own ([`::engine::emulator_arn`]), which is
+    /// also the only `CatalogId` a catalog resource can live under here (see
+    /// [`is_known_catalog`]), so a minted ARN and a stored record always agree on whose
+    /// resource it is.
+    pub fn arn(self, region: &str, name: &str) -> String {
+        ::engine::emulator_arn(
+            ARN_NAMESPACE,
+            region,
+            &format!("{}/{name}", self.arn_segment()),
+        )
+    }
+}
+
+/// A Glue resource a tagging call named by ARN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggedResource {
+    /// Which kind of resource the ARN's resource-type segment names.
+    pub kind: TaggedResourceKind,
+    /// Field 4 of the ARN: the Region whose estate the resource belongs to.
+    pub region: String,
+    /// Field 5 of the ARN: the account that owns the resource, which for a Data Catalog
+    /// resource is also the `CatalogId` it lives under ("If none is provided, the Amazon
+    /// Web Services account ID is used by default").
+    pub account_id: String,
+    /// The resource's name, folded exactly as the store keys it: lowercased for a
+    /// database ([`fold_name`]), as written for the kinds the model documents no fold
+    /// for.
+    pub name: String,
+}
+
+/// The Glue resource `resource_arn` names, or `None` when it is not the ARN of a taggable
+/// Glue resource at all — a value in another service's namespace, a malformed ARN, or a
+/// Glue resource kind this store holds no tag set for.
+///
+/// Only the KIND and the identity fields are read here; whether this store holds the
+/// resource is [`ComAmazonawsGlueAwsglueState::resource_tags`]'s answer, so an ARN of a
+/// known kind that names nothing earns that kind's not-found refusal rather than being
+/// called malformed.
+pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
+    // `arn:<partition>:glue:<region>:<account>:<resource>`. The resource is the LAST
+    // field, so it keeps any colon of its own.
+    let fields: Vec<&str> = resource_arn.splitn(6, ':').collect();
+    if fields.len() != 6 || fields[0] != "arn" || fields[2] != ARN_NAMESPACE {
+        return None;
+    }
+    let (segment, name) = fields[5].split_once('/')?;
+    if name.is_empty() {
+        return None;
+    }
+    let (_, kind) = TAGGED_RESOURCE_TYPES
+        .iter()
+        .find(|(candidate, _)| *candidate == segment)?;
+    Some(TaggedResource {
+        kind: *kind,
+        region: fields[3].to_string(),
+        account_id: fields[4].to_string(),
+        name: match kind {
+            // The two Hive-compatible catalog resources are the ones the catalog folds;
+            // a crawler, job or connection name is keyed as written.
+            TaggedResourceKind::Database => fold_name(name),
+            TaggedResourceKind::Connection
+            | TaggedResourceKind::Crawler
+            | TaggedResourceKind::Job => name.to_string(),
+        },
+    })
+}
+
+/// The message a refusal carries for a `ResourceArn` of a known kind that names no
+/// resource this store holds.
+///
+/// Each sentence is the one this crate already answers wherever that kind fails to
+/// resolve ([`messages`]), so "this ARN names no database" reads the same from a tagging
+/// operation as from `GetDatabase`. The two kinds whose refusal wording no recording or
+/// doc states take a sentence DERIVED from the request instead: it names the ARN that
+/// resolved to nothing, and what is pinned is the behaviour — 400 with
+/// `EntityNotFoundException`.
+pub fn tagged_resource_not_found_message(resource: &TaggedResource, resource_arn: &str) -> String {
+    match resource.kind {
+        TaggedResourceKind::Database => messages::database_not_found(&resource.name),
+        TaggedResourceKind::Crawler => messages::crawler_not_found(&resource.name),
+        TaggedResourceKind::Connection | TaggedResourceKind::Job => {
+            format!("Entity not found for resource {resource_arn}")
+        }
+    }
+}
+
+/// The message a refusal carries for a `ResourceArn` that is not the ARN of a taggable
+/// Glue resource ([`parse_tagged_resource`] answers `None`).
+///
+/// Derived from the request, like this crate's other reference refusals: it names the
+/// member, the resource types the member accepts ([`TAGGED_RESOURCE_TYPES`]) and the
+/// value that is none of them.
+pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
+    let kinds: Vec<&str> = TAGGED_RESOURCE_TYPES
+        .iter()
+        .map(|(segment, _)| *segment)
+        .collect();
+    format!(
+        "ResourceArn must be the ARN of a taggable Glue resource naming one of {}; got \
+         {resource_arn:?}",
+        kinds.join(", ")
+    )
 }
 
 /// A wall-clock instant as the modelled timestamp type.
