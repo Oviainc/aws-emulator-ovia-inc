@@ -146,8 +146,9 @@ async fn with_inventory(inventory: &[(&str, usize)]) -> Emulator {
 }
 
 /// The `(resourceType, count)` pairs a response reports, in the order it reported
-/// them.
-fn counts_of(case: &str, body: &Value) -> Vec<(String, i64)> {
+/// them. `pub(crate)` so the suites that drive the discovered-resource inventory
+/// through other operations read a count the one way.
+pub(crate) fn counts_of(case: &str, body: &Value) -> Vec<(String, i64)> {
     body["resourceCounts"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected resourceCounts, got {body}"))
