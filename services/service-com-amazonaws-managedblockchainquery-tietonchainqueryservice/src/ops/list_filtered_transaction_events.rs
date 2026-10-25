@@ -340,11 +340,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
         let mut matching: Vec<(String, TransactionEvent)> = Vec::new();
-        for transaction in state
-            .ledger(&input.network)
-            .map(|ledger| ledger.for_address(address))
-            .unwrap_or_default()
-        {
+        // The ledger is carried into the loop because the unit a value is quoted in is
+        // published by the token's own contract, which the ledger holds
+        // (`state::NetworkLedger::amount_decimals`); a network whose ledger holds nothing
+        // for the address lists no event.
+        let ledger = state.ledger(&input.network);
+        for (ledger, transaction) in ledger.into_iter().flat_map(|ledger| {
+            ledger
+                .for_address(address)
+                .into_iter()
+                .map(move |transaction| (ledger, transaction))
+        }) {
             let instant = transaction.transaction_timestamp;
             // An event is listed only where the transaction that emitted it is: the
             // event carries that transaction's own `confirmationStatus`, so the finality
@@ -364,7 +370,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             for (position, (stored, event)) in transaction
                 .events
                 .iter()
-                .zip(transaction.events())
+                .zip(transaction.events(ledger))
                 .enumerate()
             {
                 // Both sides are in the ledger's own spelling: the stored events were

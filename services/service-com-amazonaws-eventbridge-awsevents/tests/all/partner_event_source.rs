@@ -178,6 +178,15 @@ fn not_entitled(namespace: &str) -> String {
     format!("Caller is not whitelisted for the event source partner namespace {namespace}")
 }
 
+/// What a `PutPartnerEvents` entry naming a `Source` the caller is not
+/// whitelisted for reports on its own row: the member that was rejected and the
+/// reason, in this service's parameter-validation form. Written out here so the
+/// implementation is not the source of the wording this test checks.
+fn not_whitelisted_for_source() -> String {
+    "Parameter Source is not valid. Reason: Caller AWS account is not whitelisted for the source."
+        .to_string()
+}
+
 /// Install the registration that makes this account the SaaS partner of
 /// `aws.partner/<partner>`: in AWS that happens during partner registration,
 /// outside EventBridge, so it is written straight into the store the handlers
@@ -295,9 +304,10 @@ async fn every_partner_authoring_operation_refuses_a_caller_outside_the_namespac
 /// RULE 1, the data plane — `PutPartnerEvents` fails every entry whose `Source`
 /// lies in a namespace the caller is not the registered SaaS partner of, through
 /// the per-entry failure channel: the CALL answers 200, each such entry carries
-/// the code for a source the caller may not publish under and no `EventId`,
-/// `FailedEntryCount` counts them, and nothing is routed. The rows differ along
-/// the batch size and along whether an entry carries `Time` and `Resources`.
+/// the parameter-validation code, a message naming the rejected member and the
+/// reason, and no `EventId`, `FailedEntryCount` counts them, and nothing is
+/// routed. The rows differ along the batch size and along whether an entry
+/// carries `Time` and `Resources`.
 #[tokio::test]
 async fn put_partner_events_fails_an_entry_outside_the_namespace_it_publishes_to() {
     let emulator = emulator();
@@ -376,8 +386,8 @@ async fn put_partner_events_fails_an_entry_outside_the_namespace_it_publishes_to
                     result.get("EventId").and_then(Value::as_str),
                 ),
                 (
-                    Some("NotAuthorizedForSourceException"),
-                    Some("Not authorized for the source."),
+                    Some("InvalidArgument"),
+                    Some(not_whitelisted_for_source().as_str()),
                     None
                 ),
                 "case {label:?} entry {index}: expected the source refusal and no EventId, got \
@@ -1330,7 +1340,7 @@ async fn a_partner_batch_fails_only_the_entries_that_cannot_be_published() {
             (
                 "a source in another partner's namespace",
                 json!({ "Source": foreign, "DetailType": "t", "Detail": "{}" }),
-                Some("NotAuthorizedForSourceException"),
+                Some("InvalidArgument"),
             ),
             (
                 "a source this partner never authored",

@@ -27,10 +27,14 @@ mod event_bus_configuration;
 mod event_bus_deletion;
 #[path = "all/event_bus_lifecycle.rs"]
 mod event_bus_lifecycle;
+#[path = "all/implicit_default_bus.rs"]
+mod implicit_default_bus;
 #[path = "all/input_validation.rs"]
 mod input_validation;
 #[path = "all/missing_resource_wording.rs"]
 mod missing_resource_wording;
+#[path = "all/partner_entry_rejection.rs"]
+mod partner_entry_rejection;
 #[path = "all/partner_event_source.rs"]
 mod partner_event_source;
 #[path = "all/pattern_and_connection_filters.rs"]

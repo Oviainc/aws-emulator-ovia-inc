@@ -147,15 +147,26 @@ const NATIVE_OUT_SATOSHI: i128 = BTC / 50;
 /// what its input spent and what its output created.
 const BITCOIN_FEE: i128 = 5_000;
 
-/// What a fixture fungible-token transfer moves, in the contract's own smallest unit, and
-/// the supply its deployer opened with.
-const TOKEN_OUT: i128 = 250_000;
+/// The `decimals` the fixture's own fungible contract publishes, and so the subdivision
+/// an amount of its token is quoted at: 18, the precision the ERC-20 implementations this
+/// index catalogs mostly report ([`super::ETHEREUM_MAINNET_ERC20`]).
+const SYNTHETIC_ERC20_DECIMALS: i32 = 18;
+
+/// One whole token of the fixture's own fungible contract, in the smallest unit that
+/// contract subdivides into — the unit the ledger holds every amount of it in.
+const EFT: i128 = 10i128.pow(SYNTHETIC_ERC20_DECIMALS as u32);
+
+/// What a fixture transfer of the ledger's OWN fungible contract moves, in that
+/// contract's smallest unit: whole tokens scaled by the `decimals` it publishes, except
+/// the internal transfer, which moves half a token so a fungible balance is not always a
+/// whole number of them.
+const TOKEN_OUT: i128 = 250 * EFT;
 /// See [`TOKEN_OUT`].
-const TOKEN_IN: i128 = 100_000;
+const TOKEN_IN: i128 = 100 * EFT;
 /// See [`TOKEN_OUT`].
-const TOKEN_INTERNAL: i128 = 50_000;
-/// See [`TOKEN_OUT`].
-const TOKEN_SUPPLY: i128 = 1_000_000_000_000_000;
+const TOKEN_INTERNAL: i128 = EFT / 2;
+/// The supply that contract's deployer opened with, in the same unit; see [`TOKEN_OUT`].
+const TOKEN_SUPPLY: i128 = 1_000_000 * EFT;
 
 /// How many whole tokens of a well-known contract a fixture wallet opens with, and how
 /// many of them it sends on: whole tokens, scaled by that contract's own `decimals`.
@@ -300,7 +311,7 @@ fn ethereum_fixture(network: &str, tip: i64) -> NetworkLedger {
             metadata: Some(ContractMetadata {
                 name: Some("Emulated Fungible Token".to_string()),
                 symbol: Some("EFT".to_string()),
-                decimals: Some(18),
+                decimals: Some(SYNTHETIC_ERC20_DECIMALS),
             }),
         },
         StoredContract {

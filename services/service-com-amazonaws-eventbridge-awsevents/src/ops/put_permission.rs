@@ -299,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         bus.policy = candidate;
         // The bus's resource policy is part of the bus, so installing a
         // statement is a modification of the bus.
-        bus.last_modified = modified;
+        bus.touch(modified);
 
         Ok(PutPermissionOutput)
     }

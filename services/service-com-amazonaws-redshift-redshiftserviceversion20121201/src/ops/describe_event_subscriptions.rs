@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEventSubscriptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEventSubscriptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEventSubscriptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the event notification subscriptions this account holds, in creation
+//! order: the ONE the request names, or every one when it names none, filtered
+//! by the request's tag keys and values and served one `MaxRecords` page at a
+//! time. A pure report — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -116,11 +112,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeEventSubscriptionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeEventSubscriptions")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeEventSubscriptions",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeEventSubscriptionsErrorModeled {
     InvalidTagFault(InvalidTagFault),
     SubscriptionNotFoundFault(SubscriptionNotFoundFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -172,20 +175,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEventSubscriptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventSubscriptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEventSubscriptions"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeEventSubscriptionsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure report: nothing here changes what a later caller sees, and a
+        // subscription has no status the clock owes a transition on.
+        let store = state.lock();
+
+        // The subscriptions this request reports: the ONE the name identifies, or
+        // every one the account holds when it names none. ONE lookup decides
+        // both, so the refusal and the selection can never disagree — a name that
+        // identifies no subscription is a refusal, not an empty report.
+        let selected: Vec<&EventSubscription> = match input.subscription_name.as_deref() {
+            Some(requested) => match store.event_subscription(requested) {
+                Some(subscription) => vec![subscription],
+                None => {
+                    return Err(
+                        DescribeEventSubscriptionsErrorModeled::SubscriptionNotFoundFault(
+                            SubscriptionNotFoundFault {
+                                message: Some(st::subscription_not_found_message(requested)),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => store.event_subscriptions.iter().collect(),
+        };
+
+        // Selected by REFERENCE, so only the page is cloned: the work done under
+        // the state lock is proportional to the page, not to the whole store. The
+        // tag filter selects SUBSCRIPTIONS — a resource with "either or both of
+        // these tag keys" — so one matching tag reports the whole record, every
+        // tag it carries included.
+        let matched: Vec<&EventSubscription> = selected
+            .into_iter()
+            .filter(|subscription| {
+                st::tags_match(
+                    subscription.tags.as_deref().unwrap_or_default(),
+                    input.tag_keys.as_deref(),
+                    input.tag_values.as_deref(),
+                )
+            })
+            .collect();
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeEventSubscriptionsOutput {
+            event_subscriptions_list: Some(
+                matched[start..end]
+                    .iter()
+                    .map(|subscription| (*subscription).clone())
+                    .collect(),
+            ),
+            marker: next_marker,
+        })
     }
 }

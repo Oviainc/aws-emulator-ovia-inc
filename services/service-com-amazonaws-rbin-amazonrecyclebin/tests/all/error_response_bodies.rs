@@ -14,10 +14,12 @@
 //!    pattern, enum and required-member constraints, in the body and in a URI label, on
 //!    six operations.
 //! 2. A rule the request addressed and this Region does not hold is `ResourceNotFound`:
-//!    HTTP 404, `Message` composed from the value the request addressed it by
-//!    (`Recycle Bin Rule '<addressed>' does not exist.`), and `Reason` the fault class
-//!    the model names for it (`RULE_NOT_FOUND`). Asserted on every operation that
-//!    addresses a rule — by `Identifier` and by `ResourceArn`.
+//!    HTTP 404 and `Message` composed from the value the request addressed it by
+//!    (`Recycle Bin Rule '<addressed>' does not exist.`), with the optional `Reason` the
+//!    service does not populate on this path left out —
+//!    `tests/all/not_found_error_body_members.rs` asserts that absence over the class.
+//!    Asserted on every operation that addresses a rule — by `Identifier` and by
+//!    `ResourceArn`.
 //! 3. A lock, modify or delete the rule's own state forbids is `Conflict`: HTTP 409,
 //!    `Reason` `INVALID_RULE_STATE`, and `Message` composed from the identifier and the
 //!    blocking condition (`Cannot <action> Recycle Bin rule <id> because it is
@@ -69,11 +71,6 @@ const RULE_ARN_PATTERN: &str = r"arn:\S+:rbin:[a-z\-0-9]{0,63}:[0-9]{12}:rule/[0
 /// `ResourceType` accepts exactly these values, in this order.
 /// Source: smithy_query(query="shape", shape="ResourceType") — enum values.
 const RESOURCE_TYPES: [&str; 3] = ["EBS_SNAPSHOT", "EBS_VOLUME", "EC2_IMAGE"];
-
-/// The sole value `ResourceNotFoundExceptionReason` declares, which is therefore the
-/// fault class of every 404 this service raises.
-/// Source: smithy_query(query="shape", shape="ResourceNotFoundExceptionReason").
-const NOT_FOUND_REASON: &str = "RULE_NOT_FOUND";
 
 /// The wire error code of an error response (`__type`), or `"<none>"`. `pub(crate)` so
 /// the sibling suites of this one test target read an error's code the same way.
@@ -530,9 +527,9 @@ async fn an_addressed_rule_this_region_does_not_hold_is_reported_as_not_existing
                 message(&body)
             );
             assert_eq!(
-                body.get("Reason").and_then(Value::as_str),
-                Some(NOT_FOUND_REASON),
-                "case {case:?}: expected Reason {NOT_FOUND_REASON}, got {:?}",
+                body.get("Reason"),
+                None,
+                "case {case:?}: expected no Reason member on the not-found body, got {:?}",
                 body.get("Reason")
             );
         }
@@ -574,9 +571,9 @@ async fn an_addressed_rule_this_region_does_not_hold_is_reported_as_not_existing
                 message(&body)
             );
             assert_eq!(
-                body.get("Reason").and_then(Value::as_str),
-                Some(NOT_FOUND_REASON),
-                "case {case:?}: expected Reason {NOT_FOUND_REASON}, got {:?}",
+                body.get("Reason"),
+                None,
+                "case {case:?}: expected no Reason member on the not-found body, got {:?}",
                 body.get("Reason")
             );
         }

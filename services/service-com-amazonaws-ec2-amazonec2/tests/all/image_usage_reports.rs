@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for `DescribeImageUsageReports`, driven over the wire the service
+//! End-to-end cover for `DescribeImageUsageReports` — and for the report id space it shares
+//! with `DeleteImageUsageReport` — driven over the wire the service
 //! actually speaks: `ec2Query` — an `application/x-www-form-urlencoded` POST whose body
 //! carries `Action=DescribeImageUsageReports`, answered with XML (README.md /
 //! OPERATIONS.md "Wire protocol"). ec2Query is selected by the `ec2` signing name in the
@@ -15,9 +16,11 @@
 //! 2. A report past its `ExpirationTime` is GONE — "the date and time when Amazon EC2 will
 //!    delete the report (30 days after the report was created)" — and nothing else a
 //!    describe does changes what a later caller sees.
-//! 3. A member a request may get wrong is REFUSED with EC2's own code: an unknown
-//!    `ReportId`, something that is not an AMI id, a filter this operation does not
-//!    document, a token the service never issued, and `DryRun`.
+//! 3. A member a request may get wrong is REFUSED with EC2's own code: a `ReportId` EC2
+//!    could never have issued (`InvalidImageUsageReportId.Malformed`, before any lookup) as
+//!    against one it could but the account holds no report for
+//!    (`InvalidImageUsageReportId.NotFound`), something that is not an AMI id, a filter this
+//!    operation does not document, a token the service never issued, and `DryRun`.
 //!
 //! Every table row is a distinct input along what those rules generalise over — which
 //! documented filter, how many values, how many filters, which ids, which page size, where
@@ -30,13 +33,13 @@ use ec2::ops::types::{
     ImageUsageReport, ImageUsageResourceType, ImageUsageResourceTypeOption, Tag,
 };
 use ec2::state::{
-    ComAmazonawsEc2Amazonec2State as Ec2State, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
-    MAX_FILTERS, system_time_to_date_time,
+    ComAmazonawsEc2Amazonec2State as Ec2State, IMAGE_USAGE_REPORT_ID_PREFIX,
+    MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES, MAX_FILTERS, system_time_to_date_time,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{element, elements, error_code, filters, indexed};
+use super::ec2_query::{element, elements, error_code, filters, indexed, unescaped};
 
 /// The three words `ImageUsageReport$State` documents
 /// (`smithy_query(query="shape",shape="ImageUsageReport")`): "`available` - The report is
@@ -51,12 +54,13 @@ const STATE_ERROR: &str = "error";
 /// own, so the Region only selects the ec2Query envelope.
 const REGION: &str = "us-east-1";
 
-/// The id prefix the store mints a report id under, as `DeleteImageUsageReport`'s suite
-/// seeds one: `imgrpt-` plus 17 hex digits.
-const REPORT_ID_PREFIX: &str = "imgrpt";
+/// The id prefix the store mints a report id under: [`IMAGE_USAGE_REPORT_ID_PREFIX`]
+/// (`imgusgrpt-`) plus 17 hex digits, the form
+/// `ec2::state::image_usage_report_id_is_well_formed` accepts.
+const REPORT_ID_PREFIX: &str = IMAGE_USAGE_REPORT_ID_PREFIX;
 
 /// A report id shaped like one this account could hold, that nothing was ever stored under.
-const UNKNOWN_REPORT_ID: &str = "imgrpt-0ffffffffffffffff";
+const UNKNOWN_REPORT_ID: &str = "imgusgrpt-0ffffffffffffffff";
 
 /// An AMI id shaped like one the account could hold, that no seeded report names.
 const UNNAMED_IMAGE_ID: &str = "ami-0ffffffffffffffff";
@@ -840,8 +844,8 @@ async fn an_undocumented_or_oversized_filter_is_refused() {
 }
 
 /// A `ReportId` the account holds no report for is refused the way `DeleteImageUsageReport`
-/// refuses one; something that is not an AMI id at all is refused before any lookup; and a
-/// well-formed AMI id no report names simply selects nothing.
+/// refuses one; something that is not a report id, or not an AMI id, at all is refused
+/// before any lookup; and a well-formed AMI id no report names simply selects nothing.
 #[tokio::test]
 async fn unresolvable_ids_are_answered_with_ec2s_own_codes() {
     let (router, engine) = super::ec2_query::emulator();
@@ -859,7 +863,7 @@ async fn unresolvable_ids_are_answered_with_ec2s_own_codes() {
             "a report id that is not a report id at all",
             "ReportId",
             "not-a-report",
-            "InvalidImageUsageReportId.NotFound",
+            "InvalidImageUsageReportId.Malformed",
         ),
         (
             "an image id that is not an AMI id at all",
@@ -914,6 +918,222 @@ async fn unresolvable_ids_are_answered_with_ec2s_own_codes() {
         "InvalidImageUsageReportId.NotFound",
         "one unknown id among known ones: expected InvalidImageUsageReportId.NotFound, got \
          {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The report id space: malformed before not found
+// ---------------------------------------------------------------------------
+
+/// One `DeleteImageUsageReport` call carrying `params`, as its HTTP status and XML body.
+async fn delete(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
+    super::ec2_query::call(router, REGION, "DeleteImageUsageReport", params).await
+}
+
+/// The one `ReportId` form field `DeleteImageUsageReport` takes.
+fn report_id_param(report_id: &str) -> Vec<(String, String)> {
+    vec![("ReportId".to_string(), report_id.to_string())]
+}
+
+/// One id-space row: the case name, the id the request carries, and whether it is an id EC2
+/// could have ISSUED.
+type ReportIdCase<'a> = (&'a str, &'a str, bool);
+
+/// A report id EC2 could never have ISSUED is refused `InvalidImageUsageReportId.Malformed`
+/// before anything is looked up, and only a well-formed id the account holds no report for
+/// is `InvalidImageUsageReportId.NotFound` — on `DeleteImageUsageReport` and
+/// `DescribeImageUsageReports` alike, since both read one id space.
+///
+/// Every row differs along what the id rule generalises over — the prefix, the separator,
+/// the digit count at each accepted bound and one past it, the digit alphabet, the case of
+/// the digits, and the null id — so no single id is the specification.
+#[tokio::test]
+async fn a_report_id_outside_the_id_space_is_refused_malformed_before_any_lookup() {
+    let (router, engine) = super::ec2_query::emulator();
+    let seeded = seed(&engine);
+
+    // `(case, the id, whether EC2 could have issued it)`. The two accepted digit counts are
+    // the short and the long EC2 resource id form (8 and 17 lowercase hexadecimal digits),
+    // and the null id is excluded because ids are minted from a counter that starts at one.
+    let cases: Vec<ReportIdCase<'_>> = vec![
+        ("the null id, long form", "imgusgrpt-00000000000000000", false),
+        ("the null id, short form", "imgusgrpt-00000000", false),
+        ("the long form", "imgusgrpt-0123456789abcdef0", true),
+        ("the long form, every digit used", "imgusgrpt-0fedcba9876543210", true),
+        ("the short form", "imgusgrpt-0abc1234", true),
+        ("the short form, one non-zero digit", "imgusgrpt-00000001", true),
+        ("uppercase hexadecimal digits", "imgusgrpt-0ABCDEF0123456789", false),
+        ("digits outside hexadecimal", "imgusgrpt-0zzzzzzzzzzzzzzzz", false),
+        ("one digit short of the long form", "imgusgrpt-0123456789abcdef", false),
+        ("one digit past the long form", "imgusgrpt-0123456789abcdef01", false),
+        ("one digit short of the short form", "imgusgrpt-0abc123", false),
+        ("one digit past the short form", "imgusgrpt-0abc12345", false),
+        ("no digits at all", "imgusgrpt-", false),
+        ("the prefix without its separator", "imgusgrpt0123456789abcdef0", false),
+        ("another resource's prefix", "vol-0123456789abcdef0", false),
+        ("no prefix at all", "0123456789abcdef0", false),
+        ("a word that is not an id", "not-a-report", false),
+        ("the long form with a trailing space", "imgusgrpt-0123456789abcdef0 ", false),
+    ];
+
+    for (case, report_id, well_formed) in cases {
+        let expected_code = if well_formed {
+            "InvalidImageUsageReportId.NotFound"
+        } else {
+            "InvalidImageUsageReportId.Malformed"
+        };
+        for (action, params) in [
+            ("DeleteImageUsageReport", report_id_param(report_id)),
+            (
+                "DescribeImageUsageReports",
+                indexed("ReportId", &[report_id]),
+            ),
+        ] {
+            let (status, body) = if action == "DeleteImageUsageReport" {
+                delete(&router, &params).await
+            } else {
+                describe(&router, &params).await
+            };
+            assert_eq!(
+                status, 400,
+                "case {case:?} on {action}: expected HTTP 400, got {status} with body {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                expected_code,
+                "case {case:?} on {action}: expected {expected_code}, got {body}"
+            );
+            if !well_formed {
+                let message = unescaped(&element(&body, "Message").unwrap_or_default());
+                assert_eq!(
+                    message,
+                    format!("The image-usage-report ID '{report_id}' is malformed"),
+                    "case {case:?} on {action}: the message names the id the request carried, \
+                     got {message:?}"
+                );
+            }
+        }
+        // A refused call writes nothing: the store still holds every seeded report.
+        assert_eq!(
+            stored_ids(&engine),
+            seeded,
+            "case {case:?}: a refused call leaves the store as it found it"
+        );
+    }
+
+    // The same id space resolves a report that IS held: the delete removes the one it names
+    // — read back through `DescribeImageUsageReports` — and the id it removed is then
+    // answered NotFound rather than Malformed, which is the half of the rule the refusals
+    // above cannot show.
+    let (status, body) = delete(&router, &report_id_param(&seeded[0])).await;
+    assert_eq!(
+        status, 200,
+        "deleting a held report: expected HTTP 200, got {status} with body {body}"
+    );
+    assert_eq!(
+        element(&body, "return").as_deref(),
+        Some("true"),
+        "deleting a held report reports true, got {body}"
+    );
+    let remaining = described_ids(&router, "after the delete", &[]).await;
+    assert_eq!(
+        remaining,
+        seeded[1..].to_vec(),
+        "after the delete: expected the other reports, got {remaining:?}"
+    );
+    let (status, body) = delete(&router, &report_id_param(&seeded[0])).await;
+    assert_eq!(
+        status, 400,
+        "deleting it twice: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidImageUsageReportId.NotFound",
+        "deleting it twice: expected InvalidImageUsageReportId.NotFound, got {body}"
+    );
+}
+
+/// On the DELETE, `DryRun` — "checks whether you have the required permissions for the
+/// action, without actually making the request" — is answered before the store is touched,
+/// so the call removes nothing whatever id it names, while an id EC2 could never have issued
+/// is still refused before the flag is reached.
+///
+/// Each row differs along what the rule generalises over: whether the named report is held,
+/// and whether the id is one EC2 could have issued at all.
+#[tokio::test]
+async fn a_dry_run_delete_removes_nothing() {
+    let (router, engine) = super::ec2_query::emulator();
+    let seeded = seed(&engine);
+
+    // `(case, the id, the status due, the code due)`.
+    let cases: Vec<(&str, &str, u16, &str)> = vec![
+        (
+            "a report the account holds",
+            seeded[0].as_str(),
+            412,
+            "DryRunOperation",
+        ),
+        (
+            "another report the account holds",
+            seeded[3].as_str(),
+            412,
+            "DryRunOperation",
+        ),
+        (
+            "a well-formed id nothing is stored under",
+            UNKNOWN_REPORT_ID,
+            412,
+            "DryRunOperation",
+        ),
+        (
+            "the null id, which EC2 could never have issued",
+            "imgusgrpt-00000000000000000",
+            400,
+            "InvalidImageUsageReportId.Malformed",
+        ),
+        (
+            "another resource's prefix",
+            "vol-0123456789abcdef0",
+            400,
+            "InvalidImageUsageReportId.Malformed",
+        ),
+    ];
+
+    for (case, report_id, expected_status, expected_code) in cases {
+        let mut params = report_id_param(report_id);
+        params.push(("DryRun".to_string(), "true".to_string()));
+        let (status, body) = delete(&router, &params).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
+        );
+        assert!(
+            element(&body, "return").is_none(),
+            "case {case:?}: a dry run performs no delete, so it reports no outcome, got {body}"
+        );
+        assert_eq!(
+            stored_ids(&engine),
+            seeded,
+            "case {case:?}: a dry run leaves every stored report where it was"
+        );
+    }
+
+    // The same call without the flag is what removes the report, which is how the dry runs
+    // above are known to have been answered on a report that could have been deleted.
+    let (status, body) = delete(&router, &report_id_param(&seeded[0])).await;
+    assert_eq!(
+        status, 200,
+        "the delete itself: expected HTTP 200, got {status} with body {body}"
+    );
+    assert_eq!(
+        stored_ids(&engine),
+        seeded[1..].to_vec(),
+        "the delete itself removes the report the dry runs left in place"
     );
 }
 
