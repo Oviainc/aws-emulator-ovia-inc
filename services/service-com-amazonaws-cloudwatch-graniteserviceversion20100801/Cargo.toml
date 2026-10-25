@@ -16,7 +16,10 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# The alarm clock (`state::alarm_actions::drive_alarm_clock`) waits for the instant an
+# evaluation becomes due, so this crate needs tokio's timer as well as its runtime and
+# macros: the feature is declared here rather than relied on from another crate's resolution.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
