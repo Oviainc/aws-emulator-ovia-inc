@@ -8,7 +8,7 @@
 //! in [`crate::ops::types`] (`Topic`, `Subscription`).
 
 use std::collections::{HashMap, VecDeque};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -1472,9 +1472,141 @@ pub struct SandboxPhoneNumberRecord {
     pub created_at: SystemTime,
 }
 
+// =============================================================================
+// Phone numbers: the E.164 rule and the SMS opt-out list
+// =============================================================================
+
+/// The parameter name SNS states in a refusal of a phone number, whatever case the
+/// operation spells the member in on the wire (`phoneNumber` on the opt-out pair,
+/// `PhoneNumber` on the sandbox and publish ones).
+///
+/// Recorded evidence: `OptInPhoneNumber` with a value that is not an E.164 number
+/// answers `400 InvalidParameter` naming `PhoneNumber`.
+pub const PHONE_NUMBER_PARAMETER: &str = "PhoneNumber";
+
+/// The most digits a phone number in E.164 format carries, country code included:
+/// ITU-T Recommendation E.164 caps an international public telecommunication number
+/// at fifteen digits.
+pub const MAX_E164_DIGITS: usize = 15;
+
+/// The fewest digits this service accepts after the `+` of a phone number in E.164
+/// format, taken from SNS's own published constraint on a destination phone number:
+/// `smithy_query(query="shape", shape="PhoneNumberString")` reports the pattern
+/// `^(\+[0-9]{8,}|[0-9]{0,9})$`, whose E.164 branch takes eight digits at least.
+pub const MIN_E164_DIGITS: usize = 8;
+
+/// Whether `value` is a phone number in E.164 format: a `+`, then a country code
+/// that does not begin with `0`, then digits only — between [`MIN_E164_DIGITS`] and
+/// [`MAX_E164_DIGITS`] digits in all.
+///
+/// Every SNS operation whose phone-number member the model leaves an unconstrained
+/// string documents it as "Use E.164 format", so this is the rule those members are
+/// held to, and it is ARGUMENT validation — the phone-number counterpart of
+/// [`arn_shape_reason`]: a value that could not be a phone number anywhere is bad
+/// input, judged BEFORE the store is consulted.
+///
+/// Deliberately STRICTER than the SMS subscription endpoint's rule
+/// (`is_phone_number` in `crate::ops::subscribe`), which accepts a national form
+/// written with separators and no `+`: `Subscribe` documents its `sms` endpoint as "a
+/// phone number of an SMS-enabled device", while these members say E.164 and nothing
+/// else. The two floors differ for the same reason — this one is the digit count SNS
+/// publishes for an E.164 destination number.
+pub fn is_e164(value: &str) -> bool {
+    let Some(digits) = value.strip_prefix('+') else {
+        return false;
+    };
+    (MIN_E164_DIGITS..=MAX_E164_DIGITS).contains(&digits.len())
+        && !digits.starts_with('0')
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The opening every refusal of a phone-number parameter carries: `Invalid
+/// parameter:`, the parameter as SNS names it, and the `Reason:` the clauses below
+/// complete — so the parameter name has ONE source for every such sentence.
+fn phone_number_refusal_opening() -> String {
+    format!("Invalid parameter: {PHONE_NUMBER_PARAMETER} Reason: ")
+}
+
+/// The sentence SNS refuses a phone number that is not in E.164 format with.
+///
+/// Fixed, whichever clause of [`is_e164`] the value broke — SNS states the parameter
+/// and that its input was formatted wrongly, and does NOT reproduce the value the
+/// caller sent (the model marks every phone-number member `@sensitive`, so echoing it
+/// would put a sensitive value in an error string). Recorded evidence:
+/// `OptInPhoneNumber` with a value that is not an E.164 number answers `400
+/// InvalidParameter` with exactly this sentence.
+pub fn invalid_phone_number_message() -> String {
+    format!("{}input incorrectly formatted", phone_number_refusal_opening())
+}
+
+/// The message a phone-number member holding `value` is refused with, or `None` when
+/// `value` is a phone number in E.164 format — the phone-number counterpart of
+/// [`arn_refusal`].
+pub fn phone_number_refusal(value: &str) -> Option<String> {
+    (!is_e164(value)).then(invalid_phone_number_message)
+}
+
+/// How long after an opt-in the next one on the same phone number may happen: "You
+/// can opt in a phone number only once every 30 days" (`OptInPhoneNumber` doc).
+pub const OPT_IN_INTERVAL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The sentence an opt-in is refused with while the number's previous opt-in is
+/// younger than [`OPT_IN_INTERVAL`]: the parameter and the documented interval it
+/// failed, with none of the (sensitive) number echoed back.
+///
+/// The interval is documented; the error SHAPE is this emulator's reading of the
+/// operation's modelled error set — `InvalidParameterException` is the one client
+/// error it declares for a parameter that does not comply, and no recorded response
+/// of a too-soon opt-in is available to fix either the shape or this wording. A
+/// recording that shows otherwise corrects both here.
+pub fn opt_in_too_soon_message() -> String {
+    let days = OPT_IN_INTERVAL.as_secs() / (24 * 60 * 60);
+    format!(
+        "{}A phone number can be opted in only once every {days} days",
+        phone_number_refusal_opening()
+    )
+}
+
+/// What this account knows about one phone number's SMS opt-out state.
+///
+/// A number opts OUT out of band — the recipient replies `STOP` to the message — and
+/// no SNS API performs that, so nothing a caller sends creates a record here. What a
+/// caller can do is opt a number back in, which is why the record outlives the
+/// opt-out it started as: [`Self::last_opt_in`] is what the
+/// once-every-[`OPT_IN_INTERVAL`] rule is measured from.
+#[derive(Debug, Clone)]
+pub struct PhoneNumberRecord {
+    /// The phone number, as the opt-out that created the record spelled it. The model
+    /// marks every phone-number member `@sensitive`, so it belongs in a modelled
+    /// listing — `ListPhoneNumbersOptedOut`, still a scaffold stub, is what will read
+    /// it — and in no error string.
+    pub phone_number: String,
+    /// When the number opted out of receiving SMS messages from this account —
+    /// `None` once it has been opted back in.
+    pub opted_out_at: Option<SystemTime>,
+    /// When `OptInPhoneNumber` last opted this number back in, or `None` when it
+    /// never has been.
+    pub last_opt_in: Option<SystemTime>,
+}
+
+impl PhoneNumberRecord {
+    /// A number that has opted out of receiving SMS messages from this account and
+    /// has not been opted back in: what `CheckIfPhoneNumberIsOptedOut` reports and
+    /// what `OptInPhoneNumber` has something to do about.
+    pub fn is_opted_out(&self) -> bool {
+        self.opted_out_at.is_some()
+    }
+
+    /// The instant from which this number may be opted in again, or `None` when it
+    /// has never been opted in and so may be opted in now.
+    pub fn opt_in_available_at(&self) -> Option<SystemTime> {
+        self.last_opt_in.map(|at| at + OPT_IN_INTERVAL)
+    }
+}
+
 /// Per-service state for com-amazonaws-sns-amazonsimplenotificationservice. A handler reaches it through [`service_state`].
 ///
-/// Every store here is caller-driven and therefore BOUNDED: `topics`,
+/// Every CALLER-DRIVEN store here is therefore BOUNDED: `topics`,
 /// `subscriptions` and `sandbox_phone_numbers` at [`MAX_RECORDS_PER_STORE`] records
 /// each (a request that would cross it is refused with a modelled error), and
 /// `delivered` at
@@ -1492,6 +1624,12 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// phone number itself: the sandbox holds one record per destination number. At
     /// most [`MAX_RECORDS_PER_STORE`].
     pub sandbox_phone_numbers: HashMap<String, SandboxPhoneNumberRecord>,
+    /// The SMS opt-out state this account knows per phone number, keyed by the number
+    /// itself. NOT caller-grown, so it needs no ceiling of its own: a record appears
+    /// when a number opts OUT, which the recipient does out of band and no SNS API
+    /// performs — `OptInPhoneNumber` only clears and annotates a record already here,
+    /// and `CheckIfPhoneNumberIsOptedOut` only reads one.
+    pub phone_numbers: HashMap<String, PhoneNumberRecord>,
     /// Delivered messages by subscription ARN, oldest first. Bounded: write through
     /// [`Self::record_delivery`], never by hand.
     ///

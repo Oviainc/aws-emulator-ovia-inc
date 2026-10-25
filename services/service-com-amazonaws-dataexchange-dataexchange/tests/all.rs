@@ -19,6 +19,8 @@ mod data_sets;
 mod jobs;
 #[path = "all/optional_page_size.rs"]
 mod optional_page_size;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/revisions.rs"]
 mod revisions;
 #[path = "all/state_roundtrip.rs"]

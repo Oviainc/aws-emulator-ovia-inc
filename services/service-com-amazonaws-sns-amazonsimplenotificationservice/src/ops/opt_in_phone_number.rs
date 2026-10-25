@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op OptInPhoneNumber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `OptInPhoneNumber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`OptInPhoneNumber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -69,6 +60,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -105,6 +97,15 @@ impl From<OptInPhoneNumberErrorModeled> for OptInPhoneNumberError {
     }
 }
 
+/// The modelled refusal of a request parameter that does not comply with its
+/// constraints — this operation's only client error for bad input.
+fn invalid_parameter(message: String) -> OptInPhoneNumberError {
+    OptInPhoneNumberErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `OptInPhoneNumber` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -136,23 +137,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::OPT_IN_PHONE_NUMBER_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Opt `phoneNumber` back in, so SMS messages to it resume: the number's opt-out
+    /// is cleared and the opt-in instant recorded, which is what
+    /// `CheckIfPhoneNumberIsOptedOut` then reports.
+    ///
+    /// Three rules, in the order a caller fixes them:
+    ///
+    /// 1. the number has to be one, in E.164 format ("The phone number to opt in. Use
+    ///    E.164 format", `OptInPhoneNumberInput$phoneNumber` doc) — argument
+    ///    validation, judged before the store is consulted, and refused with the
+    ///    modelled `InvalidParameterException`;
+    /// 2. a number this account holds no opt-out for asks for what already is, so it
+    ///    is answered and nothing is written: the operation opts in "a phone number
+    ///    that is opted out", and there is no modelled error for a number that is not;
+    /// 3. an opt-out cleared less than [`state::OPT_IN_INTERVAL`] ago cannot be
+    ///    cleared again ("You can opt in a phone number only once every 30 days",
+    ///    this operation's doc), so the opt-out stands and the call is refused.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `OptInPhoneNumber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(OptInPhoneNumberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("OptInPhoneNumber"))
+        if let Some(message) = state::phone_number_refusal(&input.phone_number) {
+            return Err(invalid_parameter(message));
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(OptInPhoneNumberErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        // No record, or a record that is already opted in: nothing is opted out, so
+        // there is nothing to opt in and no window to consume.
+        let Some(record) = store.phone_numbers.get_mut(&input.phone_number) else {
+            return Ok(OptInPhoneNumberOutput {});
+        };
+        if !record.is_opted_out() {
+            return Ok(OptInPhoneNumberOutput {});
+        }
+
+        let now = ::std::time::SystemTime::now();
+        if record
+            .opt_in_available_at()
+            .is_some_and(|available_at| now < available_at)
+        {
+            return Err(invalid_parameter(state::opt_in_too_soon_message()));
+        }
+
+        record.opted_out_at = None;
+        record.last_opt_in = Some(now);
+
+        Ok(OptInPhoneNumberOutput {})
     }
 }

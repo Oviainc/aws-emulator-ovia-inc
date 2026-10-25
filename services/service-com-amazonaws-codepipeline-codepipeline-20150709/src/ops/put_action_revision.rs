@@ -350,6 +350,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stop: None,
             artifacts: ::std::collections::BTreeMap::new(),
             manual_retry_attempts: 0,
+            // An execution that runs the pipeline forward rolls nothing back.
+            rollback_target: None,
         };
 
         state.action_revisions.insert(action, revision);

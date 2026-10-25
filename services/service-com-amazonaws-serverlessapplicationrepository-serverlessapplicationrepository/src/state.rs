@@ -28,8 +28,12 @@
 //! An application also carries its permission policy — the `policy_statements` list
 //! `PutApplicationPolicy` replaces and `GetApplicationPolicy` reports — so a policy is
 //! part of the application record and goes away with it. Room is still deliberately left
-//! for the operations later issues own: the CloudFormation CHANGESET operations declare no
-//! state of their own here yet, and they still answer 501.
+//! for the operations later issues own: `UnshareApplication` and
+//! `ListApplicationDependencies` declare no state of their own here yet, and they still
+//! answer 501. `CreateCloudFormationChangeSet` needs none either: it reads the published
+//! version's own template out of this store (or the prepared template a `TemplateId`
+//! names), and the change set itself lives in AWS CloudFormation, which it calls in
+//! process.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -214,9 +218,10 @@ pub struct AppVersion {
     pub source_code_archive_url: Option<String>,
     /// The parameters the stored template declares; see [`parse_template`].
     pub parameter_definitions: Vec<ParameterDefinition>,
-    /// The capabilities a deployment of this version must acknowledge. A template does
-    /// not state them — they are derived from the resources it creates, which the
-    /// CloudFormation changeset operations own — so this stays empty here.
+    /// The capabilities a deployment of this version must acknowledge, derived from the
+    /// resources its template declares when the version is PUBLISHED (see
+    /// [`required_capabilities_of`]) and stored with it: a later publish never rewrites an
+    /// already-published version's list, and a read does not re-derive it.
     pub required_capabilities: Vec<String>,
     /// Whether every resource in the version is supported in the region it is read
     /// from. This emulator serves one account's catalogue from the caller's own region,
@@ -1387,6 +1392,154 @@ pub fn parse_template(
         .collect();
     definitions.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(definitions)
+}
+
+// ---------------------------------------------------------------------------
+// The capabilities a deployment of a published version must acknowledge.
+//
+// "Some applications might include resources that can affect permissions in your AWS
+// account … you must explicitly acknowledge their capabilities by specifying this
+// parameter. … If you don't specify this parameter for an application that requires
+// capabilities, the call will fail."
+// (`smithy_query(query="doc", shape="CreateCloudFormationChangeSetRequest",
+// member="Capabilities")`)
+//
+// The requirement is therefore a function of the resources the version's own template
+// declares, which is why it is derived here — once — for both the operation that
+// REPORTS it (`Version$RequiredCapabilities`) and the one that HOLDS a caller to it
+// (`CreateCloudFormationChangeSet`).
+// ---------------------------------------------------------------------------
+
+/// Acknowledges the IAM resources a template creates.
+pub const CAPABILITY_IAM: &str = "CAPABILITY_IAM";
+
+/// Acknowledges IAM resources the template gives CUSTOM NAMES to.
+pub const CAPABILITY_NAMED_IAM: &str = "CAPABILITY_NAMED_IAM";
+
+/// Acknowledges the resource policies a template creates.
+pub const CAPABILITY_RESOURCE_POLICY: &str = "CAPABILITY_RESOURCE_POLICY";
+
+/// Acknowledges the nested applications a template contains.
+pub const CAPABILITY_AUTO_EXPAND: &str = "CAPABILITY_AUTO_EXPAND";
+
+/// "The following resources require you to specify CAPABILITY_IAM or
+/// CAPABILITY_NAMED_IAM: AWS::IAM::Group, AWS::IAM::InstanceProfile, AWS::IAM::Policy,
+/// and AWS::IAM::Role" — the `Capabilities` member's own documentation.
+const IAM_RESOURCE_TYPES: &[&str] = &[
+    "AWS::IAM::Group",
+    "AWS::IAM::InstanceProfile",
+    "AWS::IAM::Policy",
+    "AWS::IAM::Role",
+];
+
+/// "The following resources require you to specify CAPABILITY_RESOURCE_POLICY:
+/// AWS::Lambda::Permission, AWS::IAM:Policy, AWS::ApplicationAutoScaling::ScalingPolicy,
+/// AWS::S3::BucketPolicy, AWS::SQS::QueuePolicy, and AWS::SNS:TopicPolicy" — the same
+/// member's documentation, with the two type names it abbreviates (`AWS::IAM:Policy`,
+/// `AWS::SNS:TopicPolicy`) spelled as the resource-type reference spells them.
+const RESOURCE_POLICY_RESOURCE_TYPES: &[&str] = &[
+    "AWS::ApplicationAutoScaling::ScalingPolicy",
+    "AWS::IAM::Policy",
+    "AWS::Lambda::Permission",
+    "AWS::S3::BucketPolicy",
+    "AWS::SNS::TopicPolicy",
+    "AWS::SQS::QueuePolicy",
+];
+
+/// "Applications that contain one or more nested applications require you to specify
+/// CAPABILITY_AUTO_EXPAND": a nested application is an `AWS::Serverless::Application`
+/// resource, the AWS SAM resource type for one.
+const NESTED_APPLICATION_RESOURCE_TYPE: &str = "AWS::Serverless::Application";
+
+/// The property that gives an IAM resource a CUSTOM NAME, per resource type: the `Name`
+/// property that type's reference publishes as OPTIONAL. `AWS::IAM::Policy` is absent
+/// deliberately — its `PolicyName` is a REQUIRED property of the type, so every policy
+/// carries one and it is not a name the template chose to pin.
+const IAM_NAME_PROPERTIES: &[(&str, &str)] = &[
+    ("AWS::IAM::Group", "GroupName"),
+    ("AWS::IAM::InstanceProfile", "InstanceProfileName"),
+    ("AWS::IAM::Role", "RoleName"),
+];
+
+/// The capabilities a deployment of `template_body` must acknowledge, sorted.
+///
+/// Derived from the `Resources` the template declares, against the catalogue the
+/// `Capabilities` member documents (see the note above). `CAPABILITY_NAMED_IAM` replaces
+/// `CAPABILITY_IAM` when any IAM resource carries a custom name, because it is the
+/// stronger acknowledgement of the same resources: "If the application contains IAM
+/// resources, you can specify either CAPABILITY_IAM or CAPABILITY_NAMED_IAM. If the
+/// application contains IAM resources with custom names, you must specify
+/// CAPABILITY_NAMED_IAM."
+///
+/// A template this emulator cannot read — one the caller named only by `TemplateUrl`, or
+/// one in YAML — declares nothing it can judge, so it requires nothing: the same policy
+/// [`parse_template`] applies to the parameters it reports.
+pub fn required_capabilities_of(template_body: Option<&String>) -> Vec<String> {
+    let Some(body) = template_body else {
+        return Vec::new();
+    };
+    let Ok(template) = ::serde_json::from_str::<::serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(resources) = template.get("Resources").and_then(|r| r.as_object()) else {
+        return Vec::new();
+    };
+
+    let mut required: BTreeSet<&'static str> = BTreeSet::new();
+    for spec in resources.values() {
+        let Some(resource_type) = spec.get("Type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        if IAM_RESOURCE_TYPES.contains(&resource_type) {
+            if carries_a_custom_name(resource_type, spec) {
+                required.insert(CAPABILITY_NAMED_IAM);
+            } else {
+                required.insert(CAPABILITY_IAM);
+            }
+        }
+        if RESOURCE_POLICY_RESOURCE_TYPES.contains(&resource_type) {
+            required.insert(CAPABILITY_RESOURCE_POLICY);
+        }
+        if resource_type == NESTED_APPLICATION_RESOURCE_TYPE {
+            required.insert(CAPABILITY_AUTO_EXPAND);
+        }
+    }
+    // One template with a named and an unnamed IAM resource requires the named
+    // capability only: it already acknowledges both.
+    if required.contains(CAPABILITY_NAMED_IAM) {
+        required.remove(CAPABILITY_IAM);
+    }
+    required.into_iter().map(str::to_string).collect()
+}
+
+/// Whether this resource pins its own name, whatever the property's value is — a literal
+/// or an intrinsic function both name the resource.
+fn carries_a_custom_name(resource_type: &str, spec: &::serde_json::Value) -> bool {
+    IAM_NAME_PROPERTIES
+        .iter()
+        .filter(|(named_type, _)| *named_type == resource_type)
+        .any(|(_, property)| {
+            spec.get("Properties")
+                .and_then(|properties| properties.get(property))
+                .is_some_and(|name| !name.is_null())
+        })
+}
+
+/// The entries of `required` that `acknowledged` does not cover, in `required`'s order.
+///
+/// `CAPABILITY_NAMED_IAM` covers a `CAPABILITY_IAM` requirement (it is the stronger
+/// acknowledgement of the same resources); nothing else covers anything but itself.
+pub fn unacknowledged_capabilities(required: &[String], acknowledged: &[String]) -> Vec<String> {
+    required
+        .iter()
+        .filter(|capability| {
+            let covered = acknowledged.iter().any(|given| given == *capability)
+                || (capability.as_str() == CAPABILITY_IAM
+                    && acknowledged.iter().any(|given| given == CAPABILITY_NAMED_IAM));
+            !covered
+        })
+        .cloned()
+        .collect()
 }
 
 /// One pass over `Resources`: for each identifier a resource references, the names of

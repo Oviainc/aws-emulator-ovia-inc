@@ -23,7 +23,8 @@ use crate::ops::types::{
     NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType,
     ResourceServerScopeType, ResourceServerType, RoutingType,
     SchemaAttributeType, SignInPolicyType, SmsConfigurationType, StringAttributeConstraintsType,
-    TokenValidityUnitsType, UserAttributeUpdateSettingsType, UserImportJobType, UserPoolAddOnsType,
+    TermsType, TokenValidityUnitsType, UserAttributeUpdateSettingsType, UserImportJobType,
+    UserPoolAddOnsType,
     UserPoolClientType, UserPoolDescriptionType, UserPoolPolicyType, UserPoolType, UserType,
     UsernameConfigurationType, VerificationMessageTemplateType,
 };
@@ -826,6 +827,14 @@ pub struct UserPool {
     /// ordered so a read of several is stable. `ProviderNameType` carries no
     /// case-insensitivity trait, so a name is matched exactly as it was created.
     pub identity_providers: BTreeMap<String, IdentityProvider>,
+    /// This pool's terms documents keyed by their minted `TermsId`, ordered so a
+    /// read of several is stable. A terms document belongs to one app client of
+    /// this pool, and "terms document names must be unique to the app client"
+    /// (`TermsExistsException` in this service's model), so the (`ClientId`,
+    /// `TermsName`) pair is unique across this map too. No separate bound is
+    /// needed: `TermsNameType` admits two names and a document names a stored
+    /// app client, so this map holds at most twice [`MAX_CLIENTS_PER_POOL`].
+    pub terms: BTreeMap<String, Terms>,
     /// This pool's user import jobs keyed by their minted `JobId`, ordered so a
     /// read of several is stable: "Import jobs are retained in user pool
     /// configuration so that you can stage, stop, start, review, and delete
@@ -1247,6 +1256,18 @@ impl UserPool {
             .into_iter()
             .find(|slot| slot.as_ref().is_some_and(|stored| stored.domain == domain))
             .and_then(Option::take)
+    }
+
+    /// This pool's terms documents that app client `client_id` holds under
+    /// `terms_name`, or `None` when the client holds none of that name.
+    ///
+    /// A terms document is assigned to one app client and its name is unique to
+    /// that client (`TermsExistsException` in this service's model), so at most
+    /// one stored document can answer.
+    pub fn terms_for_client(&self, client_id: &str, terms_name: &str) -> Option<&Terms> {
+        self.terms
+            .values()
+            .find(|stored| stored.client_id == client_id && stored.terms_name == terms_name)
     }
 
     /// The modelled view of this pool, rendered from what is stored.
@@ -2300,6 +2321,78 @@ impl IdentityProvider {
     }
 }
 
+/// Every language `LinksType`'s key admits, in the order its target
+/// `LanguageIdType` lists them
+/// (`^cognito:(default|dutch|english|french|spanish|german|bahasa-indonesia|italian|japanese|korean|portuguese-brazil|chinese-(simplified|traditional))$`
+/// in this service's model). `cognito:default` is the one a language with no
+/// entry of its own falls back to.
+pub const LINK_LANGUAGES: [&str; 13] = [
+    "cognito:default",
+    "cognito:dutch",
+    "cognito:english",
+    "cognito:french",
+    "cognito:spanish",
+    "cognito:german",
+    "cognito:bahasa-indonesia",
+    "cognito:italian",
+    "cognito:japanese",
+    "cognito:korean",
+    "cognito:portuguese-brazil",
+    "cognito:chinese-simplified",
+    "cognito:chinese-traditional",
+];
+
+/// The lowest-ordered key of a submitted `Links` map that is not one of
+/// [`LINK_LANGUAGES`], or `None` when every key names a language managed login
+/// localizes. Lowest-ordered so one request is refused over the same key every
+/// time, whatever order the map arrived in.
+pub fn unsupported_link_language<'links>(
+    links: impl IntoIterator<Item = &'links String>,
+) -> Option<&'links String> {
+    links
+        .into_iter()
+        .filter(|language| !LINK_LANGUAGES.contains(&language.as_str()))
+        .min()
+}
+
+/// One stored set of terms documents of a user pool: what `CreateTerms` stored
+/// and every later read of it renders.
+#[derive(Debug, Clone)]
+pub struct Terms {
+    pub terms_id: String,
+    pub user_pool_id: String,
+    pub client_id: String,
+    pub terms_name: String,
+    pub terms_source: String,
+    pub enforcement: String,
+    /// The language-to-URL map, ordered so a read of several languages is
+    /// stable. `LinksType` admits 1..13 entries, so this map is never empty.
+    pub links: BTreeMap<String, String>,
+    pub creation_date: SystemTime,
+    pub last_modified_date: SystemTime,
+}
+
+impl Terms {
+    /// The modelled view of these terms documents, rendered from what is stored.
+    pub fn to_terms_type(&self) -> TermsType {
+        TermsType {
+            terms_id: self.terms_id.clone(),
+            user_pool_id: self.user_pool_id.clone(),
+            client_id: self.client_id.clone(),
+            terms_name: self.terms_name.clone(),
+            terms_source: self.terms_source.clone(),
+            enforcement: self.enforcement.clone(),
+            links: self
+                .links
+                .iter()
+                .map(|(language, url)| (language.clone(), url.clone()))
+                .collect(),
+            creation_date: to_date_time(self.creation_date),
+            last_modified_date: to_date_time(self.last_modified_date),
+        }
+    }
+}
+
 /// A challenge session: what a `RespondToAuthChallenge` for this session resumes.
 #[derive(Debug, Clone)]
 pub struct AuthSession {
@@ -2823,6 +2916,7 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         groups: BTreeMap::new(),
         resource_servers: BTreeMap::new(),
         identity_providers: BTreeMap::new(),
+        terms: BTreeMap::new(),
         user_import_jobs: BTreeMap::new(),
         // A pool's token-signing key exists from the moment the pool does, as
         // on AWS, so its key set is publishable before anything signs in. One
