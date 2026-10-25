@@ -38,9 +38,11 @@
 //! The data transformation job is the fifth: a job record is addressed by its
 //! own `JobId`, `StartDataTransformationJob` MINTS one in
 //! [`ComAmazonawsHealthlakeHealthlakeState::transformation_jobs`] and
-//! `DescribeDataTransformationJob` reads the SAME record back, so a started job
-//! is observable through it. A transformation job reads and writes Amazon S3
-//! rather than a data store, so no record reaps one.
+//! `DescribeDataTransformationJob` / `ListDataTransformationJobs` both read the
+//! SAME records back — one by `JobId`, the other filtered and paged — so a
+//! started job is observable identically through either of them. A
+//! transformation job reads and writes Amazon S3 rather than a data store, so
+//! no record reaps one.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
@@ -50,7 +52,8 @@ use crate::ops::types::{
     ErrorCause, ExportJobProperties, IdentityProviderConfiguration, ImportJobProperties,
     InputDataConfig, JobProgressReport, KmsEncryptionConfig, NlpConfiguration, OutputDataConfig,
     PreloadDataConfig, ProfileConfiguration, SseConfiguration, Tag, TransformationInputDataConfig,
-    TransformationJobProgressReport, TransformationJobProperties, TransformationOutputDataConfig,
+    TransformationJobProgressReport, TransformationJobProperties, TransformationJobSummary,
+    TransformationOutputDataConfig,
 };
 
 /// How long after the call that starts it a data store's pending lifecycle
@@ -1192,6 +1195,25 @@ impl TransformationJob {
         }
     }
 
+    /// This record as the modelled `TransformationJobSummary`, the shape
+    /// `ListDataTransformationJobs` reports a job through: the subset of
+    /// [`Self::properties`] that shape declares, read off the SAME record, so
+    /// the two operations cannot disagree about one job.
+    pub fn summary(&self) -> TransformationJobSummary {
+        TransformationJobSummary {
+            job_id: self.id.clone(),
+            job_status: self.status.as_wire().to_string(),
+            submit_time: self.submitted_at,
+            job_name: self.name.clone(),
+            end_time: self.ended_at,
+            // `TransformationJobSummary$SourceFormat` is "the source data
+            // format for this job", which is the format the job's own
+            // `InputDataConfig` names — reported from there rather than
+            // stored twice.
+            source_format: self.input_data_config.source_format.clone(),
+        }
+    }
+
     /// Materialise the transition the clock has ALREADY made due on this job.
     ///
     /// The transition was owed at `now` whether or not anybody called, so a
@@ -1463,8 +1485,8 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     pub import_jobs: BTreeMap<String, ImportJob>,
     /// Every data transformation job, by `JobId` — the identifier
     /// `DescribeDataTransformationJob` addresses one by. A `BTreeMap` so
-    /// `ListDataTransformationJobs` can page in a stable, resumable order once
-    /// it is written. A transformation job belongs to no data store, so no
+    /// `ListDataTransformationJobs` pages in a stable, resumable order. A
+    /// transformation job belongs to no data store, so no
     /// record reaps one. Bounded by [`MAX_TRANSFORMATION_JOBS`], which
     /// `StartDataTransformationJob` — the only operation that mints one —
     /// refuses past.
