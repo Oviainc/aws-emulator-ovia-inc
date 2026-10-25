@@ -1192,13 +1192,19 @@ impl AlarmKind {
         Self::ProvisionedCapacityLow,
     ];
 
-    /// The name segment this kind contributes to its alarm's name.
-    pub fn as_str(self) -> &'static str {
+    /// The name segment this kind contributes to its alarm's name, under the namespace
+    /// whose resource the policy scales.
+    ///
+    /// The pair on the TRACKED metric is named for the direction it drives, the same
+    /// wherever the policy lives. The pair that watches the resource's PROVISIONED
+    /// capacity belongs to the owning service's own integration, so it is named as that
+    /// service names it ([`capacity_alarm_rules`]).
+    pub fn name_segment(self, service_namespace: &str) -> &'static str {
         match self {
             Self::AlarmHigh => "AlarmHigh",
             Self::AlarmLow => "AlarmLow",
-            Self::ProvisionedCapacityHigh => "ProvisionedCapacityHigh",
-            Self::ProvisionedCapacityLow => "ProvisionedCapacityLow",
+            Self::ProvisionedCapacityHigh => capacity_alarm_rules(service_namespace).high,
+            Self::ProvisionedCapacityLow => capacity_alarm_rules(service_namespace).low,
         }
     }
 
@@ -1214,6 +1220,51 @@ impl AlarmKind {
             self,
             Self::ProvisionedCapacityHigh | Self::ProvisionedCapacityLow
         )
+    }
+}
+
+/// How the service that OWNS a scaled resource mints the pair of alarms that watch that
+/// resource's provisioned capacity: what each is called, and whether a scaling direction
+/// that cannot act withholds its one.
+#[derive(Debug, Clone, Copy)]
+struct CapacityAlarmRules {
+    /// The name segment of the alarm that watches the capacity moving UP.
+    high: &'static str,
+    /// The one that watches it moving DOWN.
+    low: &'static str,
+    /// Whether the alarm of a direction goes with that direction when it is disabled or
+    /// suspended, rather than being minted regardless.
+    follows_direction: bool,
+}
+
+/// The capacity-alarm rules of one namespace.
+///
+/// A catalog with one row per namespace that HAS such alarms — the two whose tracked
+/// metric counts capacity units consumed, which is the only case where the utilisation
+/// thresholds depend on the resource's provisioned capacity — each row recorded from that
+/// service's own auto scaling integration:
+///
+/// * DynamoDB's are the bare `ProvisionedCapacity*`, each minted beside the tracked
+///   metric's alarm for the same direction, so a direction that cannot act has neither;
+/// * Amazon Keyspaces' carry that service's prefix and are minted as a pair, whatever
+///   `DisableScaleIn` or a suspension says about scaling in, because they report a
+///   threshold computed from a capacity the resource no longer has rather than drive a
+///   direction.
+///
+/// Any other namespace mints no capacity alarm at all, so its row is never reached; the
+/// DynamoDB spelling is the fallback the service's own naming started from.
+fn capacity_alarm_rules(service_namespace: &str) -> CapacityAlarmRules {
+    match service_namespace {
+        "cassandra" => CapacityAlarmRules {
+            high: "CassandraProvisionedCapacityHigh",
+            low: "CassandraProvisionedCapacityLow",
+            follows_direction: false,
+        },
+        _ => CapacityAlarmRules {
+            high: "ProvisionedCapacityHigh",
+            low: "ProvisionedCapacityLow",
+            follows_direction: true,
+        },
     }
 }
 
@@ -1673,6 +1724,7 @@ const MAX_ALARM_NAME_LEN: usize = 255;
 /// scales, which of the policy's alarms this is, and an opaque id that makes the name unique
 /// to this policy.
 pub fn policy_alarm_name(key: &PolicyKey, kind: AlarmKind) -> String {
+    let kind = kind.name_segment(&key.target.service_namespace);
     let id = opaque_id(
         &[
             "alarm",
@@ -1680,12 +1732,11 @@ pub fn policy_alarm_name(key: &PolicyKey, kind: AlarmKind) -> String {
             &key.target.resource_id,
             &key.target.scalable_dimension,
             &key.policy_name,
-            kind.as_str(),
+            kind,
         ]
         .join("\u{1f}"),
         32,
     );
-    let kind = kind.as_str();
     let suffix = format!("-{kind}-{id}");
     let room = MAX_ALARM_NAME_LEN
         .saturating_sub(ALARM_NAME_PREFIX.len() + 1 + suffix.len())
@@ -1923,13 +1974,20 @@ pub fn target_tracking_alarms(
         }
     };
 
+    let capacity_rules = capacity_alarm_rules(&key.target.service_namespace);
     let mut alarms = Vec::new();
     for kind in AlarmKind::ALL {
-        let withheld = if kind.scales_out() {
-            suspended_out
-        } else {
-            scale_in_disabled
-        };
+        // A direction that cannot act has no alarm to trigger it. Whether that takes the
+        // capacity alarm of the same direction with it is the owning service's own
+        // mechanics ([`capacity_alarm_rules`]), since that alarm reports a stale
+        // threshold rather than drive a scaling direction.
+        let follows_direction = !kind.watches_capacity() || capacity_rules.follows_direction;
+        let withheld = follows_direction
+            && if kind.scales_out() {
+                suspended_out
+            } else {
+                scale_in_disabled
+            };
         if withheld {
             continue;
         }
