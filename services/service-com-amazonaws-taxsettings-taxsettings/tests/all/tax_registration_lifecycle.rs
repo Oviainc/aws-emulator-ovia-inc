@@ -23,6 +23,8 @@ use service_com_amazonaws_taxsettings_taxsettings::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::declared_member_defaults::{address_as_stored, country_block_as_stored};
+
 /// One emulator: this service mounted on one shared engine. Each test builds its
 /// own, so no test observes another's writes.
 pub(crate) fn emulator() -> MultiServiceRouter {
@@ -303,13 +305,16 @@ fn round_trip_cases() -> Vec<Case> {
 }
 
 /// The members a submitted entry and the reported registration share verbatim.
+///
+/// `legalAddress` is NOT among them: two of its members declare a default the
+/// write materialises, so it is asserted below through
+/// `crate::declared_member_defaults::address_as_stored`.
 const ECHOED_MEMBERS: &[&str] = &[
     "registrationId",
     "registrationType",
     "legalName",
     "sector",
     "certifiedEmailId",
-    "legalAddress",
 ];
 
 /// RULE: a stored tax registration is reported, member for member, as it was
@@ -375,9 +380,23 @@ async fn a_stored_registration_is_reported_exactly_as_submitted() {
                 registration.get(member)
             );
         }
+        // `legalAddress` round-trips with the defaults the model declares for
+        // its members materialised — the members the entry submitted, plus
+        // `addressLine1` and `city` where it omitted them.
+        if let Some(submitted) = case.entry.get("legalAddress") {
+            assert_eq!(
+                registration.get("legalAddress"),
+                Some(&address_as_stored(submitted)),
+                "case {:?}: expected legalAddress to round-trip as {:?}, got {:?}",
+                case.name,
+                address_as_stored(submitted),
+                registration.get("legalAddress")
+            );
+        }
         // `additionalTaxInformation` is submitted as `AdditionalInfoRequest` and
         // reported as `AdditionalInfoResponse`: the country blocks a client can
-        // submit must survive the projection unchanged.
+        // submit must survive the projection unchanged, but for the declared
+        // default one of their members carries.
         if let Some(submitted) = case.entry.get("additionalTaxInformation") {
             let reported = registration
                 .get("additionalTaxInformation")
@@ -386,7 +405,7 @@ async fn a_stored_registration_is_reported_exactly_as_submitted() {
             for (country, block) in submitted.as_object().expect("an object") {
                 assert_eq!(
                     reported.get(country),
-                    Some(block),
+                    Some(&country_block_as_stored(country, block)),
                     "case {:?}: expected additionalTaxInformation.{country} to round-trip as \
                      {block:?}, got {:?}",
                     case.name,
