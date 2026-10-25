@@ -98,6 +98,14 @@ pub const MIN_TAG_KEY_LEN: usize = 1;
 /// The most characters [`TAG_KEY_PATTERN`]'s `.{1,128}` admits, from the same pattern.
 pub const MAX_TAG_KEY_LEN: usize = 128;
 
+/// The characters [`TAG_KEY_PATTERN`]'s `.` does NOT match.
+///
+/// A Smithy `@pattern` is an ECMA-262 regular expression, and there `.` matches every
+/// character except a LINE TERMINATOR: line feed, carriage return, line separator and
+/// paragraph separator. A key carrying any of them therefore cannot be `.{1,128}`,
+/// however many characters it has.
+pub const TAG_KEY_EXCLUDED_CHARS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
+
 /// Why `key` is not a `TagKey`, or `None` when it satisfies [`TAG_KEY_PATTERN`].
 ///
 /// This one modelled constraint cannot be left to the framework's centralized
@@ -116,8 +124,8 @@ pub const MAX_TAG_KEY_LEN: usize = 128;
 /// `(?!aws:)`, which states exactly "the key does not begin with
 /// [`RESERVED_TAG_KEY_PREFIX`]" — a prefix test, case-SENSITIVE because the pattern is
 /// (`AWS:` is admitted by it). What remains is `.{1,128}` anchored at both ends: 1 to
-/// 128 characters, counted as the Unicode scalar values `.` matches, none of them the
-/// line feed `.` excludes.
+/// 128 characters, counted as the Unicode scalar values `.` matches, none of them one of
+/// the [`TAG_KEY_EXCLUDED_CHARS`] it does not.
 pub fn tag_key_rejection(key: &str) -> Option<String> {
     if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
         return Some(format!(
@@ -130,8 +138,11 @@ pub fn tag_key_rejection(key: &str) -> Option<String> {
             "must carry between {MIN_TAG_KEY_LEN} and {MAX_TAG_KEY_LEN} characters, not {len}"
         ));
     }
-    if key.contains('\n') {
-        return Some("must not carry a line feed".to_string());
+    if let Some(excluded) = key.chars().find(|c| TAG_KEY_EXCLUDED_CHARS.contains(c)) {
+        return Some(format!(
+            "must not carry the line terminator U+{:04X}",
+            excluded as u32
+        ));
     }
     None
 }

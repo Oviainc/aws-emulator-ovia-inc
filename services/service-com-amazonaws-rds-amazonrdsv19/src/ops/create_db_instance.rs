@@ -437,7 +437,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.resolve_db_subnet_group(&region, name).is_none() {
                 return Err(CreateDBInstanceErrorModeled::DBSubnetGroupNotFoundFault(
                     DBSubnetGroupNotFoundFault {
-                        message: Some(format!("DBSubnetGroup '{name}' not found.")),
+                        message: Some(crate::state::db_subnet_group_not_found_message(name)),
                     },
                 )
                 .into());

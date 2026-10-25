@@ -49,6 +49,8 @@ mod function_configuration;
 mod function_lifecycle;
 #[path = "all/function_recursion_config.rs"]
 mod function_recursion_config;
+#[path = "all/function_scaling_config.rs"]
+mod function_scaling_config;
 #[path = "all/function_url_config.rs"]
 mod function_url_config;
 #[path = "all/function_url_deletion.rs"]

@@ -160,6 +160,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CreateDBSubnetGroup` stores the name as a lowercase string, so every lookup
         // folds the same way.
         let name = input.db_subnet_group_name.to_ascii_lowercase();
+        // "You can't delete the default subnet group" / "Must not be default": the group
+        // the real service provides alongside the account's default VPC belongs to the
+        // service, so a request naming it is refused for the VALUE it carries — the
+        // `InvalidParameterValue` the Query API answers a broken member constraint with,
+        // the same refusal `CreateDBSubnetGroup` answers for that name. It is NOT the
+        // not-found fault: that group does resolve, and every other operation that names
+        // it resolves it.
+        if name == crate::state::DEFAULT_DB_SUBNET_GROUP {
+            return Err(DeleteDBSubnetGroupError::invalid_parameter_value(format!(
+                "DBSubnetGroupName must not be {}: the DB subnet group of the account's \
+                 default VPC can't be deleted",
+                crate::state::DEFAULT_DB_SUBNET_GROUP
+            )));
+        }
 
         // No store means this service was mounted on an engine it has no state in,
         // so it cannot serve the operation at all. Unreachable with the engine the
@@ -175,12 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deleting if-exists branches on it.
         //
         // RDS is regional: only the region the request was signed for is in scope.
+        //
+        // The lookup goes through the ONE resolver every operation that names a DB
+        // subnet group uses, so a group one operation reports as existing is never
+        // reported absent by another.
         let key = (region.clone(), name.clone());
-        if !store.db_subnet_groups.contains_key(&key) {
+        if store.resolve_db_subnet_group(&region, &name).is_none() {
             return Err(
                 DeleteDBSubnetGroupErrorModeled::DBSubnetGroupNotFoundFault(
                     DBSubnetGroupNotFoundFault {
-                        message: Some(format!("DBSubnetGroup '{name}' not found.")),
+                        message: Some(crate::state::db_subnet_group_not_found_message(&name)),
                     },
                 )
                 .into(),

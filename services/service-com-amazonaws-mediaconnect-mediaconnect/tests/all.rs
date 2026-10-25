@@ -17,6 +17,8 @@ mod bridge_lifecycle;
 mod bridge_members_and_deletion;
 #[path = "all/bridge_output_admission.rs"]
 mod bridge_output_admission;
+#[path = "all/bridge_update_references.rs"]
+mod bridge_update_references;
 #[path = "all/create_flow_stored_formats.rs"]
 mod create_flow_stored_formats;
 #[path = "all/create_router_input.rs"]

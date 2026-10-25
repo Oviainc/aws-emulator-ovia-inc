@@ -4,7 +4,7 @@
 //! IMPLEMENTED: this operation fans out over the same OnlineStore `GetRecord` reads
 //! ([`crate::state`]): every identifier present in its feature group comes back in
 //! `Records`, every identifier of an entry whose `FeatureGroupName` resolves to no
-//! feature group comes back in `Errors` with the [`VALIDATION_ERROR_CODE`] error code,
+//! feature group comes back in `Errors` with the [`crate::state::VALIDATION_ERROR_CODE`] error code,
 //! and an identifier absent from a group that resolves is simply omitted.
 //!
 //! Authorization is not emulated, so the modelled `AccessForbidden` is unreachable.
@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     |identifier| BatchGetRecordError2 {
                         feature_group_name: group_name.clone(),
                         record_identifier_value_as_string: identifier.clone(),
-                        error_code: VALIDATION_ERROR_CODE.to_owned(),
+                        error_code: crate::state::VALIDATION_ERROR_CODE.to_owned(),
                         error_message: message.clone(),
                     },
                 ));
@@ -268,11 +268,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The per-entry `ErrorCode` this operation reports an unresolvable `FeatureGroupName`
-/// with: the wire code of the modelled `ValidationError` every other operation of this
-/// data plane answers the same failure with, so one classification serves the whole
-/// service. `ErrorCode` is documented as "the error code of an error that has occurred
-/// when attempting to retrieve a batch of Records", i.e. one of this API's own error
-/// codes.
-const VALIDATION_ERROR_CODE: &str = "ValidationError";

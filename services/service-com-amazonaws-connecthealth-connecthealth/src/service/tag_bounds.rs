@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The modelled bounds of ONE `TagMap` entry, enforced where the request boundary cannot
-//! reach them.
+//! What ONE `TagMap` entry has to satisfy — the modelled lengths of its key and its
+//! value, and the reserved key namespace the service keeps for itself — enforced where
+//! the request boundary cannot reach them.
 //!
 //! `TagMap`'s key targets `TagKey` (`@length` min 1, max 128) and its value targets
 //! `TagValue` (`@length` min 0, max 256)
@@ -17,13 +18,22 @@
 //! `CreateDomain` and `TagResource` — refuses it through [`violation`] here, stated once
 //! so the two cannot enforce different halves of one bound.
 //!
+//! Beside the two modelled lengths there is one rule the model cannot state: the
+//! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace belongs to the tags the service
+//! itself sets, so a key a caller spells with that prefix (whatever its case) is refused
+//! rather than stored. `TagKey` carries no `@pattern`, so this is a service-side rule and
+//! the handler is likewise the only place that can apply it — and it is applied here, in
+//! the same one check, so the operations that accept a `TagMap` cannot disagree about it
+//! either.
+//!
 //! NOTHING about constraint checking or its wording is reimplemented: the two bounds are
 //! re-declared in the framework's own form (a [`TraitMap`] carrying a [`LengthTrait`])
 //! hung on a member schema named after the member the map is bound to, the check is
 //! [`validate`] — the same walk the request boundary runs, so the length is counted in
 //! characters and an over-long value is elided exactly as it would be there — and the
-//! text is [`envelope`]'s. A refusal made here therefore reads exactly like one made at
-//! the boundary.
+//! text is [`envelope`]'s. A refusal of a LENGTH made here therefore reads exactly like
+//! one made at the boundary; the reserved-namespace refusal is the service's own sentence,
+//! because no modelled constraint states that rule for it to borrow.
 
 use std::sync::LazyLock;
 
@@ -32,7 +42,10 @@ use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
 use ::aws_smithy_schema_server::constraints::{path, validate, LengthTrait, Violation};
 use ::aws_smithy_schema_server::envelope;
 
-use crate::state::{MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MIN_TAG_KEY_LEN, MIN_TAG_VALUE_LEN};
+use crate::state::{
+    MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MIN_TAG_KEY_LEN, MIN_TAG_VALUE_LEN,
+    RESERVED_TAG_KEY_PREFIX,
+};
 
 /// This service's Smithy namespace, for the member schemas below.
 const NAMESPACE: &str = "com.amazonaws.connecthealth";
@@ -128,9 +141,20 @@ fn checked(member: &'static Schema, value: &str) -> Option<Violation> {
         .next()
 }
 
-/// The refusal text for the first entry of `tags` outside the modelled `TagKey` /
-/// `TagValue` lengths, or `None` when every entry is inside them — BOTH ends of both
-/// bounds, so an empty key is refused and an empty value is not.
+/// Whether `key` lies in the namespace the service reserves for the tags it sets itself
+/// ([`RESERVED_TAG_KEY_PREFIX`]), compared without regard to ASCII case because the
+/// namespace is reserved however the caller spells it. `str::get` yields `None` rather
+/// than panicking when the prefix's length is not a character boundary of `key`, and a
+/// key whose first characters are multi-byte is not in the namespace anyway.
+fn reserved(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The refusal text for the first entry of `tags` this service does not accept — one
+/// outside the modelled `TagKey` / `TagValue` lengths (BOTH ends of both bounds, so an
+/// empty key is refused and an empty value is not), or one whose key lies in the reserved
+/// [`RESERVED_TAG_KEY_PREFIX`] namespace — or `None` when every entry is acceptable.
 ///
 /// The caller renders the text through its own `ValidationException` channel (HTTP 400)
 /// and writes nothing.
@@ -142,6 +166,16 @@ pub fn violation<'t>(
         // report its value at.
         if let Some(violation) = checked(&M_TAG_KEY, key) {
             return envelope(&[violation]);
+        }
+        // The reserved namespace is the service's own rule rather than a modelled
+        // constraint, so its sentence is the service's own too: it names the key the
+        // caller asked for and the prefix no caller may use. Only the KEY is checked —
+        // a VALUE may say anything the length allows.
+        if reserved(key) {
+            return Some(format!(
+                "Tag keys cannot start with '{RESERVED_TAG_KEY_PREFIX}': the tag key \
+                 '{key}' at 'tags' uses the prefix reserved for tags this service sets"
+            ));
         }
         let mut violation = checked(&M_TAG_VALUE, value)?;
         // A map value's path is `<member>.<key>.member` — the spelling the walk itself
@@ -198,6 +232,19 @@ mod tests {
     fn an_entry_inside_both_bounds_is_not_refused() {
         for (case, key, value) in [
             ("an ordinary entry", "env".to_string(), "prod".to_string()),
+            (
+                // The namespace is reserved at the START of a key only, so a key that
+                // merely contains the prefix is an ordinary key.
+                "a key carrying the reserved prefix somewhere other than its start",
+                format!("team{RESERVED_TAG_KEY_PREFIX}owner"),
+                "prod".to_string(),
+            ),
+            (
+                // And the rule is on the KEY: a value may say anything.
+                "a value spelling the reserved prefix",
+                "stack".to_string(),
+                format!("{RESERVED_TAG_KEY_PREFIX}cloudformation"),
+            ),
             ("a one-character key", "k".to_string(), "v".to_string()),
             ("an empty value", "retired".to_string(), String::new()),
             (
@@ -222,6 +269,25 @@ mod tests {
             assert!(
                 reported.is_none(),
                 "case {case:?}: must be accepted, got {reported:?}"
+            );
+        }
+    }
+
+    /// A key in the reserved namespace is refused whatever case it is spelled in, and the
+    /// sentence names both the key the caller asked for and the prefix it may not use.
+    #[test]
+    fn a_key_in_the_reserved_namespace_is_refused() {
+        let value = "anything".to_string();
+        for spelling in ["aws:", "AWS:", "Aws:", "aWs:"] {
+            let key = format!("{spelling}owner");
+            let reported = violation([(&key, &value)]);
+            let text = reported.unwrap_or_else(|| {
+                panic!("case {key:?}: a reserved key must be refused, got nothing")
+            });
+            assert!(
+                text.contains(&key) && text.contains(RESERVED_TAG_KEY_PREFIX),
+                "case {key:?}: the refusal must name the key and the reserved prefix, \
+                 got {text:?}"
             );
         }
     }

@@ -291,15 +291,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A Kubernetes version belongs to an Amazon EKS control plane, and a cluster
         // `RegisterCluster` connected has none — it reports a `connectorConfig` and
-        // nothing else — so there is no control plane version of it to move.
+        // nothing else — so this operation does not apply to it at all. That is a
+        // PERMANENT fact about the cluster, which is why it is `ClientException` and not
+        // `InvalidRequestException` ("the request is invalid given the STATE of the
+        // cluster"): a client reads the state refusal as transient and waits for a status
+        // that will never come.
         if record.is_connected() {
-            return Err(invalid_request(
-                &cluster_name,
-                format!(
-                    "Cluster {cluster_name} is a connected cluster, which has no Amazon EKS \
-                     control plane version to update"
-                ),
-            ));
+            return Err(
+                UpdateClusterVersionErrorModeled::ClientException(
+                    crate::state::connected_cluster_refusal(&cluster_name),
+                )
+                .into(),
+            );
         }
         let Some(current_version) = record.version.clone() else {
             return Err(invalid_request(

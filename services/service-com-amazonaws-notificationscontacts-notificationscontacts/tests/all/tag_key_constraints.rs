@@ -9,8 +9,8 @@
 //!
 //! The rule under test: a tag key this service accepts must satisfy the modelled
 //! `TagKey` pattern `^(?!aws:).{1,128}$`
-//! (`smithy_query(query="shape",shape="TagKey")`) — 1 to 128 characters, none of them
-//! the line feed `.` excludes, not beginning with the reserved `aws:` prefix — and a
+//! (`smithy_query(query="shape",shape="TagKey")`) — 1 to 128 characters, none of them a
+//! line terminator `.` excludes, not beginning with the reserved `aws:` prefix — and a
 //! request naming a key outside it is the modelled 400 `ValidationException` that
 //! persists and removes nothing. It holds at every member whose target is `TagKey`:
 //! `CreateEmailContact$tags` and `TagResource$tags` (through `TagMap`'s key) and
@@ -32,18 +32,28 @@ const MIN_TAG_KEY_LEN: usize = 1;
 /// The prefix the pattern's leading `(?!aws:)` look-ahead excludes.
 const RESERVED_PREFIX: &str = "aws:";
 
+/// The characters the pattern's `.` does not match. A Smithy `@pattern` is an ECMA-262
+/// regular expression, whose `.` matches every character except a line terminator: line
+/// feed, carriage return, line separator (U+2028) and paragraph separator (U+2029).
+const LINE_TERMINATORS: [(&str, char); 4] = [
+    ("a line feed", '\n'),
+    ("a carriage return", '\r'),
+    ("the line separator U+2028", '\u{2028}'),
+    ("the paragraph separator U+2029", '\u{2029}'),
+];
+
 /// One tag key and whether the modelled `TagKey` pattern admits it.
 struct Case {
     /// What this row varies, named in every assertion.
-    what: &'static str,
+    what: String,
     key: String,
     /// `true` when `^(?!aws:).{1,128}$` matches `key`.
     admitted: bool,
 }
 
-fn case(what: &'static str, key: impl Into<String>, admitted: bool) -> Case {
+fn case(what: impl Into<String>, key: impl Into<String>, admitted: bool) -> Case {
     Case {
-        what,
+        what: what.into(),
         key: key.into(),
         admitted,
     }
@@ -51,16 +61,16 @@ fn case(what: &'static str, key: impl Into<String>, admitted: bool) -> Case {
 
 /// Every row is one tag key, the rows differing along what the pattern generalises
 /// over: length (at each bound of `.{1,128}` and one past the maximum), the characters
-/// a key carries (`.` is every scalar value but the line feed, so punctuation, spaces
-/// and non-ASCII text are all admitted), how wide those characters are in UTF-8 (the
-/// bound counts characters, not bytes), and where the reserved `aws:` prefix sits (the
-/// look-ahead is anchored at the start and is case-sensitive).
+/// a key carries (`.` is every scalar value but a line terminator, so punctuation,
+/// spaces and non-ASCII text are all admitted), how wide those characters are in UTF-8
+/// (the bound counts characters, not bytes), and where the reserved `aws:` prefix sits
+/// (the look-ahead is anchored at the start and is case-sensitive).
 ///
 /// The reserved-prefix rows deliberately include the boundary cases the issue did not
 /// cite: `aws` and `awsome` are NOT the reserved prefix, and `AWS:` is admitted because
 /// the modelled pattern is case-sensitive.
 fn tag_key_table() -> Vec<Case> {
-    vec![
+    [
         case("an ordinary key", "team", true),
         case(
             "the shortest key the pattern admits",
@@ -116,11 +126,26 @@ fn tag_key_table() -> Vec<Case> {
         ),
         case("far past the maximum", "k".repeat(1_000), false),
         case(
-            "a key carrying the line feed the dot excludes",
-            "line\nfeed",
-            false,
+            "a key that is nothing but a tab, which the dot admits",
+            "\t",
+            true,
         ),
     ]
+    .into_iter()
+    // One row per line terminator the pattern's `.` excludes: carried in the middle of
+    // an otherwise legal key, and alone as the whole key, so neither length nor
+    // position can be what refuses it.
+    .chain(LINE_TERMINATORS.into_iter().flat_map(|(what, terminator)| {
+        [
+            case(
+                format!("{what} inside an otherwise legal key"),
+                format!("line{terminator}break"),
+                false,
+            ),
+            case(format!("{what} as the whole key"), terminator.to_string(), false),
+        ]
+    }))
+    .collect()
 }
 
 /// A key short enough to name in an assertion message, so a 1000-character row does not
@@ -444,6 +469,69 @@ async fn a_refused_key_beside_legal_ones_persists_none_of_them() {
     let reported = tags_ok(&em, &arn).await;
     assert_eq!(
         reported, expected,
+        "case \"the same pairs without the illegal key\": the legal pairs must land, got \
+         {reported:?}"
+    );
+}
+
+/// `CreateEmailContact` mints the resource the tag map travels with, so a map carrying
+/// one refused key leaves no contact behind at all — not an untagged one, and not one
+/// holding the pairs the pattern did admit.
+#[tokio::test]
+async fn a_create_mixing_a_refused_key_with_legal_ones_persists_no_contact() {
+    let em = emulator();
+    let legal = tag_map([pair("team", "infra"), pair("env", "prod")]);
+
+    for (index, (what, illegal)) in [
+        ("a reserved key", RESERVED_PREFIX.to_string()),
+        ("a reserved key with a name", format!("{RESERVED_PREFIX}owner")),
+        ("an over-long key", "k".repeat(MAX_TAG_KEY_LEN + 1)),
+        ("the empty key", String::new()),
+        ("a key carrying a line terminator", "line\u{2028}break".to_string()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let before = contact_count(&em).await;
+        let mut request = legal.clone();
+        request.insert(illegal, "x".to_string());
+        let (status, body) = create(
+            &em,
+            &json!({
+                "name": format!("mixed-{index}"),
+                "emailAddress": format!("mixed-{index}@example.com"),
+                "tags": Value::Object(
+                    request
+                        .iter()
+                        .map(|(key, value)| (key.clone(), json!(value)))
+                        .collect(),
+                ),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {what:?}: a create carrying one illegal key must be refused, got \
+             {status} / {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {what:?}: expected ValidationException, got {body:?}"
+        );
+        assert_eq!(
+            contact_count(&em).await,
+            before,
+            "case {what:?}: a refused create must leave no contact behind"
+        );
+    }
+
+    // The same map with its one illegal key dropped creates the contact and stores
+    // exactly the pairs it named, so the refusals above came from the key alone.
+    let arn = create_tagged(&em, "mixed-legal", Some(&legal)).await;
+    let reported = tags_ok(&em, &arn).await;
+    assert_eq!(
+        reported, legal,
         "case \"the same pairs without the illegal key\": the legal pairs must land, got \
          {reported:?}"
     );

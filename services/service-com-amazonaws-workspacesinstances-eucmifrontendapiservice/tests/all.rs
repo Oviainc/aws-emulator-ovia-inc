@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/catalog_fidelity.rs"]
 mod catalog_fidelity;
+#[path = "all/create_tag_specifications.rs"]
+mod create_tag_specifications;
 #[path = "all/idempotency_token_reuse.rs"]
 mod idempotency_token_reuse;
 #[path = "all/instance_deletion_lifecycle.rs"]

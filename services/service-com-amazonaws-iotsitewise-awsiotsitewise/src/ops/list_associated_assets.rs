@@ -375,15 +375,16 @@ fn associated_summary(
 /// Resolve a hierarchy `CustomID` label — a raw id or `externalId:<externalId>` —
 /// against the `(id, externalId)` pairs of the hierarchies `declared` holds, to the
 /// hierarchy id an association is keyed by; `None` when none of them declares it.
+///
+/// Which pair a label names is [`crate::state::matches_id_label`], the one definition
+/// of the two label forms; this function only says what to return around it.
 fn resolve_hierarchy_label<'a>(
     declared: impl Iterator<Item = (Option<&'a str>, Option<&'a str>)>,
     label: &str,
 ) -> Option<String> {
-    let external = label.strip_prefix(crate::state::EXTERNAL_ID_PREFIX);
     declared
-        .filter(|(id, hierarchy_external)| match external {
-            Some(wanted) => *hierarchy_external == Some(wanted),
-            None => *id == Some(label),
+        .filter(|(id, hierarchy_external)| {
+            crate::state::matches_id_label(*id, *hierarchy_external, label)
         })
         .find_map(|(id, _)| id.map(str::to_string))
 }

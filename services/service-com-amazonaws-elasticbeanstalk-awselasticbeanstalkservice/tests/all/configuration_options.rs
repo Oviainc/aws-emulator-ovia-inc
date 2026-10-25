@@ -18,7 +18,9 @@
 //!   expression on a string one, a value set on a selection;
 //! * `DefaultValue` is the option's default on that PLATFORM, which is what an
 //!   option a configuration set does not set falls back to: it does not follow
-//!   what the set stores, which is what `DescribeConfigurationSettings` reports;
+//!   what the set stores, and `DescribeConfigurationSettings` reports that
+//!   default for an option the set never wrote (the rule
+//!   `all/configuration_resolution.rs` is the suite for);
 //! * `Options` restricts the descriptions to the options it names, a
 //!   specification carrying only a namespace selecting that whole namespace;
 //! * a request that names a configuration set two ways, a platform version two
@@ -47,13 +49,18 @@ const APPLICATION: &str = "options-app";
 /// One `ConfigurationOptionDescription` as the answer reports it. Read member by
 /// member off ONE element, so an answer that mixes up which restriction belongs
 /// to which option fails rather than matching several independent flat lists.
+///
+/// `pub(crate)` along with [`reported_options`]: the
+/// `configuration_resolution` suite reads the catalogue a configuration set
+/// resolves against off the same wire answer, so neither suite keeps a second
+/// reader of this shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ReportedOption {
-    namespace: String,
-    name: String,
-    default_value: Option<String>,
+pub(crate) struct ReportedOption {
+    pub(crate) namespace: String,
+    pub(crate) name: String,
+    pub(crate) default_value: Option<String>,
     change_severity: String,
-    user_defined: Option<String>,
+    pub(crate) user_defined: Option<String>,
     value_type: String,
     value_options: Vec<String>,
     min_value: Option<String>,
@@ -69,7 +76,7 @@ impl ReportedOption {
 }
 
 /// Every option description in `answer`, in the order the document lists them.
-fn reported_options(answer: &Answer) -> Vec<ReportedOption> {
+pub(crate) fn reported_options(answer: &Answer) -> Vec<ReportedOption> {
     answer
         .elements_at("Options/member")
         .iter()
@@ -909,9 +916,11 @@ async fn a_configuration_set_reports_the_catalog_of_the_platform_version_it_is_f
         );
     }
 
-    // What the SET stores is what `DescribeConfigurationSettings` reports, and
-    // it is not what the catalog above published: the two answers describe
-    // different things about the same template.
+    // What the SET stores is its OVERRIDE of the catalog above, and the
+    // configuration set it reports is that override resolved over the
+    // catalog: the option the template wrote carries the value it wrote, and
+    // the sibling it never wrote carries the `DefaultValue` the catalog
+    // publishes for it.
     let settings = created(
         &emulator,
         "DescribeConfigurationSettings",
@@ -921,9 +930,10 @@ async fn a_configuration_set_reports_the_catalog_of_the_platform_version_it_is_f
         ],
     )
     .await;
-    let stored: Vec<(String, String)> = settings
+    let resolved: Vec<(String, String)> = settings
         .elements_at("ConfigurationSettings/member/OptionSettings/member")
         .iter()
+        .filter(|setting| setting.value("Namespace") == Some("aws:autoscaling:asg"))
         .map(|setting| {
             (
                 setting.value("OptionName").unwrap_or_default().to_string(),
@@ -931,11 +941,28 @@ async fn a_configuration_set_reports_the_catalog_of_the_platform_version_it_is_f
             )
         })
         .collect();
-    assert_eq!(
-        stored,
-        vec![("MinSize".to_string(), "3".to_string())],
-        "case \"the stored settings\": the template holds only the option it was created with, \
-         got {}",
+    let published_max_size = reported_options(
+        &created(
+            &emulator,
+            "DescribeConfigurationOptions",
+            &[("SolutionStackName", &template_stack.name())],
+        )
+        .await,
+    )
+    .into_iter()
+    .find(|option| option.namespace == "aws:autoscaling:asg" && option.name == "MaxSize")
+    .and_then(|option| option.default_value)
+    .unwrap_or_else(|| panic!("case \"the resolved settings\": expected a MaxSize default"));
+    assert!(
+        resolved.contains(&("MinSize".to_string(), "3".to_string())),
+        "case \"the resolved settings\": the option the template wrote must carry its \
+         value, got {resolved:?} in {}",
+        settings.body
+    );
+    assert!(
+        resolved.contains(&("MaxSize".to_string(), published_max_size.clone())),
+        "case \"the resolved settings\": the option the template never wrote must carry the \
+         published default {published_max_size:?}, got {resolved:?} in {}",
         settings.body
     );
 }

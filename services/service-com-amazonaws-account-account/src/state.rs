@@ -1206,6 +1206,26 @@ pub fn primary_email_update_not_pending(status: &str) -> ConflictException {
     }
 }
 
+/// The `ConflictException` payload for a `StartPrimaryEmailUpdate` on an account
+/// whose previous update is still in flight: it has been accepted and the
+/// address change the clock owes it has not come due yet, so there is no
+/// replacing its record — "the request could not be processed because of a
+/// conflict in the current status of the resource".
+///
+/// The counterpart of [`region_opt_in_progress`]: a change the clock still owes
+/// is refused rather than discarded, so no accepted address change is lost. The
+/// message names the status the update IS in and no address, because
+/// `PrimaryEmailAddress` is `@sensitive`.
+pub fn primary_email_update_in_progress(status: &str) -> ConflictException {
+    ConflictException {
+        message: format!(
+            "The primary email update is in status {status}; wait for it to complete before \
+             starting another update"
+        ),
+        error_type: None,
+    }
+}
+
 /// The `ValidationException` payload for an `AcceptPrimaryEmailUpdate` whose
 /// `PrimaryEmail` is not the address the update was started for.
 ///

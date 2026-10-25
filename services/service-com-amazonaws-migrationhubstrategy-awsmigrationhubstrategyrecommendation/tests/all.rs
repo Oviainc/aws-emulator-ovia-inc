@@ -74,5 +74,8 @@ mod server_details;
 #[path = "all/server_inventory.rs"]
 mod server_inventory;
 
+#[path = "all/server_strategies.rs"]
+mod server_strategies;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

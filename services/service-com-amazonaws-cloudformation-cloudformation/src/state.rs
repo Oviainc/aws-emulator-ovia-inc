@@ -97,6 +97,14 @@
 //! stack's: nothing in a registry record settles on the stack clock, and `DescribeType`
 //! reads it the way `DescribeStacks` reads the stacks.
 //!
+//! ## The publisher registration
+//!
+//! Beside the registry it holds this ACCOUNT's extension-publisher registration
+//! ([`publisher`]), which `RegisterPublisher` writes and `DescribePublisher` reads back.
+//! There is at most one of it — a second registration replaces the record rather than
+//! adding one, so it is not a growth site — and it is NOT namespaced by Region: the
+//! publisher id it carries "applies to your account in all Amazon Web Services Regions".
+//!
 //! ## Drift detection
 //!
 //! It also holds every DRIFT DETECTION a caller has started ([`StoredDriftDetection`]):
@@ -154,6 +162,10 @@ pub mod resource_types;
 /// The extension registry: the registered and activated extensions this account and
 /// Region holds, and the versions of each.
 pub mod registry;
+
+/// This account's extension-publisher registration: what `RegisterPublisher` writes and
+/// `DescribePublisher` reads back.
+pub mod publisher;
 
 /// The resource schema the registry holds for a resource type: the document that defines
 /// which properties the type has.
@@ -1694,6 +1706,12 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// [`registry`]). A registry record has nothing to do with a stack's lifecycle, so it
     /// is neither settled nor reclaimed with one.
     pub extensions: Vec<registry::StoredExtension>,
+    /// This account's extension-publisher registration, once `RegisterPublisher` has
+    /// written one (see [`publisher`]). The publisher id "applies to your account in all
+    /// Amazon Web Services Regions", so there is at most ONE such record and it is not
+    /// namespaced by Region; it belongs to no stack, so it is neither settled nor
+    /// reclaimed with one.
+    pub publisher: Option<publisher::StoredPublisher>,
     /// Every drift-detection operation this service has run, in the order they were
     /// started, so `DescribeStackDriftDetectionStatus` reads back the result of the id
     /// `DetectStackDrift` handed out. Bounded at [`MAX_DRIFT_DETECTIONS`], oldest
@@ -2155,6 +2173,46 @@ impl ComAmazonawsCloudformationCloudformationState {
             .find(|extension| extension.region == region && extension.arn == arn)
     }
 
+    /// Register this account as a publisher of public extensions, and answer the publisher
+    /// id the registration is addressed by.
+    ///
+    /// The id is minted on the FIRST registration and kept from then on: it is "the ID
+    /// assigned this account by CloudFormation", one per account rather than one per call,
+    /// and the operation is `@idempotent`, so registering again re-verifies the account's
+    /// identity — the record carries the verification the latest registration supplied —
+    /// without handing out a second id.
+    pub fn register_publisher(&mut self, connection_arn: Option<String>) -> String {
+        match &mut self.publisher {
+            Some(registered) => {
+                registered.status = publisher::publisher_status::VERIFIED.to_string();
+                registered.connection_arn = connection_arn;
+                registered.publisher_id.clone()
+            }
+            none => {
+                let registered =
+                    publisher::StoredPublisher::new(new_publisher_id(), connection_arn);
+                let publisher_id = registered.publisher_id.clone();
+                *none = Some(registered);
+                publisher_id
+            }
+        }
+    }
+
+    /// The publisher record a request addresses: the one `publisher_id` names, or this
+    /// account's own where the request names none ("if you don't supply a PublisherId, and
+    /// you have registered as an extension publisher, DescribePublisher returns information
+    /// about your own publisher account").
+    ///
+    /// `None` where the store holds no such registration — an account that has not
+    /// registered, or an id that is not the one it registered under.
+    pub fn publisher(&self, publisher_id: Option<&str>) -> Option<&publisher::StoredPublisher> {
+        let registered = self.publisher.as_ref()?;
+        match publisher_id {
+            Some(wanted) if registered.publisher_id != wanted => None,
+            _ => Some(registered),
+        }
+    }
+
     fn position_of(&self, region: &str, name_or_id: &str) -> Option<usize> {
         self.stacks
             .iter()
@@ -2453,6 +2511,16 @@ pub fn new_operation_id() -> String {
 /// characters and so satisfies the modelled `StackDriftDetectionId` length (1..36).
 pub fn new_drift_detection_id() -> String {
     new_identifier("drift")
+}
+
+/// Mint the `PublisherId` a `RegisterPublisher` call assigns this account.
+///
+/// The same minted identifier as every other one this service hands out, with the group
+/// separators dropped: `PublisherId` is modelled `@pattern("^[0-9a-zA-Z]{12,40}$")`, which
+/// admits no `-`, so the id is the digest's 32 hex characters — inside that pattern and
+/// inside the modelled length (1..40).
+pub fn new_publisher_id() -> String {
+    new_identifier("publisher").replace('-', "")
 }
 
 /// Mint a change set id: `arn:aws:cloudformation:<region>:<account>:changeSet/<name>/<uuid>`,

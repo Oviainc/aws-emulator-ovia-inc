@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceTypeLimits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceTypeLimits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceTypeLimits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the limits one instance type publishes on an engine version, per instance
+//! ROLE that type can serve: how many of it a domain holds in that role, the storage
+//! types that attach to it with their published ranges, and the role's additional
+//! limit. Every figure comes from the derivation in
+//! [`crate::state::instance_type_limits`].
+//!
+//! A limit is published BY the service, never created by a caller, so this is a pure
+//! read: it writes nothing, and the same request answers the same way on every call.
+//! The only account state it reaches is the domain a request may name, which has to
+//! exist.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +161,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceTypeLimits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceTypeLimitsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceTypeLimits"))
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // "Version of OpenSearch or Elasticsearch, in the format Elasticsearch_X.Y or
+        // OpenSearch_X.Y" — which instance types exist is a function of that version,
+        // so a value no engine release can be read out of is refused rather than
+        // answered for an engine nothing runs.
+        let version = crate::state::parse_engine_version(&input.engine_version).ok_or_else(|| {
+            DescribeInstanceTypeLimitsErrorModeled::ValidationException(
+                crate::state::malformed_engine_version("EngineVersion", &input.engine_version),
+            )
+        })?;
+
+        // `InstanceType` targets `OpenSearchPartitionInstanceType`, the model's record
+        // of which instance types exist, so a value outside it names no instance type
+        // at all. The boundary refuses one before this handler runs; the check is
+        // repeated here so the rule holds however the request reached us.
+        if !OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.contains(&input.instance_type.as_str()) {
+            return Err(DescribeInstanceTypeLimitsErrorModeled::ValidationException(
+                crate::state::unknown_instance_type("InstanceType", &input.instance_type),
+            )
+            .into());
+        }
+
+        // An instance type the named engine release does not offer — a family
+        // introduced for a later release — cannot run that version, so the pairing is
+        // the modelled "invalid or not supported" refusal rather than limits for a
+        // combination that cannot exist.
+        if !crate::state::offers_instance_type(version, &input.instance_type) {
+            return Err(DescribeInstanceTypeLimitsErrorModeled::InvalidTypeException(
+                InvalidTypeException {
+                    message: Some(format!(
+                        "InstanceType {} is not supported on {}",
+                        input.instance_type, input.engine_version
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The name of the domain. Only specify if you need the limits for an existing
+        // domain" — so a request that names one names an account resource that has to
+        // exist, while one that names none is answered from the published catalog
+        // alone. Reading the store leaves it exactly as it was.
+        if let Some(domain_name) = input.domain_name.as_deref() {
+            let store = state.lock();
+            if !store.domains.contains_key(domain_name) {
+                return Err(
+                    DescribeInstanceTypeLimitsErrorModeled::ResourceNotFoundException(
+                        crate::state::domain_not_found(domain_name),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        Ok(DescribeInstanceTypeLimitsOutput {
+            limits_by_role: Some(crate::state::instance_type_limits(&input.instance_type)),
+        })
     }
 }
+

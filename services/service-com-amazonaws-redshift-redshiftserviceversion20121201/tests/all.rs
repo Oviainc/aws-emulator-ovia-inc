@@ -27,6 +27,8 @@ mod cluster_parameters;
 mod cluster_security_groups;
 #[path = "all/cluster_structure.rs"]
 mod cluster_structure;
+#[path = "all/cluster_transition_convergence.rs"]
+mod cluster_transition_convergence;
 #[path = "all/cluster_versions.rs"]
 mod cluster_versions;
 #[path = "all/default_cluster_parameters.rs"]

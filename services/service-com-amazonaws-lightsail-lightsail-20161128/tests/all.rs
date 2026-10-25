@@ -25,6 +25,8 @@ mod bucket_bundles;
 mod bucket_error_envelope;
 #[path = "all/bucket_lifecycle.rs"]
 mod bucket_lifecycle;
+#[path = "all/bucket_metric_data.rs"]
+mod bucket_metric_data;
 #[path = "all/bucket_object_data_plane.rs"]
 mod bucket_object_data_plane;
 #[path = "all/bundle_catalog.rs"]
