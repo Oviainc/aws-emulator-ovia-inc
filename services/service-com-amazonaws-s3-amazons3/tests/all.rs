@@ -85,6 +85,8 @@ mod object_and_tagging_roundtrip;
 mod object_batch_deletion;
 #[path = "all/object_copy.rs"]
 mod object_copy;
+#[path = "all/object_content_type.rs"]
+mod object_content_type;
 #[path = "all/object_default_encryption.rs"]
 mod object_default_encryption;
 #[path = "all/object_encryption.rs"]
@@ -109,5 +111,9 @@ mod object_write_and_read_back;
 mod object_write_tagging_header;
 #[path = "all/objects.rs"]
 mod objects;
+#[path = "all/public_access_guardrails.rs"]
+mod public_access_guardrails;
+#[path = "all/refusal_codes.rs"]
+mod refusal_codes;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

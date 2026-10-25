@@ -288,9 +288,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // Block Public Access: with `BlockPublicPolicy` on, S3 "causes Amazon S3 to reject
+        // calls to PUT Bucket policy if the specified bucket policy allows public access"
+        // (`PublicAccessBlockConfiguration$BlockPublicPolicy`). The refusal is
+        // `AccessDenied` — the guardrail denies the call — and the policy the bucket
+        // already carries is left untouched, so a re-put of a policy that was accepted
+        // before the switch went on is refused too. Whether a policy allows public access
+        // is the same classification `GetBucketPolicyStatus` reports.
+        if bucket
+            .public_access_block()
+            .is_some_and(|settings| settings.block_public_policy)
+            && crate::state::policy_grants_public_access(&input.policy)
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
         // One policy per bucket: a later put replaces the one that was there.
         bucket.policy = Some(input.policy);
 
         Ok(PutBucketPolicyOutput)
     }
 }
+
+/// The code S3 answers a call its Block Public Access configuration denies with, and the
+/// status and message its error-responses list carries for it — the wording the sibling
+/// ACL write states the same refusal in.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";

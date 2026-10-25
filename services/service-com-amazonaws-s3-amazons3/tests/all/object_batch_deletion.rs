@@ -360,7 +360,15 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
     for (key, marker_id) in &marker_ids {
         named.push((key.clone(), Some(marker_id.clone())));
     }
-    named.push(("one".to_string(), Some("not-a-version-this-store-minted".to_string())));
+    // A WELL-FORMED id this store never minted: 32 characters of the URL-safe Base64
+    // alphabet, so it is shaped like a version id and names no stored version — which is
+    // `NoSuchVersion`, where an id that is not shaped like one at all is a malformed
+    // argument.
+    named.push((
+        "one".to_string(),
+        Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+    ));
+    named.push(("one".to_string(), Some("not-a-version".to_string())));
     let borrowed: Vec<Identifier> = named
         .iter()
         .map(|(key, version_id)| (key.as_str(), version_id.as_deref()))
@@ -383,8 +391,12 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
     );
     assert_eq!(
         result.error_codes(),
-        vec![("one".to_string(), "NoSuchVersion".to_string())],
-        "the identifier naming no stored version is the only error, got {:?}",
+        vec![
+            ("one".to_string(), "NoSuchVersion".to_string()),
+            ("one".to_string(), "InvalidArgument".to_string())
+        ],
+        "the identifier naming no stored version and the one naming a malformed id are \
+         each that identifier's own error, got {:?}",
         result.error_codes()
     );
     let emptied = version_listing_of(&list_object_versions(&router, name, "").await);
@@ -404,15 +416,15 @@ async fn a_batch_delete_outside_what_it_can_serve_is_refused_not_guessed() {
 
     // A payload that names no Object at all, and one past the published ceiling of 1,000,
     // are both outside the schema S3 publishes for `Delete`: each is REFUSED with 400, not
-    // answered as a success that deleted nothing. The empty one is refused by the
-    // framework's own boundary validator (`ValidationException`) before the handler runs —
-    // `Delete$Objects` is a required member — the way a listing's out-of-enum
-    // `encoding-type` is; the over-long one is `MalformedXML`, the code S3 answers a
-    // payload that does not validate against its published schema.
+    // answered as a success that deleted nothing, and each carries `MalformedXML` — the
+    // code S3 answers a document that does not validate against its published schema.
+    // The empty one is refused by the boundary validator before the handler runs
+    // (`Delete$Objects` is a required member) and the over-long one by the handler, so one
+    // code for one logical failure is what says the two cannot drift apart.
     let too_many: Vec<String> = (0..1_001).map(|index| format!("key-{index}")).collect();
     let too_many: Vec<Identifier> = too_many.iter().map(|key| (key.as_str(), None)).collect();
     for (case, identifiers, code) in [
-        ("no Object element at all", Vec::new(), "ValidationException"),
+        ("no Object element at all", Vec::new(), "MalformedXML"),
         (
             "one more than the 1,000-key ceiling",
             too_many,

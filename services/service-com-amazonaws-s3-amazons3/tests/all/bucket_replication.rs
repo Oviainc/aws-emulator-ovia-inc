@@ -443,12 +443,12 @@ async fn a_configuration_s3_cannot_apply_is_refused_and_changes_nothing() {
             // `ReplicationConfiguration$Rules` is REQUIRED and `xmlFlattened`, so a
             // container carrying no `Rule` element names no list at all — which the
             // request boundary refuses against the model before this operation's handler
-            // runs, with the framework's `ValidationException`. Either way it is a 400
-            // that records nothing, which is what "a replication configuration must
-            // include at least one rule" requires.
+            // runs, as a document that does not validate against S3's published schema.
+            // Either way it is a 400 that records nothing, which is what "a replication
+            // configuration must include at least one rule" requires.
             "no rule at all",
             configuration_payload(ROLE_ARN, &[]),
-            "ValidationException",
+            "MalformedXML",
         ),
         (
             "one rule past the maximum",

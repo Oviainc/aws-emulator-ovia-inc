@@ -72,8 +72,23 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &[u8]) 
 }
 
 /// Create [`BUCKET`], so the objects below have somewhere to live.
+///
+/// The create names its `LocationConstraint`: this suite signs for [`SIGNING_REGION`], and
+/// S3 serves a create that names none only at the endpoint the unspecified constraint
+/// stands for (us-east-1).
 async fn create_bucket(router: &MultiServiceRouter) {
-    let (status, body) = s3(router, "PUT", &format!("/{BUCKET}"), b"").await;
+    let (status, body) = s3(
+        router,
+        "PUT",
+        &format!("/{BUCKET}"),
+        format!(
+            "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <LocationConstraint>{SIGNING_REGION}</LocationConstraint>\
+             </CreateBucketConfiguration>"
+        )
+        .as_bytes(),
+    )
+    .await;
     assert_eq!(
         status,
         200,

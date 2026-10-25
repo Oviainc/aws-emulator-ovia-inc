@@ -563,6 +563,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let held = match source.version_id.as_deref() {
             None => source_bucket.object(&source.key).cloned(),
             Some(version_id) => {
+                // A `versionId` that is not SHAPED like one cannot name a version of
+                // anything, so it is a malformed argument rather than an absent version —
+                // the way `GetObject` answers the same argument.
+                if !crate::state::version_id_is_well_formed(version_id) {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_ARGUMENT_CODE,
+                        crate::state::INVALID_ARGUMENT_STATUS,
+                        crate::state::INVALID_VERSION_ID_MESSAGE,
+                    ));
+                }
                 // A `versionId` naming no version the source bucket holds is
                 // `NoSuchVersion`, which this model carries no shape for, so it goes out
                 // through the unmodelled channel with the code and 404 S3 answers — the
@@ -642,7 +652,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ) {
                     Ok(tags) => tags,
                     Err(rejection) => {
-                        return Err(crate::scaffolded::Scaffolded::validation(
+                        return Err(crate::scaffolded::Scaffolded::unmodeled(
+                            rejection.code(),
+                            crate::state::TAG_REJECTION_STATUS,
                             rejection.to_string(),
                         ))
                     }
@@ -697,7 +709,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             body: source_object.body.clone(),
         };
         if replaces_metadata {
-            object.content_type = input.content_type.clone();
+            // The replacement is the REQUEST's metadata in full, so a copy that replaces
+            // it and names no `Content-Type` leaves the destination with the same default
+            // a write naming none gets — never the source's type, which `REPLACE` drops.
+            object.content_type = Some(
+                input
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_CONTENT_TYPE.to_string()),
+            );
             object.cache_control = input.cache_control.clone();
             object.content_disposition = input.content_disposition.clone();
             object.content_encoding = input.content_encoding.clone();

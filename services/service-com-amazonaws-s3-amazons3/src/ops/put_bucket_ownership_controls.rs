@@ -249,6 +249,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation's own documentation): the payload is the complete container, so what
         // it names becomes the bucket's ownership controls in full, whether the bucket had
         // some already or none.
+        //
+        // Switching to the setting that DISABLES ACLs is refused while the bucket still
+        // carries an ACL that grants something: "Bucket cannot have ACLs set with
+        // ObjectOwnership's BucketOwnerEnforced setting"
+        // (`InvalidBucketAclWithObjectOwnership`, HTTP 400). The owner's own
+        // `FULL_CONTROL` is not such a grant — it is the ACL every bucket carries, and
+        // the one a read of an ACL-disabled bucket still reports — so only an ACL that
+        // goes beyond it blocks the switch.
+        if rules
+            .last()
+            .is_some_and(|rule| rule == crate::state::BUCKET_OWNER_ENFORCED)
+            && bucket
+                .stored_acl_grants()
+                .is_some_and(|grants| grants != crate::state::default_acl_grants())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_BUCKET_ACL_WITH_OBJECT_OWNERSHIP_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                crate::state::INVALID_BUCKET_ACL_WITH_OBJECT_OWNERSHIP_MESSAGE,
+            ));
+        }
+
         bucket.set_ownership_controls(rules);
 
         // `Unit` output: success is the modelled 200 and an empty body.

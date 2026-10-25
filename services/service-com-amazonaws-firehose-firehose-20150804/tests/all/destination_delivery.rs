@@ -98,14 +98,14 @@ impl Emulator {
         answered
     }
 
-    /// One path-style Amazon S3 request.
-    async fn s3(&self, method: &str, path: &str) -> Answer {
+    /// One path-style Amazon S3 request, with `body` as the request's own bytes.
+    async fn s3_with_body(&self, method: &str, path: &str, body: &[u8]) -> Answer {
         let request = http::Request::builder()
             .method(method)
             .uri(format!("https://{HOST}{path}"))
             .header("host", HOST)
             .header("authorization", authorization("s3"))
-            .body(bytes::Bytes::new())
+            .body(bytes::Bytes::copy_from_slice(body))
             .expect("the request builds");
         let response = self.router.dispatch(request).await;
         let (parts, body) = response.into_parts();
@@ -115,9 +115,30 @@ impl Emulator {
         }
     }
 
+    /// One path-style Amazon S3 request.
+    async fn s3(&self, method: &str, path: &str) -> Answer {
+        self.s3_with_body(method, path, b"").await
+    }
+
     /// `PUT /<bucket>` — S3's `CreateBucket`.
+    ///
+    /// The create names its `LocationConstraint`: a create that names none can only mean
+    /// us-east-1, the Region the unspecified constraint stands for, so S3 refuses one sent
+    /// to any other Region's endpoint and this harness signs for [`REGION`].
     async fn create_bucket(&self, bucket: &str) {
-        let answer = self.s3("PUT", &format!("/{bucket}")).await;
+        let answer = self
+            .s3_with_body(
+                "PUT",
+                &format!("/{bucket}"),
+                format!(
+                    "<CreateBucketConfiguration \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <LocationConstraint>{REGION}</LocationConstraint>\
+                     </CreateBucketConfiguration>"
+                )
+                .as_bytes(),
+            )
+            .await;
         assert_eq!(
             answer.status,
             200,

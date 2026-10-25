@@ -625,16 +625,15 @@ async fn a_listing_parameter_this_emulator_cannot_serve_is_refused_not_guessed()
         ("negative max-keys", "&max-keys=-1", 400, "InvalidArgument"),
         (
             // The boundary validator refuses a value outside the modelled `EncodingType`
-            // enum before the handler runs, through the framework's own refusal channel
-            // (`ValidationException`, HTTP 400) rather than S3's `InvalidArgument`; what
-            // this row pins is that such a request is REFUSED rather than answered 200
-            // with keys the response then claims an encoding for. The handler carries the
-            // same guard behind it, the way `PutBucketEncryption` guards its own
-            // `SSEAlgorithm`.
+            // enum before the handler runs, with the code S3 answers a bad query
+            // parameter: `InvalidArgument`, HTTP 400. What this row pins is that such a
+            // request is REFUSED rather than answered 200 with keys the response then
+            // claims an encoding for. The handler carries the same guard behind it, the
+            // way `PutBucketEncryption` guards its own `SSEAlgorithm`.
             "an encoding type the model does not declare",
             "&encoding-type=base64",
             400,
-            "ValidationException",
+            "InvalidArgument",
         ),
         (
             "a continuation token this service did not issue",

@@ -757,7 +757,7 @@ pub const BUCKET_ACCELERATE_STATUS_VALUES: &[&str] = &["Enabled", "Suspended"];
 
 
 /// The values `BucketCannedACL` accepts on the wire.
-pub const BUCKET_CANNED_A_C_L_VALUES: &[&str] = &["authenticated-read", "private", "public-read", "public-read-write"];
+pub const BUCKET_CANNED_A_C_L_VALUES: &[&str] = &["authenticated-read", "log-delivery-write", "private", "public-read", "public-read-write"];
 
 
 /// The values `BucketLocationConstraint` accepts on the wire.
