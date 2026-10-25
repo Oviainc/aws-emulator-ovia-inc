@@ -194,6 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
+        // The boundary validator reaches a map's VALUES but not its KEYS, so
+        // `TagKey`'s own bound is enforced here, the way `CreatePipeline` enforces
+        // it, and before anything is stored.
+        for tag_key in input.tags.iter().flatten().map(|(tag_key, _)| tag_key) {
+            crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
+        }
+
         // `clientToken` is NOT honoured for idempotent replay: this change stores no
         // token -> created-id mapping, so a retry with the same token mints a second
         // asset rather than replaying the first answer. Deliberately left to the
@@ -237,13 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // say assets cannot be created directly from either.
         if model.model_type != "ASSET_MODEL" {
             let model_type = model.model_type.clone();
-            return Err(CreateAssetError::Modeled(
-                CreateAssetErrorModeled::InvalidRequestException(InvalidRequestException {
-                    message: format!(
-                        "Assets cannot be created from an asset model of type {model_type}."
-                    ),
-                }),
-            ));
+            return Err(invalid_request(format!(
+                "Assets cannot be created from an asset model of type {model_type}."
+            )));
         }
 
         // Each asset property is materialised from a model property definition and
@@ -340,6 +343,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(output)
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message` — the client-input error
+/// this operation declares for a malformed request.
+fn invalid_request(message: String) -> CreateAssetError {
+    CreateAssetError::Modeled(CreateAssetErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
 }
 
 /// HTTP 409 `ResourceAlreadyExistsException` for a `dimension` of the request

@@ -208,6 +208,8 @@ mod single_property_aggregates;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/tag_key_refusals.rs"]
+mod tag_key_refusals;
 #[path = "all/time_series.rs"]
 mod time_series;
 #[path = "all/time_series_disassociation.rs"]
