@@ -23,6 +23,8 @@ mod enforced_guardrail_configuration;
 mod evaluation_jobs;
 #[path = "all/foundation_models.rs"]
 mod foundation_models;
+#[path = "all/get_foundation_model.rs"]
+mod get_foundation_model;
 #[path = "all/guardrail_timestamp_wire_form.rs"]
 mod guardrail_timestamp_wire_form;
 #[path = "all/guardrail_wire_shape.rs"]

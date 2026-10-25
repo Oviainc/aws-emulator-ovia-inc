@@ -482,9 +482,10 @@ async fn a_dry_run_validates_without_triggering_or_writing() {
 }
 
 /// A `clientToken` is an idempotency key for the documented minute: a retry presenting
-/// it answers the first call's outcome and triggers no second execution, a fresh token
-/// (or none at all) executes again, and the same token presented for a different report
-/// inside the window is refused with the modelled ConflictException (409).
+/// it for the same report answers the first call's outcome and triggers no second
+/// execution, a fresh token (or none at all) executes again, and the same token
+/// presented for a different report is a different request, which executes that report.
+/// (The token's scope is covered over a table in `execution_token_scope.rs`.)
 #[tokio::test]
 async fn a_client_token_suppresses_a_second_execution_within_the_window() {
     let router = router();
@@ -519,8 +520,8 @@ async fn a_client_token_suppresses_a_second_execution_within_the_window() {
         );
     }
 
-    // The same token for a DIFFERENT report is a conflicting reuse, not a retry: it is
-    // refused, and the other report is left untouched.
+    // The same token for a DIFFERENT report is a different request, not a retry: it
+    // triggers that report's execution and answers that report's health.
     let (status, body) = call(
         &router,
         "ExecuteScheduledReport",
@@ -528,19 +529,26 @@ async fn a_client_token_suppresses_a_second_execution_within_the_window() {
     )
     .await;
     assert_eq!(
-        status, 409,
-        "a token already used for another report is refused with 409, got {status}: {body}"
+        status, 200,
+        "a token another report used is no reason to refuse this one, got {status}: {body}"
     );
+    assert_eq!(
+        body.get("executionTriggered").and_then(Value::as_bool),
+        Some(true),
+        "the other report under the shared token is triggered: {body}"
+    );
+    assert_health(
+        body.get("healthStatus")
+            .unwrap_or_else(|| panic!("no healthStatus in {body}")),
+        "shared token, other report",
+        HEALTHY,
+        None,
+    );
+    let executed_other = stored_report(&router, &other_arn).await;
     assert!(
-        error_code(&body).ends_with("ConflictException"),
-        "expected ConflictException, got {body}"
+        executed_other.get("lastExecutionAt").is_some(),
+        "the call under the shared token executed the other report: {executed_other}"
     );
-    let untouched = stored_report(&router, &other_arn).await;
-    assert!(
-        untouched.get("lastExecutionAt").is_none(),
-        "the refused call must not have executed the other report: {untouched}"
-    );
-    assert_unrefreshed_health(&untouched, "conflicting token reuse");
 
     // A fresh token, and no token at all, each execute again.
     for (label, request) in [
@@ -564,7 +572,8 @@ async fn a_client_token_suppresses_a_second_execution_within_the_window() {
         );
     }
 
-    // The other report can still be executed under its own token.
+    // The other report can still be executed under its own token, and its retry under
+    // the shared token replays its own outcome rather than triggering again.
     let answered = ok_call(
         &router,
         "ExecuteScheduledReport",
@@ -575,6 +584,26 @@ async fn a_client_token_suppresses_a_second_execution_within_the_window() {
         answered.get("executionTriggered").and_then(Value::as_bool),
         Some(true),
         "the other report executes under its own token: {answered}"
+    );
+    let other_execution_at = timestamp(
+        &stored_report(&router, &other_arn).await,
+        "lastExecutionAt",
+        "other report",
+    );
+    ok_call(
+        &router,
+        "ExecuteScheduledReport",
+        &json!({"arn": other_arn, "clientToken": token}),
+    )
+    .await;
+    assert_eq!(
+        timestamp(
+            &stored_report(&router, &other_arn).await,
+            "lastExecutionAt",
+            "other report retry"
+        ),
+        other_execution_at,
+        "the other report's retry under the shared token triggers no second execution"
     );
 }
 

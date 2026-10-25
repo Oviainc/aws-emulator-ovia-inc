@@ -2243,6 +2243,30 @@ impl AttachmentRecord {
         }
     }
 
+    /// The ONE edge location this attachment sits at, or `None` for a kind that spans
+    /// several of them instead.
+    ///
+    /// ONE place decides it, so every answer that names the single Region an attachment
+    /// lives in — the `Attachment$EdgeLocation` of its own reader
+    /// ([`Self::to_attachment_at`]) and the `NetworkResource$AwsRegion` of the global
+    /// network's inventory ([`ComAmazonawsNetworkmanagerNetworkmanagerState::network_resources_of`])
+    /// — reports the same one. A Direct Connect gateway attachment is the kind that spans
+    /// several edges and reports them as `Attachment$EdgeLocations` instead ("This is
+    /// returned only for Direct Connect gateway attachments. All other attachment types
+    /// retrun EdgeLocation", `smithy_query query="doc" shape="Attachment"
+    /// member="EdgeLocations"`), so it has no single edge to name.
+    pub fn sole_edge_location(&self) -> Option<&str> {
+        match &self.detail {
+            AttachmentDetail::DirectConnectGateway { .. } => None,
+            AttachmentDetail::Vpc { .. }
+            | AttachmentDetail::Connect { .. }
+            | AttachmentDetail::SiteToSiteVpn
+            | AttachmentDetail::TransitGatewayRouteTable { .. } => {
+                Some(self.edge_location.as_str())
+            }
+        }
+    }
+
     /// The modelled `Attachment` envelope of this record, as of `now`.
     ///
     /// `EdgeLocations` is absent because "this is returned only for Direct Connect gateway
@@ -2277,19 +2301,9 @@ impl AttachmentRecord {
             attachment_type: Some(self.attachment_type.to_string()),
             state: Some(state.to_string()),
             // Exactly ONE of the two edge members is reported, and which one is a function
-            // of the kind: a Direct Connect gateway attachment spans several edges and
-            // reports them as `EdgeLocations`, every other kind sits at one and reports it
-            // as `EdgeLocation` (see [`AttachmentDetail::DirectConnectGateway`]). Neither
-            // is a copy of the other: the absent member stays absent.
-            edge_location: match &self.detail {
-                AttachmentDetail::DirectConnectGateway { .. } => None,
-                AttachmentDetail::Vpc { .. }
-                | AttachmentDetail::Connect { .. }
-                | AttachmentDetail::SiteToSiteVpn
-                | AttachmentDetail::TransitGatewayRouteTable { .. } => {
-                    Some(self.edge_location.clone())
-                }
-            },
+            // of the kind ([`Self::sole_edge_location`]). Neither is a copy of the other:
+            // the absent member stays absent.
+            edge_location: self.sole_edge_location().map(str::to_string),
             edge_locations: match &self.detail {
                 AttachmentDetail::DirectConnectGateway { edge_locations } => {
                     Some(edge_locations.clone())
@@ -3541,6 +3555,10 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 NetworkResource {
                     // An attachment belongs to the core network it joins a resource to.
                     core_network_id: Some(record.core_network_id.clone()),
+                    // The attachment lives at the edge it was created at, which its own
+                    // reader reports as the Region of that edge
+                    // ([`AttachmentRecord::sole_edge_location`]).
+                    aws_region: record.sole_edge_location().map(str::to_string),
                     definition,
                     ..network_resource(ATTACHMENT_KIND, &record.id, &record.arn, &record.tags, now)
                 },
@@ -3552,6 +3570,9 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 NetworkResource {
                     // A peering belongs to the core network it joins to another resource.
                     core_network_id: Some(record.core_network_id.clone()),
+                    // A peering joins ONE edge of its core network to the peer, and its
+                    // own reader reports that edge as `Peering$EdgeLocation`.
+                    aws_region: Some(record.edge_location.clone()),
                     definition: resource_definition(&Peering::SCHEMA, &record.to_peering(now)),
                     ..network_resource(PEERING_KIND, &record.id, &record.arn, &record.tags, now)
                 },
@@ -3568,6 +3589,9 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                     // A Connect peer belongs to the core network of the Connect attachment
                     // it is carried over.
                     core_network_id: Some(record.core_network_id.clone()),
+                    // A Connect peer lands on the edge of that attachment, which its own
+                    // reader reports as `ConnectPeer$EdgeLocation`.
+                    aws_region: Some(record.edge_location.clone()),
                     definition: resource_definition(&ConnectPeer::SCHEMA, &record.to_shape(now)),
                     ..network_resource(CONNECT_PEER_KIND, &record.id, &record.arn, &record.tags, now)
                 },
@@ -3902,20 +3926,21 @@ pub fn network_resource_key(resource_type: &str, resource_id: &str) -> String {
 
 /// The members every network resource of this service carries, whatever its kind: the
 /// account that holds it, its type, id and ARN, its tags, and the instant the answer read
-/// its definition. The caller fills `Definition` (and, for a core network, `CoreNetworkId`)
-/// from the record itself.
+/// its definition. The caller fills `Definition` (and, where the kind has one,
+/// `CoreNetworkId` and `AwsRegion`) from the record itself.
 ///
-/// Three members are deliberately left absent, because nothing in the store holds them:
+/// `AwsRegion` defaults to absent here and is filled in by the caller for every kind whose
+/// own reader names the single Region the resource lives in — the edge location of an
+/// attachment, a peering or a Connect peer, all typed `ExternalRegionCode` exactly as
+/// `NetworkResource$AwsRegion` is (`smithy_query shape=NetworkResource,Attachment`). A kind
+/// whose reader names no single Region keeps the default: the resource is held under the
+/// global network itself rather than at one edge (a site, a link, a device, a connection),
+/// or it spans several Regions at once and reports them as a LIST (a core network's
+/// `Edges`, a Direct Connect gateway attachment's `EdgeLocations`), which a single-valued
+/// member cannot carry.
 ///
-/// * `AwsRegion` — every resource this service stores is partition-scoped: its ARN carries
-///   an empty region segment (see
-///   [`ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn`]), so none of these
-///   kinds sits in one Region and an `awsRegion` filter selects none of them. The
-///   Region-scoped kinds a global network can also hold (a registered transit gateway, a
-///   VPN connection) are minted by operations that are still scaffold stubs. A kind that
-///   DOES live in one Region must report it here when it starts being stored — a resource
-///   whose Region is known but unreported would be silently under-selected by that filter
-///   (an attachment, for one, knows the edge location it sits at).
+/// Two members are deliberately left absent, because nothing in the store holds them:
+///
 /// * `RegisteredGatewayArn` — only a resource reached through a registered gateway carries
 ///   one, and the registering operation (`RegisterTransitGateway`) is still a scaffold
 ///   stub. Associating a customer gateway with a device does not register one: it ties a

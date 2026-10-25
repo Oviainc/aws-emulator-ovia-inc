@@ -157,3 +157,39 @@ pub async fn create_table(router: &MultiServiceRouter, database: &str, name: &st
         "case create table {database}.{name}: expected 200, got {status} {body:?}"
     );
 }
+
+/// Create a Glue database from a whole `DatabaseInput`, asserting Glue accepted it.
+///
+/// For a suite that has to vary what the create sends — the Lake Formation defaults a
+/// database hands to its TABLES, say — where [`create_database`] sends only the name.
+pub async fn create_database_with_input(router: &MultiServiceRouter, input: &Value) {
+    let (status, body) = glue(router, "CreateDatabase", &json!({ "DatabaseInput": input })).await;
+    assert_eq!(
+        status, 200,
+        "case create database {input:?}: expected 200, got {status} {body:?}"
+    );
+}
+
+/// Revoke a database's creation-time default grant: `ALL` to `IAM_ALLOWED_PRINCIPALS`, the
+/// account's "use only IAM access control" setting, which every database is created
+/// carrying.
+///
+/// A suite about the EXPLICIT grant store calls this first, so its listings read back only
+/// the records its own grants wrote. The default itself is covered by
+/// `default_database_grant.rs` and `revoke_default_grant.rs`.
+pub async fn revoke_default_database_grant(router: &MultiServiceRouter, database: &str) {
+    let (status, body) = lake_formation(
+        router,
+        "RevokePermissions",
+        &json!({
+            "Principal": { "DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS" },
+            "Resource": { "Database": { "Name": database } },
+            "Permissions": ["ALL"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case revoke the default grant of {database:?}: expected 200, got {status} {body:?}"
+    );
+}

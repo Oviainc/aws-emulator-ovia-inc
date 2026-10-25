@@ -39,6 +39,8 @@ mod page_acknowledgement;
 mod page_receipts;
 #[path = "all/page_resolution.rs"]
 mod page_resolution;
+#[path = "all/recurrence_validity.rs"]
+mod recurrence_validity;
 #[path = "all/replication_set_precondition.rs"]
 mod replication_set_precondition;
 #[path = "all/rotation_deletes.rs"]

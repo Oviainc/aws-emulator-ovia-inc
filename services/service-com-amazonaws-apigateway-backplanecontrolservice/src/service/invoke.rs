@@ -21,17 +21,18 @@
 //!
 //! A client on the machine this emulator runs on cannot reach that host at all: nothing
 //! resolves `{rest-api-id}.execute-api.{region}.amazonaws.com` there, so it points at the
-//! emulator's own endpoint and carries in the PATH what it cannot carry in the host — the
-//! api id ahead of the stage, or the stage alone. [`resolve`] reads all three addressings,
+//! emulator's own endpoint and carries in the PATH what it cannot carry in the host — this
+//! data plane and the api id behind the reserved `/_aws/execute-api/{api-id}` prefix, the
+//! api id ahead of the stage, or the stage alone. [`resolve`] reads all four addressings,
 //! and each one is checked against this service's own records, so one request still has
 //! one claimant.
 //!
 //! # What it resolves, in order
 //!
-//! 1. the request names a stored `RestApi` — by the host's first label, by the first path
-//!    segment, or, on a host that names no service, by the stage segment of its path
-//!    ([`resolve`]) — whose `disableExecuteApiEndpoint` must not have turned this endpoint
-//!    off;
+//! 1. the request names a stored `RestApi` — by the host's first label, by the api id
+//!    behind the data-plane path prefix, by the first path segment, or, on a host that names
+//!    no service, by the stage segment of its path ([`resolve`]) — whose
+//!    `disableExecuteApiEndpoint` must not have turned this endpoint off;
 //! 2. the first segment of the path WITHIN that api names a `Stage` of it, and that
 //!    stage's `deploymentId` names a stored `Deployment`;
 //! 3. the rest of the path matches one of the resource paths THAT DEPLOYMENT holds
@@ -99,6 +100,18 @@ use crate::state::{ApiKeyEntry, DeploymentEntry, MethodEntry, RestApiEntry};
 /// From `RestApi$disableExecuteApiEndpoint`: "clients can invoke your API with the default
 /// `https://{api_id}.execute-api.{region}.amazonaws.com` endpoint".
 pub const EXECUTE_API_LABEL: &str = "execute-api";
+
+/// The reserved path segment that names a DATA plane on the one endpoint this emulator
+/// serves its whole surface at, ahead of [`EXECUTE_API_LABEL`] and the api id:
+/// `/_aws/execute-api/{api-id}/{stage}/{resource-path}`.
+///
+/// A client reaching AWS addresses the api by host; a client reaching this emulator has
+/// one host for every service and every plane, so the two parts of an invoke URL that
+/// AWS puts in the host — that it is the `execute-api` data plane, and which api — travel
+/// in the path instead. The segment begins with `_`, which no modelled path segment of any
+/// service does, so the prefix cannot collide with a control-plane route however a stage or
+/// a resource is named.
+const EMULATOR_PATH_NAMESPACE: &str = "_aws";
 
 /// The path segment that belongs to ApiGatewayManagementApi rather than to a stage.
 ///
@@ -292,7 +305,7 @@ struct Resolved<'s, 'r> {
 
 /// What `addressed` addresses, or `None` when this data plane serves it not at all.
 ///
-/// THREE addressings resolve, because a client reaches this emulator at a different
+/// FOUR addressings resolve, because a client reaches this emulator at a different
 /// address than it reaches AWS at:
 ///
 /// * HOST-STYLE, the addressing `RestApi$disableExecuteApiEndpoint` documents: the host's
@@ -302,6 +315,14 @@ struct Resolved<'s, 'r> {
 ///   (an API Gateway V2 api is reached on the same host shape, and its own service claims
 ///   it), so reading its path as one of THIS service's stages would make two services claim
 ///   one request;
+/// * PREFIXED PATH-STYLE, the addressing a client reaching an EMULATOR uses: the data
+///   plane is named by the reserved namespace segment [`EMULATOR_PATH_NAMESPACE`] and the
+///   [`EXECUTE_API_LABEL`], then the api id, then the invoke path —
+///   `/_aws/execute-api/{api_id}/{stage}/{resource-path}`. One
+///   endpoint serves this emulator's whole surface, control plane and data plane alike, so
+///   a client that cannot reach `{api_id}.execute-api.{region}.amazonaws.com` names the
+///   data plane in the path before naming the api, which is what keeps an invoke path off
+///   the control plane's own modelled path space whatever a stage is called;
 /// * PATH-STYLE: the api id is the FIRST PATH SEGMENT and the invoke path is what follows
 ///   it. A client on the machine this emulator runs on resolves
 ///   `{api_id}.execute-api.{region}.amazonaws.com` nowhere, so it reaches the emulator's own
@@ -323,14 +344,15 @@ struct Resolved<'s, 'r> {
 ///   decides it, and not the whole routing key: an `AWS_IAM` method is invoked with a SigV4
 ///   credential, whose scope resolves a routing key for every such request, so a claim
 ///   conditioned on the key having resolved nothing would leave exactly the signed invokes
-///   unclaimed. When two apis hold a stage of that name the request names no ONE api, so
-///   nothing is resolved rather than one of them guessed at.
+///   unclaimed. When several apis publish a stage of that name the request names no ONE
+///   api, so nothing is resolved rather than one of them guessed at; each is reachable by an
+///   addressing that names it, which is what the prefixed form above is for.
 ///
 /// This service's own CONTROL-plane path space is never read as a stage: a request whose
 /// first segment is one of the model's route segments is a control-plane call on whatever
 /// host it arrives at, and answering it from the data plane would take `/restapis` away
 /// from the operations that serve it. A stage named like one of those segments is reachable
-/// through the two addressings above, where the api is named before the stage is.
+/// through the three addressings above, where the api is named before the stage is.
 fn resolve<'s, 'r>(
     store: &'s crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState,
     addressed: &Addressed<'r>,
@@ -345,6 +367,15 @@ fn resolve<'s, 'r>(
             api,
             invoke_path: addressed.path,
         });
+    }
+    // PREFIXED PATH-STYLE: the path names this data plane before it names the api, so it is
+    // read on whatever host it arrives at — the prefix is in no service's modelled path
+    // space, and an api id this service does not hold is served by nothing here.
+    if let Some((api_id, invoke_path)) = split_execute_api_prefix(addressed.path) {
+        return store
+            .rest_apis
+            .get(api_id)
+            .map(|api| Resolved { api, invoke_path });
     }
     let (first, rest) = split_first_segment(addressed.path)?;
     // Which service the host names, by the front door's own rule: `None` is the emulator's
@@ -375,8 +406,8 @@ fn resolve<'s, 'r>(
         return None;
     }
     // STAGE-ONLY: the first segment names a stage, and the api is the one that holds a
-    // stage of that name. When two apis hold one the request names no ONE api, so nothing
-    // is resolved rather than one of them guessed at — the two addressings above carry the
+    // stage of that name. When several hold one the request names no ONE api, so nothing is
+    // resolved rather than one of them guessed at — the three addressings above carry the
     // api id and are never ambiguous.
     let mut holding = store
         .rest_apis
@@ -387,6 +418,26 @@ fn resolve<'s, 'r>(
         api,
         invoke_path: addressed.path,
     })
+}
+
+/// The api id and the invoke path of a PREFIXED PATH-STYLE address, or `None` when `path`
+/// does not carry that prefix.
+///
+/// The prefix is [`EMULATOR_PATH_NAMESPACE`] then [`EXECUTE_API_LABEL`], by exact segment
+/// equality, and what follows is the api id and then the invoke path the host-style
+/// addressing carries whole — `/_aws/execute-api/{api-id}/{stage}/{resource-path}`. The
+/// invoke path is a SLICE of the request's own path, so nothing is copied, and a prefix
+/// with no api id after it resolves nothing.
+fn split_execute_api_prefix(path: &str) -> Option<(&str, &str)> {
+    let (prefix, after_prefix) = split_first_segment(path)?;
+    if prefix != EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    let (label, after_label) = split_first_segment(after_prefix)?;
+    if label != EXECUTE_API_LABEL {
+        return None;
+    }
+    split_first_segment(after_label)
 }
 
 /// The first non-empty segment of `path` and the path that follows it, or `None` for a
@@ -1326,6 +1377,51 @@ mod tests {
             assert_eq!(
                 resolved, *expected,
                 "case {host:?}: expected the api id {expected:?}, got {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_data_plane_path_prefix_names_the_api_before_the_stage() {
+        // Rows differ along what follows the prefix (an api id with an invoke path, with a
+        // stage alone, with nothing), along the spelling of the prefix itself (extra
+        // slashes, a label that merely starts with it, one segment of it alone) and along
+        // paths that carry no prefix at all, which the other addressings read.
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            (
+                "/_aws/execute-api/abc1230000/prod/pets",
+                Some(("abc1230000", "prod/pets")),
+            ),
+            (
+                "/_aws/execute-api/abc1230000/prod",
+                Some(("abc1230000", "prod")),
+            ),
+            ("/_aws/execute-api/abc1230000", Some(("abc1230000", ""))),
+            // Empty segments are not segments, so the same address spelled with extra
+            // slashes names the same api, and the invoke path it leaves is read by
+            // [`split_stage`], which drops them too.
+            (
+                "//_aws//execute-api//abc1230000//prod//pets",
+                Some(("abc1230000", "/prod//pets")),
+            ),
+            // The prefix is read by exact segment equality, so a segment that merely starts
+            // with it is a different path.
+            ("/_awsx/execute-api/abc1230000/prod", None),
+            ("/_aws/execute-apifoo/abc1230000/prod", None),
+            // The prefix with nothing after it names no api.
+            ("/_aws/execute-api", None),
+            ("/_aws", None),
+            // No prefix at all: the api id or the stage leads, for the other addressings.
+            ("/abc1230000/prod/pets", None),
+            ("/prod/pets", None),
+            ("/", None),
+            ("", None),
+        ];
+        for (path, expected) in cases {
+            let split = split_execute_api_prefix(path);
+            assert_eq!(
+                split, *expected,
+                "case {path:?}: expected the api id and invoke path {expected:?}, got {split:?}"
             );
         }
     }

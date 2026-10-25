@@ -180,6 +180,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // `capacityLimits` is stored and walked every time a service job of a queue over
+        // this environment is weighed against it, so how many entries are kept is bounded
+        // (`state::limits::MAX_SERVICE_ENVIRONMENT_CAPACITY_LIMITS`).
+        batch::validate_stored_list_length(
+            "capacityLimits",
+            input.capacity_limits.len(),
+            batch::limits::MAX_SERVICE_ENVIRONMENT_CAPACITY_LIMITS,
+        )
+        .map_err(|detail| {
+            CreateServiceEnvironmentError::from(
+                CreateServiceEnvironmentErrorModeled::ClientException(batch::client_exception(
+                    detail,
+                )),
+            )
+        })?;
         if state
             .service_environments
             .contains_key(&input.service_environment_name)

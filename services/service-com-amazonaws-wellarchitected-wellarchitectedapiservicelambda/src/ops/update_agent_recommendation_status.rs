@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAgentRecommendationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAgentRecommendationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAgentRecommendationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Updates the status of a recommendation to track its progress through the
+//! implementation lifecycle": the status the request carries is recorded on the
+//! recommendation its `recommendationArn` names, with the reason that update was made
+//! for, so every later reading of that recommendation reports the new status and the
+//! `RecommendationState` derived from it.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +141,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAgentRecommendationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAgentRecommendationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAgentRecommendationStatus"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAgentRecommendationStatusErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Well-Architected Tool agent profile store is unavailable"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        // Defence in depth for a caller that builds the input directly: `status` is a
+        // `RecommendationStatus`, so the boundary walk in `crate::service` already refuses
+        // a value outside the published set with this same 400 before the handler runs. It
+        // is kept so no recommendation is ever STORED carrying a status the enum does not
+        // publish.
+        if !RECOMMENDATION_STATUS_VALUES.contains(&input.status.as_str()) {
+            return Err(
+                UpdateAgentRecommendationStatusErrorModeled::ValidationException(
+                    crate::state::member_constraint_exception(
+                        STATUS_MEMBER,
+                        &format!(
+                            "Member must satisfy enum value set: [{}], got {}",
+                            RECOMMENDATION_STATUS_VALUES.join(", "),
+                            input.status
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The recommendations of a generation whose analysis the clock has finished exist
+        // from that instant, so they are recorded before this ARN is resolved: a caller may
+        // update one as soon as the generation that produced it completed.
+        store.materialise_due_agent_recommendations(now);
+
+        // "The Amazon Resource Name (ARN) of the recommendation to update": an ARN that
+        // names no recommendation this account holds has nothing to update, which is the
+        // 404 this operation models.
+        let Some(record) = store.agent_recommendation_mut(&input.recommendation_arn) else {
+            return Err(
+                UpdateAgentRecommendationStatusErrorModeled::ResourceNotFoundException(
+                    crate::state::agent_recommendation_not_found(&input.recommendation_arn),
+                )
+                .into(),
+            );
+        };
+
+        // The whole update: the new status, and the reason THIS update was made for.
+        // `updateReason` is "the free-text reason associated with the recommendation's most
+        // recent status update" (`AgentRecommendationSummary$updateReason`), so it is
+        // replaced by what this request carried — including by nothing, when the request
+        // gives no reason: the member describes the LATEST update, so an earlier update's
+        // reason must not be left standing as if it belonged to this one.
+        record.status = input.status;
+        record.update_reason = input.update_reason;
+        // "The identifier of the user or system that last modified this recommendation":
+        // every request this emulator serves is attributed to its one account, exactly as
+        // the generation that produced the recommendation is.
+        record.last_modified_by = Some(::engine::emulator_account_id().to_string());
+        record.last_modified_at = Some(now);
+
+        // The response carries no members (`UpdateAgentRecommendationStatusResponse` is an
+        // empty structure), so the recorded status is observed through the operations that
+        // report the recommendation. `@idempotent`: re-sending the same status leaves the
+        // recommendation in the state it already reached.
+        Ok(UpdateAgentRecommendationStatusOutput {})
     }
 }
+
+/// The modelled input member a status finding names
+/// (`UpdateAgentRecommendationStatusRequest$status`), as `ValidationExceptionField$Name`
+/// reports it.
+const STATUS_MEMBER: &str = "status";

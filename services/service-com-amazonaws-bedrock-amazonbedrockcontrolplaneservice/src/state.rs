@@ -63,8 +63,9 @@
 //! removes, each holding the foundation models that profile tracks metrics and costs for.
 //!
 //! And it holds the published foundation model catalog — the base models
-//! `ops/list_foundation_models.rs` reports — which is seeded with the store and never
-//! written, because no operation of this service creates a foundation model.
+//! `ops/list_foundation_models.rs` reports and `ops/get_foundation_model.rs` resolves one
+//! row of — which is seeded with the store and never written, because no operation of this
+//! service creates a foundation model.
 //!
 //! And it holds the resource policies `ops/put_resource_policy.rs` attaches and
 //! `ops/get_resource_policy.rs` reports, keyed by the [`TaggedResource`] each one is
@@ -90,6 +91,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     CustomModelDataSource, CustomModelDeploymentSummary, CustomModelSummary, EndpointConfig,
     EvaluationConfig, EvaluationInferenceConfig, EvaluationOutputDataConfig,
+    FoundationModelDetails, FoundationModelLifecycle, FoundationModelSummary,
     GuardrailAutomatedReasoningPolicy, GuardrailAutomatedReasoningPolicyConfig,
     GuardrailContentFilter, GuardrailContentFilterConfig, GuardrailContentFiltersTier,
     GuardrailContentFiltersTierConfig, GuardrailContentPolicy, GuardrailContentPolicyConfig,
@@ -3212,8 +3214,11 @@ const FINE_TUNING_AND_PRE_TRAINING: &[&str] = &["FINE_TUNING", "CONTINUED_PRE_TR
 const FINE_TUNING_AND_DISTILLATION: &[&str] = &["FINE_TUNING", "DISTILLATION"];
 /// `FoundationModelLifecycleStatus` — the model is available.
 const LIFECYCLE_ACTIVE: &str = "ACTIVE";
-/// `FoundationModelLifecycleStatus` — the model is deprecated: its id still resolves, and
-/// callers are expected to move off it.
+/// `FoundationModelLifecycleStatus` — the model is deprecated: it is still offered and
+/// still invocable, and callers are expected to move off it before its end of life. The
+/// two values this enum carries are the two states an OFFERED model can be in; a model
+/// past its end of life is no longer offered, so it is absent from this catalog rather
+/// than carried in it under a status (see [`FOUNDATION_MODELS`]).
 const LIFECYCLE_LEGACY: &str = "LEGACY";
 
 /// Every foundation model this emulator's Amazon Bedrock offers, in `modelId` order.
@@ -3223,11 +3228,19 @@ const LIFECYCLE_LEGACY: &str = "LEGACY";
 /// `ListFoundationModels` reports and `GetFoundationModel` resolves one row of, not
 /// anything a request can add to or remove from.
 ///
+/// It is the set of models the service currently OFFERS, which is what makes it the set
+/// both of those operations answer out of: a model is here while it is available
+/// ([`LIFECYCLE_ACTIVE`]) and while it is deprecated ([`LIFECYCLE_LEGACY`]), and a model
+/// past its end of life is not offered at all, so it is in no row — it is listed by
+/// nothing and resolves for nobody. The inference plane keeps such an id in its own
+/// inventory to refuse it, which is where the end-of-life refusal belongs; the control
+/// plane simply no longer carries the model.
+///
 /// The ids are the base model ids AWS publishes in "Amazon Bedrock base model IDs
 /// (on-demand throughput)" and "Supported foundation models in Amazon Bedrock", and the
-/// rows past their end of life carry the ids "Model lifecycle" lists; this emulator's
-/// bedrock-runtime plane recognises the same ids, so the two planes agree about which
-/// models exist. Each row's provider, modalities, streaming support, customizations and
+/// rows AWS marks deprecated carry the status "Model lifecycle" lists them under; this
+/// emulator's bedrock-runtime plane serves the same ids, so the two planes agree about
+/// which models exist. Each row's provider, modalities, streaming support, customizations and
 /// inference types are as those pages publish them for that model; a per-model attribute
 /// no page publishes is left out of the row rather than invented (the lifecycle's
 /// `startOfLifeTime`, `endOfLifeTime`, `legacyTime` and `publicExtendedAccessTime` are
@@ -3237,17 +3250,6 @@ const LIFECYCLE_LEGACY: &str = "LEGACY";
 /// filter on, because the filter rule — not the catalog's size — is what this emulator
 /// has to get right.
 pub const FOUNDATION_MODELS: &[FoundationModel] = &[
-    FoundationModel {
-        model_id: "ai21.j2-ultra-v1",
-        model_name: "Jurassic-2 Ultra",
-        provider_name: "AI21 Labs",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: false,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_LEGACY,
-    },
     FoundationModel {
         model_id: "ai21.jamba-1-5-mini-v1:0",
         model_name: "Jamba 1.5 Mini",
@@ -3337,17 +3339,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         lifecycle_status: LIFECYCLE_ACTIVE,
     },
     FoundationModel {
-        model_id: "amazon.titan-text-express-v1",
-        model_name: "Titan Text Express",
-        provider_name: "Amazon",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: FINE_TUNING_AND_PRE_TRAINING,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_LEGACY,
-    },
-    FoundationModel {
         model_id: "amazon.titan-text-lite-v1",
         model_name: "Titan Text Lite",
         provider_name: "Amazon",
@@ -3356,7 +3347,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING_AND_PRE_TRAINING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_ACTIVE,
+        lifecycle_status: LIFECYCLE_LEGACY,
     },
     FoundationModel {
         model_id: "amazon.titan-text-premier-v1:0",
@@ -3403,17 +3394,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         lifecycle_status: LIFECYCLE_ACTIVE,
     },
     FoundationModel {
-        model_id: "anthropic.claude-v2",
-        model_name: "Claude",
-        provider_name: "Anthropic",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_LEGACY,
-    },
-    FoundationModel {
         model_id: "cohere.command-light-text-v14",
         model_name: "Command Light",
         provider_name: "Cohere",
@@ -3422,7 +3402,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_ACTIVE,
+        lifecycle_status: LIFECYCLE_LEGACY,
     },
     FoundationModel {
         model_id: "cohere.command-text-v14",
@@ -3433,7 +3413,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_ACTIVE,
+        lifecycle_status: LIFECYCLE_LEGACY,
     },
     FoundationModel {
         model_id: "cohere.embed-english-v3",
@@ -3445,17 +3425,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
-    },
-    FoundationModel {
-        model_id: "meta.llama2-70b-chat-v1",
-        model_name: "Llama 2 Chat 70B",
-        provider_name: "Meta",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: FINE_TUNING,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_LEGACY,
     },
     FoundationModel {
         model_id: "meta.llama3-1-8b-instruct-v1:0",
@@ -3597,6 +3566,64 @@ pub fn provider_matches(model: &FoundationModel, by_provider: &str) -> bool {
         .map_or(model.model_id, |(provider, _)| provider);
     by_provider.eq_ignore_ascii_case(model.provider_name)
         || by_provider.eq_ignore_ascii_case(id_provider)
+}
+
+/// One catalog row as the `FoundationModelSummary` a `ListFoundationModels` response for
+/// `region` carries.
+///
+/// Lives here rather than in `ops/list_foundation_models.rs` because every member it
+/// carries is also a member `GetFoundationModel` reports
+/// ([`foundation_model_details`], which is built out of it), and the two must agree about
+/// them: a listed summary is the same row the read of that one model finds.
+///
+/// `modelLifecycle` reports the row's `status` and none of the four lifecycle instants:
+/// nothing publishes a launch, legacy or end-of-life date per model, and a date is not
+/// something to invent.
+#[must_use]
+pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> FoundationModelSummary {
+    let list = |values: &[&str]| values.iter().map(|value| (*value).to_string()).collect();
+    FoundationModelSummary {
+        model_arn: foundation_model_arn(region, model.model_id),
+        model_id: model.model_id.to_string(),
+        model_name: Some(model.model_name.to_string()),
+        provider_name: Some(model.provider_name.to_string()),
+        input_modalities: Some(list(model.input_modalities)),
+        output_modalities: Some(list(model.output_modalities)),
+        response_streaming_supported: Some(model.response_streaming_supported),
+        customizations_supported: Some(list(model.customizations_supported)),
+        inference_types_supported: Some(list(model.inference_types_supported)),
+        model_lifecycle: Some(FoundationModelLifecycle {
+            status: model.lifecycle_status.to_string(),
+            start_of_life_time: None,
+            end_of_life_time: None,
+            legacy_time: None,
+            public_extended_access_time: None,
+        }),
+    }
+}
+
+/// The same catalog row as the `FoundationModelDetails` a `GetFoundationModel` response
+/// for `region` carries.
+///
+/// `FoundationModelDetails` and `FoundationModelSummary` declare the same ten members, and
+/// a read of a model must report what a listing reports for it, so this moves the ONE
+/// mapping [`foundation_model_summary`] computes into the shape this response declares
+/// rather than computing the members a second time.
+#[must_use]
+pub fn foundation_model_details(model: &FoundationModel, region: &str) -> FoundationModelDetails {
+    let summary = foundation_model_summary(model, region);
+    FoundationModelDetails {
+        model_arn: summary.model_arn,
+        model_id: summary.model_id,
+        model_name: summary.model_name,
+        provider_name: summary.provider_name,
+        input_modalities: summary.input_modalities,
+        output_modalities: summary.output_modalities,
+        response_streaming_supported: summary.response_streaming_supported,
+        customizations_supported: summary.customizations_supported,
+        inference_types_supported: summary.inference_types_supported,
+        model_lifecycle: summary.model_lifecycle,
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

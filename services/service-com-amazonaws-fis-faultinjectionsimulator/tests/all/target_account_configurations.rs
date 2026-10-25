@@ -144,7 +144,20 @@ async fn send(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
 /// Create an experiment template to hang target account configurations off, and report
 /// its minted id. `label` only has to be unique within one test; whitespace in it is
 /// collapsed because `ClientToken` is modelled `pattern ^[\S]+$`.
+///
+/// The template targets MULTIPLE accounts, which is the targeting a target account
+/// configuration belongs to: `accountTargeting` and the configurations a template holds
+/// state the same thing between them. A case that hangs NO configuration off its template
+/// asks for the documented default instead ([`template_targeting`]).
 async fn template(router: &MultiServiceRouter, label: &str) -> String {
+    template_targeting(router, label, "multi-account").await
+}
+
+async fn template_targeting(
+    router: &MultiServiceRouter,
+    label: &str,
+    targeting: &str,
+) -> String {
     let token: String = label
         .chars()
         .map(|c| if c.is_whitespace() { '-' } else { c })
@@ -158,6 +171,7 @@ async fn template(router: &MultiServiceRouter, label: &str) -> String {
             "description": format!("target account configuration suite: {label}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-target-account-configurations",
             "stopConditions": [{ "source": "none" }],
+            "experimentOptions": { "accountTargeting": targeting },
             // `aws:fis:wait` takes a required `duration`, an ISO 8601 duration within the
             // documented 1 to 720 minutes.
             "actions": {
@@ -503,7 +517,15 @@ async fn a_template_counts_the_configurations_it_holds_and_an_experiment_snapsho
     // several.
     for configured in [0usize, 1, 3] {
         let case = format!("{configured}-configurations");
-        let template_id = template(&router, &case).await;
+        // A template that is configured for no account at all targets a SINGLE account:
+        // a multi-account template is only one FIS runs once it names a target account,
+        // which `account_targeting_agreement.rs` owns.
+        let targeting = if configured == 0 {
+            "single-account"
+        } else {
+            "multi-account"
+        };
+        let template_id = template_targeting(&router, &case, targeting).await;
         for index in 0..configured {
             let account_id = format!("55555555{index:04}");
             let created = create_configuration(

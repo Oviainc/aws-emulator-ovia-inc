@@ -32,6 +32,17 @@
 //!   `ValidationException` (400) — the same per-resource ceiling `TagResource` reports
 //!   with `TooManyTagsException`, which this operation does not declare — so no team is
 //!   ever stored already past it.
+//! * `Tags` naming a key in the namespace AWS reserves for its own tags
+//!   ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) earns `ValidationException` (400): such
+//!   a key is AWS's, not the caller's, so no path that writes tags writes one and no team
+//!   is ever stored already carrying one.
+//! * `Policies` naming a policy version the catalog does not hold earns
+//!   `ValidationException` (400). An attachment is resolved through
+//!   [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::policy_version`], the one
+//!   resolver a `QualifiedPolicyArn` is read by, so an attachment this call accepts is
+//!   one `GetApprovalTeam`, `ListResourcePolicies` and `GetResourcePolicy` all resolve to
+//!   the same policy version; the modelled pattern fixes an attachment's FORM, not the
+//!   existence of what it names.
 //!
 //! A new team is `PENDING` / `PENDING_ACTIVATION` until its approvers have answered their
 //! invitations; see [`crate::state`] for who materialises that.
@@ -292,6 +303,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::MAX_TAGS_PER_RESOURCE
                 ),
             })
+            .into());
+        }
+
+        // A tag key in the namespace reserved for Amazon Web Services belongs to AWS,
+        // not to the caller, so no path that writes tags may write one: create is one of
+        // those paths, and refuses such a request with the `ValidationException` (400) it
+        // declares before any team is stored. Otherwise a team could be created already
+        // carrying a key `TagResource` is not allowed to write or change.
+        if let Some(tags) = input.tags.as_ref() {
+            if crate::state::names_reserved_tag_key(tags.keys().map(String::as_str)) {
+                return Err(CreateApprovalTeamErrorModeled::ValidationException(
+                    crate::state::reserved_tag_key(),
+                )
+                .into());
+            }
+        }
+
+        // `Policies` ATTACHES policies to the team, and a policy is AWS-owned: nothing in
+        // this model mints one, so a reference is attachable only when the catalog holds
+        // the policy and the version the reference names. Each reference is resolved here
+        // through the same resolver the resource-policy reads and `GetPolicyVersion` use,
+        // and one that resolves to nothing is refused with the declared
+        // `ValidationException` (400) before any team is stored — otherwise the team would
+        // carry an attachment `GetApprovalTeam` reports and `ListResourcePolicies` /
+        // `GetResourcePolicy` cannot resolve.
+        if let Some(unattachable) = state.unattachable_policy_reference(
+            input.policies.iter().map(|policy| policy.policy_arn.as_str()),
+        ) {
+            return Err(CreateApprovalTeamErrorModeled::ValidationException(
+                crate::state::unattachable_policy(unattachable),
+            )
             .into());
         }
 

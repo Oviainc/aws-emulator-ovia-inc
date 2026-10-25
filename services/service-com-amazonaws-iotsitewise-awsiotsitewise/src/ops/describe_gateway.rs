@@ -169,6 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let _ = ctx;
 
+        let now = ::std::time::SystemTime::now();
         let store = state.lock();
         let record = store
             .gateways
@@ -182,8 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             gateway_platform: Some(record.platform.clone()),
             gateway_version: Some(record.version.clone()),
             // Whatever capabilities are configured on the stored gateway — an empty
-            // list until one is, which is what the required member reports then.
-            gateway_capability_summaries: record.capability_summaries.clone(),
+            // list until one is, which is what the required member reports then. Each
+            // one's sync status is derived from the stored capability, so this reader
+            // and `DescribeGatewayCapabilityConfiguration` cannot disagree about it.
+            gateway_capability_summaries: record.capability_summaries(now),
             creation_date: crate::state::to_date_time(record.creation_date),
             last_update_date: crate::state::to_date_time(record.last_update_date),
         })

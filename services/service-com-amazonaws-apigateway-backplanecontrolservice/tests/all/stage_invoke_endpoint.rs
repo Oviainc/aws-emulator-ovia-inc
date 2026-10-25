@@ -449,8 +449,10 @@ async fn a_request_that_names_no_one_api_is_left_to_the_front_door() {
     // "two do".
     let only = deployed_api(&gateway, "sole-stage", "staging").await;
 
-    // Rows differ along what the path's first segment names: a stage two apis hold (so it
-    // names no ONE api), a stage no api holds, this service's own control-plane path space,
+    // Rows differ along what the path's first segment names: a stage two apis hold whose
+    // deployments BOTH serve the requested route (so it names no ONE api — the sibling
+    // `stage_invoke_shared_stage_names` suite covers the stage name several apis hold whose
+    // route places it), a stage no api holds, this service's own control-plane path space,
     // and ApiGatewayManagementApi's `@connections` space — plus the two rows that still
     // resolve, so the table is not passing by refusing everything.
     let cases: &[(&str, String, u16)] = &[
