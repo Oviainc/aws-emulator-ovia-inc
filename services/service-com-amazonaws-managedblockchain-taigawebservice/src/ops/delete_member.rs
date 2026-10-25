@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMember
-//! Implemented: removes a stored member — and "all associated resources", its nodes —
-//! from its network in [`crate::state`], so a later `GetMember` answers
-//! `ResourceNotFoundException` and `ListMembers` no longer reports it. When the member
-//! removed was the last one on the network, the network is deleted with it.
+//! Implemented: starts the asynchronous deletion of a stored member — and of "all
+//! associated resources", its nodes — in [`crate::state`], so the member reports
+//! `MemberStatus` `DELETING` until the clock owes it `DELETED` and `GetMember` /
+//! `ListMembers` keep reporting it throughout. When the member deleted was the network's
+//! last, the network starts deleting with it and reports the same two `NetworkStatus`
+//! values.
 //!
 //! ## Shape of an operation
 //!
@@ -167,8 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
-        guard.settle(::std::time::SystemTime::now());
+        guard.settle(now);
 
         // `DELETE /networks/{NetworkId}/members/{MemberId}` nests the member INSIDE the
         // network, so the path labels resolve left to right: a `NetworkId` this service
@@ -233,10 +236,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The requested resource exists but isn't in a status that can complete the
         // operation" (`ResourceNotReadyException`): a member whose creation has not
         // finished ("CREATING - The Amazon Web Services account is in the process of
-        // creating a member", `Member$Status`) cannot be deleted yet. Every settled status
+        // creating a member", `Member$Status`) cannot be deleted yet. Every other status
         // can be — `INACCESSIBLE_ENCRYPTION_KEY` explicitly so, "When a resource is in
         // this state, we recommend deleting and recreating the resource" — so the refusal
-        // names that one transient status rather than everything other than `AVAILABLE`.
+        // names that one status rather than everything other than `AVAILABLE`. A member
+        // already `DELETING` or `DELETED` has no deletion left to start, and this
+        // operation models no state-conflict error for one, so a repeated delete succeeds
+        // while leaving the status and the due instant the first one set: it never
+        // re-arms the transition.
         if member.status == crate::state::STATUS_CREATING {
             return Err(DeleteMemberErrorModeled::ResourceNotReadyException(
                 ResourceNotReadyException {
@@ -252,32 +259,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Deleting a member removes the member and all associated resources from the
-        // network": `crate::state`'s `remove_member` is the one path that does it — shared
-        // with the approved `RemoveAction` that removes a member this account does not own
-        // — so the member's nodes go with the member either way. It answers `false` only
-        // when the member was not there to remove, which the lookups above ruled out.
-        if !guard.remove_member(&region, &input.network_id, &input.member_id) {
+        // network", and `MemberStatus` says HOW: "DELETING - The member and all associated
+        // resources are in the process of being deleted", then "DELETED - The member can no
+        // longer participate on the network and all associated resources are deleted". So
+        // this call STARTS the deletion and the record stays readable in those statuses;
+        // `crate::state`'s `begin_member_deletion` is the one path that does it — shared
+        // with the approved `RemoveAction` that removes a member this account does not own,
+        // which the status text names as the other way into `DELETING` — so the member's
+        // nodes begin deleting with it either way, and a network left without a
+        // participating member begins deleting too ("If MemberId is the last member in a
+        // network specified by the last Amazon Web Services account, the network is deleted
+        // also", reported through `NetworkStatus`'s own `DELETING` and `DELETED`). It
+        // answers `false` only when the member was not there to delete, which the lookups
+        // above ruled out.
+        if !guard.begin_member_deletion(&region, &input.network_id, &input.member_id, now) {
             return Err(DeleteMemberErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {},
             )
             .into());
         }
 
-        // "If MemberId is the last member in a network specified by the last Amazon Web
-        // Services account, the network is deleted also." Every member this store holds
-        // belongs to the account its ARN names, so a network left with no members at all
-        // has lost the last member of its last account, and the network goes with it:
-        // every later read of the network is a `ResourceNotFoundException` too.
-        let emptied = guard
-            .network(&region, &input.network_id)
-            .is_some_and(|network| network.members.is_empty());
-        if emptied {
-            guard.remove_network(&region, &input.network_id);
-        }
-
         // The idempotency ledger must not outlive the resources it describes (the same
         // reason a deleted node releases its create token): a create whose every minted id
-        // has now been deleted could only replay ids nothing holds.
+        // is now deleted or deleting could only replay ids nothing a caller can still use.
+        // Once for the call — the voting path sweeps once for its own removals the same
+        // way.
         guard.forget_dangling_tokens();
 
         Ok(DeleteMemberOutput {})
