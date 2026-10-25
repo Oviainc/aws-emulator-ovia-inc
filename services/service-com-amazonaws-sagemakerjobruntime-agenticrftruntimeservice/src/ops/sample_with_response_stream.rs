@@ -164,29 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `Body` is `@required` and `@httpPayload`, so a request without one is
-        // already refused at the boundary; a request WITH an empty payload gets
-        // this far and carries no inference request to capture.
-        if input.body.is_empty() {
-            return Err(validation(
-                "Body must carry the inference request payload; it was empty.".to_string(),
-            ));
-        }
-
-        // `JobArn` names the job this turn belongs to, created in the SageMaker control
-        // plane — this service's model binds no operation that creates, lists or deletes
-        // one, so the job is resolved against the directory that control plane writes
-        // (`crate::state::job_exists`). The member's modelled constraints (`@length`
-        // 1..256 and the ARN `@pattern`) are already enforced by the time `handle` runs,
-        // and they admit any partition, region, account and job name: an ARN no create
-        // ever minted is well formed and still names no job, so the request cannot be
-        // routed to a model session and is refused rather than served an inference.
-        if !crate::state::job_exists(&*self.engine, &input.job_arn) {
-            return Err(validation(crate::state::job_not_found_message(
-                &input.job_arn,
-            )));
-        }
-
         let request_content_type = ctx
             .parts()
             .headers
@@ -198,46 +175,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let job_arn = input.job_arn.clone();
         let trajectory_id = input.trajectory_id.clone();
         let prompt = input.body.clone();
-        // The SAME state path as `Sample`, so one trajectory can mix turns served
-        // by either operation; only the framing of the response body differs.
-        let turn = state
-            .lock()
-            .append_turn(
-                &crate::state::TurnRequest {
-                    job_arn: &job_arn,
-                    trajectory_id: &trajectory_id,
-                    request_body: &prompt,
-                    request_content_type,
-                    streamed: true,
-                    at: now,
-                },
-                |index| {
-                    (
-                        crate::state::sample_stream_response_body(
-                            &job_arn,
-                            &trajectory_id,
-                            index,
-                            &prompt,
-                            now,
-                        ),
-                        crate::state::EVENT_STREAM_CONTENT_TYPE.to_string(),
-                    )
-                },
-            )
-            .map_err(|refusal| {
-                let message = refusal.message(&trajectory_id);
-                if refusal.is_quota() {
-                    SampleWithResponseStreamErrorModeled::ServiceQuotaExceededException(
-                        ServiceQuotaExceededException { message },
-                    )
-                    .into()
-                } else {
-                    // This operation models no `ConflictException`, so a request
-                    // that conflicts with the trajectory's sealed state is refused
-                    // with the client error it does model.
-                    validation(message)
-                }
-            })?;
+        // The SAME state path as `Sample` — the crate's ONE sampling path
+        // (`crate::state::serve_sampling_turn`) — so one trajectory can mix turns
+        // served by either operation and the two cannot drift; only the framing of
+        // the response body differs.
+        let turn = crate::state::serve_sampling_turn(
+            &*self.engine,
+            &state,
+            &crate::state::TurnRequest {
+                job_arn: &job_arn,
+                trajectory_id: &trajectory_id,
+                request_body: &prompt,
+                request_content_type,
+                streamed: true,
+                at: now,
+            },
+            |index| {
+                (
+                    crate::state::sample_stream_response_body(
+                        &job_arn,
+                        &trajectory_id,
+                        index,
+                        &prompt,
+                        now,
+                    ),
+                    crate::state::EVENT_STREAM_CONTENT_TYPE.to_string(),
+                )
+            },
+        )
+        .map_err(|refusal| {
+            if refusal.is_quota() {
+                SampleWithResponseStreamErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: refusal.into_message(),
+                    },
+                )
+                .into()
+            } else {
+                validation(refusal.into_message())
+            }
+        })?;
 
         Ok(SampleWithResponseStreamOutput {
             content_type: Some(turn.content_type),
