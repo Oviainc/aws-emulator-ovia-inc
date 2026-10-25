@@ -24,8 +24,8 @@ use std::time::Duration;
 use ec2::ops::types::Tag;
 use ec2::state::{
     CARRIER_GATEWAY_ID_PREFIX, CARRIER_GATEWAY_STATE_AVAILABLE, CARRIER_GATEWAY_STATE_PENDING,
-    CarrierGatewaySpec, ComAmazonawsEc2Amazonec2State as Ec2State, MAX_CLIENT_TOKEN_CHARS,
-    TRANSITION_DELAY,
+    CarrierGatewaySpec, ComAmazonawsEc2Amazonec2State as Ec2State, IDEMPOTENT_PARAMETER_MISMATCH,
+    MAX_CLIENT_TOKEN_CHARS, TRANSITION_DELAY,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -80,6 +80,28 @@ async fn describe_one(router: &MultiServiceRouter, case: &str, carrier_gateway_i
         "case {case:?}: expected HTTP 200, got {status} with body {body}"
     );
     body
+}
+
+/// The form fields that ask `CreateCarrierGateway` for `tags` on the gateway it creates, as
+/// one `TagSpecification` naming the carrier gateway resource type. No tags asks for no
+/// specification at all.
+fn tag_params(tags: &[(&str, &str)]) -> Vec<(String, String)> {
+    if tags.is_empty() {
+        return Vec::new();
+    }
+    let mut params = vec![param("TagSpecification.1.ResourceType", "carrier-gateway")];
+    for (index, (key, value)) in tags.iter().enumerate() {
+        let position = index + 1;
+        params.push(param(
+            &format!("TagSpecification.1.Tag.{position}.Key"),
+            key,
+        ));
+        params.push(param(
+            &format!("TagSpecification.1.Tag.{position}.Value"),
+            value,
+        ));
+    }
+    params
 }
 
 /// A tag, as the fixtures carry them.
@@ -518,6 +540,95 @@ async fn a_client_token_makes_the_create_idempotent() {
         element(&other, "carrierGatewayId").as_deref(),
         Some(first_id.as_str()),
         "a second token: expected a new gateway, got {other}"
+    );
+}
+
+/// One row of the idempotency-mismatch table: the case name, which VPC the replay names,
+/// and the tags it asks for.
+type ReplayCase = (&'static str, usize, Vec<(&'static str, &'static str)>);
+
+/// A client token is idempotent only for the REQUEST it was first given with: replayed with
+/// any different parameter it is refused with `IdempotentParameterMismatch` rather than
+/// answered with a gateway the caller did not ask for. The rows differ along each parameter
+/// the request decides — the VPC, and how many tags it carries, with which keys and which
+/// values.
+#[tokio::test]
+async fn a_client_token_replayed_with_a_different_request_is_refused() {
+    let (router, engine) = super::ec2_query::emulator();
+    let vpc_ids = [
+        default_vpc_id(&router).await,
+        create_vpc(&router, "10.4.0.0/16").await,
+    ];
+    const TOKEN: &str = "shared-token";
+    let first_tags = [("Name", "wavelength"), ("Owner", "TeamA")];
+
+    let mut params = vec![param("VpcId", &vpc_ids[0]), param("ClientToken", TOKEN)];
+    params.extend(tag_params(&first_tags));
+    let (status, body) = create(&router, &params).await;
+    assert_eq!(
+        status, 200,
+        "the first create: expected HTTP 200, got {status} with body {body}"
+    );
+    let first_id = element(&body, "carrierGatewayId").expect("a created gateway has an id");
+
+    let cases: Vec<ReplayCase> = vec![
+        ("a different VPC", 1, first_tags.to_vec()),
+        (
+            "one tag more",
+            0,
+            vec![("Name", "wavelength"), ("Owner", "TeamA"), ("Tier", "prod")],
+        ),
+        ("one tag fewer", 0, vec![("Name", "wavelength")]),
+        (
+            "a different tag value",
+            0,
+            vec![("Name", "edge"), ("Owner", "TeamA")],
+        ),
+        (
+            "a different tag key",
+            0,
+            vec![("Name", "wavelength"), ("Team", "TeamA")],
+        ),
+        ("no tags at all", 0, Vec::new()),
+    ];
+
+    for (case, vpc_index, tags) in &cases {
+        let mut params = vec![
+            param("VpcId", &vpc_ids[*vpc_index]),
+            param("ClientToken", TOKEN),
+        ];
+        params.extend(tag_params(tags));
+        let (status, body) = create(&router, &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            IDEMPOTENT_PARAMETER_MISMATCH,
+            "case {case:?}: expected {IDEMPOTENT_PARAMETER_MISMATCH}, got {body}"
+        );
+    }
+
+    // The tags a create asks for are a SET, so naming the same ones in another order is the
+    // SAME request: it reports the gateway the token already minted.
+    let mut params = vec![param("VpcId", &vpc_ids[0]), param("ClientToken", TOKEN)];
+    params.extend(tag_params(&[("Owner", "TeamA"), ("Name", "wavelength")]));
+    let (status, body) = create(&router, &params).await;
+    assert_eq!(
+        status, 200,
+        "the same tags in another order: expected HTTP 200, got {status} with body {body}"
+    );
+    assert_eq!(
+        element(&body, "carrierGatewayId").as_deref(),
+        Some(first_id.as_str()),
+        "the same tags in another order: expected the gateway the token minted, got {body}"
+    );
+
+    assert_eq!(
+        engine.state::<Ec2State>().lock().carrier_gateways.len(),
+        1,
+        "a refused or replayed create must not store a second gateway"
     );
 }
 

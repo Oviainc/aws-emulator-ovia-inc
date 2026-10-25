@@ -2,7 +2,9 @@
 
 //! @op CreateDashboard
 //! IMPLEMENTED: creates an IoT SiteWise Monitor dashboard from the request and
-//! persists it in this service's state; `DescribeDashboard` reads it back.
+//! persists it in this service's state; `DescribeDashboard` reads it back. A
+//! retry carrying the `clientToken` of a create this store already served
+//! answers from the dashboard THAT create minted and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -189,12 +191,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
         }
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> created-id mapping, so a retry with the same token mints a second
-        // dashboard rather than replaying the first answer. Deliberately left to the
-        // idempotency issue rather than half-done here, exactly as `CreatePortal`
-        // leaves it; nothing is fabricated for it.
         let mut store = state.lock();
+
+        // `clientToken` makes the create idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A dashboard is named by the id this call
+        // mints, so the token of the create that minted one is what its retry is
+        // recognised by: the retry answers from that dashboard and writes nothing,
+        // which is also why it is answered BEFORE the request is resolved against
+        // the store — a replay stays the answer the first call gave, whatever has
+        // changed since.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = store.dashboard_for_client_token(token) {
+                return Ok(CreateDashboardOutput {
+                    dashboard_id: existing.id.clone(),
+                    dashboard_arn: existing.arn.clone(),
+                });
+            }
+        }
 
         // A dashboard is created IN a project, so a `projectId` that resolves to no
         // stored project names no container for the dashboard to live in — the
@@ -247,6 +261,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             definition: input.dashboard_definition,
             creation_date: now,
             last_update_date: now,
+            // The token this create carried, which is what recognises its retry.
+            client_token: input.client_token,
             tags: input.tags.unwrap_or_default(),
         };
 
