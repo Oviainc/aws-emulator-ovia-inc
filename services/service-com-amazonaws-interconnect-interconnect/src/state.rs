@@ -14,7 +14,9 @@
 //!
 //! Attach points are NOT held here: an attach point is a Direct Connect gateway of the
 //! account, so `ListAttachPoints` resolves them against the service that owns them
-//! ([`direct_connect`]) rather than reading a catalog of this service's own.
+//! ([`direct_connect`]) rather than reading a catalog of this service's own — and
+//! `CreateConnection` resolves the attach point it is given through that same walk, so
+//! what a Connection may be attached to is what the listing offers.
 //!
 //! Server-owned fields (`id`, `arn`, `sharedId`, `activationKey`, `ownerAccount`,
 //! `provider`, `location`, `type`, `billingTier`, `state`) are computed here or in
@@ -404,6 +406,94 @@ pub fn attach_point_eq(left: &AttachPoint, right: &AttachPoint) -> bool {
     }
 }
 
+/// How the service words an `attachPoint` that resolves to nothing a connection can
+/// be attached to on the named Environment.
+///
+/// An attach point has to be one the caller has access to and that is valid for the
+/// Environment — the set `ListAttachPoints` reports for it — so the message names the
+/// identifier the request carried and the environment it was offered for, and is
+/// built from the request rather than from the store.
+pub fn attach_point_not_valid_message(identifier: &str, environment_id: &str) -> String {
+    format!(
+        "{REFUSAL_ENVELOPE}{identifier} is not an attach point valid for environment \
+         {environment_id}"
+    )
+}
+
+/// The `RemoteAccountIdentifierType` an Environment declares when its partner
+/// verifies the remote side by AWS account number — one of the two values that enum
+/// models (`REMOTE_ACCOUNT_IDENTIFIER_TYPE_VALUES`).
+pub const REMOTE_IDENTIFIER_TYPE_ACCOUNT: &str = "account";
+
+/// The `RemoteAccountIdentifierType` an Environment declares when its partner
+/// verifies the remote side by email address — the other value that enum models.
+pub const REMOTE_IDENTIFIER_TYPE_EMAIL: &str = "email";
+
+/// Whether `identifier` is an AWS account number: the twelve digits an account id has.
+///
+/// The one place that rule lives: an `AmazonResourceName`'s account field is judged by
+/// it too ([`parse_connection_arn`]).
+fn is_account_identifier(identifier: &str) -> bool {
+    identifier.len() == ARN_ACCOUNT_ID_DIGITS && identifier.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Whether `identifier` is an email address: a non-empty local part, one `@`, and a
+/// non-empty domain.
+///
+/// No more than that: neither the model nor the service's docs state an email grammar,
+/// so what is judged is the `@`-separated SHAPE the kind means, and the domain's own
+/// form is left to the partner that verifies it. Judging it here would refuse
+/// addresses the real service takes.
+fn is_email_identifier(identifier: &str) -> bool {
+    let Some((local, domain)) = identifier.split_once('@') else {
+        return false;
+    };
+    !local.is_empty() && !domain.is_empty() && !domain.contains('@')
+}
+
+/// Why `supplied` is not the `remoteAccount` `environment` asks a create for — or
+/// `None` when it is.
+///
+/// `Environment$remoteIdentifierType` is "the type of identifying information that
+/// should be supplied to the `remoteAccount` parameter of a `CreateConnection` call
+/// for this specific Environment": an Environment that declares one asks every create
+/// on it for identifying information OF THAT KIND, because that is what its partner
+/// verifies the remote side by. One that declares none asks for nothing, so nothing is
+/// judged and anything the caller sends is accepted.
+///
+/// `remoteAccount` is OPTIONAL in the model precisely because whether it is needed is
+/// the Environment's to say, so ABSENCE is refused on an Environment that declares a
+/// type for the same reason the wrong kind is: that Environment's partner would have
+/// nothing to verify the remote side with, and the connection could never be confirmed
+/// on its portal.
+pub fn remote_account_violation(
+    environment: &Environment,
+    supplied: Option<&RemoteAccountIdentifier>,
+) -> Option<String> {
+    let declared = environment.remote_identifier_type.as_deref()?;
+    let Some(RemoteAccountIdentifier::Identifier(identifier)) = supplied else {
+        return Some(format!(
+            "{REFUSAL_ENVELOPE}environment {} requires remoteAccount to carry the {declared} of \
+             the remote side",
+            environment.environment_id
+        ));
+    };
+    let is_of_declared_kind = match declared {
+        REMOTE_IDENTIFIER_TYPE_ACCOUNT => is_account_identifier(identifier),
+        REMOTE_IDENTIFIER_TYPE_EMAIL => is_email_identifier(identifier),
+        // A type outside the ones the enum models is nothing this service can hold an
+        // identifier to, so one that is present is taken as given.
+        _ => true,
+    };
+    (!is_of_declared_kind).then(|| {
+        format!(
+            "{REFUSAL_ENVELOPE}remoteAccount does not carry the {declared} environment {} \
+             requires",
+            environment.environment_id
+        )
+    })
+}
+
 /// The `ConnectionId` prefix an Environment's provider kind dictates.
 ///
 /// The model's `Provider` members say it: a `cloudServiceProvider` environment
@@ -562,9 +652,7 @@ pub fn parse_connection_arn(arn: &str) -> Option<ConnectionArn<'_>> {
         return None;
     }
     let region = fields.next().filter(|region| !region.is_empty())?;
-    let account = fields.next().filter(|account| {
-        account.len() == ARN_ACCOUNT_ID_DIGITS && account.chars().all(|c| c.is_ascii_digit())
-    })?;
+    let account = fields.next().filter(|account| is_account_identifier(account))?;
     if fields.next() != Some(ARN_RESOURCE_TYPE) || fields.next().is_some() || id.is_empty() {
         return None;
     }
