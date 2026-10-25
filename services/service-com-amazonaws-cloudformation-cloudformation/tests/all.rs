@@ -57,6 +57,8 @@ mod iam_capability_gate;
 mod list_change_sets;
 #[path = "all/list_stack_resources.rs"]
 mod list_stack_resources;
+#[path = "all/list_types.rs"]
+mod list_types;
 #[path = "all/nested_resource_outputs.rs"]
 mod nested_resource_outputs;
 #[path = "all/no_echo_parameters.rs"]
