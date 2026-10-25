@@ -354,6 +354,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has deleted this user, so the clock owes its removal
             // nothing; `DeleteUser` is what sets this.
             pending_removal: None,
+            // Nothing has modified it either, so no status change is owed;
+            // `ModifyUser` is what sets this.
+            pending_status: None,
         };
         store.users.insert(user_id.clone(), record);
 

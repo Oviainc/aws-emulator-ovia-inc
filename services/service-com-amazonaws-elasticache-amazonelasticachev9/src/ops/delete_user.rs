@@ -240,15 +240,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         // `InvalidUserStateFault`: "The user is not in active state." A user
-        // already on its way out is the case a caller reaches, by deleting the
-        // same user twice inside the span the removal takes.
-        if user.status != crate::state::USER_STATUS_ACTIVE {
+        // already on its way out, or still carrying a change `ModifyUser` left
+        // outstanding, is the case a caller reaches by acting again inside the
+        // span that change takes; the statuses a change is accepted in are
+        // stated once in `crate::state::user_state_refusal`.
+        if let Some(message) = crate::state::user_state_refusal(user) {
             return Err(DeleteUserErrorModeled::InvalidUserStateFault(
                 InvalidUserStateFault {
-                    message: Some(format!(
-                        "User {user_id} is in {} state, not active.",
-                        user.status
-                    )),
+                    message: Some(message),
                 },
             )
             .into());
