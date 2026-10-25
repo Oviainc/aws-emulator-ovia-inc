@@ -402,19 +402,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A mismatch is the one failure `PreconditionFailedException` is modelled for:
         // "The RevisionId provided does not match the latest RevisionId for the Lambda
         // function or alias."
-        if let Some(expected) = input
+        if input
             .revision_id
             .as_deref()
-            .filter(|expected| *expected != record.config.revision_id)
+            .is_some_and(|expected| expected != record.config.revision_id)
         {
             return Err(UpdateFunctionCodeErrorModeled::PreconditionFailedException(
                 PreconditionFailedException {
                     r#type: None,
-                    message: Some(format!(
-                        "The RevisionId provided ({expected}) does not match the latest \
-                         RevisionId for the Lambda function. Call the GetFunction API to \
-                         retrieve the latest RevisionId for your resource."
-                    )),
+                    message: Some(
+                        crate::state::CONFIGURATION_REVISION_PRECONDITION_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

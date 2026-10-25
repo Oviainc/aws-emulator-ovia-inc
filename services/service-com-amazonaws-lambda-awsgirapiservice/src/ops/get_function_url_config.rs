@@ -227,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetFunctionUrlConfigErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,
-                    message: Some(crate::state::FUNCTION_URL_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
