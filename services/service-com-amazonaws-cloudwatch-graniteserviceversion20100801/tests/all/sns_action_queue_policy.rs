@@ -19,7 +19,10 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{element, emulator, grant_sns_delivery, rpc, sns, Emulator};
+use crate::harness::{
+    element, emulator, given_queue, grant_sns_delivery_on, received_messages, rpc, set_alarm_state,
+    sns, subscribe_queue, Emulator,
+};
 
 /// `DescribeAlarms` for one alarm, as the state value it reports.
 async fn alarm_state(emulator: &Emulator, name: &str) -> String {
@@ -37,77 +40,10 @@ async fn alarm_state(emulator: &Emulator, name: &str) -> String {
         .to_string()
 }
 
-/// Force one alarm into `state`, which is what fires the actions configured for it.
-async fn set_alarm_state(emulator: &Emulator, name: &str, state: &str) {
-    rpc(
-        emulator,
-        "monitoring",
-        "GraniteServiceVersion20100801",
-        "SetAlarmState",
-        &json!({
-            "AlarmName": name,
-            "StateValue": state,
-            "StateReason": "driven by the test",
-        }),
-    )
-    .await;
-}
-
-/// A queue called `name`: its url and its ARN, with no policy of its own.
-async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
-    let created = rpc(
-        emulator,
-        "sqs",
-        "AmazonSQS",
-        "CreateQueue",
-        &json!({"QueueName": name}),
-    )
-    .await;
-    let url = created["QueueUrl"]
-        .as_str()
-        .unwrap_or_else(|| panic!("CreateQueue {name}: no QueueUrl in {created}"))
-        .to_string();
-    let attributes = rpc(
-        emulator,
-        "sqs",
-        "AmazonSQS",
-        "GetQueueAttributes",
-        &json!({"QueueUrl": url, "AttributeNames": ["QueueArn"]}),
-    )
-    .await;
-    let arn = attributes["Attributes"]["QueueArn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("GetQueueAttributes {name}: no QueueArn in {attributes}"))
-        .to_string();
-    (url, arn)
-}
-
-/// Grant the SNS service principal the send on the queue at `url`.
-async fn grant(emulator: &Emulator, url: &str, queue_arn: &str) {
-    rpc(
-        emulator,
-        "sqs",
-        "AmazonSQS",
-        "SetQueueAttributes",
-        &json!({"QueueUrl": url, "Attributes": {"Policy": grant_sns_delivery(queue_arn)}}),
-    )
-    .await;
-}
-
 /// Every notification waiting on the queue at `url`, as the alarm documents SNS enveloped.
 async fn notifications(emulator: &Emulator, url: &str) -> Vec<Value> {
-    let received = rpc(
-        emulator,
-        "sqs",
-        "AmazonSQS",
-        "ReceiveMessage",
-        &json!({"QueueUrl": url, "MaxNumberOfMessages": 10}),
-    )
-    .await;
-    received["Messages"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+    received_messages(emulator, url)
+        .await
         .iter()
         .map(|message| {
             let body = message["Body"].as_str().unwrap_or_default();
@@ -139,19 +75,10 @@ async fn an_alarm_notification_is_withheld_from_a_queue_without_the_sns_grant() 
             "TopicArn",
         );
         let (granted_url, granted_arn) = given_queue(&emulator, "granted").await;
-        grant(&emulator, &granted_url, &granted_arn).await;
+        grant_sns_delivery_on(&emulator, &granted_url, &granted_arn).await;
         let (withheld_url, withheld_arn) = given_queue(&emulator, "withheld").await;
         for endpoint in [&granted_arn, &withheld_arn] {
-            sns(
-                &emulator,
-                "Subscribe",
-                &[
-                    ("TopicArn", &topic),
-                    ("Protocol", "sqs"),
-                    ("Endpoint", endpoint),
-                ],
-            )
-            .await;
+            subscribe_queue(&emulator, &topic, endpoint).await;
         }
 
         let alarm = format!("{metric}-alarm");
@@ -216,7 +143,7 @@ async fn an_alarm_notification_is_withheld_from_a_queue_without_the_sns_grant() 
 
         // The repair, and the next transition: the queue receives that one, and never the
         // notification withheld before it.
-        grant(&emulator, &withheld_url, &withheld_arn).await;
+        grant_sns_delivery_on(&emulator, &withheld_url, &withheld_arn).await;
         set_alarm_state(&emulator, &alarm, "OK").await;
         set_alarm_state(&emulator, &alarm, "ALARM").await;
         let repaired = notifications(&emulator, &withheld_url).await;
