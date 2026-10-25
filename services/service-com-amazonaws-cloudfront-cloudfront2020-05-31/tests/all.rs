@@ -19,6 +19,8 @@ mod cache_policy_lifecycle;
 mod cache_policy_list;
 #[path = "all/cache_policy_update.rs"]
 mod cache_policy_update;
+#[path = "all/caller_reference_immutable.rs"]
+mod caller_reference_immutable;
 #[path = "all/connection_function_lifecycle.rs"]
 mod connection_function_lifecycle;
 #[path = "all/connection_function_publish.rs"]
@@ -79,6 +81,8 @@ mod managed_cache_policy_catalog;
 mod managed_certificate_details;
 #[path = "all/managed_certificate_domain_ownership.rs"]
 mod managed_certificate_domain_ownership;
+#[path = "all/managed_policy_catalogs.rs"]
+mod managed_policy_catalogs;
 #[path = "all/monitoring_subscription.rs"]
 mod monitoring_subscription;
 #[path = "all/origin_access_control_delete.rs"]
