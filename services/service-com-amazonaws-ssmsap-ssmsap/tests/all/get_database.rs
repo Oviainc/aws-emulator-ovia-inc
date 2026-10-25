@@ -267,10 +267,11 @@ const CASES: &[Case] = &[
         }],
     },
     // A registration that named a System ID but declared no `ComponentsInfo`: its
-    // database belongs to the HANA component those ids identify, and no component of this
-    // application answers that id, so there is no connected component ARN to report.
+    // database belongs to the SAP HANA component those ids identify, which the
+    // registration describes without declaring it, so that component's ARN is the
+    // connected component ARN.
     Case {
-        name: "a database whose component the registration never declared",
+        name: "a database of a registration that declared no component",
         application_id: "hdb-no-components",
         application_type: "HANA",
         sid: Some("NOC"),
@@ -285,7 +286,7 @@ const CASES: &[Case] = &[
             arn: None,
             component_id: Some("NOC-HANA"),
             credentials: &[("SYSTEMDB", "sap/noc/system")],
-            connected_components: &[],
+            connected_components: &["NOC-HANA"],
         }],
     },
     // The ARN and a credential naming the SAME database, beside a database named only by
