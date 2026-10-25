@@ -8,14 +8,23 @@
 //! service applies for a member the account has still never set, which is what a
 //! following `GetPreferences` reports as well.
 //!
-//! Every member the model declares is the caller's to set: the model states no
-//! precondition between `savingsEstimationMode`, `preferredCommitment` and
-//! `memberAccountDiscountVisibility`, and none about the caller
-//! (`smithy_query(query="operation", operation="UpdatePreferences")` lists an
-//! input of three independent, optional members). So a request whose values are
-//! inside their modelled enums is ACCEPTED and merged; the modelled
-//! `ValidationException` is reserved for a value the model itself refuses, which
-//! the boundary walk raises before this handler runs.
+//! Two of the three members carry a rule the model does not express, both of
+//! them about the ORGANIZATION the calling account belongs to, and both
+//! answered with the modelled `ValidationException` (400) before anything is
+//! stored:
+//!
+//! * `memberAccountDiscountVisibility` is a preference of the organization, not
+//!   of one account, so only the organization's management account may set it
+//!   (and only it is reported the member by a read);
+//! * `savingsEstimationMode` = `AfterDiscounts` reports figures net of the
+//!   discounts member accounts' spend carries, so it is available only while
+//!   the organization has made those discounts visible
+//!   (`memberAccountDiscountVisibility` = `All`).
+//!
+//! Everything else the model declares is the caller's to set, so a request
+//! whose values are inside their modelled enums and that satisfies both rules
+//! is ACCEPTED and merged; a value outside its modelled enum is refused by the
+//! boundary walk before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -177,10 +186,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = {
             let mut store = state.lock();
 
-            // No pre-store gate: each member is independently settable, so the
-            // merge below is the whole write. A value outside its modelled enum
-            // never reaches here — the framework's constraint walk answers it in
-            // this service's structured `ValidationException` first.
+            // The organization-wide preference is the organization's
+            // management account's to set; a value outside its modelled enum
+            // never reaches here, because the framework's constraint walk
+            // answers it in this service's structured `ValidationException`
+            // first.
+            if input.member_account_discount_visibility.is_some()
+                && !store.is_management_account(&account_id)
+            {
+                return Err(discount_visibility_is_the_management_accounts());
+            }
+
+            // Whether the organization's member-account discounts are visible
+            // once this request is applied: the value the request sets if it
+            // sets one (which, past the gate above, is the organization's own),
+            // otherwise the one already in effect.
+            let discounts_visible = match input.member_account_discount_visibility.as_deref() {
+                Some(requested) => requested == crate::state::DISCOUNT_VISIBILITY_ALL,
+                None => store.member_account_discounts_visible(),
+            };
+            if input.savings_estimation_mode.as_deref() == Some(crate::state::AFTER_DISCOUNTS)
+                && !discounts_visible
+            {
+                return Err(after_discounts_needs_visible_discounts());
+            }
+
             let preferences = store.preferences.entry(account_id.clone()).or_default();
             preferences.merge(
                 input.savings_estimation_mode,
@@ -199,3 +229,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// Refuse a caller that is not the organization's management account the
+/// organization-wide member-account discount-visibility preference: the
+/// modelled `ValidationException` (400), stating the rule that rejects the
+/// request in the service's own words for it, so a client can tell this refusal
+/// from the field-validation summary a value outside the member's enum is
+/// answered with.
+fn discount_visibility_is_the_management_accounts() -> UpdatePreferencesError {
+    UpdatePreferencesErrorModeled::ValidationException(
+        crate::service::stated_validation_exception(
+            "Only management accounts can update member account discount visibility."
+                .to_string(),
+            vec![ValidationExceptionDetail {
+                field_name: DISCOUNT_VISIBILITY_MEMBER.to_string(),
+                message: "the preference is the organization's, so only the organization's \
+                          management account can set it"
+                    .to_string(),
+            }],
+        ),
+    )
+    .into()
+}
+
+/// Refuse the discount-adjusted savings estimation mode while the organization
+/// has not made its member accounts' discounts visible: the mode's figures are
+/// net of those discounts, so the mode is unavailable until the preference that
+/// shows them is set — in Cost Optimization Hub, or in the organization's cost
+/// management preferences, which is the other place the same permission is
+/// granted and which the sentence names as well.
+fn after_discounts_needs_visible_discounts() -> UpdatePreferencesError {
+    UpdatePreferencesErrorModeled::ValidationException(
+        crate::service::stated_validation_exception(
+            "Invalid permission to update preferences. To use AfterDiscounts savings \
+             estimation mode, the management account must either enable member account \
+             discount visibility in Cost Optimization Hub, or enable linked account \
+             discount visibility in Cost Management Preferences."
+                .to_string(),
+            vec![ValidationExceptionDetail {
+                field_name: "savingsEstimationMode".to_string(),
+                message: "the mode reports figures net of the organization's discounts, which \
+                          are not visible to member accounts"
+                    .to_string(),
+            }],
+        ),
+    )
+    .into()
+}
+
+/// The input member both organization rules above are attributed to.
+const DISCOUNT_VISIBILITY_MEMBER: &str = "memberAccountDiscountVisibility";

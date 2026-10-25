@@ -5,15 +5,16 @@
 //!
 //! The rule under test: `UpdatePreferences`' three members
 //! (`savingsEstimationMode`, `memberAccountDiscountVisibility`,
-//! `preferredCommitment`) are independent, optional preferences with no
-//! precondition on each other and none on the caller
-//! (`smithy_query(query="operation", operation="UpdatePreferences")` models the
-//! input as three optional members and declares no such rule), so ANY request
-//! whose values are inside their modelled enums is accepted: the members it
-//! supplies are merged into the account's stored record, it answers 200 with the
-//! effective record, and a following `GetPreferences` reports the same record.
-//! Only a value the model itself refuses is a 400, and that refusal is the
-//! constraint walk's (`validation_exception_fields`).
+//! `preferredCommitment`) are optional preferences, and a request whose values
+//! are inside their modelled enums and that satisfies the service's two
+//! organization rules is accepted: the members it supplies are merged into the
+//! account's stored record, it answers 200 with the effective record, and a
+//! following `GetPreferences` reports the same record. The organization rules
+//! are that the organization-wide `memberAccountDiscountVisibility` is the
+//! management account's to set, and that `savingsEstimationMode` =
+//! `AfterDiscounts` needs that preference set to `All`; `preference_gates` owns
+//! them, so the account driven here is the management account and the rows that
+//! those rules refuse are expected to be refused.
 //!
 //! Every value in the tables below comes from the model's own enums
 //! (`shared_types::{SAVINGS_ESTIMATION_MODE_VALUES,
@@ -29,12 +30,15 @@ use cost_optimization_hub::ops::types::shared_types::{
     SAVINGS_ESTIMATION_MODE_VALUES, TERM_VALUES,
 };
 
-/// The `savingsEstimationMode` a read reports for an account that has set none —
-/// read from the service rather than copied here, so the expectation cannot
-/// drift from the mode the service applies.
-use cost_optimization_hub::state::DEFAULT_SAVINGS_ESTIMATION_MODE;
+/// The `savingsEstimationMode` a read reports for an account that has set none,
+/// and the discount-adjusted mode the service gates — read from the service
+/// rather than copied here, so the expectations cannot drift from what the
+/// service applies.
+use cost_optimization_hub::state::{AFTER_DISCOUNTS, DEFAULT_SAVINGS_ESTIMATION_MODE};
 
-use crate::cost_optimization_hub::{call, error_code, ok, router};
+use crate::cost_optimization_hub::{
+    call, error_code, management_account_router, ok, DISCOUNT_VISIBILITY_ALL,
+};
 
 /// The defaults the service applies for the commitment members an account has
 /// never set, from the model's own docs: `PreferredCommitment$term` documents
@@ -88,15 +92,17 @@ fn expected_record(stored: &Value, request: &Value) -> Value {
     Value::Object(record)
 }
 
-/// Every combination of the modelled enums is accepted on a fresh account: the
-/// write answers 200 with exactly the record it stored, and a read reports the
-/// same thing.
+/// Every combination of the modelled enums is accepted on a fresh
+/// management account — bar the one the service's `AfterDiscounts` rule refuses,
+/// the request that asks for the discounted mode while setting the discount
+/// visibility that gates it to `None` — and an accepted write answers 200 with
+/// exactly the record it stored, which a read then reports.
 ///
 /// This is the rule at its widest — the full cross product of
 /// `savingsEstimationMode` × `memberAccountDiscountVisibility` ×
 /// `preferredCommitment.term` × `preferredCommitment.paymentOption` — so no
-/// combination of values can be refused and none can be dropped on the way to
-/// the store.
+/// combination the rules allow can be refused, none can be dropped on the way
+/// to the store, and the one combination they refuse changes nothing.
 #[tokio::test]
 async fn every_combination_of_the_modelled_preference_values_is_stored() {
     for mode in SAVINGS_ESTIMATION_MODE_VALUES {
@@ -115,13 +121,37 @@ async fn every_combination_of_the_modelled_preference_values_is_stored() {
                     });
                     // A fresh account per row, so each row is judged on its own
                     // request rather than on what a previous row left behind.
-                    let router = router();
+                    // The caller is the organization's management account, so
+                    // the organization-wide member is its to set.
+                    let router = management_account_router();
+
+                    // The discounted mode needs the organization's discounts
+                    // visible, which this very request decides.
+                    let discounts_visible = *visibility == DISCOUNT_VISIBILITY_ALL;
+                    let expected_status =
+                        if *mode == AFTER_DISCOUNTS && !discounts_visible { 400 } else { 200 };
 
                     let (status, updated) = call(&router, "UpdatePreferences", &request).await;
                     assert_eq!(
-                        status, 200,
-                        "case {case:?}: expected HTTP 200, got {status} with {updated}"
+                        status, expected_status,
+                        "case {case:?}: expected HTTP {expected_status}, got {status} with {updated}"
                     );
+                    if expected_status == 400 {
+                        let code = error_code(&updated);
+                        assert_eq!(
+                            code, "ValidationException",
+                            "case {case:?}: expected ValidationException, got {code:?} in {updated}"
+                        );
+                        // Refused, so nothing was stored: the account still
+                        // reads the service's defaults.
+                        let fetched = ok(&router, "GetPreferences", &json!({})).await;
+                        let defaults = expected_record(&Value::Null, &json!({}));
+                        assert_eq!(
+                            fetched, defaults,
+                            "case {case:?}: a refused write must leave {defaults}, got {fetched}"
+                        );
+                        continue;
+                    }
                     let expected = expected_record(&Value::Null, &request);
                     assert_eq!(
                         updated, expected,
@@ -147,9 +177,13 @@ async fn every_combination_of_the_modelled_preference_values_is_stored() {
 /// stored one and every member it omits keeps its stored value, whatever subset
 /// of the three members the request carries — and the record can be written
 /// back to an earlier value, which is what a client's teardown does.
+///
+/// Driven as the organization's management account, so every subset below
+/// (including the organization-wide member, and the discounted mode the
+/// preceding write makes available) is the caller's to write.
 #[tokio::test]
 async fn successive_writes_merge_and_can_be_restored() {
-    let router = router();
+    let router = management_account_router();
 
     // The requests, in order, spanning the subsets a client sends: one member
     // alone, a nested member alone, the organization-scoped member alone, two
@@ -206,12 +240,13 @@ async fn successive_writes_merge_and_can_be_restored() {
     }
 }
 
-/// The only `UpdatePreferences` refusal is the model's own: a value outside a
-/// member's enum is a 400 `ValidationException`, and it leaves the stored record
-/// untouched — while the same member with a modelled value is accepted.
+/// A value outside a member's enum is a 400 `ValidationException` that leaves
+/// the stored record untouched, while the same member with a modelled value is
+/// accepted. (The service's two organization rules refuse further requests whose
+/// values are all modelled; `preference_gates` owns those.)
 #[tokio::test]
-async fn only_a_value_outside_the_model_is_refused() {
-    let router = router();
+async fn a_value_outside_the_model_is_refused() {
+    let router = management_account_router();
 
     let accepted = json!({
         "savingsEstimationMode": "BeforeDiscounts",
