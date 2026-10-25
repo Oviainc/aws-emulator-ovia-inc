@@ -13,9 +13,10 @@
 //!    which is what a local client sends), the URI path space THIS model binds: its own
 //!    exclusive first segments, plus its share of a space a sibling also binds — the
 //!    `/app-instances` resource space, whose streaming-configuration sub-space belongs to
-//!    Chime SDK Messaging. A space five of the six bind IDENTICALLY, `/tags`, names no
-//!    service in a request that carries no endpoint, so no member claims it and the
-//!    router's terminal `404 UnknownService` says so.
+//!    Chime SDK Messaging, and the `/tags` space five of the six bind IDENTICALLY, which
+//!    names no service in a request that carries no endpoint and is therefore served by
+//!    this service as the family's declared tagging owner, out of the ARN-keyed tag
+//!    directory the family shares.
 //!
 //! Every case drives `MultiServiceRouter::dispatch`, the same path the production front
 //! door uses, so what is asserted is the wire behaviour a client sees. The tables span
@@ -218,8 +219,9 @@ async fn a_request_naming_no_endpoint_is_claimed_only_inside_this_model_s_path_s
     // `chime` signing name, including one that lives UNDER a first path segment this
     // service owns (`/app-instances/…/streaming-configurations` is Chime SDK
     // Messaging's) — which is why the first path segment alone cannot be the
-    // discriminator — and the `/tags` space five of the six bind identically, which a
-    // request naming no endpoint cannot place.
+    // discriminator. The `/tags` space five of the six bind identically is claimed here
+    // instead: this service is the family's declared tagging owner for a request that
+    // names no endpoint.
     let rows: Vec<Row> = vec![
         Row {
             case: "list app instances, this service's own collection route",
@@ -269,6 +271,25 @@ async fn a_request_naming_no_endpoint_is_claimed_only_inside_this_model_s_path_s
             expect: Expect::Code(501, "NotImplemented"),
         },
         Row {
+            // `GET /tags?arn=…` IS a route this model binds — and four siblings bind it
+            // identically. The resource ARN names the service and a request naming no
+            // endpoint does not carry it readably (tag and untag put it in the body), so
+            // the space is served by one declared owner — this service — out of the tag
+            // directory the whole family shares.
+            case: "tag a resource, the shared space under POST and a query constraint",
+            method: "POST",
+            uri: "/tags?operation=tag-resource".to_string(),
+            body: Some(json!({"ResourceARN": arn, "Tags": [{"Key": "k", "Value": "v"}]})),
+            expect: Expect::Status(204),
+        },
+        Row {
+            case: "list tags, a route five of the six bind identically",
+            method: "GET",
+            uri: format!("/tags?arn={encoded}"),
+            body: None,
+            expect: Expect::Member(200, "Tags"),
+        },
+        Row {
             case: "delete the app instance, a route bound only under DELETE",
             method: "DELETE",
             uri: format!("/app-instances/{encoded}"),
@@ -280,24 +301,6 @@ async fn a_request_naming_no_endpoint_is_claimed_only_inside_this_model_s_path_s
             method: "GET",
             uri: format!("/app-instances/{encoded}/streaming-configurations"),
             body: None,
-            expect: Expect::NotClaimed,
-        },
-        Row {
-            // `GET /tags?arn=…` IS a route this model binds — and four siblings bind it
-            // identically. The resource ARN names the service, and a request naming no
-            // endpoint does not carry it readably (tag and untag put it in the body), so
-            // the whole space is left to an endpoint-addressed request.
-            case: "list tags, a route five of the six bind identically",
-            method: "GET",
-            uri: format!("/tags?arn={encoded}"),
-            body: None,
-            expect: Expect::NotClaimed,
-        },
-        Row {
-            case: "tag a resource, the same shared space under POST and a query constraint",
-            method: "POST",
-            uri: "/tags?operation=tag-resource".to_string(),
-            body: Some(json!({"ResourceARN": arn, "Tags": [{"Key": "k", "Value": "v"}]})),
             expect: Expect::NotClaimed,
         },
         Row {
@@ -366,8 +369,7 @@ async fn a_request_addressing_this_endpoint_is_served_by_this_service_whatever_i
     // request carrying it is this endpoint's whatever its path: an operation this model
     // does not bind answers from the service the caller ADDRESSED — its own protocol's
     // routing failure — rather than silently from a sibling, and the `/tags` space five
-    // models bind identically becomes reachable here, which is the only place it can be
-    // placed.
+    // models bind identically is served here too.
     let rows: Vec<Row> = vec![
         Row {
             case: "this model's own collection route",
@@ -377,12 +379,15 @@ async fn a_request_addressing_this_endpoint_is_served_by_this_service_whatever_i
             expect: Expect::Member(200, "AppInstances"),
         },
         Row {
+            // An app instance this emulator does not hold: the tagging routes read this
+            // service's own store for a resource of this service, so the answer is the
+            // modelled refusal — which only this service can give, and the router cannot.
             case: "the shared tagging space, reachable because the request names this endpoint",
             method: "GET",
             uri: "/tags?arn=arn%3Aaws%3Achime%3Aus-east-1%3A000000000000%3Aapp-instance%2Fai1"
                 .to_string(),
             body: None,
-            expect: Expect::Code(501, "NotImplemented"),
+            expect: Expect::Code(400, "BadRequestException"),
         },
         Row {
             case: "a sibling's route, answered by the endpoint the caller addressed",

@@ -17,8 +17,9 @@
 //! URI path space. Where two of the six bind the same path space, the segment their models
 //! differ at decides; where five bind the same space identically and the request carries
 //! no signal that names one of them (the `/tags` space, whose resource ARN travels in the
-//! request body on tag and untag), nobody claims it and the router's terminal
-//! `404 UnknownService` says so, rather than a retryable 500 naming five claimants.
+//! request body on tag and untag), the family's DECLARED tagging owner claims it, which it
+//! can answer for any member's resource because the tags live in the ARN-keyed directory
+//! the family shares — never two claimants, which would be a retryable 500.
 //!
 //! Rows therefore span the dimensions that rule generalises over: which endpoint owns the
 //! operation, a `Host` that names the owner, a sibling, or no service at all, both sides
@@ -469,8 +470,8 @@ fn exactly_one_service_sharing_the_chime_signing_name_claims_each_request() {
         // The `/tags` space five of the six bind identically. The resource ARN names the
         // service, and it is in the request BODY on tag and untag, so the endpoint is the
         // only signal the claim seam can read: with one, that endpoint answers; with
-        // none, nobody does and the router says `UnknownService` rather than naming five
-        // claimants in a 500.
+        // none, the family's declared tagging owner answers, out of the tag directory
+        // every member shares, rather than five claimants in a 500.
         (
             "ListTagsForResource at the messaging endpoint".to_string(),
             "GET",
@@ -503,21 +504,21 @@ fn exactly_one_service_sharing_the_chime_signing_name_claims_each_request() {
             "GET",
             "localhost:9297",
             format!("/tags?arn={}", label(&format!("{APP_INSTANCE}/channel/c1"))),
-            NOBODY,
+            IDENTITY,
         ),
         (
             "TagResource with no endpoint named".to_string(),
             "POST",
             "localhost:9297",
             "/tags?operation=tag-resource".to_string(),
-            NOBODY,
+            IDENTITY,
         ),
         (
             "UntagResource with no endpoint named".to_string(),
             "POST",
             "localhost:9297",
             "/tags?operation=untag-resource".to_string(),
-            NOBODY,
+            IDENTITY,
         ),
         // A path no model in the family binds, and a request signed for a service outside
         // it: neither is any member's, and neither is an ambiguity.
@@ -686,6 +687,16 @@ async fn every_chime_signed_request_is_dispatched_instead_of_refused_as_ambiguou
             "localhost:9297",
             "/sdk-media-pipelines".to_string(),
             Value::Null,
+        ),
+        (
+            // The generic tagging space, which names no service in the request: the
+            // family's declared tagging owner answers it, so a client pointed at the
+            // emulator reaches the operation instead of the router's refusal.
+            "the shared tagging space with no endpoint named",
+            "POST",
+            "localhost:9297",
+            "/tags?operation=tag-resource".to_string(),
+            json!({"ResourceARN": APP_INSTANCE, "Tags": [{"Key": "k", "Value": "v"}]}),
         ),
     ];
 
