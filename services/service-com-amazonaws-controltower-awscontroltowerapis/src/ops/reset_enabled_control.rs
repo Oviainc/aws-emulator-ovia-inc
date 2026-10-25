@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetEnabledControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetEnabledControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetEnabledControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ResetEnabledControl` re-deploys an enabled control's own configuration, exactly as the
+//! control already carries it, through an asynchronous operation the caller tracks by the
+//! `operationIdentifier` this call returns — the same shape `ResetLandingZone` has one
+//! level up.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +149,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetEnabledControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetEnabledControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ResetEnabledControlErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // `enabledControlIdentifier` is modelled as an `Arn`, so the only identifier the
+        // front door lets through is the ARN `EnableControl` minted — which is this map's
+        // key, the same resolution `GetEnabledControl` and `UpdateEnabledControl` do.
+        let Some(control) = store
+            .enabled_controls
+            .get(&input.enabled_control_identifier)
+            .cloned()
+        else {
+            return Err(ResetEnabledControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no enabled control matches enabledControlIdentifier {}",
+                        input.enabled_control_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // An operation still changing this control owns it: a re-deployment starting now
+        // would apply on top of a change only half applied, which is the inconsistent
+        // state `ConflictException` reports. That is a property of the control rather than
+        // of one call, so it is the rule `UpdateEnabledControl` applies too.
+        if control.status == crate::state::EnablementStatus::UnderChange {
+            return Err(ResetEnabledControlErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "control operation {} is still in progress against {}; re-deploying \
+                         this control now would leave it in an inconsistent state",
+                        control.last_operation_identifier, control.arn
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A reset starts an asynchronous operation, as every call acting on an enabled
+        // control does, so the identifier it returns names a record in the control
+        // operation log and the control is `UNDER_CHANGE` until the clock makes that
+        // record due. What it deploys is the configuration the control already carries —
+        // which is why this call takes no `parameters` and changes none; what the
+        // re-deployment settles is the control's drift against that configuration.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetEnabledControl"))
+        // Nothing this service stores records HOW a control is implemented, so no request
+        // is refused here for naming one implemented with a service control policy.
+        let Some(operation_identifier) = store.record_enabled_control_reset(&control.arn, now)
+        else {
+            // The ARN was read out of this same locked store above, so nothing can have
+            // removed the control in between; the modelled 404 is the answer if it ever
+            // did.
+            return Err(ResetEnabledControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no enabled control matches enabledControlIdentifier {}",
+                        control.arn
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(ResetEnabledControlOutput {
+            operation_identifier,
+        })
     }
 }
