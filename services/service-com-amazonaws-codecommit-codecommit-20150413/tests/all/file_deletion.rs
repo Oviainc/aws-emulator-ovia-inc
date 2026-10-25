@@ -718,13 +718,13 @@ async fn successive_deletions_chain_through_the_branch_tip() {
     .await;
     assert_eq!(
         root.get("files"),
-        None,
-        "every file was deleted, so the root tree holds none, got {root}"
+        Some(&json!([])),
+        "every file was deleted, so the root tree reports an empty files list, got {root}"
     );
     assert_eq!(
         root.get("subFolders"),
-        None,
-        "every file was deleted, so the root tree holds no folder, got {root}"
+        Some(&json!([])),
+        "every file was deleted, so the root tree reports an empty subFolders list, got {root}"
     );
 
     // Deleting the same path again finds nothing to delete.

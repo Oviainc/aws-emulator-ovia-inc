@@ -22,7 +22,7 @@
 //! `ExportLens` reads back and the versions `GetLensVersionDifference` compares are backed
 //! the same way, and `ListLenses` pages over those
 //! lenses beside the AWS-official lens this emulator ships. The Well-Architected
-//! Tool profiles (`CreateProfile`, `GetProfile`) are backed the same way, each keyed by the
+//! Tool profiles (`CreateProfile`, `GetProfile`, `ListProfiles`) are backed the same way, each keyed by the
 //! `ProfileArn` the create minted, and the association of one with a workload
 //! (`AssociateProfiles`, `DisassociateProfiles`) is held on the workload the association is
 //! OF, pinned at the profile version the workload is reviewed against — the version
@@ -76,7 +76,7 @@ use crate::ops::types::{
     ContextSummary,
     GoalSummary, JiraSelectedQuestionConfiguration, LensReview, LensSummary, Milestone,
     MilestoneSummary, PillarReviewSummary,
-    Profile, ProfileQuestion, Progress,
+    Profile, ProfileQuestion, ProfileSummary, Progress,
     ResourceNotFoundException,
     ReviewTemplate, ReviewTemplateAnswer, ReviewTemplateLensReview,
     ReviewTemplatePillarReviewSummary,
@@ -3702,6 +3702,14 @@ pub const MAX_QUESTIONS_PER_PROFILE: usize = 100;
 /// (`CreateProfileInput$ProfileQuestions` / `UpdateProfileInput$ProfileQuestions`).
 pub const PROFILE_QUESTIONS_MEMBER: &str = "ProfileQuestions";
 
+/// `ProfileOwnerType$SELF`: a profile the CALLING account owns
+/// (`smithy_query(query="shape", shape="ProfileOwnerType")`, which publishes `SELF` and
+/// `SHARED`).
+pub const PROFILE_OWNER_TYPE_SELF: &str = "SELF";
+
+/// `ProfileOwnerType$SHARED`: a profile another account owns and shared with the caller.
+pub const PROFILE_OWNER_TYPE_SHARED: &str = "SHARED";
+
 /// One stored Well-Architected Tool profile: the resource `CreateProfile` mints and
 /// `GetProfile` reports.
 ///
@@ -3754,6 +3762,36 @@ impl ProfileRecord {
             // what a projection of the stored profile reports.
             tags: Some(self.tags.clone().into_iter().collect()),
         }
+    }
+
+    /// The `ProfileSummary` projection the profile LIST reports
+    /// (`ListProfilesOutput$ProfileSummaries`), so one place decides how a stored profile
+    /// is summarised.
+    ///
+    /// `ProfileSummary` is its own structure (`smithy_query(query="shape",
+    /// shape="ProfileSummary")`) carrying the members it declares and no other: the
+    /// questions, the tags and the share invitation `Profile` also carries are NOT among
+    /// them. Every member it does declare is read off the same record [`Self::to_profile`]
+    /// reads, so a listed profile cannot disagree with a read of it.
+    pub fn to_summary(&self) -> ProfileSummary {
+        ProfileSummary {
+            profile_arn: Some(self.profile_arn.clone()),
+            profile_version: Some(self.profile_version.clone()),
+            profile_name: Some(self.profile_name.clone()),
+            profile_description: Some(self.profile_description.clone()),
+            owner: Some(self.owner.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+        }
+    }
+
+    /// Whether this profile is owned by `account`, which is what a `ProfileOwnerType` of
+    /// [`PROFILE_OWNER_TYPE_SELF`] selects — the complement,
+    /// [`PROFILE_OWNER_TYPE_SHARED`], being a profile another account owns and shared
+    /// with the caller. `Profile$Owner` is the account that created it, so ownership is
+    /// decided by that member rather than by where the record is held.
+    pub fn owned_by(&self, account: &str) -> bool {
+        self.owner == account
     }
 
     /// The stored questions as the modelled `Profile$ProfileQuestions` carries them.
@@ -5206,6 +5244,20 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         keys
     }
 
+    /// The stable list order `ListProfiles` pages over: `ProfileArn`, which is also what
+    /// [`Self::profiles`] is keyed by.
+    ///
+    /// The model publishes no order for `ProfileSummaries`, so this is the emulator's own,
+    /// chosen for the reason [`Self::review_template_order`] gives: the `NextToken` carries
+    /// the key of the last profile a page served, so that key has to be unique and fixed
+    /// for the profile's whole life. The ARN is both, where `ProfileName` is a member
+    /// `UpdateProfile` can move.
+    pub fn profile_order(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.profiles.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     /// The service's stable list order: workload name, then id to break ties between
     /// two names that normalize apart but sort equal.
     pub fn workload_order(&self) -> Vec<(String, String)> {
@@ -5706,6 +5758,21 @@ pub fn encode_review_template_next_token(template_arn: &str) -> String {
 /// the token is not one this service issued.
 pub fn decode_review_template_next_token(token: &str) -> Option<String> {
     Some(decode_cursor(token)?.get("t")?.as_str()?.to_string())
+}
+
+/// Encode a `ListProfiles` cursor: the `ProfileArn` last served, in the same opaque
+/// scheme as [`encode_next_token`]. Profiles are enumerated in `ProfileArn` order
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::profile_order`]),
+/// so that ARN is the whole cursor. Its own key, so a cursor issued by another paginated
+/// operation is not a cursor here.
+pub fn encode_profile_next_token(profile_arn: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "o": profile_arn }))
+}
+
+/// The `ProfileArn` a `ListProfiles` `NextToken` points just past, or `None` when the
+/// token is not one this service issued.
+pub fn decode_profile_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("o")?.as_str()?.to_string())
 }
 
 /// Encode a `ListAgentContexts` cursor: the context `UUID` last served, in the same

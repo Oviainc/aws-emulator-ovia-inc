@@ -32,6 +32,12 @@ pub(crate) struct Answer {
     pub(crate) error_code: String,
 }
 
+/// The Region this harness signs every request in — the credential scope in
+/// [`Client::send`]'s `authorization` header, which is how a handler learns a request's
+/// Region. Named so a fixture that has to build an ARN itself puts it in the Region a
+/// resource minted over the wire lands in.
+pub(crate) const SIGNED_REGION: &str = "us-west-2";
+
 impl Client {
     pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -425,6 +431,55 @@ impl Client {
             None => format!("/profiles/{encoded}"),
         };
         self.send("GET", &uri, None).await
+    }
+
+    /// `ListProfiles`: `GET /profileSummaries`, with every filter and paging member bound
+    /// to the query string. `query` is passed as sent, empty for a request that names
+    /// none.
+    pub(crate) async fn list_profiles(&self, query: &str) -> Answer {
+        let uri = if query.is_empty() {
+            "/profileSummaries".to_string()
+        } else {
+            format!("/profileSummaries?{query}")
+        };
+        self.send("GET", &uri, None).await
+    }
+
+    /// Record a profile ANOTHER account owns straight through the shared state, so a test
+    /// has a profile the caller does not own for `ProfileOwnerType` to select. Nothing
+    /// over the wire mints one — `CreateProfile` attributes a profile to the calling
+    /// account and the profile-share operations are still stubs with their own issues —
+    /// while the LIST under test still crosses the HTTP boundary. Answers the stored ARN.
+    ///
+    /// The ARN is built from the service's own `ARN_NAMESPACE` and the Region this
+    /// harness signs its requests in, so it satisfies the modelled `ProfileArn` pattern
+    /// and sits in the same Region as a profile minted over the wire; only the account
+    /// segment differs, because the profile belongs to another account.
+    pub(crate) fn seed_foreign_profile(&self, name: &str, owner: &str, resource_id: &str) -> String {
+        let state = self
+            .engine
+            .state::<service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState>();
+        let mut store = state.lock();
+        let profile_arn = format!(
+            "arn:aws:{}:{SIGNED_REGION}:{owner}:profile/{resource_id}",
+            service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::ARN_NAMESPACE
+        );
+        let now = SystemTime::now();
+        store.profiles.insert(
+            profile_arn.clone(),
+            service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::ProfileRecord {
+                profile_arn: profile_arn.clone(),
+                profile_version: "1".to_string(),
+                profile_name: name.to_string(),
+                profile_description: "a profile another account owns".to_string(),
+                questions: std::collections::BTreeMap::new(),
+                owner: owner.to_string(),
+                created_at: now,
+                updated_at: now,
+                tags: std::collections::BTreeMap::new(),
+            },
+        );
+        profile_arn
     }
 
     /// `CreateWorkloadShare`: `POST /workloads/{WorkloadId}/shares`.

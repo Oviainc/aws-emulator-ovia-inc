@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! `CreateWorkspaceInstance` when a spent `ClientToken` comes back on a request that
+//! differs in SEVERAL members at once, driven over the wire this service speaks
+//! (awsJson1_0, `POST /`, `X-Amz-Target: EUCMIFrontendAPIService.<OperationName>`).
+//!
+//! The rule under test: a create's `ClientToken` identifies ONE request, so the whole
+//! request beside the token is what a later call carrying that token is compared
+//! against — a call that differs in ANY member, at any depth, in any number, is a
+//! different request under a spent token and is refused with the modelled
+//! `ConflictException` (HTTP 409, `ResourceId`/`ResourceType` naming the resource the
+//! token did create — `smithy_query(query="shape",shape="ConflictException")`), while
+//! the resource that token created keeps the configuration the FIRST call asked for.
+//!
+//! The sibling `idempotency_token_reuse` suite varies ONE member per row; the rows
+//! here vary a member nested two levels down, a member dropped, members added, a list
+//! and a scalar together, and a whole structure replaced — the shapes of difference a
+//! comparison that only looked at the members it was written for would miss.
+//!
+//! Nothing here can pass against a canned answer: the refusal has to name the id the
+//! first call minted, the configuration the store holds for it is read back after the
+//! refusal, and each refused body is shown to be a create this service accepts by
+//! being replayed under a token of its own.
+
+use std::sync::Arc;
+
+use serde_json::json;
+use service_com_amazonaws_workspacesinstances_eucmifrontendapiservice as wsinst;
+
+use crate::idempotency_token_reuse::{assert_conflict, TokenRow};
+use crate::workspace_instance_lifecycle::{call, create, harness, ok, DEFAULT_TEST_REGION};
+
+/// Everything the store holds about instance `id` that a create call decided,
+/// rendered field by field.
+///
+/// The `ManagedInstance` a create persists is reported by no operation of this slice,
+/// so reading the record is the only way to show that a refused retry left the first
+/// call's configuration — not just its billing mode and tags — exactly as it was.
+fn stored_configuration(engine: &Arc<engine::InMemoryEngine>, case: &str, id: &str) -> String {
+    let store = wsinst::state::service_state(&**engine).expect("the service's own store");
+    let state = store.lock();
+    let record = state
+        .instances
+        .get(id)
+        .unwrap_or_else(|| panic!("case {case:?}: the store must hold the created {id:?}"));
+    format!(
+        "region={:?} ec2_instance_id={:?} managed_instance={:?} billing_configuration={:?} \
+         tags={:?} client_token={:?}",
+        record.region,
+        record.ec2_instance_id,
+        record.managed_instance,
+        record.billing_configuration,
+        record.tags,
+        record.client_token,
+    )
+}
+
+/// The instance ids the store holds, in id order.
+fn stored_ids(engine: &Arc<engine::InMemoryEngine>) -> Vec<String> {
+    let store = wsinst::state::service_state(&**engine).expect("the service's own store");
+    let ids = store.lock().instances.keys().cloned().collect();
+    ids
+}
+
+/// The create pairs the rule is asserted over. Every member named below is one the
+/// model declares on `CreateWorkspaceInstance`'s input or on `ManagedInstanceRequest`
+/// (`smithy_query(query="shape",shape="ManagedInstanceRequest")`), and every value
+/// satisfies that member's constraints, so a refusal of either side can only be the
+/// conflict and never a validation failure — which the second test here proves by
+/// replaying each `second` body under a token of its own.
+fn mismatch_rows() -> Vec<TokenRow> {
+    vec![
+        TokenRow {
+            case: "three members at once: a changed InstanceType, a BillingConfiguration \
+                   added and the Tags dropped",
+            first: json!({
+                "ManagedInstance": { "InstanceType": "t3.medium" },
+                "Tags": [{ "Key": "env", "Value": "dev" }],
+            }),
+            second: json!({
+                "ManagedInstance": { "InstanceType": "m5.large" },
+                "BillingConfiguration": { "BillingMode": "MONTHLY" },
+            }),
+        },
+        TokenRow {
+            case: "one member two levels down: Placement.Tenancy",
+            first: json!({
+                "ManagedInstance": {
+                    "InstanceType": "t3.medium",
+                    "Placement": { "AvailabilityZone": "us-east-1a", "Tenancy": "default" },
+                },
+            }),
+            second: json!({
+                "ManagedInstance": {
+                    "InstanceType": "t3.medium",
+                    "Placement": { "AvailabilityZone": "us-east-1a", "Tenancy": "dedicated" },
+                },
+            }),
+        },
+        TokenRow {
+            case: "a member dropped from ManagedInstance",
+            first: json!({
+                "ManagedInstance": { "InstanceType": "t3.medium", "SubnetId": "subnet-0a1b2c3d" },
+            }),
+            second: json!({ "ManagedInstance": { "InstanceType": "t3.medium" } }),
+        },
+        TokenRow {
+            case: "two members added, a boolean and an integer",
+            first: json!({ "ManagedInstance": { "InstanceType": "t3.medium" } }),
+            second: json!({
+                "ManagedInstance": {
+                    "InstanceType": "t3.medium",
+                    "EbsOptimized": true,
+                    "Ipv6AddressCount": 2,
+                },
+            }),
+        },
+        TokenRow {
+            case: "a list one entry longer and a tag value changed together",
+            first: json!({
+                "ManagedInstance": { "SecurityGroupIds": ["sg-0000000a"] },
+                "Tags": [{ "Key": "env", "Value": "dev" }],
+            }),
+            second: json!({
+                "ManagedInstance": { "SecurityGroupIds": ["sg-0000000a", "sg-0000000b"] },
+                "Tags": [{ "Key": "env", "Value": "staging" }],
+            }),
+        },
+        TokenRow {
+            case: "the whole ManagedInstance replaced by an empty one",
+            first: json!({
+                "ManagedInstance": { "InstanceType": "t3.medium", "ImageId": "ami-0123456789" },
+            }),
+            second: json!({ "ManagedInstance": {} }),
+        },
+        TokenRow {
+            case: "a tag nested inside ManagedInstance.TagSpecifications",
+            first: json!({
+                "ManagedInstance": {
+                    "TagSpecifications": [{
+                        "ResourceType": "instance",
+                        "Tags": [{ "Key": "team", "Value": "research" }],
+                    }],
+                },
+            }),
+            second: json!({
+                "ManagedInstance": {
+                    "TagSpecifications": [{
+                        "ResourceType": "instance",
+                        "Tags": [{ "Key": "team", "Value": "platform" }],
+                    }],
+                },
+            }),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn an_instance_token_reused_on_a_request_differing_in_several_members_is_a_conflict() {
+    for (row_index, row) in mismatch_rows().into_iter().enumerate() {
+        // One store per row, so what the store holds afterwards is this row's doing.
+        let (router, engine) = harness();
+        let token = format!("tok-multi-{row_index}");
+
+        let mut first = row.first.clone();
+        first["ClientToken"] = json!(token);
+        let created = create(&router, first.clone()).await;
+        let configuration = stored_configuration(&engine, row.case, &created);
+
+        // The reuse is refused the same way however many times it arrives: the token
+        // stays spent on the FIRST request, so the second attempt is the same conflict
+        // as the first and neither of them writes.
+        let mut second = row.second.clone();
+        second["ClientToken"] = json!(token);
+        for attempt in 1..=2 {
+            let (status, payload) = call(&router, "CreateWorkspaceInstance", second.clone()).await;
+            assert_conflict(
+                &format!("{} (attempt {attempt})", row.case),
+                status,
+                &payload,
+                &created,
+                wsinst::state::WORKSPACE_INSTANCE_RESOURCE_TYPE,
+            );
+        }
+
+        // Nothing the refused call asked for reached the store: one instance, and every
+        // field of it still the one the first call decided — including the
+        // `ManagedInstance` configuration no operation of this slice reports back.
+        assert_eq!(
+            stored_ids(&engine),
+            vec![created.clone()],
+            "case {:?}: expected the refused retry to create no instance, got {:?}",
+            row.case,
+            stored_ids(&engine)
+        );
+        assert_eq!(
+            stored_configuration(&engine, row.case, &created),
+            configuration,
+            "case {:?}: expected the first call's configuration to survive the refusal",
+            row.case
+        );
+
+        // The claim still names that instance, so the FIRST request still replays it
+        // and creates nothing, and the instance is still readable.
+        let claims = {
+            let store = wsinst::state::service_state(&*engine).expect("the service's own store");
+            let claims = store.lock().client_tokens.clone();
+            claims
+        };
+        assert_eq!(
+            claims
+                .get(&(DEFAULT_TEST_REGION.to_string(), token.clone()))
+                .map(|claim| claim.resource_id.as_str()),
+            Some(created.as_str()),
+            "case {:?}: expected the claim to still name {created:?}, got {claims:?}",
+            row.case
+        );
+        let replayed = create(&router, first).await;
+        assert_eq!(
+            replayed, created,
+            "case {:?}: expected the unchanged request to replay {created:?}, got {replayed:?}",
+            row.case
+        );
+        let got = ok(
+            &router,
+            "GetWorkspaceInstance",
+            json!({ "WorkspaceInstanceId": &created }),
+        )
+        .await;
+        assert_eq!(
+            got["WorkspaceInstanceId"].as_str(),
+            Some(created.as_str()),
+            "case {:?}: expected the instance to still be readable, got {got}",
+            row.case
+        );
+        assert_eq!(
+            stored_ids(&engine),
+            vec![created.clone()],
+            "case {:?}: expected the replay to create no second instance, got {:?}",
+            row.case,
+            stored_ids(&engine)
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_refused_body_is_a_create_this_service_accepts_under_its_own_token() {
+    for (row_index, row) in mismatch_rows().into_iter().enumerate() {
+        let (router, engine) = harness();
+
+        // What makes the retry a conflict is the SPENT token, not the body: the same
+        // two bodies under tokens of their own are two different requests, so each
+        // creates its own instance.
+        let mut first = row.first.clone();
+        first["ClientToken"] = json!(format!("tok-left-{row_index}"));
+        let left = create(&router, first).await;
+
+        let mut second = row.second.clone();
+        second["ClientToken"] = json!(format!("tok-right-{row_index}"));
+        let right = create(&router, second.clone()).await;
+        assert_ne!(
+            left, right,
+            "case {:?}: expected the second body to mint its own instance under its own token",
+            row.case
+        );
+
+        // And under no token at all it is a different request again.
+        second
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("case {:?}: the row body must be an object", row.case))
+            .remove("ClientToken");
+        let untokened = create(&router, second).await;
+        let mut expected = vec![left, right, untokened];
+        expected.sort();
+        assert_eq!(
+            stored_ids(&engine),
+            expected,
+            "case {:?}: expected one instance per request, got {:?}",
+            row.case,
+            stored_ids(&engine)
+        );
+    }
+}

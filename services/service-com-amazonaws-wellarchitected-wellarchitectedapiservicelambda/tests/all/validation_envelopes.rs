@@ -579,9 +579,9 @@ async fn a_scaffolded_operation_still_answers_501_for_a_valid_request() {
     let client = Client::new();
     for (case, method, path, body) in [
         (
-            "ListProfiles",
+            "ListProfileNotifications",
             "GET",
-            "/profileSummaries?MaxResults=10".to_string(),
+            "/profileNotifications?MaxResults=10".to_string(),
             None,
         ),
     ] {
