@@ -14,6 +14,7 @@ use crate::ops::types::{
     Authorization, Channel, CmafPackage, CmafPackageCreateOrUpdateParameters, DashPackage,
     EgressAccessLogs, HarvestJob, HlsIngest, HlsManifest, HlsPackage, IngestEndpoint,
     IngressAccessLogs, MssPackage, OriginEndpoint, S3Destination, SpekeKeyProvider,
+    StreamSelection,
 };
 use crate::scaffolded::ServiceError;
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
@@ -28,8 +29,13 @@ pub const SERVICE_NAME: &str = "mediapackage";
 /// names `us-east-1` as the emulator default.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// `ManifestName`'s documented default: "A short string appended to the end of the
-/// OriginEndpoint URL" — MediaPackage appends `index` when the caller sends none.
+/// The ENDPOINT-level `ManifestName`'s documented default: "A short string that will be
+/// used as the filename of the OriginEndpoint URL (defaults to \"index\")".
+///
+/// This is the only place the literal belongs. A CMAF child manifest's own `ManifestName`
+/// documents a different default — "defaults to the manifestName for the OriginEndpoint" —
+/// so a child inherits the endpoint's effective value (see [`stored_cmaf_package`]) and
+/// reaches this literal only through an endpoint that took it itself.
 pub const DEFAULT_MANIFEST_NAME: &str = "index";
 
 /// How many ingest endpoints a Channel's `HlsIngest` carries. MediaPackage provisions a
@@ -1342,13 +1348,19 @@ pub fn bound_origin_endpoint_durations(
 //   rather than being left absent. `tests/all/dash_live_manifest_defaults.rs` pins all six
 //   values on the wire, so a change to any of them is a test failure and not a silent drift.
 //
+// * PUBLISHED by MediaPackage as the stream selection every packaging block it stores is
+//   created with: `streamOrder` ORIGINAL (the source order is kept), with no bitrate floor
+//   or ceiling, reported as `minVideoBitsPerSecond` 0 and `maxVideoBitsPerSecond` the
+//   largest value the modelled `__integer` holds. `StreamSelection` is a member of all four
+//   packaging shapes, so the block is materialised on each of them.
+//
 // The defaults are keyed by MEMBER, so the same member takes the same default wherever a
-// published default covers it (`HlsPackage`, a CMAF child `HlsManifest`, `DashPackage`);
-// where a default belongs to one packaging format it is named for that format. A member
-// whose default neither the model, a recording nor the service's published configuration
-// publishes is left exactly as the request sent it — `StreamSelection`, `Encryption`,
-// `HlsPackage$SegmentDurationSeconds` and every `MssPackage` member — because inventing a
-// value for it would be a fabrication, not a default.
+// published default covers it (`HlsPackage`, a CMAF child `HlsManifest`, `DashPackage`,
+// `MssPackage`); where a default belongs to one packaging format it is named for that
+// format. A member whose default neither the model, a recording nor the service's published
+// configuration publishes is left exactly as the request sent it — `Encryption`,
+// `HlsPackage$SegmentDurationSeconds` and the `MssPackage` window and segment members —
+// because inventing a value for it would be a fabrication, not a default.
 // ---------------------------------------------------------------------------
 
 /// `Origination`'s default: a new endpoint may be requested unless the caller denies it.
@@ -1464,9 +1476,43 @@ pub const DEFAULT_DASH_SUGGESTED_PRESENTATION_DELAY_SECONDS: i32 = 25;
 /// `HlsPackage` member publishes none and so stays as sent.
 pub const DEFAULT_DASH_SEGMENT_DURATION_SECONDS: i32 = 2;
 
+/// `StreamSelection.StreamOrder`'s default: the output keeps the order the source stream
+/// published, which the enum names ORIGINAL
+/// (`crate::ops::types::STREAM_ORDER_VALUES`).
+pub const DEFAULT_STREAM_ORDER: &str = "ORIGINAL";
+
+/// `StreamSelection.MinVideoBitsPerSecond`' default: no video bitrate floor, so every
+/// rendition of the source is eligible for the output.
+pub const DEFAULT_MIN_VIDEO_BITS_PER_SECOND: i32 = 0;
+
+/// `StreamSelection.MaxVideoBitsPerSecond`' default: no video bitrate ceiling. "No
+/// ceiling" is reported as the largest value the member's modelled `__integer` can hold,
+/// because the member is a bitrate rather than a nullable switch.
+pub const DEFAULT_MAX_VIDEO_BITS_PER_SECOND: i32 = i32::MAX;
+
 /// An owned list for one of the `&[&str]` default lists above.
 fn default_list(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
+}
+
+/// Materialise the `StreamSelection` of a packaging block: the service stores a complete
+/// selection on every block it keeps, so an absent one becomes the all-defaults block and
+/// a partly supplied one keeps each member it carries and gains the rest.
+///
+/// `StreamSelection` is a member of all four packaging shapes, so this one function is what
+/// fills it on each of them.
+fn fill_stream_selection(selection: &mut Option<StreamSelection>) {
+    let selection = selection.get_or_insert_with(StreamSelection::default);
+    selection.stream_order = selection
+        .stream_order
+        .take()
+        .or_else(|| Some(DEFAULT_STREAM_ORDER.to_string()));
+    selection.min_video_bits_per_second = selection
+        .min_video_bits_per_second
+        .or(Some(DEFAULT_MIN_VIDEO_BITS_PER_SECOND));
+    selection.max_video_bits_per_second = selection
+        .max_video_bits_per_second
+        .or(Some(DEFAULT_MAX_VIDEO_BITS_PER_SECOND));
 }
 
 /// Fill the server defaults of the HLS packaging members `package` left unset, leaving
@@ -1503,6 +1549,7 @@ fn fill_hls_package(package: &mut HlsPackage) {
     package.use_audio_rendition_group = package
         .use_audio_rendition_group
         .or(Some(DEFAULT_USE_AUDIO_RENDITION_GROUP));
+    fill_stream_selection(&mut package.stream_selection);
 }
 
 /// Fill the server defaults of the manifest members a CMAF child `HlsManifest` left unset.
@@ -1584,6 +1631,7 @@ fn fill_dash_package(package: &mut DashPackage) {
         .utc_timing
         .take()
         .or_else(|| Some(DEFAULT_DASH_UTC_TIMING.to_string()));
+    fill_stream_selection(&mut package.stream_selection);
 }
 
 /// Materialise the server-filled members of an origin endpoint built from a create or
@@ -1610,6 +1658,10 @@ pub fn apply_origin_endpoint_defaults(record: &mut OriginEndpointRecord) {
         for manifest in package.hls_manifests.iter_mut().flatten() {
             fill_hls_manifest(manifest);
         }
+        fill_stream_selection(&mut package.stream_selection);
+    }
+    if let Some(package) = record.mss_package.as_mut() {
+        fill_stream_selection(&mut package.stream_selection);
     }
 }
 
@@ -2388,15 +2440,18 @@ pub fn cmaf_manifest_url(
 /// The `CmafPackage` to store for the `CmafPackageCreateOrUpdateParameters` an input
 /// carried.
 ///
-/// The create/update parameter shape differs from the stored shape in exactly two ways,
-/// both of them values the SERVICE supplies: each child HLS manifest gains the playback
-/// `Url` derived for it, and an absent `SegmentPrefix` takes its documented default,
-/// the ChannelId.
+/// The create/update parameter shape differs from the stored shape in exactly three ways,
+/// all of them values the SERVICE supplies: each child HLS manifest gains the playback
+/// `Url` derived for it, a child manifest sent without a `ManifestName` takes its
+/// documented default — the endpoint's own effective `ManifestName`, which
+/// `endpoint_manifest_name` carries already resolved — and an absent `SegmentPrefix` takes
+/// its documented default, the ChannelId.
 pub fn stored_cmaf_package(
     params: &CmafPackageCreateOrUpdateParameters,
     region: &str,
     channel_id: &str,
     endpoint_id: &str,
+    endpoint_manifest_name: &str,
 ) -> CmafPackage {
     let hls_manifests = params
         .hls_manifests
@@ -2406,7 +2461,7 @@ pub fn stored_cmaf_package(
             let manifest_name = manifest
                 .manifest_name
                 .clone()
-                .unwrap_or_else(|| DEFAULT_MANIFEST_NAME.to_string());
+                .unwrap_or_else(|| endpoint_manifest_name.to_string());
             HlsManifest {
                 ad_markers: manifest.ad_markers.clone(),
                 ad_triggers: manifest.ad_triggers.clone(),

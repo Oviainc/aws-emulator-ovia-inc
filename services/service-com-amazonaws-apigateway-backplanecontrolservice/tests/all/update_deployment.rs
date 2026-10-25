@@ -264,7 +264,7 @@ async fn a_patched_deployment_description_is_stored_and_read_back() {
 }
 
 #[tokio::test]
-async fn an_unsupported_patch_path_is_refused_with_the_path_the_op_and_the_supported_set() {
+async fn an_unsupported_patch_path_is_refused_with_the_path_the_request_sent() {
     let gateway = Gateway::new();
     let (api, _) = api_with_a_method(&gateway, "deployment-unsupported-path").await;
 
@@ -295,14 +295,8 @@ async fn an_unsupported_patch_path_is_refused_with_the_path_the_op_and_the_suppo
         assert_failure(&answer, 400, "BadRequestException", &case);
         assert_eq!(
             answer.body["message"].as_str(),
-            Some(
-                format!(
-                    "Invalid patch path  '{path}' specified for op '{kind}'. \
-                     Must be one of: [/description]"
-                )
-                .as_str()
-            ),
-            "case {case}: expected the refusal naming the path, the op and the supported set, got {:?}",
+            Some(format!("Invalid patch path {path}").as_str()),
+            "case {case}: expected the fixed sentence and the path the request sent, got {:?}",
             answer.body["message"]
         );
         // Nothing was applied: the stored record is the one the create wrote.

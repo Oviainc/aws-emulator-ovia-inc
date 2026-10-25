@@ -1006,6 +1006,113 @@ pub fn subscriber_limit_violation<'a>(
     Ok(())
 }
 
+/// Amazon SNS's own ARN namespace: the vendor field an address has to carry for it to
+/// name an SNS topic at all ([`names_sns_topic`]), which is also the prefix SNS is
+/// addressed by in a Region (the endpoint [`alerts`] publishes an alert to).
+pub const SNS_NAMESPACE: &str = "sns";
+
+/// The sentence refusing an address that carries a line break — `Subscriber$Address`'s
+/// own sentence, which is the rule it states for an address of EITHER subscription type:
+/// "When you create a subscriber, the value of `Address` can't contain line breaks."
+const ADDRESS_LINE_BREAK_REFUSAL: &str =
+    "When you create a subscriber, the value of Address can't contain line breaks.";
+
+/// The sentence refusing an `EMAIL` subscriber whose address is not an email address,
+/// stating the half of `Subscriber`'s rule that type names ("a subscription type and
+/// either an Amazon SNS topic or an email address") about the member it was violated on.
+const EMAIL_ADDRESS_REFUSAL: &str = "The Address of an EMAIL subscriber must be an email address.";
+
+/// The sentence refusing an `SNS` subscriber whose address does not name a topic — the
+/// other half of the same rule, as `Subscriber$Address` words it ("either an SNS topic or
+/// an email").
+const SNS_ADDRESS_REFUSAL: &str =
+    "The Address of an SNS subscriber must be the ARN of an Amazon SNS topic.";
+
+/// The sentence refusing a subscriber whose subscription type names NO address form —
+/// `Subscriber`'s rule with neither half selected, for a type outside the two the model
+/// lists (see [`subscriber_address_violation`]).
+const SUBSCRIBER_FORM_REFUSAL: &str =
+    "The Address of a subscriber must be either an Amazon SNS topic or an email address.";
+
+/// The ADDRESS rule every subscriber a write ESTABLISHES is held to.
+///
+/// A `Subscriber` "consists of a subscription type and either an Amazon SNS topic or an
+/// email address", and `Subscriber$Address` is "the address that Amazon Web Services
+/// sends budget notifications to, either an SNS topic or an email" — so an address has to
+/// be the kind of address its own `SubscriptionType` names: an email address under
+/// `EMAIL`, the ARN of an SNS topic under `SNS`. The member's documentation states one
+/// further rule, which holds whichever type it is: "when you create a subscriber, the
+/// value of `Address` can't contain line breaks."
+///
+/// None of that is expressible as a constraint trait — the modelled `@pattern`
+/// `^(.*[\n\r\t\f\ ]?)*$` admits any text, line breaks included — so every operation that
+/// establishes a subscriber checks the set it would leave behind here, before anything is
+/// written, and refuses one that fails it with the client error each of them models
+/// ("An error on the client occurred. Typically, the cause is an invalid input value.").
+/// An address that could never receive a budget notification is therefore never stored,
+/// so no read reports one.
+///
+/// `Err` carries the sentence that goes in that refusal's `Message`, stating the rule the
+/// address broke as the model words it. The refused ADDRESS is never part of it:
+/// `Subscriber$Address` is `@sensitive`, so a refusal that echoed it would put a caller's
+/// mailbox or topic into every error body and log.
+///
+/// Neither form is decided here: an email address is read through the ONE shared reading
+/// of a caller-supplied address (`service_common::email_address`) and a topic through the
+/// ONE shared parse of a caller-supplied ARN ([`names_sns_topic`]), so this service cannot
+/// disagree with another about what either is.
+///
+/// Takes any iterator of subscribers, so an operation that establishes ONE subscriber and
+/// one that establishes a whole set are held to the same rule.
+pub fn subscriber_address_violation<'a>(
+    subscribers: impl IntoIterator<Item = &'a Subscriber>,
+) -> Result<(), String> {
+    for subscriber in subscribers {
+        if subscriber.address.contains(['\n', '\r']) {
+            return Err(ADDRESS_LINE_BREAK_REFUSAL.to_string());
+        }
+        let violation = match subscriber.subscription_type.as_str() {
+            SUBSCRIPTION_TYPE_EMAIL => {
+                (!::service_common::email_address::is_email_address(&subscriber.address))
+                    .then_some(EMAIL_ADDRESS_REFUSAL)
+            }
+            SUBSCRIPTION_TYPE_SNS => {
+                (!names_sns_topic(&subscriber.address)).then_some(SNS_ADDRESS_REFUSAL)
+            }
+            // No request reaches this arm today: `SubscriptionType` is a modelled enum of
+            // exactly these two, so a value outside them is refused at request validation.
+            // It is a refusal rather than an acceptance because a type this service knows
+            // no address form for can only mean the catalog grew, and an address nothing
+            // checked is what this rule exists to keep out of the store.
+            _ => Some(SUBSCRIBER_FORM_REFUSAL),
+        };
+        if let Some(message) = violation {
+            return Err(message.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Whether `address` names an Amazon SNS TOPIC — what an `SNS` subscriber's address has
+/// to be.
+///
+/// Read through the ONE shared parse of a caller-supplied ARN (`service_common::arn`)
+/// rather than split here: the value has to be a well-formed resource ARN in SNS's own
+/// namespace ([`SNS_NAMESPACE`]), which is what makes it a topic a budget alert can be
+/// published to at all ([`alerts`]). An ARN's resource field is the topic's NAME, so a
+/// value whose resource field carries a `:` or a `/` names something beneath a topic (a
+/// subscription of one) rather than the topic itself; a topic belongs to an account, so
+/// the account field has to name one; and no field of an ARN carries whitespace.
+fn names_sns_topic(address: &str) -> bool {
+    // A line break is whitespace, so this scan covers one too — but an address carrying
+    // one never reaches here: the caller refuses that first, with the sentence the model
+    // states for it.
+    !address.chars().any(char::is_whitespace)
+        && ::service_common::arn::parse_of(address, SNS_NAMESPACE).is_some_and(|arn| {
+            !arn.account.is_empty() && !arn.resource.contains([':', '/'])
+        })
+}
+
 /// The notification and subscriber limits over the set of notifications ONE call would
 /// attach to a budget that already holds `already_held` of them.
 ///

@@ -245,12 +245,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The Region this request is signed for picks the store it writes to,
+        // and the Region the component type's ARN carries: the workspace it is
+        // created in is the one THIS Region holds under that id.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateComponentTypeErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),
             })
         })?;
         let mut state = state.lock();
+        let state = state.region_mut(&region);
 
         let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
             return Err(CreateComponentTypeErrorModeled::ValidationException(
@@ -366,7 +371,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::component_type_arn(
             &region,
             &input.workspace_id,

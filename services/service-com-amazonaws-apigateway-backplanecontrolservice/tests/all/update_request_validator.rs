@@ -370,18 +370,16 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
         assert_members(&read.body, &baseline_members, case, "GetRequestValidator");
     }
 
-    // A path the resource has no updateable member for is refused with the paths it does
-    // have, so a caller can fix the request from the message alone.
+    // A path the resource has no updateable member for is refused with the fixed sentence
+    // and the path the request sent, and nothing else.
     let id = baseline(&gateway, &api, "the message of an unsupported path", baseline_request()).await;
     let answer = update(&gateway, &api, &id, vec![replace("/id", "zzzzzzzzzz")]).await;
     let message = answer.body["message"].as_str().unwrap_or_default();
-    for path in ["/name", "/validateRequestBody", "/validateRequestParameters"] {
-        assert!(
-            message.contains(path),
-            "case the message of an unsupported path: expected the supported path {path} in \
-             the refusal, got {message:?}"
-        );
-    }
+    assert_eq!(
+        message, "Invalid patch path /id",
+        "case the message of an unsupported path: expected the fixed sentence and the path, \
+         got {message:?}"
+    );
 }
 
 #[tokio::test]

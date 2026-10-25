@@ -141,6 +141,39 @@ pub fn is_reserved_tag_key(tag_key: &str) -> bool {
     key.len() >= prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
+/// The MODELLED length bounds of an identity-pool tag KEY, `TagKeysType` (`len 1..128`):
+/// the shape both the tag map's key (`IdentityPoolTagsType`) and the untag list's member
+/// (`IdentityPoolTagsListType`) target
+/// (`smithy_query(query="shape",shape="IdentityPoolTagsType,IdentityPoolTagsListType")`).
+/// Held here so every operation that reads a tag key checks the one bound the model states.
+pub const TAG_KEY_LENGTH: ::std::ops::RangeInclusive<usize> = 1..=128;
+
+/// The MODELLED length bounds of a tag VALUE, `TagValueType` (`len 0..256`), from the same
+/// query.
+pub const TAG_VALUE_LENGTH: ::std::ops::RangeInclusive<usize> = 0..=256;
+
+/// Whether `value` lies inside `bounds`, counted in CHARACTERS, as the `length` trait
+/// measures a string.
+pub fn length_is_within(value: &str, bounds: &::std::ops::RangeInclusive<usize>) -> bool {
+    bounds.contains(&value.chars().count())
+}
+
+/// The one message a constraint refusal carries: the envelope AWS wraps modelled-constraint
+/// violations in, stating how many it DETECTED and naming the ones in `violations`. Shared
+/// by every operation of this service that refuses a value the model bounds, so the refusals
+/// read alike however many violations one request carries.
+///
+/// `detected` is the number of violations the request has, which is what AWS's envelope
+/// counts; `violations` are the clauses this refusal names, so a caller reading them against
+/// the count can see when a refusal names fewer clauses than the request has violations.
+pub fn validation_errors_detected(detected: usize, violations: &[String]) -> String {
+    format!(
+        "{detected} validation error{} detected: {}",
+        if detected == 1 { "" } else { "s" },
+        violations.join("; ")
+    )
+}
+
 /// The punctuation an AWS tag key admits beside letters, digits and separators. AWS's
 /// tagging rules publish the character set of a tag key as letters, numbers, spaces
 /// representable in UTF-8 and `_ . : / = + - @`; a principal tag is referenced from an IAM

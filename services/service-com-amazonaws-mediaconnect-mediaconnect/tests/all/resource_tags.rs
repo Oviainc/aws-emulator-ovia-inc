@@ -52,6 +52,10 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// Percent-encode one path segment or query value: everything outside RFC 3986 §2.3's
 /// unreserved set is escaped, which is what an SDK client sends for an ARN bound to a
 /// NON-greedy `@httpLabel` (`/tags/{ResourceArn}`) and for each `tagKeys` query pair.
+///
+/// `pub(crate)` because the other suites that address a resource by an ARN label encode it
+/// the same way (see `tests/all/global_resource_tags.rs`), so there is one encoder rather
+/// than one per suite.
 pub(crate) fn pct(value: &str) -> String {
     value
         .bytes()

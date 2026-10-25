@@ -536,18 +536,16 @@ async fn an_op_or_path_the_resource_does_not_support_is_refused_and_changes_noth
         );
     }
 
-    // The refusal names the path, the op and the paths the resource does have, so a
-    // client can fix the request from the message alone.
+    // The refusal is the fixed sentence and the path the request sent, and nothing else:
+    // it names neither the op nor the paths the resource does have.
     let answer = update(&gateway, &api, &id, vec![replace("/id", "0123456789")]).await;
     let message = answer.body["message"]
         .as_str()
         .unwrap_or_else(|| panic!("case the unsupported path message: expected a message, got {:?}", answer.body));
-    for expected in ["/id", "replace", "/name", "/authorizerResultTtlInSeconds"] {
-        assert!(
-            message.contains(expected),
-            "case the unsupported path message: expected {expected:?} in {message:?}"
-        );
-    }
+    assert_eq!(
+        message, "Invalid patch path /id",
+        "case the unsupported path message: expected the fixed sentence and the path, got {message:?}"
+    );
 }
 
 #[tokio::test]

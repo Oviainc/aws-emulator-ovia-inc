@@ -229,17 +229,23 @@ fn bound_input(input: &CreateAuthorizerInput) -> Result<(), String> {
 /// the default value is 300", "If it equals 0, authorization caching is disabled" and
 /// "The maximum value is 3600, or 1 hour" — so the member takes a value in `0..=3600`
 /// and the service picks 300 for a request that sets none. Shared so every writer of
-/// that member applies one rule.
+/// that member applies one rule: `UpdateAuthorizer` patches the same member through it.
 pub fn authorizer_result_ttl(requested: Option<i32>) -> Result<i32, String> {
     let ttl = requested.unwrap_or(DEFAULT_AUTHORIZER_RESULT_TTL_SECONDS);
     if !(MIN_AUTHORIZER_RESULT_TTL_SECONDS..=MAX_AUTHORIZER_RESULT_TTL_SECONDS).contains(&ttl) {
-        return Err(format!(
-            "authorizerResultTtlInSeconds must be between \
-             {MIN_AUTHORIZER_RESULT_TTL_SECONDS} and {MAX_AUTHORIZER_RESULT_TTL_SECONDS}, \
-             got {ttl}"
-        ));
+        return Err(ttl_out_of_range());
     }
     Ok(ttl)
+}
+
+/// The refusal for an `authorizerResultTtlInSeconds` outside that window: a fixed
+/// sentence naming the window's bounds in seconds, which quotes the rejected value back
+/// nowhere.
+pub fn ttl_out_of_range() -> String {
+    format!(
+        "Authorizer result TTL outside allowable range. TTL must be between \
+         {MIN_AUTHORIZER_RESULT_TTL_SECONDS} and {MAX_AUTHORIZER_RESULT_TTL_SECONDS} seconds."
+    )
 }
 
 /// The `AuthorizerType` value for a Lambda authorizer taking a single token from a
@@ -267,6 +273,10 @@ pub const AUTHORIZER_TYPE_COGNITO_USER_POOLS: &str = "COGNITO_USER_POOLS";
 ///   COGNITO_USER_POOLS authorizer": the pools whose tokens are accepted, so that type
 ///   cannot authorize without at least one.
 ///
+/// Every one of them is refused with [`INVALID_REQUEST_INPUT`]: API Gateway answers an
+/// authorizer whose members its type does not admit with that one sentence and names
+/// neither the member it missed nor the type that wanted it.
+///
 /// The check reads the STORED record rather than one request's members, because the same
 /// rule has to hold however the record came to look that way: the TTL it is judged
 /// against is the stored one from [`authorizer_result_ttl`], not the requested one, since
@@ -280,9 +290,7 @@ pub fn require_members_of_type(entry: &AuthorizerEntry) -> Result<(), String> {
         AUTHORIZER_TYPE_TOKEN | AUTHORIZER_TYPE_REQUEST
     ) && !supplied(&entry.authorizer_uri)
     {
-        return Err(format!(
-            "authorizerUri is required for an authorizer of type {authorizer_type}"
-        ));
+        return Err(INVALID_REQUEST_INPUT.to_string());
     }
     let caching_enabled = ttl > MIN_AUTHORIZER_RESULT_TTL_SECONDS;
     let identity_source_required = match authorizer_type {
@@ -291,22 +299,18 @@ pub fn require_members_of_type(entry: &AuthorizerEntry) -> Result<(), String> {
         _ => false,
     };
     if identity_source_required && !supplied(&entry.identity_source) {
-        return Err(if authorizer_type == AUTHORIZER_TYPE_REQUEST {
-            format!(
-                "identitySource is required for an authorizer of type {authorizer_type} \
-                 when authorization caching is enabled"
-            )
-        } else {
-            format!("identitySource is required for an authorizer of type {authorizer_type}")
-        });
+        return Err(INVALID_REQUEST_INPUT.to_string());
     }
     if authorizer_type == AUTHORIZER_TYPE_COGNITO_USER_POOLS && entry.provider_arns.is_empty() {
-        return Err(format!(
-            "providerARNs is required for an authorizer of type {authorizer_type}"
-        ));
+        return Err(INVALID_REQUEST_INPUT.to_string());
     }
     Ok(())
 }
+
+/// The refusal for an authorizer configuration the requested `type` does not admit: the
+/// one sentence API Gateway answers every one of them with, which makes no claim about
+/// which member is at fault.
+pub const INVALID_REQUEST_INPUT: &str = "Invalid request input";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -433,10 +437,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreateAuthorizerErrorModeled::LimitExceededException(
                     LimitExceededException {
                         retry_after_seconds: None,
-                        message: Some(format!(
-                            "Maximum number of authorizers exceeded for this API: {}",
-                            crate::state::MAX_AUTHORIZERS_PER_API
-                        )),
+                        message: Some(crate::state::quota_reached("Authorizers", "API")),
                     },
                 )
                 .into());

@@ -47,7 +47,10 @@ use crate::distribution_tags::{
 ///
 /// The ARN travels in the query exactly as the reader's does: every character a
 /// CloudFront ARN uses is legal in a query value, and none of them is `&`, `=` or `%`.
-async fn tag_resource(
+///
+/// `pub(crate)` so a sibling suite that tags a resource kind of its own calls the same
+/// wire path rather than growing a copy of this.
+pub(crate) async fn tag_resource(
     router: &MultiServiceRouter,
     arn: &str,
     submitted: Option<&[SubmittedTag]>,

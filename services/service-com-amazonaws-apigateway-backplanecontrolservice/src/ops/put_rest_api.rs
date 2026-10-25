@@ -283,7 +283,7 @@ pub struct ImportedPath {
 /// emulator's own resource guards below keep their own wording instead, because they are
 /// this emulator's bounds rather than anything the service publishes, and a caller has to
 /// be able to tell the two apart.
-pub const INVALID_DEFINITION: &str = "Invalid OpenAPI input.";
+pub const INVALID_DEFINITION: &str = "Invalid OAS input";
 
 /// The pseudo parameter an API definition writes where an integration's ARN needs the
 /// Region the API is imported into.
@@ -1461,10 +1461,7 @@ pub fn plan_resources(
             let path = child_path(&parent, segment);
             if known.insert(path.clone()) {
                 if known.len() > crate::state::MAX_RESOURCES_PER_API {
-                    return Err(format!(
-                        "Maximum number of resources exceeded for this API: {}",
-                        crate::state::MAX_RESOURCES_PER_API
-                    ));
+                    return Err(crate::state::quota_reached("Resources", "API"));
                 }
                 planned.push(PlannedResource {
                     path: path.clone(),

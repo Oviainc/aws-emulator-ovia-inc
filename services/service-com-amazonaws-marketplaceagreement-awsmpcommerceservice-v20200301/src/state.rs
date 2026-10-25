@@ -1703,21 +1703,49 @@ pub fn accepted_term(requested: &RequestedTerm, context: &AcceptedTermContext<'_
 }
 
 /// When the agreement that holds `terms` ends, or `None` for an agreement whose
-/// terms set no end date.
+/// terms commit it for no duration at all.
 ///
-/// `ValidityTerm$agreementEndDate` "defines the date when the agreement ends"
-/// and `DescribeAgreementOutput$endTime` is "the date and time when the
-/// agreement ends": one value, so the agreement ends when its accepted validity
-/// term says it does. Terms carrying no validity term leave it absent — "the
-/// field is null for pay-as-you-go agreements, which don't have end dates".
+/// `ValidityTerm$agreementEndDate` states the rule for terms that name no end
+/// date of their own: "If `AgreementEndDate` isn't provided, the agreement end
+/// date is determined by the validity of individual terms." So an agreement ends
+/// when the duration its accepted terms committed it for runs out — the one
+/// window every term of it reports ([`AcceptedTermContext::validity_end`]) — and
+/// it has no end date only when NONE of those terms commits a duration, which is
+/// the case `DescribeAgreementOutput$endTime` leaves absent: "the field is null
+/// for pay-as-you-go agreements, which don't have end dates".
 pub fn agreement_end_time(
     terms: &[AcceptedTerm],
     context: &AcceptedTermContext<'_>,
 ) -> Option<SystemTime> {
     terms
         .iter()
-        .any(|term| matches!(term, AcceptedTerm::validityTerm(_)))
+        .any(commits_agreement_duration)
         .then(|| context.validity_end())
+}
+
+/// Whether one accepted term commits the agreement that holds it for a duration,
+/// as that term's own duration member states it.
+///
+/// Three kinds carry one: a validity term, whose `agreementDuration` "defines
+/// the duration that the agreement remains active"; a configured prepaid term,
+/// whose `ConfigurableUpfrontPricingTermConfiguration$selectorValue` "defines the
+/// length of time for which the particular pricing/dimension is being purchased
+/// by the acceptor"; and a fixed prepaid term, whose `duration` is the "contract
+/// duration for the terms".
+///
+/// No other kind bounds the agreement: metered usage is charged "based on product
+/// usage", a recurring, variable or net payment term states a billing or payment
+/// period rather than a length the agreement is bought for, a legal, support or
+/// BYOL term states no window at all, a renewal term decides what happens AT an
+/// end date rather than setting one, and `FreeTrialPricingTerm$duration` is the
+/// length of the free trial inside the agreement, not of the agreement.
+fn commits_agreement_duration(term: &AcceptedTerm) -> bool {
+    match term {
+        AcceptedTerm::validityTerm(validity) => validity.agreement_duration.is_some(),
+        AcceptedTerm::configurableUpfrontPricingTerm(pricing) => pricing.configuration.is_some(),
+        AcceptedTerm::fixedUpfrontPricingTerm(fixed) => fixed.duration.is_some(),
+        _ => false,
+    }
 }
 
 /// When a term of `kind` is charged, or `None` for a kind that carries no
@@ -1892,9 +1920,9 @@ pub struct Agreement {
     pub status: String,
     pub start_time: SystemTime,
     /// "The field is null for pay-as-you-go agreements, which don't have end
-    /// dates": an agreement ends when its accepted `ValidityTerm` says it does
-    /// ([`agreement_end_time`]), and one whose accepted terms carry no validity
-    /// term has no end date at all.
+    /// dates": an agreement ends when the duration its accepted terms commit it
+    /// for runs out ([`agreement_end_time`]), and one whose accepted terms
+    /// commit no duration at all has no end date.
     pub end_time: Option<SystemTime>,
     pub acceptance_time: SystemTime,
     pub proposal_summary: ProposalSummary,

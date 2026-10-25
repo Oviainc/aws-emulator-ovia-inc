@@ -443,10 +443,16 @@ async fn create_table_registers_a_scalable_target_per_configured_capacity() {
             )
             .await;
         if case.expected.is_empty() && case.specification.is_null() {
-            // A table auto scaling was never configured for has no settings at all.
+            // A table auto scaling was never configured for has no settings at all — and is
+            // still reported, with the optional member absent.
             assert_eq!(
-                status, 404,
-                "case {:?}: expected the modelled not-found, got {status} {body}",
+                status, 200,
+                "case {:?}: expected the table to be reported, got {status} {body}",
+                case.name
+            );
+            assert!(
+                body.pointer("/autoScalingSpecification").is_none(),
+                "case {:?}: expected no autoScalingSpecification, got {body}",
                 case.name
             );
             continue;
@@ -761,7 +767,8 @@ async fn settings_registered_through_application_auto_scaling_are_reported_by_ke
         .given_provisioned_table("a table with no auto scaling", keyspace, table, None)
         .await;
 
-    // Before anything is registered, the table has no auto scaling settings.
+    // Before anything is registered, the table has no auto scaling settings — and is
+    // still reported, with the optional member absent.
     let (status, body) = emulator
         .keyspaces(
             "GetTableAutoScalingSettings",
@@ -769,8 +776,12 @@ async fn settings_registered_through_application_auto_scaling_are_reported_by_ke
         )
         .await;
     assert_eq!(
-        status, 404,
-        "case \"unscaled\": expected the modelled not-found, got {status} {body}"
+        status, 200,
+        "case \"unscaled\": expected the table to be reported, got {status} {body}"
+    );
+    assert!(
+        body.pointer("/autoScalingSpecification").is_none(),
+        "case \"unscaled\": expected no autoScalingSpecification, got {body}"
     );
 
     // Registered directly through Application Auto Scaling, for each capacity in turn.
@@ -900,8 +911,12 @@ async fn settings_registered_through_application_auto_scaling_are_reported_by_ke
         )
         .await;
     assert_eq!(
-        status, 404,
-        "case \"deregistered both\": expected the modelled not-found, got {status} {body}"
+        status, 200,
+        "case \"deregistered both\": expected the table to be reported, got {status} {body}"
+    );
+    assert!(
+        body.pointer("/autoScalingSpecification").is_none(),
+        "case \"deregistered both\": expected no autoScalingSpecification, got {body}"
     );
 }
 

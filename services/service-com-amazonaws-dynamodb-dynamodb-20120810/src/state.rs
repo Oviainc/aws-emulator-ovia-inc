@@ -18,7 +18,7 @@ use bigdecimal::BigDecimal;
 
 use crate::ops::types::{
     AttributeDefinition, AttributeValue, AttributeValueUpdate, BackupDescription, BackupDetails,
-    BackupSummary, BillingModeSummary, Capacity,
+    BackupSummary, BillingModeSummary, CancellationReason, Capacity,
     ConsumedCapacity, ContinuousBackupsDescription, ExpectedAttributeValue,
     GlobalSecondaryIndexDescription, GlobalSecondaryIndexInfo,
     GlobalSecondaryIndexWarmThroughputDescription,

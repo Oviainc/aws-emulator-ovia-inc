@@ -167,11 +167,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// about which services exist; a service with no change recorded inside the window has no
     /// state to report, since a `ServiceState`'s `LatestChangeEvents` is `length 1..1`. The
     /// order is the discovered set's, which is what makes the page cursor a stable boundary.
+    ///
+    /// Nothing in the reported event comes off this REQUEST: the change it reports is a write
+    /// the store already holds the record of, so its Region and its name are that record's
+    /// own and this read reports one recorded change exactly as `ListEntityEvents` does.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let _ = ctx;
         if let Some(message) = crate::state::time_range_refusal(&input.start_time, &input.end_time)
         {
             return Err(refused(message));
@@ -198,14 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let observed = if other_account {
             Vec::new()
         } else {
-            // A change is reported in the caller's own region, read off the SigV4 credential
-            // scope exactly as a minted ARN's region is.
-            let region = crate::state::region_of(ctx.parts());
             state.lock().observed_service_states(
                 &input.start_time,
                 &input.end_time,
                 input.attribute_filters.as_deref().unwrap_or_default(),
-                &region,
             )
         };
 

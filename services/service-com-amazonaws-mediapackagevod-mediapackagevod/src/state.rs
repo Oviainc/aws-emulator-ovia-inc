@@ -132,6 +132,15 @@ pub const MAX_ASSETS: usize = 10_000;
 /// so the boundary validator admits any map at all and the SERVICE decides this.
 pub const MAX_TAGS: usize = 50;
 
+/// The shortest tag key AWS accepts, from the same restrictions ("Minimum key length
+/// - 1 Unicode character in UTF-8"), counted in characters rather than bytes.
+///
+/// The empty string is therefore not a tag key at all: naming it — on a create or to
+/// remove it — is a parameter violation rather than a request that tags or untags
+/// nothing. The key's VALUE has no such minimum ("Values can be empty"), so only the
+/// key is bounded below.
+pub const MIN_TAG_KEY_CHARS: usize = 1;
+
 /// The longest tag key AWS accepts, from the same restrictions ("Maximum key length
 /// - 128 Unicode characters in UTF-8"), counted in characters rather than bytes.
 pub const MAX_TAG_KEY_CHARS: usize = 128;
@@ -972,12 +981,20 @@ fn tag_key_label(key: &str) -> String {
 /// Every way the tag key `key` breaks AWS's tagging restrictions, as the phrases a
 /// refusal attributes to the member the key arrived on.
 ///
-/// Only the rules that hold for a key WHATEVER the caller does with it: its length, and
-/// the reserved [`RESERVED_TAG_KEY_PREFIX`] AWS owns — which is why the same check
-/// covers naming a key on a create and naming one to remove.
+/// Only the rules that hold for a key WHATEVER the caller does with it: its length —
+/// bounded at both ends, [`MIN_TAG_KEY_CHARS`] to [`MAX_TAG_KEY_CHARS`] characters, so
+/// the empty string is not a key — and the reserved [`RESERVED_TAG_KEY_PREFIX`] AWS
+/// owns, which is why the same check covers naming a key on a create and naming one to
+/// remove.
 fn tag_key_violations(key: &str) -> Vec<String> {
     let mut phrases = Vec::new();
     let length = key.chars().count();
+    if length < MIN_TAG_KEY_CHARS {
+        phrases.push(format!(
+            "key {} must be at least {MIN_TAG_KEY_CHARS} character, not {length}",
+            tag_key_label(key)
+        ));
+    }
     if length > MAX_TAG_KEY_CHARS {
         phrases.push(format!(
             "key {} must be at most {MAX_TAG_KEY_CHARS} characters, not {length}",
@@ -998,8 +1015,11 @@ fn tag_key_violations(key: &str) -> Vec<String> {
 ///
 /// A reserved key is refused on NAMING it, not on writing it: a caller may no more
 /// DELETE an `aws:` tag than create one, so the removal is refused rather than reported
-/// as done. A well-formed key the resource does not carry is NOT refused here —
-/// removing it is simply idempotent.
+/// as done. The same holds for a key no tag can have at all — one outside the
+/// [`MIN_TAG_KEY_CHARS`]-to-[`MAX_TAG_KEY_CHARS`] bound, the empty string among them:
+/// the request names something that is not a tag key, so it is refused rather than
+/// answered as a removal that removed nothing. A WELL-FORMED key the resource does not
+/// carry is NOT refused here — removing it is simply idempotent.
 pub fn check_tag_keys(
     member: &str,
     keys: &[String],
@@ -1019,9 +1039,10 @@ pub fn check_tag_keys(
 }
 
 /// Refuse a caller-supplied `Tags` map that breaks AWS's universal resource-tagging
-/// restrictions: more than [`MAX_TAGS`] entries, a key longer than
-/// [`MAX_TAG_KEY_CHARS`], a value longer than [`MAX_TAG_VALUE_CHARS`], or a key
-/// carrying the reserved [`RESERVED_TAG_KEY_PREFIX`].
+/// restrictions: more than [`MAX_TAGS`] entries, a key shorter than
+/// [`MIN_TAG_KEY_CHARS`] or longer than [`MAX_TAG_KEY_CHARS`], a value longer than
+/// [`MAX_TAG_VALUE_CHARS`], or a key carrying the reserved
+/// [`RESERVED_TAG_KEY_PREFIX`].
 ///
 /// This is the ONE place the rules are decided, so every operation that accepts a tag
 /// map judges one the same way, and it is called BEFORE anything is stored — a refused

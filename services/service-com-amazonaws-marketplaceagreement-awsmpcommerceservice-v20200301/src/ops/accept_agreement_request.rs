@@ -263,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for — plus this agreement's own window where a term reports one. The
         // context is built once for the whole agreement, so every term of it
         // reports the same contract length and the same dates, and the
-        // agreement's end date is the one its accepted validity term states.
+        // agreement's end date is the end of the window its terms commit it for.
         let context = crate::state::AcceptedTermContext::new(
             &request.requested_terms,
             now,
@@ -290,8 +290,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             start_time: now,
             acceptance_time: now,
             // "The field is null for pay-as-you-go agreements, which don't have
-            // end dates" — this agreement ends when its accepted validity term
-            // says it does, and has no end date when its terms carry none.
+            // end dates" — this agreement ends when the duration its accepted
+            // terms commit it for runs out, and has no end date when they
+            // commit none.
             end_time,
             proposal_summary,
             accepted_terms,

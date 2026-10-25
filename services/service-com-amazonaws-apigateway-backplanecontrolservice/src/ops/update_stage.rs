@@ -111,45 +111,17 @@ use super::types::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::state::{
-    patch_bool, patch_enum_string, patch_f64_in, patch_i32_in, patch_optional_string,
-    patch_string_map, Patch, PatchFailure, PatchOpKind, StageEntry, MAX_COLLECTION_ENTRIES,
-    MAX_STRING_CHARS,
+    patch_bool, patch_enum_string, patch_f64_checked, patch_f64_in, patch_i32_in,
+    patch_optional_string, patch_string_map, Patch, PatchFailure, PatchOpKind, StageEntry,
+    MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
 
-/// The `path` values `UpdateStage` accepts: one per updateable member of the `Stage`
-/// shape, the `canarySettings` and `accessLogSettings` sub-members and the per-method
-/// settings included. `stageName`, `createdDate`, `lastUpdatedDate` and
-/// `cacheClusterStatus` are assigned by the service, `tags` are changed through
-/// `TagResource`/`UntagResource` and `webAclArn` by associating a WebACL through AWS WAF,
-/// so none of them is patchable.
-const SUPPORTED_PATHS: &[&str] = &[
-    "/accessLogSettings",
-    "/accessLogSettings/destinationArn",
-    "/accessLogSettings/format",
-    "/cacheClusterEnabled",
-    "/cacheClusterSize",
-    "/canarySettings",
-    "/canarySettings/deploymentId",
-    "/canarySettings/percentTraffic",
-    "/canarySettings/stageVariableOverrides/<name>",
-    "/canarySettings/useStageCache",
-    "/clientCertificateId",
-    "/deploymentId",
-    "/description",
-    "/documentationVersion",
-    "/tracingEnabled",
-    "/variables/<name>",
-    "/{resource_path}/{http_method}/caching/dataEncrypted",
-    "/{resource_path}/{http_method}/caching/enabled",
-    "/{resource_path}/{http_method}/caching/requireAuthorizationForCacheControl",
-    "/{resource_path}/{http_method}/caching/ttlInSeconds",
-    "/{resource_path}/{http_method}/caching/unauthorizedCacheControlHeaderStrategy",
-    "/{resource_path}/{http_method}/logging/dataTrace",
-    "/{resource_path}/{http_method}/logging/loglevel",
-    "/{resource_path}/{http_method}/metrics/enabled",
-    "/{resource_path}/{http_method}/throttling/burstLimit",
-    "/{resource_path}/{http_method}/throttling/rateLimit",
-];
+// The `path` values `UpdateStage` accepts are the ones `apply_patch` below has an arm
+// for: one per updateable member of the `Stage` shape, the `canarySettings` and
+// `accessLogSettings` sub-members and the per-method settings included. `stageName`,
+// `createdDate`, `lastUpdatedDate` and `cacheClusterStatus` are assigned by the service,
+// `tags` are changed through `TagResource`/`UntagResource` and `webAclArn` by associating
+// a WebACL through AWS WAF, so none of them is patchable.
 
 /// The pointer a canary promotion copies the deployment id FROM: "to promote a canary
 /// deployment, you copy the canary deployment ID to the affiliated deployment ID by
@@ -157,10 +129,6 @@ const SUPPORTED_PATHS: &[&str] = &[
 /// "from":"/canarySettings/deploymentId" and "path":"/deploymentId""
 /// (`PatchOperation$from`).
 const CANARY_DEPLOYMENT_POINTER: &str = "/canarySettings/deploymentId";
-
-/// From `CanarySettings$percentTraffic`'s own documentation: "The percent (0-100) of
-/// traffic diverted to a canary deployment."
-const PERCENT_TRAFFIC_RANGE: ::std::ops::RangeInclusive<f64> = 0.0..=100.0;
 
 /// The values `MethodSetting$loggingLevel` documents: "Valid values are OFF, ERROR, and
 /// INFO." The member is a plain string on the wire, so its value set is checked here.
@@ -376,7 +344,7 @@ fn apply_canary_patch(
                 entry.canary_settings = None;
                 Ok(())
             }
-            _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+            _ => Err(patch.unsupported_path()),
         };
     }
     let mut canary = entry.canary_settings.clone().unwrap_or_default();
@@ -385,7 +353,11 @@ fn apply_canary_patch(
     let nested = patch.rebased(1);
     match nested.member() {
         "percentTraffic" => {
-            patch_f64_in(&mut canary.percent_traffic, &nested, PERCENT_TRAFFIC_RANGE)?;
+            patch_f64_checked(
+                &mut canary.percent_traffic,
+                &nested,
+                crate::state::accepted_percent_traffic,
+            )?;
         }
         "useStageCache" => patch_bool(&mut canary.use_stage_cache, &nested)?,
         "deploymentId" => {
@@ -412,7 +384,7 @@ fn apply_canary_patch(
             canary.stage_variable_overrides =
                 (!overrides.is_empty()).then(|| overrides.into_iter().collect());
         }
-        _ => return Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => return Err(patch.unsupported_path()),
     }
     entry.canary_settings = Some(canary);
     Ok(())
@@ -426,7 +398,7 @@ fn apply_access_log_patch(entry: &mut StageEntry, patch: &Patch) -> Result<(), P
                 entry.access_log_settings = None;
                 Ok(())
             }
-            _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+            _ => Err(patch.unsupported_path()),
         };
     }
     let mut settings = entry.access_log_settings.clone().unwrap_or_default();
@@ -448,7 +420,7 @@ fn apply_access_log_patch(entry: &mut StageEntry, patch: &Patch) -> Result<(), P
                 }
             }
         }
-        _ => return Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => return Err(patch.unsupported_path()),
     }
     entry.access_log_settings = Some(settings);
     Ok(())
@@ -526,7 +498,7 @@ fn method_setting_tail(patch: &Patch) -> Option<(usize, &'static str)> {
 /// the patch addressed.
 fn apply_method_setting_patch(entry: &mut StageEntry, patch: &Patch) -> Result<(), PatchFailure> {
     let Some((depth, setting)) = method_setting_tail(patch) else {
-        return Err(patch.unsupported_path(SUPPORTED_PATHS));
+        return Err(patch.unsupported_path());
     };
     let raw: Vec<&str> = patch
         .path
@@ -535,7 +507,7 @@ fn apply_method_setting_patch(entry: &mut StageEntry, patch: &Patch) -> Result<(
         .split('/')
         .collect();
     let Some(method_path) = raw.get(..depth).map(|segments| segments.join("/")) else {
-        return Err(patch.unsupported_path(SUPPORTED_PATHS));
+        return Err(patch.unsupported_path());
     };
     if !entry.method_settings.contains_key(&method_path) {
         crate::state::bound_entries(
@@ -582,7 +554,7 @@ fn apply_method_setting_patch(entry: &mut StageEntry, patch: &Patch) -> Result<(
             &nested,
             UNAUTHORIZED_CACHE_CONTROL_HEADER_STRATEGY_VALUES,
         ),
-        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => Err(patch.unsupported_path()),
     }
 }
 

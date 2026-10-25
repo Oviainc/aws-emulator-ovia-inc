@@ -107,6 +107,9 @@ mod event_bridge_rule_templates;
 #[path = "all/input_deletion.rs"]
 mod input_deletion;
 
+#[path = "all/input_device_description.rs"]
+mod input_device_description;
+
 #[path = "all/input_device_listing.rs"]
 mod input_device_listing;
 
