@@ -1,22 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InferSNOMEDCT
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InferSNOMEDCT`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InferSNOMEDCT::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. The ontology linking runs in-process: the submitted text is tokenized,
+//! every mention the lexicon below names — a medical condition, a body structure, a
+//! test, a treatment or a procedure — is placed from the characters the text itself
+//! carries, the context around each mention licenses its traits, the words beside it
+//! become its attributes, and each mention is linked to the SNOMED CT concepts its
+//! lexicon entry lists. Nothing is matched out of a particular request, and no value is
+//! carried over from one call to the next.
 //!
-//! ## Shape of an operation
+//! No maintained crates.io crate ships a clinical-text model that can be loaded
+//! in-process without an external runtime, so the engine here is rule- and
+//! lexicon-based — the same class of engine as `crate::ops::infer_icd10_cm` and as the
+//! recognisers in the sibling `comprehend` crate — and the rule each table applies is
+//! stated on that table.
 //!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `InferSNOMEDCT::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! The generic half of that pass is NOT written twice: tokenization, spans, lexicon
+//! matching, the context cues, the character-offset conversion and the confidence
+//! weights are reached from [`crate::ops::infer_icd10_cm`], which states them once for
+//! every ontology-linking operation of this service. What lives here is what is SNOMED
+//! CT's own — the lexicon, the three entity categories, the measurement attributes of a
+//! test name, and the mapping onto the modelled SNOMED CT shapes.
+//!
+//! The operation holds NO state: the answer is a function of the submitted text alone,
+//! so repeating the call returns the same entities and nothing a later caller reads is
+//! changed by calling it.
 //!
 //! ## Reaching this service's state
 //!
@@ -93,6 +102,2389 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+// The generic clinical-text pass, stated once for every ontology-linking operation of
+// this service. See the module docs of `infer_icd10_cm` for why it lives there.
+use crate::ops::infer_icd10_cm::{
+    character_offset, character_starts, cue_precedes, cue_trait_names, first_family_cues, is_count,
+    lexicon_matches, term_confidence, tokenize, Span, Token, ACUITY_MODIFIERS,
+    ATTRIBUTE_WINDOW_TOKENS, CONCEPT_CANDIDATE_LIMIT, CONCEPT_RANK_DECAY, DIRECTION_MODIFIERS,
+    QUALITY_MODIFIERS, RELATIONSHIP_DISTANCE_PENALTY, WEIGHT_CUE, WEIGHT_MODIFIER, WEIGHT_PATTERN,
+    WEIGHT_RELATIONSHIP,
+};
+
+/// The version this emulator reports for the model behind the ontology linking.
+///
+/// The modelled `ModelVersion` member documents the SHAPE of the value ("in the format
+/// n.n.n"), not a particular version, so one constant is the single source for every
+/// response this operation serves.
+const MODEL_VERSION: &str = "0.1.0";
+
+/// The SNOMED CT revision the lexicon below is drawn from, which is what the modelled
+/// `SNOMEDCTDetails` reports: the edition, the language of its descriptions, and the
+/// release date of that edition.
+const DETAILS_EDITION: &str = "US";
+const DETAILS_LANGUAGE: &str = "en";
+const DETAILS_VERSION_DATE: &str = "2021-03-01";
+
+// The modelled enum values this pass can produce, named once so no rule below can
+// invent a value outside the enum: `SNOMEDCTEntityCategory`, `SNOMEDCTEntityType`,
+// `SNOMEDCTTraitName`, `SNOMEDCTAttributeType` and `SNOMEDCTRelationshipType` (see
+// `super::types::S_N_O_M_E_D_C_T_*_VALUES`, generated from the model).
+const CATEGORY_MEDICAL_CONDITION: &str = "MEDICAL_CONDITION";
+const CATEGORY_ANATOMY: &str = "ANATOMY";
+const CATEGORY_TEST_TREATMENT_PROCEDURE: &str = "TEST_TREATMENT_PROCEDURE";
+const TYPE_DX_NAME: &str = "DX_NAME";
+const TYPE_TEST_NAME: &str = "TEST_NAME";
+const TYPE_PROCEDURE_NAME: &str = "PROCEDURE_NAME";
+const TYPE_TREATMENT_NAME: &str = "TREATMENT_NAME";
+const TRAIT_DIAGNOSIS: &str = "DIAGNOSIS";
+const TRAIT_SIGN: &str = "SIGN";
+const TRAIT_SYMPTOM: &str = "SYMPTOM";
+const TRAIT_PAST_HISTORY: &str = "PAST_HISTORY";
+const TRAIT_FUTURE: &str = "FUTURE";
+const ATTRIBUTE_ACUITY: &str = "ACUITY";
+const ATTRIBUTE_QUALITY: &str = "QUALITY";
+const ATTRIBUTE_DIRECTION: &str = "DIRECTION";
+const ATTRIBUTE_SYSTEM_ORGAN_SITE: &str = "SYSTEM_ORGAN_SITE";
+const ATTRIBUTE_TEST_VALUE: &str = "TEST_VALUE";
+const ATTRIBUTE_TEST_UNIT: &str = "TEST_UNIT";
+
+/// One SNOMED CT concept: the concept id and the description the ontology gives it.
+#[derive(Debug)]
+struct Concept {
+    code: &'static str,
+    description: &'static str,
+}
+
+/// One lexicon entry: a written form of a clinical concept, what the modelled enums call
+/// it, the trait a bare mention of it licenses, and the SNOMED CT concepts that mention
+/// could refer to.
+///
+/// `term` is the written form already normalized the way the shared tokenizer normalizes
+/// the submitted text — lowercase tokens separated by single spaces — so a mention
+/// written with different case, spacing or hyphenation still matches it.
+///
+/// `entity_type` is `None` for a body structure: the modelled `SNOMEDCTEntityType` names
+/// only the four clinical kinds (`DX_NAME`, `TEST_NAME`, `PROCEDURE_NAME`,
+/// `TREATMENT_NAME`), so an anatomical entity reports its category and no type rather
+/// than a value the enum does not hold. `base_trait` is `None` wherever a bare mention
+/// asserts nothing about the patient (a body structure, a test, a treatment).
+#[derive(Debug)]
+struct Term {
+    term: &'static str,
+    category: &'static str,
+    entity_type: Option<&'static str>,
+    base_trait: Option<&'static str>,
+    concepts: &'static [Concept],
+}
+
+// The candidate lists. Source: the concept ids and descriptions of the SNOMED CT release
+// named by `DETAILS_*` above, which is what the modelled `SNOMEDCTConcept` reports. Each
+// list is ordered most-likely-first: the concept a bare mention names, then the nearby
+// concepts the same mention could be refined to. Lists are shared by the synonyms and
+// abbreviations that name one concept.
+
+const CONCEPTS_DIABETES: &[Concept] = &[
+    Concept {
+        code: "73211009",
+        description: "Diabetes mellitus",
+    },
+    Concept {
+        code: "44054006",
+        description: "Diabetes mellitus type 2",
+    },
+    Concept {
+        code: "46635009",
+        description: "Diabetes mellitus type 1",
+    },
+];
+
+const CONCEPTS_DIABETES_TYPE_2: &[Concept] = &[
+    Concept {
+        code: "44054006",
+        description: "Diabetes mellitus type 2",
+    },
+    Concept {
+        code: "73211009",
+        description: "Diabetes mellitus",
+    },
+];
+
+const CONCEPTS_DIABETES_TYPE_1: &[Concept] = &[
+    Concept {
+        code: "46635009",
+        description: "Diabetes mellitus type 1",
+    },
+    Concept {
+        code: "73211009",
+        description: "Diabetes mellitus",
+    },
+];
+
+const CONCEPTS_KETOACIDOSIS: &[Concept] = &[Concept {
+    code: "420422005",
+    description: "Ketoacidosis in diabetes mellitus",
+}];
+
+const CONCEPTS_HYPERTENSION: &[Concept] = &[
+    Concept {
+        code: "38341003",
+        description: "Hypertensive disorder, systemic arterial",
+    },
+    Concept {
+        code: "59621000",
+        description: "Essential hypertension",
+    },
+];
+
+const CONCEPTS_HYPERLIPIDEMIA: &[Concept] = &[Concept {
+    code: "55822004",
+    description: "Hyperlipidemia",
+}];
+
+const CONCEPTS_MYOCARDIAL_INFARCTION: &[Concept] = &[
+    Concept {
+        code: "22298006",
+        description: "Myocardial infarction",
+    },
+    Concept {
+        code: "57054005",
+        description: "Acute myocardial infarction",
+    },
+];
+
+const CONCEPTS_ATRIAL_FIBRILLATION: &[Concept] = &[Concept {
+    code: "49436004",
+    description: "Atrial fibrillation",
+}];
+
+const CONCEPTS_HEART_FAILURE: &[Concept] = &[
+    Concept {
+        code: "84114007",
+        description: "Heart failure",
+    },
+    Concept {
+        code: "42343007",
+        description: "Congestive heart failure",
+    },
+];
+
+const CONCEPTS_CONGESTIVE_HEART_FAILURE: &[Concept] = &[
+    Concept {
+        code: "42343007",
+        description: "Congestive heart failure",
+    },
+    Concept {
+        code: "84114007",
+        description: "Heart failure",
+    },
+];
+
+const CONCEPTS_CORONARY_ARTERY_DISEASE: &[Concept] = &[Concept {
+    code: "53741008",
+    description: "Coronary arteriosclerosis",
+}];
+
+const CONCEPTS_STROKE: &[Concept] = &[Concept {
+    code: "230690007",
+    description: "Cerebrovascular accident",
+}];
+
+const CONCEPTS_ASTHMA: &[Concept] = &[Concept {
+    code: "195967001",
+    description: "Asthma",
+}];
+
+const CONCEPTS_COPD: &[Concept] = &[Concept {
+    code: "13645005",
+    description: "Chronic obstructive lung disease",
+}];
+
+const CONCEPTS_PNEUMONIA: &[Concept] = &[Concept {
+    code: "233604007",
+    description: "Pneumonia",
+}];
+
+const CONCEPTS_BRONCHITIS: &[Concept] = &[Concept {
+    code: "32398004",
+    description: "Bronchitis",
+}];
+
+const CONCEPTS_INFLUENZA: &[Concept] = &[Concept {
+    code: "6142004",
+    description: "Influenza",
+}];
+
+const CONCEPTS_COUGH: &[Concept] = &[Concept {
+    code: "49727002",
+    description: "Cough",
+}];
+
+const CONCEPTS_DYSPNEA: &[Concept] = &[Concept {
+    code: "267036007",
+    description: "Dyspnea",
+}];
+
+const CONCEPTS_WHEEZING: &[Concept] = &[Concept {
+    code: "56018004",
+    description: "Wheezing",
+}];
+
+const CONCEPTS_FEVER: &[Concept] = &[Concept {
+    code: "386661006",
+    description: "Fever",
+}];
+
+const CONCEPTS_CHILLS: &[Concept] = &[Concept {
+    code: "43724002",
+    description: "Chill",
+}];
+
+const CONCEPTS_FATIGUE: &[Concept] = &[Concept {
+    code: "84229001",
+    description: "Fatigue",
+}];
+
+const CONCEPTS_HEADACHE: &[Concept] = &[Concept {
+    code: "25064002",
+    description: "Headache",
+}];
+
+const CONCEPTS_MIGRAINE: &[Concept] = &[Concept {
+    code: "37796009",
+    description: "Migraine",
+}];
+
+const CONCEPTS_NAUSEA: &[Concept] = &[Concept {
+    code: "422587007",
+    description: "Nausea",
+}];
+
+const CONCEPTS_VOMITING: &[Concept] = &[Concept {
+    code: "422400008",
+    description: "Vomiting",
+}];
+
+const CONCEPTS_DIARRHEA: &[Concept] = &[Concept {
+    code: "62315008",
+    description: "Diarrhea",
+}];
+
+const CONCEPTS_CONSTIPATION: &[Concept] = &[Concept {
+    code: "14760008",
+    description: "Constipation",
+}];
+
+const CONCEPTS_ABDOMINAL_PAIN: &[Concept] = &[Concept {
+    code: "21522001",
+    description: "Abdominal pain",
+}];
+
+const CONCEPTS_CHEST_PAIN: &[Concept] = &[Concept {
+    code: "29857009",
+    description: "Chest pain",
+}];
+
+const CONCEPTS_BACK_PAIN: &[Concept] = &[Concept {
+    code: "161891005",
+    description: "Backache",
+}];
+
+const CONCEPTS_LOW_BACK_PAIN: &[Concept] = &[Concept {
+    code: "279039007",
+    description: "Low back pain",
+}];
+
+const CONCEPTS_PAIN: &[Concept] = &[Concept {
+    code: "22253000",
+    description: "Pain",
+}];
+
+const CONCEPTS_DIZZINESS: &[Concept] = &[Concept {
+    code: "404640003",
+    description: "Dizziness",
+}];
+
+const CONCEPTS_SYNCOPE: &[Concept] = &[Concept {
+    code: "271594007",
+    description: "Syncope",
+}];
+
+const CONCEPTS_RASH: &[Concept] = &[Concept {
+    code: "271807003",
+    description: "Eruption of skin",
+}];
+
+const CONCEPTS_WEIGHT_LOSS: &[Concept] = &[Concept {
+    code: "89362005",
+    description: "Weight loss finding",
+}];
+
+const CONCEPTS_EDEMA: &[Concept] = &[Concept {
+    code: "267038008",
+    description: "Edema",
+}];
+
+const CONCEPTS_SEIZURE: &[Concept] = &[Concept {
+    code: "91175000",
+    description: "Seizure",
+}];
+
+const CONCEPTS_SORE_THROAT: &[Concept] = &[
+    Concept {
+        code: "267102003",
+        description: "Sore throat symptom",
+    },
+    Concept {
+        code: "405737000",
+        description: "Pharyngitis",
+    },
+];
+
+const CONCEPTS_URINARY_TRACT_INFECTION: &[Concept] = &[Concept {
+    code: "68566005",
+    description: "Urinary tract infectious disease",
+}];
+
+const CONCEPTS_ANEMIA: &[Concept] = &[Concept {
+    code: "271737000",
+    description: "Anemia",
+}];
+
+const CONCEPTS_OBESITY: &[Concept] = &[Concept {
+    code: "414916001",
+    description: "Obesity",
+}];
+
+const CONCEPTS_DEPRESSION: &[Concept] = &[Concept {
+    code: "35489007",
+    description: "Depressive disorder",
+}];
+
+const CONCEPTS_ANXIETY: &[Concept] = &[
+    Concept {
+        code: "48694002",
+        description: "Anxiety",
+    },
+    Concept {
+        code: "197480006",
+        description: "Anxiety disorder",
+    },
+];
+
+const CONCEPTS_HYPOTHYROIDISM: &[Concept] = &[Concept {
+    code: "40930008",
+    description: "Hypothyroidism",
+}];
+
+const CONCEPTS_REFLUX: &[Concept] = &[Concept {
+    code: "235595009",
+    description: "Gastroesophageal reflux disease",
+}];
+
+const CONCEPTS_CHRONIC_KIDNEY_DISEASE: &[Concept] = &[Concept {
+    code: "709044004",
+    description: "Chronic kidney disease",
+}];
+
+const CONCEPTS_OSTEOARTHRITIS: &[Concept] = &[Concept {
+    code: "396275006",
+    description: "Osteoarthritis",
+}];
+
+const CONCEPTS_FRACTURE: &[Concept] = &[Concept {
+    code: "125605004",
+    description: "Fracture of bone",
+}];
+
+const CONCEPTS_THORAX: &[Concept] = &[Concept {
+    code: "51185008",
+    description: "Thoracic structure",
+}];
+
+const CONCEPTS_ABDOMEN: &[Concept] = &[Concept {
+    code: "113345001",
+    description: "Abdominal structure",
+}];
+
+const CONCEPTS_HEAD: &[Concept] = &[Concept {
+    code: "69536005",
+    description: "Head structure",
+}];
+
+const CONCEPTS_NECK: &[Concept] = &[Concept {
+    code: "45048000",
+    description: "Neck structure",
+}];
+
+const CONCEPTS_BACK: &[Concept] = &[Concept {
+    code: "77568009",
+    description: "Back structure",
+}];
+
+const CONCEPTS_LUNG: &[Concept] = &[Concept {
+    code: "39607008",
+    description: "Lung structure",
+}];
+
+const CONCEPTS_HEART: &[Concept] = &[Concept {
+    code: "80891009",
+    description: "Heart structure",
+}];
+
+const CONCEPTS_KIDNEY: &[Concept] = &[Concept {
+    code: "64033007",
+    description: "Kidney structure",
+}];
+
+const CONCEPTS_LIVER: &[Concept] = &[Concept {
+    code: "10200004",
+    description: "Liver structure",
+}];
+
+const CONCEPTS_STOMACH: &[Concept] = &[Concept {
+    code: "69695003",
+    description: "Stomach structure",
+}];
+
+const CONCEPTS_BLADDER: &[Concept] = &[Concept {
+    code: "89837001",
+    description: "Urinary bladder structure",
+}];
+
+const CONCEPTS_BRAIN: &[Concept] = &[Concept {
+    code: "12738006",
+    description: "Brain structure",
+}];
+
+const CONCEPTS_SKIN: &[Concept] = &[Concept {
+    code: "39937001",
+    description: "Skin structure",
+}];
+
+const CONCEPTS_THROAT: &[Concept] = &[Concept {
+    code: "54066008",
+    description: "Pharyngeal structure",
+}];
+
+const CONCEPTS_EYE: &[Concept] = &[Concept {
+    code: "81745001",
+    description: "Structure of eye proper",
+}];
+
+const CONCEPTS_EAR: &[Concept] = &[Concept {
+    code: "117590005",
+    description: "Ear structure",
+}];
+
+const CONCEPTS_ARM: &[Concept] = &[Concept {
+    code: "40983000",
+    description: "Structure of upper limb",
+}];
+
+const CONCEPTS_LEG: &[Concept] = &[Concept {
+    code: "61685007",
+    description: "Structure of lower limb",
+}];
+
+const CONCEPTS_HAND: &[Concept] = &[Concept {
+    code: "85562004",
+    description: "Hand structure",
+}];
+
+const CONCEPTS_FOOT: &[Concept] = &[Concept {
+    code: "56459004",
+    description: "Foot structure",
+}];
+
+const CONCEPTS_KNEE: &[Concept] = &[Concept {
+    code: "72696002",
+    description: "Knee region structure",
+}];
+
+const CONCEPTS_HIP: &[Concept] = &[Concept {
+    code: "29836001",
+    description: "Hip region structure",
+}];
+
+const CONCEPTS_SHOULDER: &[Concept] = &[Concept {
+    code: "16982005",
+    description: "Shoulder region structure",
+}];
+
+const CONCEPTS_BLOOD_PRESSURE: &[Concept] = &[Concept {
+    code: "75367002",
+    description: "Blood pressure",
+}];
+
+const CONCEPTS_HEART_RATE: &[Concept] = &[Concept {
+    code: "364075005",
+    description: "Heart rate",
+}];
+
+const CONCEPTS_TEMPERATURE: &[Concept] = &[Concept {
+    code: "56342008",
+    description: "Temperature taking",
+}];
+
+const CONCEPTS_HEMOGLOBIN_A1C: &[Concept] = &[Concept {
+    code: "43396009",
+    description: "Hemoglobin A1c measurement",
+}];
+
+const CONCEPTS_GLUCOSE: &[Concept] = &[Concept {
+    code: "33747003",
+    description: "Glucose measurement",
+}];
+
+const CONCEPTS_CREATININE: &[Concept] = &[Concept {
+    code: "70901006",
+    description: "Creatinine measurement",
+}];
+
+const CONCEPTS_COMPLETE_BLOOD_COUNT: &[Concept] = &[Concept {
+    code: "26604007",
+    description: "Complete blood count",
+}];
+
+const CONCEPTS_URINALYSIS: &[Concept] = &[Concept {
+    code: "27171005",
+    description: "Urinalysis",
+}];
+
+const CONCEPTS_CHEST_XRAY: &[Concept] = &[Concept {
+    code: "399208008",
+    description: "Plain chest X-ray",
+}];
+
+const CONCEPTS_XRAY: &[Concept] = &[Concept {
+    code: "168537006",
+    description: "Plain radiography",
+}];
+
+const CONCEPTS_COMPUTED_TOMOGRAPHY: &[Concept] = &[Concept {
+    code: "77477000",
+    description: "Computerized axial tomography",
+}];
+
+const CONCEPTS_MAGNETIC_RESONANCE_IMAGING: &[Concept] = &[Concept {
+    code: "113091000",
+    description: "Magnetic resonance imaging",
+}];
+
+const CONCEPTS_ELECTROCARDIOGRAM: &[Concept] = &[Concept {
+    code: "29303009",
+    description: "Electrocardiographic procedure",
+}];
+
+const CONCEPTS_ECHOCARDIOGRAM: &[Concept] = &[Concept {
+    code: "40701008",
+    description: "Echocardiography",
+}];
+
+const CONCEPTS_ULTRASOUND: &[Concept] = &[Concept {
+    code: "16310003",
+    description: "Diagnostic ultrasonography",
+}];
+
+const CONCEPTS_BIOPSY: &[Concept] = &[Concept {
+    code: "86273004",
+    description: "Biopsy",
+}];
+
+const CONCEPTS_COLONOSCOPY: &[Concept] = &[Concept {
+    code: "73761001",
+    description: "Colonoscopy",
+}];
+
+const CONCEPTS_APPENDECTOMY: &[Concept] = &[Concept {
+    code: "80146002",
+    description: "Appendectomy",
+}];
+
+const CONCEPTS_CHOLECYSTECTOMY: &[Concept] = &[Concept {
+    code: "38102005",
+    description: "Cholecystectomy",
+}];
+
+const CONCEPTS_CORONARY_BYPASS: &[Concept] = &[Concept {
+    code: "232717009",
+    description: "Coronary artery bypass graft",
+}];
+
+const CONCEPTS_CORONARY_INTERVENTION: &[Concept] = &[Concept {
+    code: "415070008",
+    description: "Percutaneous coronary intervention",
+}];
+
+const CONCEPTS_INTUBATION: &[Concept] = &[Concept {
+    code: "112798008",
+    description: "Insertion of endotracheal tube",
+}];
+
+const CONCEPTS_DIALYSIS: &[Concept] = &[Concept {
+    code: "265764009",
+    description: "Renal dialysis",
+}];
+
+const CONCEPTS_SURGERY: &[Concept] = &[Concept {
+    code: "387713003",
+    description: "Surgical procedure",
+}];
+
+const CONCEPTS_TRANSFUSION: &[Concept] = &[Concept {
+    code: "116859006",
+    description: "Transfusion of blood product",
+}];
+
+const CONCEPTS_CHEMOTHERAPY: &[Concept] = &[Concept {
+    code: "367336001",
+    description: "Chemotherapy",
+}];
+
+const CONCEPTS_RADIOTHERAPY: &[Concept] = &[Concept {
+    code: "108290001",
+    description: "Radiation oncology AND/OR radiotherapy",
+}];
+
+const CONCEPTS_PHYSICAL_THERAPY: &[Concept] = &[Concept {
+    code: "91251008",
+    description: "Physical therapy procedure",
+}];
+
+const CONCEPTS_VACCINATION: &[Concept] = &[Concept {
+    code: "33879002",
+    description: "Administration of vaccine product",
+}];
+
+const CONCEPTS_OXYGEN_THERAPY: &[Concept] = &[Concept {
+    code: "57485005",
+    description: "Oxygen therapy",
+}];
+
+const CONCEPTS_INSULIN: &[Concept] = &[Concept {
+    code: "67866001",
+    description: "Insulin",
+}];
+
+const CONCEPTS_METFORMIN: &[Concept] = &[Concept {
+    code: "109081006",
+    description: "Metformin",
+}];
+
+const CONCEPTS_ASPIRIN: &[Concept] = &[Concept {
+    code: "387458008",
+    description: "Aspirin",
+}];
+
+const CONCEPTS_LISINOPRIL: &[Concept] = &[Concept {
+    code: "386873009",
+    description: "Lisinopril",
+}];
+
+const CONCEPTS_ATORVASTATIN: &[Concept] = &[Concept {
+    code: "373444002",
+    description: "Atorvastatin",
+}];
+
+const CONCEPTS_SALBUTAMOL: &[Concept] = &[Concept {
+    code: "372897005",
+    description: "Salbutamol",
+}];
+
+const CONCEPTS_PREDNISONE: &[Concept] = &[Concept {
+    code: "116602009",
+    description: "Prednisone",
+}];
+
+const CONCEPTS_AMOXICILLIN: &[Concept] = &[Concept {
+    code: "372687004",
+    description: "Amoxicillin",
+}];
+
+const CONCEPTS_IBUPROFEN: &[Concept] = &[Concept {
+    code: "387207008",
+    description: "Ibuprofen",
+}];
+
+const CONCEPTS_FUROSEMIDE: &[Concept] = &[Concept {
+    code: "387475002",
+    description: "Furosemide",
+}];
+
+const CONCEPTS_WARFARIN: &[Concept] = &[Concept {
+    code: "372756006",
+    description: "Warfarin",
+}];
+
+const CONCEPTS_METOPROLOL: &[Concept] = &[Concept {
+    code: "372826007",
+    description: "Metoprolol",
+}];
+
+const CONCEPTS_NITROGLYCERIN: &[Concept] = &[Concept {
+    code: "387404004",
+    description: "Glyceryl trinitrate",
+}];
+
+const CONCEPTS_OMEPRAZOLE: &[Concept] = &[Concept {
+    code: "387137007",
+    description: "Omeprazole",
+}];
+
+const CONCEPTS_ANTIBIOTIC: &[Concept] = &[Concept {
+    code: "255631004",
+    description: "Antibiotic",
+}];
+
+/// The lexicon: every written form this pass places, with the SNOMED CT concepts it is
+/// linked to.
+///
+/// A medical condition licenses the trait its own written form carries — a named disease
+/// is a `DIAGNOSIS`, something the patient reports is a `SYMPTOM`, something an examiner
+/// observes is a `SIGN` — which is what the modelled `SNOMEDCTTrait` reports for a bare
+/// mention. A body structure, a test, a treatment and a procedure assert nothing about
+/// the patient on their own, so they carry no base trait.
+const TERMS: &[Term] = &[
+    // Medical conditions.
+    Term {
+        term: "diabetes",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DIABETES,
+    },
+    Term {
+        term: "diabetes mellitus",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DIABETES,
+    },
+    Term {
+        term: "type 2 diabetes",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DIABETES_TYPE_2,
+    },
+    Term {
+        term: "type 2 diabetes mellitus",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DIABETES_TYPE_2,
+    },
+    Term {
+        term: "t2dm",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DIABETES_TYPE_2,
+    },
+    Term {
+        term: "type 1 diabetes",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DIABETES_TYPE_1,
+    },
+    Term {
+        term: "type 1 diabetes mellitus",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DIABETES_TYPE_1,
+    },
+    Term {
+        term: "t1dm",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DIABETES_TYPE_1,
+    },
+    Term {
+        term: "diabetic ketoacidosis",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_KETOACIDOSIS,
+    },
+    Term {
+        term: "dka",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_KETOACIDOSIS,
+    },
+    Term {
+        term: "hypertension",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_HYPERTENSION,
+    },
+    Term {
+        term: "htn",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_HYPERTENSION,
+    },
+    Term {
+        term: "high blood pressure",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_HYPERTENSION,
+    },
+    Term {
+        term: "hyperlipidemia",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_HYPERLIPIDEMIA,
+    },
+    Term {
+        term: "myocardial infarction",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_MYOCARDIAL_INFARCTION,
+    },
+    Term {
+        term: "heart attack",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_MYOCARDIAL_INFARCTION,
+    },
+    Term {
+        term: "atrial fibrillation",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_ATRIAL_FIBRILLATION,
+    },
+    Term {
+        term: "afib",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_ATRIAL_FIBRILLATION,
+    },
+    Term {
+        term: "heart failure",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_HEART_FAILURE,
+    },
+    Term {
+        term: "congestive heart failure",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_CONGESTIVE_HEART_FAILURE,
+    },
+    Term {
+        term: "chf",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_CONGESTIVE_HEART_FAILURE,
+    },
+    Term {
+        term: "coronary artery disease",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_CORONARY_ARTERY_DISEASE,
+    },
+    Term {
+        term: "cad",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_CORONARY_ARTERY_DISEASE,
+    },
+    Term {
+        term: "stroke",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_STROKE,
+    },
+    Term {
+        term: "cerebrovascular accident",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_STROKE,
+    },
+    Term {
+        term: "cva",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_STROKE,
+    },
+    Term {
+        term: "asthma",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_ASTHMA,
+    },
+    Term {
+        term: "copd",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_COPD,
+    },
+    Term {
+        term: "chronic obstructive pulmonary disease",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_COPD,
+    },
+    Term {
+        term: "pneumonia",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_PNEUMONIA,
+    },
+    Term {
+        term: "bronchitis",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_BRONCHITIS,
+    },
+    Term {
+        term: "influenza",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_INFLUENZA,
+    },
+    Term {
+        term: "flu",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_INFLUENZA,
+    },
+    Term {
+        term: "urinary tract infection",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_URINARY_TRACT_INFECTION,
+    },
+    Term {
+        term: "uti",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_URINARY_TRACT_INFECTION,
+    },
+    Term {
+        term: "anemia",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_ANEMIA,
+    },
+    Term {
+        term: "obesity",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_OBESITY,
+    },
+    Term {
+        term: "depression",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DEPRESSION,
+    },
+    Term {
+        term: "anxiety",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_ANXIETY,
+    },
+    Term {
+        term: "hypothyroidism",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_HYPOTHYROIDISM,
+    },
+    Term {
+        term: "gerd",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_REFLUX,
+    },
+    Term {
+        term: "acid reflux",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_REFLUX,
+    },
+    Term {
+        term: "chronic kidney disease",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_CHRONIC_KIDNEY_DISEASE,
+    },
+    Term {
+        term: "ckd",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_CHRONIC_KIDNEY_DISEASE,
+    },
+    Term {
+        term: "osteoarthritis",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_OSTEOARTHRITIS,
+    },
+    Term {
+        term: "migraine",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_MIGRAINE,
+    },
+    Term {
+        term: "fracture",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_FRACTURE,
+    },
+    Term {
+        term: "cough",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_COUGH,
+    },
+    Term {
+        term: "dyspnea",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_DYSPNEA,
+    },
+    Term {
+        term: "shortness of breath",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_DYSPNEA,
+    },
+    Term {
+        term: "sob",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_DYSPNEA,
+    },
+    Term {
+        term: "wheezing",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SIGN),
+        concepts: CONCEPTS_WHEEZING,
+    },
+    Term {
+        term: "fever",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_FEVER,
+    },
+    Term {
+        term: "pyrexia",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_FEVER,
+    },
+    Term {
+        term: "chills",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_CHILLS,
+    },
+    Term {
+        term: "fatigue",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_FATIGUE,
+    },
+    Term {
+        term: "headache",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_HEADACHE,
+    },
+    Term {
+        term: "nausea",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_NAUSEA,
+    },
+    Term {
+        term: "vomiting",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_VOMITING,
+    },
+    Term {
+        term: "emesis",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_VOMITING,
+    },
+    Term {
+        term: "diarrhea",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_DIARRHEA,
+    },
+    Term {
+        term: "constipation",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_CONSTIPATION,
+    },
+    Term {
+        term: "abdominal pain",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_ABDOMINAL_PAIN,
+    },
+    Term {
+        term: "chest pain",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_CHEST_PAIN,
+    },
+    Term {
+        term: "back pain",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_BACK_PAIN,
+    },
+    Term {
+        term: "low back pain",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_LOW_BACK_PAIN,
+    },
+    Term {
+        term: "pain",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_PAIN,
+    },
+    Term {
+        term: "dizziness",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_DIZZINESS,
+    },
+    Term {
+        term: "syncope",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_SYNCOPE,
+    },
+    Term {
+        term: "sore throat",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SYMPTOM),
+        concepts: CONCEPTS_SORE_THROAT,
+    },
+    Term {
+        term: "rash",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SIGN),
+        concepts: CONCEPTS_RASH,
+    },
+    Term {
+        term: "weight loss",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SIGN),
+        concepts: CONCEPTS_WEIGHT_LOSS,
+    },
+    Term {
+        term: "edema",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SIGN),
+        concepts: CONCEPTS_EDEMA,
+    },
+    Term {
+        term: "seizure",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_SIGN),
+        concepts: CONCEPTS_SEIZURE,
+    },
+    // Body structures. The modelled entity-type enum names no anatomical type, so these
+    // report their category and no type.
+    Term {
+        term: "chest",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_THORAX,
+    },
+    Term {
+        term: "thorax",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_THORAX,
+    },
+    Term {
+        term: "abdomen",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_ABDOMEN,
+    },
+    Term {
+        term: "abdominal",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_ABDOMEN,
+    },
+    Term {
+        term: "head",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_HEAD,
+    },
+    Term {
+        term: "neck",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_NECK,
+    },
+    Term {
+        term: "back",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_BACK,
+    },
+    Term {
+        term: "lung",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_LUNG,
+    },
+    Term {
+        term: "lungs",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_LUNG,
+    },
+    Term {
+        term: "heart",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_HEART,
+    },
+    Term {
+        term: "kidney",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_KIDNEY,
+    },
+    Term {
+        term: "kidneys",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_KIDNEY,
+    },
+    Term {
+        term: "liver",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_LIVER,
+    },
+    Term {
+        term: "stomach",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_STOMACH,
+    },
+    Term {
+        term: "bladder",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_BLADDER,
+    },
+    Term {
+        term: "brain",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_BRAIN,
+    },
+    Term {
+        term: "skin",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_SKIN,
+    },
+    Term {
+        term: "throat",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_THROAT,
+    },
+    Term {
+        term: "eye",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_EYE,
+    },
+    Term {
+        term: "ear",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_EAR,
+    },
+    Term {
+        term: "arm",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_ARM,
+    },
+    Term {
+        term: "leg",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_LEG,
+    },
+    Term {
+        term: "hand",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_HAND,
+    },
+    Term {
+        term: "foot",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_FOOT,
+    },
+    Term {
+        term: "knee",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_KNEE,
+    },
+    Term {
+        term: "hip",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_HIP,
+    },
+    Term {
+        term: "shoulder",
+        category: CATEGORY_ANATOMY,
+        entity_type: None,
+        base_trait: None,
+        concepts: CONCEPTS_SHOULDER,
+    },
+    // Tests.
+    Term {
+        term: "blood pressure",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_BLOOD_PRESSURE,
+    },
+    Term {
+        term: "bp",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_BLOOD_PRESSURE,
+    },
+    Term {
+        term: "heart rate",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_HEART_RATE,
+    },
+    Term {
+        term: "pulse",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_HEART_RATE,
+    },
+    Term {
+        term: "temperature",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_TEMPERATURE,
+    },
+    Term {
+        term: "hemoglobin a1c",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_HEMOGLOBIN_A1C,
+    },
+    Term {
+        term: "hba1c",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_HEMOGLOBIN_A1C,
+    },
+    Term {
+        term: "a1c",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_HEMOGLOBIN_A1C,
+    },
+    Term {
+        term: "blood glucose",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_GLUCOSE,
+    },
+    Term {
+        term: "glucose",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_GLUCOSE,
+    },
+    Term {
+        term: "creatinine",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_CREATININE,
+    },
+    Term {
+        term: "complete blood count",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_COMPLETE_BLOOD_COUNT,
+    },
+    Term {
+        term: "cbc",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_COMPLETE_BLOOD_COUNT,
+    },
+    Term {
+        term: "urinalysis",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_URINALYSIS,
+    },
+    Term {
+        term: "chest x ray",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_CHEST_XRAY,
+    },
+    Term {
+        term: "x ray",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_XRAY,
+    },
+    Term {
+        term: "ct scan",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_COMPUTED_TOMOGRAPHY,
+    },
+    Term {
+        term: "computed tomography",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_COMPUTED_TOMOGRAPHY,
+    },
+    Term {
+        term: "mri",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_MAGNETIC_RESONANCE_IMAGING,
+    },
+    Term {
+        term: "magnetic resonance imaging",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_MAGNETIC_RESONANCE_IMAGING,
+    },
+    Term {
+        term: "ecg",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_ELECTROCARDIOGRAM,
+    },
+    Term {
+        term: "ekg",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_ELECTROCARDIOGRAM,
+    },
+    Term {
+        term: "electrocardiogram",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_ELECTROCARDIOGRAM,
+    },
+    Term {
+        term: "echocardiogram",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_ECHOCARDIOGRAM,
+    },
+    Term {
+        term: "ultrasound",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TEST_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_ULTRASOUND,
+    },
+    // Procedures.
+    Term {
+        term: "biopsy",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_BIOPSY,
+    },
+    Term {
+        term: "colonoscopy",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_COLONOSCOPY,
+    },
+    Term {
+        term: "appendectomy",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_APPENDECTOMY,
+    },
+    Term {
+        term: "cholecystectomy",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_CHOLECYSTECTOMY,
+    },
+    Term {
+        term: "coronary artery bypass graft",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_CORONARY_BYPASS,
+    },
+    Term {
+        term: "cabg",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_CORONARY_BYPASS,
+    },
+    Term {
+        term: "percutaneous coronary intervention",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_CORONARY_INTERVENTION,
+    },
+    Term {
+        term: "pci",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_CORONARY_INTERVENTION,
+    },
+    Term {
+        term: "intubation",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_INTUBATION,
+    },
+    Term {
+        term: "dialysis",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_DIALYSIS,
+    },
+    Term {
+        term: "surgery",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_SURGERY,
+    },
+    Term {
+        term: "blood transfusion",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_TRANSFUSION,
+    },
+    Term {
+        term: "transfusion",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_TRANSFUSION,
+    },
+    Term {
+        term: "vaccination",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_VACCINATION,
+    },
+    Term {
+        term: "immunization",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_PROCEDURE_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_VACCINATION,
+    },
+    // Treatments.
+    Term {
+        term: "chemotherapy",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_CHEMOTHERAPY,
+    },
+    Term {
+        term: "radiation therapy",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_RADIOTHERAPY,
+    },
+    Term {
+        term: "radiotherapy",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_RADIOTHERAPY,
+    },
+    Term {
+        term: "physical therapy",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_PHYSICAL_THERAPY,
+    },
+    Term {
+        term: "oxygen therapy",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_OXYGEN_THERAPY,
+    },
+    Term {
+        term: "supplemental oxygen",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_OXYGEN_THERAPY,
+    },
+    Term {
+        term: "insulin",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_INSULIN,
+    },
+    Term {
+        term: "metformin",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_METFORMIN,
+    },
+    Term {
+        term: "aspirin",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_ASPIRIN,
+    },
+    Term {
+        term: "lisinopril",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_LISINOPRIL,
+    },
+    Term {
+        term: "atorvastatin",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_ATORVASTATIN,
+    },
+    Term {
+        term: "albuterol",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_SALBUTAMOL,
+    },
+    Term {
+        term: "salbutamol",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_SALBUTAMOL,
+    },
+    Term {
+        term: "prednisone",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_PREDNISONE,
+    },
+    Term {
+        term: "amoxicillin",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_AMOXICILLIN,
+    },
+    Term {
+        term: "ibuprofen",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_IBUPROFEN,
+    },
+    Term {
+        term: "furosemide",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_FUROSEMIDE,
+    },
+    Term {
+        term: "warfarin",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_WARFARIN,
+    },
+    Term {
+        term: "metoprolol",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_METOPROLOL,
+    },
+    Term {
+        term: "nitroglycerin",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_NITROGLYCERIN,
+    },
+    Term {
+        term: "omeprazole",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_OMEPRAZOLE,
+    },
+    Term {
+        term: "antibiotic",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_ANTIBIOTIC,
+    },
+    Term {
+        term: "antibiotics",
+        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+        entity_type: Some(TYPE_TREATMENT_NAME),
+        base_trait: None,
+        concepts: CONCEPTS_ANTIBIOTIC,
+    },
+];
+
+/// Words that place the mention after them in the patient's history rather than in the
+/// present, which is what the modelled `PAST_HISTORY` trait reports.
+const PAST_HISTORY_CUES: &[&str] = &[
+    "history",
+    "hx",
+    "previously",
+    "previous",
+    "prior",
+    "past",
+    "formerly",
+    "remote",
+    "childhood",
+];
+
+/// Words that place the mention after them in the future — something planned, scheduled
+/// or recommended rather than observed — which is what the modelled `FUTURE` trait
+/// reports.
+const FUTURE_CUES: &[&str] = &[
+    "will",
+    "plan",
+    "plans",
+    "planned",
+    "schedule",
+    "scheduled",
+    "upcoming",
+    "anticipate",
+    "anticipated",
+    "expect",
+    "expected",
+    "recommend",
+    "recommended",
+    "advised",
+    "start",
+    "begin",
+];
+
+/// The units a clinical measurement is reported in, as single alphanumeric runs: the
+/// tokenizer splits on everything else, so "mg/dL" arrives as "mg" and "dl" and a
+/// written unit of several runs is re-joined by [`joined_written_value`].
+///
+/// Source: the units the vital signs and laboratory results of a patient record are
+/// written in, which is what the modelled `TEST_UNIT` attribute reports.
+const TEST_UNITS: &[&str] = &[
+    "mg", "g", "mcg", "ng", "kg", "lb", "lbs", "dl", "l", "ml", "mmol", "mol", "mmhg", "cmh2o",
+    "bpm", "celsius", "fahrenheit", "c", "f", "percent", "iu", "units", "unit", "mm", "cm", "m",
+    "sec", "min", "hr",
+];
+
+/// One attribute of an entity: a stretch of text beside the mention that says something
+/// about it, which modelled attribute type it reports, and the concepts it is itself
+/// linked to when a lexicon placed it.
+#[derive(Debug)]
+struct Attribute {
+    span: Span,
+    attribute_type: &'static str,
+    category: &'static str,
+    score: f32,
+    /// Tokens between the attribute and the mention, which is what the relationship
+    /// confidence falls off with.
+    distance: usize,
+    concepts: &'static [Concept],
+}
+
+/// One entity the pass placed: the stretch of text naming it, its lexicon entry, and the
+/// attributes read as belonging to it.
+#[derive(Debug)]
+struct Entity {
+    span: Span,
+    term: &'static Term,
+    attributes: Vec<Attribute>,
+}
+
+/// The lexicon, indexed by written form, with the longest form it holds.
+struct Lexicon {
+    terms: HashMap<&'static str, &'static Term>,
+    max_tokens: usize,
+}
+
+/// The lexicon, built once per process rather than per request.
+fn lexicon() -> &'static Lexicon {
+    static LEXICON: OnceLock<Lexicon> = OnceLock::new();
+    LEXICON.get_or_init(|| {
+        let mut terms = HashMap::with_capacity(TERMS.len());
+        let mut max_tokens = 1;
+        for term in TERMS {
+            max_tokens = max_tokens.max(term.term.split(' ').count());
+            terms.insert(term.term, term);
+        }
+        Lexicon { terms, max_tokens }
+    })
+}
+
+/// How the entity and an attribute of that type are related, as the modelled
+/// `SNOMEDCTRelationshipType` names it. Every member of the attribute-type enum is also
+/// a member of the relationship-type enum, so the relationship an attribute has to its
+/// entity is the one its own type names.
+fn relationship_type(attribute_type: &'static str) -> &'static str {
+    attribute_type
+}
+
+/// The category an attribute reports: a body site or a laterality names a body
+/// structure, a measured value or its unit belongs to the test it was measured by, and
+/// an acuity or a quality qualifies the entity it modifies, so it carries that entity's
+/// category.
+fn attribute_category(attribute_type: &str, entity_category: &'static str) -> &'static str {
+    match attribute_type {
+        ATTRIBUTE_SYSTEM_ORGAN_SITE | ATTRIBUTE_DIRECTION => CATEGORY_ANATOMY,
+        ATTRIBUTE_TEST_VALUE | ATTRIBUTE_TEST_UNIT => CATEGORY_TEST_TREATMENT_PROCEDURE,
+        _ => entity_category,
+    }
+}
+
+/// The modelled attribute type a one-word modifier reports, or `None` when the word
+/// modifies nothing. The vocabularies are the shared ones: how far the condition has
+/// progressed (acuity), how it presents (quality), and which side or part of the body it
+/// is on (direction).
+fn modifier_type(token: &Token) -> Option<&'static str> {
+    let word = token.lower.as_str();
+    if ACUITY_MODIFIERS.contains(&word) {
+        return Some(ATTRIBUTE_ACUITY);
+    }
+    if QUALITY_MODIFIERS.contains(&word) {
+        return Some(ATTRIBUTE_QUALITY);
+    }
+    if DIRECTION_MODIFIERS.contains(&word) {
+        return Some(ATTRIBUTE_DIRECTION);
+    }
+    None
+}
+
+/// Tokens between two spans of one clause.
+fn token_distance(left: &Span, right: &Span) -> usize {
+    if left.tokens.end <= right.tokens.start {
+        right.tokens.start - left.tokens.end
+    } else {
+        left.tokens.start.saturating_sub(right.tokens.end)
+    }
+}
+
+/// The entity of `span`'s own clause nearest to it, with the tokens between them.
+fn nearest_entity(tokens: &[Token], entities: &[Entity], span: &Span) -> Option<(usize, usize)> {
+    entities
+        .iter()
+        .enumerate()
+        .filter(|(_, entity)| {
+            tokens[entity.span.tokens.start].clause == tokens[span.tokens.start].clause
+        })
+        .map(|(index, entity)| (token_distance(&entity.span, span), index))
+        .min()
+        .map(|(distance, index)| (index, distance))
+}
+
+/// Whether the tokens at `left` and `right` are two runs of ONE written value: a single
+/// `/` or `-` separates them in the text, as a blood pressure ("140/90") and a
+/// concentration ("mg/dL") are written.
+fn joined_written_value(text: &str, tokens: &[Token], left: usize, right: usize) -> bool {
+    matches!(&text[tokens[left].end..tokens[right].start], "/" | "-")
+}
+
+/// The measured value and the unit a test name is reported with: within
+/// [`ATTRIBUTE_WINDOW_TOKENS`] tokens AFTER the test name, in its own clause, a written
+/// number is the value the test produced and a unit word is the unit it was measured in.
+fn measurement_attributes(
+    tokens: &[Token],
+    text: &str,
+    span: &Span,
+    covered: &mut [bool],
+) -> Vec<Attribute> {
+    let clause = tokens[span.tokens.start].clause;
+    let limit = (span.tokens.end + ATTRIBUTE_WINDOW_TOKENS).min(tokens.len());
+    let mut attributes = Vec::new();
+    let mut index = span.tokens.end;
+    while index < limit {
+        if covered[index] || tokens[index].clause != clause {
+            break;
+        }
+        let attribute_type = if is_count(&tokens[index]) {
+            ATTRIBUTE_TEST_VALUE
+        } else if TEST_UNITS.contains(&tokens[index].lower.as_str()) {
+            ATTRIBUTE_TEST_UNIT
+        } else {
+            index += 1;
+            continue;
+        };
+        // One written value may be several runs joined by a single separator.
+        let mut end = index + 1;
+        while end < tokens.len()
+            && !covered[end]
+            && tokens[end].clause == clause
+            && joined_written_value(text, tokens, end - 1, end)
+            && of_same_kind(&tokens[end], attribute_type)
+        {
+            end += 1;
+        }
+        let distance = index - span.tokens.end;
+        for taken in &mut covered[index..end] {
+            *taken = true;
+        }
+        attributes.push(Attribute {
+            span: Span::of(tokens, index..end),
+            attribute_type,
+            category: CATEGORY_TEST_TREATMENT_PROCEDURE,
+            score: WEIGHT_PATTERN,
+            distance,
+            concepts: &[],
+        });
+        index = end;
+    }
+    attributes
+}
+
+/// Whether `token` continues a written value of the given attribute type.
+fn of_same_kind(token: &Token, attribute_type: &str) -> bool {
+    match attribute_type {
+        ATTRIBUTE_TEST_VALUE => is_count(token),
+        ATTRIBUTE_TEST_UNIT => TEST_UNITS.contains(&token.lower.as_str()),
+        _ => false,
+    }
+}
+
+/// The modifiers standing within [`ATTRIBUTE_WINDOW_TOKENS`] tokens of the mention at
+/// `span`, in its own clause, that no other span has taken. Entities are served in
+/// document order, so a modifier between two mentions belongs to the first that reaches
+/// it.
+fn modifier_attributes(
+    tokens: &[Token],
+    span: &Span,
+    covered: &mut [bool],
+    entity_category: &'static str,
+) -> Vec<Attribute> {
+    let clause = tokens[span.tokens.start].clause;
+    let before = span.tokens.start.saturating_sub(ATTRIBUTE_WINDOW_TOKENS)..span.tokens.start;
+    let after = span.tokens.end..(span.tokens.end + ATTRIBUTE_WINDOW_TOKENS).min(tokens.len());
+    let mut attributes = Vec::new();
+    for index in before.chain(after) {
+        if covered[index] || tokens[index].clause != clause {
+            continue;
+        }
+        let Some(attribute_type) = modifier_type(&tokens[index]) else {
+            continue;
+        };
+        let distance = if index < span.tokens.start {
+            span.tokens.start - index - 1
+        } else {
+            index - span.tokens.end
+        };
+        covered[index] = true;
+        attributes.push(Attribute {
+            span: Span::of(tokens, index..index + 1),
+            attribute_type,
+            category: attribute_category(attribute_type, entity_category),
+            score: WEIGHT_MODIFIER,
+            distance,
+            concepts: &[],
+        });
+    }
+    attributes
+}
+
+/// The traits of the span at `span`: the one its lexicon entry licenses on its own, plus
+/// every trait the words around it license — the shared context cues, and the cues that
+/// place the mention in the patient's history or in the future.
+fn span_traits(
+    tokens: &[Token],
+    span: &Span,
+    family_cues: &HashMap<usize, usize>,
+    base_trait: Option<&'static str>,
+    base_score: f32,
+) -> Vec<SNOMEDCTTrait> {
+    let mut traits = Vec::new();
+    if let Some(name) = base_trait {
+        traits.push(SNOMEDCTTrait {
+            name: Some(name.to_string()),
+            score: Some(base_score),
+        });
+    }
+    traits.extend(
+        cue_trait_names(tokens, span, family_cues)
+            .into_iter()
+            .map(|name| SNOMEDCTTrait {
+                name: Some(name.to_string()),
+                score: Some(WEIGHT_CUE),
+            }),
+    );
+    for (cues, name) in [
+        (PAST_HISTORY_CUES, TRAIT_PAST_HISTORY),
+        (FUTURE_CUES, TRAIT_FUTURE),
+    ] {
+        if cue_precedes(tokens, span, cues) {
+            traits.push(SNOMEDCTTrait {
+                name: Some(name.to_string()),
+                score: Some(WEIGHT_CUE),
+            });
+        }
+    }
+    traits
+}
+
+/// The SNOMED CT concepts a lexicon entry is linked to, most likely first.
+///
+/// The candidates of one entry are ordered most-likely-first, and the modelled
+/// `SNOMEDCTConcept$Score` reports the likelihood of the match, so each successive
+/// candidate reports a fixed share of the one in front of it and the list is strictly
+/// descending.
+fn concepts(entry: &'static [Concept], score: f32) -> Vec<SNOMEDCTConcept> {
+    entry
+        .iter()
+        .take(CONCEPT_CANDIDATE_LIMIT)
+        .enumerate()
+        .map(|(rank, concept)| SNOMEDCTConcept {
+            code: Some(concept.code.to_string()),
+            description: Some(concept.description.to_string()),
+            score: Some(score * CONCEPT_RANK_DECAY.powi(i32::try_from(rank).unwrap_or(i32::MAX))),
+        })
+        .collect()
+}
+
+/// The SNOMED CT entities the submitted text carries.
+///
+/// The answer is a function of `text` alone: every mention is placed from the text's own
+/// characters, so the same text always yields the same entities and no value from any
+/// other request can appear. `BeginOffset`/`EndOffset` are 0-based CHARACTER offsets, as
+/// the modelled members document, so an entity's `Text` is exactly the characters they
+/// delimit.
+pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
+    let tokens = tokenize(text);
+    let mut covered = vec![false; tokens.len()];
+    let family_cues = first_family_cues(&tokens);
+    let lexicon = lexicon();
+
+    // Every lexicon mention, in document order. The matcher marks the tokens it placed,
+    // so a mention never overlaps another and no modifier pass below re-reads one.
+    let matches: Vec<(Span, &'static Term)> =
+        lexicon_matches(&tokens, &mut covered, lexicon.max_tokens, |phrase| {
+            lexicon.terms.contains_key(phrase)
+        })
+        .into_iter()
+        .filter_map(|(span, phrase)| {
+            lexicon
+                .terms
+                .get(phrase.as_str())
+                .map(|term| (span, *term))
+        })
+        .collect();
+
+    // A mention of a condition, a test, a treatment or a procedure is an entity of its
+    // own. A body structure is the SITE of such an entity when it stands within the
+    // attribute window of one in the same clause — that is what the modelled
+    // `SYSTEM_ORGAN_SITE` attribute reports — and an entity of its own otherwise.
+    let mut entities: Vec<Entity> = matches
+        .iter()
+        .filter(|(_, term)| term.category != CATEGORY_ANATOMY)
+        .map(|(span, term)| Entity {
+            span: span.clone(),
+            term,
+            attributes: Vec::new(),
+        })
+        .collect();
+    let mut loose_anatomy: Vec<(Span, &'static Term)> = Vec::new();
+    for (span, term) in matches
+        .iter()
+        .filter(|(_, term)| term.category == CATEGORY_ANATOMY)
+    {
+        match nearest_entity(&tokens, &entities, span) {
+            Some((owner, distance)) if distance <= ATTRIBUTE_WINDOW_TOKENS => {
+                let score = term_confidence(term.term.split(' ').count());
+                entities[owner].attributes.push(Attribute {
+                    span: span.clone(),
+                    attribute_type: ATTRIBUTE_SYSTEM_ORGAN_SITE,
+                    category: CATEGORY_ANATOMY,
+                    score,
+                    distance,
+                    concepts: term.concepts,
+                });
+            }
+            _ => loose_anatomy.push((span.clone(), term)),
+        }
+    }
+    entities.extend(loose_anatomy.into_iter().map(|(span, term)| Entity {
+        span,
+        term,
+        attributes: Vec::new(),
+    }));
+
+    // The value, the unit and the modifiers come last, so a token a mention already
+    // covers is never read as one of them too.
+    let placed: Vec<(usize, Span, &'static Term)> = entities
+        .iter()
+        .enumerate()
+        .map(|(index, entity)| (index, entity.span.clone(), entity.term))
+        .collect();
+    for (index, span, term) in placed {
+        let mut found = Vec::new();
+        if term.entity_type == Some(TYPE_TEST_NAME) {
+            found.extend(measurement_attributes(&tokens, text, &span, &mut covered));
+        }
+        found.extend(modifier_attributes(
+            &tokens,
+            &span,
+            &mut covered,
+            term.category,
+        ));
+        entities[index].attributes.extend(found);
+    }
+
+    entities.sort_by_key(|entity| entity.span.start);
+
+    // Character offsets, as both modelled offset members document, from the byte offsets
+    // the pass works in.
+    let starts = character_starts(text);
+
+    // `Id` is a monotonically increasing id unique within this response: every entity
+    // and every attribute takes the next one, in the order they are written.
+    let next_id = std::cell::Cell::new(0i32);
+    let mint_id = || {
+        let id = next_id.get();
+        next_id.set(id + 1);
+        id
+    };
+    let mut reported = Vec::with_capacity(entities.len());
+    for entity in entities {
+        let score = term_confidence(entity.term.term.split(' ').count());
+        let id = mint_id();
+        let traits = span_traits(
+            &tokens,
+            &entity.span,
+            &family_cues,
+            entity.term.base_trait,
+            score,
+        );
+        let mut attributes = entity.attributes;
+        attributes.sort_by_key(|attribute| attribute.span.start);
+        let attributes = attributes
+            .into_iter()
+            .map(|attribute| {
+                let attribute_id = mint_id();
+                let relationship_score = (WEIGHT_RELATIONSHIP
+                    - RELATIONSHIP_DISTANCE_PENALTY * attribute.distance as f32)
+                    .clamp(0.0, 1.0);
+                SNOMEDCTAttribute {
+                    category: Some(attribute.category.to_string()),
+                    r#type: Some(attribute.attribute_type.to_string()),
+                    score: Some(attribute.score),
+                    relationship_score: Some(relationship_score),
+                    relationship_type: Some(relationship_type(attribute.attribute_type).to_string()),
+                    id: Some(attribute_id),
+                    begin_offset: Some(character_offset(&starts, attribute.span.start)),
+                    end_offset: Some(character_offset(&starts, attribute.span.end)),
+                    text: Some(text[attribute.span.start..attribute.span.end].to_string()),
+                    traits: Some(span_traits(
+                        &tokens,
+                        &attribute.span,
+                        &family_cues,
+                        None,
+                        attribute.score,
+                    )),
+                    // Only an attribute a lexicon placed names a concept of its own.
+                    snomedct_concepts: match attribute.concepts {
+                        [] => None,
+                        entry => Some(concepts(entry, attribute.score)),
+                    },
+                }
+            })
+            .collect();
+        reported.push(SNOMEDCTEntity {
+            id: Some(id),
+            text: Some(text[entity.span.start..entity.span.end].to_string()),
+            category: Some(entity.term.category.to_string()),
+            r#type: entity.term.entity_type.map(ToString::to_string),
+            score: Some(score),
+            begin_offset: Some(character_offset(&starts, entity.span.start)),
+            end_offset: Some(character_offset(&starts, entity.span.end)),
+            attributes: Some(attributes),
+            traits: Some(traits),
+            snomedct_concepts: Some(concepts(entity.term.concepts, score)),
+        });
+    }
+    reported
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -166,18 +2558,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InferSNOMEDCT` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InferSNOMEDCTErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InferSNOMEDCT"))
+        // Ontology linking holds NO state: the answer is a function of the submitted
+        // text alone, so repeating the call returns the same entities and nothing a
+        // later caller reads is changed by calling it.
+        let _ = (ctx, &self.engine);
+
+        // `Text` carries the modelled 1..10000 length, which the boundary validator
+        // enforces before this handler runs — reaching here means the text is present,
+        // non-empty and within the size limit — and it arrives as a Rust `String`, so
+        // it is valid UTF-8 and the modelled `InvalidEncodingException` is unreachable.
+        let entities = infer_snomedct(input.text.as_str());
+
+        Ok(InferSNOMEDCTOutput {
+            entities,
+            // Every entity of the submitted text is in this one response: nothing was
+            // truncated, so there is no page for the caller to resume from.
+            pagination_token: None,
+            model_version: Some(MODEL_VERSION.to_string()),
+            snomedct_details: Some(SNOMEDCTDetails {
+                edition: Some(DETAILS_EDITION.to_string()),
+                language: Some(DETAILS_LANGUAGE.to_string()),
+                version_date: Some(DETAILS_VERSION_DATE.to_string()),
+            }),
+            // "The number of characters in the input request documentation": the
+            // characters of the submitted text, counted as characters rather than bytes.
+            characters: Some(Characters {
+                original_text_characters: Some(
+                    i32::try_from(input.text.chars().count()).unwrap_or(i32::MAX),
+                ),
+            }),
+        })
     }
 }
