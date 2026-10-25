@@ -2298,34 +2298,38 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         by_edge.into_values().collect()
     }
 
-    /// The last instant inside the window at which this emulator recorded a change to the
-    /// service `identity` names, or `None` when it recorded none there.
+    /// The last change this emulator recorded to the service `identity` names inside the
+    /// window, as the RECORD that change was read off, or `None` when it recorded none
+    /// there.
     ///
     /// A stored SLO is a configuration of what Application Signals watches on its entity, so
-    /// the instants that record a change to a service are the instants its SLOs were written
-    /// at: each SLO's `CreatedTime` and its `LastUpdatedTime`, read off the stored record
-    /// rather than re-derived, so the instant reported here is one `GetServiceLevelObjective`
-    /// reports for the same SLO. Only an instant INSIDE the window counts: the window is the
-    /// period the caller asks about, so a change before it is not news in it and a change
-    /// after it has not happened yet. The bounds are compared the way every window in this
-    /// module is ([`instant_nanos`]), so this read and `ListEntityEvents` cannot disagree
-    /// about whether a change falls inside one.
-    fn last_changed_in_window(
+    /// the changes recorded for a service are the writes of its SLOs ([`slo_change_records`],
+    /// the same records `ListEntityEvents` reads its events off): each instant comes off the
+    /// stored record rather than being re-derived, so the instant reported here is one
+    /// `GetServiceLevelObjective` reports for the same SLO. Only an instant INSIDE the window
+    /// counts: the window is the period the caller asks about, so a change before it is not
+    /// news in it and a change after it has not happened yet. The bounds are compared the way
+    /// every window in this module is ([`instant_nanos`]), so this read and `ListEntityEvents`
+    /// cannot disagree about whether a change falls inside one.
+    ///
+    /// The RECORD rather than the bare instant is what comes back, because the event reported
+    /// for a change states the Region and the operation of the write it was read off
+    /// ([`ChangeRecord::event`]). "The last" is decided by the TOTAL order a history is read
+    /// in ([`ChangeRecord::order_key`]), so two writes at one instant cannot resolve
+    /// differently here and in the read that reports them as a list.
+    fn latest_change_in_window(
         &self,
         identity: &HashMap<String, String>,
         window_start: &DateTime,
         window_end: &DateTime,
-    ) -> Option<DateTime> {
-        let (window_start, window_end) = (instant_nanos(window_start), instant_nanos(window_end));
+    ) -> Option<ChangeRecord<'_>> {
+        let window = (instant_nanos(window_start), instant_nanos(window_end));
         self.slos
             .values()
             .filter(|slo| names_same_service(entity_of(slo).key_attributes.as_ref(), identity))
-            .flat_map(|slo| [slo.created_time, slo.last_updated_time])
-            .filter(|at| {
-                let at = instant_nanos(at);
-                window_start <= at && at <= window_end
-            })
-            .max_by_key(instant_nanos)
+            .flat_map(slo_change_records)
+            .filter(|record| record.inside(window))
+            .min_by_key(ChangeRecord::order_key)
     }
 
     /// The state of each service this emulator observed over the window, as
@@ -2335,7 +2339,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// read cannot report a service `ListServices` does not, and `filters` then narrows that
     /// set ([`passes_attribute_filter`]). Each reported entry carries the one most recent
     /// change recorded for its service inside the window
-    /// ([`Self::last_changed_in_window`]) — `ServiceState.LatestChangeEvents` is `@required`
+    /// ([`Self::latest_change_in_window`]) — `ServiceState.LatestChangeEvents` is `@required`
     /// with `length 1..1`, so a service with no recorded change inside the window has no
     /// state to report rather than one with an empty event list.
     ///
@@ -2343,18 +2347,17 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// states it carries; a request that named none has none applied, and holding no filters
     /// and holding an empty set are the same state.
     ///
-    /// `ChangeEvent` states WHAT changed, WHEN and WHERE: the entity is the identity this
-    /// read reports for the service, the instant is the recorded one, and the account and
-    /// region are this store's account and the caller's own region, exactly as a minted ARN
-    /// renders them. `UserName` and `EventName` stay absent: the store records that a
-    /// configuration changed and when, not who asked for it or what the service would call
-    /// the change.
+    /// `ChangeEvent` states WHAT changed, WHEN and WHERE, and it is built from the RECORD the
+    /// change was read off ([`ChangeRecord::event`]) exactly as `ListEntityEvents` builds it
+    /// for the same record: the entity is the identity this read reports for the service, and
+    /// the instant, the Region and the `EventName` are the write's own — nothing about the
+    /// event depends on who is reading it, so neither read can attribute one recorded change
+    /// to a Region or an operation the other does not.
     pub fn observed_service_states(
         &self,
         window_start: &DateTime,
         window_end: &DateTime,
         filters: &[AttributeFilter],
-        region: &str,
     ) -> Vec<ServiceState> {
         let applied = (!filters.is_empty()).then(|| filters.to_vec());
         self.observed_services(window_start, window_end)
@@ -2365,16 +2368,14 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                     .all(|filter| passes_attribute_filter(&summary.key_attributes, filter))
             })
             .filter_map(|summary| {
-                let changed_at =
-                    self.last_changed_in_window(&summary.key_attributes, window_start, window_end)?;
+                let change = self.latest_change_in_window(
+                    &summary.key_attributes,
+                    window_start,
+                    window_end,
+                )?;
                 Some(ServiceState {
                     attribute_filters: applied.clone(),
-                    latest_change_events: vec![change_event(
-                        changed_at,
-                        &summary.key_attributes,
-                        region,
-                        None,
-                    )],
+                    latest_change_events: vec![change.event(&summary.key_attributes)],
                     service: summary.key_attributes,
                 })
             })
@@ -3912,8 +3913,8 @@ fn record_region(arn: &str) -> &str {
     ::service_common::arn::region_of(arn, SIGNING_NAME).unwrap_or(DEFAULT_REGION)
 }
 
-/// One change event: the dated change `event_name` describes — nothing, where the record
-/// says only THAT it changed — to the entity `entity` identifies, in `region`.
+/// One change event: the dated change `event_name` names — the operation that made it — to
+/// the entity `entity` identifies, in `region`.
 ///
 /// The ONE place this service builds a [`ChangeEvent`], so the two reads that report one —
 /// `ListEntityEvents` through
@@ -3931,7 +3932,7 @@ fn change_event(
     at: DateTime,
     entity: &HashMap<String, String>,
     region: &str,
-    event_name: Option<&str>,
+    event_name: &str,
 ) -> ChangeEvent {
     ChangeEvent {
         timestamp: at,
@@ -3941,8 +3942,76 @@ fn change_event(
         change_event_type: CONFIGURATION_CHANGE_EVENT.to_string(),
         event_id: UNRECORDED_EVENT_ID.to_string(),
         user_name: None,
-        event_name: event_name.map(ToString::to_string),
+        event_name: Some(event_name.to_string()),
     }
+}
+
+/// One dated write this service holds the record of, as BOTH reads that report a
+/// [`ChangeEvent`] read it: the instant, the ARN of the record the instant was read off, and
+/// the operation that wrote that dated member.
+///
+/// A change event is a report of a WRITE, so everything the event says about where and what
+/// the change was comes off the record the write left behind rather than off the request
+/// reading it — which is what this type carries from the store to whichever read reports it.
+#[derive(Clone, Copy, Debug)]
+struct ChangeRecord<'store> {
+    at: DateTime,
+    arn: &'store str,
+    event_name: &'static str,
+}
+
+/// The key a [`ChangeRecord`] is ordered by ([`ChangeRecord::order_key`]).
+type ChangeOrder<'store> = (::std::cmp::Reverse<i128>, &'store str, &'static str);
+
+impl<'store> ChangeRecord<'store> {
+    /// This record reported as the change event of the entity `entity` identifies: the
+    /// Region of the record's OWN ARN ([`record_region`]) and the name of the operation that
+    /// wrote it, through the one [`change_event`] builder.
+    fn event(&self, entity: &HashMap<String, String>) -> ChangeEvent {
+        change_event(self.at, entity, record_region(self.arn), self.event_name)
+    }
+
+    /// Whether this write's instant falls inside the window, given as the pair of
+    /// nanosecond bounds ([`instant_nanos`]), INCLUSIVE at both ends.
+    fn inside(&self, (window_start, window_end): (i128, i128)) -> bool {
+        let at = instant_nanos(&self.at);
+        window_start <= at && at <= window_end
+    }
+
+    /// The order a history of changes is read in: newest first, with the record's ARN and the
+    /// event's name breaking a tie between two writes at the same instant. ASCENDING in this
+    /// key, so the smallest is the latest change — the order has to be TOTAL for a page
+    /// cursor into it to be a stable boundary, and for the ONE latest change to be the same
+    /// write however it is asked for.
+    fn order_key(&self) -> ChangeOrder<'store> {
+        (
+            ::std::cmp::Reverse(instant_nanos(&self.at)),
+            self.arn,
+            self.event_name,
+        )
+    }
+}
+
+/// The dated writes one stored SLO is the record of: its creation, and the update that last
+/// touched it when one followed.
+///
+/// A record that has never been updated carries its create instant in both members, which is
+/// ONE change, not two. Single-homed here so the reads that report a change of an SLO cannot
+/// disagree about which writes it is the record of.
+fn slo_change_records(slo: &ServiceLevelObjective) -> Vec<ChangeRecord<'_>> {
+    let mut records = vec![ChangeRecord {
+        at: slo.created_time,
+        arn: &slo.arn,
+        event_name: SLO_CREATED_EVENT_NAME,
+    }];
+    if instant_nanos(&slo.last_updated_time) > instant_nanos(&slo.created_time) {
+        records.push(ChangeRecord {
+            at: slo.last_updated_time,
+            arn: &slo.arn,
+            event_name: SLO_UPDATED_EVENT_NAME,
+        });
+    }
+    records
 }
 
 impl ComAmazonawsApplicationsignalsApplicationsignalsState {
@@ -3969,39 +4038,33 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// ends falls within it. Nothing else bounds the set — a window entirely in the future
     /// selects no event because no record is dated after now.
     ///
-    /// The order is newest first, which is the order a history is read in, with the record's
-    /// ARN and the event's name breaking a tie between two events at the same instant: the
-    /// order has to be TOTAL for a page cursor into it to be a stable boundary.
+    /// The order is newest first ([`ChangeRecord::order_key`]), which is the order a history
+    /// is read in, with the record's ARN and the event's name breaking a tie between two
+    /// events at the same instant: the order has to be TOTAL for a page cursor into it to be
+    /// a stable boundary.
     ///
-    /// `ListServiceStates` reads the same SLO instants ([`Self::last_changed_in_window`]) but
+    /// `ListServiceStates` reads the same SLO writes ([`Self::latest_change_in_window`]) but
     /// answers a different question — the ONE latest change of each DISCOVERED service,
     /// matching identities symmetrically ([`names_same_service`]) because the service it
     /// reports is one this emulator discovered rather than one a request named — so neither
-    /// read can be expressed as the other; both build their event through [`change_event`],
-    /// which is where what an event of this emulator carries is stated once.
-    pub fn entity_change_events(
-        &self,
+    /// read can be expressed as the other; both read the writes of an SLO off
+    /// [`slo_change_records`] and report one as [`ChangeRecord::event`] builds it, which is
+    /// where what an event of this emulator carries is stated once.
+    pub fn entity_change_events<'store>(
+        &'store self,
         entity: &HashMap<String, String>,
         window_start: &DateTime,
         window_end: &DateTime,
     ) -> Vec<ChangeEvent> {
-        // `(instant, tie-break key, event)`: the sort key is kept beside the event rather
-        // than re-derived in the comparator, so the order cannot drift from the key.
-        let mut dated: Vec<(i128, String, ChangeEvent)> = Vec::new();
-        let (window_start, window_end) = (instant_nanos(window_start), instant_nanos(window_end));
-        let mut collect = |at: DateTime,
-                           attributes: &HashMap<String, String>,
-                           arn: &str,
-                           event_name: &str| {
-            let at_nanos = instant_nanos(&at);
-            if at_nanos < window_start || at_nanos > window_end {
+        // `(sort key, event)`: the key is kept beside the event rather than re-derived in the
+        // comparator, so the order cannot drift from the key.
+        let mut dated: Vec<(ChangeOrder<'store>, ChangeEvent)> = Vec::new();
+        let window = (instant_nanos(window_start), instant_nanos(window_end));
+        let mut collect = |record: ChangeRecord<'store>, attributes: &HashMap<String, String>| {
+            if !record.inside(window) {
                 return;
             }
-            dated.push((
-                at_nanos,
-                format!("{arn}\u{1d}{event_name}"),
-                change_event(at, attributes, record_region(arn), Some(event_name)),
-            ));
+            dated.push((record.order_key(), record.event(attributes)));
         };
 
         for slo in self.slos.values() {
@@ -4014,21 +4077,8 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             if attributes.is_empty() || !attributes_contain(Some(&attributes), entity) {
                 continue;
             }
-            collect(
-                slo.created_time,
-                &attributes,
-                &slo.arn,
-                SLO_CREATED_EVENT_NAME,
-            );
-            // A record that has never been updated carries its create instant in both
-            // members, which is ONE change, not two.
-            if instant_nanos(&slo.last_updated_time) > instant_nanos(&slo.created_time) {
-                collect(
-                    slo.last_updated_time,
-                    &attributes,
-                    &slo.arn,
-                    SLO_UPDATED_EVENT_NAME,
-                );
+            for record in slo_change_records(slo) {
+                collect(record, &attributes);
             }
         }
 
@@ -4039,15 +4089,17 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             }
             for stored in set.configurations.values() {
                 collect(
-                    stored.created_at,
+                    ChangeRecord {
+                        at: stored.created_at,
+                        arn: &stored.arn,
+                        event_name: INSTRUMENTATION_CREATED_EVENT_NAME,
+                    },
                     &attributes,
-                    &stored.arn,
-                    INSTRUMENTATION_CREATED_EVENT_NAME,
                 );
             }
         }
 
-        dated.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-        dated.into_iter().map(|(_, _, event)| event).collect()
+        dated.sort_by(|left, right| left.0.cmp(&right.0));
+        dated.into_iter().map(|(_, event)| event).collect()
     }
 }

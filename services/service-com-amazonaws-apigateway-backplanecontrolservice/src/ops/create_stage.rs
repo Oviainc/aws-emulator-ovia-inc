@@ -222,6 +222,10 @@ fn bound_input(input: &CreateStageInput) -> Result<(), String> {
         }
     }
     if let Some(canary) = &input.canary_settings {
+        // The canary's share of the stage's traffic goes through the SAME check
+        // `UpdateStage` applies to a patch of the member, so one percentage is refused
+        // the same way whichever operation set it.
+        crate::state::accepted_percent_traffic(canary.percent_traffic)?;
         if let Some(overrides) = &canary.stage_variable_overrides {
             bound_entries(
                 "canarySettings.stageVariableOverrides",
@@ -378,10 +382,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateStageErrorModeled::LimitExceededException(
                 LimitExceededException {
                     retry_after_seconds: None,
-                    message: Some(format!(
-                        "Maximum number of stages exceeded for this API: {}",
-                        crate::state::MAX_STAGES_PER_API
-                    )),
+                    message: Some(crate::state::quota_reached("Stages", "API")),
                 },
             )
             .into());

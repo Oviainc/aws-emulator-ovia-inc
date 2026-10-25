@@ -802,6 +802,33 @@ impl SourceApiAssociationRecord {
         self.last_successful_merge_date = Some(due);
     }
 
+    /// Initiate a merge of the source API's schema into the Merged API, and report the
+    /// `SourceApiAssociationStatus` the association is left in, or the refusal the call
+    /// meets.
+    ///
+    /// Scheduling is all this does: the merge itself comes due one [`MERGE_SPAN`] later
+    /// and [`Self::settle`] materialises it, exactly as the create that first scheduled
+    /// one does. A merge the clock already owes IS the merge such a call initiates, so
+    /// its due instant is kept rather than pushed out — repeated calls can neither
+    /// starve the transition nor leave two merges owed for one association.
+    ///
+    /// An association whose DELETION the clock still owes is being destroyed and has no
+    /// schema left to merge, and that deletion is a modification already in progress, so
+    /// the call is refused rather than overwriting the status the deletion left behind.
+    pub fn start_merge(&mut self, now: SystemTime) -> Result<String, AssociationRefusal> {
+        if self.deletion_pending() {
+            return Err(AssociationRefusal::ConcurrentModification(
+                CONCURRENT_MODIFICATION_MESSAGE.to_string(),
+            ));
+        }
+        if self.merge_due_at.is_none() {
+            self.merge_due_at = Some(now + MERGE_SPAN);
+        }
+        self.status = MERGE_SCHEDULED.to_string();
+        self.status_detail = MERGE_SCHEDULED_DETAIL.to_string();
+        Ok(self.status.clone())
+    }
+
     /// This record as the modelled `SourceApiAssociation` shape.
     ///
     /// The single projection every operation that reports an association answers
@@ -865,6 +892,35 @@ pub enum AssociationRefusal {
     /// A modification of the pair's association is still in progress:
     /// `ConcurrentModificationException` (HTTP 409), carrying this text.
     ConcurrentModification(String),
+}
+
+/// Why an `(mergedApiIdentifier, associationId)` pair resolves to no one association,
+/// as the HTTP answer every operation that addresses an association that way gives it.
+///
+/// Stated independently of the operation, so the read and the merge refuse the same
+/// pair the same way; each handler lifts a variant into its own modelled error. Only
+/// the two refusals the LOOKUP itself can meet are here — what an operation then does
+/// with the association it found is its own business.
+#[derive(Debug, Clone)]
+pub enum AssociationLookupRefusal {
+    /// The request names an identifier that cannot name an API at all:
+    /// `BadRequestException` (HTTP 400), carrying this text.
+    BadRequest(String),
+    /// The Merged API or the association under it is not one this account holds:
+    /// `NotFoundException` (HTTP 404), carrying this text.
+    NotFound(String),
+}
+
+/// A lookup refusal is one of the refusals an association operation can give, so an
+/// operation that both resolves a pair and then acts on it answers both kinds the same
+/// way.
+impl From<AssociationLookupRefusal> for AssociationRefusal {
+    fn from(refusal: AssociationLookupRefusal) -> Self {
+        match refusal {
+            AssociationLookupRefusal::BadRequest(message) => Self::BadRequest(message),
+            AssociationLookupRefusal::NotFound(message) => Self::NotFound(message),
+        }
+    }
 }
 
 /// Create the association `request` asks for and return it as the modelled shape, or
@@ -1147,6 +1203,41 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
         self.source_api_associations.values().find(|association| {
             association.merged_api_id == merged_api_id && association.source_api_id == source_api_id
         })
+    }
+
+    /// The association `association_id` names OF the Merged API `merged_api_identifier`
+    /// addresses, or the refusal the pair meets.
+    ///
+    /// The rule every operation that addresses one association by that pair follows, in
+    /// one place:
+    ///
+    /// * an identifier that is neither an API id nor an ARN names no API at all, so the
+    ///   request is malformed rather than pointed at a missing resource;
+    /// * the Merged API is resolved in either identifier form, and one that resolves to
+    ///   nothing is a not-found;
+    /// * an `associationId` names an association OF the Merged API addressed, so one
+    ///   that belongs to another Merged API — or to none — is not found under this one.
+    pub fn resolve_association(
+        &self,
+        merged_api_identifier: &str,
+        association_id: &str,
+    ) -> Result<&SourceApiAssociationRecord, AssociationLookupRefusal> {
+        if !is_api_identifier(merged_api_identifier) {
+            return Err(AssociationLookupRefusal::BadRequest(invalid_api_id_message(
+                merged_api_identifier,
+            )));
+        }
+
+        let merged = api_by_identifier(&self.graphql_apis, merged_api_identifier).ok_or_else(
+            || AssociationLookupRefusal::NotFound(API_NOT_FOUND_MESSAGE.to_string()),
+        )?;
+
+        self.source_api_associations
+            .get(association_id)
+            .filter(|association| association.merged_api_id == merged.api_id)
+            .ok_or_else(|| {
+                AssociationLookupRefusal::NotFound(ASSOCIATION_NOT_FOUND_MESSAGE.to_string())
+            })
     }
 
     /// Drop every association the API `api_id` takes part in, on either side.
@@ -1437,9 +1528,14 @@ pub const API_NOT_FOUND_MESSAGE: &str = "API not found.";
 pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token given.";
 
 /// The text a `NotFoundException` (HTTP 404) carries for an association this account
-/// does not hold. The requirement the refusal answers is the status and the error
-/// shape; no recording pins AppSync's own wording, so this states the absent resource.
-pub const ASSOCIATION_NOT_FOUND_MESSAGE: &str = "Source API association not found.";
+/// does not hold.
+///
+/// AppSync's own fixed text for the absent association, as the service answers it when
+/// a merge is initiated against an `associationId` that resolves to nothing: it states
+/// the absent resource and names nothing of the request that asked for it, so it has no
+/// variable part to fill. Shared with `GetSourceApiAssociation`, which resolves the same
+/// pair by the same rule.
+pub const ASSOCIATION_NOT_FOUND_MESSAGE: &str = "No source API association was found";
 
 /// The text `ConcurrentModificationException` (HTTP 409) carries, which the MODEL
 /// states for the shape itself: "Another modification is in progress at this time and

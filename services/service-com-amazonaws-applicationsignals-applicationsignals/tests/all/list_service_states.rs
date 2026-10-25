@@ -27,7 +27,9 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/eu-west-2/application-signals/aws4_request, \
      SignedHeaders=host, Signature=0000";
 
-/// The region in [`AUTHORIZATION`], which is also the region a reported change event names.
+/// The region in [`AUTHORIZATION`], which every ARN this emulator mints for these requests
+/// carries — and therefore the Region every reported change event names, since an event
+/// reports the Region of the record it was read off.
 const REGION: &str = "eu-west-2";
 
 /// A router with just this service mounted on a fresh engine.
@@ -266,7 +268,8 @@ async fn seed(router: &MultiServiceRouter) -> BTreeMap<&'static str, f64> {
 
 /// `ListServiceStates` reports one state per discovered service, each carrying exactly one
 /// change event: the most recent change the store records for that service, stated with the
-/// entity it applied to, this account and the caller's region.
+/// entity it applied to, this account, and the Region and the operation of the write it was
+/// read off.
 #[tokio::test]
 async fn one_state_per_discovered_service_carries_its_latest_recorded_change() {
     let router = router();
@@ -360,7 +363,7 @@ async fn one_state_per_discovered_service_carries_its_latest_recorded_change() {
         assert_eq!(
             event["Region"].as_str(),
             Some(REGION),
-            "case {label:?}: expected the caller's region, got {:?}",
+            "case {label:?}: expected the Region of the record the change was read off, got {:?}",
             event["Region"]
         );
         // A configuration change: a deployment is an event of the customer's own pipeline,
@@ -379,8 +382,17 @@ async fn one_state_per_discovered_service_carries_its_latest_recorded_change() {
             event["EventId"]
         );
         assert!(
-            event.get("UserName").is_none() && event.get("EventName").is_none(),
-            "case {label:?}: expected no initiator or event name to be invented, got {event:?}"
+            event.get("UserName").is_none(),
+            "case {label:?}: expected no initiator to be invented, got {event:?}"
+        );
+        // Every seeded record was written by a create and never updated, so the change each
+        // state reports is that create: `EventName` names the operation that wrote the
+        // instant, exactly as `ListEntityEvents` names it for the same record.
+        assert_eq!(
+            event["EventName"].as_str(),
+            Some("CreateServiceLevelObjective"),
+            "case {label:?}: expected the operation that wrote the reported instant, got {:?}",
+            event["EventName"]
         );
         assert!(
             state.get("AttributeFilters").is_none(),

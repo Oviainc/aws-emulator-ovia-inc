@@ -738,8 +738,25 @@ pub fn usage_plan_key_already_exists(usage_plan_id: &str, key_id: &str) -> Strin
 
 /// The `LimitExceededException` message for a plan that already meters as many API keys
 /// as this emulator stores for one plan; see [`MAX_USAGE_PLAN_KEYS_PER_PLAN`].
-pub fn too_many_usage_plan_keys(max: usize) -> String {
-    format!("Maximum number of API keys in a usage plan exceeded: {max}")
+pub fn too_many_usage_plan_keys() -> String {
+    quota_reached("API Keys", "Usage Plan")
+}
+
+/// The `LimitExceededException` message for a quota of `resources` that has been reached
+/// in `scope`.
+///
+/// API Gateway reports a reached quota with ONE fixed sentence: it names the resources the
+/// quota counts and the scope it counts them in, and points the caller at AWS for a raise.
+/// The LIMIT ITSELF is not in it — a recorded refusal of the per-API stage quota reads
+/// `Maximum number of Stages for this API has been reached.  Please contact AWS if you
+/// need additional Stages.`, with no number anywhere — so neither the count nor the cap
+/// is quoted back here. One copy for every quota this service enforces, so no two of them
+/// word the same kind of refusal differently.
+pub fn quota_reached(resources: &str, scope: &str) -> String {
+    format!(
+        "Maximum number of {resources} for this {scope} has been reached.  \
+         Please contact AWS if you need additional {resources}."
+    )
 }
 
 /// One stored custom `DomainName`: the name a client reaches an API by, the certificate
@@ -1775,8 +1792,9 @@ pub struct Page {
 /// and `None` starts at the first id. `limit` defaults to [`DEFAULT_PAGE_LIMIT`] and is
 /// clamped into the documented `1..=`[`MAX_PAGE_LIMIT`] range.
 ///
-/// `Err` carries the message for an unresolvable cursor: a `position` naming no id in
-/// the sequence, which the caller must be told about rather than served an empty page.
+/// `Err` carries [`INVALID_POSITION`] for an unresolvable cursor: a `position` naming no
+/// id in the sequence, which the caller must be told about rather than served an empty
+/// page.
 pub fn page_of(
     ordered: &[String],
     position: Option<&str>,
@@ -1787,7 +1805,7 @@ pub fn page_of(
         Some(cursor) => ordered
             .iter()
             .position(|id| id == cursor)
-            .ok_or_else(|| format!("Invalid position: {cursor}"))?,
+            .ok_or_else(|| INVALID_POSITION.to_string())?,
     };
     let size = limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
     let size = usize::try_from(size).unwrap_or(1);
@@ -1797,6 +1815,14 @@ pub fn page_of(
         next_position: ordered.get(end).cloned(),
     })
 }
+
+/// The `BadRequestException` message for a `position` this service did not issue for the
+/// collection being listed.
+///
+/// A fixed sentence naming the member that is wrong, which quotes the rejected cursor back
+/// nowhere. One copy for every `position`/`limit` collection, so an unusable cursor is
+/// refused the same way whichever listing took it.
+pub const INVALID_POSITION: &str = "Invalid position parameter";
 
 // ---------------------------------------------------------------------------
 // Patch operations
@@ -1915,11 +1941,7 @@ impl Patch {
         // root, so it begins with `/` and names at least one member.
         let tokens: Vec<String> = match path.strip_prefix('/') {
             Some(rest) if !rest.is_empty() => rest.split('/').map(unescape_pointer_token).collect(),
-            _ => {
-                return Err(PatchFailure::BadRequest(format!(
-                    "Invalid patch path: {path}; a path is a JSON Pointer naming a member of the resource, such as /name"
-                )))
-            }
+            _ => return Err(PatchFailure::BadRequest(invalid_patch_path(path))),
         };
         Ok(Self {
             op,
@@ -1960,19 +1982,35 @@ impl Patch {
         }
     }
 
+    /// The op's `value` read as the integer an integer member takes.
+    pub fn require_i32(&self) -> Result<i32, PatchFailure> {
+        let value = self.require_value()?;
+        value.trim().parse().map_err(|_| {
+            PatchFailure::BadRequest(format!(
+                "{} takes an integer value, got {value:?}",
+                self.path
+            ))
+        })
+    }
+
+    /// The op's `value` read as the number a double member takes.
+    pub fn require_f64(&self) -> Result<f64, PatchFailure> {
+        let value = self.require_value()?;
+        value.trim().parse().map_err(|_| {
+            PatchFailure::BadRequest(format!(
+                "{} takes a number value, got {value:?}",
+                self.path
+            ))
+        })
+    }
+
     /// The op's `value` read as an integer inside `range`, for a member documented with
     /// bounds.
     pub fn require_i32_in(
         &self,
         range: ::std::ops::RangeInclusive<i32>,
     ) -> Result<i32, PatchFailure> {
-        let value = self.require_value()?;
-        let parsed: i32 = value.trim().parse().map_err(|_| {
-            PatchFailure::BadRequest(format!(
-                "{} takes an integer value, got {value:?}",
-                self.path
-            ))
-        })?;
+        let parsed = self.require_i32()?;
         if !range.contains(&parsed) {
             return Err(PatchFailure::BadRequest(format!(
                 "{} must be between {} and {}, inclusive: {parsed}",
@@ -2034,29 +2072,18 @@ impl Patch {
         if self.tokens.len() == 1 {
             return Ok(());
         }
-        Err(PatchFailure::BadRequest(format!(
-            "Invalid patch path: {}; {} is a single-valued member and has no sub-member",
-            self.path,
-            self.member()
-        )))
+        Err(PatchFailure::BadRequest(invalid_patch_path(&self.path)))
     }
 
     /// The refusal for a path the targeted resource has no updateable member for.
     ///
     /// "Attempts to apply an unsupported operation on a resource will return an error
-    /// message" (`PatchOperation$op`), and the message API Gateway returns names the
-    /// path, the op and the paths the resource does have — as a recorded refusal shows:
-    /// `Invalid patch path  '/id' specified for op 'replace'. Must be one of:
-    /// [/description, /enabled, /name, /customerId]`. That is the rule reproduced here,
-    /// with each operation's own `supported` list; a caller has to fix the request from
-    /// this text alone.
-    pub fn unsupported_path(&self, supported: &[&str]) -> PatchFailure {
-        PatchFailure::BadRequest(format!(
-            "Invalid patch path  '{}' specified for op '{}'. Must be one of: [{}]",
-            self.path,
-            self.op.as_str(),
-            supported.join(", ")
-        ))
+    /// message" (`PatchOperation$op`), and the message API Gateway returns is
+    /// [`invalid_patch_path`]'s sentence: the fixed text and the path the request sent,
+    /// and nothing else — not the op that named it and not the paths the resource does
+    /// have.
+    pub fn unsupported_path(&self) -> PatchFailure {
+        PatchFailure::BadRequest(invalid_patch_path(&self.path))
     }
 
     /// The refusal for an op the member this path names does not support.
@@ -2092,14 +2119,23 @@ impl Patch {
     pub fn map_key(&self, depth: usize) -> Result<String, PatchFailure> {
         match self.tokens.get(depth..) {
             Some(rest) if !rest.is_empty() => Ok(rest.join("/")),
-            _ => Err(PatchFailure::BadRequest(format!(
-                "Invalid patch path: {}; {} is a map and the path must name one key, as in {}/<key>",
-                self.path,
-                self.member(),
-                self.path.trim_end_matches('/')
-            ))),
+            _ => Err(PatchFailure::BadRequest(invalid_patch_path(&self.path))),
         }
     }
+}
+
+/// The `BadRequestException` message for a patch `path` the targeted resource cannot be
+/// addressed by.
+///
+/// API Gateway answers EVERY unaddressable path with one sentence — the fixed text
+/// `Invalid patch path` and then the path exactly as the request spelled it, as a
+/// recorded refusal of a `replace` of `/id` shows (`Invalid patch path /id`) — whichever
+/// way the pointer cannot be applied: a member the resource does not have, a pointer that
+/// is no JSON Pointer at all, one reaching into a single-valued member, or one naming a
+/// map member without a key. One copy for all of them, so a caller reading the text sees
+/// the same sentence for the same kind of mistake whichever resource it was made on.
+pub fn invalid_patch_path(path: &str) -> String {
+    format!("Invalid patch path {path}")
 }
 
 /// Parse a request's `patchOperations` into the edits to apply, in request order.
@@ -2210,37 +2246,6 @@ pub fn patch_bool(current: &mut bool, patch: &Patch) -> Result<(), PatchFailure>
     Ok(())
 }
 
-/// Apply `patch` to an integer member bounded by `range` that always has a value: `add`
-/// and `replace` set it, and `remove` is refused, because a member declared with a
-/// default is never absent from the record.
-pub fn patch_i32(
-    current: &mut i32,
-    patch: &Patch,
-    range: ::std::ops::RangeInclusive<i32>,
-) -> Result<(), PatchFailure> {
-    patch.require_single_valued()?;
-    match patch.op {
-        PatchOpKind::Add | PatchOpKind::Replace => *current = patch.require_i32_in(range)?,
-        _ => return Err(patch.unsupported_op()),
-    }
-    Ok(())
-}
-
-/// Apply `patch` to a nullable integer member bounded by `range`; `remove` clears it.
-pub fn patch_optional_i32(
-    current: &mut Option<i32>,
-    patch: &Patch,
-    range: ::std::ops::RangeInclusive<i32>,
-) -> Result<(), PatchFailure> {
-    patch.require_single_valued()?;
-    match patch.op {
-        PatchOpKind::Add | PatchOpKind::Replace => *current = Some(patch.require_i32_in(range)?),
-        PatchOpKind::Remove => *current = None,
-        _ => return Err(patch.unsupported_op()),
-    }
-    Ok(())
-}
-
 /// Apply `patch` to an integer member declared with a default, bounded by `range`.
 /// `remove` is refused for the reason [`patch_bool`] gives: a member the model declares
 /// with a default always has a value.
@@ -2267,6 +2272,60 @@ pub fn patch_f64_in(
     patch.require_single_valued()?;
     match patch.op {
         PatchOpKind::Add | PatchOpKind::Replace => *current = patch.require_f64_in(range)?,
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
+/// Apply `patch` to an integer member the SERVICE checks itself: `accept` is the member's
+/// own checker — the one the create or put operation for that member runs — so the value
+/// is refused with that member's own sentence whichever operation set it. `remove` is
+/// refused for the reason [`patch_bool`] gives.
+pub fn patch_i32_checked(
+    current: &mut i32,
+    patch: &Patch,
+    accept: impl FnOnce(i32) -> Result<i32, String>,
+) -> Result<(), PatchFailure> {
+    patch.require_single_valued()?;
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => {
+            *current = accept(patch.require_i32()?).map_err(PatchFailure::BadRequest)?;
+        }
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
+/// Apply `patch` to a nullable integer member the service checks itself; `remove` clears
+/// it. See [`patch_i32_checked`] for what `accept` is.
+pub fn patch_optional_i32_checked(
+    current: &mut Option<i32>,
+    patch: &Patch,
+    accept: impl FnOnce(i32) -> Result<i32, String>,
+) -> Result<(), PatchFailure> {
+    patch.require_single_valued()?;
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => {
+            *current = Some(accept(patch.require_i32()?).map_err(PatchFailure::BadRequest)?);
+        }
+        PatchOpKind::Remove => *current = None,
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
+/// Apply `patch` to a double member the service checks itself; see
+/// [`patch_i32_checked`].
+pub fn patch_f64_checked(
+    current: &mut f64,
+    patch: &Patch,
+    accept: impl FnOnce(f64) -> Result<f64, String>,
+) -> Result<(), PatchFailure> {
+    patch.require_single_valued()?;
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => {
+            *current = accept(patch.require_f64()?).map_err(PatchFailure::BadRequest)?;
+        }
         _ => return Err(patch.unsupported_op()),
     }
     Ok(())
@@ -2635,12 +2694,21 @@ pub fn bound_tag(key: &str, value: &str) -> Result<(), String> {
         .to_ascii_lowercase()
         .starts_with(RESERVED_TAG_KEY_PREFIX)
     {
-        return Err(format!(
-            "a tag key must not start with the reserved prefix {RESERVED_TAG_KEY_PREFIX}, \
-             got {key}"
-        ));
+        return Err(reserved_tag_key_prefix());
     }
     Ok(())
+}
+
+/// The refusal for a tag key in AWS's own reserved namespace.
+///
+/// A fixed sentence: it names the reserved prefix and that the rule holds whatever the
+/// key's case, and does NOT quote the offending key back. One copy for every operation
+/// that takes tags.
+pub fn reserved_tag_key_prefix() -> String {
+    format!(
+        "Invalid tag key. Tag keys cannot start with '{RESERVED_TAG_KEY_PREFIX}' \
+         (case insensitive)"
+    )
 }
 
 /// Refuse a `ThrottleSettings` whose limits are not a request rate API Gateway can
@@ -2650,28 +2718,27 @@ pub fn bound_tag(key: &str, value: &str) -> Result<(), String> {
 /// `rateLimit` a requests-per-second rate ("The API target request rate limit") —
 /// `ThrottleSettings`' own members — so neither can be negative, and a rate must be a
 /// finite number. Real AWS answers 400 `BadRequestException` for a negative or otherwise
-/// invalid throttle rate.
+/// invalid throttle rate, with ONE fixed sentence that covers both members and quotes
+/// neither value back: [`INVALID_THROTTLE_SETTINGS`].
 ///
 /// One check for every place this shape rides on a request — a usage plan's own
 /// `throttle`, the per-method throttle map on each of its `apiStages` entries, and any
 /// later operation that takes the shape — so one value is refused the same way wherever
-/// it appears. `member` is the path the message names, so the caller can see which one to
-/// fix.
-pub fn bound_throttle_settings(member: &str, throttle: &ThrottleSettings) -> Result<(), String> {
-    if throttle.burst_limit < 0 {
-        return Err(format!(
-            "{member}.burstLimit must not be negative, got {}",
-            throttle.burst_limit
-        ));
-    }
-    if !throttle.rate_limit.is_finite() || throttle.rate_limit < 0.0 {
-        return Err(format!(
-            "{member}.rateLimit must be a non-negative number, got {}",
-            throttle.rate_limit
-        ));
+/// it appears.
+pub fn bound_throttle_settings(throttle: &ThrottleSettings) -> Result<(), String> {
+    if throttle.burst_limit < 0
+        || !throttle.rate_limit.is_finite()
+        || throttle.rate_limit < 0.0
+    {
+        return Err(INVALID_THROTTLE_SETTINGS.to_string());
     }
     Ok(())
 }
+
+/// The refusal for a usage plan's throttle settings, whichever of the two limits is not a
+/// rate: one fixed sentence naming both members and the rule they break.
+pub const INVALID_THROTTLE_SETTINGS: &str =
+    "Usage Plan throttle rate limit and burst limit must be numeric and greater than zero";
 
 /// Refuse a `QuotaSettings` whose counts are not a quota API Gateway can meter.
 ///
@@ -2679,19 +2746,56 @@ pub fn bound_throttle_settings(member: &str, throttle: &ThrottleSettings) -> Res
 /// period" and `offset` "The number of requests subtracted from the given limit in the
 /// initial time period" (`QuotaSettings`' own members): both count requests, so neither
 /// can be negative, and real AWS answers 400 `BadRequestException` for a negative quota
-/// limit.
+/// count with a fixed sentence per member that names the member and the rule, and quotes
+/// no value back (see [`invalid_quota_count`]).
 ///
 /// `period` is NOT checked here: it targets the modelled `QuotaPeriodType` enum, so a
 /// value outside that set is refused at the boundary before any handler runs.
-pub fn bound_quota_settings(member: &str, quota: &QuotaSettings) -> Result<(), String> {
+pub fn bound_quota_settings(quota: &QuotaSettings) -> Result<(), String> {
     for (count_member, count) in [("limit", quota.limit), ("offset", quota.offset)] {
         if count < 0 {
-            return Err(format!(
-                "{member}.{count_member} must not be negative, got {count}"
-            ));
+            return Err(invalid_quota_count(count_member));
         }
     }
     Ok(())
+}
+
+/// The refusal for one negative count of a usage plan's quota: the fixed sentence AWS
+/// answers a negative quota `limit` with, over the member that carried it.
+pub fn invalid_quota_count(count_member: &str) -> String {
+    format!("Usage Plan quota {count_member} must be a non-negative numeric")
+}
+
+/// The smallest share of a stage's traffic a canary may take: "The percent (0-100) of
+/// traffic diverted to a canary deployment" (`CanarySettings$percentTraffic`).
+pub const MIN_CANARY_PERCENT_TRAFFIC: i32 = 0;
+
+/// The largest share of a stage's traffic a canary may take; see
+/// [`MIN_CANARY_PERCENT_TRAFFIC`].
+pub const MAX_CANARY_PERCENT_TRAFFIC: i32 = 100;
+
+/// The canary traffic share a stage may be stored with, or the reason the requested one
+/// is refused.
+///
+/// One check for every operation that sets canary settings — the stage's own
+/// `canarySettings`, the ones a deployment is created with, and a patch of either — so
+/// one percentage is refused the same way wherever it rides.
+pub fn accepted_percent_traffic(requested: f64) -> Result<f64, String> {
+    let window = f64::from(MIN_CANARY_PERCENT_TRAFFIC)..=f64::from(MAX_CANARY_PERCENT_TRAFFIC);
+    if !requested.is_finite() || !window.contains(&requested) {
+        return Err(invalid_percent_traffic());
+    }
+    Ok(requested)
+}
+
+/// The refusal for a canary traffic share outside that window: a fixed sentence naming
+/// the stage's canary and the window's bounds, which quotes the rejected share back
+/// nowhere.
+pub fn invalid_percent_traffic() -> String {
+    format!(
+        "Invalid traffic settings for stage canary. Must be between \
+         {MIN_CANARY_PERCENT_TRAFFIC} and {MAX_CANARY_PERCENT_TRAFFIC}"
+    )
 }
 
 /// The `NotFoundException` message for a `restApiId` that names no stored API.
@@ -2803,12 +2907,10 @@ pub const NO_SUCH_REQUEST_VALIDATOR: &str = "Invalid Request Validator identifie
 /// The `NotFoundException` message for a `responseType` the API carries no CUSTOMIZED
 /// gateway response for — the record `DeleteGatewayResponse` clears and
 /// `PutGatewayResponse` writes. Every modelled type always has the response API Gateway
-/// generates itself, so what is missing is the customization and not the type; the
-/// message is BUILT FROM THE REQUEST and names the type it looked for, the way this
-/// service's other identifier refusals do (see [`no_such_rest_api`]).
-pub fn no_such_gateway_response(response_type: &str) -> String {
-    format!("No customized gateway response specified for response type {response_type}")
-}
+/// generates itself, so what is missing is the customization and not the type: a fixed
+/// sentence saying the type is not defined on the api, which names neither the type nor
+/// the API, in the shape of the sibling identifier messages above.
+pub const NO_SUCH_GATEWAY_RESPONSE: &str = "Gateway response type not defined on api";
 
 /// The `target` every audit record this service emits carries, so a consumer can select
 /// the access trail without reading the rest of the emulator's traces.

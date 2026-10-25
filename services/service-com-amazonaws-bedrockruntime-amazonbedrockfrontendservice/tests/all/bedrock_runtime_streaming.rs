@@ -20,6 +20,7 @@ use std::sync::Arc;
 use aws_smithy_eventstream::frame::read_message_from;
 use aws_smithy_types::event_stream::HeaderValue;
 use serde_json::{json, Value};
+use service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::state;
 use service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -252,6 +253,16 @@ fn converse_rows() -> Vec<ConverseRow> {
             system: json!([]),
             messages: json!([{"role": "user", "content": [{"text": "Explain idempotency."}]}]),
             max_tokens: Some(3),
+        },
+        ConverseRow {
+            case: "generation capped well above the completion",
+            model_id: "amazon.nova-lite-v1:0",
+            system: json!([]),
+            messages: json!([{
+                "role": "user",
+                "content": [{"text": "Reply with only the lowercase English word for 2+3."}],
+            }]),
+            max_tokens: Some(20),
         },
         ConverseRow {
             case: "a long prompt",
@@ -566,12 +577,20 @@ async fn converse_stream_frames_the_turn_converse_serves() {
             "case {case:?}: expected stopReason {expected_stop:?}, got {}",
             by_name("messageStop")
         );
-        if row.max_tokens == Some(3) {
-            assert_eq!(
-                expected_stop, "max_tokens",
-                "case {case:?}: a capped turn stops on max_tokens, got {expected_stop:?}"
-            );
-        }
+        // The cap is a ceiling: only a cap too small for the shortest
+        // completion cuts the turn off, and the `messageStop` frame reports that
+        // the same way the unary call does.
+        let shortest = i64::from(state::count_text_tokens(state::EMULATED_COMPLETION_FLOOR));
+        let expected_for_cap = match row.max_tokens {
+            Some(cap) if cap < shortest => "max_tokens",
+            _ => "end_turn",
+        };
+        assert_eq!(
+            expected_stop, expected_for_cap,
+            "case {case:?}: expected stopReason {expected_for_cap:?} for maxTokens={:?} \
+             against a {shortest}-token shortest completion, got {expected_stop:?}",
+            row.max_tokens
+        );
 
         let metadata = by_name("metadata");
         assert_eq!(
@@ -581,7 +600,7 @@ async fn converse_stream_frames_the_turn_converse_serves() {
         );
         let latency = metadata["metrics"]["latencyMs"].as_i64();
         assert!(
-            latency.is_some_and(|millis| millis >= 0),
+            latency.is_some_and(|millis| millis > 0),
             "case {case:?}: metadata must report the latency measured, got {metadata}"
         );
     }
@@ -874,7 +893,7 @@ async fn response_stream_delivers_the_turn_as_the_model_families_streaming_event
         }
         for field in ["invocationLatency", "firstByteLatency"] {
             assert!(
-                metrics[field].as_i64().is_some_and(|millis| millis >= 0),
+                metrics[field].as_i64().is_some_and(|millis| millis > 0),
                 "case {case:?}: {field} must report the latency measured, got {metrics}"
             );
         }

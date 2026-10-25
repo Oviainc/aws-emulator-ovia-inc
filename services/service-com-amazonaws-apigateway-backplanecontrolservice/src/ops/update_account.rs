@@ -84,9 +84,6 @@ use super::types::*;
 
 use crate::state::{patch_optional_string, Patch, PatchFailure};
 
-/// The `patchOperations` paths this operation supports, for the refusal that lists them.
-const SUPPORTED_PATHS: &[&str] = &["/cloudwatchRoleArn"];
-
 /// The ARN vendor an account's CloudWatch role ARN names, and the resource type under
 /// it: the member is "the ARN of an Amazon CloudWatch role for the current Account", and
 /// API Gateway assumes that IAM ROLE to write logs, so a value that is not an IAM role
@@ -133,7 +130,7 @@ fn apply_patch(account: &mut crate::state::AccountEntry, patch: &Patch) -> Resul
                 crate::state::MAX_STRING_CHARS,
             )
         }
-        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => Err(patch.unsupported_path()),
     }
 }
 

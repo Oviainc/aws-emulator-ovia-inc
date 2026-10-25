@@ -342,7 +342,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stop_reason: turn.stop_reason().to_string(),
             usage: turn.usage(),
             metrics: ConverseMetrics {
-                latency_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                latency_ms: crate::state::latency_ms(started.elapsed()),
             },
             additional_model_response_fields: None,
             trace: None,

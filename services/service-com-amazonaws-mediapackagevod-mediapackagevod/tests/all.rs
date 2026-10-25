@@ -47,5 +47,7 @@ mod resource_tag_removal;
 mod state_roundtrip;
 #[path = "all/success_path_projections.rs"]
 mod success_path_projections;
+#[path = "all/tag_key_length_bounds.rs"]
+mod tag_key_length_bounds;
 #[path = "all/tag_restrictions.rs"]
 mod tag_restrictions;

@@ -263,6 +263,32 @@ pub const MIN_TIMEOUT_IN_MILLIS: i32 = 50;
 /// private APIs only" describes a quota increase, which this account does not carry.)
 pub const MAX_TIMEOUT_IN_MILLIS: i32 = 29_000;
 
+/// The refusal for a `timeoutInMillis` outside that window: a fixed sentence naming the
+/// window's bounds in milliseconds, which quotes the rejected value back nowhere. Shared
+/// with `UpdateIntegration`, which patches the same member.
+pub fn invalid_timeout() -> String {
+    format!("Timeout should be between {MIN_TIMEOUT_IN_MILLIS} ms and {MAX_TIMEOUT_IN_MILLIS} ms")
+}
+
+/// The `timeoutInMillis` an integration may be stored with, or the reason the requested
+/// one is refused. Shared with `UpdateIntegration`, which patches the same member.
+pub fn accepted_timeout(requested: i32) -> Result<i32, String> {
+    if !(MIN_TIMEOUT_IN_MILLIS..=MAX_TIMEOUT_IN_MILLIS).contains(&requested) {
+        return Err(invalid_timeout());
+    }
+    Ok(requested)
+}
+
+/// The refusal for a private integration that names no VPC link: a fixed sentence saying
+/// what `connectionId` must be set to on that connection type, which quotes nothing of
+/// the request back.
+pub fn missing_vpc_link_connection_id() -> String {
+    format!(
+        "ConnectionId should be set to the vpcLinkId or stage variable on connection type \
+         {VPC_LINK_CONNECTION_TYPE}"
+    )
+}
+
 /// Emulator resource guard, NOT an AWS quota: the longest single mapping template this
 /// emulator stores for one content type. API Gateway's published mapping-template limit
 /// is far larger, so this bounds the store without refusing a realistic template.
@@ -403,11 +429,7 @@ pub fn validate_integration(
         .unwrap_or(DEFAULT_CONNECTION_TYPE);
     let private = connection_type == VPC_LINK_CONNECTION_TYPE;
     match (&integration.connection_id, private) {
-        (None, true) => {
-            return Err(format!(
-                "connectionId is required when connectionType is {VPC_LINK_CONNECTION_TYPE}"
-            ))
-        }
+        (None, true) => return Err(missing_vpc_link_connection_id()),
         (Some(_), false) => {
             return Err(format!(
                 "connectionId may be specified only when connectionType is \
@@ -491,13 +513,7 @@ pub fn validate_integration(
         ));
     }
 
-    if !(MIN_TIMEOUT_IN_MILLIS..=MAX_TIMEOUT_IN_MILLIS).contains(&integration.timeout_in_millis) {
-        return Err(format!(
-            "timeoutInMillis must be between {MIN_TIMEOUT_IN_MILLIS} and \
-             {MAX_TIMEOUT_IN_MILLIS} milliseconds, got {}",
-            integration.timeout_in_millis
-        ));
-    }
+    accepted_timeout(integration.timeout_in_millis)?;
 
     // `cacheKeyParameters`: "To be valid values for cacheKeyParameters, these parameters
     // must also be specified for Method requestParameters."

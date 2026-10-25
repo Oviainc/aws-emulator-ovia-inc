@@ -65,6 +65,8 @@ mod device_lifecycle;
 mod direct_connect_gateway_attachment_lifecycle;
 #[path = "all/filter_id_list_maximum.rs"]
 mod filter_id_list_maximum;
+#[path = "all/get_connect_attachment.rs"]
+mod get_connect_attachment;
 #[path = "all/get_connections.rs"]
 mod get_connections;
 #[path = "all/global_network_lifecycle.rs"]

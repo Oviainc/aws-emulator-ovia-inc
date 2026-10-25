@@ -102,14 +102,10 @@ use crate::state::{
     MAX_STRING_CHARS,
 };
 
-/// The `path` values `UpdateMethodResponse` accepts: one per updateable member of the
-/// `MethodResponse` shape. `statusCode` is the response's identity — it is the URI label
-/// that addresses this very record — so it is reported but not patchable, the way
-/// `UpdateMethod` treats a method's `httpMethod`.
-const SUPPORTED_PATHS: &[&str] = &[
-    "/responseModels/<content-type>",
-    "/responseParameters/<header-name>",
-];
+// The `path` values `UpdateMethodResponse` accepts are the ones `apply_patch` below has an
+// arm for: one per updateable member of the `MethodResponse` shape. `statusCode` is the
+// response's identity — it is the URI label that addresses this very record — so it is
+// reported but not patchable, the way `UpdateMethod` treats a method's `httpMethod`.
 
 /// Apply one patch to a COPY of a stored method response.
 ///
@@ -155,7 +151,7 @@ fn apply_patch(entry: &mut GetMethodResponseOutput, patch: &Patch) -> Result<(),
             entry.response_models = crate::state::stored_map(models);
             Ok(())
         }
-        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => Err(patch.unsupported_path()),
     }
 }
 

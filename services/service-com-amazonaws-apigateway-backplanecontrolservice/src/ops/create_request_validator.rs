@@ -209,10 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateRequestValidatorErrorModeled::LimitExceededException(
                 LimitExceededException {
                     retry_after_seconds: None,
-                    message: Some(format!(
-                        "Maximum number of request validators exceeded for this API: \
-                         {MAX_REQUEST_VALIDATORS_PER_API}"
-                    )),
+                    message: Some(crate::state::quota_reached("Request Validators", "API")),
                 },
             )
             .into());

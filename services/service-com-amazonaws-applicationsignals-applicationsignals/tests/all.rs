@@ -17,6 +17,8 @@ mod audit_findings;
 mod batch_instrumentation_configuration_deletion;
 #[path = "all/budget_reports.rs"]
 mod budget_reports;
+#[path = "all/change_event_attribution.rs"]
+mod change_event_attribution;
 #[path = "all/discovered_metric_references.rs"]
 mod discovered_metric_references;
 #[path = "all/discovery_enablement.rs"]
