@@ -55,6 +55,18 @@ pub const POLICY_USAGE_PERMISSIONS_POLICY: &str = "PermissionsPolicy";
 /// value to PermissionsBoundary". See [`POLICY_USAGE_PERMISSIONS_POLICY`].
 pub const POLICY_USAGE_PERMISSIONS_BOUNDARY: &str = "PermissionsBoundary";
 
+/// The `policyScopeType` value that selects only the managed policies AWS owns: "to
+/// list only Amazon Web Services managed policies, set Scope to AWS"
+/// (`ListPolicies$Scope`). One of the three values the enum declares, which
+/// `ops::types::POLICY_SCOPE_TYPE_VALUES` records.
+pub const POLICY_SCOPE_AWS: &str = "AWS";
+
+/// The `policyScopeType` value that selects only the managed policies the ACCOUNT
+/// owns: "to list only the customer managed policies in your Amazon Web Services
+/// account, set Scope to Local". See [`POLICY_SCOPE_AWS`]; the third value (`All`)
+/// selects both, which is also what an absent `Scope` means.
+pub const POLICY_SCOPE_LOCAL: &str = "Local";
+
 /// The prefix AWS gives an IAM user's unique id. `User$UserId` is modelled as
 /// `idType` (len 16..128, pattern `^[\w]+$`), which this prefix plus
 /// [`UNIQUE_ID_SUFFIX_LEN`] base32 characters satisfies.
@@ -348,11 +360,26 @@ pub const MARKER_SCOPE_ROLES: &str = "roles";
 /// issued while paging groups is not read as a position among the users or roles.
 pub const MARKER_SCOPE_GROUPS: &str = "groups";
 
+/// The marker scope of the managed policies an account can read — the ones it holds
+/// itself and the ones AWS owns ([`AWS_MANAGED_POLICIES`]) — which `ListPolicies`
+/// pages over. It is its OWN scope, like the user and role collections, and ONE
+/// scope covers the whole collection because that operation pages over the same key
+/// order (the policy's ARN) whichever scope, path prefix, attachment state or usage
+/// it filters by: the filters select within the order rather than changing it.
+pub const MARKER_SCOPE_POLICIES: &str = "policies";
+
 /// The marker scope of ONE role's attached managed policies, which
 /// `ListAttachedRolePolicies` pages over. The role's key follows it, so a marker
 /// issued while paging one role's attachments does not name a position in
 /// another's: see [`role_attached_policies_marker_scope`].
 pub const MARKER_SCOPE_ROLE_ATTACHED_POLICIES: &str = "role-attached-policies";
+
+/// The marker scope of ONE user's attached managed policies, which
+/// `ListAttachedUserPolicies` pages over. It is its OWN scope, with the user's key
+/// following it, so a marker issued while paging one user's attachments names no
+/// position in another user's — nor in any role's attachment order:
+/// see [`user_attached_policies_marker_scope`].
+pub const MARKER_SCOPE_USER_ATTACHED_POLICIES: &str = "user-attached-policies";
 
 /// The marker scope of ONE role's EMBEDDED inline policies, which
 /// `ListRolePolicies` pages over. The role's key follows it, exactly as it does
@@ -1776,6 +1803,11 @@ pub fn role_attached_policies_marker_scope(role_key: &str) -> String {
     format!("{MARKER_SCOPE_ROLE_ATTACHED_POLICIES}:{role_key}")
 }
 
+/// The marker scope of the attachment set of the user keyed by `user_key`.
+pub fn user_attached_policies_marker_scope(user_key: &str) -> String {
+    format!("{MARKER_SCOPE_USER_ATTACHED_POLICIES}:{user_key}")
+}
+
 /// The marker scope of the inline-policy set of the role keyed by `role_key`.
 pub fn role_policies_marker_scope(role_key: &str) -> String {
     format!("{MARKER_SCOPE_ROLE_POLICIES}:{role_key}")
@@ -2425,6 +2457,25 @@ pub fn listed_user(user: &User) -> User {
         permissions_boundary: None,
         tags: None,
         ..user.clone()
+    }
+}
+
+/// One managed policy as a resource-LISTING operation reports it, for the same
+/// reason [`listed_role`] exists.
+///
+/// `ListPolicies`' documentation: "IAM resource-listing operations return a subset of
+/// the available attributes for the resource. For example, this operation does not
+/// return tags, even though they are an attribute of the returned object. To view all
+/// of the information for a customer manged policy, see GetPolicy." `Description` is
+/// withheld on the same ground, stated by the member itself: "this element is included
+/// in the response to the GetPolicy operation. It is not included in the response to
+/// the ListPolicies operation" (`Policy$Description`). Every other member of the
+/// record — including the two counts the resolution derives — is reported as it stands.
+pub fn listed_policy(policy: &Policy) -> Policy {
+    Policy {
+        description: None,
+        tags: None,
+        ..policy.clone()
     }
 }
 

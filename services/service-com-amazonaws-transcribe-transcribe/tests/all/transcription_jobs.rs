@@ -807,10 +807,13 @@ async fn the_service_managed_transcript_uri_is_in_the_signed_region() {
 
     for (index, (scope_region, expected_region)) in cases.iter().enumerate() {
         let name = format!("region-job-{index}");
+        // Read back through the SAME Region's endpoint the job was started through:
+        // the resources a regional endpoint serves are the ones created through it.
         let fetched = transcribe
-            .call(
+            .call_in_region(
                 "GetTranscriptionJob",
                 json!({"TranscriptionJobName": name.clone()}),
+                Some(scope_region),
             )
             .await;
         let job = fetched.ok(scope_region)["TranscriptionJob"].clone();

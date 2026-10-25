@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOperationsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOperationsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the operation log entries recorded against one resource, a page at a
+//! time, oldest first.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOperationsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY handler file for this operation; the page it answers is taken
+//! out of the store by [`crate::state::ComAmazonawsLightsailLightsail20161128State::operations_for_resource_page`],
+//! which lives in `src/state.rs` beside the other listings' paging helpers.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +169,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOperationsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOperationsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOperationsForResource"))
+        // The log is the account's, not a Region's, and this operation reports an
+        // entry by NAME exactly as `GetOperation` reports one by id — so nothing
+        // here is decided from request metadata. The emulator verifies every
+        // request signature before a handler runs (a service never checks
+        // signatures itself), which is why the modelled `UnauthenticatedException`
+        // and `AccessDeniedException` are not constructed on any path here.
+        let _ = ctx;
+
+        let resource_name = input.resource_name;
+        // `pageToken` NAMES the entry a page starts at — the id the previous page
+        // reported as its `nextPageToken`, which is the first entry of this page.
+        // Naming the entry rather than carrying an index means an entry appended
+        // between two pages cannot make the walk skip or repeat another one. An
+        // absent — or empty — token asks for the first page.
+        let page_token = input.page_token.filter(|token| !token.is_empty());
+
+        crate::state::with_state(&*self.engine, |store| {
+            // Reporting only: each entry is answered exactly as the store holds
+            // it, including the terminal status the clock has already settled it
+            // into (`with_state` applies what the clock owed before this body
+            // ran). The log is append-only and keyed by resource NAME, so an
+            // entry is still reported after the resource it names is gone — which
+            // is what lets a caller poll the operation that deleted it.
+            // A name the log holds nothing for and NO token reports an empty
+            // page; the same name WITH a token is refused, because that token
+            // names no entry of it. The asymmetry is the token's, not the
+            // name's: a token is only ever answered by the entry it names.
+            let (operations, next_page_token) = store
+                .operations_for_resource_page(&resource_name, page_token.as_deref())
+                .ok_or_else(|| {
+                    invalid_page_token(
+                        page_token.as_deref().unwrap_or_default(),
+                        &resource_name,
+                    )
+                })?;
+            Ok(GetOperationsForResourceOutput {
+                // A resource the log holds nothing for reports an empty list,
+                // not an absent one: the caller asked which operations touched
+                // it, and the answer is "none".
+                operations: Some(operations),
+                // `nextPageCount` is DISCONTINUED: "In releases prior to June 12,
+                // 2017, this parameter returned null by the API. It is now
+                // discontinued, and the API returns the next page token parameter
+                // instead." So it is never reported.
+                next_page_count: None,
+                next_page_token,
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// `pageToken` names no log entry of this resource, so there is no page to
+/// answer: the modelled `InvalidInputException`, documented as "user input does
+/// not conform to the validation rules of an input field". The message is built
+/// from the request and says what a page token is.
+fn invalid_page_token(token: &str, resource_name: &str) -> GetOperationsForResourceError {
+    GetOperationsForResourceErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(format!(
+            "pageToken {token:?} does not name an operation recorded against {resource_name:?}; \
+             a page token is the operation id a previous page reported as nextPageToken"
+        )),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetOperationsForResourceError {
+    GetOperationsForResourceErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail operation log is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

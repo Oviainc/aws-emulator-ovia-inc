@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the managed policies the account can see — its own and AWS's — filtered by
+//! scope, path prefix, attachment and usage, and paged with `MaxItems`/`Marker`.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +177,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPolicies"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPoliciesErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The page resumes strictly after the POSITION in the policy order that the
+        // marker names, so a token this service's encoding cannot have produced is
+        // refused rather than silently read as "start from the beginning". This
+        // operation models no invalid-input error, so the refusal is the 400
+        // `ValidationException` an unmodelled bad request gets. A token that decodes
+        // but names a policy deleted since the previous page is NOT an error:
+        // pagination resumes from the position, and that policy is simply no longer in
+        // the range.
+        let resume_after = match &input.marker {
+            Some(marker) => {
+                match crate::state::decode_marker(crate::state::MARKER_SCOPE_POLICIES, marker) {
+                    Some(key) => Some(key),
+                    None => {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            "Invalid Marker: the value is not a marker this service issued",
+                        ))
+                    }
+                }
+            }
+            None => None,
+        };
+
+        // "If it is not included, it defaults to a slash (/), listing all policies."
+        let path_prefix = input
+            .path_prefix
+            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        // `maxItemsType` is range 1..1000 and the boundary validator has already
+        // refused anything outside it, so the only choice left here is the default
+        // for an absent `MaxItems`. `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // `Scope` and `PolicyUsageFilter` each name one value of a modelled enum, and
+        // the boundary validator has already refused any value outside the declared
+        // set (400 `ValidationException`), so reaching here means both carry a value
+        // the model declares.
+
+        // WHOSE policies the request asks about: "to list only Amazon Web Services
+        // managed policies, set Scope to AWS. To list only the customer managed
+        // policies in your Amazon Web Services account, set Scope to Local … if it is
+        // not included, or if it is set to All, all policies are returned."
+        let scope = input.scope.as_deref();
+        let want_account_owned = scope != Some(crate::state::POLICY_SCOPE_AWS);
+        let want_aws_owned = scope != Some(crate::state::POLICY_SCOPE_LOCAL);
+
+        // WHICH USE of a policy the request asks about: "to list only permissions
+        // policies, set PolicyUsageFilter to PermissionsPolicy. To list only the
+        // policies used to set permissions boundaries, set the value to
+        // PermissionsBoundary … if it is not included, all policies are returned." The
+        // use a policy is put to is what the account's state records: an identity it is
+        // attached to uses it as a permissions policy, an identity carrying it as its
+        // boundary uses it to set one — the same two relations `ListEntitiesForPolicy`
+        // separates, counted here by the policy's own `AttachmentCount` and
+        // `PermissionsBoundaryUsageCount`.
+        let usage = input.policy_usage_filter.as_deref();
+        let filtering_by_usage = usage.is_some();
+        let want_permissions_policy = usage != Some(crate::state::POLICY_USAGE_PERMISSIONS_BOUNDARY);
+        let want_permissions_boundary = usage != Some(crate::state::POLICY_USAGE_PERMISSIONS_POLICY);
+
+        // A read: it reports the managed policies the account can see and writes
+        // nothing.
+        let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before any policy is reported. The resource the decision is
+        // made on is the policy collection this request addresses — the account's
+        // `policy` resource type under the path prefix being listed.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_POLICIES,
+            &crate::state::policy_arn(&path_prefix, ""),
+        )?;
+
+        // The policies in scope, named by ARN: the account's own store plus AWS's
+        // catalog, which is part of every account's view of IAM — this operation
+        // "lists all the managed policies that are available in your Amazon Web
+        // Services account, including your own customer-defined managed policies and
+        // all Amazon Web Services managed policies". A SET keyed by the ARN, because
+        // the ARN is the policy's identity: one policy is one entry however many
+        // sources name it.
+        let mut in_scope: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
+        if want_account_owned {
+            in_scope.extend(
+                store
+                    .policies
+                    .values()
+                    .filter_map(|held| held.policy.arn.clone()),
+            );
+        }
+        if want_aws_owned {
+            in_scope.extend(
+                crate::state::AWS_MANAGED_POLICIES
+                    .iter()
+                    .map(|entry| entry.arn()),
+            );
+        }
+
+        let mut matching: Vec<(String, Policy)> = Vec::new();
+        for arn in in_scope {
+            // ONE resolution, the one every reader of a managed policy reports from,
+            // so a listed policy carries the same record — and the same live
+            // attachment and boundary-usage counts — as its own `GetPolicy` read.
+            let Some(resolved) = store.resolve_policy(&arn) else {
+                continue;
+            };
+            let policy = resolved.policy;
+            // A policy with no stored `Path` sits at the account root, the value every
+            // create defaults it to (`crate::state::DEFAULT_PATH`), so it is selected
+            // by the prefixes that select the root rather than dropped.
+            if !policy
+                .path
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_PATH)
+                .starts_with(&path_prefix)
+            {
+                continue;
+            }
+            let attached = policy.attachment_count.unwrap_or_default() > 0;
+            let bounding = policy.permissions_boundary_usage_count.unwrap_or_default() > 0;
+            // "When OnlyAttached is true, the returned list contains only the policies
+            // that are attached to an IAM user, group, or role. When OnlyAttached is
+            // false, or when the parameter is not included, all policies are returned."
+            if input.only_attached && !attached {
+                continue;
+            }
+            if filtering_by_usage
+                && !((want_permissions_policy && attached)
+                    || (want_permissions_boundary && bounding))
+            {
+                continue;
+            }
+            // A resource-listing operation reports a SUBSET of a policy's attributes:
+            // `Tags` and `Description` are withheld here and reported by `GetPolicy`
+            // (`crate::state::listed_policy`).
+            matching.push((arn, crate::state::listed_policy(&policy)));
+        }
+
+        // The page key order IS the enumeration order the `Marker` names a position
+        // in, so it is established here rather than inherited from the order the two
+        // sources happened to be walked in: a page resumes strictly after a key, which
+        // is only every remaining policy if the keys ascend.
+        matching.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let mut policies = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        for (key, policy) in matching
+            .into_iter()
+            .filter(|(key, _)| resume_after.as_deref().is_none_or(|after| key.as_str() > after))
+        {
+            if policies.len() == page_size {
+                // There is at least one more matching policy, so the caller needs
+                // another page to see it.
+                is_truncated = true;
+                break;
+            }
+            policies.push(policy);
+            last_key = Some(key);
+        }
+
+        Ok(ListPoliciesOutput {
+            policies: Some(policies),
+            is_truncated,
+            marker: is_truncated
+                .then(|| {
+                    last_key.as_deref().map(|key| {
+                        crate::state::encode_marker(crate::state::MARKER_SCOPE_POLICIES, key)
+                    })
+                })
+                .flatten(),
+        })
     }
 }

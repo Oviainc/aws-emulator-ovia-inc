@@ -433,10 +433,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A job may only apply a custom vocabulary, custom vocabulary filter or custom
-        // language model this account HOLDS: each of those members names a resource of
+        // language model this REGION holds: each of those members names a resource of
         // its own family ("The name of the custom vocabulary you want to use in your
         // transcription job request", and the same sentence for the filter and the
-        // model), so a name no create of that family recorded is refused here rather
+        // model), so a name no create of that family recorded here is refused rather
         // than stored on a job that would report it back. The per-language
         // `LanguageIdSettings` name resources of the very same families, so every
         // entry of it is checked too — see
@@ -450,13 +450,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &mut references,
             input.language_id_settings.as_ref(),
         );
-        if let Some(message) = store.unheld_reference_error(&references) {
+        if let Some(message) = store.unheld_reference_error(&region, &references) {
             return Err(bad_request(&message));
         }
 
+        // A job name is unique within one Region of the account: a regional endpoint
+        // holds only the jobs started through it.
         if store
             .transcription_jobs
-            .contains_key(&input.transcription_job_name)
+            .contains(&region, &input.transcription_job_name)
         {
             return Err(StartTranscriptionJobErrorModeled::ConflictException(
                 ConflictException {
@@ -470,15 +472,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The account's job quota is a CONCURRENCY one: the service runs at most
-        // `MAX_CONCURRENT_TRANSCRIPTION_JOBS` jobs of this family at a time, so only
-        // the jobs it is still working on count against it and a job that has reached
+        // The job quota is a CONCURRENCY one, per account per Region: the service runs
+        // at most `MAX_CONCURRENT_TRANSCRIPTION_JOBS` jobs of this family at a time in
+        // one Region, so only the jobs it is still working on THERE count against it and
+        // a job that has reached
         // a terminal status has released its slot (see
         // [`crate::state::jobs_in_flight`], which materialises the transitions the
         // clock already owed each record before counting). A start made while that
         // many jobs are in flight is refused with the error this operation models for
         // an exceeded quota.
-        if crate::state::jobs_in_flight(&mut store.transcription_jobs, now)
+        if crate::state::jobs_in_flight(&mut store.transcription_jobs, &region, now)
             >= crate::state::MAX_CONCURRENT_TRANSCRIPTION_JOBS
         {
             return Err(StartTranscriptionJobErrorModeled::LimitExceededException(
@@ -486,6 +489,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(crate::state::concurrency_limit_message(
                         crate::state::MAX_CONCURRENT_TRANSCRIPTION_JOBS,
                         crate::state::FAMILY_TRANSCRIPTION_JOBS,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The Region comes from the request's own (unauthenticated) credential scope, so
+        // the concurrency quota above and the retention bound below bound this family's
+        // store only together with a cap on how many Regions it keeps job records for
+        // (see [`crate::state::MAX_REGIONS`]).
+        if store.transcription_jobs.region_bucket_exhausted(&region) {
+            return Err(StartTranscriptionJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::region_capacity_message(
+                        crate::state::FAMILY_TRANSCRIPTION_JOBS,
+                        &region,
                     )),
                 },
             )
@@ -533,7 +552,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             output_bucket_name: input.output_bucket_name,
             output_key: input.output_key,
-            region,
+            region: region.clone(),
             settings: input.settings,
             model_settings: input.model_settings,
             job_execution_settings: input.job_execution_settings,
@@ -570,11 +589,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region = %record.region,
             "transcription job started"
         );
-        store.transcription_jobs.insert(record.name.clone(), record);
+        let name = record.name.clone();
+        store.transcription_jobs.insert(&region, &name, record);
         // The quota above counts only the jobs in flight, so it is this that keeps
         // the store bounded: the oldest records the service has finished with make
         // way for the new one (see [`crate::state::evict_oldest_finished_jobs`]).
-        crate::state::evict_oldest_finished_jobs(&mut store.transcription_jobs);
+        crate::state::evict_oldest_finished_jobs(&mut store.transcription_jobs, &region);
 
         Ok(StartTranscriptionJobOutput {
             transcription_job: Some(job),

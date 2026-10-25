@@ -38,28 +38,8 @@ use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::ops::t
 use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::state::chain::network_genesis;
 use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::state::is_bitcoin;
 
-use crate::chain_query_slice::{hashes, Emulator, NetworkFixture};
+use crate::chain_query_slice::{hashes, unseeded_addresses, Emulator, NetworkFixture};
 use crate::native_token_denomination::{amount_decimals, amount_units};
-
-/// Identifiers the fixture ledger does not hold. They satisfy `ChainAddress`'s
-/// `^[-A-Za-z0-9]{13,74}$` and differ in form, length, case and alphabet:
-///
-/// * the mixed-case hex form an Ethereum mainnet wallet is written in (the wallet the
-///   recorded trace queried — one row, not the rule);
-/// * the base58 alphabet a Bitcoin address is written in, over a body no fixture
-///   produced (a PUBLISHED Bitcoin address would not do: those the index holds, which
-///   is what `state::derived`'s catalog is for);
-/// * a lowercase bech32-shaped address;
-/// * a hyphenated label;
-/// * the shortest and the longest the pattern admits.
-const STRANGERS: [&str; 6] = [
-    "0x28C6C06298d514Db089934071355E5743bf21d60",
-    "1NotASeededBitcoinAddressAtAll",
-    "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
-    "a-stranger-with-hyphens",
-    "aaaaaaaaaaaaa",
-    "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
-];
 
 /// 2023-01-01T00:00:00Z and 2023-02-01T00:00:00Z: the month-long historical window the
 /// recorded traces query. Used as a row wherever the ledger's own span covers it.
@@ -935,7 +915,11 @@ async fn an_identifier_the_ledger_does_not_hold_is_an_empty_page_or_not_found() 
     let emulator = Emulator::new();
 
     for network in emulator.fixture() {
-        for stranger in STRANGERS {
+        // Each row is a well-formed address of the queried network's OWN chain that no
+        // fixture produced (a published address would not do: those the index holds,
+        // which is what `state::derived`'s catalog is for), differing in encoding,
+        // version character, case and length.
+        for stranger in unseeded_addresses(&network.network) {
             let case = format!("{}/{stranger}", network.network);
 
             // No history: the emulator holds no index of the public chain, so it reports

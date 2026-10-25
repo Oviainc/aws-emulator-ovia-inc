@@ -37,10 +37,12 @@
 
 use crate::ops::types::{Budget, Notification, Spend, Subscriber};
 
-/// Amazon SNS's own namespace: the vendor field an `SNS` subscriber's address has to
-/// carry for that address to name a topic at all, which is also the prefix SNS is
-/// addressed by in a Region.
-const SNS_NAMESPACE: &str = "sns";
+// Amazon SNS's own namespace: the vendor field an `SNS` subscriber's address has to
+// carry for that address to name a topic at all (which is what
+// `super::subscriber_address_violation` holds every stored subscriber to), and the
+// prefix SNS is addressed by in a Region. Defined once beside the store, so the
+// validation that admits an address and the publish that uses it read the same vendor.
+use super::SNS_NAMESPACE;
 
 /// The budget an alert is published FOR, copied out of the stored budget so the message
 /// can be built and published once the store's lock is released.

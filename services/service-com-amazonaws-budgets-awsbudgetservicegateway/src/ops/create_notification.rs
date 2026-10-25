@@ -10,6 +10,12 @@
 //! is a `DuplicateRecordException`, and the documented notification and per-type
 //! subscriber limits are answered with `CreationLimitExceededException`.
 //!
+//! Every subscriber attached here is held to the form its own `SubscriptionType` names —
+//! an email address or an SNS topic ARN, and no line breaks either way
+//! ([`crate::state::subscriber_address_violation`]) — so an address that could never
+//! receive the notification's alert is refused with `InvalidParameterException` rather
+//! than stored.
+//!
 //! A subscriber carries no id either, so the `Subscribers` supplied for the notification
 //! are a SET: a repeat of one the same list already names is collapsed into it
 //! ([`crate::state::distinct_subscribers`]) before the per-type limits are counted and
@@ -193,6 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
+
+        // "Either an Amazon SNS topic or an email address" (`Subscriber`), and "the value
+        // of `Address` can't contain line breaks" (`Subscriber$Address`) — the form of
+        // every address this call would attach, which no constraint trait can express.
+        // Checked before anything is written, so a notification is never stored holding
+        // an address that could not receive its alert.
+        crate::state::subscriber_address_violation(&input.subscribers).map_err(|message| {
+            CreateNotificationErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+        })?;
 
         // A subscriber's subscription type and address are its whole identity, so the
         // subscribers of a notification are a SET: a repeat of one the same list already

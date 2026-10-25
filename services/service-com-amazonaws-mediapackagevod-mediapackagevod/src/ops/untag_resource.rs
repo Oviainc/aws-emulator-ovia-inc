@@ -11,10 +11,13 @@
 //! key the resource does not carry removes nothing, which makes the call idempotent -
 //! repeating it answers 204 again and leaves the same map.
 //!
-//! A `TagKeys` entry carrying the reserved `aws:` prefix is refused with
+//! A `TagKeys` entry that is not a tag key at all is refused with
 //! `UnprocessableEntityException` (HTTP 422) attributed to that member
-//! ([`crate::state::check_tag_keys`]): such a tag belongs to AWS, and a caller may no
-//! more delete one than create one, so nothing is removed.
+//! ([`crate::state::check_tag_keys`]), and nothing is removed: one carrying the reserved
+//! `aws:` prefix, because such a tag belongs to AWS and a caller may no more delete one
+//! than create one, and one outside AWS's 1-to-128-character bound on a key (the empty
+//! string among them), because no tag of any resource can carry it. Idempotence covers a
+//! WELL-FORMED key the resource happens not to carry, not a key no resource could have.
 //!
 //! `ResourceArn` is resolved the way every other operation of this REGIONAL control
 //! plane resolves a resource: only a resource held in the Region the request is served
@@ -206,10 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the Region its SigV4 credential scope names.
         let region = crate::state::request_region(ctx.parts());
         // Judged BEFORE anything is removed, so a refused call leaves the stored tags
-        // exactly as it found them. A key carrying the reserved `aws:` prefix names a
-        // tag AWS owns, which a caller may no more delete than create, so it is refused
-        // rather than reported as removed. Idempotence is about a WELL-FORMED key the
-        // resource happens not to carry, which is removed below without error.
+        // exactly as it found them. A key AWS's tagging restrictions admit for no tag at
+        // all — one carrying the reserved `aws:` prefix, or one outside the bound on a
+        // key's length, the empty string among them — is refused rather than reported as
+        // removed. Idempotence is about a WELL-FORMED key the resource happens not to
+        // carry, which is removed below without error.
         crate::state::check_tag_keys("tagKeys", &input.tag_keys)?;
         let mut state = store.lock();
         if !state.holds_arn_resource(&region, &input.resource_arn) {

@@ -157,6 +157,15 @@
 //!   document through, a group's declared tags beside the ones CloudFormation gives it. A
 //!   schedule is keyed by its name AND the group holding it
 //!   ([`scheduled_group_of`]), so its delete and its drift read carry both.
+//! * the two `AWS::MSK::*` cluster types' properties are their creates' own members in
+//!   lower camel case, so each arm walks the evaluated document ([`msk_members`]) with the
+//!   one member whose API spelling is not a case change renamed
+//!   ([`MSK_RENAMED_MEMBERS`]); a serverless cluster's two configuration properties go
+//!   under the `serverless` body `CreateClusterV2` takes, whose `VpcConfigs` entries are
+//!   mapped by name. Each type's identity is the `ClusterArn` Amazon MSK mints ("Ref
+//!   returns the ARN of the cluster"), so that ARN — not a computed name — is what the
+//!   stack reports for the resource, and the delete and the drift read address the cluster
+//!   by it.
 //!
 //! ## The tags every created resource carries
 //!
@@ -198,7 +207,8 @@ use super::template::{
     ACM_ACME_ENDPOINT, AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
-    GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
+    GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, MSK_CLUSTER, MSK_SERVERLESS_CLUSTER,
+    S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
     SCHEDULER_SCHEDULE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
     WAF_REGIONAL_IP_SET,
@@ -262,6 +272,8 @@ pub(super) enum Provisioner {
     WafRegionalIpSet,
     GrafanaWorkspace,
     GuardDutyDetector,
+    MskCluster,
+    MskServerlessCluster,
     RdsDbInstance,
     RdsDbSubnetGroup,
     RdsDbParameterGroup,
@@ -298,6 +310,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         WAF_REGIONAL_IP_SET => Some(Provisioner::WafRegionalIpSet),
         GRAFANA_WORKSPACE => Some(Provisioner::GrafanaWorkspace),
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
+        MSK_CLUSTER => Some(Provisioner::MskCluster),
+        MSK_SERVERLESS_CLUSTER => Some(Provisioner::MskServerlessCluster),
         RDS_DB_INSTANCE => Some(Provisioner::RdsDbInstance),
         RDS_DB_SUBNET_GROUP => Some(Provisioner::RdsDbSubnetGroup),
         RDS_DB_PARAMETER_GROUP => Some(Provisioner::RdsDbParameterGroup),
@@ -383,6 +397,10 @@ impl Provisioner {
             Self::GuardDutyDetector => {
                 create_detector(ctx, region, resource, propagated).await
             }
+            Self::MskCluster => create_msk_cluster(ctx, region, resource, propagated).await,
+            Self::MskServerlessCluster => {
+                create_msk_serverless_cluster(ctx, region, resource, propagated).await
+            }
             Self::RdsDbInstance => {
                 create_db_instance(ctx, region, resource, propagated).await
             }
@@ -447,7 +465,8 @@ impl Provisioner {
     /// rather than sent to be refused — a stack must not fail over tags CloudFormation adds
     /// of its own accord. The stack's own tags, which are ordinary keys, are applied either
     /// way. ACM is the same case: its `CreateAcmeEndpoint` refuses a reserved key on either
-    /// half of a pair, and so does Amazon ECS's `CreateCluster`.
+    /// half of a pair, and so do Amazon ECS's `CreateCluster` and Amazon MSK's two cluster
+    /// creates.
     fn applicable_tags(self, propagated: &[(String, String)]) -> Vec<(String, String)> {
         let refuses_reserved_keys = matches!(
             self,
@@ -458,6 +477,8 @@ impl Provisioner {
                 | Self::S3VectorsIndex
                 | Self::SchedulerScheduleGroup
                 | Self::AcmAcmeEndpoint
+                | Self::MskCluster
+                | Self::MskServerlessCluster
         );
         propagated
             .iter()
@@ -583,6 +604,11 @@ impl Provisioner {
                 delete_workspace(ctx, region, physical_resource_id).await
             }
             Self::GuardDutyDetector => delete_detector(ctx, region, physical_resource_id).await,
+            // One `DeleteCluster` deletes a cluster of either kind, addressed by the ARN
+            // Amazon MSK minted for it.
+            Self::MskCluster | Self::MskServerlessCluster => {
+                delete_msk_cluster(ctx, region, physical_resource_id).await
+            }
             // The delete carries one member off the resource's own declaration
             // (`DeleteAutomatedBackups`), so it takes the record rather than the id.
             Self::RdsDbInstance => delete_db_instance(ctx, region, resource).await,
@@ -684,6 +710,10 @@ impl Provisioner {
                 describe_workspace(ctx, region, physical_resource_id).await
             }
             Self::GuardDutyDetector => describe_detector(ctx, region, physical_resource_id).await,
+            // One `DescribeClusterV2` reads a cluster of either kind back.
+            Self::MskCluster | Self::MskServerlessCluster => {
+                describe_msk_cluster(ctx, region, physical_resource_id).await
+            }
             Self::RdsDbInstance => {
                 describe_db_instance(ctx, region, physical_resource_id).await
             }
@@ -2727,6 +2757,25 @@ fn reported_as_properties(detail: &Value, members: &[(&str, &str)]) -> Value {
 ///
 /// `depth` is how many levels are already above this one, as in [`camel_cased`].
 fn lower_camel_members(value: &Value, depth: usize) -> Result<Value, Refusal> {
+    // No member of these types is spelled anything but the property with its initial
+    // letter lower-cased, so the walk carries no exceptions.
+    renamed_members(value, depth, &[])
+}
+
+/// The same walk where some of the members are NOT the property with its initial letter
+/// lower-cased: `renamed` is the table of those, as (property, member) pairs, and every
+/// other key is re-cased exactly as [`lower_camel_members`] does it.
+///
+/// That is the shape a type whose API spells one member differently needs
+/// (`AWS::MSK::Cluster`'s `StorageInfo.EBSStorageInfo` against `storageInfo.\
+/// ebsStorageInfo`), and the same exception-carrying arrangement [`camel_cased`] has for
+/// the one map whose keys are data. A table small enough to read is what keeps this a
+/// re-casing walk rather than a per-member mapping ([`mapped_members`]).
+fn renamed_members(
+    value: &Value,
+    depth: usize,
+    renamed: &[(&str, &str)],
+) -> Result<Value, Refusal> {
     if depth >= MAX_PROPERTY_NESTING {
         return Err(too_deeply_nested());
     }
@@ -2734,19 +2783,34 @@ fn lower_camel_members(value: &Value, depth: usize) -> Result<Value, Refusal> {
         Value::Object(members) => {
             let mut converted = Map::new();
             for (name, member) in members {
-                converted.insert(lower_initial(name), lower_camel_members(member, depth + 1)?);
+                converted.insert(
+                    renamed_member(name, renamed),
+                    renamed_members(member, depth + 1, renamed)?,
+                );
             }
             Ok(Value::Object(converted))
         }
         Value::Array(items) => {
             let mut converted = Vec::with_capacity(items.len());
             for item in items {
-                converted.push(lower_camel_members(item, depth + 1)?);
+                converted.push(renamed_members(item, depth + 1, renamed)?);
             }
             Ok(Value::Array(converted))
         }
         scalar => Ok(scalar.clone()),
     }
+}
+
+/// The API member one property name is: the one `renamed` names it, and otherwise the
+/// property with its initial letter lower-cased.
+fn renamed_member(property: &str, renamed: &[(&str, &str)]) -> String {
+    renamed
+        .iter()
+        .find(|(declared, _)| *declared == property)
+        .map_or_else(
+            || lower_initial(property),
+            |(_, member)| (*member).to_string(),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -4422,6 +4486,301 @@ async fn describe_detector(
 /// internal failure, which says nothing about whether the detector is there.
 fn guardduty_rejected(refusal: &Refusal) -> bool {
     refusal.code == GUARDDUTY_INVALID_INPUT || refusal.code == GUARDDUTY_BAD_REQUEST
+}
+
+// ---------------------------------------------------------------------------
+// Amazon MSK: AWS::MSK::Cluster and AWS::MSK::ServerlessCluster
+// ---------------------------------------------------------------------------
+
+/// Amazon MSK's signing name, from its model (`sigv4Name: kafka`, `endpointPrefix: kafka`).
+/// That service speaks `restJson1`, so its operations are bound to a METHOD and a URI
+/// rather than to an `X-Amz-Target` header.
+const MSK_SIGNING_NAME: &str = "kafka";
+
+/// The URI `CreateCluster` is bound to, and the collection a cluster's own URI hangs off:
+/// `POST /v1/clusters` creates a provisioned cluster, `GET /v1/clusters/{ClusterArn}` reads
+/// one and `DELETE /v1/clusters/{ClusterArn}` deletes a cluster of EITHER kind
+/// (`smithy_query(query="operation", operation="CreateCluster,DescribeCluster,\
+/// DeleteCluster")` on that service's model).
+const MSK_CLUSTERS_URI: &str = "/v1/clusters";
+
+/// The v2 collection, which is the one that serves a SERVERLESS cluster: `CreateClusterV2`
+/// is `POST /api/v2/clusters` and `DescribeClusterV2` is
+/// `GET /api/v2/clusters/{ClusterArn}`. The v1 `DescribeCluster` answers only for a
+/// provisioned cluster — its `ClusterInfo` describes broker nodes, which a serverless
+/// cluster has none of — while the v2 `Cluster` shape models a member for each kind.
+const MSK_CLUSTERS_V2_URI: &str = "/api/v2/clusters";
+
+/// The error code Amazon MSK answers for a cluster ARN it holds no cluster for
+/// (`NotFoundException`, a modelled error of `DescribeCluster`, `DescribeClusterV2` and
+/// `DeleteCluster`).
+const MSK_NOT_FOUND: &str = "NotFoundException";
+
+/// The `AWS::MSK::Cluster` properties `CreateCluster` has no member for.
+///
+/// `CurrentVersion` is the version token an UPDATE of a cluster that already exists must
+/// match ("The current version of the MSK cluster"), and a create has no version to match
+/// — so it is not carried out, and nothing about the cluster the create makes differs for
+/// it. Every other property of the type IS a `CreateCluster` member ([`msk_members`]).
+const MSK_UPDATE_ONLY_PROPERTIES: &[&str] = &["CurrentVersion"];
+
+/// The one `AWS::MSK::Cluster` property name that is not its API member's name with the
+/// initial letter lower-cased: the type spells the initialism of
+/// `StorageInfo.EBSStorageInfo` in full capitals where the member is
+/// `storageInfo.ebsStorageInfo` (`smithy_query(query="shape", shape="StorageInfo")`).
+const MSK_RENAMED_MEMBERS: &[(&str, &str)] = &[("EBSStorageInfo", "ebsStorageInfo")];
+
+/// The members one `AWS::MSK::ServerlessCluster` `VpcConfigs` entry carries, as
+/// (property, member) pairs.
+///
+/// The entry is Amazon MSK's `VpcConfig` (`smithy_query(query="shape", shape="VpcConfig")`:
+/// `subnetIds`, `securityGroupIds`), and the type publishes the security-group list as
+/// `SecurityGroups` — a per-member correspondence rather than a case change, which is why
+/// this one structure is mapped by name instead of walked.
+const MSK_SERVERLESS_VPC_CONFIG_MEMBERS: &[(&str, &str)] =
+    &[("SubnetIds", "subnetIds"), ("SecurityGroups", "securityGroupIds")];
+
+/// Create the provisioned cluster an `AWS::MSK::Cluster` declares, and report the
+/// `ClusterArn` Amazon MSK ASSIGNED it.
+///
+/// The type's properties ARE `CreateCluster`'s own members spelled with an initial capital
+/// — `BrokerNodeGroupInfo`, `ClientAuthentication`, `ConfigurationInfo`, `EncryptionInfo`,
+/// `EnhancedMonitoring`, `KafkaVersion`, `LoggingInfo`, `NumberOfBrokerNodes`,
+/// `OpenMonitoring` and `StorageMode` against `brokerNodeGroupInfo`,
+/// `clientAuthentication`, `configurationInfo`, `encryptionInfo`, `enhancedMonitoring`,
+/// `kafkaVersion`, `loggingInfo`, `numberOfBrokerNodes`, `openMonitoring` and
+/// `storageMode`, every one of them a `jsonName` of
+/// `smithy_query(query="closure", operation="CreateCluster")` — and the correspondence
+/// holds all the way down (`BrokerNodeGroupInfo.ClientSubnets` is
+/// `brokerNodeGroupInfo.clientSubnets`; `ClientAuthentication.Sasl.Iam.Enabled` is
+/// `clientAuthentication.sasl.iam.enabled`;
+/// `LoggingInfo.BrokerLogs.CloudWatchLogs.LogGroup` is
+/// `loggingInfo.brokerLogs.cloudWatchLogs.logGroup`;
+/// `OpenMonitoring.Prometheus.JmxExporter.EnabledInBroker` is
+/// `openMonitoring.prometheus.jmxExporter.enabledInBroker`). So the whole evaluated
+/// document is carried through [`msk_members`] rather than mapped member by member, which
+/// is safe for the same reason the Amazon ECS and GuardDuty walks are: no property of this
+/// type carries a MAP of caller data. The exceptions are the one member whose API spelling
+/// is not a case change ([`MSK_RENAMED_MEMBERS`]), the property the create has no member
+/// for ([`MSK_UPDATE_ONLY_PROPERTIES`]) and `Tags`, which the type publishes as a MAP of
+/// tag key to value exactly as the create takes one ([`tags_as_map`]) — lifted out before
+/// the walk so it carries the tags CloudFormation gives the resource beside the declared
+/// ones ([`tags_of`]).
+///
+/// VALUES are untouched: an enum value, a number and a boolean are what the template
+/// declared, and Amazon MSK's own validation is what judges them — its refusal leaves the
+/// stack `CREATE_FAILED` rather than a cluster configured differently from the template.
+///
+/// The cluster's NAME is the one value CloudFormation decides
+/// ([`msk_cluster_name`]), so it is set on the way out; its identity is not
+/// CloudFormation's at all ("Ref returns the ARN of the cluster", whose resource path
+/// carries an identifier only Amazon MSK mints), so the ARN the create answers with is
+/// reported as the resource's physical id ([`msk_created`]).
+async fn create_msk_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    if let Some(properties) = resource.properties.as_object() {
+        for (property, value) in properties {
+            if property == "Tags" || MSK_UPDATE_ONLY_PROPERTIES.contains(&property.as_str()) {
+                continue;
+            }
+            request.insert(
+                renamed_member(property, MSK_RENAMED_MEMBERS),
+                msk_members(value)?,
+            );
+        }
+    }
+    request.insert(
+        "clusterName".to_string(),
+        Value::String(msk_cluster_name(resource)?),
+    );
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let reported = call_rest_json(
+        ctx,
+        MSK_SIGNING_NAME,
+        region,
+        "POST",
+        MSK_CLUSTERS_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    msk_created(resource, &reported)
+}
+
+/// Create the serverless cluster an `AWS::MSK::ServerlessCluster` declares, and report the
+/// `ClusterArn` Amazon MSK ASSIGNED it.
+///
+/// A serverless cluster is created by `CreateClusterV2`, whose request carries the cluster
+/// name and the tags beside ONE of its two alternative bodies — the `Serverless` one here.
+/// That body's members are this type's `VpcConfigs` and `ClientAuthentication`
+/// (`smithy_query(query="shape", shape="ServerlessRequest")`: `vpcConfigs`,
+/// `clientAuthentication`), so the declaration's two configuration properties go under
+/// `serverless` rather than at the top of the request. `ClientAuthentication` is the same
+/// members with a lower-case initial all the way down (`Sasl.Iam.Enabled` is
+/// `sasl.iam.enabled`) and is walked; a `VpcConfigs` entry is not, because the type
+/// publishes its security-group list under a different name
+/// ([`MSK_SERVERLESS_VPC_CONFIG_MEMBERS`]).
+async fn create_msk_serverless_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut serverless = Map::new();
+    if let Some(Value::Array(configs)) = resource.properties.get("VpcConfigs") {
+        serverless.insert(
+            "vpcConfigs".to_string(),
+            Value::Array(
+                configs
+                    .iter()
+                    .map(|config| mapped_members(config, MSK_SERVERLESS_VPC_CONFIG_MEMBERS))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(authentication) = resource.properties.get("ClientAuthentication") {
+        serverless.insert(
+            "clientAuthentication".to_string(),
+            msk_members(authentication)?,
+        );
+    }
+    let mut request = Map::new();
+    request.insert(
+        "clusterName".to_string(),
+        Value::String(msk_cluster_name(resource)?),
+    );
+    request.insert("serverless".to_string(), Value::Object(serverless));
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let reported = call_rest_json(
+        ctx,
+        MSK_SIGNING_NAME,
+        region,
+        "POST",
+        MSK_CLUSTERS_V2_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    msk_created(resource, &reported)
+}
+
+/// Delete the cluster a stack created, addressed by the ARN Amazon MSK minted for it —
+/// this resource's physical id, which is what `Ref` returns for either type.
+///
+/// `DeleteCluster` deletes a cluster of either kind, and a cluster Amazon MSK holds no
+/// cluster for under that ARN (`NotFoundException`) is already in the state the delete asks
+/// for. Judged on the error CODE, never on the message, which carries the request's own
+/// ARN. The ARN goes into the URI percent-encoded, as a non-greedy `@httpLabel` is sent,
+/// so its `:` and `/` cannot address a different operation.
+async fn delete_msk_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let uri = format!(
+        "{MSK_CLUSTERS_URI}/{}",
+        percent_encoded(physical_resource_id)
+    );
+    match call_rest_json(ctx, MSK_SIGNING_NAME, region, "DELETE", &uri, None).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == MSK_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The cluster's configuration as Amazon MSK reports it, for drift detection: the record
+/// `DescribeClusterV2` answers with, read by the ARN that service minted.
+///
+/// The v2 read serves both kinds of cluster, which is why it is the one this uses. An ARN
+/// Amazon MSK holds no cluster for (`NotFoundException`) is the resource having been
+/// deleted. The record's members are Amazon MSK's own (lower camel), so a declared property
+/// spelled identically on both sides takes part in the comparison and one spelled
+/// differently leaves the cluster reported as existing rather than as modified — exactly
+/// what [`super::drift`] documents for every arm here.
+async fn describe_msk_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let uri = format!(
+        "{MSK_CLUSTERS_V2_URI}/{}",
+        percent_encoded(physical_resource_id)
+    );
+    match call_rest_json(ctx, MSK_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answer) => Ok(answer.get("clusterInfo").cloned()),
+        Err(refusal) if refusal.code == MSK_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// What a cluster create answered, as the resource's identity: the `ClusterArn` Amazon MSK
+/// minted.
+///
+/// "Ref returns the ARN of the cluster" for both types, and that ARN is also each type's
+/// one published `Fn::GetAtt` attribute — so it is reported as the physical id
+/// ([`Created::physical_resource_id`]), which
+/// [`super::provisioning::reconcile`] adopts, and as `Arn`. The conventional
+/// `<Type>Arn` name every resource also answers
+/// ([`super::template::conventional_attributes`]) was computed from the stand-in identifier
+/// the naming rules derived, so it is re-pointed at the minted ARN too: one resource must
+/// not report two different ARNs.
+fn msk_created(resource: &StoredResource, reported: &Value) -> Result<Created, Refusal> {
+    let Some(arn) = reported.get("clusterArn").and_then(Value::as_str) else {
+        // The create answered 2xx without the ARN its output models. Nothing addresses an
+        // MSK cluster without one, so this is reported as a failure rather than recorded
+        // as a resource with a physical id nothing minted.
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "Amazon MSK answered no clusterArn for the cluster it created".to_string(),
+        });
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Arn".to_string(), arn.to_string());
+    if let Some(segment) = resource.resource_type.rsplit("::").next() {
+        attributes.insert(format!("{segment}Arn"), arn.to_string());
+    }
+    Ok(Created {
+        physical_resource_id: Some(arn.to_string()),
+        attributes,
+    })
+}
+
+/// The name the cluster is created under: the `ClusterName` the declaration asks for —
+/// which both types REQUIRE — and otherwise the name CloudFormation generated for the
+/// resource, which [`super::template`] records as its `Name`.
+///
+/// A declaration carrying neither describes no cluster that could be created, so it is
+/// refused here rather than with a request Amazon MSK would have to reject.
+fn msk_cluster_name(resource: &StoredResource) -> Result<String, Refusal> {
+    property(resource, "ClusterName")
+        .or_else(|| {
+            resource
+                .attributes
+                .get("Name")
+                .filter(|name| !name.is_empty())
+                .cloned()
+        })
+        .ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!("{} declares no ClusterName", resource.resource_type),
+        })
+}
+
+/// One Amazon MSK property value with every member name inside it spelled as that
+/// service's model spells the very same member: the shared re-casing walk
+/// ([`renamed_members`]) carrying the one member whose API name is not the property with
+/// its initial letter lower-cased ([`MSK_RENAMED_MEMBERS`]).
+fn msk_members(value: &Value) -> Result<Value, Refusal> {
+    renamed_members(value, 0, MSK_RENAMED_MEMBERS)
 }
 
 // ---------------------------------------------------------------------------

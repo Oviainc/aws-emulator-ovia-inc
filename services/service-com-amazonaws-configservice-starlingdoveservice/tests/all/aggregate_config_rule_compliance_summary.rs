@@ -62,35 +62,40 @@ const AWS_REGION: &str = "AWS_REGION";
 const RULE_CAP: usize = 25;
 
 /// The bounds `Limit` publishes (`GroupByAPILimit`, `@range(min: 0, max: 1000)`).
-const MIN_LIMIT: i64 = 0;
+pub(crate) const MIN_LIMIT: i64 = 0;
 /// See [`MIN_LIMIT`].
-const MAX_LIMIT: i64 = 1000;
+pub(crate) const MAX_LIMIT: i64 = 1000;
 
 /// The Region the harness signs its requests for, which is therefore the Region this
 /// store's Config data belongs to.
-const HOME_REGION: &str = "us-east-1";
+pub(crate) const HOME_REGION: &str = "us-east-1";
 /// Another Region, used both as a Region the aggregator does not take in and as the
 /// Region a second harness signs for.
-const OTHER_REGION: &str = "us-west-2";
+pub(crate) const OTHER_REGION: &str = "us-west-2";
 
 /// A source account that is not this emulator's, in the twelve-digit form `AccountId`'s
 /// `^\d{12}$` pattern allows.
-const OTHER_ACCOUNT: &str = "111122223333";
+pub(crate) const OTHER_ACCOUNT: &str = "111122223333";
 
 /// The aggregator every case that is not about the aggregator's own scope uses.
-const AGGREGATOR: &str = "org-wide";
+///
+/// `pub(crate)` from here down: every suite about an AGGREGATE read of this account's
+/// Config data needs exactly this setup — an aggregator over this account's sources and
+/// an emulator holding rules with recorded results — so the aggregate suites share one
+/// copy of it (`aggregate_compliance_by_config_rules` is the other one).
+pub(crate) const AGGREGATOR: &str = "org-wide";
 
 /// This emulator's account id, the account whose Config data the store holds.
-fn account() -> String {
+pub(crate) fn account() -> String {
     emulator_server::emulator_account_id().to_string()
 }
 
 /// One Config rule a row seeds: its name and the evaluation results recorded for it.
-type Rule = (String, Vec<&'static str>);
+pub(crate) type Rule = (String, Vec<&'static str>);
 
 /// `specs` as Config rules: one rule per repetition each spec asks for, carrying the
 /// evaluation results that spec names, with names distinct across the whole table row.
-fn rules(specs: &[(usize, &[&'static str])]) -> Vec<Rule> {
+pub(crate) fn rules(specs: &[(usize, &[&'static str])]) -> Vec<Rule> {
     let mut seeded = Vec::new();
     for (group, (count, results)) in specs.iter().enumerate() {
         for ordinal in 0..*count {
@@ -102,7 +107,7 @@ fn rules(specs: &[(usize, &[&'static str])]) -> Vec<Rule> {
 
 /// An emulator signed for `region`, with a configuration recorder and delivery channel,
 /// holding `seeded` Config rules and their recorded evaluation results.
-async fn emulator_holding(region: &str, seeded: &[Rule]) -> Emulator {
+pub(crate) async fn emulator_holding(region: &str, seeded: &[Rule]) -> Emulator {
     let emulator = Emulator::in_region(region);
     with_recorder_and_channel(&emulator).await;
     for (name, results) in seeded {
@@ -114,7 +119,7 @@ async fn emulator_holding(region: &str, seeded: &[Rule]) -> Emulator {
 
 /// An account aggregation source over `accounts`, aggregating the Regions in `regions`,
 /// or every Region when `regions` is empty.
-fn account_source(accounts: &[&str], regions: &[&str]) -> Value {
+pub(crate) fn account_source(accounts: &[&str], regions: &[&str]) -> Value {
     let mut source = json!({ "AccountIds": accounts });
     if regions.is_empty() {
         source["AllAwsRegions"] = json!(true);
@@ -126,7 +131,7 @@ fn account_source(accounts: &[&str], regions: &[&str]) -> Value {
 
 /// An organization aggregation source over the Regions in `regions`, or every Region
 /// when `regions` is empty.
-fn organization_source(regions: &[&str]) -> Value {
+pub(crate) fn organization_source(regions: &[&str]) -> Value {
     let mut source = json!({ "RoleArn": ROLE_ARN });
     if regions.is_empty() {
         source["AllAwsRegions"] = json!(true);
@@ -138,20 +143,20 @@ fn organization_source(regions: &[&str]) -> Value {
 
 /// Create the aggregator [`AGGREGATOR`] from the `PutConfigurationAggregator` body
 /// `sources`.
-async fn put_aggregator(emulator: &Emulator, mut sources: Value) {
+pub(crate) async fn put_aggregator(emulator: &Emulator, mut sources: Value) {
     sources["ConfigurationAggregatorName"] = json!(AGGREGATOR);
     emulator.ok("PutConfigurationAggregator", &sources).await;
 }
 
 /// An aggregator that aggregates this account in every Region.
-async fn put_whole_account_aggregator(emulator: &Emulator) {
+pub(crate) async fn put_whole_account_aggregator(emulator: &Emulator) {
     put_aggregator(emulator, account_source(&[&account()], &[])).await;
 }
 
 /// The `(CappedCount, CapExceeded)` of one reported `ComplianceContributorCount`. A
 /// member the response leaves out is the modelled default, which is what a zero count
 /// and an unexceeded cap are.
-type Contributors = (i64, bool);
+pub(crate) type Contributors = (i64, bool);
 
 /// One reported group: the name it carries and the two counts its `ComplianceSummary`
 /// reports.
@@ -189,7 +194,7 @@ fn reported(case: &str, body: &Value) -> Vec<Group> {
 }
 
 /// The counts one `ComplianceContributorCount` reports.
-fn contributors(count: &Value) -> Contributors {
+pub(crate) fn contributors(count: &Value) -> Contributors {
     (
         count
             .get("CappedCount")

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDashboard
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDashboard`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDashboard::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or replaces a dashboard in this service's store. Implemented here, and the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -111,12 +104,27 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `PutDashboardError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#PutDashboard")]
+//
+// `InvalidParameterValueException` — "The value of an input parameter is bad or
+// out-of-range." — and `LimitExceededException` — "The operation exceeded one or more
+// limits." — are widened in through `extra_errors`: this SERVICE models both shapes (and
+// `GetDashboard`, `ListDashboards` and `DeleteDashboards` declare the first), but this
+// operation's own `errors` list omits them. A `DashboardName` outside the length and
+// character set its documentation states is a bad parameter VALUE rather than invalid
+// dashboard DATA (`DashboardInvalidInputError`), which is what a refused over-long name
+// answers with; and this store's capacity ([`crate::state::MAX_DASHBOARDS`]) is a limit, not
+// a property of the request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#PutDashboard",
+    extra_errors = ["InvalidParameterValueException", "LimitExceededException"]
+)]
 #[derive(Debug)]
 pub enum PutDashboardErrorModeled {
     ConflictException(ConflictException),
     DashboardInvalidInputError(DashboardInvalidInputError),
     InternalServiceFault(InternalServiceFault),
+    InvalidParameterValueException(InvalidParameterValueException),
+    LimitExceededException(LimitExceededException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -170,18 +178,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDashboard` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDashboardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDashboard"))
+        // A dashboard is global, so nothing here reads the Region the request was signed for.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutDashboardErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch dashboard store is unavailable".into()),
+            })
+        })?;
+
+        // Every rule below is prose the model carries no constraint for, so the request
+        // reaches this handler having satisfied the modelled ones already: `DashboardName`
+        // and `DashboardBody` are `@required` strings with neither a length nor a pattern.
+        if let Some(message) =
+            crate::state::dashboard_name_error("DashboardName", &input.dashboard_name)
+        {
+            return Err(invalid_parameter_value(message));
+        }
+        if let Some(message) = crate::state::tag_count_error("dashboard", input.tags.as_deref()) {
+            return Err(invalid_parameter_value(message));
+        }
+        validate_body(&input.dashboard_body)?;
+
+        let now = crate::state::now_secs();
+        let mut store = state.lock();
+        // "If a dashboard with this name already exists, this call modifies that dashboard,
+        // replacing its current contents. Otherwise, a new dashboard is created."
+        // (`PutDashboardInput$DashboardName`)
+        let existing = store.dashboards.get(&input.dashboard_name);
+        if existing.is_none() && store.dashboards.len() >= crate::state::MAX_DASHBOARDS {
+            return Err(PutDashboardErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator holds at most {} dashboards",
+                        crate::state::MAX_DASHBOARDS
+                    )),
+                },
+            )
+            .into());
+        }
+        // "You can use this parameter only when creating a new dashboard. If you specify Tags
+        // when updating an existing dashboard, the tag updates are ignored."
+        // (`PutDashboardInput$Tags`)
+        let tags = existing.map_or_else(
+            || input.tags.clone().unwrap_or_default(),
+            |stored| stored.tags.clone(),
+        );
+        store.dashboards.insert(
+            input.dashboard_name.clone(),
+            crate::state::StoredDashboard {
+                // "If you update a dashboard, the entire contents are replaced with what you
+                // specify here." (`PutDashboard`)
+                body: input.dashboard_body.clone(),
+                last_modified_secs: now,
+                tags,
+            },
+        );
+
+        // "If the input for PutDashboard was correct and the dashboard was successfully
+        // created or modified, this result is empty."
+        // (`PutDashboardOutput$DashboardValidationMessages`) — the dashboard was stored, so
+        // there is no warning and no error to report about it.
+        Ok(PutDashboardOutput {
+            dashboard_validation_messages: Some(Vec::new()),
+        })
     }
+}
+
+/// Refuse the request with this operation's `InvalidParameterValueException` (HTTP 400):
+/// "The value of an input parameter is bad or out-of-range."
+fn invalid_parameter_value(message: String) -> PutDashboardError {
+    PutDashboardErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse a `DashboardBody` that is not a dashboard document at all.
+///
+/// "The detailed information about the dashboard in JSON format, including the widgets to
+/// include and their location on the dashboard." (`PutDashboardInput$DashboardBody`) — the
+/// model constrains the member only as a string, so a body that is not a JSON object is
+/// refused here with the modelled `DashboardInvalidInputError` (HTTP 400, `awsQueryError`
+/// code `InvalidParameterInput`): "Some part of the dashboard data is invalid."
+///
+/// What each WIDGET of an otherwise well-formed document must carry is diagnosed per
+/// `dataPath` into `DashboardValidationMessages` and is not checked here.
+fn validate_body(body: &str) -> Result<(), PutDashboardError> {
+    if ::serde_json::from_str::<::serde_json::Value>(body).is_ok_and(|parsed| parsed.is_object()) {
+        return Ok(());
+    }
+    Err(
+        PutDashboardErrorModeled::DashboardInvalidInputError(DashboardInvalidInputError {
+            message: Some("The field DashboardBody must be a valid JSON object".into()),
+            dashboard_validation_messages: None,
+        })
+        .into(),
+    )
 }

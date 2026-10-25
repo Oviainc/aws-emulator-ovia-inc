@@ -69,7 +69,7 @@ fn status(output: &Value) -> String {
 /// an order being submitted from the quote, and a case about what each status BLOCKS
 /// must not depend on which. Every assertion about behaviour still goes over the
 /// wire.
-fn set_quote_status(outposts: &Outposts, quote_id: &str, quote_status: &str) {
+pub(crate) fn set_quote_status(outposts: &Outposts, quote_id: &str, quote_status: &str) {
     let store = outposts.store();
     let mut store = store.lock();
     let quote = store
@@ -82,7 +82,7 @@ fn set_quote_status(outposts: &Outposts, quote_id: &str, quote_status: &str) {
 /// `CreateQuote` for `outpost_identifier` (or for no Outpost at all), returning the
 /// minted `QuoteId`. The body is [`crate::quote_lifecycle`]'s: the two members the
 /// model marks `@required`, plus the optional association.
-async fn a_quote(outposts: &Outposts, outpost_identifier: Option<&str>) -> String {
+pub(crate) async fn a_quote(outposts: &Outposts, outpost_identifier: Option<&str>) -> String {
     let association = match outpost_identifier {
         Some(identifier) => json!({ "OutpostIdentifier": identifier }),
         None => json!({}),

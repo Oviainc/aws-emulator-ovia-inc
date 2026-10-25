@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,23 +144,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_ENDPOINT_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Remove the device endpoint `EndpointArn` names from this account's platform
+    /// endpoint records.
+    ///
+    /// "This action is idempotent" (`DeleteEndpoint` doc), and the operation models no
+    /// `NotFoundException`, so an endpoint this account holds no record of is a SUCCESS
+    /// that removes nothing — the answer and the state are the same however many times
+    /// the same delete arrives.
+    ///
+    /// What the idempotence does NOT cover is a value that is not an ARN at all: it
+    /// names no endpoint in any account, so it is bad input, refused with the modelled
+    /// `InvalidParameterException` BEFORE the store is consulted. An ARN-shaped value
+    /// that names something other than one of this account's endpoints is simply a
+    /// record this store does not hold, which is the idempotent case above.
+    ///
+    /// A deleted endpoint's SUBSCRIPTIONS stay where they are: "When you delete an
+    /// endpoint that is also subscribed to a topic, then you must also unsubscribe the
+    /// endpoint from the topic" (same doc) — the unsubscribe is a separate call the
+    /// caller makes, so this one does not make it.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEndpoint"))
+        if let Some(message) = crate::state::arn_refusal("EndpointArn", &input.endpoint_arn) {
+            return Err(DeleteEndpointErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteEndpointErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        store.lock().platform_endpoints.remove(&input.endpoint_arn);
+
+        Ok(DeleteEndpointOutput)
     }
 }

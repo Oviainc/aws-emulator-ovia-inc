@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLongTermPricing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLongTermPricing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLongTermPricing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Buys a long-term pricing contract: the term and device type the request names are
+//! persisted as a contract of this service's own, starting at the instant of the call and
+//! running for the whole calendar months the `LongTermPricingType` names, under a minted
+//! `LongTermPricingId` the caller then quotes on `CreateJob` and `UpdateLongTermPricing`.
+//!
+//! The contract is the only thing this call creates — no device, no job — so the modelled
+//! `InvalidResourceException` ("The specified resource can't be found") is unreachable
+//! here: the request names no existing resource for the service to fail to find. A value
+//! outside one of the two modelled enum catalogs names no term and no device type, and is
+//! refused rather than stored.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +79,46 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The contract term each `LongTermPricingType` names, in whole calendar months.
+///
+/// Source: the modelled catalog `LongTermPricingType`, whose values are `OneMonth`,
+/// `OneYear` and `ThreeYear` (`shared_types::LONG_TERM_PRICING_TYPE_VALUES`) — each value
+/// names its own term, which the operation documents as "a 1-year or 3-year long-term
+/// pricing type for the device". The table carries the whole catalog, so a type the model
+/// admits always has a term and a value outside it has none.
+pub const LONG_TERM_PRICING_TERM_MONTHS: &[(&str, u32)] =
+    &[("OneMonth", 1), ("OneYear", 12), ("ThreeYear", 36)];
+
+/// What a create answers when this emulator's long-term pricing store is at its ceiling.
+fn store_full_message() -> String {
+    format!(
+        "this emulator stores at most {} long-term pricing contracts, and that limit has \
+         been reached",
+        crate::state::MAX_STORED_LONG_TERM_PRICING
+    )
+}
+
+/// The instant `months` whole calendar months after `start`, or `None` when that instant
+/// is outside the range a timestamp can represent.
+///
+/// Calendar months, not a fixed number of days: a one-month contract bought on the 31st
+/// ends on the last day of the following month, and a three-year one spans the leap days
+/// in between. `chrono` does that arithmetic (including clamping a day the target month
+/// does not have), so this service does not carry a calendar of its own.
+fn plus_calendar_months(
+    start: ::std::time::SystemTime,
+    months: u32,
+) -> Option<::std::time::SystemTime> {
+    let since_epoch = start.duration_since(::std::time::UNIX_EPOCH).ok()?;
+    let start = ::chrono::DateTime::from_timestamp(
+        i64::try_from(since_epoch.as_secs()).ok()?,
+        since_epoch.subsec_nanos(),
+    )?;
+    let end = start.checked_add_months(::chrono::Months::new(months))?;
+    let seconds = u64::try_from(end.timestamp()).ok()?;
+    Some(::std::time::UNIX_EPOCH + ::std::time::Duration::new(seconds, end.timestamp_subsec_nanos()))
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +188,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLongTermPricing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLongTermPricingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLongTermPricing"))
+        // Nothing in this operation depends on the request's metadata: a contract is
+        // bought for a term and a device type, neither of which the Region or the headers
+        // say anything about.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        // `LongTermPricingType` targets an enum, so a value outside that catalog names no
+        // term at all and there is no contract to buy: refuse it the way the boundary
+        // validator refuses a value a modelled constraint rejects. The term lookup IS the
+        // catalog check — the table carries the whole catalog — so the two cannot drift.
+        let Some((_, term_months)) = LONG_TERM_PRICING_TERM_MONTHS
+            .iter()
+            .find(|(pricing_type, _)| *pricing_type == input.long_term_pricing_type)
+        else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::outside_catalog_message(
+                    "longTermPricingType",
+                    &input.long_term_pricing_type,
+                    LONG_TERM_PRICING_TYPE_VALUES,
+                ),
+            ));
+        };
+
+        // The same rule for the device type: `SnowballType` targets an enum, and a
+        // contract covers "the type of Snow Family devices to use for the long-term
+        // pricing job", so a value naming no device type cannot be stored as one.
+        if !SNOWBALL_TYPE_VALUES.contains(&input.snowball_type.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::outside_catalog_message(
+                    "snowballType",
+                    &input.snowball_type,
+                    SNOWBALL_TYPE_VALUES,
+                ),
+            ));
+        }
+
+        // "You are billed upfront": the contract runs from the instant it is bought, for
+        // the term its type names.
+        let start_date = ::std::time::SystemTime::now();
+        let Some(end_date) = plus_calendar_months(start_date, *term_months) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "a {} long-term pricing contract starting now ends outside the range a \
+                 timestamp can represent",
+                input.long_term_pricing_type
+            )));
+        };
+
+        // This emulator holds a bounded number of contracts, and nothing in this API
+        // deletes one, so a store at its ceiling refuses the create rather than growing
+        // the process further. The model declares no quota error on this operation, so the
+        // refusal travels on the framework's channel, naming the limit reached. It is
+        // answered BEFORE an id is minted, so a refused create leaves the id sequence
+        // where it was.
+        let mut store = state.lock();
+        if !store.can_store_another_long_term_pricing() {
+            return Err(crate::scaffolded::Scaffolded::validation(store_full_message()));
+        }
+
+        // The id is the service's own: the caller names no contract on this call, so the
+        // record is keyed and reported by the id minted here.
+        let long_term_pricing_id = store.mint_long_term_pricing_id();
+        let record = crate::state::StoredLongTermPricing {
+            long_term_pricing_id: long_term_pricing_id.clone(),
+            long_term_pricing_type: input.long_term_pricing_type,
+            snowball_type: input.snowball_type,
+            // "Specifies whether the current long-term pricing type for the device should
+            // be renewed": a create that does not ask for renewal does not get it, so the
+            // stored contract answers the question either way.
+            is_long_term_pricing_auto_renew: input.is_long_term_pricing_auto_renew.unwrap_or(false),
+            long_term_pricing_start_date: start_date,
+            long_term_pricing_end_date: end_date,
+            // A contract whose upfront payment has been taken is one the service is
+            // holding to from this instant on.
+            long_term_pricing_status: crate::state::LONG_TERM_PRICING_STATUS_ACTIVE.to_string(),
+        };
+
+        // The ceiling is enforced again at the insertion point, which is the only place
+        // that can tell whether the record went in. Under the lock held here it cannot
+        // fire — the check above has already asked the same store — so this is the
+        // defence that keeps the ceiling true if that pre-check is ever dropped, not a
+        // second refusal path a request can reach today.
+        if !store.insert_long_term_pricing(record) {
+            return Err(crate::scaffolded::Scaffolded::validation(store_full_message()));
+        }
+
+        Ok(CreateLongTermPricingOutput {
+            long_term_pricing_id: Some(long_term_pricing_id),
+        })
     }
 }

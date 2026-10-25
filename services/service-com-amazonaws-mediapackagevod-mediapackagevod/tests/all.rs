@@ -21,6 +21,8 @@ mod asset_listing;
 mod configure_logs;
 #[path = "all/describe_packaging_configuration.rs"]
 mod describe_packaging_configuration;
+#[path = "all/empty_response_framing.rs"]
+mod empty_response_framing;
 #[path = "all/error_responses.rs"]
 mod error_responses;
 #[path = "all/packaging_configuration_deletion.rs"]
@@ -45,5 +47,7 @@ mod resource_tag_removal;
 mod state_roundtrip;
 #[path = "all/success_path_projections.rs"]
 mod success_path_projections;
+#[path = "all/tag_key_length_bounds.rs"]
+mod tag_key_length_bounds;
 #[path = "all/tag_restrictions.rs"]
 mod tag_restrictions;

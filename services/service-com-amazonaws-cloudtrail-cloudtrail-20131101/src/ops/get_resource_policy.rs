@@ -172,11 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A resource ARN carries its own Region, so this operation reads no Region
         // off the request.
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -208,9 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetResourcePolicyErrorModeled::ResourcePolicyNotFoundException(
                     ResourcePolicyNotFoundException {
-                        message: Some(format!(
-                            "No resource policy is attached to {}",
-                            resource.arn
+                        message: Some(crate::state::resource_policy_not_found_message(
+                            &resource.arn,
                         )),
                     },
                 )

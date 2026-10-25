@@ -285,6 +285,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`InvalidParameterException`). Checked before anything is written, so a
         // refused update leaves the stored action exactly as it was.
         if let Some(subscribers) = &input.subscribers {
+            // Every address in a replacement set is held to the form its own
+            // `SubscriptionType` names, exactly as the set a create establishes is: "either
+            // an Amazon SNS topic or an email address" (`Subscriber`), with no line breaks
+            // (`Subscriber$Address`). Checked before anything is written, so a refused
+            // update leaves the stored action's subscribers as they were.
+            crate::state::subscriber_address_violation(subscribers).map_err(|message| {
+                UpdateBudgetActionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+            })?;
             crate::state::subscriber_limit_violation(subscribers).map_err(|message| {
                 UpdateBudgetActionErrorModeled::InvalidParameterException(
                     InvalidParameterException {

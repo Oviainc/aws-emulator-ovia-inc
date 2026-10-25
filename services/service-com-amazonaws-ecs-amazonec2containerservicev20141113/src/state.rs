@@ -469,6 +469,17 @@ pub const TASK_DEFINITION_ACTIVE: &str = "ACTIVE";
 /// indefinitely."
 pub const TASK_DEFINITION_INACTIVE: &str = "INACTIVE";
 
+/// `TaskDefinition$status` for a revision whose DELETE has been asked for — the
+/// `DeleteTaskDefinitions` doc: "When you delete a task definition revision, it is
+/// immediately transitions from the `INACTIVE` to `DELETE_IN_PROGRESS`." The third
+/// `TaskDefinitionStatus` value
+/// (`smithy_query(query="shape", shape="TaskDefinitionStatus")`), and the status a
+/// revision keeps while the deletion is outstanding: "A task definition revision will
+/// stay in `DELETE_IN_PROGRESS` status until all the associated tasks and services have
+/// been terminated", and while it is there "the task definition name is displayed in the
+/// console and returned in the API" — so the revision stays stored and readable.
+pub const TASK_DEFINITION_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
+
 /// `DaemonTaskDefinition$status` for a registered daemon revision. One of the
 /// `DaemonTaskDefinitionStatus` values
 /// (`smithy_query(query="shape", shape="DaemonTaskDefinitionStatus")`: `ACTIVE`,
@@ -940,6 +951,11 @@ pub const MAX_CLIENT_TOKEN_LENGTH: usize = 36;
 /// How many services one `DescribeServices` request may name. The member's doc: "You
 /// may specify up to 10 services to describe in a single operation."
 pub const MAX_DESCRIBE_SERVICES: usize = 10;
+
+/// How many task-definition revisions one `DeleteTaskDefinitions` request may name. The
+/// `DeleteTaskDefinitionsRequest$taskDefinitions` doc: "You can specify up to 10 task
+/// definitions as a comma separated list."
+pub const MAX_DELETE_TASK_DEFINITIONS: usize = 10;
 
 /// How many tags ONE resource may carry, whoever wrote them. The `Tag` doc's first
 /// restriction: "Maximum number of tags per resource - 50" — the same number the `Tags`
@@ -1545,6 +1561,10 @@ pub struct TaskDefinitionRecord {
     pub registered_by: String,
     pub registered_at: DateTime,
     pub deregistered_at: Option<DateTime>,
+    /// "The Unix timestamp for the time when the task definition delete was requested" —
+    /// absent until `DeleteTaskDefinitions` asks for one, and kept as the instant THAT
+    /// call ran.
+    pub delete_requested_at: Option<DateTime>,
 }
 
 /// The container-definition collection members a task-definition projection always
@@ -1803,7 +1823,7 @@ impl TaskDefinitionRecord {
             proxy_configuration: self.proxy_configuration.clone(),
             registered_at: Some(self.registered_at),
             deregistered_at: self.deregistered_at,
-            delete_requested_at: None,
+            delete_requested_at: self.delete_requested_at,
             // "The principal that registered the task definition", as it was resolved
             // when the registration ran.
             registered_by: Some(self.registered_by.clone()),
@@ -4185,6 +4205,26 @@ impl ClusterFields {
         fields
     }
 }
+
+/// A `Failure` for a revision a delete cannot act on because it has not been
+/// deregistered: the `DeleteTaskDefinitions` doc's own requirement, "You must deregister
+/// a task definition revision before you delete it", which is also why the operation
+/// reports it per entry rather than refusing the whole batch — one entry of a request may
+/// be deletable while another is not.
+pub fn not_inactive_failure(arn: &str, status: &str) -> Failure {
+    Failure {
+        arn: Some(arn.to_string()),
+        reason: Some(TASK_DEFINITION_NOT_INACTIVE_REASON.to_string()),
+        // "The details of the failure": the status the revision is actually in, which is
+        // what tells the caller whether to deregister it or to wait for a delete already
+        // under way.
+        detail: Some(format!("The task definition is in {status} status.")),
+    }
+}
+
+/// `Failure$reason` for a revision a delete cannot act on because it is not `INACTIVE`.
+pub const TASK_DEFINITION_NOT_INACTIVE_REASON: &str =
+    "Task definition must be in INACTIVE status to be deleted.";
 
 /// A `Failure` for an id that names nothing: `reason: "MISSING"`.
 pub fn missing_failure(arn: &str) -> Failure {

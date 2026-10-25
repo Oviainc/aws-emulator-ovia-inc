@@ -23,7 +23,8 @@
 //! * the **quota utilization reports** (`StartQuotaUtilizationReport`,
 //!   `GetQuotaUtilizationReport`) — each one a FROZEN snapshot of the quota values in
 //!   force when it was initiated, published once the clock has made its generation
-//!   due and deleted once its retention has passed;
+//!   due and deleted once its retention has passed; a start while one is still live
+//!   reuses it rather than minting a second;
 //! * the **tags on an applied quota** (`TagResource`, `ListTagsForResource`,
 //!   `UntagResource`) — keyed by the quota's own ARN, the only thing a tagging
 //!   operation names its resource by, so one quota has exactly one tag set however
@@ -307,19 +308,11 @@ pub const REPORT_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 ///
 /// AWS-DOCUMENTED, so it keeps its value: `GetQuotaUtilizationReport`'s own
 /// documentation says "Reports are automatically deleted after 15 minutes."
-pub const REPORT_RETENTION: Duration = Duration::from_secs(15 * 60);
-
-/// The most un-expired utilization reports this emulator keeps per region.
 ///
-/// A report holds a snapshot of every quota, so the store needs a ceiling for a
-/// caller that starts reports in a loop; past it a further start is refused with the
-/// `TooManyRequestsException` the model declares on `StartQuotaUtilizationReport`
-/// (`@httpError(429)` in the model, which this awsJson front end puts on the wire as
-/// HTTP 400 with that `__type`, the way [`crate::scaffolded::wire_http_status`]
-/// classifies every client fault). The number is CHOSEN (AWS publishes no limit on
-/// concurrent reports) and reports leave the store on their own as
-/// [`REPORT_RETENTION`] passes.
-pub const MAX_LIVE_REPORTS_PER_REGION: usize = 50;
+/// It is also what BOUNDS the report store, so no ceiling on reports is needed: a
+/// region holds at most ONE report, because a start reuses the live one instead of
+/// minting a second, and that one leaves the store on its own when this passes.
+pub const REPORT_RETENTION: Duration = Duration::from_secs(15 * 60);
 
 /// The usage this service's state has recorded against a quota.
 ///
@@ -556,6 +549,9 @@ pub struct UtilizationReport {
     pub id: String,
     /// A `ReportStatus` member.
     pub status: String,
+    /// When the report was initiated. The recency a start reuses by: the live report
+    /// of a region is the one most recently initiated there.
+    pub started_at: SystemTime,
     /// When generation starts (`PENDING` -> `IN_PROGRESS`). Stored, never slept on.
     pub in_progress_at: SystemTime,
     /// When generation completes (`IN_PROGRESS` -> `COMPLETED`), and the `GeneratedAt`
@@ -567,6 +563,37 @@ pub struct UtilizationReport {
     /// that is the state the report analysed — and published only once the report has
     /// completed, so every page of one report sees the same records.
     pub quotas: Vec<QuotaUtilizationInfo>,
+}
+
+/// What a start of a quota utilization report arrived at: the report the caller is
+/// answered with, and whether this call minted it or handed back the one the account
+/// already had.
+///
+/// The distinction is part of the answer rather than an implementation detail: the
+/// operation's own `Message` is documented to "indicate if an existing recent report
+/// is being reused".
+#[derive(Debug, Clone)]
+pub enum ReportStart {
+    /// This region held no live report, so the call minted one, `PENDING`, over the
+    /// quota values in force when it was called.
+    Minted(UtilizationReport),
+    /// This region already held a live report, so the call reused it, with whatever
+    /// status the clock has brought it to.
+    Reused(UtilizationReport),
+}
+
+impl ReportStart {
+    /// The report the caller is answered with, however the start arrived at it.
+    pub fn report(&self) -> &UtilizationReport {
+        match self {
+            Self::Minted(report) | Self::Reused(report) => report,
+        }
+    }
+
+    /// Whether an existing recent report was reused instead of a new one minted.
+    pub fn reused(&self) -> bool {
+        matches!(self, Self::Reused(_))
+    }
 }
 
 /// Why a `ResourceARN` handed to a tagging operation names no applied quota.
@@ -1149,23 +1176,26 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         }
     }
 
-    /// Initiate a quota utilization report and return the stored record — `None` when
-    /// this region already holds [`MAX_LIVE_REPORTS_PER_REGION`] un-expired reports.
+    /// Start a quota utilization report: reuse the live report this region already
+    /// holds, and mint one only when it holds none.
     ///
-    /// The report is stored `PENDING` with the instants its generation and its
+    /// A report is readable until its retention passes and is then deleted, so the
+    /// recent report of a region is the live one, and while it is live a further start
+    /// is answered with THAT report — its `ReportId` and the status the clock has
+    /// brought it to — taking no second snapshot. That is what makes a caller which
+    /// re-starts converge on one report instead of accumulating them.
+    ///
+    /// A minted report is stored `PENDING` with the instants its generation and its
     /// deletion come due at, and with the snapshot of the quota values in force NOW:
     /// that is the state the report analyses, so what it publishes does not depend on
     /// when anybody polls it.
-    pub fn start_utilization_report(
-        &mut self,
-        region: &str,
-        now: SystemTime,
-    ) -> Option<UtilizationReport> {
-        self.purge_expired_reports(region, now);
-        // The ceiling is checked BEFORE the snapshot is taken, so a refused start does
-        // no analysis work.
-        if self.stored_report_count(region) >= MAX_LIVE_REPORTS_PER_REGION {
-            return None;
+    pub fn start_utilization_report(&mut self, region: &str, now: SystemTime) -> ReportStart {
+        // Settling first is what makes a reused report carry the status a read of it
+        // at this same instant reports, and what deletes one whose retention passed —
+        // both owed by the clock whether or not anybody called.
+        self.settle_due_reports(region, now);
+        if let Some(live) = self.live_utilization_report(region) {
+            return ReportStart::Reused(live.clone());
         }
         let quotas = self.utilization_snapshot(region);
         let state = self.regions.entry(region.to_string()).or_default();
@@ -1174,13 +1204,28 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         let report = UtilizationReport {
             id: id.clone(),
             status: REPORT_STATUS_PENDING.to_string(),
+            started_at: now,
             in_progress_at: now + REPORT_PROCESSING_DELAY,
             completed_at: now + REPORT_COMPLETION_DELAY,
             expires_at: now + REPORT_RETENTION,
             quotas,
         };
         state.reports.insert(id, report.clone());
-        Some(report)
+        ReportStart::Minted(report)
+    }
+
+    /// The live report of `region` — the most recently initiated one still inside its
+    /// retention, which is the report a start reuses.
+    ///
+    /// Reports past their retention are already gone: both
+    /// [`Self::settle_due_reports`] and [`Self::start_utilization_report`] delete them
+    /// when the clock has made their deletion due.
+    fn live_utilization_report(&self, region: &str) -> Option<&UtilizationReport> {
+        self.regions
+            .get(region)?
+            .reports
+            .values()
+            .max_by_key(|report| report.started_at)
     }
 
     /// Materialise every report transition the clock has already made due in `region`:
@@ -1212,8 +1257,9 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         self.regions.get(region)?.reports.get(id)
     }
 
-    /// How many un-expired utilization reports this region holds, against
-    /// [`MAX_LIVE_REPORTS_PER_REGION`].
+    /// How many un-expired utilization reports this region holds. A region that has
+    /// been started on holds ONE — a start reuses the live report — until its
+    /// retention passes.
     pub fn stored_report_count(&self, region: &str) -> usize {
         self.regions.get(region).map_or(0, |state| state.reports.len())
     }

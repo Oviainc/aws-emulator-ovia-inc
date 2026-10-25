@@ -2,7 +2,7 @@
 
 //! The account-id well-formedness refusal, asserted through EVERY operation whose
 //! input carries account ids — the member operations that take an `AccountIds` list,
-//! the invitation delete that takes one, the create that takes an `AccountDetails`
+//! the invitation decline and delete that take one, the create that takes an `AccountDetails`
 //! list, and the organization-configuration pair whose include/exclude lists together
 //! name one account scope.
 //!
@@ -67,9 +67,10 @@ const MODE: &str = "LIVE";
 /// `smithy_query(query="doc",shape="DetectionRuleOrgConfiguration",member="IncludeAccountIds")`),
 /// so the create is driven through `includeAccountIds` and the update through
 /// `excludeAccountIds`: both sides of the pair are covered.
-const OPERATIONS: [&str; 10] = [
+const OPERATIONS: [&str; 11] = [
     "GetMembers",
     "InviteMembers",
+    "DeclineInvitations",
     "DeleteInvitations",
     "DisassociateMembers",
     "StopMonitoringMembers",
@@ -136,8 +137,20 @@ async fn send(
             )
             .await
         }
+        "DeclineInvitations" => {
+            // One of the two that name no detector: the inbox it answers from is the
+            // one the request's Region serves (`POST /invitation/decline` —
+            // `smithy_query(operation="DeclineInvitations")`).
+            call(
+                router,
+                "POST",
+                "/invitation/decline",
+                Some(json!({"accountIds": ids})),
+            )
+            .await
+        }
         "DeleteInvitations" => {
-            // The only one of these that names no detector: the inbox it deletes
+            // The other one that names no detector: the inbox it deletes
             // from is the one the request's Region serves
             // (`POST /invitation/delete` —
             // `smithy_query(operation="DeleteInvitations")`).

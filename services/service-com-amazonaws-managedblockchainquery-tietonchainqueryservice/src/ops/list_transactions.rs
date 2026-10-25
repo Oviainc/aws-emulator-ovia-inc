@@ -10,6 +10,12 @@
 //! (`crate::state::derived::normalize_address`), so the two spellings of one Ethereum
 //! account read one history.
 //!
+//! `address` has to be an address OF the chain `network` names before any of that: one
+//! `ChainAddress` type serves every chain this service indexes, so its `@pattern` admits
+//! the other chains' addresses, and a string that is not an address of the requested chain
+//! is refused per field by `crate::state::validation` rather than answered with the empty
+//! page an address the index merely holds nothing under gets.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

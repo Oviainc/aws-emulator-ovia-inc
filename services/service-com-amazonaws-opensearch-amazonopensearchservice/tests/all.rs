@@ -33,6 +33,8 @@ mod domain_lifecycle;
 mod domain_nodes;
 #[path = "all/index_registry.rs"]
 mod index_registry;
+#[path = "all/insights.rs"]
+mod insights;
 #[path = "all/instance_type_catalog.rs"]
 mod instance_type_catalog;
 #[path = "all/instance_type_limits.rs"]

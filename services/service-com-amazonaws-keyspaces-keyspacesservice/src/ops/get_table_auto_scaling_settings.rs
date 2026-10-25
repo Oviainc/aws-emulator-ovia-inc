@@ -8,10 +8,13 @@
 //! `replicaSpecifications.readCapacityAutoScaling` override applied when one is stored.
 //! This is the ONLY file to touch for `GetTableAutoScalingSettings`.
 //!
-//! A table's auto scaling settings are a resource of their own — the scalable target this
-//! operation needs `application-autoscaling:DescribeScalableTargets` to read — so a table
-//! that was never given any has none to report, which is the modelled
-//! `ResourceNotFoundException`, not an empty success.
+//! A table's auto scaling settings are OPTIONAL in the response, while the table's
+//! identity members are `@required`: a table that was never given any auto scaling — the
+//! scalable target this operation needs `application-autoscaling:DescribeScalableTargets`
+//! to read — is still reported with a 200 naming the keyspace, the table and its ARN, and
+//! `autoScalingSpecification` simply absent. The modelled `ResourceNotFoundException` is
+//! for a keyspace or table that does not exist (or is not `ACTIVE`), so it is answered
+//! only when the lookup itself fails.
 //!
 //! ## Shape of an operation
 //!
@@ -226,32 +229,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The settings of the table's two capacities as they stand now: the scalable
         // targets and target-tracking policies Application Auto Scaling holds for them,
         // which is what this operation needs `DescribeScalableTargets` and
-        // `DescribeScalingPolicies` permission to read.
+        // `DescribeScalingPolicies` permission to read. A table auto scaling was never
+        // configured for has no scalable target, so there is nothing to report under
+        // `autoScalingSpecification` — which the response models as OPTIONAL, unlike the
+        // identity members below. The table itself was resolved from state above, so it
+        // exists, and reporting it as absent would be a different answer than the one
+        // asked for.
         let auto_scaling_specification = crate::state::reported_auto_scaling(
             &*self.engine,
             &table.keyspace_name,
             &table.table_name,
             table.auto_scaling_specification.as_ref(),
         );
-        // The settings this operation reads are the table's scalable targets, which exist
-        // only for a table auto scaling was configured for — for the table itself, or for
-        // one of the Regions it is replicated in. For any other table the operation "tried
-        // to access a ... resource that doesn't exist".
-        let replica_auto_scaling = table.has_replica_auto_scaling();
-        if auto_scaling_specification.is_none() && !replica_auto_scaling {
-            return Err(
-                GetTableAutoScalingSettingsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Table {} has no auto scaling settings.",
-                            table.table_name
-                        )),
-                        resource_arn: Some(table.resource_arn.clone()),
-                    },
-                )
-                .into(),
-            );
-        }
 
         Ok(GetTableAutoScalingSettingsOutput {
             keyspace_name: table.keyspace_name.clone(),

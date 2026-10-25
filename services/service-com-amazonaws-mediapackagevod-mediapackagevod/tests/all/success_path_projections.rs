@@ -528,13 +528,13 @@ async fn delete_packaging_group_makes_every_later_read_not_found() {
             "case {case:?}: DeletePackagingGroup answers 204 No Content, got {status}, \
              body {body}"
         );
-        // The operation models no output members, so what the response may carry is the
-        // framework's rendering of an empty output struct (`{}`) rather than anything
-        // this handler puts there; only the status is this handler's to assert.
+        // The operation models no output members and answers 204 No Content, which has
+        // no body to carry the framework's rendering of an empty output struct — see
+        // `src/service.rs` and `tests/all/empty_response_framing.rs`.
         assert_eq!(
             body,
-            json!({}),
-            "case {case:?}: DeletePackagingGroup models no output members, got {body}"
+            Value::Null,
+            "case {case:?}: a 204 DeletePackagingGroup carries no body, got {body}"
         );
 
         // The read after the delete: 404, the modelled error type on the wire, and a

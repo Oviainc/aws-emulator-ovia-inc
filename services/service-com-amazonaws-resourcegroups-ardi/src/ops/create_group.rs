@@ -7,9 +7,14 @@
 //! every later read returns the stored one.
 //!
 //! A group is created with EITHER a `ResourceQuery` or a service `Configuration`, and
-//! both forms are stored on the same record, so a configured (application) group is an
-//! ordinary group afterwards: `GetGroup`, `GetGroupConfiguration`, `UpdateGroup` and
+//! both forms are stored on the same record, so a configured group is an ordinary
+//! group afterwards: `GetGroup`, `GetGroupConfiguration`, `UpdateGroup` and
 //! `DeleteGroup` all resolve it by name or ARN.
+//!
+//! A configuration that declares the group an APPLICATION group gives it an
+//! application identity: its ARN qualifies its name with an application id minted
+//! here, and every `Group` it is reported in carries the membership tag whose value
+//! is that ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -224,6 +229,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+        // The group service configuration can declare the group an APPLICATION
+        // group, which is the one kind of group that carries an application
+        // identity and reports a membership tag for it.
+        let application_group = input
+            .configuration
+            .iter()
+            .flatten()
+            .any(|item| item.r#type == crate::state::APPLICATION_GROUP_CONFIGURATION_TYPE);
+        // An application group's ARN QUALIFIES its name with its application id,
+        // and the modelled `ApplicationArn` writes that name segment narrower
+        // than a group name may be, so a longer name cannot be given the
+        // identity an application group has.
+        if application_group && !crate::state::is_qualifiable_group_name(&input.name) {
+            return Err(bad_request(format!(
+                "Name {} is not valid: an application group's ARN qualifies its name \
+                 with the group's application id, and writes that name as at most {} \
+                 characters",
+                input.name,
+                crate::state::MAX_QUALIFIED_GROUP_NAME_LENGTH,
+            )));
+        }
         // Modelled on `CreateGroupInput$Name`: "The name cannot start with AWS, aws, or
         // any other possible capitalization; these are reserved." `get` keeps the
         // comparison on a char boundary: `Name` is request-supplied, so byte-indexing it
@@ -287,8 +313,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_GROUPS,
             )));
         }
+        // An application group's identity carries the application id that
+        // qualifies its name, minted ONCE here and stored with the group, so
+        // every later read reports the same identity and the same membership
+        // tag. A group that is not an application group carries none until
+        // something it hosts needs one.
+        let application_id = application_group.then(crate::state::new_qualifying_id);
         let record = crate::state::GroupRecord {
-            group_arn: crate::state::group_arn(&region, &input.name),
+            group_arn: match application_id.as_deref() {
+                Some(id) => crate::state::qualified_group_arn(&region, &input.name, id),
+                None => crate::state::group_arn(&region, &input.name),
+            },
             owner_id: crate::state::owning_account_id(),
             name: input.name.clone(),
             description: input.description,
@@ -311,8 +346,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             grouping_statuses: std::collections::BTreeMap::new(),
             // Minted only if the group later hosts a resource whose ARN
             // qualifies the group's name, so a group that hosts none carries
-            // none.
-            application_id: None,
+            // none — except an APPLICATION group, whose own identity is
+            // qualified from the moment it is created (above).
+            application_id,
         };
         // Reported from the record that is about to be stored, so the response and
         // the store cannot disagree.

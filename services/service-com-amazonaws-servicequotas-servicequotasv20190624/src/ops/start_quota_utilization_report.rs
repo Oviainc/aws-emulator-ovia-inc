@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartQuotaUtilizationReport
-//! Initiates a quota utilization report: mints a report over the quotas in this
+//! Starts a quota utilization report: hands back the live report this region already
+//! holds (saying in `Message` that it is reused), or mints one over the quotas in this
 //! service's state, stores it `PENDING` with the instants its generation comes due at,
 //! and returns its `ReportId` for `GetQuotaUtilizationReport` to poll.
 //!
@@ -145,14 +146,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::START_QUOTA_UTILIZATION_REPORT_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
-    /// Initiate a quota utilization report.
+    /// Start a quota utilization report, reusing the live one if there is one.
     ///
     /// MUTATING by its own specification ("Initiates the generation of a quota
-    /// utilization report"): every call mints a report, so two calls answer with two
-    /// `ReportId`s and neither reuses the other's. The report is stored `PENDING` —
-    /// the status the model documents for a report that was just initiated — with the
-    /// snapshot of the quota values in force now and the instants its generation and
-    /// its deletion come due at; nothing here sleeps for them.
+    /// utilization report"), but only when there is something to initiate: while the
+    /// account still holds a live report in this region — one inside the retention
+    /// `GetQuotaUtilizationReport` documents — the call is answered with THAT report's
+    /// `ReportId` and current status, and its `Message` says the existing recent
+    /// report is being reused, which is what the modelled `Message` is documented to
+    /// indicate. Only when no live report is left does the call mint one, stored
+    /// `PENDING` — the status the model documents for a report that was just
+    /// initiated — with the snapshot of the quota values in force now and the instants
+    /// its generation and its deletion come due at; nothing here sleeps for them.
     async fn handle(
         &self,
         input: Self::Input,
@@ -169,32 +174,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut quotas_state = state.lock();
         // The snapshot the report analyses must see every increase the clock has
-        // already made due, the same way a quota read does.
+        // already made due, the same way a quota read does. The report transitions the
+        // clock owes are settled by the start itself, so a reused report answers with
+        // the status a read of it at this instant reports.
         quotas_state.settle_due_requests(&region, now);
-        quotas_state.settle_due_reports(&region, now);
 
-        let report = quotas_state
-            .start_utilization_report(&region, now)
-            .ok_or_else(|| {
-                StartQuotaUtilizationReportErrorModeled::TooManyRequestsException(
-                    TooManyRequestsException {
-                        message: Some(format!(
-                            "this region already has {} quota utilization reports in flight; \
-                             retrieve or wait for one to expire before starting another",
-                            crate::state::MAX_LIVE_REPORTS_PER_REGION
-                        )),
-                    },
-                )
-            })?;
+        let started = quotas_state.start_utilization_report(&region, now);
+        let report = started.report();
+        let message = if started.reused() {
+            "An existing recent quota utilization report is being reused; call \
+             GetQuotaUtilizationReport with this ReportId to retrieve its results"
+                .to_string()
+        } else {
+            format!(
+                "Report generation started for {} quotas; call GetQuotaUtilizationReport \
+                 with this ReportId to retrieve the results",
+                report.quotas.len()
+            )
+        };
 
         Ok(StartQuotaUtilizationReportOutput {
             report_id: Some(report.id.clone()),
             status: Some(report.status.clone()),
-            message: Some(format!(
-                "report generation started for {} quotas; call GetQuotaUtilizationReport with \
-                 this ReportId to retrieve the results",
-                report.quotas.len()
-            )),
+            message: Some(message),
         })
     }
 }

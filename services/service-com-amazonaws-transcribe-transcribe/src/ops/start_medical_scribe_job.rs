@@ -231,7 +231,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartMedicalScribeJobErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -322,29 +321,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(&message));
         }
 
+        // The Region this request is served in: the job is started in — and only in —
+        // the Region the caller signed for.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // A Medical Scribe job may only apply a custom vocabulary or custom vocabulary
-        // filter this account HOLDS — the rule every job family's settings follow, see
+        // filter this REGION holds — the rule every job family's settings follow, see
         // [`crate::state::unheld_reference_error`].
-        if let Some(message) = store.unheld_reference_error(&[
-            (
-                crate::state::ResourceFamily::Vocabulary,
-                input.settings.vocabulary_name.as_deref(),
-            ),
-            (
-                crate::state::ResourceFamily::VocabularyFilter,
-                input.settings.vocabulary_filter_name.as_deref(),
-            ),
-        ]) {
+        if let Some(message) = store.unheld_reference_error(
+            &region,
+            &[
+                (
+                    crate::state::ResourceFamily::Vocabulary,
+                    input.settings.vocabulary_name.as_deref(),
+                ),
+                (
+                    crate::state::ResourceFamily::VocabularyFilter,
+                    input.settings.vocabulary_filter_name.as_deref(),
+                ),
+            ],
+        ) {
             return Err(bad_request(&message));
         }
 
         // "This name is case sensitive, cannot contain spaces, and must be unique
         // within an Amazon Web Services account. If you try to create a new job with
-        // the same name as an existing job, you get a ConflictException error."
-        if store.medical_scribe_jobs.contains_key(&input.medical_scribe_job_name) {
+        // the same name as an existing job, you get a ConflictException error." Unique
+        // within ONE Region of that account: a regional endpoint holds only the jobs
+        // started through it.
+        if store
+            .medical_scribe_jobs
+            .contains(&region, &input.medical_scribe_job_name)
+        {
             return Err(StartMedicalScribeJobErrorModeled::ConflictException(
                 ConflictException {
                     // The kind, not the caller's name — see
@@ -357,12 +367,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The account's job quota is a CONCURRENCY one, as it is for every job family
-        // here: only the jobs the service is still working on count against
+        // The job quota is a CONCURRENCY one, per account per Region as it is for every
+        // job family here: only the jobs this REGION is still working on count against
         // `crate::state::MAX_CONCURRENT_MEDICAL_SCRIBE_JOBS`, and a job that has
         // reached a terminal status has released its slot (see
         // [`crate::state::jobs_in_flight`]).
-        if crate::state::jobs_in_flight(&mut store.medical_scribe_jobs, now)
+        if crate::state::jobs_in_flight(&mut store.medical_scribe_jobs, &region, now)
             >= crate::state::MAX_CONCURRENT_MEDICAL_SCRIBE_JOBS
         {
             return Err(StartMedicalScribeJobErrorModeled::LimitExceededException(
@@ -370,6 +380,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(crate::state::concurrency_limit_message(
                         crate::state::MAX_CONCURRENT_MEDICAL_SCRIBE_JOBS,
                         crate::state::FAMILY_MEDICAL_SCRIBE_JOBS,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The Region comes from the request's own (unauthenticated) credential scope, so
+        // the concurrency quota above and the retention bound below bound this family's
+        // store only together with a cap on how many Regions it keeps job records for
+        // (see [`crate::state::MAX_REGIONS`]).
+        if store.medical_scribe_jobs.region_bucket_exhausted(&region) {
+            return Err(StartMedicalScribeJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::region_capacity_message(
+                        crate::state::FAMILY_MEDICAL_SCRIBE_JOBS,
+                        &region,
                     )),
                 },
             )
@@ -411,10 +437,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status = %record.status,
             "medical scribe job started"
         );
-        store.medical_scribe_jobs.insert(record.name.clone(), record);
+        let name = record.name.clone();
+        store.medical_scribe_jobs.insert(&region, &name, record);
         // What keeps the store bounded, since the quota above counts only the jobs in
         // flight (see [`crate::state::evict_oldest_finished_jobs`]).
-        crate::state::evict_oldest_finished_jobs(&mut store.medical_scribe_jobs);
+        crate::state::evict_oldest_finished_jobs(&mut store.medical_scribe_jobs, &region);
 
         Ok(StartMedicalScribeJobOutput {
             medical_scribe_job: Some(job),

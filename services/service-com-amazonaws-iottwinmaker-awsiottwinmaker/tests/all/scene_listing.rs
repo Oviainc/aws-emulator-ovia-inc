@@ -31,7 +31,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 
-use crate::harness::{scene_arn, workspace_arn, Emulator, Resp};
+use crate::harness::{scene_arn, workspace_arn, Emulator, Resp, REGION};
 
 /// The members a `SceneSummary` carries that `GetSceneResponse` carries too —
 /// the ones a summary and the single-resource read must agree about. Taken from
@@ -617,6 +617,7 @@ async fn listing_scenes_changes_nothing_a_later_caller_sees() {
     }
     let state = emulator.state();
     let state = state.lock();
+    let state = state.region(REGION);
     assert_eq!(
         (
             state.workspaces.len(),
