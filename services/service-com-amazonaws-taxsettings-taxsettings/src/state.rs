@@ -9,6 +9,7 @@
 //! way instead of each rebuilding it from the raw fields.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 use std::time::{Duration, Instant, SystemTime};
 
 use ::aws_smithy_types::base64;
@@ -1909,6 +1910,74 @@ pub fn decode_page_token(token: &str) -> Result<String, ValidationException> {
         ));
     }
     Ok(account_id)
+}
+
+/// One page of a listing: the entries it reports, in store order, and the cursor
+/// a caller continues from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page<T> {
+    /// The entries this page reports, at most the page size asked of
+    /// [`build_page`] of them, in the order the store enumerates them.
+    pub items: Vec<T>,
+    /// The cursor naming the last key this page emitted — issued only when a
+    /// further entry remains, so the last page carries none.
+    pub next_token: Option<String>,
+}
+
+/// Build one page of a listing over an ordered store: resume past the key the
+/// cursor names, report up to `page_size` entries, and issue a cursor naming the
+/// last key of the page only when a further entry remains.
+///
+/// The ONE implementation of this service's page-build rule, so every listing
+/// pages the same way and a change to paging — a new listing, or a change to how
+/// a cursor is minted ([`encode_page_token`], beside this) — has a single place
+/// to touch.
+///
+/// `project` turns a stored entry into the shape its listing reports, and
+/// answers `None` for one with nothing to report: such an entry is skipped
+/// rather than reported empty, and its key never becomes a cursor.
+///
+/// Resuming uses the ordered map's own `range`, so a cursor's page costs a
+/// lookup rather than a scan of everything before it, and the work done here is
+/// bounded by the page — `page_size` reported entries, plus the entries
+/// `project` skips and the one peeked at to decide the cursor — not by the size
+/// of the store. What a CALLER of this does under the state lock besides
+/// building the page (settling what the clock owes, say) is its own cost.
+///
+/// `page_size` must be at least one: a page of none would report nothing and
+/// carry no cursor, leaving a caller unable to continue. Every caller takes it
+/// from [`PageBounds::page_size`], which never answers zero, and the assertion
+/// below keeps that where the rule lives rather than at each listing.
+pub fn build_page<V, T, F>(
+    source: &BTreeMap<String, V>,
+    resume_after: Option<&str>,
+    page_size: usize,
+    mut project: F,
+) -> Page<T>
+where
+    F: FnMut(&str, &V) -> Option<T>,
+{
+    debug_assert!(page_size > 0, "a page carries at least one entry");
+    let lower = match resume_after {
+        Some(after) => Bound::Excluded(after),
+        None => Bound::Unbounded,
+    };
+    let mut remaining = source
+        .range::<str, _>((lower, Bound::Unbounded))
+        .filter_map(|(key, stored)| project(key, stored).map(|item| (key.as_str(), item)))
+        .peekable();
+    let mut items = Vec::new();
+    let mut last_key: Option<&str> = None;
+    for (key, item) in remaining.by_ref().take(page_size) {
+        last_key = Some(key);
+        items.push(item);
+    }
+    let next_token = if remaining.peek().is_some() {
+        last_key.map(encode_page_token)
+    } else {
+        None
+    };
+    Page { items, next_token }
 }
 
 // ---------------------------------------------------------------------------
