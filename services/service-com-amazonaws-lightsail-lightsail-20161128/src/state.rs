@@ -663,6 +663,8 @@ pub const OPERATION_TYPE_CREATE_CERTIFICATE: &str = "CreateCertificate";
 pub const OPERATION_TYPE_ATTACH_CERTIFICATE_TO_DISTRIBUTION: &str =
     "AttachCertificateToDistribution";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_RESET_DISTRIBUTION_CACHE: &str = "ResetDistributionCache";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_CONTACT_METHOD: &str = "CreateContactMethod";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_CONTACT_METHOD: &str = "DeleteContactMethod";
@@ -9276,6 +9278,26 @@ pub const DISTRIBUTION_STATUS_IN_PROGRESS: &str = "InProgress";
 /// See [`DISTRIBUTION_STATUS_IN_PROGRESS`].
 pub const DISTRIBUTION_STATUS_DEPLOYED: &str = "Deployed";
 
+/// The status of a reset of a distribution's cached content while the reset is
+/// still being applied across the CDN, and once it has been.
+///
+/// `ResetDistributionCacheResult$status` ("The status of the reset cache
+/// request") and `GetDistributionLatestCacheResetResult$status` ("The status of
+/// the last cache reset") are plain strings in the model with no enum behind
+/// them. A Lightsail distribution IS an Amazon CloudFront distribution (which is
+/// why its own status carries CloudFront's distribution status values, see
+/// [`DISTRIBUTION_STATUS_IN_PROGRESS`]) and deleting its cached content is a
+/// CloudFront invalidation, so a reset carries CloudFront's own
+/// `Invalidation$Status`: `InProgress` while the invalidation is being applied
+/// and `Completed` once it has been, as the CloudFront API documents for that
+/// member ("When the invalidation batch is finished, the status is Completed").
+/// That a LATER read reports the status of the last reset at all is what says
+/// the value changes after the call that started it: a status fixed for the life
+/// of the record would be nothing to go back and read.
+pub const CACHE_RESET_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`CACHE_RESET_STATUS_IN_PROGRESS`].
+pub const CACHE_RESET_STATUS_COMPLETED: &str = "Completed";
+
 /// The most distributions this emulator will hold.
 ///
 /// Emulator resource guard, NOT an AWS quota. A create that would exceed it is
@@ -9472,6 +9494,42 @@ pub struct ResolvedOrigin {
     pub public_dns: Option<String>,
 }
 
+/// The last reset of ONE distribution's cached content: what a
+/// `ResetDistributionCache` call started, and the whole of what
+/// `GetDistributionLatestCacheReset` reports.
+///
+/// A distribution holds the LATEST reset only — both operations answer a single
+/// timestamp and a single status, "the last cache reset" — so a new reset
+/// replaces the record of the one before it rather than appending to a history
+/// nothing reports.
+#[derive(Debug, Clone, Copy)]
+pub struct StoredCacheReset {
+    /// When the reset was requested: `createTime`, "The timestamp of the reset
+    /// cache request".
+    pub created_at_ms: i64,
+    /// One of [`CACHE_RESET_STATUS_IN_PROGRESS`] /
+    /// [`CACHE_RESET_STATUS_COMPLETED`].
+    pub status: &'static str,
+    /// The status the clock owes this reset, while one is outstanding.
+    pub due: Option<DueNamedState>,
+}
+
+impl StoredCacheReset {
+    /// The reset a `ResetDistributionCache` call at `now_ms` starts: the
+    /// invalidation is being applied, and the clock owes it
+    /// [`CACHE_RESET_STATUS_COMPLETED`].
+    ///
+    /// The span is non-zero, so a caller that resets and reads straight back
+    /// still observes the reset in progress, exactly as it does against AWS.
+    pub fn started(now_ms: i64) -> Self {
+        Self {
+            created_at_ms: now_ms,
+            status: CACHE_RESET_STATUS_IN_PROGRESS,
+            due: Some(DueNamedState::after(now_ms, CACHE_RESET_STATUS_COMPLETED)),
+        }
+    }
+}
+
 /// One stored distribution: the CDN distribution `CreateDistribution` created.
 ///
 /// What the caller asked for — name, bundle, origin, cache behaviour and
@@ -9535,6 +9593,10 @@ pub struct StoredDistribution {
     pub viewer_minimum_tls_protocol_version: Option<String>,
     pub default_root_object: Option<String>,
     pub custom_error_responses: Vec<DistributionCustomErrorResponse>,
+    /// The last reset of this distribution's cached content, once one has been
+    /// requested: `None` on a distribution whose cache has never been reset,
+    /// which has no timestamp and no status of a reset to report.
+    pub latest_cache_reset: Option<StoredCacheReset>,
 }
 
 impl StoredDistribution {
@@ -10212,6 +10274,22 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// The CDN distribution `name` names, for a reporting operation.
     pub fn distribution(&self, name: &str) -> Option<&StoredDistribution> {
         self.distributions.get(name)
+    }
+
+    /// The most recent cache reset of ANY distribution this account holds, or
+    /// `None` when no distribution's cache has ever been reset.
+    ///
+    /// What `GetDistributionLatestCacheReset` reports when the request names no
+    /// distribution: its `distributionName` documentation says that "when
+    /// omitted, the response includes the latest cache reset timestamp of all
+    /// your distributions", and the result carries ONE timestamp and ONE status
+    /// — so the answer is the latest of them. Ties go to the distribution that
+    /// sorts last in the store's own total order, which is stable across reads.
+    pub fn latest_cache_reset(&self) -> Option<StoredCacheReset> {
+        self.distributions
+            .values()
+            .filter_map(|distribution| distribution.latest_cache_reset)
+            .max_by_key(|reset| reset.created_at_ms)
     }
 
     /// Store a newly created CDN distribution.
@@ -11316,10 +11394,19 @@ impl ComAmazonawsLightsailLightsail20161128State {
             }
         }
         for distribution in self.distributions.values_mut() {
-            let Some(due) = distribution.due else { continue };
-            if due.at_ms <= now_ms {
+            if let Some(due) = distribution.due.filter(|due| due.at_ms <= now_ms) {
                 distribution.status = due.state;
                 distribution.due = None;
+            }
+            // A reset of the distribution's cached content settles on its OWN
+            // clock: deleting cached content is not a configuration change, so
+            // it neither waits for the distribution's deployment nor delays it.
+            let Some(reset) = distribution.latest_cache_reset.as_mut() else {
+                continue;
+            };
+            if let Some(due) = reset.due.filter(|due| due.at_ms <= now_ms) {
+                reset.status = due.state;
+                reset.due = None;
             }
         }
         for certificate in self.certificates.values_mut() {
