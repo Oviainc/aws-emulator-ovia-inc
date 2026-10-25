@@ -33,6 +33,8 @@ mod feed_association;
 mod feed_association_retry;
 #[path = "all/feed_lifecycle.rs"]
 mod feed_lifecycle;
+#[path = "all/feed_output_validation.rs"]
+mod feed_output_validation;
 #[path = "all/feed_policy.rs"]
 mod feed_policy;
 #[path = "all/feed_reconfiguration_status.rs"]
