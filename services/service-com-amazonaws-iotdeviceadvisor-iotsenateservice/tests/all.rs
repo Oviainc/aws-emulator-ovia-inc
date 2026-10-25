@@ -17,6 +17,9 @@ mod definition_live_configuration;
 #[path = "all/definition_versions.rs"]
 mod definition_versions;
 
+#[path = "all/device_identity_validation.rs"]
+mod device_identity_validation;
+
 #[path = "all/endpoint.rs"]
 mod endpoint;
 
