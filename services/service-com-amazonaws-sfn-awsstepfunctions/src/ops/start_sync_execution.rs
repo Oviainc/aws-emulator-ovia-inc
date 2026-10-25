@@ -370,6 +370,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state_machine_arn: machine_arn.clone(),
             state_machine_name: machine_name.clone(),
             role_arn: role_arn.clone(),
+            // A synchronous Express execution is run once and answered: "this API
+            // action is not supported by EXPRESS state machines", so there is no
+            // attempt but the first and nothing ever redrives it.
+            redrive_count: 0,
         };
         let interpreted = {
             let definition = definition.clone();
@@ -456,6 +460,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             history,
             // Nothing is owed to the clock: see above.
             pending: None,
+            // "This API action is not supported by EXPRESS state machines", so no
+            // redrive continues this run from any step of it.
+            redrive_step: None,
             // Measured and counted by `insert_execution`.
             retained_bytes: 0,
         };

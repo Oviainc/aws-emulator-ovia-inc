@@ -138,6 +138,27 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Why a schedule whose end is not after its start was refused — the requirement the
+/// rejected member failed, which `crate::state::validation_failed` states in the
+/// service's own envelope. It states the RULE, so it carries neither of the instants the
+/// caller sent.
+const END_TIME_NOT_AFTER_START_REQUIREMENT: &str = "The end time of a harvest job's \
+    schedule must be later than its start time. Correct the schedule and then try again";
+
+/// Why a schedule covering no time at all was refused — the requirement the rejected
+/// member failed. A harvest job exports the content inside its window, so a window of
+/// zero length names nothing to export.
+const ZERO_LENGTH_WINDOW_REQUIREMENT: &str = "The schedule of a harvest job must cover a \
+    window of non-zero length, so its end time can't equal its start time. Correct the \
+    schedule and then try again";
+
+/// Why a harvested manifest the endpoint does not publish was refused — the requirement
+/// the rejected member failed. It states which SET the member has to come from and names
+/// no manifest from the request.
+const UNPUBLISHED_MANIFEST_REQUIREMENT: &str = "A harvest job can harvest only the \
+    manifests its origin endpoint publishes. Verify the manifest names against the \
+    manifests of the origin endpoint and then try again";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -226,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = input.tags.clone().unwrap_or_default();
         // A create's tag map is the same unbounded-growth site `TagResource` is, so it is
         // judged against the same bounds before anything is stored.
-        if let Some(rejection) = crate::state::tag_bounds_rejection(&tags) {
+        if let Some(rejection) = crate::state::tag_bounds_rejection("Tags", &tags) {
             return Err(CreateHarvestJobErrorModeled::ValidationException(rejection).into());
         }
         // Tag-on-create writes into the same tag map `TagResource` does, so it is held to
@@ -240,32 +261,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let start = input.schedule_configuration.start_time.as_secs_f64();
         let end = input.schedule_configuration.end_time.as_secs_f64();
+        // Both schedule refusals are worded by the crate's one validation builder, so
+        // they report the member the request named them at and the rule it failed, in the
+        // same form as every other refusal this service makes.
         if end < start {
             return Err(CreateHarvestJobErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        "ScheduleConfiguration.EndTime is earlier than \
-                         ScheduleConfiguration.StartTime"
-                            .to_string(),
-                    ),
-                    validation_exception_type: Some(
-                        crate::state::VALIDATION_END_TIME_EARLIER_THAN_START_TIME.to_string(),
-                    ),
-                },
+                crate::state::validation_failed(
+                    "scheduleConfiguration.endTime",
+                    END_TIME_NOT_AFTER_START_REQUIREMENT,
+                    crate::state::VALIDATION_END_TIME_EARLIER_THAN_START_TIME,
+                ),
             )
             .into());
         }
         if end == start {
             return Err(CreateHarvestJobErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        "ScheduleConfiguration describes a zero-length harvest window"
-                            .to_string(),
-                    ),
-                    validation_exception_type: Some(
-                        crate::state::VALIDATION_INVALID_HARVEST_JOB_DURATION.to_string(),
-                    ),
-                },
+                crate::state::validation_failed(
+                    "scheduleConfiguration.endTime",
+                    ZERO_LENGTH_WINDOW_REQUIREMENT,
+                    crate::state::VALIDATION_INVALID_HARVEST_JOB_DURATION,
+                ),
             )
             .into());
         }
@@ -299,18 +314,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A harvest job exports manifests the endpoint actually publishes, so each
         // requested manifest name is resolved against the endpoint's own manifests.
-        if let Some(missing) = unpublished_manifest(&input.harvested_manifests, endpoint) {
+        if names_unpublished_manifest(&input.harvested_manifests, endpoint) {
             return Err(CreateHarvestJobErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "HarvestedManifests names {missing}, which this origin endpoint does \
-                         not publish"
-                    )),
-                    validation_exception_type: Some(
-                        crate::state::VALIDATION_HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT
-                            .to_string(),
-                    ),
-                },
+                crate::state::validation_failed(
+                    "harvestedManifests",
+                    UNPUBLISHED_MANIFEST_REQUIREMENT,
+                    crate::state::VALIDATION_HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT,
+                ),
             )
             .into());
         }
@@ -401,51 +411,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The first manifest name in `requested` that `endpoint` does not publish, or `None`
-/// when every one of them resolves.
+/// Whether `requested` names any manifest `endpoint` does not publish.
 ///
 /// A harvested manifest is addressed by the `ManifestName` the endpoint was created with,
 /// per family: HLS and low-latency HLS and DASH each have their own list on the endpoint,
 /// so each requested family is resolved against the matching one.
-fn unpublished_manifest(
+///
+/// A PREDICATE rather than the offending name: what the caller is told is the rule it
+/// broke, so the name it sent is never needed outside this check.
+fn names_unpublished_manifest(
     requested: &HarvestedManifests,
     endpoint: &crate::state::OriginEndpoint,
-) -> Option<String> {
-    let missing_hls = requested
-        .hls_manifests
-        .iter()
-        .flatten()
-        .map(|manifest| &manifest.manifest_name)
-        .find(|name| {
-            !endpoint
-                .hls_manifests
-                .iter()
-                .any(|published| &published.manifest_name == *name)
-        });
-    let missing_low_latency = requested
-        .low_latency_hls_manifests
-        .iter()
-        .flatten()
-        .map(|manifest| &manifest.manifest_name)
-        .find(|name| {
-            !endpoint
-                .low_latency_hls_manifests
-                .iter()
-                .any(|published| &published.manifest_name == *name)
-        });
-    let missing_dash = requested
-        .dash_manifests
-        .iter()
-        .flatten()
-        .map(|manifest| &manifest.manifest_name)
-        .find(|name| {
-            !endpoint
-                .dash_manifests
-                .iter()
-                .any(|published| &published.manifest_name == *name)
-        });
-    missing_hls
-        .or(missing_low_latency)
-        .or(missing_dash)
-        .cloned()
+) -> bool {
+    /// The per-family rule, stated once: a requested name resolves only if the endpoint
+    /// publishes a manifest with that name in the SAME family. Both sides stay
+    /// iterators, so a family is walked only until a name fails to resolve.
+    fn any_unpublished<'a, Requested, Published>(
+        mut requested: Requested,
+        published: Published,
+    ) -> bool
+    where
+        Requested: Iterator<Item = &'a str>,
+        Published: Iterator<Item = &'a str> + Clone,
+    {
+        requested.any(|name| !published.clone().any(|known| known == name))
+    }
+    any_unpublished(
+        requested
+            .hls_manifests
+            .iter()
+            .flatten()
+            .map(|manifest| manifest.manifest_name.as_str()),
+        endpoint
+            .hls_manifests
+            .iter()
+            .map(|published| published.manifest_name.as_str()),
+    ) || any_unpublished(
+        requested
+            .low_latency_hls_manifests
+            .iter()
+            .flatten()
+            .map(|manifest| manifest.manifest_name.as_str()),
+        endpoint
+            .low_latency_hls_manifests
+            .iter()
+            .map(|published| published.manifest_name.as_str()),
+    ) || any_unpublished(
+        requested
+            .dash_manifests
+            .iter()
+            .flatten()
+            .map(|manifest| manifest.manifest_name.as_str()),
+        endpoint
+            .dash_manifests
+            .iter()
+            .map(|published| published.manifest_name.as_str()),
+    )
 }

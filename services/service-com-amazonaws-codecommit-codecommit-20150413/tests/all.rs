@@ -45,6 +45,8 @@ mod branch_listing;
 mod branch_listing_writes;
 #[path = "all/client_error_messages.rs"]
 mod client_error_messages;
+#[path = "all/client_request_token_validation.rs"]
+mod client_request_token_validation;
 #[path = "all/comment_content_deletion.rs"]
 mod comment_content_deletion;
 #[path = "all/comment_deleted_refusal_templates.rs"]
@@ -89,6 +91,8 @@ mod merge_options;
 mod object_store_bounds;
 #[path = "all/path_depth_bound.rs"]
 mod path_depth_bound;
+#[path = "all/pull_request_approval_rules.rs"]
+mod pull_request_approval_rules;
 #[path = "all/pull_request_comments.rs"]
 mod pull_request_comments;
 #[path = "all/pull_request_creation.rs"]

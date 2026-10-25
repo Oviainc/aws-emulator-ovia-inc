@@ -335,12 +335,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             })?;
 
-        // A blank idempotency token names no earlier request, the same as leaving
-        // the optional member out.
-        let client_request_token = input
-            .client_request_token
-            .as_deref()
-            .filter(|token| !token.is_empty());
+        // The idempotency token the request names. Which tokens are acceptable is
+        // `crate::state`'s rule, so every operation carrying the member agrees
+        // about it: leaving it out names no earlier request, while a present token
+        // that names none (an empty one, one past the length bound) is MALFORMED
+        // rather than absent and is refused before anything is written.
+        let client_request_token = match input.client_request_token.as_deref() {
+            Some(token) if !crate::state::is_client_request_token(token) => {
+                return Err(
+                    PostCommentForComparedCommitErrorModeled::InvalidClientRequestTokenException(
+                        InvalidClientRequestTokenException {
+                            message: Some(
+                                crate::state::INVALID_CLIENT_REQUEST_TOKEN_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            token => token,
+        };
 
         let now = std::time::SystemTime::now();
         let author_arn = crate::state::caller_identity_arn(ctx.parts());

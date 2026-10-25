@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/audit_findings.rs"]
 mod audit_findings;
+#[path = "all/batch_instrumentation_configuration_deletion.rs"]
+mod batch_instrumentation_configuration_deletion;
 #[path = "all/budget_reports.rs"]
 mod budget_reports;
 #[path = "all/discovered_metric_references.rs"]

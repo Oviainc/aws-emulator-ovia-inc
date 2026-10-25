@@ -76,5 +76,7 @@ mod manifest_count_range;
 mod caller_supplied_arns;
 #[path = "all/channel_reset_multiview.rs"]
 mod channel_reset_multiview;
+#[path = "all/harvest_job_refusal_text.rs"]
+mod harvest_job_refusal_text;
 #[path = "all/harvest_job_tagging.rs"]
 mod harvest_job_tagging;

@@ -1,0 +1,75 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: s3.bucket-acl-write-blocked-by-ownership-enforced s3.object-annotation-not-found-errors s3.put-object-bad-content-md5-rejected s3.s3checksum-malformed-header-rejected-as-invalid-request-not-baddigest s3.sigv4skew-presigned-get-altered-expires-param-rejected s3.put-object-append-conditional-offset-contention
+Issue-Shape-Id: com.amazonaws.s3#AmazonS3
+Issue-Key: s3.bucket-acl-write-blocked-by-ownership-enforced|_client_error#5|AssertionError|raise AssertionError(f"expected the call to be rejected, but it SUCCEEDED and returned {result!r}")
+Issue-Key: s3.object-annotation-not-found-errors|run#4|AssertionError|assert code1 == "NoSuchBucket", f"expected NoSuchBucket, got {code1}"
+Issue-Key: s3.put-object-bad-content-md5-rejected|run#12|AssertionError|assert code == ("BadDigest", "The Content-MD5 you specified did not match what we received."), (
+Issue-Key: s3.s3checksum-malformed-header-rejected-as-invalid-request-not-baddigest|run#9|AssertionError|assert exc_short is not None, (
+Issue-Key: s3.sigv4skew-presigned-get-altered-expires-param-rejected|run#21|AssertionError|assert err["Message"] == (
+Issue-Key: s3.put-object-append-conditional-offset-contention|_create_directory_bucket_or_skip#2|AssertionError|raise AssertionError(
+Issue-Commit: e6eec4415380d0861b3cd74514fe77af8743d21c
+
+# S3: 6 net-new root causes — PutBucketAcl ignores BucketOwnerEnforced, GetObjectAnnotation is a stub, Content-MD5 mismatch mis-coded, malformed checksum header accepted, SignatureDoesNotMatch message/payload wrong, S3 Express directory buckets unusable
+
+> _Note: this issue was identified against the code base at commit `e6eec4415380d0861b3cd74514fe77af8743d21c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+PutBucketAcl
+
+## Description
+Six distinct root causes on S3, each grounded in a failing behavioral check that no open issue carries. Each cause is numbered with its own failing check ids; all six must be closed before this issue is submitted.
+
+Cause 1 of 6: PutBucketAcl is accepted on a bucket whose ObjectOwnership is BucketOwnerEnforced.
+AWS: Smithy s3#PutBucketAcl is bound to PUT /{Bucket}?acl and takes ACL (@httpHeader x-amz-acl, target BucketCannedACL); the model declares no operation errors, so the refusal is documented/recorded behavior only. On a bucket created today (default ObjectOwnership=BucketOwnerEnforced) every ACL-setting call is refused HTTP 400 with code AccessControlListNotSupported and the message 'The bucket does not allow ACLs' — that message is entirely fixed text, it has no variable part. The recorded positive control: after PutBucketOwnershipControls sets ObjectOwnership=ObjectWriter on the same bucket, the identical PutBucketAcl ACL=public-read succeeds and GetBucketAcl then reports a Group grant for http://acs.amazonaws.com/groups/global/AllUsers.
+Emulator: the call succeeds — HTTP 200, empty body — so a public-read ACL is installed on a bucket AWS keeps ACL-free.
+Why: a caller that relies on BucketOwnerEnforced to make ACLs unreachable gets the opposite result, and a security review run against the emulator concludes a public-read bucket ACL is reachable where AWS refuses it; the client also never sees the AccessControlListNotSupported it branches on.
+Fix: the PutBucketAcl handler's ownership-controls precondition, reading the bucket's ObjectOwnership state (services/service-com-amazonaws-s3-amazons3/src/ops/put_bucket_acl.rs). Related open issue 20261025T032458Z-s3-control-plane-10-root-causes-generic-validationexception.md carries the sibling checks s3.bucket-acl-public-grant-blocked-by-public-access-block-rejected and s3.s3-oc-enforced-put-bucket-acl-rejected-even-for-the-private-canned-acl, but it does not carry this check id.
+Traces: s3.bucket-acl-write-blocked-by-ownership-enforced
+
+Cause 2 of 6: GetObjectAnnotation is an unimplemented scaffold stub, so none of its three not-found refusals exist.
+AWS: Smithy s3#GetObjectAnnotation is bound to GET /{Bucket}/{Key+}?annotation and declares exactly three errors — NoSuchBucket (client, httpError 404), NoSuchKey (client, httpError 404) and NoSuchAnnotation (client, httpError 404). Which one is returned is decided by the first missing link of the chain bucket -> object -> annotation. The messages are fixed documented text: 'The specified bucket does not exist' for NoSuchBucket, 'The specified key does not exist.' for NoSuchKey, 'The specified annotation does not exist.' for NoSuchAnnotation (no variable parts). Once bucket, key and annotation all exist the identical call returns the stored AnnotationPayload.
+Emulator: every call answers HTTP 501 NotImplemented — the handler file still carries the '//! SCAFFOLDED, NOT IMPLEMENTED' marker — so the first leg already reports code 'NotImplemented' where NoSuchBucket is required.
+Why: a client cannot tell which resource in the chain is missing (the whole point of the three codes), and a 501 reads as a broken server rather than a missing bucket.
+Fix: implement the operation in services/service-com-amazonaws-s3-amazons3/src/ops/get_object_annotation.rs (its three-way not-found resolution). Sibling issues exist for PutObjectAnnotation and DeleteObjectAnnotation; none names GetObjectAnnotation.
+Traces: s3.object-annotation-not-found-errors
+
+Cause 3 of 6: a mismatched Content-MD5 on PutObject is refused with the wrong code and message.
+AWS: Smithy s3#PutObject declares ContentMD5 (@httpHeader Content-MD5). When the base64 MD5 in that header does not match the digest of the received body, AWS refuses the write with HTTP 400, code BadDigest and the message 'The Content-MD5 you specified did not match what we received.' — fixed text, no variable part — stores nothing at the key (HeadObject then answers 404 and the bucket lists empty), and accepts the byte-identical PUT once the correct Content-MD5 is supplied (ETag then equals the quoted hex MD5 of the body).
+Emulator: the write is refused, but with code 'InvalidRequest' and the generic message "A parameter or header in your request isn't valid. For details, see the description of this API operation."
+Why: BadDigest is the retry signal every SDK and uploader branches on (recompute the digest and retry the same bytes); InvalidRequest tells the client its request shape is wrong, so it does not retry and reports a bogus diagnosis.
+Fix: the Content-MD5 verification branch of the PutObject handler and the error it raises (services/service-com-amazonaws-s3-amazons3/src/ops/put_object.rs). Cause 1 of open issue 20261025T032458Z-s3-request-auth-and-eventing-plane-10-root.md covers the x-amz-checksum-* flexible checksums; it does not cover Content-MD5 and does not carry this check id.
+Traces: s3.put-object-bad-content-md5-rejected
+
+Cause 4 of 6: a checksum header of the wrong byte length is accepted instead of being refused before any comparison.
+AWS: Smithy s3#PutObject declares ChecksumSHA256 (@httpHeader x-amz-checksum-sha256) and carries @httpChecksum{requestAlgorithmMember: ChecksumAlgorithm}. AWS validates the header's SHAPE before it compares anything: a value that base64-decodes to a length other than 32 bytes for SHA-256 is refused HTTP 400, code InvalidRequest, message 'Value for x-amz-checksum-sha256 header is invalid.' (fixed text apart from the header name, which is the member's bound header). A well-formed 32-byte digest that does not describe the bytes is a different refusal: HTTP 400, code BadDigest, message 'The SHA256 you specified did not match the calculated checksum.'. Neither refused PUT stores anything; the same bytes with the true digest are accepted and the digest is echoed and re-reported on GET with ChecksumMode=ENABLED.
+Emulator: PutObject ACCEPTS ChecksumSHA256='YWJj' (3 decoded bytes) and stores the object, so the shape-validation refusal does not exist and the two refusal classes cannot be distinguished.
+Why: a header that cannot possibly be a SHA-256 is treated as an integrity guarantee, so a client that mis-encodes a digest believes its upload was verified; and a caller that distinguishes 'my header is malformed' (InvalidRequest, fix the client) from 'the bytes changed in flight' (BadDigest, retry) gets neither.
+Fix: shape validation of the x-amz-checksum-* headers, ahead of digest comparison, in the PutObject input validation (services/service-com-amazonaws-s3-amazons3/src/ops/put_object.rs). Cause 1 of open issue 20261025T032458Z-s3-request-auth-and-eventing-plane-10-root.md requires checksums to be VERIFIED; verifying them does not by itself produce this InvalidRequest shape refusal, and that issue does not carry this check id.
+Traces: s3.s3checksum-malformed-header-rejected-as-invalid-request-not-baddigest
+
+Cause 5 of 6: the SignatureDoesNotMatch refusal carries an emulator-authored message and omits the diagnostic elements of the error document.
+AWS: a presigned GET whose signed X-Amz-Expires query parameter is altered after signing is refused HTTP 403 with an <Error> document whose Code is SignatureDoesNotMatch and whose Message is the fixed AWS constant 'The request signature we calculated does not match the signature you provided. Check your key and signing method.'; the same document carries CanonicalRequest (which contains the tampered X-Amz-Expires value, proving the parameter is signed) and SignatureProvided (the untouched X-Amz-Signature the URL still carries). The untampered URL continues to serve the object with 200.
+Emulator: the refusal is 403/SignatureDoesNotMatch but the message is 'The request signature does not match', and the error document is correspondingly reduced.
+Why: clients, CLIs and test suites match on AWS's documented message text and read CanonicalRequest/SignatureProvided to diagnose a signing bug; an abbreviated message and a missing canonical request make a signature failure undiagnosable.
+Fix: the message constant and the error-document serializer of the S3 SigV4 verifier's SignatureDoesNotMatch path (include CanonicalRequest and SignatureProvided). Cause 3 of open issue 20261025T032458Z-s3-request-auth-and-eventing-plane-10-root.md covers canonical-request CONSTRUCTION for host-style/presigned requests and does not carry this check id or this message defect.
+Traces: s3.sigv4skew-presigned-get-altered-expires-param-rejected
+
+Cause 6 of 6: S3 Express One Zone directory buckets cannot be created or addressed because CreateSession answers a bare 404.
+AWS: Smithy s3#CreateSession is bound to GET /{Bucket}?session, returns a required Credentials member, and declares exactly one error, NoSuchBucket (client, httpError 404), for an absent bucket; for a directory bucket that exists it answers 200 with session credentials, which is what the SDK needs before any data-plane call on a <base>--<az-id>--x-s3 bucket. On a directory bucket, append-mode PutObject (x-amz-write-offset-bytes) resolves two racers targeting the same stale offset to exactly one 200 and one InvalidWriteOffset/400 (s3#PutObject declares error InvalidWriteOffset, client, httpError 400), and the object ends up exactly one chunk longer.
+Emulator: directory-bucket creation fails in every availability zone with 'An error occurred (404) when calling the CreateSession operation: Not Found' — a bare 404 with no S3 error code — so the append/offset-contention contract is unreachable.
+Why: the entire S3 Express surface (zonal buckets, session auth, append writes) is unusable, and a client gets a code-less 404 it cannot classify.
+Fix: the CreateSession handler (services/service-com-amazonaws-s3-amazons3/src/ops/create_session.rs, still a SCAFFOLDED stub) and directory-bucket routing/state. NOTE FOR THE FIXER: this is the same root cause already documented as Cause 8 of open issue 20261025T032458Z-s3-object-plane-10-root-causes-conditional-requests.md — that issue simply does not carry this check id in its replay keys. Close it there and replay this check id too; do not implement it twice.
+Traces: s3.put-object-append-conditional-offset-contention
+
+## Evidence
+Cause 1: `AssertionError: expected the call to be rejected, but it SUCCEEDED and returned {'ResponseMetadata': {'HTTPStatusCode': 200, 'HTTPHeaders': {'content-type': 'application/xml', 'content-length': '0', ...}}}` — expected code AccessControlListNotSupported, HTTP 400, message 'The bucket does not allow ACLs'.
+Cause 2: `AssertionError: expected NoSuchBucket, got NotImplemented` on get_object_annotation(Bucket=<absent bucket>, Key='whatever.txt', AnnotationName='note'); the handler file carries '//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented`'.
+Cause 3: `AssertionError: expected BadDigest for a mismatched Content-MD5, got ('InvalidRequest', "A parameter or header in your request isn't valid. For details, see the description of this API operation.")` — expected ('BadDigest', 'The Content-MD5 you specified did not match what we received.') with HTTP 400.
+Cause 4: `AssertionError: PutObject accepted ChecksumSHA256='YWJj', which decodes to 3 bytes; a SHA-256 header of the wrong length must be refused before any comparison happens` — expected InvalidRequest/400 with message 'Value for x-amz-checksum-sha256 header is invalid.'
+Cause 5: `AssertionError: unexpected SignatureDoesNotMatch message 'The request signature does not match'` — expected 'The request signature we calculated does not match the signature you provided. Check your key and signing method.' plus CanonicalRequest and SignatureProvided elements in the <Error> document.
+Cause 6: `AssertionError: S3 Express One Zone directory buckets are not available in this account/region (tried 3 availability zones); last error: An error occurred (404) when calling the CreateSession operation: Not Found` — expected 200 with Credentials (or NoSuchBucket/404 carrying an S3 error code).
+
+## Steps to Reproduce
+Boot the emulator and replay the behavioral suite, re-running exactly the check ids listed under each cause's Traces line (all six are in trace_ids). Manual repros: (1) CreateBucket (default ObjectOwnership), PutPublicAccessBlock all-false, then PutBucketAcl ACL='public-read'; (2) GetObjectAnnotation against a bucket that does not exist, then against an existing bucket with a missing key, then with a missing annotation name; (3) PutObject with ContentMD5 set to the base64 MD5 of different bytes; (4) PutObject with ChecksumSHA256=base64('abc') (3 decoded bytes), then with a well-formed 32-byte digest of other bytes; (5) generate_presigned_url('get_object', ExpiresIn=300), double the X-Amz-Expires query value, GET the tampered URL and read the <Error> document; (6) CreateBucket with CreateBucketConfiguration={'Location': {'Type':'AvailabilityZone','Name': <zone-id>}, 'Bucket': {'DataRedundancy':'SingleAvailabilityZone','Type':'Directory'}} on a <base>--<zone-id>--x-s3 name, then PutObject with WriteOffsetBytes.

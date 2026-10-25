@@ -77,6 +77,14 @@
 //!   That is deliberate, and the constant says why: an uncompressed run would make every
 //!   terminal status unobservable for up to the documented twelve hours.
 //!
+//! A template may carry a `logConfiguration`, and then the experiments started from it
+//! DELIVER their log records to the destination it names — a CloudWatch Logs log group, an
+//! Amazon S3 bucket and prefix, or both. The records are produced by the very transitions
+//! above, parked on the experiment ([`ExperimentRecord::pending_log_records`]) and written
+//! to the emulator's own CloudWatch Logs and S3 services by the operation that materialised
+//! them, with no store guard held: see [`experiment_logs`] for what a record says, when it
+//! falls due and why nothing is logged for work this emulator did not carry out.
+//!
 //! A template may also carry TARGET ACCOUNT CONFIGURATIONS, one per account id, which
 //! `UpdateTargetAccountConfiguration` changes in place. A configuration names one account
 //! and the role FIS assumes in it, so the two have to agree: the role has to belong to
@@ -141,6 +149,7 @@ use crate::ops::types::{
 };
 
 pub mod action_permissions;
+pub mod experiment_logs;
 
 /// The IAM store this service resolves an execution role against.
 ///
@@ -1473,6 +1482,19 @@ pub struct ExperimentRecord {
     pub run_span: Duration,
     /// The terminal status the run earns once [`run_span`](Self::run_span) elapses.
     pub outcome: ExperimentOutcome,
+    /// The experiment log records this run has produced and not yet written to the
+    /// destination the template configured ([`experiment_logs`]).
+    ///
+    /// Empty for an experiment whose template configured no `logConfiguration`: there is
+    /// nowhere to deliver to, so no record is produced at all. Bounded by
+    /// [`experiment_logs::MAX_PENDING_LOG_RECORDS`], and drained by
+    /// [`ComAmazonawsFisFaultinjectionsimulatorState::take_pending_log_deliveries`].
+    pub pending_log_records: Vec<experiment_logs::LogRecord>,
+    /// How many records this run has PARKED altogether, delivered or not — what numbers
+    /// the S3 object keys, so one experiment's records sort in the order its run produced
+    /// them however many drains it took. A record the outbox bound drops is not parked,
+    /// so it takes no number: the keys stay dense.
+    pub log_records_produced: usize,
 }
 
 impl ExperimentRecord {
@@ -1519,7 +1541,7 @@ impl ExperimentRecord {
             &plan.carried_out,
             plan.empty_target_failure.clone().or(failure),
         );
-        Self {
+        let mut record = Self {
             id,
             arn,
             experiment_template_id: template.id.clone(),
@@ -1573,13 +1595,157 @@ impl ExperimentRecord {
             transition_due: Some(now + TRANSITION_DELAY),
             run_span,
             outcome,
-        }
+            pending_log_records: Vec::new(),
+            log_records_produced: 0,
+        };
+        // The run has begun, so its first records — the start and what the start resolved —
+        // are true as of `now` and are produced here rather than by whoever looks next.
+        record.log_run_started(now);
+        record
     }
 
     /// `targetAccountConfigurationsCount` — how many target account configurations this
     /// experiment was started with, derived from the snapshot it carries.
     pub fn target_account_configurations_count(&self) -> i64 {
         i64::try_from(self.target_account_configurations.len()).unwrap_or(i64::MAX)
+    }
+
+    /// Park one experiment log record on this experiment's outbox.
+    ///
+    /// A no-op for an experiment whose template configured no destination — nothing is
+    /// produced for a run with nowhere to deliver it — and for an outbox already holding
+    /// [`experiment_logs::MAX_PENDING_LOG_RECORDS`], which is what bounds the records one
+    /// experiment can hold. A record the bound drops is TRACED, so a run whose records
+    /// were truncated can be told from one that produced them all.
+    fn log_event(
+        &mut self,
+        log_type: &'static str,
+        at: SystemTime,
+        details: ::serde_json::Value,
+    ) {
+        if self.log_configuration.is_none() {
+            return;
+        }
+        if self.pending_log_records.len() >= experiment_logs::MAX_PENDING_LOG_RECORDS {
+            ::tracing::warn!(
+                experiment_id = %self.id,
+                log_type = %log_type,
+                limit = experiment_logs::MAX_PENDING_LOG_RECORDS,
+                "the experiment's undelivered log records are at their bound, so this \
+                 record is dropped rather than queued"
+            );
+            return;
+        }
+        self.pending_log_records.push(experiment_logs::LogRecord {
+            log_type,
+            at,
+            details,
+        });
+        self.log_records_produced += 1;
+    }
+
+    /// Produce the records the START of this run makes true: the experiment itself, and
+    /// one per target the start resolved.
+    fn log_run_started(&mut self, at: SystemTime) {
+        if self.log_configuration.is_none() {
+            return;
+        }
+        let start = {
+            let mut actions: Vec<&str> = self.actions.keys().map(String::as_str).collect();
+            actions.sort_unstable();
+            let mut details = ::serde_json::Map::new();
+            details.insert(
+                "experiment_template_id".to_string(),
+                ::serde_json::json!(self.experiment_template_id),
+            );
+            details.insert("role_arn".to_string(), ::serde_json::json!(self.role_arn));
+            details.insert(
+                "status".to_string(),
+                ::serde_json::json!(self.status.as_wire()),
+            );
+            details.insert(
+                "start_time".to_string(),
+                ::serde_json::json!(experiment_logs::rfc3339(self.start_time)),
+            );
+            details.insert("actions".to_string(), ::serde_json::json!(actions));
+            if let Some(mode) = &self.experiment_options.actions_mode {
+                details.insert("actions_mode".to_string(), ::serde_json::json!(mode));
+            }
+            if let Some(targeting) = &self.experiment_options.account_targeting {
+                details.insert(
+                    "account_targeting".to_string(),
+                    ::serde_json::json!(targeting),
+                );
+            }
+            if let Some(mode) = &self.experiment_options.empty_target_resolution_mode {
+                details.insert(
+                    "empty_target_resolution_mode".to_string(),
+                    ::serde_json::json!(mode),
+                );
+            }
+            ::serde_json::Value::Object(details)
+        };
+        let resolutions: Vec<::serde_json::Value> = self
+            .resolved_targets
+            .iter()
+            .map(experiment_logs::target_resolution_details)
+            .collect();
+        self.log_event(experiment_logs::LOG_TYPE_EXPERIMENT_START, at, start);
+        for details in resolutions {
+            self.log_event(
+                experiment_logs::LOG_TYPE_TARGET_RESOLUTION,
+                at,
+                details,
+            );
+        }
+    }
+
+    /// Produce the record a status change makes true, stamped at the instant that change
+    /// fell due rather than at whoever observed it.
+    ///
+    /// A move into a terminal status is the run's END, which is the record a client reads
+    /// the outcome off, so it carries the reason and — for a failed run — the
+    /// `ExperimentError` the service reports with it.
+    fn log_state_change(&mut self, at: SystemTime) {
+        if self.log_configuration.is_none() {
+            return;
+        }
+        let terminal = self.status.is_terminal();
+        let details = {
+            let mut details = ::serde_json::Map::new();
+            details.insert(
+                "status".to_string(),
+                ::serde_json::json!(self.status.as_wire()),
+            );
+            if !self.reason.is_empty() {
+                details.insert("reason".to_string(), ::serde_json::json!(self.reason));
+            }
+            if let (ExperimentStatus::Failed, ExperimentOutcome::Failed(failure)) =
+                (self.status, &self.outcome)
+            {
+                details.insert(
+                    "error".to_string(),
+                    ::serde_json::json!({
+                        "code": failure.code,
+                        "location": failure.location,
+                        "account_id": ::engine::emulator_account_id(),
+                    }),
+                );
+            }
+            if terminal {
+                details.insert(
+                    "end_time".to_string(),
+                    ::serde_json::json!(experiment_logs::rfc3339(at)),
+                );
+            }
+            ::serde_json::Value::Object(details)
+        };
+        let log_type = if terminal {
+            experiment_logs::LOG_TYPE_EXPERIMENT_END
+        } else {
+            experiment_logs::LOG_TYPE_EXPERIMENT_STATE_CHANGE
+        };
+        self.log_event(log_type, at, details);
     }
 
     /// Materialise the transition the clock already owes at `now`, if it is due.
@@ -1616,6 +1782,7 @@ impl ExperimentRecord {
                     // place of a panic that every later read of the same record would take
                     // again.
                     self.transition_due = Some(due.checked_add(self.run_span).unwrap_or(due));
+                    self.log_state_change(due);
                 }
                 ExperimentStatus::Running => {
                     match &self.outcome {
@@ -1632,11 +1799,13 @@ impl ExperimentRecord {
                     // happened to look.
                     self.end_time = Some(due);
                     self.transition_due = None;
+                    self.log_state_change(due);
                 }
                 ExperimentStatus::Stopping => {
                     self.status = ExperimentStatus::Stopped;
                     self.end_time = Some(due);
                     self.transition_due = None;
+                    self.log_state_change(due);
                 }
                 ExperimentStatus::Stopped
                 | ExperimentStatus::Completed
@@ -1663,6 +1832,7 @@ impl ExperimentRecord {
         self.status = ExperimentStatus::Stopping;
         self.reason = reason.to_string();
         self.transition_due = Some(now + TRANSITION_DELAY);
+        self.log_state_change(now);
     }
 
     /// The bucket and key this experiment's report is written to, or `None` when its
@@ -1781,7 +1951,8 @@ impl ExperimentRecord {
             target_account_configurations_count: Some(self.target_account_configurations_count()),
             experiment_report_configuration: self.experiment_report_configuration.clone(),
             // The generation of the report this experiment configured, and nothing at all
-            // for an experiment that configured none.
+            // for an experiment that configured none. Experiment LOGGING is a different
+            // member with its own destination: see [`experiment_logs`].
             experiment_report: self
                 .report
                 .as_ref()
@@ -2137,6 +2308,57 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
         for record in self.experiments.values_mut() {
             record.settle(now);
         }
+    }
+
+    /// Take every experiment log record the store holds and has not delivered, as one
+    /// delivery per experiment ([`experiment_logs::PendingDelivery`]).
+    ///
+    /// Call it right after settling, with the records the settle produced still parked,
+    /// and then WRITE what it hands back with the state guard released
+    /// ([`experiment_logs::deliver`]). The records leave the store here, so two callers
+    /// cannot deliver one record twice; an experiment with nothing parked contributes no
+    /// delivery at all, which is every experiment whose template configured no
+    /// destination.
+    ///
+    /// The walk is over the whole experiment map, which is bounded by
+    /// [`MAX_EXPERIMENTS`] and costs one `is_empty` per experiment: every operation that
+    /// settles already walks or indexes that same map, so this adds no term to their cost
+    /// that the store's own bound does not already hold.
+    pub fn take_pending_log_deliveries(&mut self) -> Vec<experiment_logs::PendingDelivery> {
+        let mut deliveries = Vec::new();
+        for record in self.experiments.values_mut() {
+            if record.pending_log_records.is_empty() {
+                continue;
+            }
+            let records = ::std::mem::take(&mut record.pending_log_records);
+            let Some(configuration) = record.log_configuration.as_ref() else {
+                // Unreachable: a record is only ever parked on an experiment that carries
+                // a configuration. Dropping the parked records is what a configuration
+                // that is gone means — there is nowhere to write them.
+                continue;
+            };
+            deliveries.push(experiment_logs::PendingDelivery {
+                experiment_id: record.id.clone(),
+                log_schema_version: configuration.log_schema_version,
+                log_group_arn: configuration
+                    .cloud_watch_logs_configuration
+                    .as_ref()
+                    .and_then(|logs| logs.log_group_arn.clone()),
+                bucket_name: configuration
+                    .s3_configuration
+                    .as_ref()
+                    .and_then(|s3| s3.bucket_name.clone()),
+                prefix: configuration
+                    .s3_configuration
+                    .as_ref()
+                    .and_then(|s3| s3.prefix.clone()),
+                // The records being drained are the LAST ones this run produced, so they
+                // are numbered from the end of what came before them.
+                first_sequence: record.log_records_produced.saturating_sub(records.len()),
+                records,
+            });
+        }
+        deliveries
     }
 
     /// The account's safety lever as it stands at `now`, with the transition the clock

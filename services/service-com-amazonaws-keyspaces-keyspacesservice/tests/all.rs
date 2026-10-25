@@ -17,6 +17,8 @@ mod auto_scaling_propagation;
 mod cdc_streams;
 #[path = "all/column_types_and_auto_scaling.rs"]
 mod column_types_and_auto_scaling;
+#[path = "all/delete_keyspace_in_flight_resources.rs"]
+mod delete_keyspace_in_flight_resources;
 #[path = "all/delete_keyspace_lifecycle.rs"]
 mod delete_keyspace_lifecycle;
 #[path = "all/delete_table_in_flight.rs"]

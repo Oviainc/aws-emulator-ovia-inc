@@ -57,6 +57,8 @@ mod iam_capability_gate;
 mod list_change_sets;
 #[path = "all/list_stack_resources.rs"]
 mod list_stack_resources;
+#[path = "all/list_types.rs"]
+mod list_types;
 #[path = "all/nested_resource_outputs.rs"]
 mod nested_resource_outputs;
 #[path = "all/no_echo_parameters.rs"]
@@ -81,6 +83,8 @@ mod sam_deployed_resources;
 mod sam_transform;
 #[path = "all/scratch.rs"]
 mod scratch;
+#[path = "all/stack_exports.rs"]
+mod stack_exports;
 #[path = "all/stack_lifecycle.rs"]
 mod stack_lifecycle;
 #[path = "all/stack_output_resolution.rs"]

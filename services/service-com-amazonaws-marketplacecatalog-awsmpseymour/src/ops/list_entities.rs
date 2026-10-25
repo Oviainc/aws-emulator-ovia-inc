@@ -2,7 +2,8 @@
 
 //! @op ListEntities
 //! Lists the stored entities whose type matches `EntityType`, filtered and ordered as
-//! `Filter` and `Sort` ask, one `MaxResults` page at a time.
+//! `FilterList` / `Sort` and that type's own `EntityTypeFilters` / `EntityTypeSort` ask,
+//! one `MaxResults` page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +91,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::EntityCriterion;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -193,29 +195,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `EntityTypeFilters` / `EntityTypeSort` select and order on members
-        // that belong to one entity type's own shape (an offer's buyer
-        // accounts, a product's title). This slice stores an entity's common
-        // members only, so rather than answer as if a type-specific filter had
-        // been applied, the request is refused and the generic `FilterList` /
-        // `Sort` named instead.
-        if input.entity_type_filters.is_some() || input.entity_type_sort.is_some() {
-            let member = if input.entity_type_filters.is_some() {
-                "EntityTypeFilters"
-            } else {
-                "EntityTypeSort"
-            };
-            return Err(ListEntitiesErrorModeled::ValidationException(
-                crate::state::validation(
-                    member,
-                    format!(
-                        "this emulator lists entities by FilterList and Sort; the type-specific \
-                         {member} is not implemented"
-                    ),
-                ),
-            )
-            .into());
-        }
+        // `EntityTypeFilters` is the per-EntityType search surface: each member
+        // of the union carries the filter fields of ONE entity type, so the
+        // member a request names must be the one belonging to the `EntityType`
+        // being listed, and each field it names selects on the entity attribute
+        // of that name.
+        let type_criteria = match input.entity_type_filters.as_ref() {
+            None => Vec::new(),
+            Some(filters) => {
+                let (filtered, criteria) = type_criteria(filters);
+                if filtered != input.entity_type {
+                    return Err(ListEntitiesErrorModeled::ValidationException(
+                        crate::state::validation(
+                            "EntityTypeFilters",
+                            format!(
+                                "{filtered}Filters filters the {filtered} entity type, not {:?}",
+                                input.entity_type
+                            ),
+                        ),
+                    )
+                    .into());
+                }
+                if criteria.len() > MAX_TYPE_FILTERS {
+                    return Err(ListEntitiesErrorModeled::ValidationException(
+                        crate::state::validation(
+                            "EntityTypeFilters",
+                            format!(
+                                "ListEntities filters on at most {MAX_TYPE_FILTERS} fields a \
+                                 request, not {}",
+                                criteria.len()
+                            ),
+                        ),
+                    )
+                    .into());
+                }
+                let wild_cards = criteria
+                    .iter()
+                    .filter(|criterion| criterion.is_wild_card())
+                    .count();
+                if wild_cards > MAX_WILD_CARD_FILTERS {
+                    return Err(ListEntitiesErrorModeled::ValidationException(
+                        crate::state::validation(
+                            "EntityTypeFilters",
+                            format!(
+                                "ListEntities filters on at most {MAX_WILD_CARD_FILTERS} wildcard \
+                                 field a request, not {wild_cards}"
+                            ),
+                        ),
+                    )
+                    .into());
+                }
+                criteria
+            }
+        };
 
         // `OwnershipType` SELF is "entities the account owns" and SHARED those
         // another account shared with it. Every entity in this store was
@@ -265,9 +297,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let sort_by = sort
             .sort_by
             .unwrap_or_else(|| crate::state::ENTITY_SORT_BY[0].to_string());
-        if !crate::state::ENTITY_SORT_BY.contains(&sort_by.as_str()) {
+        // `Sort$SortBy` publishes `LastModifiedDate` and `EntityId` for every
+        // type and adds "each `EntityType` might support additional fields",
+        // which the model names in that type's own sort enum — so the set a
+        // request is judged against is the one belonging to the type it lists.
+        let sort_attributes = crate::state::entity_sort_attributes(&input.entity_type);
+        if !sort_attributes.contains(&sort_by.as_str()) {
             return Err(ListEntitiesErrorModeled::ValidationException(
-                crate::state::invalid_sort_by(&sort_by, crate::state::ENTITY_SORT_BY),
+                crate::state::invalid_sort_by(&sort_by, &sort_attributes),
             )
             .into());
         }
@@ -276,6 +313,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let sort_order = sort
             .sort_order
             .unwrap_or_else(|| crate::state::DEFAULT_SORT_ORDER.to_string());
+
+        // `EntityTypeSort` orders on one entity type's own fields, the same way
+        // `EntityTypeFilters` selects on them, so the member named must again be
+        // the one belonging to the type being listed. It and the generic `Sort`
+        // order the one page this call serves, so both are honoured: the
+        // type-specific ordering is the primary key and the generic one the
+        // tie-break behind it.
+        let mut orders: Vec<PageOrder> = Vec::new();
+        if let Some(asked) = input.entity_type_sort.as_ref() {
+            let (sorted, type_sort_by, type_sort_order) = type_sort(asked);
+            if sorted != input.entity_type {
+                return Err(ListEntitiesErrorModeled::ValidationException(
+                    crate::state::validation(
+                        "EntityTypeSort",
+                        format!(
+                            "{sorted}Sort orders the {sorted} entity type, not {:?}",
+                            input.entity_type
+                        ),
+                    ),
+                )
+                .into());
+            }
+            orders.push(PageOrder {
+                by: type_sort_by
+                    .unwrap_or(crate::state::ENTITY_SORT_BY[0])
+                    .to_string(),
+                descending: type_sort_order.unwrap_or(crate::state::DEFAULT_SORT_ORDER)
+                    == crate::state::DEFAULT_SORT_ORDER,
+            });
+        }
+        orders.push(PageOrder {
+            descending: sort_order == crate::state::DEFAULT_SORT_ORDER,
+            by: sort_by,
+        });
 
         // A token this service never issued names no page, and neither does one
         // outside the modelled `NextToken` syntax (`skip_validation` on
@@ -338,18 +409,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .iter()
                         .all(|(name, values)| record.matches_filter(name, values))
                 })
+                .filter(|record| {
+                    type_criteria
+                        .iter()
+                        .all(|criterion| criterion.matches(record))
+                })
                 .collect()
         };
         matched.sort_by(|left, right| {
-            let ordering = left
-                .sort_key(&sort_by)
-                .cmp(right.sort_key(&sort_by))
-                .then_with(|| left.id.cmp(&right.id));
-            if sort_order == "DESCENDING" {
-                ordering.reverse()
-            } else {
-                ordering
+            let mut verdict = ::std::cmp::Ordering::Equal;
+            for order in &orders {
+                let keys = left
+                    .attribute_sort_key(&order.by)
+                    .cmp(&right.attribute_sort_key(&order.by));
+                verdict = verdict.then(if order.descending { keys.reverse() } else { keys });
             }
+            // The entity id breaks a tie the orderings leave, in the direction
+            // of the last of them, so one page is a total order that reads the
+            // way the ordering asked for does.
+            let by_id = left.id.cmp(&right.id);
+            verdict.then(if orders.last().is_some_and(|order| order.descending) {
+                by_id.reverse()
+            } else {
+                by_id
+            })
         });
 
         let summaries: Vec<EntitySummary> =
@@ -365,5 +448,302 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             entity_summary_list: Some(page.items),
             next_token: page.next_token,
         })
+    }
+}
+
+/// How many fields of one entity type a request may filter on: every `*Filters`
+/// shape documents "Client can add only one wildcard filter and a maximum of 8
+/// filters in a single `ListEntities` request".
+const MAX_TYPE_FILTERS: usize = 8;
+
+/// How many of those fields may be filtered by a wildcard, from the same
+/// sentence.
+const MAX_WILD_CARD_FILTERS: usize = 1;
+
+/// One ordering the served page is sorted by.
+struct PageOrder {
+    /// The attribute, as [`crate::state::EntityRecord::attribute_sort_key`]
+    /// reads it.
+    by: String,
+    descending: bool,
+}
+
+/// Keep `criterion` only if the filter shape it was read from carried a value:
+/// a member present but empty constrains nothing.
+fn push_criterion(into: &mut Vec<EntityCriterion>, criterion: EntityCriterion) {
+    if !criterion.is_empty() {
+        into.push(criterion);
+    }
+}
+
+/// A condition from a filter shape declaring `ValueList`.
+macro_rules! values {
+    ($into:expr, $member:literal, $filter:expr) => {
+        push_criterion(
+            $into,
+            EntityCriterion::on($member)
+                .values($filter.as_ref().and_then(|held| held.value_list.as_ref())),
+        )
+    };
+}
+
+/// A condition from a filter shape declaring `ValueList` and `WildCardValue`.
+macro_rules! text {
+    ($into:expr, $member:literal, $filter:expr) => {
+        push_criterion(
+            $into,
+            EntityCriterion::on($member)
+                .values($filter.as_ref().and_then(|held| held.value_list.as_ref()))
+                .wild_card(
+                    $filter
+                        .as_ref()
+                        .and_then(|held| held.wild_card_value.as_ref()),
+                ),
+        )
+    };
+}
+
+/// A condition from a filter shape declaring `WildCardValue` alone.
+macro_rules! wild_card {
+    ($into:expr, $member:literal, $filter:expr) => {
+        push_criterion(
+            $into,
+            EntityCriterion::on($member).wild_card(
+                $filter
+                    .as_ref()
+                    .and_then(|held| held.wild_card_value.as_ref()),
+            ),
+        )
+    };
+}
+
+/// A condition from a filter shape declaring `DateRange`.
+macro_rules! range {
+    ($into:expr, $member:literal, $filter:expr) => {{
+        let bounds = $filter.as_ref().and_then(|held| held.date_range.as_ref());
+        push_criterion(
+            $into,
+            EntityCriterion::on($member).range(
+                bounds.and_then(|range| range.after_value.as_ref()),
+                bounds.and_then(|range| range.before_value.as_ref()),
+            ),
+        )
+    }};
+}
+
+/// A condition from a filter shape declaring both `DateRange` and `ValueList`.
+macro_rules! dates {
+    ($into:expr, $member:literal, $filter:expr) => {{
+        let bounds = $filter.as_ref().and_then(|held| held.date_range.as_ref());
+        push_criterion(
+            $into,
+            EntityCriterion::on($member)
+                .values($filter.as_ref().and_then(|held| held.value_list.as_ref()))
+                .range(
+                    bounds.and_then(|range| range.after_value.as_ref()),
+                    bounds.and_then(|range| range.before_value.as_ref()),
+                ),
+        )
+    }};
+}
+
+/// The entity type one `EntityTypeFilters` member filters, and the conditions it
+/// puts on that type's attributes.
+///
+/// Every member of every `*Filters` shape is named after the `EntitySummary`
+/// member it selects on (plus `EntityId` and `LastModifiedDate`, which every
+/// type carries), so each condition names that attribute and the record reads
+/// it; nothing here is keyed to one request's shape.
+fn type_criteria(filters: &EntityTypeFilters) -> (&'static str, Vec<EntityCriterion>) {
+    let mut criteria: Vec<EntityCriterion> = Vec::new();
+    let entity_type = match filters {
+        EntityTypeFilters::AmiProductFilters(asked) => {
+            values!(&mut criteria, "EntityId", asked.entity_id);
+            range!(&mut criteria, "LastModifiedDate", asked.last_modified_date);
+            text!(&mut criteria, "ProductTitle", asked.product_title);
+            values!(&mut criteria, "Visibility", asked.visibility);
+            "AmiProduct"
+        }
+        EntityTypeFilters::ContainerProductFilters(asked) => {
+            values!(&mut criteria, "EntityId", asked.entity_id);
+            range!(&mut criteria, "LastModifiedDate", asked.last_modified_date);
+            text!(&mut criteria, "ProductTitle", asked.product_title);
+            values!(&mut criteria, "Visibility", asked.visibility);
+            "ContainerProduct"
+        }
+        EntityTypeFilters::DataProductFilters(asked) => {
+            values!(&mut criteria, "EntityId", asked.entity_id);
+            range!(&mut criteria, "LastModifiedDate", asked.last_modified_date);
+            text!(&mut criteria, "ProductTitle", asked.product_title);
+            values!(&mut criteria, "Visibility", asked.visibility);
+            "DataProduct"
+        }
+        EntityTypeFilters::MachineLearningProductFilters(asked) => {
+            values!(&mut criteria, "EntityId", asked.entity_id);
+            range!(&mut criteria, "LastModifiedDate", asked.last_modified_date);
+            text!(&mut criteria, "ProductTitle", asked.product_title);
+            values!(&mut criteria, "Visibility", asked.visibility);
+            "MachineLearningProduct"
+        }
+        EntityTypeFilters::SaaSProductFilters(asked) => {
+            values!(&mut criteria, "EntityId", asked.entity_id);
+            range!(&mut criteria, "LastModifiedDate", asked.last_modified_date);
+            text!(&mut criteria, "ProductTitle", asked.product_title);
+            values!(&mut criteria, "Visibility", asked.visibility);
+            "SaaSProduct"
+        }
+        EntityTypeFilters::OfferFilters(asked) => {
+            values!(&mut criteria, "EntityId", asked.entity_id);
+            text!(&mut criteria, "Name", asked.name);
+            values!(&mut criteria, "ProductId", asked.product_id);
+            values!(
+                &mut criteria,
+                "ResaleAuthorizationId",
+                asked.resale_authorization_id
+            );
+            range!(&mut criteria, "ReleaseDate", asked.release_date);
+            range!(
+                &mut criteria,
+                "AvailabilityEndDate",
+                asked.availability_end_date
+            );
+            wild_card!(&mut criteria, "BuyerAccounts", asked.buyer_accounts);
+            values!(&mut criteria, "State", asked.state);
+            values!(&mut criteria, "Targeting", asked.targeting);
+            range!(&mut criteria, "LastModifiedDate", asked.last_modified_date);
+            values!(&mut criteria, "OfferSetId", asked.offer_set_id);
+            values!(
+                &mut criteria,
+                "TargetAgreementId",
+                asked.target_agreement_id
+            );
+            values!(
+                &mut criteria,
+                "TargetAgreementIntent",
+                asked.target_agreement_intent
+            );
+            values!(&mut criteria, "CreatedBySource", asked.created_by_source);
+            "Offer"
+        }
+        EntityTypeFilters::OfferSetFilters(asked) => {
+            values!(&mut criteria, "EntityId", asked.entity_id);
+            values!(&mut criteria, "Name", asked.name);
+            values!(&mut criteria, "State", asked.state);
+            range!(&mut criteria, "ReleaseDate", asked.release_date);
+            values!(
+                &mut criteria,
+                "AssociatedOfferIds",
+                asked.associated_offer_ids
+            );
+            values!(&mut criteria, "SolutionId", asked.solution_id);
+            range!(&mut criteria, "LastModifiedDate", asked.last_modified_date);
+            "OfferSet"
+        }
+        EntityTypeFilters::ResaleAuthorizationFilters(asked) => {
+            values!(&mut criteria, "EntityId", asked.entity_id);
+            text!(&mut criteria, "Name", asked.name);
+            text!(&mut criteria, "ProductId", asked.product_id);
+            dates!(&mut criteria, "CreatedDate", asked.created_date);
+            dates!(
+                &mut criteria,
+                "AvailabilityEndDate",
+                asked.availability_end_date
+            );
+            text!(
+                &mut criteria,
+                "ManufacturerAccountId",
+                asked.manufacturer_account_id
+            );
+            text!(&mut criteria, "ProductName", asked.product_name);
+            text!(
+                &mut criteria,
+                "ManufacturerLegalName",
+                asked.manufacturer_legal_name
+            );
+            text!(
+                &mut criteria,
+                "ResellerAccountID",
+                asked.reseller_account_id
+            );
+            text!(&mut criteria, "ResellerLegalName", asked.reseller_legal_name);
+            values!(&mut criteria, "Status", asked.status);
+            values!(
+                &mut criteria,
+                "OfferExtendedStatus",
+                asked.offer_extended_status
+            );
+            range!(&mut criteria, "LastModifiedDate", asked.last_modified_date);
+            values!(&mut criteria, "ResellerRole", asked.reseller_role);
+            values!(
+                &mut criteria,
+                "SourceAuthorization",
+                asked.source_authorization
+            );
+            values!(&mut criteria, "IssuerAccountId", asked.issuer_account_id);
+            "ResaleAuthorization"
+        }
+        EntityTypeFilters::ExpressPrivateOfferConfigurationFilters(asked) => {
+            values!(&mut criteria, "EntityId", asked.entity_id);
+            values!(&mut criteria, "ProductId", asked.product_id);
+            values!(&mut criteria, "State", asked.state);
+            "ExpressPrivateOfferConfiguration"
+        }
+    };
+    (entity_type, criteria)
+}
+
+/// The entity type one `EntityTypeSort` member orders, and the `SortBy` /
+/// `SortOrder` it asked for.
+///
+/// Every member carries that type's own `*SortBy` enum, whose values are again
+/// the attribute names the record reads, so the ordering needs no per-type
+/// translation.
+fn type_sort(sort: &EntityTypeSort) -> (&'static str, Option<&str>, Option<&str>) {
+    match sort {
+        EntityTypeSort::AmiProductSort(asked) => (
+            "AmiProduct",
+            asked.sort_by.as_deref(),
+            asked.sort_order.as_deref(),
+        ),
+        EntityTypeSort::ContainerProductSort(asked) => (
+            "ContainerProduct",
+            asked.sort_by.as_deref(),
+            asked.sort_order.as_deref(),
+        ),
+        EntityTypeSort::DataProductSort(asked) => (
+            "DataProduct",
+            asked.sort_by.as_deref(),
+            asked.sort_order.as_deref(),
+        ),
+        EntityTypeSort::MachineLearningProductSort(asked) => (
+            "MachineLearningProduct",
+            asked.sort_by.as_deref(),
+            asked.sort_order.as_deref(),
+        ),
+        EntityTypeSort::SaaSProductSort(asked) => (
+            "SaaSProduct",
+            asked.sort_by.as_deref(),
+            asked.sort_order.as_deref(),
+        ),
+        EntityTypeSort::OfferSort(asked) => (
+            "Offer",
+            asked.sort_by.as_deref(),
+            asked.sort_order.as_deref(),
+        ),
+        EntityTypeSort::OfferSetSort(asked) => (
+            "OfferSet",
+            asked.sort_by.as_deref(),
+            asked.sort_order.as_deref(),
+        ),
+        EntityTypeSort::ResaleAuthorizationSort(asked) => (
+            "ResaleAuthorization",
+            asked.sort_by.as_deref(),
+            asked.sort_order.as_deref(),
+        ),
+        EntityTypeSort::ExpressPrivateOfferConfigurationSort(asked) => (
+            "ExpressPrivateOfferConfiguration",
+            asked.sort_by.as_deref(),
+            asked.sort_order.as_deref(),
+        ),
     }
 }

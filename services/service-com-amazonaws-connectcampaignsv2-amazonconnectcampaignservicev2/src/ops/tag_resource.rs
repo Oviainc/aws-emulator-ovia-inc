@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The keys are checked FIRST: they are an input constraint, and a request
         // whose input is malformed is refused before any resource is resolved. The
@@ -213,8 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The ARN is resolved in the region this request was signed for: a campaign
+        // is only this endpoint's to tag when it was created through it.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        let Some(campaign) = store.campaign_by_arn_mut(&input.arn) else {
+        let Some(campaign) = store.campaign_by_arn_mut(&region, &input.arn) else {
             return Err(crate::scaffolded::Scaffolded::wire_coded(
                 crate::state::TAG_NOT_FOUND_CODE,
                 404,

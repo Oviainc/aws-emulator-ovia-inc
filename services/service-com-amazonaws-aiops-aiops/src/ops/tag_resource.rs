@@ -178,11 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // `resourceArn` is documented as "The Amazon Resource Name (ARN) of the
-        // resource that you want to apply the tags to" and carries no name
-        // alternative, so it resolves through the ARN alone — unlike the
-        // `{identifier}` members of the resource operations, which the model documents
-        // as a name OR an ARN.
-        let group = store.group_by_arn_mut(&input.resource_arn, &region).ok_or_else(|| {
+        // resource that you want to apply the tags to", so it resolves through the
+        // ARN — the one address a group has in this service (`crate::state`).
+        let group = store.group_mut(&input.resource_arn, &region).ok_or_else(|| {
             // A tagging call is served by the tagging frontend, whose absent-resource
             // answer is 404 `NotFoundException` rather than this service's own
             // modelled `ResourceNotFoundException`; see
