@@ -8,8 +8,9 @@
 //! exactly the shape of "the call did not happen" for the type it owns:
 //!
 //! 1. A resource type this emulator PROVISIONS (an `AWS::KinesisFirehose::DeliveryStream`)
-//!    whose owning service does not answer leaves the stack in `CREATE_FAILED`, naming the
-//!    resource, instead of a `CREATE_COMPLETE` stack whose stream does not exist.
+//!    whose owning service does not answer fails the create — so the stack is rolled back
+//!    to `ROLLBACK_COMPLETE`, with the reason naming the resource — instead of a
+//!    `CREATE_COMPLETE` stack whose stream does not exist.
 //! 2. A resource type it has no provisioner for is DECLARED ONLY: nothing is called for
 //!    it, so the stack completes and its outputs still resolve from the identifiers
 //!    CloudFormation's documented naming rules give the resource — and the stack's
@@ -94,9 +95,9 @@ async fn a_resource_whose_owning_service_does_not_answer_fails_the_stack() {
     let body = create_and_settle(&router, case, "unreachable-stack", &template).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
-        Some("CREATE_FAILED"),
-        "case {case:?}: expected the stack to fail rather than report a stream nothing \
-         created, got {body}"
+        Some("ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the failed create to be rolled back rather than report a \
+         stream nothing created, got {body}"
     );
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
     assert!(

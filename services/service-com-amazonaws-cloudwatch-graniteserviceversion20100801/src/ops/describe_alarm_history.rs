@@ -168,7 +168,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeAlarmHistoryErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the CloudWatch alarm store is unavailable".into()),
@@ -217,6 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ascending = input.scan_by.as_deref() == Some(SCAN_ASCENDING);
 
         let now = crate::state::now_secs();
+        // A state transition the clock has already made due is part of the history this read
+        // reports, so it is materialised — and the actions it owes are executed — before the
+        // items are selected, which keeps this read's answer the same for every later caller.
+        crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
         let mut store = state.lock();
         // Retention is due on the clock, not on this call: drop what has aged out of the
         // retention window before reporting, so a read never reports an expired item.

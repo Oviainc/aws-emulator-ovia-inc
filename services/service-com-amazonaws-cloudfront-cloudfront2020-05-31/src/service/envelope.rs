@@ -38,8 +38,8 @@
 //! operation's input with `400 ValidationException` and the codec's own text;
 //! `ValidationException` is not a shape this service's model declares at all, so a client
 //! branching on the error code falls through to a generic failure and never reaches its
-//! input-correction path. Two such refusals have a modelled CloudFront answer, and both
-//! are read off the REQUEST rather than off the operation:
+//! input-correction path. Three such refusals have a modelled CloudFront answer, and each
+//! is read off the REQUEST and the refusal rather than off the operation:
 //!
 //! * a `MaxItems` the parameter's integer type cannot take is `InvalidArgument` (400),
 //!   stating the constraint on the parameter — the same refusal, in the same words, a
@@ -47,15 +47,20 @@
 //!   ([`crate::state::MAX_ITEMS_INVALID_MESSAGE`]) — and only where the refusal shows
 //!   that value as the one it refused, so a request refused for something else keeps
 //!   the cause its caller has to fix;
+//! * a value the model's ENUM does not admit for a QUERY PARAMETER the request carries is
+//!   no value of that parameter at all, so the request describes a document this API
+//!   cannot read: the answer is `MalformedXML` (400), under the sentence the boundary
+//!   already wrote, which names the parameter and the value set it broke. A member bound
+//!   anywhere else keeps the boundary's wording;
 //! * a body-bearing request that carries NO body cannot have a payload at all, so the
 //!   null member the boundary reports is one nested inside that payload and the member
 //!   that is really absent is the payload itself: the answer is `MalformedXML` (400)
 //!   naming that payload member. A refusal naming a member nested in nothing is about a
 //!   member bound outside the body, and keeps the boundary's own wording.
 //!
-//! Both leave every other refusal exactly as the framework rendered it: the restatement
-//! runs only when the boundary actually refused the request, so a request the boundary
-//! read is never second-guessed here.
+//! All three leave every other refusal exactly as the framework rendered it: the
+//! restatement runs only when the boundary actually refused the request, so a request the
+//! boundary read is never second-guessed here.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema_server::{missing_member_message, xml_escape};
@@ -107,6 +112,20 @@ const MALFORMED_XML: &str = "MalformedXML";
 /// The query parameter every CloudFront list operation binds its page size to
 /// (`@httpQuery("MaxItems")` over an `integer`, from the model's list operations).
 const MAX_ITEMS_PARAM: &str = "MaxItems";
+
+/// How the request boundary states the constraint an ENUM member carries (`Member must
+/// satisfy enum value set: [...]`), the one refusal that says the request named a value the
+/// model's enum does not admit.
+///
+/// It identifies the refusal by the CONSTRAINT it reports rather than by the member or the
+/// operation, so it holds for every enum-constrained member of every operation this service
+/// serves.
+const ENUM_VALUE_SET_MARKER: &str = "Member must satisfy enum value set:";
+
+/// The marker the framework's refusal message states the member it refused a VALUE at
+/// (`Value '<value>' at '<member path>' failed to satisfy constraint: …`), with the
+/// apostrophes as the XML envelope escapes them and as it leaves them.
+const VALUE_MEMBER_MARKERS: [(&str, &str); 2] = [(" at &apos;", "&apos;"), (" at '", "'")];
 
 /// The marker the framework's refusal message states an absent member with
 /// (`Value null at '<member path>' failed to satisfy constraint: Member must not be
@@ -216,12 +235,15 @@ fn request_query(uri: &str) -> &str {
     uri.split_once('?').map_or("", |(_, query)| query)
 }
 
+/// The `(key, value)` pairs a query component carries — the one split every lookup in this
+/// module reads a query string through.
+fn query_pairs(query: &str) -> impl Iterator<Item = (&str, &str)> {
+    query.split('&').filter_map(|pair| pair.split_once('='))
+}
+
 /// The raw value a query component gives `name`, or `None` when it names it no value.
 fn query_value<'q>(query: &'q str, name: &str) -> Option<&'q str> {
-    query.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
-        (key == name).then_some(value)
-    })
+    query_pairs(query).find_map(|(key, value)| (key == name).then_some(value))
 }
 
 /// The `MaxItems` the request asks for, read the way the request boundary reads a query
@@ -280,6 +302,98 @@ fn refused_over_max_items(req: &RtRequest, refusal: &str) -> bool {
         .any(|marker| refusal.contains(marker))
 }
 
+/// Whether `refusal` is the boundary refusing the request over a value an enum-constrained
+/// QUERY PARAMETER of the request carries.
+///
+/// Both halves are read off the request and the refusal: the refusal reports the enum value
+/// set as the constraint that failed, and the member it names is one this request gives a
+/// value to in its query string. A member bound anywhere else — in the document, in a URI
+/// path segment — keeps the wording the boundary gave it, since what this restates is a
+/// parameter of the request rather than a member of some document.
+fn refused_over_enum_query_value(req: &RtRequest, refusal: &str) -> bool {
+    let Some(message) = element_text(refusal, "Message") else {
+        return false;
+    };
+    if !message.contains(ENUM_VALUE_SET_MARKER) {
+        return false;
+    }
+    refused_member_path(message).is_some_and(|member| query_names(req, member))
+}
+
+/// The member path a refusal message states a refused VALUE at, as the framework rendered
+/// it.
+fn refused_member_path(message: &str) -> Option<&str> {
+    VALUE_MEMBER_MARKERS.iter().find_map(|(open, close)| {
+        let after = message.split_once(open)?.1;
+        Some(after.split_once(close)?.0)
+    })
+}
+
+/// Whether the request's query string gives `member` a value — the member path as the
+/// boundary renders it (`type`) against the parameter as the model binds it (`Type`), which
+/// differ only in case.
+fn query_names(req: &RtRequest, member: &str) -> bool {
+    query_pairs(request_query(req.uri())).any(|(key, _)| key.eq_ignore_ascii_case(member))
+}
+
+/// `refusal` with the enum's admitted values stated in ONE canonical order.
+///
+/// What the refusal reports is a SET of admitted values, so the order the model happens to
+/// declare them in says nothing about the request that broke the constraint: the set is
+/// stated sorted, so the same constraint is always refused with the same sentence.
+fn with_sorted_enum_values(refusal: &str) -> String {
+    let Some(message) = element_text(refusal, "Message") else {
+        return refusal.to_string();
+    };
+    let Some(sorted) = sorted_enum_values(message) else {
+        return refusal.to_string();
+    };
+    refusal.replacen(
+        &format!("<Message>{message}</Message>"),
+        &format!("<Message>{sorted}</Message>"),
+        1,
+    )
+}
+
+/// `message` with the value set it lists after [`ENUM_VALUE_SET_MARKER`] sorted, or `None`
+/// when it lists none — the rewrite reads the MESSAGE rather than the document, so nothing
+/// else the envelope carries can be touched by it.
+fn sorted_enum_values(message: &str) -> Option<String> {
+    let marker_at = message.find(ENUM_VALUE_SET_MARKER)?;
+    let tail = &message[marker_at..];
+    let open = tail.find('[')?;
+    let close = open + tail[open..].find(']')?;
+    let mut values: Vec<&str> = tail[open + 1..close].split(',').map(str::trim).collect();
+    values.sort_unstable();
+    Some(format!(
+        "{}{}{}",
+        &message[..marker_at + open + 1],
+        values.join(", "),
+        &message[marker_at + close..]
+    ))
+}
+
+/// `refusal` answered under `code`, with everything else the boundary rendered — its
+/// `Message` above all — left exactly as it stands.
+///
+/// Used where what this service restates is the CODE alone: the sentence the boundary wrote
+/// already states the member and the constraint it broke, which is the rule the refusal is
+/// built from, so rewriting it would say less rather than more. Rewriting the element
+/// in place is also what keeps the text's escaping as the renderer produced it.
+fn recoded(refusal: &str, code: &str) -> RtResponse {
+    let body = refusal.replacen(
+        &format!("<Code>{FRAMEWORK_REFUSAL_CODE}</Code>"),
+        &format!("<Code>{code}</Code>"),
+        1,
+    );
+    let mut resp = RtResponse::new(
+        StatusCode::try_from(REFUSED).expect("400 is a valid status code"),
+        SdkBody::from(body),
+    );
+    resp.headers_mut().insert("content-type", "application/xml");
+    resp
+}
+
 /// Whether the request carries no document at all: a body that is there and holds
 /// nothing but whitespace.
 ///
@@ -328,6 +442,15 @@ fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
             INVALID_ARGUMENT,
             crate::state::MAX_ITEMS_INVALID_MESSAGE,
         ));
+    }
+
+    // A value the model's enum does not admit is no value of that parameter at all, so the
+    // request describes a document this API cannot read: CloudFront answers that with
+    // `MalformedXML` (400), the same code it answers any unreadable request document with.
+    // The parameter and the values it admits are what the boundary's own sentence states,
+    // so only the code is restated.
+    if refused_over_enum_query_value(req, refusal) {
+        return Some(recoded(&with_sorted_enum_values(refusal), MALFORMED_XML));
     }
 
     // A request with a body to give carried none, so the whole payload is null. The
@@ -462,7 +585,7 @@ impl ErasedOperation for ErrorEnvelope {
 
 #[cfg(test)]
 mod tests {
-    //! The envelope surgery and the two restatement conditions, read off documents and
+    //! The envelope surgery and the three restatement conditions, read off documents and
     //! requests rather than through the router (the crate's integration suite drives the
     //! same rules end to end over HTTP).
 
@@ -478,6 +601,38 @@ mod tests {
             StatusCode::try_from(400u16).expect("400"),
             SdkBody::from(body),
         )
+    }
+
+    /// The value set an enum refusal lists is a SET: the sentence states it in one order,
+    /// and nothing else the refusal says changes.
+    #[test]
+    fn an_enum_refusals_value_set_is_stated_sorted() {
+        let refusal = format!(
+            "<ErrorResponse xmlns=\"{XML_NAMESPACE}\"><Error><Type>Sender</Type>\
+             <Code>{FRAMEWORK_REFUSAL_CODE}</Code><Message>1 validation error detected: \
+             Value &apos;bogus&apos; at &apos;type&apos; failed to satisfy constraint: \
+             {ENUM_VALUE_SET_MARKER} [managed, custom]</Message></Error></ErrorResponse>"
+        );
+        let sorted = with_sorted_enum_values(&refusal);
+        assert_eq!(
+            element_text(&sorted, "Message"),
+            Some(
+                "1 validation error detected: Value &apos;bogus&apos; at &apos;type&apos; \
+                 failed to satisfy constraint: Member must satisfy enum value set: \
+                 [custom, managed]"
+            ),
+            "expected the value set stated sorted, got {sorted}"
+        );
+
+        // A refusal that lists no value set is handed back exactly as it stands.
+        let other = "<ErrorResponse><Error><Code>ValidationException</Code>\
+                     <Message>Value null at &apos;x.y&apos; failed to satisfy constraint: \
+                     Member must not be null</Message></Error></ErrorResponse>";
+        assert_eq!(
+            with_sorted_enum_values(other),
+            other,
+            "a refusal about another constraint must be left alone"
+        );
     }
 
     #[test]

@@ -56,17 +56,24 @@ const REGION: &str = "us-west-2";
 const ACCOUNT: &str = "000000000000";
 
 /// The `TagKey` maximum the model declares (`@length(min: 1, max: 128)`).
-const MAX_TAG_KEY_LEN: usize = 128;
+pub(crate) const MAX_TAG_KEY_LEN: usize = 128;
 
 /// The `TagValue` maximum the model declares (`@length(min: 0, max: 256)`).
-const MAX_TAG_VALUE_LEN: usize = 256;
+pub(crate) const MAX_TAG_VALUE_LEN: usize = 256;
 
 /// The `TagMap` maximum the model declares (`@length(min: 0, max: 200)`).
-const MAX_TAGS: usize = 200;
+pub(crate) const MAX_TAGS: usize = 200;
+
+/// The HTTP status a successful tag mutation answers with: 204 No Content, the status the
+/// recorded AWS responses show for `TagResource` and `UntagResource`. Written as the
+/// literal the wire contract fixes, NOT read from the service, so a handler that drifts
+/// back to the protocol-defaulted 200 fails here. The rule behind it is pinned in
+/// `tag_mutation_no_content.rs`.
+pub(crate) const TAG_MUTATION_STATUS: u16 = 204;
 
 /// Which stored resource a case's `resourceArn` names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Target {
+pub(crate) enum Target {
     Monitor,
     Probe,
 }
@@ -97,7 +104,7 @@ struct TagCase {
 
 /// A JSON tag map built from `(key, value)` pairs — for the rows whose keys or
 /// values are computed rather than written out.
-fn tag_map(pairs: &[(&str, &str)]) -> Value {
+pub(crate) fn tag_map(pairs: &[(&str, &str)]) -> Value {
     Value::Object(
         pairs
             .iter()
@@ -212,7 +219,7 @@ async fn delete_probe(
 }
 
 /// `GET /tags/{resourceArn}` — `ListTagsForResource`.
-async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
     call(
         router,
         "GET",
@@ -224,7 +231,7 @@ async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Val
 
 /// `DELETE /tags/{resourceArn}?tagKeys=..&tagKeys=..` — the `tagKeys` list is
 /// bound to `@httpQuery("tagKeys")`, so each key is its own query pair.
-async fn untag_resource(
+pub(crate) async fn untag_resource(
     router: &MultiServiceRouter,
     resource_arn: &str,
     tag_keys: &[&str],
@@ -294,14 +301,14 @@ fn tags_of_probe(body: &Value, probe_id: &str) -> Value {
 
 /// A deterministic string of `length` ASCII characters, for exercising a
 /// declared length bound rather than one hand-picked spelling.
-fn filler(length: usize, seed: u8) -> String {
+pub(crate) fn filler(length: usize, seed: u8) -> String {
     (0..length)
         .map(|i| char::from(b'a' + ((i as u8).wrapping_add(seed) % 26)))
         .collect()
 }
 
 /// `count` distinct tag pairs, for exercising the tag COUNT dimension.
-fn many_tags(count: usize) -> Value {
+pub(crate) fn many_tags(count: usize) -> Value {
     let mut map = Map::new();
     for i in 0..count {
         map.insert(format!("key-{i:03}"), json!(format!("value-{i:03}")));
@@ -778,8 +785,8 @@ async fn untag_resource_removes_exactly_the_named_keys() {
 
         let (status, body) = untag_resource(&router, &resource_arn, removed).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected UntagResource 200, got {status} {body:?}"
+            status, TAG_MUTATION_STATUS,
+            "case {case:?}: expected UntagResource {TAG_MUTATION_STATUS}, got {status} {body:?}"
         );
 
         let (status, got) = get_monitor(&router, &name).await;
@@ -945,8 +952,8 @@ async fn tag_resource_adds_exactly_the_named_pairs() {
 
         let (status, body) = tag_resource(&router, &resource_arn, &written).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected TagResource 200, got {status} {body:?}"
+            status, TAG_MUTATION_STATUS,
+            "case {case:?}: expected TagResource {TAG_MUTATION_STATUS}, got {status} {body:?}"
         );
 
         let (status, got) = get_monitor(&router, &name).await;
@@ -1002,8 +1009,9 @@ async fn concurrent_tag_writes_converge_on_the_union_of_their_keys() {
         .enumerate()
     {
         assert_eq!(
-            status, 200,
-            "case \"concurrent write {index}\": expected TagResource 200, got {status} {body:?}"
+            status, TAG_MUTATION_STATUS,
+            "case \"concurrent write {index}\": expected TagResource {TAG_MUTATION_STATUS}, \
+             got {status} {body:?}"
         );
     }
 
@@ -1043,12 +1051,13 @@ async fn a_tag_write_past_the_tag_map_maximum_is_refused_and_persists_nothing() 
     )
     .await;
 
-    // At the bound: overwriting a key the monitor already carries keeps it at 200.
+    // At the bound: overwriting a key the monitor already carries is accepted.
     let overwrite = tag_map(&[(keys[0].as_str(), "overwritten")]);
     let (status, body) = tag_resource(&router, &monitor_arn, &overwrite).await;
     assert_eq!(
-        status, 200,
-        "case \"200 stored, overwriting one of them\": expected 200, got {status} {body:?}"
+        status, TAG_MUTATION_STATUS,
+        "case \"200 stored, overwriting one of them\": expected {TAG_MUTATION_STATUS}, \
+         got {status} {body:?}"
     );
 
     // One past it: a 201st key cannot be stored.
@@ -1218,8 +1227,8 @@ async fn modified_at_moves_only_when_a_key_was_removed() {
     // Removing a key the monitor does not carry changes nothing.
     let (status, body) = untag_resource(&router, &monitor_arn, &["absent"]).await;
     assert_eq!(
-        status, 200,
-        "expected UntagResource 200 for an absent key, got {status} {body:?}"
+        status, TAG_MUTATION_STATUS,
+        "expected UntagResource {TAG_MUTATION_STATUS} for an absent key, got {status} {body:?}"
     );
     let (_, after_noop) = get_monitor(&router, "untag-modified").await;
     let noop_modified_at = timestamp(&after_noop, "modifiedAt");
@@ -1232,8 +1241,8 @@ async fn modified_at_moves_only_when_a_key_was_removed() {
     // Removing a key the monitor carries is a modification.
     let (status, body) = untag_resource(&router, &monitor_arn, &["team"]).await;
     assert_eq!(
-        status, 200,
-        "expected UntagResource 200 for a present key, got {status} {body:?}"
+        status, TAG_MUTATION_STATUS,
+        "expected UntagResource {TAG_MUTATION_STATUS} for a present key, got {status} {body:?}"
     );
     let (_, after_removal) = get_monitor(&router, "untag-modified").await;
     let removed_modified_at = timestamp(&after_removal, "modifiedAt");
@@ -1303,8 +1312,8 @@ async fn modified_at_moves_only_when_a_tag_write_changed_the_stored_map() {
     for (case, written, modifies) in cases {
         let (status, body) = tag_resource(&router, &monitor_arn, &written).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected TagResource 200, got {status} {body:?}"
+            status, TAG_MUTATION_STATUS,
+            "case {case:?}: expected TagResource {TAG_MUTATION_STATUS}, got {status} {body:?}"
         );
         let (_, after) = get_monitor(&router, "tag-modified").await;
         let now_modified_at = timestamp(&after, "modifiedAt");

@@ -124,10 +124,10 @@ struct ErrorCase {
 ///
 /// The codes of the rows that are NOT modelled errors are the ones this service already
 /// answers with — `ValidationException` from the scaffold's refusal channel,
+/// `InvalidParameterValue` from the same channel for a value a parameter does not accept,
 /// `MalformedInput` from the boundary validator, `InvalidAction` from the routing
-/// and API-version gates. They are pinned here so this change cannot alter them: whether
-/// a parameter refusal should instead carry the Query API's `InvalidParameterValue` code
-/// is a different defect with its own issue, and this suite is about the envelope.
+/// and API-version gates. They are pinned here so a change to the envelope cannot alter
+/// them, and this suite is about the envelope.
 const ERROR_CASES: &[ErrorCase] = &[
     ErrorCase {
         case: "modelled 404: a read naming no stored option group",
@@ -167,7 +167,7 @@ const ERROR_CASES: &[ErrorCase] = &[
         action: "DescribeOptionGroups",
         params: &[("MaxRecords", "19")],
         status: 400,
-        code: "ValidationException",
+        code: "InvalidParameterValue",
     },
     ErrorCase {
         case: "handler refusal on a mutation: an engine the service does not host",

@@ -38,3 +38,5 @@ mod recovery_group_readiness_summary;
 mod resource_set_type_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_limits.rs"]
+mod tag_limits;

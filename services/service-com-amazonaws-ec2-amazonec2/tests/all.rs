@@ -277,6 +277,8 @@ mod vpc_endpoints_and_byoip;
 mod vpc_lifecycle;
 #[path = "all/vpc_network_lifecycle.rs"]
 mod vpc_network_lifecycle;
+#[path = "all/vpc_resources_blocking_encryption_enforcement.rs"]
+mod vpc_resources_blocking_encryption_enforcement;
 #[path = "all/vpn_connection_device_types.rs"]
 mod vpn_connection_device_types;
 // Reading one VPC back out of an ec2Query response, on top of `ec2_query`'s plumbing.

@@ -347,6 +347,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // checked when the request that set it named it.
         crate::state::refuse_unassumable_role(&*self.engine, input.role_arn.as_deref())?;
         let now = ::std::time::SystemTime::now();
+        // A stack name or id names a stack only in the Region the request was signed for.
+        let request_region = crate::state::request_region(ctx.parts());
         // The store is read under the lock and the lock is RELEASED with this block: what
         // the update computes from the request and the stack's previous values needs no
         // lock, and the calls that create or delete the stack's resources must not run
@@ -360,7 +362,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::stack_does_not_exist(&input.stack_name),
                 )
             };
-            let previous = store.resolve(&input.stack_name).ok_or_else(not_found)?;
+            let previous = store
+                .resolve(&request_region, &input.stack_name)
+                .ok_or_else(not_found)?;
             // A stack id resolves a deleted stack too, but a deleted stack cannot be
             // updated.
             if !previous.is_live() {
@@ -483,7 +487,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (stack_id, region, declared, previous_resources, provenance) = {
             let mut store = state.lock();
             let stack = store
-                .resolve_mut(&input.stack_name)
+                .resolve_mut(&request_region, &input.stack_name)
                 .filter(|stack| stack.is_live())
                 .ok_or_else(|| {
                     crate::scaffolded::Scaffolded::validation_error(
@@ -559,7 +563,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await;
 
         let mut store = state.lock();
-        if let Some(stack) = store.resolve_mut(&stack_id) {
+        if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
             stack.record_materialised_resources(materialised.resources);
             if let Some(failure) = materialised.failure {
                 // A resource an owning service refused: the update does not reach

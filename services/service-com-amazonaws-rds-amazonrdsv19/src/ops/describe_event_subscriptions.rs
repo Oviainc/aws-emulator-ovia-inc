@@ -150,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx)
             .map_err(DescribeEventSubscriptionsError::validation)?;
         let page_size = crate::state::check_max_records(input.max_records)
-            .map_err(DescribeEventSubscriptionsError::validation)?;
+            .map_err(DescribeEventSubscriptionsError::invalid_parameter_value)?;
         // `Filters`: "This parameter isn't currently supported." A filter is refused
         // rather than ignored — ignoring one would report subscriptions the caller meant
         // to exclude.

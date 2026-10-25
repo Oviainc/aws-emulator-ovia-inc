@@ -77,9 +77,9 @@ const ROLES: &[(&str, &str, &[usize], Option<usize>)] = &[
 ];
 
 /// The fixture users: `(UserName, Path, index of the POLICIES entry used as the
-/// user's permissions boundary)`. A user can hold no ATTACHED managed policy in this
-/// emulator yet — `AttachUserPolicy` is a scaffolded 501 — so the boundary is the one
-/// relation a user row varies.
+/// user's permissions boundary)`. The boundary is the one relation a user row here
+/// varies; a user's ATTACHED managed policies are the subject of
+/// `tests/all/user_attached_policies.rs`, which drives the same reader.
 const USERS: &[(&str, &str, Option<usize>)] = &[
     ("alice", "/", Some(0)),
     ("Bob.9", "/app/", Some(2)),
@@ -211,7 +211,7 @@ fn expected_roles(policy: usize, usage: Option<&str>, path_prefix: &str) -> Vec<
 
 /// The fixture users the policy at `policy` relates under `usage` and
 /// `path_prefix`, in the order the service enumerates them. Only the boundary
-/// relation can hold for a user (see [`USERS`]).
+/// relation holds for a user of THIS fixture (see [`USERS`]).
 fn expected_users(policy: usize, usage: Option<&str>, path_prefix: &str) -> Vec<String> {
     let mut names: Vec<String> = USERS
         .iter()

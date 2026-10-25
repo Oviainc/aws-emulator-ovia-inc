@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOffering
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOffering`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOffering::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The offering this operation reports is the one the CATALOG in
+//! [`crate::state::offerings`] holds under the requested id — an offering is not
+//! a resource a caller creates, so there is no per-account store of them, and a
+//! described offering is the same projection a listing reports, read out of that
+//! one catalog by [`crate::state::offering_by_id`]. An id the catalog does not
+//! hold names no offering, which is this operation's modelled 404.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +164,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOffering` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOfferingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOffering"))
+        // The catalog is this service's data model for offerings and holds no
+        // per-account state, so this read needs no store: `self.engine` is the
+        // seam every operation is constructed from, and this one reaches past it
+        // to the catalog the listing answers from too.
+        let _ = &self.engine;
+
+        // An offering is reported for the region the request was signed for:
+        // `Region` is "AWS region, e.g. 'us-west-2'" and the `Arn` names that
+        // region as well, because an offering reserves capacity in the region
+        // whose endpoint the caller addressed.
+        let region = crate::state::request_region(ctx.parts());
+
+        // Reporting only: the offering an id names is the same on every call, so
+        // resolving one changes nothing a later caller sees.
+        let offering = crate::state::offering_by_id(&input.offering_id, &region).ok_or_else(|| {
+            DescribeOfferingErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    "Offering",
+                    &input.offering_id,
+                )),
+            })
+        })?;
+
+        // The described offering IS the listed one: every member is moved across
+        // from the catalog's single projection rather than derived a second time
+        // here, so the two readers cannot drift.
+        Ok(DescribeOfferingOutput {
+            arn: offering.arn,
+            currency_code: offering.currency_code,
+            duration: offering.duration,
+            duration_units: offering.duration_units,
+            fixed_price: offering.fixed_price,
+            offering_description: offering.offering_description,
+            offering_id: offering.offering_id,
+            offering_type: offering.offering_type,
+            region: offering.region,
+            resource_specification: offering.resource_specification,
+            usage_price: offering.usage_price,
+        })
     }
 }

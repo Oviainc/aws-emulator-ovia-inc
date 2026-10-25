@@ -2226,7 +2226,16 @@ fn apply_alarms<Eng: Send + Sync + 'static>(
         };
         store.alarms.insert(
             spec.name.clone(),
-            cloudwatch::state::StoredAlarm { alarm, tags },
+            cloudwatch::state::StoredAlarm {
+                alarm,
+                tags,
+                // The alarm CloudWatch evaluates from the stored metric data, the same span
+                // after this write as for one `PutMetricAlarm` created: "the alarm state is
+                // immediately set to INSUFFICIENT_DATA. The alarm is then evaluated and its
+                // state is set appropriately."
+                evaluation_due_secs: now
+                    + cloudwatch::state::alarm_evaluation::EVALUATION_DELAY_SECS,
+            },
         );
         minted.push(Alarm {
             alarm_name: spec.name.clone(),
