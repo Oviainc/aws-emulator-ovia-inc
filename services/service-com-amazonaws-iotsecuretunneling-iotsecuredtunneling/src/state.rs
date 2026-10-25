@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::Tag;
+use crate::ops::types::{DestinationConfig, Tag};
 
 /// `TimeoutConfig$maxLifetimeTimeoutMinutes`: "The maximum amount of time (in
 /// minutes) a tunnel can remain open. If not specified,
@@ -50,6 +50,42 @@ pub const MAX_TUNNELS: usize = 500;
 /// bounded by the modelled `@length` constraints on `Tag`, the keys per tunnel
 /// by this constant, and the tunnels by [`MAX_TUNNELS`].
 pub const MAX_TAGS_PER_TUNNEL: usize = 50;
+
+/// The number of service names one tunnel's `destinationConfig` may carry.
+///
+/// A tunnel is multiplexed over at most three simultaneous data streams — one
+/// per service name the destination configuration lists — so a longer
+/// `services` list asks for streams the tunnel cannot carry and is refused
+/// rather than stored. The modelled `ServiceList` publishes only
+/// `length(min: 1)`, so the boundary validator passes any length through and the
+/// rule lives here, applied by every writer of the field.
+pub const MAX_SERVICES_PER_TUNNEL: usize = 3;
+
+/// The stored form of a request's `destinationConfig`, or the message refusing a
+/// `services` list longer than [`MAX_SERVICES_PER_TUNNEL`].
+///
+/// The single place that rule is applied, so every writer of the field —
+/// `OpenTunnel` and `RotateTunnelAccessToken` — refuses the same lists in the
+/// same words, and a refused request is refused before it mints or stores
+/// anything. `member` is the request member the configuration arrived on, so the
+/// message names what the caller has to fix; the count comes from the request
+/// and nothing else.
+pub fn stored_destination_config(
+    member: &str,
+    config: &DestinationConfig,
+) -> Result<StoredDestinationConfig, String> {
+    let count = config.services.len();
+    if count > MAX_SERVICES_PER_TUNNEL {
+        return Err(format!(
+            "{member}.services names {count} services; a tunnel is multiplexed over at most \
+             {MAX_SERVICES_PER_TUNNEL} simultaneous data streams"
+        ));
+    }
+    Ok(StoredDestinationConfig {
+        thing_name: config.thing_name.clone(),
+        services: config.services.clone(),
+    })
+}
 
 /// The tag-key namespace AWS keeps for the tags it applies itself.
 ///

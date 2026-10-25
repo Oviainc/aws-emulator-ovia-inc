@@ -19,13 +19,17 @@
 //! * re-creating a stored group is the modelled already-exists fault and nothing in the
 //!   store moves; naming a group that is not stored is the modelled not-found fault;
 //! * a listing pages over the whole set in name order for any `MaxResults`, and a page
-//!   size or token that names no page is the modelled invalid-value error.
+//!   size or token that names no page is the modelled invalid-value error;
+//! * `DeleteParameterGroup` removes the group from that state — it answers the record it
+//!   removed and both readers then answer the modelled not-found fault for the name —
+//!   while a group MemoryDB itself owns, or one a cluster still references, is refused
+//!   and left in place.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_memorydb_amazonmemorydb::state::{
-    default_parameter_group_name, parameter_group_families,
+    default_parameter_group_name, parameter_group_families, MAX_MAX_RESULTS, MIN_MAX_RESULTS,
 };
 use service_com_amazonaws_memorydb_amazonmemorydb::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -359,21 +363,39 @@ async fn describing_a_parameter_group_changes_nothing() {
     }
 }
 
-/// The listing pages over the whole set in name order for ANY page size, and the pages
-/// together are exactly the unpaged listing.
+/// The listing pages over the whole set in name order for any page size the service's
+/// window admits, and the pages together are exactly the unpaged listing.
 #[tokio::test]
 async fn the_listing_pages_over_every_group_in_name_order() {
     let router = router();
     for case in CASES {
         ok(&router, "CreateParameterGroup", &create_body(case), case.name).await;
     }
-    let mut expected: Vec<String> =
-        expected_listing(&CASES.iter().map(|case| case.name).collect::<Vec<_>>());
+    let mut created: Vec<String> = CASES.iter().map(|case| case.name.to_string()).collect();
+    // More groups than the SMALLEST page the service serves, so a page size at the bottom
+    // of the page-size window has to walk several pages to cover the set.
+    for index in 0..MIN_MAX_RESULTS {
+        let name = format!("paged-group-{index:02}");
+        ok(
+            &router,
+            "CreateParameterGroup",
+            &json!({ "ParameterGroupName": name, "Family": CASES[0].family }),
+            &name,
+        )
+        .await;
+        created.push(name);
+    }
+    let mut expected: Vec<String> = expected_listing(
+        &created
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
     expected.sort();
 
-    // Every page size from 1 to one PAST the number of groups: a size larger than the
-    // set is one page with no token.
-    for page_size in 1..=(expected.len() + 1) {
+    // At the bottom of the page-size window, one past it, and at the top: a size larger
+    // than the set is one page with no token.
+    for page_size in [MIN_MAX_RESULTS, MIN_MAX_RESULTS + 1, MAX_MAX_RESULTS] {
         let case = format!("MaxResults={page_size}");
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
@@ -387,7 +409,7 @@ async fn the_listing_pages_over_every_group_in_name_order() {
             let page = ok(&router, "DescribeParameterGroups", &body, &case).await;
             let names = group_names(&page, &case);
             assert!(
-                names.len() <= page_size,
+                i32::try_from(names.len()).unwrap_or(i32::MAX) <= page_size,
                 "case {case:?}: a page must hold at most {page_size} groups, got {page}"
             );
             seen.extend(names);
@@ -408,6 +430,98 @@ async fn the_listing_pages_over_every_group_in_name_order() {
             "case {case:?}: the pages together must be the whole listing in name order"
         );
     }
+}
+
+/// `DeleteParameterGroup` removes the group from state: it answers the record it
+/// removed, and the readers then answer the modelled not-found fault for that name — for
+/// every row of the table. The two rules the operation documents are refusals that leave
+/// the group in place: a group MemoryDB itself owns is not the caller's to delete, and a
+/// group a cluster still references cannot go away under it.
+#[tokio::test]
+async fn deleting_a_parameter_group_removes_it_from_state() {
+    let router = router();
+    for case in CASES {
+        ok(&router, "CreateParameterGroup", &create_body(case), case.name).await;
+    }
+
+    for case in CASES {
+        let request = json!({ "ParameterGroupName": case.name });
+        let deleted = ok(&router, "DeleteParameterGroup", &request, case.name).await;
+        assert_eq!(
+            deleted["ParameterGroup"],
+            expected_group(case, REGION),
+            "case {:?}: the delete must answer the record it removed, got {deleted}",
+            case.name
+        );
+        // Read back through BOTH implemented readers: the group is gone from the state
+        // they answer from, not merely from the one listing.
+        for operation in ["DescribeParameterGroups", "DescribeParameters"] {
+            let (status, refused) = call(&router, operation, &request).await;
+            assert_eq!(
+                (status, error_code(&refused).as_str()),
+                (400, "ParameterGroupNotFoundFault"),
+                "case {:?}: {operation} must answer the modelled not-found fault for a \
+                 deleted group, got {status} with {refused}",
+                case.name
+            );
+        }
+        // A second delete of the same name is that same fault: the removal stuck.
+        let (status, refused) = call(&router, "DeleteParameterGroup", &request).await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, "ParameterGroupNotFoundFault"),
+            "case {:?}: deleting it twice must answer the modelled not-found fault, got \
+             {status} with {refused}",
+            case.name
+        );
+    }
+
+    // Every group MemoryDB itself owns is refused, whichever family it belongs to, and
+    // is still there afterwards.
+    for family in parameter_group_families() {
+        let name = default_parameter_group_name(&family);
+        let request = json!({ "ParameterGroupName": name });
+        let (status, refused) = call(&router, "DeleteParameterGroup", &request).await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, "InvalidParameterValueException"),
+            "case {name:?}: a group the service owns must be refused, got {status} with \
+             {refused}"
+        );
+        ok(&router, "DescribeParameterGroups", &request, &name).await;
+    }
+
+    // A group a cluster references cannot be deleted while it does, and is still there
+    // afterwards.
+    let in_use = "in-use-group";
+    ok(
+        &router,
+        "CreateParameterGroup",
+        &json!({ "ParameterGroupName": in_use, "Family": CASES[0].family }),
+        in_use,
+    )
+    .await;
+    ok(
+        &router,
+        "CreateCluster",
+        &json!({
+            "ClusterName": "pg-holder",
+            "NodeType": "db.t4g.small",
+            "ACLName": "open-access",
+            "ParameterGroupName": in_use,
+        }),
+        in_use,
+    )
+    .await;
+    let request = json!({ "ParameterGroupName": in_use });
+    let (status, refused) = call(&router, "DeleteParameterGroup", &request).await;
+    assert_eq!(
+        (status, error_code(&refused).as_str()),
+        (400, "InvalidParameterGroupStateFault"),
+        "case {in_use:?}: a group a cluster references must be refused, got {status} with \
+         {refused}"
+    );
+    ok(&router, "DescribeParameterGroups", &request, in_use).await;
 }
 
 /// Re-creating a stored group is refused with the modelled already-exists fault, and
@@ -495,8 +609,8 @@ async fn a_request_that_names_nothing_is_refused() {
         );
     }
 
-    // A page size below 1 names no page.
-    for max_results in [0, -1, -7] {
+    // A page size outside the service's window names no page.
+    for max_results in [0, -7, MIN_MAX_RESULTS - 1, MAX_MAX_RESULTS + 1] {
         let (status, refused) = call(
             &router,
             "DescribeParameterGroups",
@@ -505,8 +619,8 @@ async fn a_request_that_names_nothing_is_refused() {
         .await;
         assert_eq!(
             status, 400,
-            "case {max_results:?}: a page size below 1 must answer 400, got {status} with \
-             {refused}"
+            "case {max_results:?}: a page size outside the window must answer 400, got \
+             {status} with {refused}"
         );
         assert_eq!(
             error_code(&refused),

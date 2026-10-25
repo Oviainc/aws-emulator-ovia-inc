@@ -39,6 +39,8 @@ mod model_invocation_logging;
 mod prompt_routers;
 #[path = "all/provisioned_model_throughputs.rs"]
 mod provisioned_model_throughputs;
+#[path = "all/resource_policies.rs"]
+mod resource_policies;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/state_roundtrip.rs"]

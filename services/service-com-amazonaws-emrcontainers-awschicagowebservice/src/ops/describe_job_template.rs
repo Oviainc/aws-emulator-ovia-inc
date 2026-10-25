@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         // Purely reporting: a job template has no status, so there is nothing the clock
         // owes it. `settle` is still called because the handlers share one store and the
         // transitions it materialises were due at this instant whether or not anybody
@@ -155,7 +155,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle();
 
-        let Some(job_template) = state.job_template_view(&input.id) else {
+        // Resolved in the region this request is signed for: a template created at
+        // another region's endpoint does not exist here.
+        let Some(job_template) = state.job_template_view(&region, &input.id) else {
             return Err(DescribeJobTemplateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     // EMR on EKS builds a not-found message from the id the request

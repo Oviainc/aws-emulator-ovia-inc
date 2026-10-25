@@ -172,10 +172,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Command::Reboot(_) => crate::state::TaskCommand::Reboot,
         };
 
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The account/region device precondition, FIRST: a task runs on devices, so a
+        // Region this account has activated none in is refused before anything the
+        // request carries is looked at — before the `tags` map is checked, before the
+        // `clientToken` replay is consulted and before a target id is resolved. That
+        // ordering is what makes the refusal identical for every caller of such a
+        // Region, however many of them call at once, and what stops a caller learning
+        // whether a particular target exists there.
+        if !store.has_devices_in(&region) {
+            return Err(CreateTaskErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
+
         // "Optional metadata that you assign to a resource": the `tags` a create
         // carries is the same `TagMap` the tagging operations write, so it is held to
         // the same AWS-wide tagging rules (`crate::state::tag_violation`). The whole
-        // map is checked BEFORE anything else happens — before the idempotency replay,
+        // map is checked before anything is LOOKED UP — before the idempotency replay,
         // the targets are resolved, or a record is minted — because it is the REQUEST
         // that is unacceptable, not the state it would have reached: so a task never
         // comes into being carrying a tag `TagResource` would refuse, and a repeated
@@ -190,13 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
         // The idempotency replay is per Region: a token minted in another Region
         // names no task here.
-        store.settle(now);
-
+        //
         // `@idempotencyToken`: the same token, in the Region it was used in, names
         // the same task.
         let replayed = input.client_token.as_deref().and_then(|token| {

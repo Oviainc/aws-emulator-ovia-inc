@@ -19,6 +19,13 @@
 //! each member is exercised on its published bound and one value past it, and a
 //! configuration created here is always read back through `GetIngestConfiguration`, so
 //! no assertion looks at an internal call.
+//!
+//! `stageArn` carries one further requirement its modelled constraint cannot state: it
+//! is a REFERENCE to a stage, so a value inside the `@pattern` is accepted only while a
+//! stage of this account answers for it (`tests/all/ingest_configurations.rs` spans that
+//! rule). Its rows below therefore read: the empty string and the omitted member name no
+//! stage and are persisted, a held stage ARN is persisted, and every other value — inside
+//! the modelled bound or past it — is the same `ValidationException` naming the member.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -101,6 +108,17 @@ impl RealTime {
         response["ingestConfiguration"].clone()
     }
 
+    /// Create a stage and return its ARN, so a row that names a stage this account holds
+    /// names one the service itself minted.
+    async fn create_stage(&self) -> String {
+        let (status, response) = self.call("CreateStage", &json!({ "name": "referenced" })).await;
+        assert_eq!(
+            status, 200,
+            "CreateStage must answer HTTP 200, got {status} {response}"
+        );
+        member(&response["stage"], "arn")
+    }
+
     /// Read `arn` back, asserting the read succeeded.
     async fn get(&self, case: &str, arn: &str) -> Value {
         let (status, response) = self
@@ -181,10 +199,11 @@ struct Row {
 /// `name` → `IngestConfigurationName` (`@length` 0..128, `@pattern ^[a-zA-Z0-9-_]*$`);
 /// `userId` → `UserId` (`@length` 0..128, NO pattern — "can be any UTF-8 encoded text");
 /// `stageArn` → `IngestConfigurationStageArn` (`@length` 0..128,
-/// `@pattern ^^$|^arn:aws:ivs:[a-z0-9-]+:[0-9]+:stage/[a-zA-Z0-9-]+$$`);
+/// `@pattern ^^$|^arn:aws:ivs:[a-z0-9-]+:[0-9]+:stage/[a-zA-Z0-9-]+$$`), plus the
+/// reference rule the module doc records — `held_stage` is a stage this account holds;
 /// `ingestProtocol` → `IngestProtocol` (`@required`, enum `RTMP | RTMPS`);
 /// `tags` → `Tags` (`@length` 0..50).
-fn rows() -> Vec<Row> {
+fn rows(held_stage: &str) -> Vec<Row> {
     let mut rows = vec![
         // ---- name: @length 0..128 ----
         Row {
@@ -265,19 +284,25 @@ fn rows() -> Vec<Row> {
             expect: Expect::Persisted(json!(NO_STAGE)),
         },
         Row {
+            case: "a stage ARN this account holds",
+            member: "stageArn",
+            request: json!({ "ingestProtocol": "RTMPS", "stageArn": held_stage }),
+            expect: Expect::Persisted(json!(held_stage)),
+        },
+        Row {
             case: "a well-formed stage ARN no stage of this store carries",
             member: "stageArn",
             request: json!({ "ingestProtocol": "RTMPS", "stageArn": stage_arn("Absent-9") }),
-            expect: Expect::Persisted(json!(stage_arn("Absent-9"))),
+            expect: Expect::Refused,
         },
         Row {
-            case: "a stage ARN at the @length maximum",
+            case: "a stage ARN at the @length maximum, which no stage answers for",
             member: "stageArn",
             request: json!({
                 "ingestProtocol": "RTMPS",
                 "stageArn": stage_arn_of_length(MAX_NAME_LENGTH),
             }),
-            expect: Expect::Persisted(json!(stage_arn_of_length(MAX_NAME_LENGTH))),
+            expect: Expect::Refused,
         },
         Row {
             case: "a stage ARN one character past the @length maximum",
@@ -374,7 +399,8 @@ fn reported(configuration: &Value, member_name: &str) -> Value {
 #[tokio::test]
 async fn every_modelled_input_constraint_decides_the_create() {
     let emulator = RealTime::new();
-    for row in rows() {
+    let held_stage = emulator.create_stage().await;
+    for row in rows(&held_stage) {
         let Row {
             case,
             member: member_name,
@@ -432,6 +458,7 @@ async fn every_modelled_input_constraint_decides_the_create() {
 #[tokio::test]
 async fn a_refused_create_leaves_every_persisted_configuration_as_it_was() {
     let emulator = RealTime::new();
+    let held_stage = emulator.create_stage().await;
 
     // Two configurations to be disturbed, each read back before the refusals.
     let mut before: BTreeMap<String, Value> = BTreeMap::new();
@@ -454,7 +481,7 @@ async fn a_refused_create_leaves_every_persisted_configuration_as_it_was() {
         before.insert(arn, read);
     }
 
-    let refused_rows: Vec<Row> = rows()
+    let refused_rows: Vec<Row> = rows(&held_stage)
         .into_iter()
         .filter(|row| matches!(row.expect, Expect::Refused))
         .collect();

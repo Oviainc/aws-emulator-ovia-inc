@@ -24,6 +24,10 @@
 //!    `@pattern`/`@length` is the modelled `ValidationException` (HTTP 400).
 //! 5. The two DOCUMENTED rules the model carries no trait for are enforced: cleartext
 //!    `RTMP` ingest requires `insecureIngest`, and an `attributes` map may reach 1 KB.
+//! 6. A REFERENCE is resolved against state: the stage a create associates the
+//!    configuration with has to be a stage this account holds, so a well-formed stage ARN
+//!    no stage answers for is refused (HTTP 400 `ValidationException`) and persists
+//!    nothing, while the empty string — the modelled "no stage" — is accepted.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -832,4 +836,191 @@ async fn tags_written_through_the_tagging_surface_are_read_back_on_the_configura
              expected {expected:?}, got {through_tagging:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The stage association is a reference, resolved against the stages this account holds
+// ---------------------------------------------------------------------------
+
+/// `stageArn` carries a REFERENCE to a stage of this same service, so a create either
+/// names a stage this account holds or names no stage at all: the empty string the
+/// modelled `IngestConfigurationStageArn` admits (and an omitted member) is the "no
+/// stage" value and is accepted, and every other value has to resolve — a well-formed
+/// stage ARN no stage answers for is refused with the modelled `ValidationException`
+/// (HTTP 400), creating nothing.
+///
+/// The rows span what the rule generalises over: whether the member is sent at all, the
+/// form and region of the ARN sent, and how it comes to name no stage (never created, or
+/// created and then deleted).
+#[tokio::test]
+async fn a_stage_association_must_name_a_stage_this_account_holds() {
+    let emulator = RealTime::new();
+
+    // One stage this account holds, and one it held and deleted, so both an association
+    // that resolves and one that stopped resolving are real rather than constructed.
+    let (status, held) = emulator.call("CreateStage", &json!({ "name": "live" })).await;
+    assert_eq!(
+        status, 200,
+        "CreateStage must answer HTTP 200, got {status} {held}"
+    );
+    let held_stage = member(&held["stage"], "arn");
+
+    let (status, doomed) = emulator.call("CreateStage", &json!({ "name": "gone" })).await;
+    assert_eq!(
+        status, 200,
+        "CreateStage must answer HTTP 200, got {status} {doomed}"
+    );
+    let deleted_stage = member(&doomed["stage"], "arn");
+    let (status, response) = emulator
+        .call("DeleteStage", &json!({ "arn": deleted_stage }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "DeleteStage must answer HTTP 200, got {status} {response}"
+    );
+
+    // One live configuration, so a refusal can be shown to have changed nothing a later
+    // caller sees.
+    let live = emulator
+        .create_in(
+            "a live configuration",
+            "us-east-1",
+            &json!({ "ingestProtocol": "RTMPS" }),
+        )
+        .await;
+    let live_arn = member(&live, "arn");
+
+    // (case, the `stageArn` the request carries, is it accepted, is it a well-formed
+    // stage ARN). Every well-formed ARN is also offered to `GetStage`, which answers 200
+    // for exactly the rows this operation must accept and 404 for the ones it must
+    // refuse — so the two operations agree on which stages exist.
+    let cases: [(&str, Option<String>, bool, bool); 8] = [
+        ("the member omitted", None, true, false),
+        (
+            "the empty string, the modelled no-stage value",
+            Some(String::new()),
+            true,
+            false,
+        ),
+        (
+            "a stage this account holds",
+            Some(held_stage.clone()),
+            true,
+            true,
+        ),
+        (
+            "a well-formed stage ARN never created",
+            Some(arn("us-east-1", "stage", "neverCreated1")),
+            false,
+            true,
+        ),
+        (
+            "a one-character stage id never created",
+            Some(arn("us-east-1", "stage", "a")),
+            false,
+            true,
+        ),
+        (
+            "a stage ARN in another region, never created",
+            Some(arn("eu-west-1", "stage", "abcdef123456")),
+            false,
+            true,
+        ),
+        (
+            "a stage created and then deleted",
+            Some(deleted_stage.clone()),
+            false,
+            true,
+        ),
+        (
+            "an ARN of another resource type",
+            Some(arn("us-east-1", "ingest-configuration", "abcdef123456")),
+            false,
+            false,
+        ),
+    ];
+
+    for (case, requested, accepted, well_formed) in cases {
+        let mut request = json!({ "ingestProtocol": "RTMPS" });
+        if let Some(stage_arn) = requested.clone() {
+            request["stageArn"] = Value::String(stage_arn);
+        }
+        let (status, response) = emulator.call("CreateIngestConfiguration", &request).await;
+
+        if accepted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 for {request}, got {status} {response}"
+            );
+            // The association is read back off the configuration: what the request named,
+            // or the no-stage value for a request that named nothing.
+            let expected = requested.clone().unwrap_or_default();
+            let created_arn = member(&response["ingestConfiguration"], "arn");
+            let read = emulator.get(case, &created_arn).await;
+            let reported = member(&read, "stageArn");
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected stageArn {expected:?}, got {reported:?}"
+            );
+            if well_formed {
+                // The premise of the acceptance: the ARN this configuration reports
+                // really names a stage, which is what `GetStage` answers for it.
+                let stage_arn = requested.unwrap_or_default();
+                let (status, stage) = emulator
+                    .call("GetStage", &json!({ "arn": stage_arn }))
+                    .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected GetStage on {stage_arn:?} to answer HTTP 200, \
+                     got {status} {stage}"
+                );
+            }
+            continue;
+        }
+
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 for {request}, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {response}"
+        );
+        let message = member(&response, "message");
+        assert!(
+            message.starts_with("CreateIngestConfiguration.stageArn "),
+            "case {case:?}: expected a refusal naming the operation and the member, \
+             got {message:?}"
+        );
+
+        if well_formed {
+            // The premise of the refusal: this ARN really names no stage, which is what
+            // `GetStage` reports for it.
+            let stage_arn = requested.clone().unwrap_or_default();
+            let (status, stage) = emulator
+                .call("GetStage", &json!({ "arn": stage_arn }))
+                .await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected GetStage on {stage_arn:?} to answer HTTP 404, \
+                 got {status} {stage}"
+            );
+        }
+    }
+
+    // Every refused create left the store as it was: the live configuration still reads
+    // back exactly, and the held stage is still held.
+    let still_there = emulator.get("a live configuration", &live_arn).await;
+    assert_eq!(
+        still_there, live,
+        "expected the live configuration to be unchanged, expected {live}, got {still_there}"
+    );
+    let (status, stage) = emulator
+        .call("GetStage", &json!({ "arn": held_stage }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected GetStage on the held stage to answer HTTP 200, got {status} {stage}"
+    );
 }

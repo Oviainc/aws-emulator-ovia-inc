@@ -160,3 +160,5 @@ mod update_authorizer;
 mod update_gateway_response;
 #[path = "all/request_validator_collection.rs"]
 mod request_validator_collection;
+#[path = "all/api_key_gate.rs"]
+mod api_key_gate;

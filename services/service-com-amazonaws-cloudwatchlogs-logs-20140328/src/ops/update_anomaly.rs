@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAnomaly
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAnomaly`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAnomaly::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: suppresses — or stops suppressing — one anomaly or one pattern of the
+//! anomaly detector the request names. The detector and the finding are both resolved from
+//! the store, so a detector ARN this account does not hold, and an `anomalyId` / `patternId`
+//! the named detector has not reported, are refused as the missing resources they are. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +177,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAnomaly` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAnomalyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAnomaly"))
+        // `ctx` carries only request metadata; this operation works on the store.
+        let _ = ctx;
+
+        // "You must specify either anomalyId or patternId, but you can't specify both
+        // parameters in the same operation." The pair is checked before anything is read,
+        // so a request that names no finding at all is refused as the bad request it is
+        // rather than as a missing resource.
+        let target = match (input.anomaly_id.as_deref(), input.pattern_id.as_deref()) {
+            (Some(anomaly_id), None) => SuppressionTarget::Anomaly(anomaly_id),
+            (None, Some(pattern_id)) => SuppressionTarget::Pattern(pattern_id),
+            _ => return Err(invalid_parameter(SELECTOR_EXCLUSIVE_MESSAGE.to_string())),
+        };
+
+        // "If you specify LIMITED, you must also specify a suppressionPeriod. If you
+        // specify INFINITE, any value for suppressionPeriod is ignored."
+        if input.suppression_type.as_deref() == Some(SUPPRESSION_TYPE_LIMITED)
+            && input.suppression_period.is_none()
+        {
+            return Err(invalid_parameter(format!(
+                "suppressionPeriod is required when suppressionType is \
+                 {SUPPRESSION_TYPE_LIMITED}"
+            )));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAnomalyError::from(UpdateAnomalyErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        // "The ARN of the anomaly detector that this operation is to act on": the detector
+        // is the resource this call acts on, so one this account does not hold is refused
+        // before its findings are looked at.
+        let Some(detector) = store
+            .anomaly_detectors
+            .get_mut(&input.anomaly_detector_arn)
+        else {
+            return Err(not_found("anomaly detector"));
+        };
+
+        // Suppression acts on a finding the DETECTOR reported — "You can find anomaly IDs by
+        // using the ListAnomalies operation" — so the id is resolved against that detector's
+        // own findings ([`crate::state::AnomalyFindings`]), and one it has not reported is a
+        // missing resource rather than a bad parameter.
+        let reported = match target {
+            SuppressionTarget::Anomaly(anomaly_id) => detector.reports_anomaly(anomaly_id),
+            SuppressionTarget::Pattern(pattern_id) => detector.reports_pattern(pattern_id),
+        };
+        if !reported {
+            // The refusal is BUILT FROM the request: it names the selector member the id
+            // came in on and the id itself, so a caller suppressing findings in a loop can
+            // attribute the refusal to one id.
+            return Err(UpdateAnomalyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No matching anomaly found for {}: {}",
+                        target.selector_member(),
+                        target.id()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A finding the detector did report is suppressed — or, with `suppressionType` and
+        // `suppressionPeriod` both omitted, has its suppression ended — on the stored record.
+        detector.suppress_finding(
+            target.id(),
+            input.suppression_type.as_deref(),
+            input.suppression_period.as_ref(),
+            input.baseline.unwrap_or(false),
+            crate::state::now_ms(),
+        );
+
+        Ok(UpdateAnomalyOutput)
     }
+}
+
+/// The `SuppressionType` whose suppression lasts only as long as the `suppressionPeriod`
+/// beside it: "If you specify LIMITED, you must also specify a suppressionPeriod."
+const SUPPRESSION_TYPE_LIMITED: &str = "LIMITED";
+
+/// How this operation refuses a request that names both selectors, or neither: the rule the
+/// operation publishes, so the refusal states the contract rather than one request's values.
+const SELECTOR_EXCLUSIVE_MESSAGE: &str = "You must specify either anomalyId or patternId, \
+                                          but you can't specify both parameters in the same \
+                                          operation.";
+
+/// Which finding of the detector one request suppresses.
+#[derive(Debug, Clone, Copy)]
+enum SuppressionTarget<'a> {
+    /// The anomaly whose `anomalyId` this is.
+    Anomaly(&'a str),
+    /// The pattern whose `patternId` this is — "If you suppress a pattern, CloudWatch Logs
+    /// won't report any anomalies related to that pattern."
+    Pattern(&'a str),
+}
+
+impl<'a> SuppressionTarget<'a> {
+    /// The id the request named.
+    fn id(self) -> &'a str {
+        match self {
+            Self::Anomaly(id) | Self::Pattern(id) => id,
+        }
+    }
+
+    /// The input member the id came in on, which a refusal names.
+    fn selector_member(self) -> &'static str {
+        match self {
+            Self::Anomaly(_) => "anomalyId",
+            Self::Pattern(_) => "patternId",
+        }
+    }
+}
+
+/// Refuse a request this operation models `InvalidParameterException` for — "A parameter is
+/// specified incorrectly."
+fn invalid_parameter(message: String) -> UpdateAnomalyError {
+    UpdateAnomalyErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse a request naming a resource this account does not hold, in the one sentence form
+/// this service refuses a missing resource with.
+fn not_found(resource_kind: &str) -> UpdateAnomalyError {
+    UpdateAnomalyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::resource_not_found_message(resource_kind)),
+    })
+    .into()
 }

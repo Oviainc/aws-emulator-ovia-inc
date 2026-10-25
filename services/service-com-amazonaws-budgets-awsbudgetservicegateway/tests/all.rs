@@ -17,6 +17,8 @@ mod account_notification_listing;
 mod account_scoping;
 #[path = "all/budget_action_execution.rs"]
 mod budget_action_execution;
+#[path = "all/budget_action_execution_role.rs"]
+mod budget_action_execution_role;
 #[path = "all/budget_action_history.rs"]
 mod budget_action_history;
 #[path = "all/budget_action_lifecycle.rs"]
@@ -45,6 +47,8 @@ mod budget_validation_rules;
 mod calculated_spend;
 #[path = "all/client_error_envelopes.rs"]
 mod client_error_envelopes;
+#[path = "all/notification_alert_delivery.rs"]
+mod notification_alert_delivery;
 #[path = "all/notification_deletion.rs"]
 mod notification_deletion;
 #[path = "all/notification_lifecycle.rs"]

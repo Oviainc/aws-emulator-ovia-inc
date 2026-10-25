@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-appsync-awsdeepdishcontrolplaneservice service.
 //!
-//! Holds the GraphQL API lifecycle: every `GraphqlApi` the service created, each with
+//! Holds the API lifecycle: every `Api` and every `GraphqlApi` the service created, each with
 //! the API keys and data sources created under it, and every source-API association
 //! between two of them. A handler reaches it through [`service_state`] and answers from what is
 //! stored here — nothing is recomputed from the request.
@@ -11,11 +11,12 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AdditionalAuthenticationProvider, ApiCache, ApiKey, DataSource, DynamodbDataSourceConfig,
-    ElasticsearchDataSourceConfig, EnhancedMetricsConfig, EventBridgeDataSourceConfig, GraphqlApi,
-    HttpDataSourceConfig, LambdaAuthorizerConfig, LambdaDataSourceConfig, LogConfig,
-    OpenIDConnectConfig, OpenSearchServiceDataSourceConfig, RelationalDatabaseDataSourceConfig,
-    SourceApiAssociation, SourceApiAssociationConfig, UserPoolConfig,
+    AdditionalAuthenticationProvider, Api, ApiCache, ApiKey, AuthMode, DataSource,
+    DynamodbDataSourceConfig, ElasticsearchDataSourceConfig, EnhancedMetricsConfig, EventConfig,
+    EventBridgeDataSourceConfig, GraphqlApi, HttpDataSourceConfig, LambdaAuthorizerConfig,
+    LambdaDataSourceConfig, LogConfig, OpenIDConnectConfig, OpenSearchServiceDataSourceConfig,
+    RelationalDatabaseDataSourceConfig, SourceApiAssociation, SourceApiAssociationConfig,
+    UserPoolConfig,
 };
 
 /// One stored `GraphqlApi`, plus the API keys created under it.
@@ -321,6 +322,163 @@ pub fn missing_data_source_config_message(member: &str, data_source_type: &str) 
     format!("{member} is required for a data source of type {data_source_type}")
 }
 
+/// One stored `Api`: an AppSync API created with an Event API configuration
+/// ("Describes an AppSync API. You can use `Api` for an AppSync API with your
+/// preferred configuration, such as an Event API").
+///
+/// An `Api` is a resource of its own, kept apart from [`GraphqlApiRecord`]: the two
+/// are addressed by different operations under different URI prefixes, so an id that
+/// names one never names the other.
+#[derive(Debug, Clone)]
+pub struct EventApiRecord {
+    /// Creation order, used to keep `ListApis` (and its `nextToken` cursor) stable
+    /// across calls: the minted `apiId` is opaque, so it cannot carry order.
+    pub seq: u64,
+    pub api_id: String,
+    pub name: String,
+    pub api_arn: String,
+    pub owner_contact: Option<String>,
+    pub xray_enabled: bool,
+    /// The web ACL associated with the API, or `None` while it has none.
+    pub waf_web_acl_arn: Option<String>,
+    /// The API's Event API configuration — its authorization providers and the
+    /// authorization modes connecting, publishing and subscribing accept.
+    pub event_config: EventConfig,
+    /// The API's DNS records — one hostname per endpoint, keyed as AppSync keys
+    /// them (`HTTP`, `REALTIME`): `Api$dns` "will include an HTTP and a real-time
+    /// endpoint".
+    pub dns: BTreeMap<String, String>,
+    pub tags: BTreeMap<String, String>,
+    pub created: SystemTime,
+}
+
+impl EventApiRecord {
+    /// This record as the modelled `Api` shape.
+    ///
+    /// The single projection used by create, get and list, so all three answer the
+    /// same body for the same stored API.
+    pub fn to_api(&self) -> Api {
+        Api {
+            api_id: Some(self.api_id.clone()),
+            name: Some(self.name.clone()),
+            owner_contact: self.owner_contact.clone(),
+            // Reported whether or not the API holds tags, the way
+            // [`GraphqlApiRecord::to_graphql_api`] reports them, so a caller reads
+            // the same member on every API of either kind.
+            tags: Some(map_out(&self.tags)),
+            dns: Some(map_out(&self.dns)),
+            api_arn: Some(self.api_arn.clone()),
+            created: Some(::aws_smithy_types::DateTime::from(self.created)),
+            xray_enabled: self.xray_enabled,
+            waf_web_acl_arn: self.waf_web_acl_arn.clone(),
+            event_config: Some(self.event_config.clone()),
+        }
+    }
+}
+
+/// The authorization types an Event API configuration sets up, i.e. the types its
+/// authorization modes may name.
+///
+/// A provider identifies ONE way of authenticating the API, so the set holds at most
+/// one entry per value of the modelled `AuthenticationType` enum.
+pub fn configured_auth_types(event_config: &EventConfig) -> std::collections::BTreeSet<String> {
+    event_config
+        .auth_providers
+        .iter()
+        .map(|provider| provider.auth_type.clone())
+        .collect()
+}
+
+/// The first mode of `modes` whose `authType` is not among `configured`, or `None`
+/// when every one of them is.
+pub fn unconfigured_auth_mode<'a>(
+    modes: &'a [AuthMode],
+    configured: &std::collections::BTreeSet<String>,
+) -> Option<&'a str> {
+    modes
+        .iter()
+        .find(|mode| !configured.contains(&mode.auth_type))
+        .map(|mode| mode.auth_type.as_str())
+}
+
+/// The text a `BadRequestException` (HTTP 400) carries for an authorization mode that
+/// names a type the API's authorization providers do not set up: the member that
+/// carried it and the type, so the caller can fix the request from the message alone.
+pub fn unconfigured_auth_mode_message(member: &str, auth_type: &str) -> String {
+    format!(
+        "{member} specifies authorization mode {auth_type}, which is not configured as an \
+         authorization provider for this API."
+    )
+}
+
+/// Why the Event API configuration a request carries is not well formed, as the text a
+/// `BadRequestException` (HTTP 400) states it with, or `None` when it is well formed.
+///
+/// `EventConfig` is carried by the create and by the update alike, so the rules are
+/// stated here once:
+///
+/// * an authorization type that is set up through a member of its own
+///   ([`missing_auth_config`]) is not configured without that member — checked per
+///   provider, which the refusal names by its 1-based position, the only way a caller
+///   can tell two of them apart;
+/// * an authorization type identifies ONE provider, so the API cannot name it twice;
+/// * an OIDC provider is identified by its issuer, an absolute URL;
+/// * `connectionAuthModes`, `defaultPublishAuthModes` and `defaultSubscribeAuthModes`
+///   are each "a list of VALID authorization modes", i.e. modes the API's own
+///   authorization providers set up.
+pub fn event_config_refusal(event_config: &EventConfig) -> Option<String> {
+    let mut configured: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (position, provider) in event_config.auth_providers.iter().enumerate() {
+        if let Some(config) = missing_auth_config(
+            Some(&provider.auth_type),
+            provider.open_id_connect_config.is_some(),
+            provider.cognito_config.is_some(),
+            provider.lambda_authorizer_config.is_some(),
+        ) {
+            return Some(format!(
+                "{config} is missing for authorization provider {}",
+                position + 1
+            ));
+        }
+        if provider
+            .open_id_connect_config
+            .as_ref()
+            .is_some_and(|config| !is_absolute_url(&config.issuer))
+        {
+            return Some("Issuer is not a valid URL".to_string());
+        }
+        if !configured.insert(provider.auth_type.clone()) {
+            return Some(format!(
+                "Authentication type {} for authorization provider {} already specified on the \
+                 API. It can only be specified once.",
+                provider.auth_type,
+                position + 1
+            ));
+        }
+    }
+
+    // Source: the three `EventConfig` members, each "a list of valid authorization
+    // modes" for connecting to, publishing on and subscribing to the Event API.
+    let mode_lists = [
+        ("connectionAuthModes", &event_config.connection_auth_modes),
+        (
+            "defaultPublishAuthModes",
+            &event_config.default_publish_auth_modes,
+        ),
+        (
+            "defaultSubscribeAuthModes",
+            &event_config.default_subscribe_auth_modes,
+        ),
+    ];
+    for (member, modes) in mode_lists {
+        if let Some(auth_type) = unconfigured_auth_mode(modes, &configured) {
+            return Some(unconfigured_auth_mode_message(member, auth_type));
+        }
+    }
+
+    None
+}
+
 /// One stored association between a Merged API and one of its source APIs.
 ///
 /// Both sides are kept by `apiId` AND by ARN, the two forms the modelled
@@ -410,6 +568,10 @@ impl SourceApiAssociationRecord {
 pub struct ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     /// Every created GraphQL API, keyed by its minted `apiId`.
     pub graphql_apis: BTreeMap<String, GraphqlApiRecord>,
+    /// Every created `Api` (an API with an Event API configuration), keyed by its
+    /// minted `apiId`. A separate resource from [`Self::graphql_apis`]: the two are
+    /// created and addressed by different operations.
+    pub event_apis: BTreeMap<String, EventApiRecord>,
     /// Every source-API association, keyed by its minted `associationId`.
     pub source_api_associations: BTreeMap<String, SourceApiAssociationRecord>,
     /// Advanced once per minted id, so no id is ever a function of the request.
@@ -1020,6 +1182,31 @@ pub const REALTIME_ENDPOINT: &str = "REALTIME";
 
 /// The key AppSync gives the GraphQL (HTTPS) endpoint in `dns` and `uris`.
 pub const GRAPHQL_ENDPOINT: &str = "GRAPHQL";
+
+/// The key AppSync gives the HTTP endpoint of an `Api` in its `dns` records:
+/// `Api$dns` "will include an HTTP and a real-time endpoint", the realtime one under
+/// [`REALTIME_ENDPOINT`].
+pub const HTTP_ENDPOINT: &str = "HTTP";
+
+/// The DNS records AppSync publishes for an API it created: one hostname per endpoint,
+/// both on the API's own endpoint host label.
+///
+/// `http_endpoint` is the key the HTTPS endpoint is published under — a GraphQL API
+/// publishes it as [`GRAPHQL_ENDPOINT`] (and derives its `uris` from these records),
+/// an `Api` as [`HTTP_ENDPOINT`] — so the two creates cannot drift on the hostname
+/// shape.
+pub fn api_dns(host_label: &str, region: &str, http_endpoint: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            http_endpoint.to_string(),
+            format!("{host_label}.appsync-api.{region}.amazonaws.com"),
+        ),
+        (
+            REALTIME_ENDPOINT.to_string(),
+            format!("{host_label}.appsync-realtime-api.{region}.amazonaws.com"),
+        ),
+    ])
+}
 
 /// A `BTreeMap` field as the modelled map shape (`HashMap`).
 pub fn map_out(map: &BTreeMap<String, String>) -> std::collections::HashMap<String, String> {

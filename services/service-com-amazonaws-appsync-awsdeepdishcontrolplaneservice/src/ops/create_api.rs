@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: creates an `Api` from the Event API configuration the request carries,
+//! mints its `apiId`, and persists it in [`crate::state`]; `GetApi` projects the same
+//! record.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApi"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateApiErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The Event API configuration has to be well formed: an authorization type
+        // that is configured through a member of its own needs that member, no type
+        // may be set up twice, an OIDC issuer has to be an absolute URL, and every
+        // authorization mode has to name a type the API's providers set up.
+        // `UpdateApi` carries the same `eventConfig` and is refused on the same
+        // grounds, so the rules live in [`crate::state::event_config_refusal`].
+        if let Some(message) = crate::state::event_config_refusal(&input.event_config) {
+            return Err(CreateApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut guard = state.lock();
+
+        // The store is bounded, so a repeated create cannot grow it without limit:
+        // an account holds at most `APIS_PER_REGION` APIs in a Region, and
+        // `ServiceQuotaExceededException` ("The operation exceeded the service quota
+        // for this resource") is the modelled refusal for a create past it. This
+        // emulator serves one Region's worth of state, so the cap applies to the
+        // whole store.
+        if guard.event_apis.len() >= APIS_PER_REGION {
+            return Err(CreateApiErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "an account may hold at most {APIS_PER_REGION} APIs in a Region"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Mint an id that is not already taken. The id is drawn from the state's own
+        // counter, so it is new on every call even for an identical request.
+        let mut api_id = guard.mint_id();
+        while guard.event_apis.contains_key(&api_id) {
+            api_id = guard.mint_id();
+        }
+        // The endpoints are published on a host label of their own, minted the same
+        // way and independently of the `apiId`: an AppSync endpoint hostname cannot
+        // be derived from the API's id.
+        let mut host_label = guard.mint_id();
+        while host_label == api_id {
+            host_label = guard.mint_id();
+        }
+        let seq = guard.next_seq();
+
+        let record = crate::state::EventApiRecord {
+            seq,
+            api_arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                &region,
+                &format!("apis/{api_id}"),
+            ),
+            // The endpoint hostnames are built the same way for either kind of API
+            // (`crate::state::api_dns`); an `Api` publishes its HTTPS endpoint under
+            // the `HTTP` key.
+            dns: crate::state::api_dns(&host_label, &region, crate::state::HTTP_ENDPOINT),
+            api_id: api_id.clone(),
+            name: input.name,
+            owner_contact: input.owner_contact,
+            // Neither member is set by this call: X-Ray tracing is off until an
+            // update turns it on, and an API carries a web ACL only once one is
+            // associated with it.
+            xray_enabled: false,
+            waf_web_acl_arn: None,
+            event_config: input.event_config,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created: std::time::SystemTime::now(),
+        };
+
+        // Answer from the STORED record, so this body is the one `GetApi` answers
+        // with later: the record is projected through the entry it was inserted
+        // under, so the response cannot report an API the store does not hold.
+        let api = Some(guard.event_apis.entry(api_id).or_insert(record).to_api());
+
+        Ok(CreateApiOutput { api })
     }
 }
+
+/// The AppSync service quota for APIs an account holds in one Region, which
+/// `ServiceQuotaExceededException` reports. It is also what bounds this service's
+/// store of `Api` records.
+const APIS_PER_REGION: usize = 25;

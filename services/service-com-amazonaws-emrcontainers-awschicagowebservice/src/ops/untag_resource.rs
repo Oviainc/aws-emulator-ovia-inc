@@ -145,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         // `resourceArn`'s length and pattern, and every `tagKeys` member's own length and
         // pattern, are refused at the boundary BEFORE this handler runs. What is left to
@@ -169,7 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this call edits is the settled one rather than a stale copy of it.
         state.settle();
 
-        let Some(tags) = state.resource_tags_mut(&resource, &input.resource_arn) else {
+        // Resolved in the region this request is signed for: an ARN that names a resource
+        // of another region is not this endpoint's to untag.
+        let Some(tags) = state.resource_tags_mut(&region, &resource, &input.resource_arn) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!("Resource {} was not found", input.resource_arn)),

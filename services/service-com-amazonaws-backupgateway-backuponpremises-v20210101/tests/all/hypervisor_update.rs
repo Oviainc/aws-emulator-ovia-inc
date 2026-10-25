@@ -11,16 +11,16 @@
 //! out of the persisted store and writes ONLY the members the request carries, so every
 //! later read reports the record the last write left and a member the request omitted
 //! keeps the value it had; an ARN the store holds no hypervisor under is refused as a
-//! missing hypervisor and nothing is written; and because a record stands for the machine
-//! reachable at its host, an update that would give two records one host is refused as a
-//! conflict.
+//! missing hypervisor and nothing is written; and because the ARN is a record's only
+//! identity, the VALUES an update carries never decide whether it may be written — a
+//! `Host` another record already holds included.
 //!
 //! The tables below span that class — updates differing in which members they carry, in
 //! their values and lengths (each published bound of the modelled members, and one past
 //! it), and ARNs differing in resource type, partition, id and length — rather than one
 //! recorded request.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -30,8 +30,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
 
 use backup_gateway::state::{
-    service_state, HYPERVISOR_ALREADY_EXISTS, HYPERVISOR_NOT_FOUND, HYPERVISOR_ONLINE,
-    HYPERVISOR_PENDING,
+    service_state, HYPERVISOR_NOT_FOUND, HYPERVISOR_ONLINE, HYPERVISOR_PENDING,
 };
 
 use crate::gateway_lifecycle::{build_engine, build_router, call, create, Reply, REGION};
@@ -143,6 +142,27 @@ fn persisted_host(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> String {
         .hypervisor(arn)
         .map(|record| record.host.clone())
         .unwrap_or_else(|| panic!("no hypervisor stored under {arn}"))
+}
+
+/// The ARNs the STORE holds a record for `host` under, read out of the records rather
+/// than off the wire. A set, because `Host` is not a key: any number of records may
+/// carry one host.
+fn persisted_arns_for_host(engine: &Arc<engine::InMemoryEngine>, host: &str) -> BTreeSet<String> {
+    service_state(&**engine)
+        .expect("the in-memory engine must expose this state")
+        .lock()
+        .hypervisors_for_host(host)
+        .iter()
+        .map(|record| record.arn.clone())
+        .collect()
+}
+
+/// How many hypervisors the store holds.
+fn persisted_hypervisor_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
+    service_state(&**engine)
+        .expect("the in-memory engine must expose this state")
+        .lock()
+        .hypervisor_count()
 }
 
 /// The whole stored record, rendered — used to assert that an update's `@sensitive`
@@ -432,58 +452,85 @@ async fn an_arn_with_no_stored_hypervisor_is_refused_as_a_missing_hypervisor() {
     );
 }
 
-/// A hypervisor record stands for the machine reachable at its host, so an update that
-/// would give two records one host is refused as a conflict and writes nothing; setting a
-/// record's own host again is the same record and succeeds; and once the record holding a
-/// host is gone the host is free.
+/// A hypervisor record is identified by the ARN minted for it and by nothing else, so an
+/// update that gives two records one host is written like any other: it answers 200,
+/// persists every member the same request carried, and leaves the other record reporting
+/// its own host. The rows span every pairing of a stored record with ANOTHER record's
+/// host, so this is not a property of one row; setting a record's own host again and
+/// moving onto the host of a record that has been deleted are the same write.
 #[tokio::test]
-async fn an_update_onto_a_host_another_hypervisor_holds_is_refused_as_a_conflict() {
-    let engine = build_engine();
-    let router = build_router(&engine);
-
+async fn an_update_onto_a_host_another_hypervisor_holds_is_written() {
     let hosts = ["198.51.100.20", "hypervisor-two.example.com", "10.0.0.3"];
-    let mut arns = Vec::new();
-    for (index, host) in hosts.iter().enumerate() {
-        arns.push(import(&router, &format!("hv-{index}"), host).await);
-    }
 
-    // (case, the record to update, the host to move it onto) — every pairing of a stored
-    // record with ANOTHER record's host, so the refusal is not a property of one row.
-    for (taker, taker_arn) in arns.iter().enumerate() {
-        for (holder, host) in hosts.iter().enumerate() {
+    for taker in 0..hosts.len() {
+        for holder in 0..hosts.len() {
             if taker == holder {
                 continue;
             }
+            // A store of its own per row, so each pairing starts from the same three
+            // records and the rows cannot mask one another.
+            let engine = build_engine();
+            let router = build_router(&engine);
+            let mut arns = Vec::new();
+            for (index, host) in hosts.iter().enumerate() {
+                arns.push(import(&router, &format!("hv-{index}"), host).await);
+            }
+
             let case = format!("hypervisor {taker} onto the host of hypervisor {holder}");
             let reply = update(
                 &router,
-                &json!({ "HypervisorArn": taker_arn, "Host": host, "Name": "hv-conflicted" }),
+                &json!({
+                    "HypervisorArn": arns[taker],
+                    "Host": hosts[holder],
+                    "Name": "hv-moved",
+                }),
             )
             .await;
             assert_eq!(
-                (reply.status, reply.code.as_deref()),
-                (409, Some("ConflictException")),
-                "case {case:?}: moving a hypervisor onto a host another one holds must be \
-                 refused with 409 ConflictException, got {} {:?}",
+                (reply.status, reply.str_at("/HypervisorArn")),
+                (200, Some(arns[taker].as_str())),
+                "case {case:?}: moving a hypervisor onto a host another one holds must \
+                 answer 200 with the ARN the store holds it under, got {} {:?}",
                 reply.status,
                 reply.body
             );
-            assert_eq!(
-                reply.str_at("/ErrorCode"),
-                Some(HYPERVISOR_ALREADY_EXISTS),
-                "case {case:?}: the refusal must state the host-already-imported error \
-                 code, got {:?}",
-                reply.body
-            );
-            // Refused BEFORE anything is written: neither the host nor the `Name` the
-            // same request carried reached the record.
-            let actual = reported(&router, taker_arn).await;
+
+            // Every member the request carried reached the record, the host included.
+            let actual = reported(&router, &arns[taker]).await;
             assert_eq!(
                 actual,
-                (format!("hv-{taker}"), hosts[taker].to_string(), None),
-                "case {case:?}: a refused update must write nothing, got {actual:?}"
+                ("hv-moved".to_string(), hosts[holder].to_string(), None),
+                "case {case:?}: the updated record must report what the request carried, \
+                 got {actual:?}"
+            );
+            // And the record that already held the host is untouched.
+            let holder_record = reported(&router, &arns[holder]).await;
+            assert_eq!(
+                holder_record,
+                (format!("hv-{holder}"), hosts[holder].to_string(), None),
+                "case {case:?}: the record that already held the host must be unchanged, \
+                 got {holder_record:?}"
+            );
+            // One host, two records, and no record minted or dropped by the update.
+            assert_eq!(
+                persisted_arns_for_host(&engine, hosts[holder]),
+                BTreeSet::from([arns[taker].clone(), arns[holder].clone()]),
+                "case {case:?}: both records must be stored for host {:?}",
+                hosts[holder]
+            );
+            assert_eq!(
+                persisted_hypervisor_count(&engine),
+                hosts.len(),
+                "case {case:?}: an update must neither mint nor drop a record"
             );
         }
+    }
+
+    let engine = build_engine();
+    let router = build_router(&engine);
+    let mut arns = Vec::new();
+    for (index, host) in hosts.iter().enumerate() {
+        arns.push(import(&router, &format!("hv-{index}"), host).await);
     }
 
     // Setting a record's own host again is the same record: it succeeds and changes
@@ -505,7 +552,8 @@ async fn an_update_onto_a_host_another_hypervisor_holds_is_refused_as_a_conflict
         );
     }
 
-    // Once the record holding a host is gone, that host is free for another record.
+    // The host of a record that has been DELETED is written exactly like the host of one
+    // still stored: nothing about a host makes an update conditional.
     let freed = call(
         &router,
         "DeleteHypervisor",

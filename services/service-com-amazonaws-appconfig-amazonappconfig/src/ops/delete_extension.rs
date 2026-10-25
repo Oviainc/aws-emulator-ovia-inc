@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteExtension
-//! IMPLEMENTED: takes one version of an extension out of the store — the highest when
-//! the request names none — and the extension itself once no version of it is left.
+//! IMPLEMENTED: takes one version of an extension this account created out of the store
+//! — the highest when the request names none — and the extension itself once no version
+//! of it is left. One of AppConfig's AWS-authored extensions is refused: it is
+//! AppConfig's, not this account's.
 //!
 //! ## Shape of an operation
 //!
@@ -155,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteExtensionErrorModeled::InternalServerException(
@@ -165,13 +167,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
+
+        // An AWS-authored extension is AppConfig's, not this account's: no
+        // `CreateExtension` call made it and no delete unmakes it. Refusing it with the
+        // modelled 400 is what keeps this operation honest both ways, exactly as
+        // `DeleteDeploymentStrategy` refuses a predefined strategy: a 204 would claim a
+        // deletion that removed nothing, and a 404 would deny an extension
+        // `GetExtension` and `ListExtensions` still report.
+        if crate::state::aws_authored_extension(&input.extension_identifier, &region).is_some() {
+            return Err(DeleteExtensionErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "Extension {} is an Amazon Web Services authored AppConfig extension \
+                         and cannot be deleted.",
+                        input.extension_identifier
+                    )),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
 
         // `ExtensionIdentifier` is "the name, ID, or Amazon Resource Name (ARN) of the
         // extension", resolved through the one state function every extension operation
         // resolves an identifier with. An ARN addresses one VERSION, so it pins the
         // version to delete unless the request names one explicitly.
-        let Some((extension, pinned_version)) = store.resolve_extension(&input.extension_identifier)
+        let Some((extension, pinned_version)) =
+            store.resolve_extension(&input.extension_identifier, &region)
         else {
             return Err(not_found(crate::state::extension_not_found()));
         };
@@ -187,13 +212,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(crate::state::extension_not_found()));
         };
 
+        // "You must delete all associations to an extension before you delete the
+        // extension": an association names one version, so the delete is refused while an
+        // association still binds the version it would take away.
+        if store.extension_version_is_associated(&extension_id, version_number) {
+            return Err(DeleteExtensionErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "Extension {} version {version_number} still has extension \
+                         associations; delete them before deleting the extension.",
+                        input.extension_identifier
+                    )),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
         // The delete IS the removal of the stored record: the version goes, and with it
         // the definition and tags that version owned, and the extension goes too once it
         // holds no version at all — so `GetExtension` and `ListExtensions` then miss on
-        // the identifier this call named. "You must delete all associations to an
-        // extension before you delete the extension" has nothing to check against yet:
-        // this service stores no extension association (`CreateExtensionAssociation` is
-        // still a scaffold, with its own issue), so none can survive the extension.
+        // the identifier this call named.
         if store
             .remove_extension_version(&extension_id, version_number)
             .is_none()

@@ -256,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let percentiles: Vec<(&str, f64)> = extended
             .iter()
             .map(|name| {
-                parse_percentile(name)
+                crate::state::parse_percentile(name)
                     .map(|percentile| (*name, percentile))
                     .ok_or_else(|| invalid_value(format!("{name} is not a supported statistic")))
             })
@@ -298,32 +298,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // `StartTime` inclusive, `EndTime` exclusive; windows are `Period` seconds wide and
-        // anchored at `StartTime`. A window with no datapoint is never emitted, so the
-        // bucket map only ever holds windows that have data.
-        let mut buckets: std::collections::BTreeMap<i64, Vec<&crate::state::StoredDatum>> =
-            std::collections::BTreeMap::new();
-        for datum in store.metrics.get(&key).into_iter().flatten() {
-            if datum.timestamp_secs < start || datum.timestamp_secs >= end {
-                continue;
-            }
-            if input
-                .unit
-                .as_deref()
-                .is_some_and(|unit| datum.unit.as_deref() != Some(unit))
-            {
-                continue;
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let index = ((datum.timestamp_secs - start) / period).floor() as i64;
-            buckets.entry(index).or_default().push(datum);
-        }
+        // anchored at `StartTime`, folded by the one shared helper every reader of a series
+        // uses ([`crate::state::windows_of`]).
+        let series = store.metrics.get(&key).map_or(&[][..], Vec::as_slice);
+        let buckets = crate::state::windows_of(series, start, end, period, input.unit.as_deref());
 
         let mut datapoints = Vec::with_capacity(buckets.len());
         for (index, data) in buckets {
-            #[allow(clippy::cast_precision_loss)]
-            let window_start = start + (index as f64) * period;
             datapoints.push(aggregate(
-                window_start,
+                crate::state::window_start(start, index, period),
                 &data,
                 &statistics,
                 &percentiles,
@@ -349,26 +332,13 @@ fn invalid_value(message: String) -> GetMetricStatisticsError {
     .into()
 }
 
-/// Refuse a `Period` the member does not document.
-///
-/// "For metrics with regular resolution, a period can be as short as one minute (60
-/// seconds) and must be a multiple of 60. For high-resolution metrics that are collected at
-/// intervals of less than one minute, the period can be 1, 5, 10, 20, 30, 60, or any
-/// multiple of 60." (`GetMetricStatisticsInput$Period`)
+/// Refuse a `Period` the member does not document, in the words the one shared rule
+/// ([`crate::state::period_error`]) states it in.
 fn validate_period(period: i32) -> Result<(), GetMetricStatisticsError> {
-    // The sub-minute periods the member lists; every other legal period is a multiple of 60.
-    const SUB_MINUTE: [i32; 5] = [1, 5, 10, 20, 30];
-
-    // A period is a span of seconds, so it is at least one — the model says so (`Period`
-    // carries `range min 1`) and so does the member ("as short as one minute […] the period
-    // can be 1, 5, 10, 20, 30, 60"). Stated here as well, so the rule the windows are built
-    // on does not depend on the boundary validator having run.
-    if period >= 1 && (SUB_MINUTE.contains(&period) || period % 60 == 0) {
-        return Ok(());
+    match crate::state::period_error(period) {
+        Some(message) => Err(invalid_value(message)),
+        None => Ok(()),
     }
-    Err(invalid_value(format!(
-        "Period must be a positive 1, 5, 10, 20, 30 or multiple of 60; got {period}"
-    )))
 }
 
 /// Aggregate one window's datapoints, emitting ONLY the statistics the caller asked for.
@@ -386,7 +356,7 @@ fn aggregate(
 
     let mut extended_statistics = std::collections::HashMap::new();
     for (name, percentile) in percentiles {
-        if let Some(value) = weighted_percentile(data, *percentile) {
+        if let Some(value) = crate::state::weighted_percentile(data, *percentile) {
             extended_statistics.insert((*name).to_string(), value);
         }
     }
@@ -423,42 +393,4 @@ fn window_unit(data: &[&crate::state::StoredDatum]) -> Option<String> {
         .all(|datum| datum.unit == first)
         .then_some(first)
         .flatten()
-}
-
-/// The percentile a `pNN`/`pNN.NN` extended statistic names, in percent.
-fn parse_percentile(name: &str) -> Option<f64> {
-    let digits = name.strip_prefix('p')?;
-    let percentile: f64 = digits.parse().ok()?;
-    (0.0..=100.0).contains(&percentile).then_some(percentile)
-}
-
-/// The `percentile`-th percentile of the window's published values, by nearest rank.
-///
-/// `None` when the window holds a datapoint whose individual values were never published,
-/// or any negative value: "Percentile statistics are not available for metrics when any of
-/// the metric values are negative numbers." (`GetMetricStatistics`)
-fn weighted_percentile(data: &[&crate::state::StoredDatum], percentile: f64) -> Option<f64> {
-    let mut values: Vec<(f64, f64)> = Vec::with_capacity(data.len());
-    for datum in data {
-        let value = datum.single_value()?;
-        if value < 0.0 {
-            return None;
-        }
-        values.push((value, datum.sample_count));
-    }
-    values.sort_by(|left, right| left.0.total_cmp(&right.0));
-
-    let total: f64 = values.iter().map(|(_, weight)| weight).sum();
-    if total <= 0.0 {
-        return None;
-    }
-    let target = percentile / 100.0 * total;
-    let mut seen = 0.0;
-    for (value, weight) in &values {
-        seen += weight;
-        if seen >= target {
-            return Some(*value);
-        }
-    }
-    values.last().map(|(value, _)| *value)
 }

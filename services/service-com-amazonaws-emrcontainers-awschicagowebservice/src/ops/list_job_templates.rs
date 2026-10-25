@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         state.settle();
 
@@ -217,12 +217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // Newest first. The creation sequence breaks a tie between two templates created
-        // in the same millisecond, so the order is total and a page boundary never
-        // depends on hash order.
+        // Newest first, over the templates THIS region holds: a template created at
+        // another region's endpoint is not one this endpoint lists. The creation sequence
+        // breaks a tie between two templates created in the same millisecond, so the order
+        // is total and a page boundary never depends on hash order.
         let mut matching: Vec<&crate::state::JobTemplateRecord> = state
-            .job_templates
-            .values()
+            .region_job_templates(&region)
             .filter(|record| matches_filters(record, &input))
             .collect();
         matching.sort_by(|left, right| {

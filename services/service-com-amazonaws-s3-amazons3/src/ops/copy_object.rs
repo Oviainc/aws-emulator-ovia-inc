@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyObject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyObject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyObject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a copy of an object already stored in this emulator: the bytes of the object
+//! `x-amz-copy-source` names are recorded at the destination bucket and key as a NEW
+//! write, so the destination object carries its own last-modified time, its own version
+//! id where the destination bucket is versioned, and — this is the part a copy is most
+//! often got wrong — the encryption of the DESTINATION: "when copying an object, if you
+//! don't specify encryption information in your copy request, the encryption setting of
+//! the target object is set to the default encryption configuration of the destination
+//! bucket" (`CopyObjectRequest$ServerSideEncryption`). What the copy DOES carry over from
+//! the source is what `x-amz-metadata-directive` and `x-amz-tagging-directive` say it
+//! does, both `COPY` by default.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -272,12 +274,31 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `CopyObjectError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#CopyObject")]
+// here — hence the `CopyObjectError` alias below.
+//
+// Three shapes are widened in with `extra_errors`, because this operation's own error
+// list names only the archived-source case and a copy has three more outcomes the service
+// does model elsewhere:
+//
+// * `NoSuchBucket` — `Bucket` is an `@httpLabel`, and `x-amz-copy-source` names a second
+//   bucket; either may be one this emulator does not hold.
+// * `NoSuchKey` — the copy source names a key the source bucket may not hold.
+// * `InvalidRequest` — "A parameter or header in your request isn't valid", which is what
+//   S3 answers a copy of an object onto itself that changes nothing about it, and the
+//   over-long key and over-large metadata a destination write is refused for (the same
+//   two cases `PutObject` answers through it).
+//
+// Each shape is this SERVICE's own (`com.amazonaws.s3#NoSuchBucket`, …); only this
+// operation's error list omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#CopyObject",
+    extra_errors = ["InvalidRequest", "NoSuchBucket", "NoSuchKey"]
+)]
 #[derive(Debug)]
 pub enum CopyObjectErrorModeled {
+    InvalidRequest(InvalidRequest),
+    NoSuchBucket(NoSuchBucket),
+    NoSuchKey(NoSuchKey),
     ObjectNotInActiveTierError(ObjectNotInActiveTierError),
 }
 
@@ -332,18 +353,614 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyObject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyObjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store neither the source can be read nor the copy recorded, and
+            // none of the modelled errors says that, so the scaffold's 501 carries what is
+            // true: this emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CopyObject"));
+        };
+
+        // Members whose semantics this emulator cannot carry out faithfully — the same
+        // list `PutObject` refuses a write for, plus the copy-source half of SSE-C:
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyObject"))
+        // * `If-Match` / `If-None-Match` make the DESTINATION write conditional, and the
+        //   documented answers when the condition fails are HTTP 412 `PreconditionFailed`
+        //   and 409 `ConditionalRequestConflict` on a key this operation does not read
+        //   before writing it.
+        // * the SSE-C members carry a customer-provided KEY. S3 "doesn't store the
+        //   encryption key you provide", so an object written under one could not be read
+        //   back here, and no object this store holds was encrypted with one — which is
+        //   also why the `x-amz-copy-source-server-side-encryption-customer-*` members
+        //   have nothing to decrypt.
+        // * the Object Lock members decide whether a later delete is allowed; no
+        //   retention, hold or event hold is emulated.
+        //
+        // The copy-source PRECONDITIONS are not in this list: they are judged below
+        // against the stored source object, and a condition that does not hold is answered
+        // with the 412 S3 documents for them.
+        for (member, present) in [
+            ("If-Match", input.if_match.is_some()),
+            ("If-None-Match", input.if_none_match.is_some()),
+            (
+                "x-amz-server-side-encryption-customer-algorithm",
+                input.sse_customer_algorithm.is_some(),
+            ),
+            (
+                "x-amz-server-side-encryption-customer-key",
+                input.sse_customer_key.is_some(),
+            ),
+            (
+                "x-amz-copy-source-server-side-encryption-customer-algorithm",
+                input.copy_source_sse_customer_algorithm.is_some(),
+            ),
+            (
+                "x-amz-copy-source-server-side-encryption-customer-key",
+                input.copy_source_sse_customer_key.is_some(),
+            ),
+            ("x-amz-object-lock-mode", input.object_lock_mode.is_some()),
+            (
+                "x-amz-object-lock-retain-until-date",
+                input.object_lock_retain_until_date.is_some(),
+            ),
+            (
+                "x-amz-object-lock-legal-hold",
+                input.object_lock_legal_hold_status.is_some(),
+            ),
+            (
+                "x-amz-object-lock-event-hold",
+                input.object_lock_event_hold.is_some(),
+            ),
+            (
+                "x-amz-object-lock-event-hold-duration-days",
+                input.object_lock_event_hold_duration_days.is_some(),
+            ),
+            (
+                "x-amz-object-lock-event-hold-duration-years",
+                input.object_lock_event_hold_duration_years.is_some(),
+            ),
+        ] {
+            if present {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "CopyObject with {member}"
+                )));
+            }
+        }
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // destination bucket, the request fails with the HTTP status code 403 Forbidden"
+        // (`CopyObjectRequest$ExpectedBucketOwner`, and the same sentence for the source
+        // bucket on `ExpectedSourceBucketOwner`), judged exactly as `HeadObject` and
+        // `PutObject` judge it: this emulator serves one account, so the owner of every
+        // bucket it holds is that account.
+        for expected in [
+            input.expected_bucket_owner.as_deref(),
+            input.expected_source_bucket_owner.as_deref(),
+        ] {
+            if expected.is_some_and(|account| account != ::engine::emulator_account_id()) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    "AccessDenied",
+                    403,
+                    "Access Denied",
+                ));
+            }
+        }
+
+        // The second documented form of a copy source names the object "as accessed
+        // through the access point" by ARN. This emulator holds no access points and no
+        // Outposts, so there is no object such a value could address — and a 200 for it
+        // would claim a copy out of a resource that does not exist here.
+        // The one leading slash the member's pattern allows is stripped the same way
+        // `parse_copy_source` strips it, so a value is classified the same here and there.
+        if input
+            .copy_source
+            .strip_prefix('/')
+            .unwrap_or(&input.copy_source)
+            .starts_with(ACCESS_POINT_ARN_PREFIX)
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CopyObject with an Amazon Resource Name as x-amz-copy-source",
+            ));
+        }
+        let source = match parse_copy_source(&input.copy_source) {
+            Ok(source) => source,
+            // The member's pattern (`^\/?.+\/.+$`) is already enforced at the boundary,
+            // so what reaches here is a value that satisfies it and still names no
+            // bucket-and-key pair. "The value of the parameter is not valid" is
+            // `InvalidArgument` (400), the channel the encryption guards below answer
+            // through, and the message names the member the caller has to fix.
+            Err(rejection) => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    rejection,
+                ))
+            }
+        };
+
+        // `ServerSideEncryption` is an enum member, so the boundary refuses a value
+        // outside the published set before this handler runs; this guard is what keeps a
+        // STORED algorithm inside that set, the way `PutObject`'s does. "Unrecognized or
+        // unsupported values won't write a destination object and will receive a 400 Bad
+        // Request response" (`CopyObjectRequest$ServerSideEncryption`), which is
+        // `InvalidArgument`.
+        if let Some(algorithm) = input.server_side_encryption.as_deref() {
+            if !SERVER_SIDE_ENCRYPTION_VALUES.contains(&algorithm) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "x-amz-server-side-encryption must be one of \
+                         {SERVER_SIDE_ENCRYPTION_VALUES:?}, got {algorithm:?}"
+                    ),
+                ));
+            }
+        }
+
+        // The encryption configuration this copy ASKED for, taken from the modelled
+        // members the request carried. "If the encryption setting in your request is
+        // different from the default encryption configuration of the destination bucket,
+        // the encryption setting in your request takes precedence"; a request that names
+        // none of the four inherits the DESTINATION bucket's default instead, resolved
+        // below.
+        let requested = crate::state::ObjectEncryption {
+            sse_algorithm: input.server_side_encryption.clone(),
+            kms_key_id: input.ssekms_key_id.clone(),
+            kms_encryption_context: input.ssekms_encryption_context.clone(),
+            bucket_key_enabled: input.bucket_key_enabled,
+        };
+        // "This parameter is allowed if and only if SSEAlgorithm is set to aws:kms or
+        // aws:kms:dsse" (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`) — each of
+        // the three names something only SSE-KMS has, so one beside another algorithm, or
+        // beside none at all, is a parameter that is not valid for this request.
+        if !requested.uses_kms() {
+            if let Some(member) = requested.kms_only_member() {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "{member} is only valid with a server-side encryption algorithm \
+                         of {}",
+                        crate::state::KMS_SSE_ALGORITHMS.join(" or ")
+                    ),
+                ));
+            }
+        }
+
+        // "Specifies whether the metadata is copied from the source object or replaced
+        // with metadata that's provided in the request … If this header isn't specified,
+        // COPY is the default behavior" (`CopyObjectRequest$MetadataDirective`), and the
+        // same for the tag set with "The default value is COPY"
+        // (`CopyObjectRequest$TaggingDirective`). Both are enum members, so the only
+        // other value that reaches here is `REPLACE`.
+        let replaces_metadata = input.metadata_directive.as_deref() == Some(DIRECTIVE_REPLACE);
+        let replaces_tags = input.tagging_directive.as_deref() == Some(DIRECTIVE_REPLACE);
+
+        let mut store = state.lock();
+
+        // The DESTINATION bucket decides the encryption of a copy that named none of it,
+        // so it is resolved from the same accessor `GetBucketEncryption` answers from —
+        // which means an object copied into a bucket reports that bucket's rule and never
+        // the source's. Reading it writes nothing: a never-configured bucket's default is
+        // computed, not materialised.
+        let Some(destination) = store.bucket(&input.bucket) else {
+            return Err(CopyObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let encryption = if requested.names_no_member() {
+            destination.default_object_encryption()
+        } else {
+            requested.clone()
+        };
+
+        // The SOURCE object, copied out of the store so the write below can borrow it
+        // mutably. "If your source bucket versioning is enabled, the x-amz-copy-source
+        // header by default identifies the current version of an object to copy. If the
+        // current version is a delete marker, Amazon S3 behaves as if the object was
+        // deleted. To copy a different version, use the versionId query parameter."
+        let Some(source_bucket) = store.bucket(&source.bucket) else {
+            return Err(CopyObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let held = match source.version_id.as_deref() {
+            None => source_bucket.object(&source.key).cloned(),
+            Some(version_id) => {
+                // A `versionId` naming no version the source bucket holds is
+                // `NoSuchVersion`, which this model carries no shape for, so it goes out
+                // through the unmodelled channel with the code and 404 S3 answers — the
+                // way `GetObject` answers the same request.
+                let Some(held) = source_bucket.stored_version(&source.key, version_id) else {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::NO_SUCH_VERSION_CODE,
+                        404,
+                        crate::state::NO_SUCH_VERSION_MESSAGE,
+                    ));
+                };
+                // A delete marker holds no bytes for a copy to read, and naming one
+                // explicitly is not something this method can do — the same 405
+                // `GetObject` answers a read of one with.
+                if held.as_delete_marker().is_some() {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::METHOD_NOT_ALLOWED_CODE,
+                        crate::state::METHOD_NOT_ALLOWED_STATUS,
+                        crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+                    ));
+                }
+                held.as_object().cloned()
+            }
+        };
+        let Some(source_object) = held else {
+            return Err(CopyObjectErrorModeled::NoSuchKey(NoSuchKey {}).into());
+        };
+
+        // "Before using an object as a source object for the copy operation, you must
+        // restore a copy of it if … the storage class of the source object is GLACIER or
+        // DEEP_ARCHIVE" (`CopyObjectRequest$StorageClass`) — which is exactly what this
+        // operation's one modelled error reports: "The source object of the COPY action is
+        // not in the active tier and is only stored in Amazon S3 Glacier."
+        if ARCHIVED_STORAGE_CLASSES.contains(&source_object.storage_class.as_str()) {
+            return Err(CopyObjectErrorModeled::ObjectNotInActiveTierError(
+                ObjectNotInActiveTierError {},
+            )
+            .into());
+        }
+
+        // The copy-source preconditions, judged against the version actually found.
+        if let Some(unmet) = unmet_source_precondition(&input, &source_object) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::PRECONDITION_FAILED_CODE,
+                crate::state::PRECONDITION_FAILED_STATUS,
+                format!("{}: {unmet}", crate::state::PRECONDITION_FAILED_MESSAGE),
+            ));
+        }
+
+        // S3 refuses a copy of an object onto ITSELF that would change nothing about it:
+        // the request names no new metadata, no new tag set, no storage class, no website
+        // redirect location and no encryption, so the write would replace the object with
+        // itself. "A parameter or header in your request isn't valid" is what the modelled
+        // `InvalidRequest` (400) reports; a self-copy that DOES change one of them is the
+        // documented way to change that attribute in place, and is served.
+        let onto_itself =
+            source.bucket == input.bucket && source.key == input.key && source.version_id.is_none();
+        let changes_nothing = !replaces_metadata
+            && !replaces_tags
+            && input.storage_class.is_none()
+            && input.website_redirect_location.is_none()
+            && requested.names_no_member();
+        if onto_itself && changes_nothing {
+            return Err(CopyObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+        }
+
+        // `REPLACE` takes the tag set from the request's `x-amz-tagging` header — "the
+        // tag-set must be encoded as URL Query parameters" — judged against the same
+        // published object limits `PutObject` judges its header against, and before
+        // anything is written, so a refused copy leaves the destination key as it was. A
+        // `REPLACE` naming no header at all replaces the tag set with the empty one.
+        let tags = if replaces_tags {
+            match input.tagging.as_deref() {
+                Some(header) => match crate::state::tag_set_from_header(
+                    header,
+                    crate::state::OBJECT_TAG_SET_LIMITS,
+                ) {
+                    Ok(tags) => tags,
+                    Err(rejection) => {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            rejection.to_string(),
+                        ))
+                    }
+                },
+                None => Vec::new(),
+            }
+        } else {
+            source_object.tags.clone()
+        };
+
+        // The destination object. Its bytes are the source's, so its entity tag is the
+        // digest of those bytes, computed the one way every object's is
+        // ([`crate::state::object_etag`]); its last-modified time is NOW, because the copy
+        // is a write of its own.
+        let etag = crate::state::object_etag(&source_object.body);
+        let last_modified = ::std::time::SystemTime::now();
+        let mut object = crate::state::Object {
+            etag: etag.clone(),
+            last_modified,
+            // "If the x-amz-storage-class header is not used, the copied object will be
+            // stored in the STANDARD Storage Class by default" — the copy does NOT
+            // inherit the source's class, which is why `CopyObject` is the documented way
+            // to change it.
+            storage_class: input
+                .storage_class
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_STORAGE_CLASS.to_string()),
+            // `COPY`, the default: the source's metadata, replaced wholesale below when
+            // the directive says `REPLACE`.
+            content_type: source_object.content_type.clone(),
+            cache_control: source_object.cache_control.clone(),
+            content_disposition: source_object.content_disposition.clone(),
+            content_encoding: source_object.content_encoding.clone(),
+            content_language: source_object.content_language.clone(),
+            expires: source_object.expires.clone(),
+            metadata: source_object.metadata.clone(),
+            // "x-amz-website-redirect-location is unique to each object and is not copied
+            // when using the x-amz-metadata-directive header. To copy the value, you must
+            // specify x-amz-website-redirect-location in the request header"
+            // (`CopyObjectRequest$MetadataDirective`) — so this member comes from the
+            // REQUEST whatever the directive says.
+            website_redirect_location: input.website_redirect_location.clone(),
+            tags,
+            // Minted by the store, which is the only place that sees the destination
+            // bucket's versioning state: this write carries no id of its own.
+            version_id: None,
+            encryption: encryption.clone(),
+            body: source_object.body.clone(),
+        };
+        if replaces_metadata {
+            object.content_type = input.content_type.clone();
+            object.cache_control = input.cache_control.clone();
+            object.content_disposition = input.content_disposition.clone();
+            object.content_encoding = input.content_encoding.clone();
+            object.content_language = input.content_language.clone();
+            object.expires = input.expires.clone();
+            object.metadata = input
+                .metadata
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+        }
+
+        // Recorded through the one place an object is ever recorded, so a copy counts
+        // against the same ceilings a `PutObject` does and is refused the same way —
+        // nothing is written unless the write was taken.
+        let Some(outcome) = store.put_object(&input.bucket, &input.key, object) else {
+            return Err(CopyObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        match outcome {
+            crate::state::ObjectWrite::Created | crate::state::ObjectWrite::Replaced => {}
+            // An over-long destination key and user-defined metadata past the published
+            // 2 KB are each a parameter that is not valid for this request, which is what
+            // the modelled `InvalidRequest` reports; AWS's own `KeyTooLongError` and
+            // `MetadataTooLarge` are not shapes in this model.
+            crate::state::ObjectWrite::KeyTooLong { .. }
+            | crate::state::ObjectWrite::MetadataTooLarge { .. } => {
+                return Err(CopyObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+            }
+            // The emulator's own ceilings, not AWS quotas, so no AWS error code describes
+            // them: they go out through the framework's 400 `ValidationException` channel,
+            // the same channel `PutObject` uses for them.
+            crate::state::ObjectWrite::ObjectCountReached => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the bucket {:?} already holds the maximum of {} objects this \
+                     emulator keeps per bucket; delete an object before copying {:?} \
+                     into it",
+                    input.bucket,
+                    crate::state::MAX_OBJECTS_PER_BUCKET,
+                    input.key
+                )));
+            }
+            crate::state::ObjectWrite::ByteBudgetReached { would_hold } => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "copying {:?} would leave the bucket {:?} holding {would_hold} bytes \
+                     of objects, past the {} bytes this emulator keeps per bucket",
+                    input.key,
+                    input.bucket,
+                    crate::state::MAX_OBJECT_BYTES_PER_BUCKET
+                )));
+            }
+            crate::state::ObjectWrite::TotalObjectCountReached => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "this emulator already holds the maximum of {} objects across every \
+                     bucket; delete an object before copying {:?}",
+                    crate::state::MAX_OBJECTS_TOTAL, input.key
+                )));
+            }
+            crate::state::ObjectWrite::TotalByteBudgetReached { would_hold } => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "copying {:?} would leave this emulator holding {would_hold} bytes of \
+                     objects across every bucket, past the {} bytes it keeps in total",
+                    input.key,
+                    crate::state::MAX_OBJECT_BYTES_TOTAL
+                )));
+            }
+        }
+
+        Ok(CopyObjectOutput {
+            // "Container for all response elements" — the entity tag and last-modified
+            // time of the object this copy created, which is what a client compares a
+            // later read against.
+            copy_object_result: Some(CopyObjectResult {
+                e_tag: Some(etag),
+                last_modified: Some(::aws_smithy_types::DateTime::from(last_modified)),
+                // The checksum members need a checksum nothing here computed, so none is
+                // reported rather than invented.
+                ..CopyObjectResult::default()
+            }),
+            // "Version ID of the source object that was copied"
+            // (`CopyObjectOutput$CopySourceVersionId`) — read off the stored version the
+            // copy was taken from, so it is reported exactly when that version has an id
+            // of its own.
+            copy_source_version_id: source_object.version_id.clone(),
+            // "Version ID of the newly created copy": "If you enable versioning on the
+            // destination bucket, Amazon S3 generates a unique version ID for the copied
+            // object … If you do not enable versioning or suspend it on the destination
+            // bucket, the version ID that Amazon S3 generates … is always null"
+            // (`CopyObjectRequest$CopySource`). Read back off the STORED object, so the
+            // caller is told the id the copy is addressable by and nothing else.
+            version_id: store
+                .bucket(&input.bucket)
+                .and_then(|bucket| bucket.object(&input.key))
+                .and_then(|stored| stored.version_id.clone()),
+            // The encryption the copy was stored under, reported back the way every reader
+            // of that object reports it: what the request named, or the DESTINATION
+            // bucket's default when it named none.
+            server_side_encryption: encryption.sse_algorithm.clone(),
+            ssekms_key_id: encryption.kms_key_id.clone(),
+            ssekms_encryption_context: encryption.kms_encryption_context.clone(),
+            bucket_key_enabled: encryption.bucket_key_enabled,
+            // Everything else this output can carry describes a feature no stored object
+            // here has, so none of it is reported rather than being invented:
+            // `Expiration` needs a lifecycle configuration (none is recorded for any
+            // bucket), the SSE-C members are refused above, and `RequestCharged` reports a
+            // Requester Pays charge this emulator does not model.
+            ..CopyObjectOutput::default()
+        })
     }
+}
+
+/// The prefix of the second documented `x-amz-copy-source` form — the ARN of an object
+/// "as accessed through the access point", or through S3 on Outposts.
+const ACCESS_POINT_ARN_PREFIX: &str = "arn:";
+
+/// The `MetadataDirective` / `TaggingDirective` value that takes the member from the
+/// REQUEST rather than the source object. Both enums are `COPY | REPLACE`
+/// (`smithy_query(query="shape",shape="MetadataDirective,TaggingDirective")`), and `COPY`
+/// is the default for each, so this is the only value that changes what is stored.
+const DIRECTIVE_REPLACE: &str = "REPLACE";
+
+/// The `StorageClass` values a source object cannot be copied out of until it is restored:
+/// "Before using an object as a source object for the copy operation, you must restore a
+/// copy of it if … the storage class of the source object is `GLACIER` or `DEEP_ARCHIVE`"
+/// (`smithy_query(query="doc",shape="CopyObjectRequest",member="StorageClass")`). Both are
+/// values of the `StorageClass` enum
+/// (`smithy_query(query="shape",shape="StorageClass")`).
+const ARCHIVED_STORAGE_CLASSES: [&str; 2] = ["GLACIER", "DEEP_ARCHIVE"];
+
+/// The source one `x-amz-copy-source` value names.
+#[derive(Debug)]
+struct CopySourceRef {
+    /// The source bucket, URL-decoded.
+    bucket: String,
+    /// The source object's key, URL-decoded.
+    key: String,
+    /// The stored version the value's `?versionId=` named, or `None` when it named none —
+    /// in which case the copy is of the key's current version.
+    version_id: Option<String>,
+}
+
+/// Read a `CopySource` value into the bucket, key and version it names, or report why it
+/// names none.
+///
+/// "Specify the name of the source bucket and the key of the source object, separated by a
+/// slash (/). For example, to copy the object `reports/january.pdf` from the general
+/// purpose bucket `awsexamplebucket`, use `awsexamplebucket/reports/january.pdf`. The
+/// value must be URL-encoded." A stored version is addressed by appending
+/// `?versionId=<version-id>` to that value
+/// (`smithy_query(query="doc",shape="CopyObjectRequest",member="CopySource")`), and the
+/// member's own pattern (`^\/?.+\/.+$`) allows one leading slash, so the FIRST slash after
+/// it separates the bucket from the key — a key with slashes of its own keeps them.
+fn parse_copy_source(value: &str) -> Result<CopySourceRef, String> {
+    let rejection = || {
+        format!(
+            "x-amz-copy-source must name the source bucket and the source object's key \
+             separated by a slash, URL-encoded, optionally followed by \
+             ?versionId=<version-id>, got {value:?}"
+        )
+    };
+    // The value is URL-encoded, so a `?` in it is the query delimiter and a `?` in a key
+    // arrives as `%3F` — which is what makes the FIRST one the end of the key, and makes
+    // `versionId` the only subresource the value may carry.
+    let (path, version_id) = match value.split_once('?') {
+        None => (value, None),
+        Some((path, query)) => match query.strip_prefix("versionId=") {
+            Some(version_id) if !version_id.is_empty() => (path, Some(version_id)),
+            _ => return Err(rejection()),
+        },
+    };
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let Some((bucket, key)) = path.split_once('/') else {
+        return Err(rejection());
+    };
+    if bucket.is_empty() || key.is_empty() {
+        return Err(rejection());
+    }
+    let Some(bucket) = url_decoded(bucket) else {
+        return Err(rejection());
+    };
+    let Some(key) = url_decoded(key) else {
+        return Err(rejection());
+    };
+    let version_id = match version_id {
+        None => None,
+        Some(version_id) => match url_decoded(version_id) {
+            Some(version_id) => Some(version_id),
+            None => return Err(rejection()),
+        },
+    };
+    Ok(CopySourceRef {
+        bucket,
+        key,
+        version_id,
+    })
+}
+
+/// One percent-encoded element of a copy source, decoded — or `None` when its escapes do
+/// not decode to UTF-8, which no bucket name or object key this store holds is.
+fn url_decoded(value: &str) -> Option<String> {
+    ::percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .ok()
+        .map(::std::borrow::Cow::into_owned)
+}
+
+/// The copy-source precondition this request carries that does NOT hold against
+/// `source`, named by its header, or `None` when every one of them holds.
+///
+/// The four members are evaluated in the order RFC 7232 gives them — an entity-tag
+/// precondition first, and the date precondition beside it only when that tag member is
+/// absent — which is exactly what the two combinations the members document describe:
+/// "if both the x-amz-copy-source-if-match and x-amz-copy-source-if-unmodified-since
+/// headers are present … x-amz-copy-source-if-match condition evaluates to true
+/// [and] x-amz-copy-source-if-unmodified-since condition evaluates to false" answers 200
+/// and copies, while "x-amz-copy-source-if-none-match condition evaluates to false [and]
+/// x-amz-copy-source-if-modified-since condition evaluates to true" answers 412.
+fn unmet_source_precondition(
+    input: &CopyObjectInput,
+    source: &crate::state::Object,
+) -> Option<&'static str> {
+    // The stored time is compared at whole-second granularity, because that is the
+    // granularity of the HTTP-date these members carry and of the `Last-Modified` the
+    // client read the value from.
+    let modified_at = unix_seconds(source.last_modified);
+    if let Some(header) = input.copy_source_if_match.as_deref() {
+        if !etag_matches(header, &source.etag) {
+            return Some("x-amz-copy-source-if-match");
+        }
+    } else if let Some(since) = input.copy_source_if_unmodified_since.as_ref() {
+        // "Copies the object if it hasn't been modified since the specified time."
+        if modified_at > since.secs() {
+            return Some("x-amz-copy-source-if-unmodified-since");
+        }
+    }
+    if let Some(header) = input.copy_source_if_none_match.as_deref() {
+        if etag_matches(header, &source.etag) {
+            return Some("x-amz-copy-source-if-none-match");
+        }
+    } else if let Some(since) = input.copy_source_if_modified_since.as_ref() {
+        // "Copies the object if it has been modified since the specified time."
+        if modified_at <= since.secs() {
+            return Some("x-amz-copy-source-if-modified-since");
+        }
+    }
+    None
+}
+
+/// Whether an entity-tag precondition value names `etag`.
+///
+/// An `ETag` is reported inside quotes, and a client may send the value back with or
+/// without them, as a comma-separated list, or as the `*` wildcard that names any existing
+/// entity (RFC 7232 §2.3, §3.1) — so each candidate is compared with the quotes and the
+/// weak marker stripped.
+fn etag_matches(header: &str, etag: &str) -> bool {
+    let stored = etag.trim_matches('"');
+    header.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate.trim_start_matches("W/").trim_matches('"') == stored
+    })
+}
+
+/// `at` as whole seconds since the Unix epoch, the unit the modelled timestamps the
+/// preconditions carry are compared in.
+fn unix_seconds(at: ::std::time::SystemTime) -> i64 {
+    at.duration_since(::std::time::SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_secs()).ok())
+        .unwrap_or_default()
 }

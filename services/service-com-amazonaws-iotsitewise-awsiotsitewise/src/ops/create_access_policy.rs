@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccessPolicy
+//! IMPLEMENTED: creates an IoT SiteWise Monitor access policy from the request and
+//! persists it in this service's state; `DescribeAccessPolicy` reads it back.
 //!
 //! ## Shape of an operation
 //!

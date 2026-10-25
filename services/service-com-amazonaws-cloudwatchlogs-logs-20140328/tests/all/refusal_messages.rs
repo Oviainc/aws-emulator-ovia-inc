@@ -458,6 +458,71 @@ async fn a_missing_resource_is_refused_with_the_services_sentence() {
             }),
         ),
         (
+            "log group",
+            "DeleteRetentionPolicy",
+            json!({"logGroupName": missing}),
+        ),
+        (
+            "log group",
+            "DeleteLogStream",
+            json!({"logGroupName": missing, "logStreamName": "s"}),
+        ),
+        (
+            "log group",
+            "AssociateKmsKey",
+            json!({
+                "logGroupName": missing,
+                "kmsKeyId": "arn:aws:kms:eu-west-2:000000000000:key/aaaabbbb-cccc-dddd-eeee-ffff00001111",
+            }),
+        ),
+        (
+            "log group",
+            "DisassociateKmsKey",
+            json!({"logGroupName": missing}),
+        ),
+        (
+            "log group",
+            "PutBearerTokenAuthentication",
+            json!({
+                "logGroupIdentifier": missing,
+                "bearerTokenAuthenticationEnabled": true,
+            }),
+        ),
+        // The same sentence answers each identifier form a request can name a missing
+        // group by: the ARN form, and a name that differs from a group that DOES exist
+        // only in case.
+        (
+            "log group",
+            "PutBearerTokenAuthentication",
+            json!({
+                "logGroupIdentifier": missing_arn,
+                "bearerTokenAuthenticationEnabled": true,
+            }),
+        ),
+        (
+            "log group",
+            "PutBearerTokenAuthentication",
+            json!({
+                "logGroupIdentifier": "Stream-Less-Group",
+                "bearerTokenAuthenticationEnabled": true,
+            }),
+        ),
+        (
+            "log group",
+            "PutLogGroupDeletionProtection",
+            json!({"logGroupIdentifier": missing, "deletionProtectionEnabled": true}),
+        ),
+        (
+            "log group",
+            "GetDataProtectionPolicy",
+            json!({"logGroupIdentifier": missing}),
+        ),
+        (
+            "log group",
+            "DeleteDataProtectionPolicy",
+            json!({"logGroupIdentifier": missing}),
+        ),
+        (
             "log stream",
             "GetLogEvents",
             json!({"logGroupName": group, "logStreamName": "no-such-stream"}),

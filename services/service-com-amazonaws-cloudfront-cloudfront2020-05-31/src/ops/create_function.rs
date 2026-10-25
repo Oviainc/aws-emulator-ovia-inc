@@ -209,44 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every CloudFront list travels in a wrapper stating its own length, and a
         // configuration whose `Quantity` disagrees with its `Items` describes no function
-        // at all. `CreateFunction` models no `InconsistentQuantities`, so the refusal is
-        // reported as the `InvalidArgument` it does model.
-        if let Some(message) =
-            crate::state::function_config_quantity_mismatch(&input.function_config)
-        {
+        // at all; neither does one associating more key value stores than a function may
+        // carry, or one naming a store this service does not hold — an association names a
+        // store by the ARN that store's own create minted, so the check is against the
+        // stored ARN rather than against the request alone. `CreateFunction` models no
+        // `InconsistentQuantities`, so every such reason is reported as the
+        // `InvalidArgument` it does model, through the ONE check an update applies too.
+        if let Some(message) = store.function_config_unusable(&input.function_config) {
             return Err(invalid_argument(message).into());
-        }
-
-        let associations = input
-            .function_config
-            .key_value_store_associations
-            .as_ref()
-            .map_or(&[][..], |associations| {
-                associations.items.as_deref().unwrap_or_default()
-            });
-        if associations.len() > crate::state::MAX_KEY_VALUE_STORE_ASSOCIATIONS {
-            return Err(invalid_argument(format!(
-                "the configuration associates {} key value stores with the function but at \
-                 most {} may be associated",
-                associations.len(),
-                crate::state::MAX_KEY_VALUE_STORE_ASSOCIATIONS
-            ))
-            .into());
-        }
-        // An association names a key value store by the ARN that store's own create
-        // minted, so a function can only be associated with a store this service HOLDS:
-        // the check is against the stored ARN, never against the request alone.
-        for association in associations {
-            if store
-                .key_value_store_by_arn(&association.key_value_store_arn)
-                .is_none()
-            {
-                return Err(invalid_argument(format!(
-                    "the key value store {} does not exist",
-                    association.key_value_store_arn
-                ))
-                .into());
-            }
         }
 
         // "A function with the same name already exists in this Amazon Web Services

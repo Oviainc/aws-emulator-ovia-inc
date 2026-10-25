@@ -1,15 +1,43 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members a request names to one stored channel and answers that
+//! channel read back out of state.
+//!
+//! `ChannelId` is the `@httpLabel` that picks the record; every other member of
+//! this operation's input is optional, so a member the request names replaces the
+//! stored one and a member it leaves out leaves the stored one alone — with the
+//! two exceptions the model itself documents:
+//!
+//! * `RoleArn` is "An optional Amazon Resource Name (ARN) of the role to assume
+//!   when running the Channel. If you do not specify this on an update call but
+//!   the role was previously set that role will be removed", so an update that
+//!   omits it REMOVES the stored role rather than keeping it;
+//! * `ChannelEngineVersion$Version` is the "build identifier of the engine
+//!   version to use for this channel. Specify 'DEFAULT' to reset to the default
+//!   version", so that one value clears the pinned version instead of storing
+//!   itself as a build identifier.
+//!
+//! A channel's configuration is changed while it is not serving: the update is
+//! accepted only once the channel has STOPPED (`ChannelRecord::has_stopped`, the
+//! notion `DeleteChannel` and `UpdateInput`'s conflict check share) and is
+//! otherwise refused with this operation's modelled `ConflictException` (409)
+//! before anything is written. An accepted update puts the channel into the
+//! modelled `UPDATING` state and owes the `IDLE` it started from, so a caller
+//! polling straight afterwards sees that transient state.
+//!
+//! The id is resolved through the LIVE channel lookup
+//! (`state::live_channel_mut`), so a channel whose delete this service has
+//! accepted — readable in `DELETING` and then in the terminal `DELETED` — names
+//! nothing a caller may still change. This operation models no 404
+//! (`smithy_query(query="operation", operation="UpdateChannel")`), so such a
+//! request, and one naming an id no channel ever had, is refused with the
+//! modelled `BadRequestException` (400) — the same treatment
+//! `ListChannelPlacementGroups` gives an id it can resolve no resource for.
+//!
+//! The response is projected from the record this call just wrote by
+//! `channel_description`, never from the request in flight.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +209,202 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannel"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `DryRun` carries no documented semantics in this model (its doc text is
+        // the generated placeholder), so what the real service validates — and
+        // what it answers — is not knowable from the contract. Refused with this
+        // operation's own modelled client error rather than silently applying an
+        // update the caller asked NOT to apply, exactly as `CreateChannel`
+        // refuses the same member.
+        if input.dry_run == Some(true) {
+            return Err(bad_request(
+                "dryRun is not implemented by this emulator; omit dryRun to update the channel",
+            ));
+        }
+
+        // The two caller-chosen lists this operation STORES carry the same
+        // ceilings `CreateChannel` applies, because the per-request work every
+        // later read spends walking them is bounded by those ceilings and not by
+        // one caller's request body. Checked before anything is written, so a
+        // refused update leaves the channel exactly as it was.
+        for (member, count, limit) in [
+            (
+                "inputAttachments",
+                input.input_attachments.as_ref().map_or(0, Vec::len),
+                crate::state::MAX_INPUT_ATTACHMENTS,
+            ),
+            (
+                "destinations",
+                input.destinations.as_ref().map_or(0, Vec::len),
+                crate::state::MAX_CHANNEL_DESTINATIONS,
+            ),
+        ] {
+            if count > limit {
+                return Err(bad_request(
+                    &crate::state::too_many_channel_entries_message(member, count, limit),
+                ));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // The channel transitions the clock had already made due decide whether
+        // this channel has stopped, so materialise them first: each was owed at
+        // that instant whether or not this update ran.
+        state.settle(now);
+
+        // Absent and already deleted are ONE refusal: a delete this service has
+        // accepted leaves the record readable in `DELETING` and then in the
+        // terminal `DELETED`, but the id names nothing a caller may still change.
+        // This operation models no `NotFoundException`, so the request itself is
+        // what cannot be served: the modelled 400. The message tells the two
+        // apart; the status and the code do not.
+        if state.live_channel_mut(&input.channel_id).is_none() {
+            let message = if state.channels.contains_key(&input.channel_id) {
+                crate::state::already_deleted_message(&format!("Channel {}", input.channel_id))
+            } else {
+                crate::state::not_found_message("Channel", &input.channel_id)
+            };
+            return Err(bad_request(&message));
+        }
+
+        // A channel that has not stopped is encoding through exactly the
+        // configuration this call would replace, so the edit waits until it has
+        // stopped — the same notion `UpdateInput` applies to the channels that
+        // attach the input it is asked to edit.
+        let channel = state
+            .live_channel_mut(&input.channel_id)
+            .ok_or_else(unavailable)?;
+        if !channel.has_stopped() {
+            return Err(UpdateChannelErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Channel {} is in state {} and must have stopped before it can be updated",
+                    channel.id, channel.state
+                )),
+            })
+            .into());
+        }
+
+        // Each member the request named is stored; each one it omitted keeps the
+        // value the channel already had.
+        if let Some(name) = input.name {
+            channel.name = Some(name);
+        }
+        if let Some(cdi) = input.cdi_input_specification {
+            channel.cdi_input_specification = Some(cdi);
+        }
+        if let Some(destinations) = input.destinations {
+            channel.destinations = destinations;
+        }
+        if let Some(encoder_settings) = input.encoder_settings {
+            channel.encoder_settings = Some(encoder_settings);
+        }
+        if let Some(attachments) = input.input_attachments {
+            channel.input_attachments = attachments;
+        }
+        if let Some(specification) = input.input_specification {
+            channel.input_specification = Some(specification);
+        }
+        if let Some(log_level) = input.log_level {
+            channel.log_level = Some(log_level);
+        }
+        if let Some(security_groups) = input.channel_security_groups {
+            channel.channel_security_groups = security_groups;
+        }
+        if let Some(anywhere_settings) = input.anywhere_settings {
+            channel.anywhere_settings = Some(anywhere_settings);
+        }
+        if let Some(linked) = input.linked_channel_settings {
+            channel.linked_channel_settings = Some(linked);
+        }
+        if let Some(inference_settings) = input.inference_settings {
+            channel.inference_settings = Some(inference_settings);
+        }
+        if let Some(router_settings) = input.special_router_settings {
+            channel.special_router_settings = Some(router_settings);
+        }
+        if let Some(maintenance) = input.maintenance {
+            apply_maintenance(&mut channel.maintenance, maintenance);
+        }
+        if let Some(version) = input.channel_engine_version.and_then(|version| version.version) {
+            // "Specify 'DEFAULT' to reset to the default version": the reset
+            // un-pins the channel, which is the state a channel created without
+            // an engine version is in, so the stored pin is cleared rather than
+            // being set to the literal the caller typed.
+            channel.channel_engine_version = if version == DEFAULT_ENGINE_VERSION {
+                None
+            } else {
+                Some(version)
+            };
+        }
+        // `RoleArn`'s own documentation makes it the one member an OMISSION
+        // writes: "If you do not specify this on an update call but the role was
+        // previously set that role will be removed".
+        channel.role_arn = input.role_arn;
+
+        // The configuration has been applied, which is what `UPDATING` reports;
+        // the channel is still stopped, so the clock owes it the `IDLE` the
+        // update started from.
+        crate::state::begin_update(channel, now);
+
+        // Read back out of the store, so the response reports the channel that
+        // was written rather than one this handler assembled from the request.
+        let channel = state
+            .channel_description(&input.channel_id)
+            .ok_or_else(unavailable)?;
+        Ok(UpdateChannelOutput {
+            channel: Some(channel),
+        })
     }
+}
+
+/// The `ChannelEngineVersionRequest$Version` value that is not a build
+/// identifier but a reset: "Specify 'DEFAULT' to reset to the default version".
+const DEFAULT_ENGINE_VERSION: &str = "DEFAULT";
+
+/// Apply a `MaintenanceUpdateSettings` patch to a channel's stored
+/// `MaintenanceStatus`.
+///
+/// Member by member, for the same reason the operation is member by member: each
+/// of the three is optional and documented on its own ("Choose one day of the
+/// week for maintenance", "Choose a specific date for maintenance to occur",
+/// "Choose the hour that maintenance will start"), so a patch that names one
+/// leaves the other two at the values the channel already had.
+/// `MaintenanceDeadline` is assigned by the real service's maintenance
+/// scheduler, which this emulator does not run, so no caller's update can reach
+/// it and it stays as the create left it.
+fn apply_maintenance(stored: &mut Option<MaintenanceStatus>, patch: MaintenanceUpdateSettings) {
+    let stored = stored.get_or_insert_with(MaintenanceStatus::default);
+    if patch.maintenance_day.is_some() {
+        stored.maintenance_day = patch.maintenance_day;
+    }
+    if patch.maintenance_start_time.is_some() {
+        stored.maintenance_start_time = patch.maintenance_start_time;
+    }
+    if patch.maintenance_scheduled_date.is_some() {
+        stored.maintenance_scheduled_date = patch.maintenance_scheduled_date;
+    }
+}
+
+/// A request this operation cannot serve, as its modelled `BadRequestException`
+/// (400) — the client refusal this operation declares for a request that names a
+/// channel it cannot resolve or a member this emulator does not implement, since
+/// its model declares no `NotFoundException`.
+fn bad_request(message: &str) -> UpdateChannelError {
+    UpdateChannelErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no channel store to update. A modelled server error, never a fresh
+/// engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateChannelError {
+    UpdateChannelErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

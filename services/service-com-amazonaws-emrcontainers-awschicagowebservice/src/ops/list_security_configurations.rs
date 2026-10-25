@@ -192,9 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing this listing reports comes from the request metadata: every filter and
+        // The only thing this listing reads from the request metadata is the region it is
+        // signed for, which is the set of configurations it reports on; every filter and
         // the page itself are members of `input`, and the records come from state.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListSecurityConfigurationsError::Modeled(
                 ListSecurityConfigurationsErrorModeled::InternalServerException(
@@ -230,12 +231,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // Newest first. The creation sequence breaks a tie between two configurations
-        // created in the same millisecond, so the order is total and a page boundary never
-        // depends on hash order.
+        // Newest first, over the configurations THIS region holds: one created at another
+        // region's endpoint is not one this endpoint lists. The creation sequence breaks a
+        // tie between two configurations created in the same millisecond, so the order is
+        // total and a page boundary never depends on hash order.
         let mut matching: Vec<&crate::state::SecurityConfigurationRecord> = state
-            .security_configurations
-            .values()
+            .region_security_configurations(&region)
             .filter(|record| matches_filters(record, &input))
             .collect();
         matching.sort_by(|left, right| {

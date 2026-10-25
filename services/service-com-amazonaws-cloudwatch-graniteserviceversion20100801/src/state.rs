@@ -179,6 +179,235 @@ impl BasicStatistics {
     }
 }
 
+/// The sub-minute `Period` values a metric may be read at: "For metrics with regular
+/// resolution, a period can be as short as one minute (60 seconds) and must be a multiple of
+/// 60. For high-resolution metrics that are collected at intervals of less than one minute,
+/// the period can be 1, 5, 10, 20, 30, 60, or any multiple of 60." (`MetricStat$Period`,
+/// `GetMetricStatisticsInput$Period`) — every other legal period is a multiple of 60.
+pub const SUB_MINUTE_PERIODS: [i32; 5] = [1, 5, 10, 20, 30];
+
+/// Why `period` is not a granularity a metric can be read at, or `None` when it is. Shared
+/// by every operation that takes a `Period`, so one rule answers them all; each maps the
+/// message onto the parameter error ITS model declares.
+///
+/// A period is a span of seconds, so it is at least one — the model says so (`Period` carries
+/// `range min 1`) and so do the members above. Stated here as well, so the rule the windows
+/// are built on does not depend on the boundary validator having run.
+pub fn period_error(period: i32) -> Option<String> {
+    let documented = period >= 1 && (SUB_MINUTE_PERIODS.contains(&period) || period % 60 == 0);
+    (!documented).then(|| {
+        format!("Period must be a positive 1, 5, 10, 20, 30 or multiple of 60; got {period}")
+    })
+}
+
+/// Fold one series' datapoints into the `period`-wide windows of `[start, end)`, keyed by the
+/// window's index from `start`.
+///
+/// `start` is INCLUSIVE and `end` EXCLUSIVE, as both readers' members document. A window
+/// holding no datapoint is never inserted, so what this allocates is bounded by the
+/// datapoints the series holds in the range rather than by the range the request spans.
+///
+/// `unit` is the caller's unit filter: "If you specify a unit, the operation returns only
+/// data that was collected with that unit specified. […] CloudWatch does not perform unit
+/// conversions." A request naming none takes every datapoint.
+pub fn windows_of<'a>(
+    data: &'a [StoredDatum],
+    start: f64,
+    end: f64,
+    period: f64,
+    unit: Option<&str>,
+) -> BTreeMap<i64, Vec<&'a StoredDatum>> {
+    let mut windows: BTreeMap<i64, Vec<&StoredDatum>> = BTreeMap::new();
+    for datum in data {
+        if datum.timestamp_secs < start || datum.timestamp_secs >= end {
+            continue;
+        }
+        if unit.is_some_and(|unit| datum.unit.as_deref() != Some(unit)) {
+            continue;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let index = ((datum.timestamp_secs - start) / period).floor() as i64;
+        windows.entry(index).or_default().push(datum);
+    }
+    windows
+}
+
+/// The instant the `index`th `period`-wide window from `start` begins, which is the time
+/// stamp a datapoint folded out of that window carries.
+pub fn window_start(start: f64, index: i64, period: f64) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let offset = index as f64;
+    start + offset * period
+}
+
+/// The percentile a `pNN` / `pNN.NN` extended statistic names, in percent, or `None` for a
+/// name that is not one. The `p` is matched without regard to ASCII case, and the number is
+/// a plain decimal in `0..=100`, so `f64`'s sign and exponent forms (`p+9`, `p1e2`) cannot
+/// slip through where a percentile is expected.
+///
+/// "The percentile statistics. Specify values between p0.0 and p100."
+/// (`GetMetricStatisticsInput$ExtendedStatistics`)
+pub fn parse_percentile(name: &str) -> Option<f64> {
+    percentage(strip_prefix_ignore_ascii_case(name, "p")?)
+}
+
+/// The statistics CloudWatch names outright on its "CloudWatch statistics definitions" page:
+/// the five basic statistics the store folds, and the interquartile mean.
+const CLOUDWATCH_BASIC_STATISTICS: &[&str] =
+    &["SampleCount", "Average", "Sum", "Minimum", "Maximum", "IQM"];
+
+/// The statistic families from the same page that take a trimming span, either as a bare
+/// percentile ("this includes tm98, wm90") or as a span: trimmed mean, trimmed count,
+/// trimmed sum and Winsorized mean.
+const TRIMMED_FAMILIES: &[&str] = &["tm", "tc", "ts", "wm"];
+
+/// The percentile-rank family from the same page, which takes a span of metric VALUES rather
+/// than a percentile ("and `PR(:300)`").
+const RANK_FAMILIES: &[&str] = &["pr"];
+
+/// The five basic statistics this store FOLDS out of its datapoints
+/// ([`BasicStatistics::named`]) — `IQM` and the bounded families are statistics CloudWatch
+/// supports that nothing here computes.
+const FOLDED_STATISTICS: &[&str] = &["SampleCount", "Average", "Sum", "Minimum", "Maximum"];
+
+/// Whether `statistic` is one CloudWatch supports at all: a basic statistic, a percentile, or
+/// a member of a bounded family. Shared by every operation that takes a statistic NAME —
+/// `MetricStat$Stat` is an unconstrained string in the model, so the grammar is the only thing
+/// that tells a statistic from a typo.
+pub fn is_cloudwatch_statistic(statistic: &str) -> bool {
+    CLOUDWATCH_BASIC_STATISTICS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(statistic))
+        || parse_percentile(statistic).is_some()
+        || bounded_statistic(statistic)
+}
+
+/// Whether this store FOLDS `statistic` out of the datapoints it keeps: one of the five
+/// basic statistics, or a percentile over the published values. A statistic CloudWatch
+/// supports but this answers `false` for is one no reader here can compute, which its caller
+/// reports as not implemented rather than as an empty series.
+pub fn computes_statistic(statistic: &str) -> bool {
+    FOLDED_STATISTICS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(statistic))
+        || parse_percentile(statistic).is_some()
+}
+
+/// A statistic of one of the bounded families, in either documented form:
+/// `<family><percentile>` (`tm98`) or `<family>(<low>:<high>)` (`TM(10%:90%)`, `PR(:300)`),
+/// where one side of a span may be omitted but not both.
+fn bounded_statistic(statistic: &str) -> bool {
+    if let Some(open) = statistic.find('(') {
+        let (family, span) = statistic.split_at(open);
+        return TRIMMED_FAMILIES
+            .iter()
+            .chain(RANK_FAMILIES)
+            .any(|known| known.eq_ignore_ascii_case(family))
+            && is_span(span);
+    }
+    TRIMMED_FAMILIES.iter().any(|family| {
+        strip_prefix_ignore_ascii_case(statistic, family)
+            .and_then(percentage)
+            .is_some()
+    })
+}
+
+/// Whether `span` is a `(<low>:<high>)` bound pair with at least one bound given.
+fn is_span(span: &str) -> bool {
+    let Some(inner) = span
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let Some((low, high)) = inner.split_once(':') else {
+        return false;
+    };
+    !(low.is_empty() && high.is_empty())
+        && [low, high]
+            .iter()
+            .all(|bound| bound.is_empty() || bound_value(bound).is_some())
+}
+
+/// One bound of a span: a percentage when it carries a `%`, otherwise a plain metric value.
+fn bound_value(bound: &str) -> Option<f64> {
+    match bound.strip_suffix('%') {
+        Some(percent) => percentage(percent),
+        None => decimal(bound),
+    }
+}
+
+/// A percentage: a decimal in `0..=100`.
+fn percentage(text: &str) -> Option<f64> {
+    decimal(text).filter(|value| (0.0..=100.0).contains(value))
+}
+
+/// A plain non-negative decimal number, so `f64`'s sign and exponent forms (`+5`, `1e3`,
+/// `inf`) cannot slip through where a statistic's bound is expected.
+fn decimal(text: &str) -> Option<f64> {
+    if text.is_empty()
+        || !text
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.')
+    {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// `text` without `prefix`, comparing the prefix without regard to ASCII case.
+fn strip_prefix_ignore_ascii_case<'text>(text: &'text str, prefix: &str) -> Option<&'text str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
+}
+
+/// The `percentile`-th percentile of a span's published values, by nearest rank.
+///
+/// `None` when the span holds a datapoint whose individual values were never published, or
+/// any negative value: "Percentile statistics are not available for metrics when any of the
+/// metric values are negative numbers." (`GetMetricStatistics`)
+pub fn weighted_percentile(data: &[&StoredDatum], percentile: f64) -> Option<f64> {
+    let mut values: Vec<(f64, f64)> = Vec::with_capacity(data.len());
+    for datum in data {
+        let value = datum.single_value()?;
+        if value < 0.0 {
+            return None;
+        }
+        values.push((value, datum.sample_count));
+    }
+    values.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+    let total: f64 = values.iter().map(|(_, weight)| weight).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let target = percentile / 100.0 * total;
+    let mut seen = 0.0;
+    for (value, weight) in &values {
+        seen += weight;
+        if seen >= target {
+            return Some(*value);
+        }
+    }
+    values.last().map(|(value, _)| *value)
+}
+
+/// One statistic of a span of datapoints by the name a request gives it: one of the basic
+/// five the model names (matched without regard to ASCII case, as the statistic grammar
+/// matches them), or a `pNN` percentile — "It can include any CloudWatch statistic or
+/// extended statistic." (`MetricStat$Stat`). `None` for a name outside both, and for a
+/// statistic the span does not define.
+pub fn statistic_value(data: &[&StoredDatum], statistic: &str) -> Option<f64> {
+    if let Some(canonical) = FOLDED_STATISTICS
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(statistic))
+    {
+        return BasicStatistics::of(data.iter().copied()).named(canonical);
+    }
+    weighted_percentile(data, parse_percentile(statistic)?)
+}
+
 /// A stored metric alarm: the modelled shape `DescribeAlarms` returns, plus the tags
 /// `PutMetricAlarm` accepted (no `MetricAlarm` member carries them).
 #[derive(Debug, Clone, Default)]
