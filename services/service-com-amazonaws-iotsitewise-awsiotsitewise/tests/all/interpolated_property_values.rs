@@ -1096,3 +1096,426 @@ async fn interpolating_changes_nothing_a_later_caller_sees() {
         "GetAssetPropertyValue after interpolating: got {latest}"
     );
 }
+
+/// How the ONE data stream a row addresses by its alias came to exist.
+#[derive(Debug, Clone, Copy)]
+enum Origin {
+    /// Created by alias-addressed ingestion: no asset property has ever carried it.
+    AliasIngest,
+    /// Bound to an asset property, then detached again by
+    /// `DisassociateTimeSeriesFromAssetProperty`, which leaves the stream standing
+    /// under its alias with the samples it held.
+    Disassociated,
+    /// Bound to an asset property and still associated with it.
+    Associated,
+    /// No stream at all: the alias names nothing.
+    Absent,
+}
+
+/// What an alias-addressed interpolation must answer for one row.
+#[derive(Debug)]
+enum Expected {
+    /// 200 with these `doubleValue` points.
+    Doubles(Vec<(At, f64)>),
+    /// 200 with these `integerValue` points.
+    Integers(Vec<(At, i64)>),
+    /// 200 with these `stringValue` points.
+    Strings(Vec<(At, &'static str)>),
+    /// This status and error code.
+    Refused(u16, &'static str),
+}
+
+/// One row of the alias table: how the stream came to exist, the alias that names
+/// it, which fixture property a bound row binds that alias to (and whose data type
+/// the stream therefore carries), the readings it holds as
+/// `(table second, value)`, the interpolation asked for and what must come back.
+struct AliasRow {
+    case: &'static str,
+    alias: &'static str,
+    origin: Origin,
+    property: &'static str,
+    readings: Vec<(i64, Value)>,
+    kind: &'static str,
+    interval: i64,
+    expected: Expected,
+}
+
+/// Write `readings` to the data stream `alias` names through
+/// `BatchPutAssetPropertyValue` addressed by `propertyAlias` alone — the write that
+/// creates the stream when no asset property carries that alias.
+async fn put_readings_by_alias(
+    router: &MultiServiceRouter,
+    alias: &str,
+    readings: &[(i64, Value)],
+) {
+    for (at, (seconds, value)) in readings.iter().enumerate() {
+        let (status, put) = call(
+            router,
+            "POST",
+            "/properties",
+            Some(json!({"entries": [{
+                "entryId": format!("a{at}"),
+                "propertyAlias": alias,
+                "propertyValues": [{
+                    "value": value,
+                    "timestamp": {
+                        "timeInSeconds": anchored(ROW_EPOCH, *seconds),
+                        "offsetInNanos": 0,
+                    },
+                    "quality": "GOOD",
+                }],
+            }]})),
+        )
+        .await;
+        assert_eq!(status, 200, "alias write {at}: got {status} {put}");
+        assert_eq!(
+            put["errorEntries"].as_array().map(Vec::len),
+            Some(0),
+            "alias write {at} must be accepted, got {put}"
+        );
+    }
+}
+
+/// An alias-addressed `GetInterpolatedAssetPropertyValues` URI over the same
+/// 1000..1100 range the tables above use, so an alias-addressed row differs from a
+/// pair-addressed one only in how it names the stream.
+fn alias_uri(alias: &str, kind: &str, interval: i64) -> String {
+    format!(
+        "/properties/interpolated?propertyAlias={alias}\
+         &startTimeInSeconds={start}&startTimeOffsetInNanos=0\
+         &endTimeInSeconds={end}&endTimeOffsetInNanos=0\
+         &intervalInSeconds={interval}&quality=GOOD&type={kind}",
+        start = anchored(ROW_EPOCH, 1_000),
+        end = anchored(ROW_EPOCH, 1_100),
+    )
+}
+
+#[tokio::test]
+async fn an_alias_names_one_stream_whether_or_not_a_property_carries_it() {
+    let router = router();
+
+    // Rows differ along how the stream the alias names came to exist, the data type
+    // it carries (which is the property's for a bound stream and the ingested
+    // value's for one no property owns), and which interpolation is asked for. In
+    // every row the alias names a stream that HOLDS the readings, so the
+    // interpolation is computed from them; only the row whose alias names nothing is
+    // an absent resource.
+    let ramp = || {
+        vec![
+            (1_000, json!({"doubleValue": 0.0})),
+            (1_100, json!({"doubleValue": 100.0})),
+        ]
+    };
+    let ramp_points = || vec![((1_000, 0), 0.0), ((1_050, 0), 50.0), ((1_100, 0), 100.0)];
+    let counts = || {
+        vec![
+            (1_000, json!({"integerValue": 10})),
+            (1_100, json!({"integerValue": 20})),
+        ]
+    };
+    let rows: Vec<AliasRow> = vec![
+        AliasRow {
+            case: "a stream created by alias-addressed ingestion",
+            alias: "/company/windfarm/3/turbine/7/temperature",
+            origin: Origin::AliasIngest,
+            property: "Temperature",
+            readings: ramp(),
+            kind: LINEAR,
+            interval: 50,
+            expected: Expected::Doubles(ramp_points()),
+        },
+        AliasRow {
+            case: "a stream left behind by disassociating it",
+            alias: "/company/windfarm/3/turbine/8/temperature",
+            origin: Origin::Disassociated,
+            property: "Temperature",
+            readings: ramp(),
+            kind: LINEAR,
+            interval: 50,
+            expected: Expected::Doubles(ramp_points()),
+        },
+        AliasRow {
+            case: "a stream still associated with its property",
+            alias: "/company/windfarm/3/turbine/9/temperature",
+            origin: Origin::Associated,
+            property: "Temperature",
+            readings: ramp(),
+            kind: LINEAR,
+            interval: 50,
+            expected: Expected::Doubles(ramp_points()),
+        },
+        AliasRow {
+            // Carrying the last observation forward reads the stream's samples just
+            // as linear interpolation does, so it must reach a disassociated one too.
+            case: "LOCF over a disassociated stream",
+            alias: "/company/windfarm/4/turbine/1/temperature",
+            origin: Origin::Disassociated,
+            property: "Temperature",
+            readings: ramp(),
+            kind: LOCF,
+            interval: 50,
+            expected: Expected::Doubles(vec![
+                ((1_000, 0), 0.0),
+                ((1_050, 0), 0.0),
+                ((1_100, 0), 100.0),
+            ]),
+        },
+        AliasRow {
+            // A stream no property owns carries the data type of the value that
+            // created it, so an INTEGER one reports integers.
+            case: "an INTEGER stream created by alias-addressed ingestion",
+            alias: "/company/windfarm/4/turbine/2/cycles",
+            origin: Origin::AliasIngest,
+            property: "Cycles",
+            readings: counts(),
+            kind: LINEAR,
+            interval: 50,
+            expected: Expected::Integers(vec![
+                ((1_000, 0), 10),
+                ((1_050, 0), 15),
+                ((1_100, 0), 20),
+            ]),
+        },
+        AliasRow {
+            case: "an INTEGER stream left behind by disassociating it",
+            alias: "/company/windfarm/4/turbine/3/cycles",
+            origin: Origin::Disassociated,
+            property: "Cycles",
+            readings: counts(),
+            kind: LINEAR,
+            interval: 50,
+            expected: Expected::Integers(vec![
+                ((1_000, 0), 10),
+                ((1_050, 0), 15),
+                ((1_100, 0), 20),
+            ]),
+        },
+        AliasRow {
+            // Carrying a reading forward copies it, so it is defined for a stream
+            // whose readings are not numbers.
+            case: "LOCF over a STRING stream no property owns",
+            alias: "/company/windfarm/4/turbine/4/status",
+            origin: Origin::AliasIngest,
+            property: "Status",
+            readings: vec![(1_000, json!({"stringValue": "RUNNING"}))],
+            kind: LOCF,
+            interval: 50,
+            expected: Expected::Strings(vec![
+                ((1_000, 0), "RUNNING"),
+                ((1_050, 0), "RUNNING"),
+                ((1_100, 0), "RUNNING"),
+            ]),
+        },
+        AliasRow {
+            // The arithmetic has no meaning for a STRING stream, and the stream's
+            // own data type is what says so whether a property owns it or not.
+            case: "linear interpolation of a STRING stream no property owns",
+            alias: "/company/windfarm/4/turbine/5/status",
+            origin: Origin::AliasIngest,
+            property: "Status",
+            readings: vec![(1_000, json!({"stringValue": "RUNNING"}))],
+            kind: LINEAR,
+            interval: 50,
+            expected: Expected::Refused(400, "InvalidRequestException"),
+        },
+        AliasRow {
+            case: "an alias no stream answers to",
+            alias: "/company/windfarm/9/turbine/9/temperature",
+            origin: Origin::Absent,
+            property: "Temperature",
+            readings: Vec::new(),
+            kind: LINEAR,
+            interval: 50,
+            expected: Expected::Refused(404, "ResourceNotFoundException"),
+        },
+    ];
+
+    for (index, row) in rows.into_iter().enumerate() {
+        let case = row.case;
+        // Seed the stream the way this row's origin creates it. A bound row gets its
+        // own asset, so no row depends on what another one left behind.
+        match row.origin {
+            Origin::AliasIngest => put_readings_by_alias(&router, row.alias, &row.readings).await,
+            Origin::Absent => {}
+            Origin::Associated | Origin::Disassociated => {
+                let (asset_id, properties) =
+                    asset_with_properties(&router, &format!("AliasTurbine{index}")).await;
+                let property = property_id(&properties, row.property);
+                let (status, bound) = call(
+                    &router,
+                    "PUT",
+                    &format!("/assets/{asset_id}/properties/{property}"),
+                    Some(json!({"propertyAlias": row.alias})),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: binding the alias got {status} {bound}"
+                );
+                let readings: Vec<Reading> = row
+                    .readings
+                    .iter()
+                    .map(|(seconds, value)| (*seconds, 0, value.clone(), Some("GOOD")))
+                    .collect();
+                put_readings(&router, &asset_id, &property, &readings).await;
+                if matches!(row.origin, Origin::Disassociated) {
+                    let (status, detached) = call(
+                        &router,
+                        "POST",
+                        &format!(
+                            "/timeseries/disassociate?alias={}&assetId={asset_id}\
+                             &propertyId={property}",
+                            row.alias
+                        ),
+                        None,
+                    )
+                    .await;
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?}: disassociating got {status} {detached}"
+                    );
+                }
+            }
+        }
+
+        // The premise of every seeded row: the alias names a stream this service
+        // reports, so the interpolation below is not asked about an absent resource.
+        let (status, described) = call(
+            &router,
+            "GET",
+            &format!("/timeseries/describe?alias={}", row.alias),
+            None,
+        )
+        .await;
+        let expected_describe = if matches!(row.origin, Origin::Absent) {
+            404
+        } else {
+            200
+        };
+        assert_eq!(
+            status, expected_describe,
+            "case {case:?}: DescribeTimeSeries expected {expected_describe}, \
+             got {status} {described}"
+        );
+
+        let (status, body) = call(
+            &router,
+            "GET",
+            &alias_uri(row.alias, row.kind, row.interval),
+            None,
+        )
+        .await;
+        match row.expected {
+            Expected::Doubles(expected) => {
+                assert_eq!(status, 200, "case {case:?}: got {status} {body}");
+                assert_doubles(case, &body, &expected);
+            }
+            Expected::Integers(expected) => {
+                assert_eq!(status, 200, "case {case:?}: got {status} {body}");
+                let actual: Vec<(At, Option<i64>)> = points(&body)
+                    .into_iter()
+                    .map(|(timestamp, value)| (timestamp, value["integerValue"].as_i64()))
+                    .collect();
+                let want: Vec<(At, Option<i64>)> = expected
+                    .into_iter()
+                    .map(|(timestamp, value)| (timestamp, Some(value)))
+                    .collect();
+                assert_eq!(
+                    actual, want,
+                    "case {case:?}: expected {want:?}, got {actual:?} ({body})"
+                );
+            }
+            Expected::Strings(expected) => {
+                assert_eq!(status, 200, "case {case:?}: got {status} {body}");
+                let actual: Vec<(At, Option<String>)> = points(&body)
+                    .into_iter()
+                    .map(|(timestamp, value)| {
+                        (
+                            timestamp,
+                            value["stringValue"].as_str().map(str::to_string),
+                        )
+                    })
+                    .collect();
+                let want: Vec<(At, Option<String>)> = expected
+                    .into_iter()
+                    .map(|(timestamp, value)| (timestamp, Some(value.to_string())))
+                    .collect();
+                assert_eq!(
+                    actual, want,
+                    "case {case:?}: expected {want:?}, got {actual:?} ({body})"
+                );
+            }
+            Expected::Refused(expected_status, expected_code) => {
+                assert_eq!(
+                    status, expected_status,
+                    "case {case:?}: expected {expected_status}, got {status} {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    expected_code,
+                    "case {case:?}: expected {expected_code}, got {body}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_pair_form_names_the_property_by_the_modelled_id_form() {
+    let router = router();
+    // This operation models `propertyId` as `ID` — len 36..36 and the UUID pattern,
+    // from `smithy_query(query="operation", operation="GetInterpolatedAssetPropertyValues")`
+    // — and NOT as `CustomID`, so the minted id is the only form that reaches the
+    // handler and the `externalId:<externalId>` form a `CustomID` member accepts is
+    // refused by that constraint. The property below carries an external id so the
+    // refused form names a property that really exists.
+    const EXTERNAL: &str = "turbine-temperature";
+    let model_id = create_model(
+        &router,
+        "ExternalIdTurbineModel",
+        json!([{
+            "name": "Temperature",
+            "externalId": EXTERNAL,
+            "dataType": "DOUBLE",
+            "type": {"measurement": {}},
+        }]),
+    )
+    .await;
+    let asset_id = create_asset(&router, "ExternalIdTurbine", &model_id).await;
+    let (status, asset) = call(&router, "GET", &format!("/assets/{asset_id}"), None).await;
+    assert_eq!(status, 200, "DescribeAsset: got {status} {asset}");
+    let temperature = property_id(&asset["assetProperties"], "Temperature");
+    put_readings(
+        &router,
+        &asset_id,
+        &temperature,
+        &[
+            (1_000, 0, json!({"doubleValue": 0.0}), Some("GOOD")),
+            (1_100, 0, json!({"doubleValue": 100.0}), Some("GOOD")),
+        ],
+    )
+    .await;
+
+    let external_label = format!("externalId:{EXTERNAL}");
+    let expected = [((1_000, 0), 0.0), ((1_050, 0), 50.0), ((1_100, 0), 100.0)];
+    for (case, property, accepted) in [
+        ("the minted id", temperature.as_str(), true),
+        ("the external id form", external_label.as_str(), false),
+    ] {
+        let request = Request {
+            interval: 50,
+            ..base(&asset_id, property)
+        };
+        let (status, body) = call(&router, "GET", &request.uri(), None).await;
+        if accepted {
+            assert_eq!(status, 200, "case {case:?}: got {status} {body}");
+            assert_doubles(case, &body, &expected);
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a propertyId outside the modelled ID form is refused, \
+                 got {status} {body}"
+            );
+        }
+    }
+}

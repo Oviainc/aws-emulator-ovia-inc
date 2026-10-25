@@ -232,6 +232,168 @@ async fn an_untouched_lever_is_disengaged_and_names_itself() {
     }
 }
 
+/// The member names `SafetyLever` declares, and nothing else.
+///
+/// SOURCE: the model's `com.amazonaws.fis#SafetyLever` structure
+/// (`smithy_query(query="shape",shape="SafetyLever")`), whose members are `id`, `arn` and
+/// `state`.
+const SAFETY_LEVER_MEMBERS: [&str; 3] = ["id", "arn", "state"];
+
+/// The member names `SafetyLeverState` declares.
+///
+/// SOURCE: the model's `com.amazonaws.fis#SafetyLeverState` structure.
+const SAFETY_LEVER_STATE_MEMBERS: [&str; 2] = ["status", "reason"];
+
+/// The keys of a JSON object, or a panic naming `case` when it is not one.
+fn keys(case: &str, what: &str, value: &Value) -> Vec<String> {
+    let object = value
+        .as_object()
+        .unwrap_or_else(|| panic!("case {case:?}: expected {what} to be an object, got {value:?}"));
+    object.keys().cloned().collect()
+}
+
+#[tokio::test]
+async fn the_reported_lever_carries_only_the_members_the_model_declares() {
+    // The rows differ along what the lever has been asked for, which is what decides
+    // whether `reason` is carried and which status is reported: an untouched lever, one
+    // whose engage is still taking effect, and a disengaged one.
+    let cases: [(&str, Option<&str>); 3] = [
+        ("untouched", None),
+        ("engaged", Some("engaged")),
+        ("disengaged", Some("disengaged")),
+    ];
+
+    for (case, requested) in cases {
+        let router = emulator();
+        if let Some(requested) = requested {
+            let updated = update_lever(&router, LEVER_ID, requested, case, REGION).await;
+            assert_eq!(
+                updated.status, 200,
+                "case {case:?}: expected HTTP 200 from UpdateSafetyLeverState, got {} with {:?}",
+                updated.status, updated.body
+            );
+        }
+
+        let answer = get_lever(&router, LEVER_ID, REGION).await;
+        assert_eq!(
+            keys(case, "the GetSafetyLever body", &answer.body),
+            vec!["safetyLever".to_string()],
+            "case {case:?}: expected only the modelled output member, got {:?}",
+            answer.body
+        );
+
+        let reported = lever(case, &answer, "safetyLever", REGION);
+        for member in keys(case, "the safetyLever", &reported) {
+            assert!(
+                SAFETY_LEVER_MEMBERS.contains(&member.as_str()),
+                "case {case:?}: {member:?} is not a member SafetyLever declares, got {reported:?}"
+            );
+        }
+        for member in SAFETY_LEVER_MEMBERS {
+            assert!(
+                !reported[member].is_null(),
+                "case {case:?}: expected the lever to carry {member:?}, got {reported:?}"
+            );
+        }
+
+        let state = reported["state"].clone();
+        for member in keys(case, "the lever state", &state) {
+            assert!(
+                SAFETY_LEVER_STATE_MEMBERS.contains(&member.as_str()),
+                "case {case:?}: {member:?} is not a member SafetyLeverState declares, got {state:?}"
+            );
+        }
+        let status = status_of(&reported);
+        assert!(
+            REPORTABLE_STATUSES.contains(&status.as_str()),
+            "case {case:?}: expected a modelled SafetyLeverStatus, got {state:?}"
+        );
+        match requested {
+            // An update stores the reason it was given, so the lever carries it.
+            Some(_) => assert_eq!(
+                state["reason"].as_str().unwrap_or_default(),
+                case,
+                "case {case:?}: expected the stored reason, got {state:?}"
+            ),
+            // Nothing has stored one, so the member is absent rather than invented.
+            None => assert!(
+                state["reason"].is_null(),
+                "case {case:?}: expected no reason on an untouched lever, got {state:?}"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn reading_the_lever_never_disturbs_the_transition_the_clock_owes() {
+    // The rows differ along HOW OFTEN the lever is read inside the window the engage takes
+    // to come into effect: reads are reporting, so the count must make no difference to
+    // what the lever settles at, and no read may walk the status backwards.
+    for reads in [1_usize, 4, 16, 64] {
+        let case = format!("reads-{reads}");
+        let router = emulator();
+        let reason = format!("polled {reads} times");
+
+        let engaged = update_lever(&router, LEVER_ID, "engaged", &reason, REGION).await;
+        let reported = lever(&case, &engaged, "safetyLever", REGION);
+        assert_eq!(
+            status_of(&reported),
+            "engaging",
+            "case {case:?}: the engage is taking effect, got {reported:?}"
+        );
+
+        let mut settled_already = false;
+        for index in 0..reads {
+            let read = get_lever(&router, LEVER_ID, REGION).await;
+            let read_lever = lever(&case, &read, "safetyLever", REGION);
+            let status = status_of(&read_lever);
+            assert!(
+                status == "engaging" || status == "engaged",
+                "case {case:?}: read {index} expected engaging or engaged, got {read_lever:?}"
+            );
+            // Once the clock has moved the lever on, it stays on: a read never takes it
+            // back to the transient status.
+            if settled_already {
+                assert_eq!(
+                    status, "engaged",
+                    "case {case:?}: read {index} went back to {status:?}, got {read_lever:?}"
+                );
+            }
+            settled_already |= status == "engaged";
+            assert_eq!(
+                read_lever["state"]["reason"].as_str().unwrap_or_default(),
+                reason,
+                "case {case:?}: read {index} changed the stored reason, got {read_lever:?}"
+            );
+        }
+
+        // However often it was read, the transition the engage owed falls due on the
+        // clock, not on the reads.
+        tokio::time::sleep(PAST_TRANSITION).await;
+        let after = get_lever(&router, LEVER_ID, REGION).await;
+        let after_lever = lever(&case, &after, "safetyLever", REGION);
+        assert_eq!(
+            status_of(&after_lever),
+            "engaged",
+            "case {case:?}: expected the engage to have taken effect, got {after_lever:?}"
+        );
+        assert_eq!(
+            after_lever["state"]["reason"].as_str().unwrap_or_default(),
+            reason,
+            "case {case:?}: expected the stored reason to survive the reads, got {after_lever:?}"
+        );
+
+        // And a read after it settled still changes nothing a later caller sees.
+        let again = get_lever(&router, LEVER_ID, REGION).await;
+        assert_eq!(
+            again.member("safetyLever"),
+            &after_lever,
+            "case {case:?}: a later read reports the same lever, got {:?}",
+            again.body
+        );
+    }
+}
+
 /// One step of a case: the state the request asks for, the status the update itself
 /// reports back, and the status a read reports once every transition the clock owes the
 /// lever has fallen due.

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutProfileOutboundRequestBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutProfileOutboundRequestBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes a batch of profile outbound requests into a campaign's profile buffer. The
+//! campaign is resolved first — an id the store does not hold is the modelled
+//! `ResourceNotFoundException` (HTTP 404) — then its lifecycle state: a campaign takes
+//! outbound requests only while it is `Running`, and any other state is the modelled
+//! `InvalidCampaignStateException` (HTTP 409) carrying that state. Both are the rules
+//! `PutOutboundRequestBatch` applies to a dial batch; the two differ only in which
+//! buffer they write and in the per-request failure catalog they report through.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutProfileOutboundRequestBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each request of the batch is then reported on its own, as the response's two lists
+//! say: one whose `expirationTime` the clock has already passed fails with
+//! `InvalidInput`, one past the campaign's buffer ceiling
+//! (`crate::state::MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN`) with `Conflict`, and anything
+//! else is taken under a minted `ProfileOutboundRequestId`. `expirationTime` is
+//! optional here, so a request that carries none never expires. The call is idempotent,
+//! as the model's documentation says ("This API is idempotent"): a `clientToken` whose
+//! request the campaign still has pending is answered with the id it was given then,
+//! and stores nothing further.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +164,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutProfileOutboundRequestBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutProfileOutboundRequestBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutProfileOutboundRequestBatch"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutProfileOutboundRequestBatchErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the ConnectCampaignsV2 campaign store is unavailable"
+                            .to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // One instant for the whole batch, so every request of it is weighed against
+        // the same clock reading.
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let Some(campaign) = store.campaign(&input.id) else {
+            return Err(
+                PutProfileOutboundRequestBatchErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A campaign places requests only while it is running: an Initialized, Paused,
+        // Stopped, Completed or Failed campaign is not reaching out to anyone, so it
+        // takes no outbound requests and the refusal names the state it is in. The
+        // state is the one the campaign is at NOW — a campaign whose scheduled run
+        // window has closed is past placing requests even though the last call wrote
+        // `Running`.
+        let current = campaign.state_at(now);
+        if current != crate::state::CampaignState::Running {
+            return Err(
+                PutProfileOutboundRequestBatchErrorModeled::InvalidCampaignStateException(
+                    InvalidCampaignStateException {
+                        state: current.as_wire().to_string(),
+                        message: format!(
+                            "Campaign {} is {} and takes outbound requests only while Running",
+                            input.id,
+                            current.as_wire()
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut successful_requests = Vec::new();
+        let mut failed_requests = Vec::new();
+        for request in &input.profile_outbound_requests {
+            // The event this request was triggered by, when the caller named one: part
+            // of the record, so a later reader of the buffer has what was submitted.
+            let source_event = request
+                .event_trigger_context
+                .as_ref()
+                .and_then(|context| context.source_event.as_deref());
+            let outcome = store.take_profile_outbound_request(
+                &input.id,
+                &request.client_token,
+                &request.profile_id,
+                request.expiration_time,
+                source_event,
+                now,
+            );
+            match outcome {
+                Some(crate::state::OutboundRequestOutcome::Taken(id)) => {
+                    successful_requests.push(SuccessfulProfileOutboundRequest {
+                        client_token: Some(request.client_token.clone()),
+                        id: Some(id),
+                    });
+                }
+                // Both codes below are from the model's own
+                // `ProfileOutboundRequestFailureCode` catalog
+                // (`PROFILE_OUTBOUND_REQUEST_FAILURE_CODE_VALUES` in
+                // `crate::ops::types`): a buffer that cannot take another request is a
+                // conflict with the campaign's current state, and a request that can
+                // never be placed is invalid input.
+                Some(crate::state::OutboundRequestOutcome::BufferFull) => {
+                    failed_requests.push(FailedProfileOutboundRequest {
+                        client_token: Some(request.client_token.clone()),
+                        id: None,
+                        failure_code: Some("Conflict".to_string()),
+                    });
+                }
+                Some(crate::state::OutboundRequestOutcome::Expired) => {
+                    failed_requests.push(FailedProfileOutboundRequest {
+                        client_token: Some(request.client_token.clone()),
+                        id: None,
+                        failure_code: Some("InvalidInput".to_string()),
+                    });
+                }
+                // The campaign was resolved above under the guard this walk still
+                // holds, so it cannot have gone; answered rather than panicked on.
+                None => {
+                    return Err(
+                        PutProfileOutboundRequestBatchErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: format!(
+                                    "campaign {} went missing while its batch was being taken",
+                                    input.id
+                                ),
+                                x_amz_error_type: None,
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            }
+        }
+
+        // Both lists are always present, including when one is empty: a client reads
+        // the outcome of every request it sent out of them.
+        Ok(PutProfileOutboundRequestBatchOutput {
+            successful_requests: Some(successful_requests),
+            failed_requests: Some(failed_requests),
+        })
     }
 }
+

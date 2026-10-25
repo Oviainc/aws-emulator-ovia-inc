@@ -25,15 +25,14 @@
 //! Every modelled input constraint — `OptInLevel`'s and `OptInType`'s value sets, the
 //! `NotificationArn` length and pattern, the exclusion list's key and member
 //! patterns — is refused by the boundary validator BEFORE this handler runs, so
-//! reaching here means the configuration is well formed and there is nothing left
-//! for this handler to refuse.
+//! reaching here means the configuration is well formed.
 //!
-//! Accepting and storing `OptInType = NotifyAndAdjust` is deliberate: the model's
-//! `OptInType` enum declares it, so the boundary validator admits it and refusing it
-//! here would refuse a value the model allows. The doc below adds "Currently, only
-//! NotifyOnly is available", which is an availability note on the real service's
-//! rollout rather than a modelled constraint — so a real call naming
-//! `NotifyAndAdjust` may be refused where this emulator records it.
+//! What the model cannot state, and this handler therefore does, is that only SOME of
+//! the modes the `OptInType` enum declares are available yet: the member's own
+//! documentation (below) names the available subset, so a mode outside it is refused
+//! with the modelled `IllegalArgumentException` instead of being stored — see
+//! [`crate::state::AVAILABLE_OPT_IN_TYPES`]. Storing one would report a mode neither
+//! the service nor this emulator acts on.
 //!
 //! ---
 //!
@@ -135,6 +134,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // An opt-in type the service does not offer yet is refused before anything is
+        // read or written: it is a fact of the REQUEST, the way the constraints the
+        // boundary validator checks just before this are.
+        if !crate::state::opt_in_type_is_available(&input.opt_in_type) {
+            return Err(StartAutoManagementErrorModeled::IllegalArgumentException(
+                IllegalArgumentException {
+                    message: Some(crate::state::unavailable_opt_in_type_message()),
+                },
+            )
+            .into());
+        }
+
         // The configuration is account-wide, so the caller's region does not pick a
         // state bucket here the way it does for the per-region quota state.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
