@@ -102,9 +102,29 @@ pub(crate) fn seed_demo_role(engine: &engine::InMemoryEngine) -> (String, String
 /// seed IAM's records directly in the one shared engine STS reads them from; the
 /// cross-service suite in `core/router/tests/` mounts both.
 pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    emulator_mounting(false)
+}
+
+/// [`emulator`] with IAM MOUNTED beside STS on the one shared engine, as
+/// `core/router/src/lib.rs` mounts them.
+///
+/// For a suite whose rule spans the two services — a role's trust policy is WRITTEN by
+/// `iam:UpdateAssumeRolePolicy` and DECIDED by `sts:AssumeRole` — so the document the
+/// decision reads is the one IAM's own handler stored rather than a value the test poked
+/// into the store.
+pub(crate) fn emulator_with_iam() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    emulator_mounting(true)
+}
+
+/// The one router construction the two constructors above share: one engine, request
+/// authentication off, STS mounted, and IAM beside it when `with_iam`.
+fn emulator_mounting(with_iam: bool) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
+    if with_iam {
+        router.register_service(iam::EmulatedService::new(Arc::clone(&engine)));
+    }
     router.register_service(sts::EmulatedService::new(Arc::clone(&engine)));
     (router, engine)
 }
@@ -129,14 +149,47 @@ pub(crate) fn form_value(value: &str) -> String {
         .collect()
 }
 
-/// One awsQuery call, signed (in the routing sense) with `access_key_id`.
+/// One STS awsQuery call, signed (in the routing sense) with `access_key_id`: this
+/// service's signing name and API version through [`query`].
 pub(crate) async fn call(
     router: &MultiServiceRouter,
     access_key_id: &str,
     action: &str,
     params: &[(&str, String)],
 ) -> (u16, String) {
-    let mut body = format!("Action={action}&Version=2011-06-15");
+    query(
+        router,
+        access_key_id,
+        STS_SIGNING_NAME,
+        STS_API_VERSION,
+        action,
+        params,
+    )
+    .await
+}
+
+/// This service's SigV4 signing name, the scope every call of these suites is signed
+/// under.
+pub(crate) const STS_SIGNING_NAME: &str = "sts";
+
+/// This service's awsQuery API version, the `Version` every call carries.
+pub(crate) const STS_API_VERSION: &str = "2011-06-15";
+
+/// One awsQuery call against `signing_name`, signed (in the routing sense) with
+/// `access_key_id`.
+///
+/// The signing name is a parameter because a suite that mounts ANOTHER service beside
+/// this one on the same engine — a role's trust policy is written by `iam`, not by `sts`
+/// — drives both through this one helper rather than a second copy of it.
+pub(crate) async fn query(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    signing_name: &str,
+    version: &str,
+    action: &str,
+    params: &[(&str, String)],
+) -> (u16, String) {
+    let mut body = format!("Action={action}&Version={version}");
     for (name, value) in params {
         body.push('&');
         body.push_str(name);
@@ -144,12 +197,13 @@ pub(crate) async fn call(
         body.push_str(&form_value(value));
     }
     let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/us-east-1/sts/aws4_request, \
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/us-east-1/{signing_name}/aws4_request, \
          SignedHeaders=host;x-amz-date, Signature=0123456789abcdef"
     );
     let request = http::Request::builder()
         .method("POST")
-        .uri("https://sts.amazonaws.com/")
+        .uri(format!("https://{signing_name}.amazonaws.com/"))
+        .header("host", format!("{signing_name}.amazonaws.com"))
         .header("content-type", "application/x-www-form-urlencoded")
         .header("authorization", authorization)
         .body(bytes::Bytes::from(body))

@@ -533,6 +533,17 @@ pub fn rule_not_found_message(arn: &str) -> String {
     format!("Rule '{arn}' not found")
 }
 
+/// The message Elastic Load Balancing answers a `PriorityInUse` with: the priority the
+/// request asked for, and the listener whose rules already evaluate at it.
+///
+/// One message for every operation that places a rule at a priority — `CreateRule` and
+/// `SetRulePriorities` — because "a listener can't have multiple rules with the same
+/// priority" is ONE rule of the service, and the listener is named because the priority
+/// lives in that listener's own namespace: the same number on another listener is free.
+pub fn priority_in_use_message(priority: i32, listener_arn: &str) -> String {
+    format!("Priority '{priority}' is in use on listener '{listener_arn}'")
+}
+
 /// The published maximum length of a load balancer name, from `CreateLoadBalancer`'s
 /// `Name` documentation: "can have a maximum of 32 characters".
 pub const LOAD_BALANCER_NAME_MAX_LENGTH: usize = 32;
@@ -2794,7 +2805,11 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
 /// The ARN of the listener the rule `arn` belongs to, or `None` when `arn` carries no
 /// rule id at all. A pure string transform of the rule ARN: the two differ in their
 /// resource type and in the rule id the rule ARN appends.
-fn rule_listener_arn(arn: &str) -> Option<String> {
+///
+/// Public because a rule's PRIORITY lives in its listener's own namespace, so an
+/// operation that re-prioritises rules has to group what it was asked for by listener
+/// ([`crate::ops::set_rule_priorities`]).
+pub fn rule_listener_arn(arn: &str) -> Option<String> {
     let (listener_part, _rule_id) = arn.rsplit_once('/')?;
     Some(listener_part.replacen(":listener-rule/", ":listener/", 1))
 }

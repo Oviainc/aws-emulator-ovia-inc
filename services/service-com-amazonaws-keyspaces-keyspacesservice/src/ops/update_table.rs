@@ -678,6 +678,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 capacity.throughput_mode != crate::state::PROVISIONED_THROUGHPUT_MODE;
             if leaves_provisioned_mode {
                 table.auto_scaling_specification = None;
+                // The same rule reaches the per-Region settings: besides the Region it
+                // names, a `ReplicaSpecification` carries only that Region's
+                // `readCapacityUnits` and its `readCapacityAutoScaling`, and both belong
+                // to provisioned mode — which is why
+                // `crate::state::resolve_replica_specifications` refuses either outside
+                // it. So a table moved out of that mode keeps no per-Region setting,
+                // exactly as a table restored into another mode keeps none of its
+                // source's, and no reader can report a combination a request would be
+                // refused for.
+                table.replica_specifications.clear();
             }
             table.capacity_specification = Some(capacity);
         }

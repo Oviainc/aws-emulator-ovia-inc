@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetRulePriorities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetRulePriorities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetRulePriorities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Re-prioritises the rules the request names: each `RulePriorityPair` moves ONE rule a
+//! caller added to the priority it carries, and "any existing rules that you do not
+//! specify retain their current priority".
+//!
+//! A rule's priority lives in its LISTENER's own namespace — "a listener can't have
+//! multiple rules with the same priority" — so the conflict this operation refuses is
+//! decided per listener, over the order the whole request LEAVES BEHIND: the new priority
+//! of every rule the request names, together with the current priority of every rule of
+//! that listener it does not. That is what lets two rules swap priorities in one call,
+//! and why the same number already in use on ANOTHER listener is no conflict at all.
+//! Two rules of one listener landing on one priority is the modelled
+//! `PriorityInUseException`.
+//!
+//! The rules are read and written on their listener's record, the one rule store
+//! `DescribeRules` walks, so a priority this operation persists is the priority that read
+//! reports. A rule the store does not hold is the modelled `RuleNotFoundException`, and a
+//! listener's DEFAULT rule has no priority to set — AWS reports its priority as
+//! `default`, not a number — so naming it is the modelled `OperationNotPermittedException`.
+//! Nothing is written until every pair has been resolved, so a refused request leaves
+//! every priority as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -69,6 +81,15 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How many rules one call may re-prioritise through `RulePriorities`.
+///
+/// The model declares no length constraint for that member, so nothing bounds what one
+/// request can ask this write to resolve: this is the emulator's own bound on the list,
+/// far above any workflow it serves (AWS publishes a quota of 100 rules per Application
+/// Load Balancer), and it is what stops one request's work growing without end. The same
+/// bound its sibling read puts on `RuleArns`.
+const MAX_RULES_PER_CALL: usize = 100;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,18 +161,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetRulePriorities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetRulePrioritiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetRulePriorities"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("SetRulePriorities")
+        })?;
+
+        // Everything read off the REQUEST alone is checked before the store is reached:
+        // the list is bounded, a pair that names no rule, or no priority to move it to,
+        // asks for nothing the store could serve, and one rule cannot evaluate at two
+        // priorities at once.
+        if input.rule_priorities.len() > MAX_RULES_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "RulePriorities can name at most {MAX_RULES_PER_CALL} rules in a single call, got {}",
+                input.rule_priorities.len()
+            )));
+        }
+        let mut asked: Vec<(String, i32)> = Vec::with_capacity(input.rule_priorities.len());
+        for pair in &input.rule_priorities {
+            let Some(rule_arn) = pair.rule_arn.clone() else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    "Each RulePriorities entry must name a RuleArn",
+                ));
+            };
+            let Some(priority) = pair.priority else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "The RulePriorities entry for rule '{rule_arn}' must name a Priority"
+                )));
+            };
+            if asked.iter().any(|(named, _)| named == &rule_arn) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "RulePriorities names rule '{rule_arn}' more than once"
+                )));
+            }
+            asked.push((rule_arn, priority));
+        }
+
+        let mut guard = state.lock();
+
+        // Every pair is resolved before anything is written, so the whole request is
+        // applied or none of it is. A rule is resolved through the very read that
+        // REPORTS it, which is why a listener's default rule resolves here too — and is
+        // the one rule whose priority this operation refuses to set.
+        let mut moves: Vec<Move> = Vec::with_capacity(asked.len());
+        for (rule_arn, priority) in asked {
+            let Some(rule) = guard.rule_by_arn(&rule_arn) else {
+                return Err(rule_not_found(&rule_arn));
+            };
+            if rule.is_default.unwrap_or(false) {
+                return Err(SetRulePrioritiesErrorModeled::OperationNotPermittedException(
+                    OperationNotPermittedException {
+                        message: Some(format!(
+                            "Rule '{rule_arn}' is the default rule of its listener and its \
+                             priority cannot be set"
+                        )),
+                    },
+                )
+                .into());
+            }
+            let Some(listener_arn) = crate::state::rule_listener_arn(&rule_arn) else {
+                // Unreachable for an ARN the read above resolved: the owning listener is
+                // a pure string transform of the rule ARN. Were it ever absent, the rule
+                // is one this store cannot hold.
+                return Err(rule_not_found(&rule_arn));
+            };
+            moves.push(Move {
+                listener_arn,
+                rule_arn,
+                priority,
+            });
+        }
+
+        // The conflict is decided over the order the request LEAVES BEHIND, per listener:
+        // the new priority of each rule it names, and the current priority of every rule
+        // of that listener it does not. The default rule is not in it — its priority is
+        // reported as `default` rather than a number — so it never conflicts.
+        for listener_arn in distinct_listeners(&moves) {
+            let Some(listener) = guard.listeners.get(listener_arn) else {
+                // Resolved above under this same lock, so nothing can have released it.
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::listener_not_found_message(listener_arn),
+                ));
+            };
+            let mut taken: Vec<i32> = Vec::with_capacity(listener.rules.len());
+            for rule in &listener.rules {
+                let priority = moves
+                    .iter()
+                    .find(|moved| moved.rule_arn == rule.arn)
+                    .map_or(rule.priority, |moved| moved.priority);
+                if taken.contains(&priority) {
+                    return Err(SetRulePrioritiesErrorModeled::PriorityInUseException(
+                        PriorityInUseException {
+                            message: Some(crate::state::priority_in_use_message(
+                                priority,
+                                listener_arn,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                taken.push(priority);
+            }
+        }
+
+        // Nothing is left to refuse, so the moves are written and the rules they moved
+        // are answered — in the order the request named them.
+        let mut moved = Vec::with_capacity(moves.len());
+        for Move {
+            listener_arn,
+            rule_arn,
+            priority,
+        } in &moves
+        {
+            let Some(record) = guard
+                .listeners
+                .get_mut(listener_arn)
+                .and_then(|listener| listener.rules.iter_mut().find(|rule| &rule.arn == rule_arn))
+            else {
+                // The rule was resolved above under this same lock, so nothing can have
+                // released it; were it ever gone, that is the modelled refusal for it.
+                return Err(rule_not_found(rule_arn));
+            };
+            record.priority = *priority;
+            moved.push(record.to_shape());
+        }
+
+        Ok(SetRulePrioritiesOutput {
+            rules: Some(moved),
+        })
     }
+}
+
+/// One rule this call moves: the listener whose priority namespace the move lands in, the
+/// rule itself, and the priority it is to evaluate at.
+struct Move {
+    listener_arn: String,
+    rule_arn: String,
+    priority: i32,
+}
+
+/// The listeners the moves touch, each once: the namespaces a conflict can arise in.
+/// Request order, so a refusal names the first listener the request broke.
+fn distinct_listeners(moves: &[Move]) -> Vec<&str> {
+    let mut listeners: Vec<&str> = Vec::new();
+    for moved in moves {
+        let listener_arn = moved.listener_arn.as_str();
+        if !listeners.contains(&listener_arn) {
+            listeners.push(listener_arn);
+        }
+    }
+    listeners
+}
+
+/// The refusal for a `RuleArn` this store holds no rule for. The identifier the request
+/// carried is the only thing the caller can act on, so the message names it
+/// ([`crate::state::rule_not_found_message`]).
+fn rule_not_found(arn: &str) -> SetRulePrioritiesError {
+    SetRulePrioritiesErrorModeled::RuleNotFoundException(RuleNotFoundException {
+        message: Some(crate::state::rule_not_found_message(arn)),
+    })
+    .into()
 }

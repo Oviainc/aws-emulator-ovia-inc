@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use ::aws_smithy_types::DateTime;
 
-use crate::ops::types::{ActivityReward, MonetaryAmount};
+use crate::ops::types::{ActivityReward, MonetaryAmount, LANGUAGE_CODE_VALUES};
 
 /// `AccountPlanType` values, from the model's enum of the same name
 /// (`shared_types::ACCOUNT_PLAN_TYPE_VALUES`).
@@ -485,6 +485,63 @@ pub fn page_size(max_results: i32) -> usize {
         max_results
     };
     usize::try_from(requested).unwrap_or(DEFAULT_MAX_RESULTS as usize)
+}
+
+/// Cut the rows a request selected down to one page and issue the `nextToken`
+/// that resumes the listing after it.
+///
+/// The third part of the pagination rule whose other two parts are
+/// [`encode_page_token`]/[`decode_page_token`] and [`page_size`], stated here
+/// ONCE so both paginated operations page by the same rule: a page reports at
+/// most `page_size` of the selected rows, in the order they were selected, and
+/// a token is issued only while a selected row is still unreported — the
+/// `@paginated` contract is that an absent token ends the iteration, so an
+/// exactly-filled last page carries none.
+///
+/// `rows` pairs each selected item with its position in the STORED order, so
+/// the token the page issues is an offset into the stored collection and not
+/// into the filtered view: changing the filter between pages cannot make a page
+/// resume in the middle of a row it already reported. `kind` names the listing
+/// the token belongs to, so a token one paginated operation issued is not
+/// accepted by the other.
+pub fn cut_page<'rows, T>(
+    kind: &str,
+    rows: &'rows [(usize, T)],
+    page_size: usize,
+) -> (&'rows [(usize, T)], Option<String>) {
+    let page = &rows[..page_size.min(rows.len())];
+    let next_token = match page.last() {
+        Some((position, _)) if rows.len() > page.len() => {
+            Some(encode_page_token(kind, position + 1))
+        }
+        _ => None,
+    };
+    (page, next_token)
+}
+
+/// Whether a request's `languageCode` names a language an activity reader can
+/// answer in, and the message refusing it when it does not.
+///
+/// The sibling of [`LocalizedText::in_language`], which resolves the codes this
+/// accepts: both activity readers document `languageCode` as the code the
+/// translated text is returned in, so a value outside the modelled
+/// `LanguageCode` enum (`crate::ops::types::LANGUAGE_CODE_VALUES`) names no
+/// language the catalog could be read in and is refused rather than silently
+/// answered in another. An absent code is accepted: the member is optional and
+/// [`DEFAULT_LANGUAGE_CODE`] answers it.
+///
+/// `None` means the code is one a reader can answer. `Some(message)` is the
+/// refusal's message, which each reader raises inside its OWN modelled
+/// `ValidationException`, so the two readers refuse in one wording.
+pub fn language_code_refusal(language_code: Option<&str>) -> Option<String> {
+    let code = language_code?;
+    if LANGUAGE_CODE_VALUES.contains(&code) {
+        return None;
+    }
+    Some(format!(
+        "languageCode: {code} is not a language code; expected one of {}",
+        LANGUAGE_CODE_VALUES.join(", ")
+    ))
 }
 
 /// Whether `activity_id` satisfies the modelled `ActivityId` constraints:

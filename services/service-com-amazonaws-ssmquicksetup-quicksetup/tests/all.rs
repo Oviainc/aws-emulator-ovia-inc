@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/configuration_definitions.rs"]
 mod configuration_definitions;
+#[path = "all/configuration_manager_teardown.rs"]
+mod configuration_manager_teardown;
 #[path = "all/configuration_managers.rs"]
 mod configuration_managers;
 #[path = "all/deployment_target_parameters.rs"]

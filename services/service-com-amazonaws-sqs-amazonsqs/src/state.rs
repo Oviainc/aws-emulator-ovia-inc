@@ -121,6 +121,16 @@ pub const DEDUPLICATION_SCOPE_MESSAGE_GROUP: &str = "messageGroup";
 /// (`SendMessageRequest$MessageDeduplicationId`).
 pub const DEDUPLICATION_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How long a deleted queue's NAME stays unavailable: "If you delete a queue, you must
+/// wait at least 60 seconds before creating a queue with the same name" (`CreateQueue`'s
+/// own documentation).
+///
+/// The sentence `CreateQueue` answers with is Amazon SQS's own for the
+/// `QueueDeletedRecently` class — "You must wait 60 seconds after deleting a queue before
+/// you can create another with the same name." — which is the model's documentation of
+/// that error shape with its second "queue" dropped, as the recorded refusal words it.
+pub const QUEUE_DELETED_RECENTLY_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The longest `MessageGroupId` / `MessageDeduplicationId` a message may carry: "The
 /// length of MessageGroupId is 128 characters" and "The maximum length of
 /// MessageDeduplicationId is 128 characters" (their own member documentation).
@@ -181,6 +191,24 @@ pub const MAX_TAG_KEY_LENGTH: usize = 128;
 /// The longest tag value a queue accepts: 256 characters, per the same "Quotas related
 /// to queues" tag restrictions.
 pub const MAX_TAG_VALUE_LENGTH: usize = 256;
+
+/// The tag-key prefix reserved for the provider's own tags, which a caller may not
+/// supply: the same "Quotas related to queues" tag restrictions state "Do not use the
+/// `aws:` prefix in your tag names or values because it is reserved for Amazon Web
+/// Services use", and a reserved key cannot be created, edited or deleted by a caller.
+///
+/// Matched case-insensitively, because the reservation is on the prefix itself rather
+/// than on one spelling of it.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` is in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace, compared
+/// without allocating and without assuming a spelling: the bytes of an ASCII prefix are
+/// a char boundary of whatever follows them, so the comparison is safe on any key.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.as_bytes()
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
+}
 
 /// Attributes `GetQueueAttributes` reports but no caller sets: they are properties of
 /// the queue record itself, so [`Queue::reported_attributes`] derives each one.
@@ -333,7 +361,7 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     },
     AttributeSpec {
         // "The queue's policy. A valid Amazon Web Services policy."
-        name: "Policy",
+        name: POLICY,
         kind: AttributeKind::Json,
         create_only: false,
         fifo_only: false,
@@ -396,6 +424,19 @@ pub const MAXIMUM_MESSAGE_SIZE: &str = "MaximumMessageSize";
 pub const MESSAGE_RETENTION_PERIOD: &str = "MessageRetentionPeriod";
 pub const RECEIVE_MESSAGE_WAIT_TIME_SECONDS: &str = "ReceiveMessageWaitTimeSeconds";
 pub const VISIBILITY_TIMEOUT: &str = "VisibilityTimeout";
+/// The attribute carrying the queue's access policy ("The queue's policy. A valid
+/// Amazon Web Services policy.").
+pub const POLICY: &str = "Policy";
+
+/// The attributes a re-create of an existing name does NOT have to match.
+///
+/// `CreateQueue` "will return the URL of the existing queue instead of creating a new
+/// one" for a request that asks for nothing different about the queue, and refuses one
+/// that does — but the queue's ACCESS POLICY is not part of what it compares: a request
+/// that re-asserts an existing queue under a different (or no) `Policy` is served with
+/// the existing url, and leaves the stored policy as it was. Every other settable
+/// attribute is compared.
+pub const ATTRIBUTES_NOT_COMPARED_ON_RECREATE: &[&str] = &[POLICY];
 /// The attribute that makes a queue a dead-letter SOURCE queue: it names the queue its
 /// messages are driven to.
 pub const REDRIVE_POLICY: &str = "RedrivePolicy";
@@ -423,6 +464,17 @@ pub fn integer_bounds(name: &str) -> (i64, i64) {
 
 /// How many queues this emulator will hold; `CreateQueue` refuses past it.
 pub const MAX_QUEUES: usize = 1_000;
+
+/// How many recently-deleted queue names the store remembers (see
+/// [`ComAmazonawsSqsAmazonsqsState::recently_deleted`]).
+///
+/// An entry lapses with [`QUEUE_DELETED_RECENTLY_INTERVAL`] and is forgotten as soon as
+/// anything touches the ledger, so this bound is only reached by a caller deleting
+/// names faster than they lapse. Past it the oldest records are forgotten first: unlike
+/// a message, a deletion record is derived data whose only effect is deferring a
+/// re-create for a minute, so forgetting one loses nothing a client was told had been
+/// accepted.
+pub const MAX_RECENTLY_DELETED_NAMES: usize = MAX_QUEUES;
 
 /// How many messages one queue holds. `MessageRetentionPeriod` is an AWS duration
 /// (4 days by default, up to 14), far longer than an emulator session, so it does not
@@ -453,6 +505,30 @@ pub const MAX_ATTRIBUTE_VALUE_BYTES: usize = 8 * 1024;
 /// unparameterised request cannot materialise a response that grows with the stored
 /// queue count. A client walks past it with `NextToken`.
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
+
+/// The inclusive range `ListQueues` accepts for `MaxResults`: "Maximum number of results
+/// to include in the response. Value range is 1 to 1000"
+/// (`ListQueuesRequest$MaxResults`). A value outside it is refused rather than clamped,
+/// so a paginating client is told its request was wrong.
+pub const LIST_QUEUES_MAX_RESULTS_RANGE: (i32, i32) = (1, 1_000);
+
+/// Why the value a listing's page-size parameter carried was refused, as the text of the
+/// refusal a caller has to fix the request from, or `None` when `requested` is inside the
+/// inclusive `(min, max)` that parameter publishes.
+///
+/// One template for every listing of this service — `ListQueues`'
+/// [`LIST_QUEUES_MAX_RESULTS_RANGE`] and `ListMessageMoveTasks`' own documented upper
+/// limit — so two operations cannot drift on how they word the same refusal. The wording
+/// is how Amazon SQS words a parameter whose value it will not take: the value, the
+/// parameter it was given for, and the reason it was refused.
+pub fn max_results_refusal(parameter: &str, (min, max): (i32, i32), requested: i32) -> Option<String> {
+    (requested < min || requested > max).then(|| {
+        format!(
+            "Value {requested} for parameter {parameter} is invalid. \
+             Reason: must be between {min} and {max}."
+        )
+    })
+}
 
 // The per-queue tag bounds live with the other tag quotas above:
 // [`MAX_TAGS_PER_QUEUE`], [`MAX_TAG_KEY_LENGTH`] and [`MAX_TAG_VALUE_LENGTH`].
@@ -583,6 +659,11 @@ pub struct ComAmazonawsSqsAmazonsqsState {
     /// The message movement tasks `StartMessageMoveTask` has started, oldest first.
     /// Bounded per source queue by [`MAX_MESSAGE_MOVE_TASKS_PER_QUEUE`].
     pub message_move_tasks: Vec<MessageMoveTask>,
+    /// The names `DeleteQueue` has removed, each with the instant it was removed: a name
+    /// stays unavailable to `CreateQueue` for [`QUEUE_DELETED_RECENTLY_INTERVAL`] after
+    /// its queue was deleted. Entries lapse with that interval and are bounded by
+    /// [`MAX_RECENTLY_DELETED_NAMES`].
+    pub recently_deleted: BTreeMap<String, SystemTime>,
 }
 
 /// A stored queue: the state the reported `Attributes` map is rebuilt from, plus the
@@ -797,10 +878,7 @@ impl Queue {
         let retention = seconds(self.integer(MESSAGE_RETENTION_PERIOD));
         let mut expired: Vec<String> = Vec::new();
         self.messages.retain(|message| {
-            let due = message
-                .sent_at
-                .checked_add(retention)
-                .is_some_and(|due| now >= due);
+            let due = lapsed(message.sent_at, retention, now);
             if due {
                 expired.push(message.message_id.clone());
             }
@@ -823,10 +901,7 @@ impl Queue {
         // A token suppresses a resend only "during the 5-minute deduplication
         // interval"; past it, "Amazon SQS can't detect duplicate messages".
         self.deduplication.retain(|_, remembered| {
-            remembered
-                .accepted_at
-                .checked_add(DEDUPLICATION_INTERVAL)
-                .is_none_or(|lapses| now < lapses)
+            !lapsed(remembered.accepted_at, DEDUPLICATION_INTERVAL, now)
         });
     }
 
@@ -930,10 +1005,48 @@ impl ComAmazonawsSqsAmazonsqsState {
         self.queues.get_mut(&name)
     }
 
-    /// Remove the queue a `QueueUrl` addresses, with every message and handle it held.
-    pub fn remove_queue_by_url(&mut self, queue_url: &str) -> Option<Queue> {
+    /// Remove the queue a `QueueUrl` addresses, with every message and handle it held,
+    /// and remember that its NAME was deleted at `at` — which is what makes a re-create
+    /// of the same name inside [`QUEUE_DELETED_RECENTLY_INTERVAL`] refusable.
+    pub fn remove_queue_by_url(&mut self, queue_url: &str, at: SystemTime) -> Option<Queue> {
         let name = queue_name_from_url(queue_url)?.to_string();
-        self.queues.remove(&name)
+        let removed = self.queues.remove(&name)?;
+        self.forget_lapsed_deletions(at);
+        self.recently_deleted.insert(name, at);
+        // The ledger is bounded; the oldest record goes first, so the names deleted most
+        // recently — the ones a re-create is most likely to name — are the ones kept.
+        while self.recently_deleted.len() > MAX_RECENTLY_DELETED_NAMES {
+            if let Some(oldest) = self
+                .recently_deleted
+                .iter()
+                .min_by_key(|(_, deleted_at)| **deleted_at)
+                .map(|(name, _)| name.clone())
+            {
+                self.recently_deleted.remove(&oldest);
+            }
+        }
+        Some(removed)
+    }
+
+    /// Forget every deletion record whose [`QUEUE_DELETED_RECENTLY_INTERVAL`] has
+    /// elapsed by `now`: the name became available again at that instant whether or not
+    /// anybody called, so materialising it is owed by the clock rather than by this call.
+    pub fn forget_lapsed_deletions(&mut self, now: SystemTime) {
+        self.recently_deleted
+            .retain(|_, deleted_at| !lapsed(*deleted_at, QUEUE_DELETED_RECENTLY_INTERVAL, now));
+    }
+
+    /// When the name `name` was deleted, if a delete removed it inside
+    /// [`QUEUE_DELETED_RECENTLY_INTERVAL`] of `now`.
+    ///
+    /// The ledger is keyed by name and says nothing about whether a queue carries that
+    /// name again, so a caller that needs both — `CreateQueue` — resolves the live queue
+    /// first and reaches here only for a name no queue answers to.
+    pub fn deleted_recently(&self, name: &str, now: SystemTime) -> Option<SystemTime> {
+        self.recently_deleted
+            .get(name)
+            .copied()
+            .filter(|deleted_at| !lapsed(*deleted_at, QUEUE_DELETED_RECENTLY_INTERVAL, now))
     }
 
     /// The names of the queues whose `RedrivePolicy` names the queue called
@@ -1706,7 +1819,8 @@ pub fn queue_name_refusal(name: &str) -> Option<String> {
 ///
 /// The rules are the tag restrictions the `tags` member's own documentation points at:
 /// at most [`MAX_TAGS_PER_QUEUE`] tags per queue, a key of 1 to
-/// [`MAX_TAG_KEY_LENGTH`] characters and a value of up to [`MAX_TAG_VALUE_LENGTH`].
+/// [`MAX_TAG_KEY_LENGTH`] characters, a value of up to [`MAX_TAG_VALUE_LENGTH`], and no
+/// key in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
 pub fn tag_refusal(
     existing: &BTreeMap<String, String>,
     supplied: &HashMap<String, String>,
@@ -1714,16 +1828,30 @@ pub fn tag_refusal(
     let mut keys: Vec<&String> = supplied.keys().collect();
     keys.sort();
     for key in &keys {
+        // Each refusal is worded as Amazon SQS words a parameter whose value it will
+        // not take: the parameter it was given for, and the reason. The VALUE is named
+        // only where it is already known to be inside its length bound, so a refusal
+        // never echoes an unbounded string back to the caller.
         let length = key.chars().count();
         if length == 0 || length > MAX_TAG_KEY_LENGTH {
             return Some(format!(
-                "Tag key is invalid: a tag key must be between 1 and {MAX_TAG_KEY_LENGTH} characters long, but was {length}"
+                "Value for parameter TagKey is invalid. \
+                 Reason: must be between 1 and {MAX_TAG_KEY_LENGTH} characters long, but was \
+                 {length}."
+            ));
+        }
+        if is_reserved_tag_key(key) {
+            return Some(format!(
+                "Value {key} for parameter TagKey is invalid. \
+                 Reason: must not start with the reserved prefix {RESERVED_TAG_KEY_PREFIX}."
             ));
         }
         let value_length = supplied[*key].chars().count();
         if value_length > MAX_TAG_VALUE_LENGTH {
             return Some(format!(
-                "The value of tag key {key} is invalid: a tag value may hold up to {MAX_TAG_VALUE_LENGTH} characters, but was {value_length}"
+                "Value for parameter TagValue is invalid. \
+                 Reason: the value of tag key {key} must be at most {MAX_TAG_VALUE_LENGTH} \
+                 characters long, but was {value_length}."
             ));
         }
     }
@@ -1733,6 +1861,52 @@ pub fn tag_refusal(
             "A queue may carry up to {MAX_TAGS_PER_QUEUE} tags, but this request would leave it with {}",
             merged.len()
         ));
+    }
+    None
+}
+
+/// Why `CreateQueue` must refuse a request that names an EXISTING queue, as the text of
+/// the `QueueNameExists` refusal, or `None` when the request asks for nothing different
+/// about that queue and is therefore idempotent.
+///
+/// "If you specify the name of an existing queue and provide the exact same names and
+/// values for all its attributes, the CreateQueue action will return the URL of the
+/// existing queue instead of creating a new one. If you attempt to create a queue with a
+/// name that already exists but with different attribute names or values, the CreateQueue
+/// action will return an error" — and `QueueNameExists` itself: "Amazon SQS returns this
+/// error only if the request includes attributes whose values differ from those of the
+/// existing queue."
+///
+/// `requested` is the attribute map the request would leave the queue with (the
+/// documented defaults overlaid with what it supplied), compared attribute by attribute
+/// in name order so a request differing in two is always refused for the same one.
+/// [`ATTRIBUTES_NOT_COMPARED_ON_RECREATE`] is left out of that comparison. `tags` is the
+/// tag map the request supplied, and `None` when it supplied no `tags` member at all:
+/// tags carry no default, so a request that supplies none includes nothing about them,
+/// while one that supplies them has to name the set the queue already holds.
+pub fn recreate_refusal(
+    existing: &Queue,
+    requested: &BTreeMap<String, String>,
+    tags: Option<&BTreeMap<String, String>>,
+) -> Option<String> {
+    let compared: BTreeSet<&String> = existing
+        .attributes
+        .keys()
+        .chain(requested.keys())
+        .filter(|name| !ATTRIBUTES_NOT_COMPARED_ON_RECREATE.contains(&name.as_str()))
+        .collect();
+    for name in compared {
+        if existing.attributes.get(name) != requested.get(name) {
+            return Some(format!(
+                "A queue already exists with the same name and a different value for attribute {name}"
+            ));
+        }
+    }
+    if tags.is_some_and(|supplied| *supplied != existing.tags) {
+        return Some(
+            "A queue already exists with the same name and a different value for attribute Tags"
+                .to_string(),
+        );
     }
     None
 }
@@ -1785,6 +1959,17 @@ pub fn seconds(value: i64) -> Duration {
 /// at 43 200 seconds).
 pub fn after(at: SystemTime, value: i64) -> SystemTime {
     at.checked_add(seconds(value)).unwrap_or(at)
+}
+
+/// Whether `interval` has run out, measured from `since`, by `now`.
+///
+/// An instant so far in the future that adding the interval overflows has not lapsed —
+/// the same reading the message and deduplication spans take of an unrepresentable
+/// deadline.
+pub fn lapsed(since: SystemTime, interval: Duration, now: SystemTime) -> bool {
+    since
+        .checked_add(interval)
+        .is_some_and(|lapses| now >= lapses)
 }
 
 /// A fresh opaque identifier: a version-4 UUID, so two calls never collide. Used for a

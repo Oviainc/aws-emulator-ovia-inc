@@ -206,6 +206,17 @@ impl Cluster {
         self.status == STATUS_ACTIVE || self.status == STATUS_IDLE
     }
 
+    /// Every resource identifier that ceases to exist when this cluster does:
+    /// the cluster itself, and each stream stored on its record — a stream lives
+    /// ON the cluster, so removing the cluster removes the stream too. The
+    /// identifiers an idempotency record can be keyed by, so
+    /// [`ComAmazonawsDsqlDsqlState::forget_tokens_for`] reaches a record keyed by
+    /// either kind.
+    pub fn removed_identifiers(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.identifier.as_str())
+            .chain(self.streams.keys().map(String::as_str))
+    }
+
     /// Mint the next unused `PolicyVersion` token for this cluster and record
     /// that it was issued.
     pub fn next_policy_version(&mut self) -> String {
@@ -610,7 +621,13 @@ impl ComAmazonawsDsqlDsqlState {
             // `ResourceNotFoundException` and `ListClusters` stops listing it.
             if pending.next_status == STATUS_DELETED {
                 if let Some(retired) = self.clusters.remove(&identifier) {
-                    self.forget_tokens_for(&identifier);
+                    // Every resource the removal takes with it, not just the
+                    // cluster: a record is keyed by the resource its call acted
+                    // on, and `CreateStream` acts on the STREAM, so a token
+                    // keyed by a stream identifier is only reachable here.
+                    for resource in retired.removed_identifiers() {
+                        self.forget_tokens_for(resource);
+                    }
                     self.retire(identifier, retired);
                 }
             }
@@ -637,6 +654,11 @@ impl ComAmazonawsDsqlDsqlState {
     /// whose record is about a resource that is still there, so such a token
     /// never outlives the resource it names. The ledger of the call that removes
     /// the resource keeps its record ([`TokenScope::outlives_its_resource`]).
+    ///
+    /// Takes ONE resource, so a removal that takes other resources with it calls
+    /// it for each of them ([`Cluster::removed_identifiers`]): a record is keyed
+    /// by the resource its own call acted on, which for a stream's writer is the
+    /// stream rather than the cluster holding it.
     fn forget_tokens_for(&mut self, resource: &str) {
         for scope in TokenScope::ALL {
             if scope.outlives_its_resource() {

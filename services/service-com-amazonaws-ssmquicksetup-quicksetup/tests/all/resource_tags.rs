@@ -26,10 +26,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_ssmquicksetup_quicksetup::state::{
-    MAX_TAGS, QUICK_SETUP_TYPE_CATALOG,
+    MAX_TAGS, QUICK_SETUP_TYPE_CATALOG, TRANSITION_SPAN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -490,6 +491,9 @@ async fn tag_resource_rejects_an_arn_naming_no_resource() {
         status, 200,
         "DeleteConfigurationManager must succeed, got {status} / {answer:?}"
     );
+    // A delete starts an asynchronous teardown, so the manager it named is gone from
+    // the store once that teardown comes due.
+    tokio::time::sleep(TRANSITION_SPAN + Duration::from_millis(400)).await;
 
     for (case, arn) in [
         (
@@ -845,6 +849,9 @@ async fn untag_resource_rejects_an_arn_naming_no_resource() {
         status, 200,
         "DeleteConfigurationManager must succeed, got {status} / {answer:?}"
     );
+    // A delete starts an asynchronous teardown, so the manager it named is gone from
+    // the store once that teardown comes due.
+    tokio::time::sleep(TRANSITION_SPAN + Duration::from_millis(400)).await;
 
     for (case, arn) in [
         ("a well-formed ARN no create minted", UNKNOWN_MANAGER_ARN.to_string()),

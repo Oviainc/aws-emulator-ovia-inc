@@ -1172,6 +1172,15 @@ use crate::ops::types::Ipv6Range;
 pub mod traffic_mirror_filters;
 pub use traffic_mirror_filters::*;
 
+/// What `CreatePublicIpv4Pool` adds to the public IPv4 pool store below: the network border
+/// group a created pool is advertised from, and the refusal for a create the store has no
+/// room for. The pool record, its insert and its projection live in the "Public IPv4 address
+/// pools" section of this module, beside the BYOIP provision that also creates one.
+/// Re-exported, so a handler reaches them as `crate::state::<item>` like every other
+/// primitive here.
+pub mod public_ipv4_pools;
+pub use public_ipv4_pools::*;
+
 /// The `Reservation` shape, under the name the scaffold generated for it.
 ///
 /// `com.amazonaws.ec2#Reservation` is both `RunInstances`'s output shape and the
@@ -1946,6 +1955,33 @@ pub const DHCP_OPTIONS_ID_PREFIX: &str = "dopt";
 /// with the VPC" (`AssociateDhcpOptionsRequest$DhcpOptionsId`). It is not an id, so it is
 /// neither looked up nor refused as malformed.
 pub const DHCP_OPTIONS_DEFAULT: &str = "default";
+
+/// The resource type a `TagSpecification` names to tag a DHCP options set, from the
+/// `ResourceType` enum — "The tags to assign to the DHCP option"
+/// (`CreateDhcpOptionsRequest$TagSpecifications`), so it is the one type that create may
+/// name.
+pub const RESOURCE_TYPE_DHCP_OPTIONS: &str = "dhcp-options";
+
+/// The DHCP option whose values are the NTP servers an instance of the VPC synchronises
+/// its clock with: "ntp-servers - The IP addresses of up to eight Network Time Protocol
+/// (NTP) servers (four IPv4 addresses and four IPv6 addresses)" (`CreateDhcpOptions`).
+pub const DHCP_OPTION_NTP_SERVERS: &str = "ntp-servers";
+
+/// The DHCP option whose values are the NetBIOS name servers of the VPC:
+/// "netbios-name-servers - The IP addresses of up to four NetBIOS name servers"
+/// (`CreateDhcpOptions`).
+pub const DHCP_OPTION_NETBIOS_NAME_SERVERS: &str = "netbios-name-servers";
+
+/// The DHCP option whose value is the NetBIOS node type of the VPC: "netbios-node-type -
+/// The NetBIOS node type (1, 2, 4, or 8)" (`CreateDhcpOptions`).
+pub const DHCP_OPTION_NETBIOS_NODE_TYPE: &str = "netbios-node-type";
+
+/// The DHCP option whose value is how often a running instance renews its DHCPv6 lease:
+/// "ipv6-address-preferred-lease-time - A value (in seconds, minutes, hours, or years) for
+/// how frequently a running instance with an IPv6 assigned to it goes through DHCPv6 lease
+/// renewal" (`CreateDhcpOptions`).
+pub const DHCP_OPTION_IPV6_ADDRESS_PREFERRED_LEASE_TIME: &str =
+    "ipv6-address-preferred-lease-time";
 
 /// EC2's error code for a request that named something that is not a DHCP options set id
 /// at all, so there is nothing to look up — answered BEFORE the id is resolved, the same
@@ -3144,8 +3180,54 @@ impl ComAmazonawsEc2Amazonec2State {
     /// later deleted does not give its Region's set back (the Region's default set outlives
     /// every VPC of it, as it does on AWS).
     pub fn has_dhcp_option_set_capacity(&self, region: &str) -> bool {
-        self.default_dhcp_options_ids.contains_key(region)
-            || self.dhcp_options.len() < MAX_DHCP_OPTION_SETS
+        self.default_dhcp_options_ids.contains_key(region) || self.has_dhcp_option_set_room()
+    }
+
+    /// Whether another DHCP option set fits inside the store's ceiling
+    /// ([`MAX_DHCP_OPTION_SETS`]).
+    ///
+    /// The ONE question a path that is about to store a set asks: `CreateDhcpOptions` asks it
+    /// for the set a caller named, and [`Self::has_dhcp_option_set_capacity`] asks it for the
+    /// Region's default set, so the two cannot drift apart on how many sets an account holds.
+    /// A path that answers `false` refuses with [`dhcp_options_limit_exceeded`] rather than
+    /// overshooting the ceiling.
+    pub fn has_dhcp_option_set_room(&self) -> bool {
+        self.dhcp_options.len() < MAX_DHCP_OPTION_SETS
+    }
+
+    /// Store a DHCP option set a caller created, as the modelled [`DhcpOptions`] shape, and
+    /// answer the `DhcpOptionsId` it was minted with.
+    ///
+    /// Every member the SERVICE owns is derived here rather than taken from a caller — the
+    /// id ([`DHCP_OPTIONS_ID_PREFIX`], from the one id mint) and the owning account — so a
+    /// caller-created set is reported by `DescribeDhcpOptions` exactly as the Region's
+    /// default set is ([`Self::default_dhcp_options_id`]), and the two cannot drift. The
+    /// record's caller-chosen bytes are charged against the store's byte budget here, so no
+    /// writer can store them uncharged.
+    ///
+    /// A WRITER: the caller must have asked [`Self::has_dhcp_option_set_room`] and
+    /// [`Self::would_exceed_stored_bytes`] first, so a request past either bound is refused
+    /// instead of overshooting it.
+    pub fn insert_dhcp_options(
+        &mut self,
+        dhcp_configurations: Vec<DhcpConfiguration>,
+        tags: Vec<Tag>,
+    ) -> String {
+        let dhcp_options_id = self.next_id(DHCP_OPTIONS_ID_PREFIX);
+        self.add_stored_bytes(
+            dhcp_configuration_list_bytes(&dhcp_configurations)
+                .saturating_add(tag_list_bytes(&tags)),
+        );
+        self.dhcp_options.insert(
+            dhcp_options_id.clone(),
+            DhcpOptions {
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                tags: Some(tags),
+                dhcp_options_id: Some(dhcp_options_id.clone()),
+                dhcp_configurations: Some(dhcp_configurations),
+            },
+        );
+        dhcp_options_id
     }
 
     /// The bytes `region`'s default DHCP option set would ADD to the store: none when the
@@ -3368,10 +3450,15 @@ impl ComAmazonawsEc2Amazonec2State {
     /// out of, so the caller reads them off that association rather than this writer
     /// guessing them.
     ///
-    /// The caller-chosen bytes the block string retains are charged against the store's
-    /// byte budget HERE, which is what [`subnet_payload_bytes`] gives back on delete; a
-    /// writer still asks [`Self::would_exceed_stored_bytes`] first so it can refuse
-    /// instead of overshooting.
+    /// The bytes the association retains are charged against the store's byte budget HERE,
+    /// by the one definition of that charge ([`subnet_ipv6_association_payload_bytes`]),
+    /// which is what [`subnet_payload_bytes`] gives back on delete.
+    ///
+    /// `None`, with NOTHING written, for a subnet the store does not hold, for a subnet
+    /// already at [`MAX_IPV6_ASSOCIATIONS_PER_SUBNET`] association records, and when the
+    /// bytes the association would hold would cross [`MAX_STORED_BYTES`]. All three are
+    /// asked HERE, before the first write, the way [`Self::insert_coip_pool`] enforces its
+    /// own ceiling — so a caller that forgets to ask cannot grow the store without bound.
     pub fn associate_subnet_ipv6_cidr_block(
         &mut self,
         subnet_id: &str,
@@ -3382,8 +3469,13 @@ impl ComAmazonawsEc2Amazonec2State {
         if !self.subnets.contains_key(subnet_id) {
             return None;
         }
+        let charged_bytes = subnet_ipv6_association_payload_bytes(&ipv6_cidr_block);
+        if !self.has_subnet_ipv6_association_capacity(subnet_id)
+            || self.would_exceed_stored_bytes(charged_bytes)
+        {
+            return None;
+        }
         let association_id = self.next_id("subnet-cidr-assoc");
-        let charged_bytes = ipv6_cidr_block.len();
         let association = SubnetIpv6CidrBlockAssociation {
             association_id: Some(association_id),
             ipv6_cidr_block: Some(ipv6_cidr_block),
@@ -3403,6 +3495,22 @@ impl ComAmazonawsEc2Amazonec2State {
         self.subnet_ipv6_associated_at
             .insert(subnet_id.to_string(), Instant::now() + TRANSITION_DELAY);
         Some(association)
+    }
+
+    /// Whether another IPv6 CIDR block association fits inside the ceiling this store keeps
+    /// for ONE subnet ([`MAX_IPV6_ASSOCIATIONS_PER_SUBNET`]).
+    ///
+    /// The same contract as [`Self::has_subnet_capacity`]: a writer asks first so it can
+    /// refuse instead of overshooting. A subnet the store does not hold has no room for an
+    /// association either.
+    pub fn has_subnet_ipv6_association_capacity(&self, subnet_id: &str) -> bool {
+        self.subnets.get(subnet_id).is_some_and(|subnet| {
+            subnet
+                .ipv6_cidr_block_association_set
+                .as_deref()
+                .map_or(0, <[SubnetIpv6CidrBlockAssociation]>::len)
+                < MAX_IPV6_ASSOCIATIONS_PER_SUBNET
+        })
     }
 
     /// Whether another subnet CIDR reservation fits inside the store's ceiling
@@ -6531,6 +6639,23 @@ pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
             value: Some(value.clone()),
         })
         .collect()
+}
+
+/// The bytes a modelled `DhcpConfiguration` list holds: every option name and every value
+/// of it, which in a caller-created set are all caller-chosen strings.
+pub fn dhcp_configuration_list_bytes(configurations: &[DhcpConfiguration]) -> usize {
+    configurations
+        .iter()
+        .map(|configuration| {
+            configuration.key.as_ref().map_or(0, String::len)
+                + configuration
+                    .values
+                    .iter()
+                    .flatten()
+                    .map(|value| value.value.as_ref().map_or(0, String::len))
+                    .sum::<usize>()
+        })
+        .sum()
 }
 
 /// The bytes a Region's default DHCP option set record holds, for the store's byte budget.
@@ -12281,6 +12406,20 @@ pub const MAX_SUBNETS: usize = 4_096;
 /// codes).
 pub const SUBNET_LIMIT_EXCEEDED: &str = "SubnetLimitExceeded";
 
+/// The largest number of IPv6 CIDR block association records this store keeps for ONE
+/// subnet.
+///
+/// A capacity bound in the style of [`MAX_SUBNETS`], not an AWS quota. "You can only
+/// associate a single IPv6 CIDR block with your subnet" (`AssociateSubnetCidrBlock`), so a
+/// subnet HOLDS one block at a time and this ceiling is never the rule a well-formed
+/// request meets; it bounds the association RECORDS one subnet's set can grow to — a block
+/// it still holds, plus any a later disassociation leaves behind to be reported — so a
+/// caller looping over the associate cannot grow one subnet's record without bound even if
+/// a writer forgets to ask.
+/// [`ComAmazonawsEc2Amazonec2State::has_subnet_ipv6_association_capacity`] is the predicate
+/// a writer asks before associating.
+pub const MAX_IPV6_ASSOCIATIONS_PER_SUBNET: usize = 4;
+
 /// The largest number of DHCP option sets this in-memory store holds.
 ///
 /// A capacity bound in the style of [`MAX_VPCS`], not an AWS quota: this store mints one
@@ -14817,9 +14956,23 @@ pub fn vpc_payload_bytes(vpc: &Vpc) -> usize {
     tag_list_bytes(vpc.tags.as_deref().unwrap_or_default()).saturating_add(ipv6_bytes)
 }
 
+/// What ONE of a subnet's IPv6 CIDR block associations costs the store's byte budget: the
+/// fixed [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, plus the block string
+/// the caller chose.
+///
+/// The ONE definition of that charge, so the writer that takes it
+/// ([`ComAmazonawsEc2Amazonec2State::associate_subnet_ipv6_cidr_block`]) and
+/// [`subnet_payload_bytes`], which gives it back, cannot disagree — and so a loop of
+/// associate calls carrying a short block cannot be nearly free against
+/// [`MAX_STORED_BYTES`] while each stored association, its minted id and its state retain
+/// far more.
+pub fn subnet_ipv6_association_payload_bytes(ipv6_cidr_block: &str) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES.saturating_add(ipv6_cidr_block.len())
+}
+
 /// The caller-chosen bytes a stored subnet retains: its tags, which is what
-/// [`ComAmazonawsEc2Amazonec2State::insert_subnet`] charged, plus the IPv6 block an
-/// association holds, which is what
+/// [`ComAmazonawsEc2Amazonec2State::insert_subnet`] charged, plus what each IPv6
+/// association costs ([`subnet_ipv6_association_payload_bytes`]), which is what
 /// [`ComAmazonawsEc2Amazonec2State::associate_subnet_ipv6_cidr_block`] charged — so
 /// [`ComAmazonawsEc2Amazonec2State::remove_subnet`] gives back exactly what was taken,
 /// the same arrangement [`vpc_payload_bytes`] has for a VPC.
@@ -14828,7 +14981,11 @@ pub fn subnet_payload_bytes(subnet: &Subnet) -> usize {
         .ipv6_cidr_block_association_set
         .iter()
         .flatten()
-        .map(|association| association.ipv6_cidr_block.as_deref().map_or(0, str::len))
+        .map(|association| {
+            subnet_ipv6_association_payload_bytes(
+                association.ipv6_cidr_block.as_deref().unwrap_or_default(),
+            )
+        })
         .sum();
     tag_list_bytes(subnet.tags.as_deref().unwrap_or_default()).saturating_add(ipv6_bytes)
 }
@@ -18483,6 +18640,16 @@ pub fn allocation_id_is_well_formed(id: &str) -> bool {
 /// the form is decided: the crate's CIDR helpers are about blocks, not single addresses.
 pub fn is_ipv4_address(candidate: &str) -> bool {
     candidate.parse::<::std::net::Ipv4Addr>().is_ok()
+}
+
+/// Whether `candidate` is an IPv6 address, the other form an option documented as taking
+/// "four IPv4 addresses and four IPv6 addresses"
+/// ([`DHCP_OPTION_NTP_SERVERS`]) accepts.
+///
+/// `Ipv6Addr`'s own parser decides the form, the way [`is_ipv4_address`] leaves the dotted
+/// quad to `Ipv4Addr`.
+pub fn is_ipv6_address(candidate: &str) -> bool {
+    candidate.parse::<Ipv6Addr>().is_ok()
 }
 
 /// Refuse an allocation id the request named that this service cannot resolve: a

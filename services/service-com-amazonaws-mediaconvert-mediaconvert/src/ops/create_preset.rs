@@ -176,6 +176,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let category = input.category.filter(|value| !value.trim().is_empty());
         let description = input.description.filter(|value| !value.trim().is_empty());
 
+        // The graph itself takes the test every stored preset's graph takes, on this door
+        // as on `UpdatePreset`: a preset is the encoder settings of one output, so a graph
+        // that describes no output is the modelled 400 rather than a stored record.
+        // Refused before the store is reached, so nothing is persisted — including for a
+        // name already in use, whose idempotent return is an answer to a request this one
+        // is not.
+        if let Some(problem) = crate::state::preset_settings_problem(&input.settings) {
+            return Err(CreatePresetErrorModeled::BadRequestException(BadRequestException {
+                message: Some(problem.message()),
+            })
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();

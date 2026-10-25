@@ -57,6 +57,23 @@ pub(crate) async fn get_member(
     .await
 }
 
+/// One `DeleteNode` call: `DELETE /networks/{NetworkId}/nodes/{NodeId}?memberId=…`, the
+/// member scope every node of a Hyperledger Fabric network is addressed through.
+pub(crate) async fn delete_node(
+    router: &MultiServiceRouter,
+    network_id: &str,
+    member_id: &str,
+    node_id: &str,
+) -> Answer {
+    call(
+        router,
+        "DELETE",
+        &format!("/networks/{network_id}/nodes/{node_id}?memberId={member_id}"),
+        None,
+    )
+    .await
+}
+
 /// One `GetNetwork` call.
 pub(crate) async fn get_network(router: &MultiServiceRouter, network_id: &str) -> Answer {
     call(router, "GET", &format!("/networks/{network_id}"), None).await

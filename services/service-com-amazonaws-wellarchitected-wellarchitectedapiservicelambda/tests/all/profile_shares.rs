@@ -112,7 +112,10 @@ pub(crate) async fn create_share(
 
 /// `GET /profiles/{ProfileArn}/shares`, the wire form of `ListProfileShares`, with every
 /// filter and paging member bound to the query string. `query` is passed as sent, empty for
-/// a request that names none.
+/// a request that names none. `pub(crate)` because other suites — including
+/// `super::lens_share_invitation_answers`, which reads a profile share's status back after
+/// its invitation is answered — read a share through this same request rather than keeping
+/// a second spelling of it.
 pub(crate) async fn list_shares(client: &Client, profile_arn: &str, query: &str) -> Answer {
     let encoded = encode_path_segment(profile_arn);
     let uri = if query.is_empty() {

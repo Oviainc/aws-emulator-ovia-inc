@@ -45,6 +45,8 @@ mod core_network_policy_versions;
 mod core_network_prefix_list_association;
 #[path = "all/core_network_prefix_list_associations.rs"]
 mod core_network_prefix_list_associations;
+#[path = "all/core_network_routing_information.rs"]
+mod core_network_routing_information;
 #[path = "all/core_network_segment_actions.rs"]
 mod core_network_segment_actions;
 #[path = "all/create_connect_peer_bounds.rs"]

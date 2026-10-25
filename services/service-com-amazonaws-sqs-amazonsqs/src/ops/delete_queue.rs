@@ -173,8 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
 
         // The queue and every message and receipt handle it held go away, so a later
-        // call on that url cannot find it.
-        if state.remove_queue_by_url(&input.queue_url).is_none() {
+        // call on that url cannot find it, and its NAME is remembered as deleted just
+        // now: "If you delete a queue, you must wait at least 60 seconds before creating
+        // a queue with the same name."
+        if state
+            .remove_queue_by_url(&input.queue_url, ::std::time::SystemTime::now())
+            .is_none()
+        {
             return Err(DeleteQueueErrorModeled::QueueDoesNotExist(
                 sqs::queue_does_not_exist(),
             )

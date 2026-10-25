@@ -1229,9 +1229,10 @@ async fn an_update_mutates_the_stored_record_and_bumps_the_modified_stamp() {
 // DeleteConfigurationManager
 // ---------------------------------------------------------------------------
 
-/// A delete removes the manager and the configurations it owned: the Get is a 404,
-/// neither listing reports it, and a second delete is a 404 too. The manager that was
-/// not deleted is untouched.
+/// Once the teardown a delete starts has come due, the manager and the configurations
+/// it owned are gone: the Get is a 404, neither listing reports it, and a second delete
+/// is a 404 too. The manager that was not deleted is untouched. The phases of the
+/// teardown itself are in `tests/all/configuration_manager_teardown.rs`.
 #[tokio::test]
 async fn a_delete_removes_the_manager_and_the_configurations_it_owned() {
     let router = emulator();
@@ -1273,6 +1274,10 @@ async fn a_delete_removes_the_manager_and_the_configurations_it_owned() {
         status, 200,
         "DeleteConfigurationManager must succeed, got {status} / {answer:?}"
     );
+
+    // Removing the deployed resources is work the service does after it has answered,
+    // so the records wind down first and are removed when that teardown comes due.
+    tokio::time::sleep(past_transition()).await;
 
     let (status, answer) = get(&router, &doomed).await;
     assert_eq!(
@@ -1747,6 +1752,10 @@ async fn a_configuration_the_store_does_not_hold_is_the_modelled_404() {
         status, 200,
         "DeleteConfigurationManager must succeed, got {status} / {answer:?}"
     );
+
+    // The configuration is reclaimed when the teardown its manager's delete started
+    // comes due, not while it is still in flight.
+    tokio::time::sleep(past_transition()).await;
 
     let cases: Vec<(&str, String)> = vec![
         ("reclaimed with its manager", reclaimed),

@@ -3842,6 +3842,76 @@ impl LensShareRecord {
             template_arn: None,
         }
     }
+
+    /// The `ShareInvitation` projection `UpdateShareInvitation` answers with: the
+    /// invitation this share raised, named by its own `ShareInvitationId` and by the lens
+    /// it offers.
+    ///
+    /// The lens counterpart of [`WorkloadShareRecord::to_invitation`], filling only the
+    /// members of the shared resource KIND. Both lens members the shape carries are the
+    /// lens's ARN: `LensArn` is "The ARN for the lens", and "For custom lenses, this is
+    /// the lens ARN" (`smithy_query(query="shape", shape="LensAlias")`), so the alias of a
+    /// custom lens IS that ARN — a custom lens has no short alias of the kind an Amazon
+    /// Web Services official lens answers to.
+    pub fn to_invitation(&self) -> ShareInvitation {
+        ShareInvitation {
+            share_invitation_id: Some(self.share_invitation_id.clone()),
+            share_resource_type: Some(LENS_RESOURCE_TYPE.to_string()),
+            workload_id: None,
+            lens_alias: Some(self.lens_arn.clone()),
+            lens_arn: Some(self.lens_arn.clone()),
+            profile_arn: None,
+            template_arn: None,
+        }
+    }
+}
+
+/// One stored share — of WHICHEVER resource kind — reached for writing through the
+/// invitation that mediates it, which is what
+/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::share_by_invitation_mut`]
+/// resolves.
+///
+/// Each resource kind holds its shares in its own map because the records differ (a
+/// workload share carries a permission and a workload, a lens share carries the lens's
+/// ARN, a profile share the profile's), while an invitation is named by its
+/// `ShareInvitationId` ALONE. This is what lets one resolution span every map and one
+/// answer path do the three things an answer needs of a share whatever resource it shares:
+/// read where it stands, move it, and project it as the invitation it raised.
+#[derive(Debug)]
+pub enum ShareByInvitationMut<'a> {
+    Workload(&'a mut WorkloadShareRecord),
+    Lens(&'a mut LensShareRecord),
+    Profile(&'a mut ProfileShareRecord),
+}
+
+impl ShareByInvitationMut<'_> {
+    /// The `ShareStatus` member the share currently stands in.
+    pub fn status(&self) -> &str {
+        match self {
+            Self::Workload(share) => &share.status,
+            Self::Lens(share) => &share.status,
+            Self::Profile(share) => &share.status,
+        }
+    }
+
+    /// Record `status` as the `ShareStatus` the share now stands in.
+    pub fn set_status(&mut self, status: &str) {
+        match self {
+            Self::Workload(share) => share.status = status.to_string(),
+            Self::Lens(share) => share.status = status.to_string(),
+            Self::Profile(share) => share.status = status.to_string(),
+        }
+    }
+
+    /// The `ShareInvitation` this share raised, each kind through its own projection, so
+    /// an answered invitation reports the members of the kind of resource it offers.
+    pub fn to_invitation(&self) -> ShareInvitation {
+        match self {
+            Self::Workload(share) => share.to_invitation(),
+            Self::Lens(share) => share.to_invitation(),
+            Self::Profile(share) => share.to_invitation(),
+        }
+    }
 }
 
 /// What a `CreateLensShare` idempotency token resolves to: the share the original
@@ -3923,6 +3993,27 @@ impl ProfileShareRecord {
             profile_name: profile_name.map(ToString::to_string),
             profile_arn: Some(self.profile_arn.clone()),
             template_name: None,
+            template_arn: None,
+        }
+    }
+
+    /// The `ShareInvitation` projection `UpdateShareInvitation` answers with: the
+    /// invitation this share raised, named by its own `ShareInvitationId` and by the
+    /// profile it offers.
+    ///
+    /// The profile counterpart of [`WorkloadShareRecord::to_invitation`] and
+    /// [`LensShareRecord::to_invitation`], filling only the members of the shared resource
+    /// KIND: `ShareInvitation` carries one member for a profile, `ProfileArn`, and the
+    /// workload, lens and review-template members belong to invitations of those kinds
+    /// (`smithy_query(query="shape", shape="ShareInvitation")`).
+    pub fn to_invitation(&self) -> ShareInvitation {
+        ShareInvitation {
+            share_invitation_id: Some(self.share_invitation_id.clone()),
+            share_resource_type: Some(PROFILE_RESOURCE_TYPE.to_string()),
+            workload_id: None,
+            lens_alias: None,
+            lens_arn: None,
+            profile_arn: Some(self.profile_arn.clone()),
             template_arn: None,
         }
     }
@@ -6442,27 +6533,94 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         Some(record)
     }
 
-    /// The share the invitation `share_invitation_id` mediates, if it was offered to
-    /// `principal` — what `UpdateShareInvitation` resolves, for writing.
+    /// The share the invitation `share_invitation_id` mediates, of WHICHEVER resource kind,
+    /// if it was offered to `principal` — what `UpdateShareInvitation` resolves, for
+    /// writing.
     ///
-    /// An invitation is named by its own `ShareInvitationId` alone, with no workload in
-    /// the request, so the search spans every workload's shares. It is offered to the
-    /// principal the resource was shared WITH, so an invitation addressed to anyone else
-    /// is not this principal's to answer and resolves to nothing — the same `None` as an
-    /// id no share carries, so neither discloses the other.
-    pub fn workload_share_by_invitation_mut(
+    /// "Update a workload or custom lens share invitation. This API operation can be
+    /// called independently of any resource" (`UpdateShareInvitation` doc): an invitation
+    /// names no resource and carries no resource kind, so it is resolved by its own id
+    /// across every share this store holds — exactly the shares
+    /// [`Self::pending_share_invitations_for`] reports invitations for, so the two sides
+    /// of one invitation cannot disagree about whether it exists. A kind whose shares this
+    /// store does not hold yet (a review-template share, whose create is a stub with its
+    /// own issue) joins both sides by being stored: it is then one more arm here and one
+    /// more map to look in, with the same two conditions.
+    ///
+    /// An invitation addressed to any other principal resolves to nothing — the same
+    /// `None` as an id no share carries, so neither discloses the other.
+    pub fn share_by_invitation_mut(
         &mut self,
         share_invitation_id: &str,
         principal: &str,
-    ) -> Option<&mut WorkloadShareRecord> {
-        self.workload_shares
-            .values_mut()
-            .flat_map(|shares| shares.values_mut())
-            .find(|share| {
-                share.share_invitation_id == share_invitation_id
-                    && share.shared_with == principal
-            })
+    ) -> Option<ShareByInvitationMut<'_>> {
+        // The share is LOCATED first, in one borrow-free pass per map
+        // ([`share_key_by_invitation`] answers owned keys), so exactly ONE mutable borrow
+        // is taken afterwards, out of the map that matched: a `&mut` taken while searching
+        // would borrow the whole store for as long as the answer lives, and no later map
+        // could be looked in. The two keys a pass answers were just read out of that same
+        // map under the one lock this store is reached through, so the lookup that follows
+        // them finds the share; `None` from it would mean the map changed in between, and
+        // is answered as the invitation not being resolvable rather than assumed away.
+        if let Some((workload_id, share_id)) = share_key_by_invitation(
+            &self.workload_shares,
+            share_invitation_id,
+            principal,
+            |share| (&share.share_invitation_id, &share.shared_with),
+        ) {
+            return self
+                .workload_shares
+                .get_mut(&workload_id)?
+                .get_mut(&share_id)
+                .map(ShareByInvitationMut::Workload);
+        }
+        if let Some((lens_id, share_id)) = share_key_by_invitation(
+            &self.lens_shares,
+            share_invitation_id,
+            principal,
+            |share| (&share.share_invitation_id, &share.shared_with),
+        ) {
+            return self
+                .lens_shares
+                .get_mut(&lens_id)?
+                .get_mut(&share_id)
+                .map(ShareByInvitationMut::Lens);
+        }
+        let (profile_arn, share_id) = share_key_by_invitation(
+            &self.profile_shares,
+            share_invitation_id,
+            principal,
+            |share| (&share.share_invitation_id, &share.shared_with),
+        )?;
+        self.profile_shares
+            .get_mut(&profile_arn)?
+            .get_mut(&share_id)
+            .map(ShareByInvitationMut::Profile)
     }
+}
+
+/// The `(resource key, ShareId)` of the share in `shares` that the invitation
+/// `share_invitation_id` mediates, if that share was offered to `principal`.
+///
+/// Generic over the record because the share maps of the different resource kinds hold
+/// different records, while the two things a share is matched on are the same for all of
+/// them: `offer` reads the id of the invitation the share raised and the principal it was
+/// offered to. The keys are answered OWNED so the search borrows nothing, which is what
+/// lets [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::share_by_invitation_mut`]
+/// take its one mutable borrow afterwards.
+fn share_key_by_invitation<Record>(
+    shares: &HashMap<String, BTreeMap<String, Record>>,
+    share_invitation_id: &str,
+    principal: &str,
+    offer: impl Fn(&Record) -> (&str, &str),
+) -> Option<(String, String)> {
+    shares.iter().find_map(|(resource_key, of_resource)| {
+        of_resource.iter().find_map(|(share_id, share)| {
+            let (invitation, shared_with) = offer(share);
+            (invitation == share_invitation_id && shared_with == principal)
+                .then(|| (resource_key.clone(), share_id.clone()))
+        })
+    })
 }
 
 /// Take one share out of a share map keyed by the shared resource then by `ShareId`,

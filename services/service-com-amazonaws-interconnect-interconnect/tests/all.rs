@@ -45,3 +45,5 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/update_connection_idempotent_retry.rs"]
+mod update_connection_idempotent_retry;

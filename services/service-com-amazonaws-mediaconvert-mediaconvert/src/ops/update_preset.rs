@@ -167,6 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `{Name}` addresses the preset; the stored key is the name exactly as
         // `CreatePreset` persisted it, so it is read as sent rather than normalised.
         let name = input.name;
+        // A `Settings` the caller sent REPLACES the stored graph, so the graph this request
+        // would leave behind is the one it carries, and it takes the same test a graph
+        // takes on the way in: a preset is the encoder settings of one output, so it can
+        // only be left in a state that still describes one.
+        let settings_problem = input
+            .settings
+            .as_ref()
+            .and_then(crate::state::preset_settings_problem);
         let mut state = state.lock();
 
         let Some(record) = state.presets.get_mut(&name) else {
@@ -181,6 +189,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if record.preset_type == crate::state::TYPE_SYSTEM {
             return Err(UpdatePresetErrorModeled::ForbiddenException(ForbiddenException {
                 message: Some(crate::state::system_resource_modify_message("name")),
+            })
+            .into());
+        }
+        // Refused BEFORE any member is applied, so a request carrying a graph the service
+        // cannot save leaves the stored preset exactly as it was — including the members it
+        // named beside `Settings` and its `LastUpdated`.
+        if let Some(problem) = settings_problem {
+            return Err(UpdatePresetErrorModeled::BadRequestException(BadRequestException {
+                message: Some(problem.message()),
             })
             .into());
         }

@@ -25,3 +25,6 @@ mod sts_authorization;
 
 #[path = "all/sts_sessions.rs"]
 mod sts_sessions;
+
+#[path = "all/trust_policy_convergence.rs"]
+mod trust_policy_convergence;

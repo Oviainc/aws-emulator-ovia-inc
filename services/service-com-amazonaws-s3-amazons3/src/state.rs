@@ -29,6 +29,8 @@ use std::time::SystemTime;
 
 use md5::{Digest, Md5};
 
+pub mod aws_published;
+
 /// The Region a general purpose bucket is created in when the request names no
 /// `CreateBucketConfiguration.LocationConstraint`.
 ///
@@ -3818,6 +3820,19 @@ pub struct Bucket {
     /// Private, like `tags`, and written only where the bucket comes into being: a stored
     /// bucket never changes hands.
     provisioned_by: Option<String>,
+    /// Whether AWS itself publishes this bucket, rather than any caller owning it — one of
+    /// the world-readable buckets the catalog in [`aws_published`] names.
+    ///
+    /// Such a bucket is in the store before the first request is served, because that is
+    /// what "AWS publishes it" means: nothing creates it and nothing has to. It is served
+    /// by this service's object data plane exactly as any other bucket is — that is the
+    /// point of holding it — while it belongs to no caller, so
+    /// [`ComAmazonawsS3Amazons3State::account_buckets`] leaves it out of the account's own
+    /// buckets and the whole-store budgets subtract what the catalog itself holds
+    /// ([`ComAmazonawsS3Amazons3State::published_retained_bytes`]).
+    ///
+    /// Private and written only where the bucket comes into being, like `provisioned_by`.
+    aws_published: bool,
     /// The multipart uploads the bucket has in progress, by upload id.
     ///
     /// An upload lands here when `CreateMultipartUpload` initiates it and leaves only
@@ -3846,6 +3861,12 @@ impl Bucket {
     /// resources, or `None` for a bucket created over S3's own API. See the field.
     pub fn provisioned_by(&self) -> Option<&str> {
         self.provisioned_by.as_deref()
+    }
+
+    /// Whether AWS publishes this bucket rather than a caller owning it. See the
+    /// `aws_published` field and the [`aws_published`] catalog.
+    pub fn is_aws_published(&self) -> bool {
+        self.aws_published
     }
 
     /// The bucket's tag set, empty when none is associated with it.
@@ -5750,7 +5771,7 @@ pub fn mint_version_id(bucket: &str, key: &str, sequence: u64) -> String {
 }
 
 /// Per-service state for com-amazonaws-s3-amazons3. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsS3Amazons3State {
     /// Buckets by name.
     ///
@@ -5782,6 +5803,49 @@ pub struct ComAmazonawsS3Amazons3State {
     /// and two uploads anywhere in the store — can never carry the same id, whatever the
     /// clock does. Only [`Self::create_multipart_upload`] advances it.
     minted_upload_ids: u64,
+    /// What the objects AWS publishes ([`aws_published`]) retain, and how many stored
+    /// versions they are, measured ONCE when the store was seeded with them.
+    ///
+    /// The whole-store ceilings ([`MAX_OBJECTS_TOTAL`] / [`MAX_OBJECT_BYTES_TOTAL`]) bound
+    /// what this process holds because a CALLER asked it to, and the published catalog is
+    /// fixed by the code rather than by anything a caller does — so this fixed amount is
+    /// subtracted from the store's footprint ([`Self::caller_retained_bytes`] /
+    /// [`Self::caller_stored_versions`]) instead of a whole bucket being skipped. Measured
+    /// rather than exempted per bucket so that bytes a caller writes INTO a published
+    /// bucket count against those budgets exactly as they would anywhere else.
+    ///
+    /// Written once, by [`Self::record_published_buckets`]; nothing else moves it, so it is
+    /// the CEILING on what the budgets subtract — [`Self::published_allowance`] takes the
+    /// smaller of it and what those buckets hold now.
+    published_retained_bytes: usize,
+    /// How many stored versions the published catalog is. See
+    /// [`Self::published_retained_bytes`].
+    published_versions: usize,
+}
+
+impl Default for ComAmazonawsS3Amazons3State {
+    /// The store a fresh engine hands this service: empty of everything a caller writes,
+    /// and already holding the buckets AWS publishes ([`aws_published`]).
+    ///
+    /// Those buckets are what the store STARTS with because that is what publishing one
+    /// means: no client creates `sagemaker-sample-files`, and a client that follows a
+    /// documented path reads sample data out of it before it creates a bucket of its own.
+    /// Seeding them here — the one place a store comes into being — is what lets every
+    /// reader resolve them through the one bucket map, with no operation carrying a case
+    /// for a managed name.
+    fn default() -> Self {
+        let mut store = Self {
+            buckets: BTreeMap::new(),
+            minted_versions: 0,
+            minted_notification_configuration_ids: 0,
+            minted_lifecycle_rule_ids: 0,
+            minted_upload_ids: 0,
+            published_retained_bytes: 0,
+            published_versions: 0,
+        };
+        store.record_published_buckets();
+        store
+    }
 }
 
 impl ComAmazonawsS3Amazons3State {
@@ -5808,7 +5872,53 @@ impl ComAmazonawsS3Amazons3State {
     /// service-managed account, so it is not in the account's own `ListBuckets` either.
     pub fn account_buckets(&self) -> impl Iterator<Item = (&str, &Bucket)> + '_ {
         self.buckets()
-            .filter(|(_, bucket)| bucket.provisioned_by.is_none())
+            .filter(|(_, bucket)| bucket.provisioned_by.is_none() && !bucket.aws_published)
+    }
+
+    /// How many stored versions the caller-stored half of this store holds, which is what
+    /// [`MAX_OBJECTS_TOTAL`] bounds: every version in the store, less the published
+    /// catalog's own ([`Self::published_allowance`]).
+    fn caller_stored_versions(&self) -> usize {
+        let (_, versions) = self.published_allowance();
+        self.buckets
+            .values()
+            .map(Bucket::stored_versions)
+            .sum::<usize>()
+            .saturating_sub(versions)
+    }
+
+    /// How many bytes the caller-stored half of this store retains, which is what
+    /// [`MAX_OBJECT_BYTES_TOTAL`] bounds: everything the store retains, less the published
+    /// catalog's own ([`Self::published_allowance`]).
+    fn caller_retained_bytes(&self) -> usize {
+        let (bytes, _) = self.published_allowance();
+        self.buckets
+            .values()
+            .map(Bucket::retained_bytes)
+            .sum::<usize>()
+            .saturating_sub(bytes)
+    }
+
+    /// What the whole-store budgets subtract for the published catalog, as
+    /// `(bytes, versions)`: the seeded amount ([`Self::published_retained_bytes`]) or what
+    /// the published buckets hold NOW, whichever is SMALLER.
+    ///
+    /// Both directions matter, which is why it is neither the cached amount alone nor the
+    /// live footprint alone. A caller that writes into a published bucket pushes the live
+    /// footprint ABOVE the seeded amount, so the subtraction stays at the seeded amount and
+    /// everything it wrote counts against the budgets like a write anywhere else. A caller
+    /// that deletes a published object pushes it BELOW, so the subtraction shrinks with it
+    /// and no room is handed out for bytes the store no longer holds.
+    fn published_allowance(&self) -> (usize, usize) {
+        let (mut bytes, mut versions) = (0usize, 0usize);
+        for bucket in self.buckets.values().filter(|held| held.aws_published) {
+            bytes += bucket.retained_bytes();
+            versions += bucket.stored_versions();
+        }
+        (
+            bytes.min(self.published_retained_bytes),
+            versions.min(self.published_versions),
+        )
     }
 
     /// The bucket named `name`, or `None` when this emulator holds no such bucket.
@@ -5855,12 +5965,10 @@ impl ComAmazonawsS3Amazons3State {
         // What the whole store would hold after this write: every other bucket's bytes,
         // plus what this bucket would hold with the object at `key` written. The counts
         // work the same way — a key the bucket already holds adds no entry, unless the
-        // version there is kept rather than replaced.
-        let held_versions: usize = self
-            .buckets
-            .values()
-            .map(Bucket::stored_versions)
-            .sum::<usize>();
+        // version there is kept rather than replaced. Measured over the CALLER-stored half
+        // of the store ([`Self::caller_retained_bytes`]), which is what these budgets
+        // bound; a write into a bucket AWS publishes counts here like any other.
+        let held_versions: usize = self.caller_stored_versions();
         if (keeps || !held) && held_versions >= MAX_OBJECTS_TOTAL {
             return Some(ObjectWrite::TotalObjectCountReached);
         }
@@ -5872,6 +5980,10 @@ impl ComAmazonawsS3Amazons3State {
             mint_version_id(bucket, key, self.minted_versions)
         });
         let incoming = object.retained_bytes() + minted.as_ref().map_or(0, String::len);
+        // The same allowance the five other whole-store checks subtract
+        // ([`Self::published_allowance`]), so this path hands out no room for published
+        // bytes the store no longer holds either.
+        let (published_bytes, _) = self.published_allowance();
         let would_hold: usize = self
             .buckets
             .iter()
@@ -5883,6 +5995,7 @@ impl ComAmazonawsS3Amazons3State {
                 }
             })
             .sum::<usize>()
+            .saturating_sub(published_bytes)
             + incoming;
         if would_hold > MAX_OBJECT_BYTES_TOTAL {
             return Some(ObjectWrite::TotalByteBudgetReached { would_hold });
@@ -6002,11 +6115,11 @@ impl ComAmazonawsS3Amazons3State {
                 would_hold: would_hold_in_bucket,
             });
         }
+        // The whole-store budget measures the caller-stored half of the store
+        // ([`Self::caller_retained_bytes`]); a part uploaded into a bucket AWS publishes
+        // counts against it like any other.
         let would_hold: usize = self
-            .buckets
-            .values()
-            .map(Bucket::retained_bytes)
-            .sum::<usize>()
+            .caller_retained_bytes()
             .saturating_sub(released)
             + incoming;
         if would_hold > MAX_OBJECT_BYTES_TOTAL {
@@ -6179,10 +6292,7 @@ impl ComAmazonawsS3Amazons3State {
             return Some(ObjectTagWrite::ByteBudgetReached { would_hold });
         }
         let total_would_hold = self
-            .buckets
-            .values()
-            .map(Bucket::retained_bytes)
-            .sum::<usize>()
+            .caller_retained_bytes()
             .saturating_sub(released)
             + taken;
         if total_would_hold > MAX_OBJECT_BYTES_TOTAL {
@@ -6249,10 +6359,7 @@ impl ComAmazonawsS3Amazons3State {
             return Some(ObjectRetentionWrite::ByteBudgetReached { would_hold });
         }
         let total_would_hold = self
-            .buckets
-            .values()
-            .map(Bucket::retained_bytes)
-            .sum::<usize>()
+            .caller_retained_bytes()
             .saturating_sub(released)
             + taken;
         if total_would_hold > MAX_OBJECT_BYTES_TOTAL {
@@ -6317,10 +6424,7 @@ impl ComAmazonawsS3Amazons3State {
             return Some(ObjectRestoreWrite::ByteBudgetReached { would_hold });
         }
         let total_would_hold = self
-            .buckets
-            .values()
-            .map(Bucket::retained_bytes)
-            .sum::<usize>()
+            .caller_retained_bytes()
             .saturating_sub(released)
             + taken;
         if total_would_hold > MAX_OBJECT_BYTES_TOTAL {
@@ -6392,10 +6496,7 @@ impl ComAmazonawsS3Amazons3State {
             return Some(AnnotationWrite::ByteBudgetReached { would_hold });
         }
         let total_would_hold = self
-            .buckets
-            .values()
-            .map(Bucket::retained_bytes)
-            .sum::<usize>()
+            .caller_retained_bytes()
             .saturating_sub(released)
             + taken;
         if total_would_hold > MAX_OBJECT_BYTES_TOTAL {
@@ -6419,7 +6520,7 @@ impl ComAmazonawsS3Amazons3State {
     /// leaves the existing bucket alone, and a create past
     /// [`MAX_BUCKETS_PER_ACCOUNT`] is refused, which is what bounds this map.
     pub fn create_bucket(&mut self, name: &str, region: &str) -> BucketCreation {
-        self.record_bucket(name, region, None)
+        self.record_bucket(name, region, None, false)
     }
 
     /// Record a bucket named `name` in `region` that `provisioned_by` — another emulated
@@ -6443,20 +6544,92 @@ impl ComAmazonawsS3Amazons3State {
         region: &str,
         provisioned_by: &str,
     ) -> BucketCreation {
-        self.record_bucket(name, region, Some(provisioned_by))
+        self.record_bucket(name, region, Some(provisioned_by), false)
+    }
+
+    /// Record every bucket AWS publishes ([`aws_published::PUBLISHED_BUCKETS`]) and store
+    /// the objects it publishes under it.
+    ///
+    /// Called from [`Default`] and nowhere else: a published bucket is in the store before
+    /// the first request is served, because nothing creates it. Each object goes in through
+    /// [`Self::put_object`], the one way an object is recorded, so a published object is
+    /// held exactly the way a caller's is and every reader serves it through the same path.
+    ///
+    /// Nothing here can refuse: the catalog is fixed at compile time, so whether each entry
+    /// is recorded is settled by the catalog rather than by anything a caller does — which
+    /// is why the outcomes are dropped instead of raising anything on a request's path. That
+    /// every entry IS recorded, with the bytes the catalog publishes, is pinned by
+    /// `the_default_store_holds_every_published_object` below and over the wire by
+    /// `tests/all/aws_published_sample_data.rs`.
+    fn record_published_buckets(&mut self) {
+        for published in aws_published::PUBLISHED_BUCKETS {
+            let _ = self.record_bucket(published.name, published.region, None, true);
+            for object in published.objects {
+                let body = object.body.as_bytes().to_vec();
+                let stored = Object {
+                    etag: object_etag(&body),
+                    body,
+                    // The instant the store came into being, which is the only instant
+                    // this emulator can report for a published object; nothing moves it
+                    // afterwards, so every read reports the same `Last-Modified`.
+                    last_modified: SystemTime::now(),
+                    storage_class: DEFAULT_STORAGE_CLASS.to_string(),
+                    content_type: Some(object.content_type.to_string()),
+                    cache_control: None,
+                    content_disposition: None,
+                    content_encoding: None,
+                    content_language: None,
+                    expires: None,
+                    website_redirect_location: None,
+                    metadata: BTreeMap::new(),
+                    tags: Vec::new(),
+                    encryption: ObjectEncryption::default(),
+                    // The store mints a version id only for a versioning-enabled bucket,
+                    // and a published bucket carries no versioning state.
+                    version_id: None,
+                    // No Object Lock retention, no restore and no annotations: nothing
+                    // placed one, and a published object is readable without one being
+                    // asked for.
+                    retention: None,
+                    restore: None,
+                    annotations: BTreeMap::new(),
+                };
+                let _ = self.put_object(published.name, object.key, stored);
+            }
+        }
+
+        // What the catalog itself holds, measured once now that it is all in: the fixed
+        // amount the whole-store budgets subtract, so the catalog takes no room from a
+        // caller's own objects while anything a caller writes into a published bucket
+        // still counts. See [`Self::published_retained_bytes`].
+        self.published_retained_bytes = self
+            .buckets
+            .values()
+            .filter(|bucket| bucket.aws_published)
+            .map(Bucket::retained_bytes)
+            .sum();
+        self.published_versions = self
+            .buckets
+            .values()
+            .filter(|bucket| bucket.aws_published)
+            .map(Bucket::stored_versions)
+            .sum();
     }
 
     /// Record a bucket named `name` in `region`, provisioned by `provisioned_by` (`None`
-    /// for one created over S3's own API), reporting what happened.
+    /// for one created over S3's own API) and published by AWS when `aws_published`,
+    /// reporting what happened.
     ///
     /// Private: a create comes in through [`Self::create_bucket`] or
     /// [`Self::provision_bucket`], which is what keeps both subject to the same taken-name
-    /// and quota checks.
+    /// and quota checks, and the published catalog through
+    /// [`Self::record_published_buckets`], which runs before any request does.
     fn record_bucket(
         &mut self,
         name: &str,
         region: &str,
         provisioned_by: Option<&str>,
+        aws_published: bool,
     ) -> BucketCreation {
         if self.buckets.contains_key(name) {
             return BucketCreation::NameTaken;
@@ -6465,8 +6638,12 @@ impl ComAmazonawsS3Amazons3State {
         // measured over them: a bucket another service provisioned is not one of them (it
         // is not even reported among them, see [`Self::account_buckets`]) and is bounded
         // by that service's own limit on the resource it belongs to, so it neither
-        // consumes this quota nor is refused by it.
-        if provisioned_by.is_none() && self.account_buckets().count() >= MAX_BUCKETS_PER_ACCOUNT {
+        // consumes this quota nor is refused by it. Neither is a bucket AWS publishes,
+        // which is nobody's account's and is fixed by the catalog.
+        if provisioned_by.is_none()
+            && !aws_published
+            && self.account_buckets().count() >= MAX_BUCKETS_PER_ACCOUNT
+        {
             return BucketCreation::QuotaReached;
         }
         self.buckets.insert(
@@ -6474,6 +6651,7 @@ impl ComAmazonawsS3Amazons3State {
             Bucket {
                 region: region.to_string(),
                 provisioned_by: provisioned_by.map(str::to_string),
+                aws_published,
                 // The creation instant is read here, where the bucket comes into being,
                 // so `CreationDate` is the moment the store accepted it.
                 created_at: Some(SystemTime::now()),
@@ -6511,11 +6689,7 @@ impl ComAmazonawsS3Amazons3State {
         let adds_version = held.versioning.is_some()
             && (versioned || held.null_version_position(key).is_none());
         if adds_version {
-            let held_versions: usize = self
-                .buckets
-                .values()
-                .map(Bucket::stored_versions)
-                .sum::<usize>();
+            let held_versions: usize = self.caller_stored_versions();
             if held_versions >= MAX_OBJECTS_TOTAL {
                 return Some(ObjectDeletion::TotalVersionCountReached);
             }
@@ -7462,6 +7636,175 @@ mod tests {
             events: events.iter().map(|event| (*event).to_string()).collect(),
             filter_rules: None,
         }
+    }
+
+    #[test]
+    fn the_default_store_holds_every_published_object() {
+        // The store a fresh engine hands this service already holds what AWS publishes,
+        // because nothing creates those buckets. Walked over the whole catalog, so an
+        // entry added to it is covered without a row being written here.
+        let store = ComAmazonawsS3Amazons3State::default();
+
+        for published in aws_published::PUBLISHED_BUCKETS {
+            let held = store
+                .bucket(published.name)
+                .unwrap_or_else(|| panic!("the published bucket {} is held", published.name));
+            assert!(
+                held.is_aws_published(),
+                "case {:?}: a published bucket is marked as AWS's own",
+                published.name
+            );
+            assert_eq!(
+                held.region, published.region,
+                "case {:?}: expected the published Region {:?}, got {:?}",
+                published.name, published.region, held.region
+            );
+            assert!(
+                store
+                    .account_buckets()
+                    .all(|(name, _)| name != published.name),
+                "case {:?}: a published bucket is not one of the account's own",
+                published.name
+            );
+
+            let keys: Vec<&str> = held.objects().map(|(key, _)| key).collect();
+            let mut expected: Vec<&str> =
+                published.objects.iter().map(|object| object.key).collect();
+            expected.sort_unstable();
+            assert_eq!(
+                keys, expected,
+                "case {:?}: expected exactly the published keys {expected:?}, got {keys:?}",
+                published.name
+            );
+
+            for object in published.objects {
+                let stored = held
+                    .object(object.key)
+                    .unwrap_or_else(|| panic!("the published key {} is held", object.key));
+                assert_eq!(
+                    stored.body,
+                    object.body.as_bytes(),
+                    "case {:?}: expected the published bytes",
+                    object.key
+                );
+                assert_eq!(
+                    stored.etag,
+                    object_etag(object.body.as_bytes()),
+                    "case {:?}: expected the entity tag of the published bytes, got {:?}",
+                    object.key,
+                    stored.etag
+                );
+                assert_eq!(
+                    stored.content_type.as_deref(),
+                    Some(object.content_type),
+                    "case {:?}: expected the published Content-Type, got {:?}",
+                    object.key,
+                    stored.content_type
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_published_catalog_takes_no_room_from_the_callers_own_objects() {
+        // The whole-store budgets bound what a CALLER stored; the published catalog is
+        // fixed by the code, so it neither consumes them nor is bounded by them. A fresh
+        // store therefore reports an empty caller half even while it holds the catalog.
+        let store = ComAmazonawsS3Amazons3State::default();
+        assert!(
+            store.buckets().count() > 0,
+            "the default store holds the published catalog"
+        );
+        assert_eq!(
+            store.caller_retained_bytes(),
+            0,
+            "a store nobody has written to retains no caller bytes, got {}",
+            store.caller_retained_bytes()
+        );
+        assert_eq!(
+            store.caller_stored_versions(),
+            0,
+            "a store nobody has written to holds no caller versions, got {}",
+            store.caller_stored_versions()
+        );
+    }
+
+    #[test]
+    fn a_caller_write_into_a_published_bucket_counts_against_the_whole_store_budgets() {
+        // The allowance the whole-store budgets subtract for the published catalog is
+        // bounded BOTH ways, and this is the branch that pins it.
+        let mut store = ComAmazonawsS3Amazons3State::default();
+        let published = aws_published::PUBLISHED_BUCKETS
+            .first()
+            .expect("the catalog publishes at least one bucket");
+        assert_eq!(
+            store.caller_retained_bytes(),
+            0,
+            "a store nobody has written to retains no caller bytes"
+        );
+
+        // A caller's write lands in a published bucket, so the live footprint rises ABOVE
+        // the seeded amount: the subtraction stays at the seeded amount and every byte the
+        // caller wrote is measured, exactly as it would be in a bucket of its own.
+        let written = object(64);
+        let footprint = written.retained_bytes();
+        assert_eq!(
+            store.put_object(published.name, "written-by-the-caller", written),
+            Some(ObjectWrite::Created),
+            "the write into a published bucket is recorded"
+        );
+        assert_eq!(
+            store.caller_retained_bytes(),
+            footprint,
+            "a caller's write into a published bucket counts in full, got {}",
+            store.caller_retained_bytes()
+        );
+        assert_eq!(
+            store.caller_stored_versions(),
+            1,
+            "a caller's write into a published bucket counts as one version, got {}",
+            store.caller_stored_versions()
+        );
+
+        // And a delete OUT of a published bucket takes the live footprint below the seeded
+        // amount, so the subtraction shrinks with it rather than handing out room for
+        // bytes the store no longer holds.
+        let key = published
+            .objects
+            .first()
+            .expect("the catalog publishes at least one object")
+            .key;
+        assert_eq!(
+            store.remove_object(published.name, key),
+            Some(ObjectDeletion::Removed),
+            "the published key was there to delete"
+        );
+        let total: usize = store.buckets.values().map(Bucket::retained_bytes).sum();
+        let still_published: usize = store
+            .buckets
+            .values()
+            .filter(|held| held.aws_published)
+            .map(Bucket::retained_bytes)
+            .sum();
+        assert!(
+            store.caller_retained_bytes() >= total - still_published,
+            "the subtraction may not exceed what the published buckets still hold: store \
+             retains {total}, published half {still_published}, caller half reported as {}",
+            store.caller_retained_bytes()
+        );
+
+        // Taking the caller's own object away again leaves the caller half empty.
+        assert_eq!(
+            store.remove_object(published.name, "written-by-the-caller"),
+            Some(ObjectDeletion::Removed),
+            "the caller's own object was there to delete"
+        );
+        assert_eq!(
+            store.caller_retained_bytes(),
+            0,
+            "with the caller's object gone the caller half is empty again, got {}",
+            store.caller_retained_bytes()
+        );
     }
 
     #[test]

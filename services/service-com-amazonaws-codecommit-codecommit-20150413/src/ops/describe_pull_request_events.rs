@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePullRequestEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePullRequestEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: reports the event log the operations that changed the pull request
+//! appended to it (`crate::state::PullRequestRecord::events`), oldest first, narrowed
+//! by `pullRequestEventType` and `actorArn` and paged through this service's one
+//! pagination rule.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePullRequestEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ActorDoesNotExistException` ("the specified ARN does not exist in the account") is
+//! never the answer here: which identities exist is not something this emulator holds —
+//! a caller is identified by the access key id its request is signed with and any such
+//! id is served — so an `actorArn` is judged on its FORM alone
+//! ([`crate::state::is_identity_arn`]), and a well-formed ARN no event names simply
+//! matches no event.
 //!
 //! ## Shape of an operation
 //!
@@ -152,6 +154,32 @@ impl From<DescribePullRequestEventsErrorModeled> for DescribePullRequestEventsEr
     }
 }
 
+/// How this operation refuses a page it cannot serve. Both codes come from this
+/// service's one pagination rule ([`crate::state::page_of_at_most`]), so every
+/// paginated listing refuses the same `maxResults` and the same `nextToken` with
+/// the same words; this only maps each outcome onto the error THIS operation
+/// models for it.
+fn page_refusal(problem: crate::state::PageProblem) -> DescribePullRequestEventsError {
+    match problem {
+        crate::state::PageProblem::InvalidMaxResults(message) => {
+            DescribePullRequestEventsErrorModeled::InvalidMaxResultsException(
+                InvalidMaxResultsException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::PageProblem::InvalidContinuationToken(message) => {
+            DescribePullRequestEventsErrorModeled::InvalidContinuationTokenException(
+                InvalidContinuationTokenException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+    }
+}
+
 /// The `DescribePullRequestEvents` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -188,18 +216,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePullRequestEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePullRequestEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePullRequestEvents"))
+        let _ = ctx;
+        // Which ids address a pull request is `crate::state`'s rule, so every
+        // operation taking a `pullRequestId` agrees about it; this only maps each
+        // outcome onto the error THIS operation models for it.
+        let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
+            .map_err(|problem| match problem {
+                crate::state::PullRequestIdProblem::Missing => {
+                    DescribePullRequestEventsErrorModeled::PullRequestIdRequiredException(
+                        PullRequestIdRequiredException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PullRequestIdProblem::Invalid => {
+                    DescribePullRequestEventsErrorModeled::InvalidPullRequestIdException(
+                        InvalidPullRequestIdException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // "Optional. The pull request event type about which you want to return
+        // information": the member is a modelled enum, so a value the model does
+        // not declare is already refused at the request boundary (see
+        // `crate::service`) and what reaches here is a type some event could
+        // carry; leaving the member out narrows nothing.
+        let event_type = input.pull_request_event_type.as_deref();
+
+        // "The Amazon Resource Name (ARN) of the user whose actions resulted in
+        // the event": likewise optional, and likewise refused when it is present
+        // but is not an ARN that could name an identity.
+        let actor_arn = input
+            .actor_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|requested| !requested.is_empty());
+        if let Some(requested) = actor_arn {
+            if !crate::state::is_identity_arn(requested) {
+                return Err(
+                    DescribePullRequestEventsErrorModeled::InvalidActorArnException(
+                        InvalidActorArnException {
+                            message: Some(crate::state::INVALID_ACTOR_ARN_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        // Reporting only: the log is read exactly as the operations that change
+        // the pull request left it, so two reads of it answer the same.
+        let store = state.lock();
+        let pull_request = store.pull_request(pull_request_id).ok_or_else(|| {
+            DescribePullRequestEventsErrorModeled::PullRequestDoesNotExistException(
+                PullRequestDoesNotExistException {
+                    message: Some(crate::state::pull_request_does_not_exist_message(
+                        &pull_request_id.to_string(),
+                    )),
+                },
+            )
+        })?;
+
+        // The entries this request asks for, in the order they were appended —
+        // which is the order the changes happened, oldest first. Each is carried
+        // as its position in the log, so the page is resolved back to the stored
+        // entries rather than to a copy of them.
+        let matching: Vec<String> = pull_request
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event_type.is_none_or(|requested| event.event_type() == requested)
+                    && actor_arn
+                        .is_none_or(|requested| event.actor_arn.as_deref() == Some(requested))
+            })
+            .map(|(position, _)| position.to_string())
+            .collect();
+
+        // A continuation token belongs to the listing it was issued for: the same
+        // pull request narrowed the same way, so a token cannot carry a position
+        // from one set of events into another.
+        let scope = format!(
+            "DescribePullRequestEvents/{pull_request_id}/{}/{}",
+            event_type.unwrap_or_default(),
+            actor_arn.unwrap_or_default()
+        );
+        let (page, next_token) = crate::state::page_of_at_most(
+            &scope,
+            &matching,
+            input.next_token.as_deref(),
+            input.max_results,
+            crate::state::PULL_REQUEST_EVENTS_PAGE_MAX,
+            crate::state::PULL_REQUEST_EVENTS_PAGE_DEFAULT,
+        )
+        .map_err(page_refusal)?;
+
+        let pull_request_events = page
+            .iter()
+            .filter_map(|position| position.parse::<usize>().ok())
+            .filter_map(|position| pull_request.events.get(position))
+            .map(|event| event.to_modeled(pull_request_id))
+            .collect();
+
+        Ok(DescribePullRequestEventsOutput {
+            pull_request_events,
+            next_token,
+        })
     }
 }

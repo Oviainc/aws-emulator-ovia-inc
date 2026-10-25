@@ -120,3 +120,5 @@ mod config_refusal_message_templates;
 mod compliance_summary_by_resource_type;
 #[path = "all/compliance_details_by_resource.rs"]
 mod compliance_details_by_resource;
+#[path = "all/resource_config_deletion.rs"]
+mod resource_config_deletion;

@@ -69,8 +69,9 @@
 //! owes falls due. The Monitor dashboards live in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dashboards`], keyed by the
 //! minted `dashboardId` — which identifies one across every project — each
-//! record naming the project it was created in and holding the definition
-//! literal the last write to it stated. Every
+//! record naming the project it was created in, holding the definition
+//! literal the last write to it stated and the idempotency token its create
+//! carried, which is what a retry of that create is recognised by. Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
@@ -4052,6 +4053,19 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         })
     }
 
+    /// The dashboard a create carrying `client_token` already minted, if any.
+    ///
+    /// What makes `CreateDashboard` idempotent on its token: a retry of a create
+    /// that carried one answers from the dashboard that create minted. Not
+    /// scoped to a project — a `dashboardId` identifies a dashboard across every
+    /// project, so the token of the create that minted one is enough to
+    /// recognise its retry.
+    pub fn dashboard_for_client_token(&self, client_token: &str) -> Option<&DashboardRecord> {
+        self.dashboards
+            .values()
+            .find(|record| record.matches_client_token(client_token))
+    }
+
     /// How many searches `workspace` holds — what the per-workspace bound reads.
     pub fn searches_in_workspace(&self, workspace_name: &str) -> usize {
         self.searches
@@ -7005,10 +7019,21 @@ pub struct DashboardRecord {
     pub definition: String,
     pub creation_date: SystemTime,
     pub last_update_date: SystemTime,
+    /// The `clientToken` the create that minted this dashboard carried, if any:
+    /// what a retry of that create is recognised by, so it answers from this
+    /// record instead of minting a second dashboard. Not the update's to
+    /// change.
+    pub client_token: Option<String>,
     pub tags: HashMap<String, String>,
 }
 
 impl DashboardRecord {
+    /// The dashboard a create carrying `client_token` already minted, if this
+    /// store holds one — see [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dashboard_for_client_token`].
+    fn matches_client_token(&self, client_token: &str) -> bool {
+        self.client_token.as_deref() == Some(client_token)
+    }
+
     /// Replace the caller-owned members with what an update stated, and record
     /// that instant as the dashboard's last update.
     ///

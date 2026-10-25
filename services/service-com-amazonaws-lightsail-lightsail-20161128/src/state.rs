@@ -633,6 +633,9 @@ pub const OPERATION_TYPE_DELETE_LOAD_BALANCER: &str = "DeleteLoadBalancer";
 pub const OPERATION_TYPE_ATTACH_INSTANCES_TO_LOAD_BALANCER: &str =
     "AttachInstancesToLoadBalancer";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_LOAD_BALANCER_TLS_CERTIFICATE: &str =
+    "CreateLoadBalancerTlsCertificate";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_LOAD_BALANCER_TLS_CERTIFICATE: &str =
     "DeleteLoadBalancerTlsCertificate";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -8829,6 +8832,61 @@ pub fn load_balancer_dns_name(region: &str, name: &str, id: &str) -> String {
     format!("{name}-{token}.{region}.{LOAD_BALANCER_DNS_SUFFIX}")
 }
 
+/// The most SSL/TLS certificates ONE load balancer may hold at a time.
+///
+/// An AWS quota, not an emulator guard: the modelled
+/// `CreateLoadBalancerTlsCertificate$certificateName` documentation states it —
+/// "Each Lightsail load balancer can have up to 2 certificates associated with
+/// it at one time."
+pub const MAX_CERTIFICATES_PER_LOAD_BALANCER: usize = 2;
+
+/// The most SSL/TLS certificates of load balancers this account may hold at a
+/// time, across every Region.
+///
+/// An AWS quota too, from the same documentation: "You can have up to 10
+/// certificates in your account at one time."
+pub const MAX_LOAD_BALANCER_TLS_CERTIFICATES: usize = 10;
+
+/// The most alternative domains and subdomains ONE load balancer certificate
+/// may also cover.
+///
+/// An AWS quota too, from the modelled
+/// `CreateLoadBalancerTlsCertificate$certificateAlternativeNames`
+/// documentation: "You can have a maximum of 9 alternative names (in addition
+/// to the 1 primary domain)."
+pub const MAX_LOAD_BALANCER_TLS_CERTIFICATE_ALTERNATIVE_NAMES: usize = 9;
+
+/// The most ENTRIES an alternative-name list may carry before it is de-duped.
+///
+/// Emulator resource guard, NOT an AWS quota, and the bound that makes the
+/// de-duping affordable: the names a request repeats are only known to be
+/// repeats once every entry has been examined, so the number of entries a
+/// request may send is capped BEFORE any of that work runs rather than after
+/// it. Generous next to the
+/// [`MAX_LOAD_BALANCER_TLS_CERTIFICATE_ALTERNATIVE_NAMES`] distinct domains
+/// that can survive de-duping; a list carrying more entries than this is
+/// refused with the modelled `InvalidInputException`.
+pub const MAX_DOMAIN_NAME_LIST_ENTRIES: usize = 100;
+
+/// The alternative domains a certificate actually covers, given the primary
+/// domain it is for and the names a request listed.
+///
+/// "Lightsail will de-dupe the names for you": a name the list repeats, and a
+/// name that already IS the certificate's primary domain, add no domain to the
+/// certificate. The ONE owner of that reduction, so every operation that
+/// stores a certificate's alternative domains stores the same shape. The walk
+/// is bounded by [`MAX_DOMAIN_NAME_LIST_ENTRIES`], which every caller checks
+/// before reading the list.
+pub fn alternative_domain_names(primary: &str, requested: Vec<String>) -> Vec<String> {
+    let mut covered: Vec<String> = Vec::new();
+    for name in requested {
+        if name != primary && !covered.contains(&name) {
+            covered.push(name);
+        }
+    }
+    covered
+}
+
 /// The SSL/TLS certificate a load balancer holds: the one
 /// `CreateLoadBalancer`'s certificate members asked for, or one
 /// `CreateLoadBalancerTlsCertificate` added.
@@ -8839,13 +8897,19 @@ pub struct StoredLoadBalancerCertificate {
     pub name: String,
     /// The domain the certificate is associated with.
     pub domain_name: String,
-    /// The alternative domains and subdomains the certificate also covers.
+    /// The alternative domains and subdomains the certificate also covers, as
+    /// [`alternative_domain_names`] reduced them — every writer of this field
+    /// goes through that one owner, so a repeat and the primary domain are
+    /// never among them.
     pub alternative_names: Vec<String>,
     /// Whether the certificate is attached to the load balancer, which is what
     /// `LoadBalancerTlsCertificateSummary$isAttached` reports. A certificate is
     /// attached only by `AttachLoadBalancerTlsCertificate`, never by the call
     /// that requested it: it has to be validated first.
     pub is_attached: bool,
+    /// The tags the request asked for, kept verbatim — "the tag keys and
+    /// optional values to add to the resource during create".
+    pub tags: Vec<Tag>,
 }
 
 /// One stored load balancer: the configuration the caller asked for, the members
@@ -8875,8 +8939,9 @@ pub struct StoredLoadBalancer {
     pub ip_address_type: String,
     /// The TLS security policy the request named, or `None` when it named none.
     pub tls_policy_name: Option<String>,
-    /// The certificate this load balancer holds, if any.
-    pub certificate: Option<StoredLoadBalancerCertificate>,
+    /// The SSL/TLS certificates this load balancer holds, in the order they
+    /// were added — at most [`MAX_CERTIFICATES_PER_LOAD_BALANCER`] of them.
+    pub certificates: Vec<StoredLoadBalancerCertificate>,
     /// The instances registered with this load balancer, in registration order
     /// — what `instanceHealthSummary` reports one entry per.
     pub attached_instances: Vec<String>,
@@ -8900,9 +8965,29 @@ impl StoredLoadBalancer {
     /// Whether an SSL/TLS certificate is ATTACHED to this load balancer, which
     /// is what decides its protocol and its public ports.
     fn serves_https(&self) -> bool {
-        self.certificate
-            .as_ref()
-            .is_some_and(|certificate| certificate.is_attached)
+        self.certificates
+            .iter()
+            .any(|certificate| certificate.is_attached)
+    }
+
+    /// The certificate `name` names among the ones this load balancer holds.
+    ///
+    /// A load balancer's certificate is addressed by its own name among THIS
+    /// load balancer's certificates, which is how every certificate operation
+    /// reaches one: the same name may name a certificate of another load
+    /// balancer, and the two are different records.
+    pub fn certificate(&self, name: &str) -> Option<&StoredLoadBalancerCertificate> {
+        self.certificate_index(name)
+            .and_then(|index| self.certificates.get(index))
+    }
+
+    /// WHERE the certificate `name` names sits among the ones this load
+    /// balancer holds — what an operation that REMOVES one needs. The one
+    /// lookup rule, shared with [`Self::certificate`].
+    pub fn certificate_index(&self, name: &str) -> Option<usize> {
+        self.certificates
+            .iter()
+            .position(|certificate| certificate.name == name)
     }
 
     /// The modelled `configurationOptions` map: one entry per
@@ -8980,7 +9065,7 @@ impl StoredLoadBalancer {
                     .collect(),
             ),
             tls_certificate_summaries: Some(
-                self.certificate
+                self.certificates
                     .iter()
                     .map(|certificate| LoadBalancerTlsCertificateSummary {
                         name: Some(certificate.name.clone()),
@@ -10709,6 +10794,22 @@ impl ComAmazonawsLightsailLightsail20161128State {
     ) -> Option<StoredLoadBalancer> {
         self.load_balancers
             .remove(&(region.to_string(), name.to_string()))
+    }
+
+    /// How many SSL/TLS certificates of load balancers this account holds,
+    /// across every Region — what [`MAX_LOAD_BALANCER_TLS_CERTIFICATES`]
+    /// bounds.
+    ///
+    /// Counted from the load balancers that hold them rather than from a
+    /// counter, so the number cannot drift from the records that actually carry
+    /// a certificate. The walk is bounded by
+    /// [`MAX_LOAD_BALANCERS_PER_REGION`] load balancers per Region, each
+    /// holding at most [`MAX_CERTIFICATES_PER_LOAD_BALANCER`].
+    pub fn load_balancer_tls_certificate_count(&self) -> usize {
+        self.load_balancers
+            .values()
+            .map(|balancer| balancer.certificates.len())
+            .sum()
     }
 
     /// Store a newly created load balancer.

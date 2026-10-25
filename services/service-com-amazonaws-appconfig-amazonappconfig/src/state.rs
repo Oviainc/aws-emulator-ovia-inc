@@ -3673,6 +3673,33 @@ pub const LISTING_EXTENSION_ASSOCIATIONS: &str = "ListExtensionAssociations";
 /// another listing cannot resume this one. See [`paginate`].
 pub const LISTING_EXPERIMENT_RUN_EVENTS: &str = "ListExperimentRunEvents";
 
+/// The `kind` a `ListExperimentRuns` cursor is stamped with, so a token minted by another
+/// listing cannot resume this one. See [`paginate`].
+pub const LISTING_EXPERIMENT_RUNS: &str = "ListExperimentRuns";
+
+/// The sort key of a resource numbered within its parent, built so that ASCENDING key
+/// order is DESCENDING number order: this service lists a parent's numbered children
+/// newest first, and [`paginate`] walks its input in ascending key order.
+///
+/// Every number this keys on is a positive `Integer`, so complementing it against
+/// `i32::MAX` keeps it non-negative, and the fixed width makes the string comparison
+/// agree with the numeric one (`"10"` must not sort before `"9"`). Shared by every
+/// listing ordered that way, so one walk's cursor cannot disagree with another's.
+pub fn descending_number_key(number: i32) -> String {
+    // The complement is only a fixed-width key for a non-negative number: a negative one
+    // would render wider than the format's 10 digits and break the ordering the cursor
+    // relies on. Every number this keys on is a positive `Integer`, so this is loud in a
+    // debug build rather than a silently mis-ordered walk.
+    debug_assert!(
+        number >= 0,
+        "a numbered child's number is positive, got {number}"
+    );
+    format!(
+        "{:010}",
+        i64::from(i32::MAX).saturating_sub(i64::from(number))
+    )
+}
+
 /// One page of a list operation: the items on it, and the token that resumes the walk
 /// after them (`None` on the last page).
 #[derive(Debug)]

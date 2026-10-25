@@ -255,12 +255,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exactly the stored tags) so the gate below and the insert agree.
         let payload_bytes = tag_list_bytes(&tags);
 
-        // A pool is a resource of the account, and this emulator stores none of the three
-        // kinds a request can name here: `CreatePublicIpv4Pool`, `CreateIpamPool` and
-        // `CreateCoipPool` are all still stubs, and an Outpost's customer-owned pool cannot
-        // exist at all without an Outpost. So a pool id a caller names can only be one the
-        // account holds no pool for, and the value is refused instead of being quietly
-        // ignored and answered with an Amazon-pool address.
+        // A pool is a resource of the account, and an Elastic IP address drawn from one has
+        // to come out of a CIDR provisioned INTO that pool: `ProvisionPublicIpv4PoolCidr`,
+        // `CreateIpamPool`'s provisioning and `CreateCoipPool` are all still stubs, and an
+        // Outpost's customer-owned pool cannot exist at all without an Outpost. So no pool
+        // this emulator can hold carries an address to give out — a pool
+        // `CreatePublicIpv4Pool` mints is empty — and the value is refused instead of being
+        // quietly ignored and answered with an Amazon-pool address.
         for (member, value) in [
             ("publicIpv4Pool", input.public_ipv4_pool.as_deref()),
             (
@@ -272,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(pool) = value {
                 return Err(Scaffolded::invalid_parameter_value(format!(
                     "Invalid value '{pool}' for {member}. \
-                     This account holds no such address pool"
+                     No address pool of this account has an address to allocate"
                 )));
             }
         }

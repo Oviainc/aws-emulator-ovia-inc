@@ -177,6 +177,130 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `MissingParameter` error shape.
+static MISSING_PARAMETER_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#MissingParameter$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `MissingParameter` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the two above: this
+/// service's model declares NO `MissingParameter` shape, so the shape cannot collide
+/// with a modeled one. The code is the one Amazon SQS answers a request that leaves out
+/// a parameter it had to carry — the same code a batch result entry reports for an
+/// entry missing a required member.
+pub static MISSING_PARAMETER_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#MissingParameter",
+        "smithy.framework",
+        "MissingParameter",
+    ),
+    ShapeType::Structure,
+    &[&MISSING_PARAMETER_MESSAGE],
+);
+
+/// The payload of a `MissingParameter` failure: which parameter the request had to
+/// carry and did not.
+#[derive(Debug, Clone)]
+pub struct MissingParameter {
+    pub message: String,
+}
+
+impl MissingParameter {
+    /// The refusal for the parameter called `parameter`, worded as Amazon SQS words it:
+    /// "The request must contain the parameter <name>." Only the member NAME reaches
+    /// the payload, never the value the request carried for it.
+    pub fn new(parameter: &str) -> Self {
+        Self {
+            message: format!("The request must contain the parameter {parameter}."),
+        }
+    }
+}
+
+impl std::fmt::Display for MissingParameter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MissingParameter: {}", self.message)
+    }
+}
+
+impl std::error::Error for MissingParameter {}
+
+impl SerializableStruct for MissingParameter {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&MISSING_PARAMETER_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
+/// The `message` member of the synthetic `InvalidParameterValue` error shape.
+static INVALID_PARAMETER_VALUE_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#InvalidParameterValue$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `InvalidParameterValue` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the others: this service's
+/// model declares NO `InvalidParameterValue` shape, so it cannot collide with a modeled
+/// one. The code is the one Amazon SQS answers a parameter whose VALUE it does not
+/// accept — the same code a batch result entry carries for an entry it refuses.
+pub static INVALID_PARAMETER_VALUE_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InvalidParameterValue",
+        "smithy.framework",
+        "InvalidParameterValue",
+    ),
+    ShapeType::Structure,
+    &[&INVALID_PARAMETER_VALUE_MESSAGE],
+);
+
+/// The payload of an `InvalidParameterValue` failure: which value was not accepted and
+/// why.
+#[derive(Debug, Clone)]
+pub struct InvalidParameterValue {
+    pub message: String,
+}
+
+impl InvalidParameterValue {
+    /// An `InvalidParameterValue` carrying `message`. Name the parameter and say what it
+    /// accepts — the caller has to fix the request from this text alone.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidParameterValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InvalidParameterValue: {}", self.message)
+    }
+}
+
+impl std::error::Error for InvalidParameterValue {}
+
+impl SerializableStruct for InvalidParameterValue {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&INVALID_PARAMETER_VALUE_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,6 +320,22 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// A parameter the request had to carry was not supplied. Renders as HTTP 400 with
+    /// the error code `MissingParameter`.
+    ///
+    /// Deliberately NOT the `ValidationException` above: `MissingParameter` is the code
+    /// Amazon SQS itself answers a request that leaves out a required parameter, and
+    /// this model declares the shape for no operation, so this wrapper is the only
+    /// channel that can carry it.
+    MissingParameter(MissingParameter),
+    /// A parameter's VALUE is not one this service accepts. Renders as HTTP 400 with the
+    /// error code `InvalidParameterValue`.
+    ///
+    /// Deliberately NOT the `ValidationException` above: `InvalidParameterValue` is the
+    /// code Amazon SQS itself answers a value outside what a parameter accepts, and this
+    /// model declares the shape for no operation, so this wrapper is the only channel
+    /// that can carry it.
+    InvalidParameterValue(InvalidParameterValue),
 }
 
 impl<E> Scaffolded<E> {
@@ -221,6 +361,19 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request with HTTP 400 `MissingParameter`, naming the parameter it had
+    /// to carry and did not (see [`Scaffolded::MissingParameter`]).
+    pub fn missing_parameter(parameter: &str) -> Self {
+        Self::MissingParameter(MissingParameter::new(parameter))
+    }
+
+    /// Refuse the request with HTTP 400 `InvalidParameterValue`, saying which value was
+    /// not accepted and what the parameter takes (see
+    /// [`Scaffolded::InvalidParameterValue`]).
+    pub fn invalid_parameter_value(message: impl Into<String>) -> Self {
+        Self::InvalidParameterValue(InvalidParameterValue::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -229,6 +382,8 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::MissingParameter(e) => write!(f, "{e}"),
+            Self::InvalidParameterValue(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +396,8 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::MissingParameter(e) => e.source(),
+            Self::InvalidParameterValue(e) => e.source(),
         }
     }
 }
@@ -255,6 +412,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::MissingParameter(e) => e,
+            Self::InvalidParameterValue(e) => e,
         }
     }
 
@@ -263,6 +422,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::MissingParameter(_) => &MISSING_PARAMETER_SCHEMA,
+            Self::InvalidParameterValue(_) => &INVALID_PARAMETER_VALUE_SCHEMA,
         }
     }
 
@@ -275,6 +436,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::MissingParameter(_) => "MissingParameter",
+            Self::InvalidParameterValue(_) => "InvalidParameterValue",
         }
     }
 
@@ -287,6 +450,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            Self::MissingParameter(_) => 400,
+            Self::InvalidParameterValue(_) => 400,
         }
     }
 
@@ -299,6 +464,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            Self::MissingParameter(_) => None,
+            Self::InvalidParameterValue(_) => None,
         }
     }
 }

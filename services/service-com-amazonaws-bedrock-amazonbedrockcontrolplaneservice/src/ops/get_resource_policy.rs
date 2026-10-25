@@ -8,10 +8,15 @@
 //! `PutResourcePolicy` stored, byte for byte, and changes nothing a later caller sees —
 //! the only write on this path is the one the CLOCK already made due, the status
 //! transitions resolving the resource materialises, which a read of that resource itself
-//! would have materialised at the same instant. A resource that holds no policy — none
-//! was ever attached, or the resource the ARN names is not one this account holds — is
-//! answered 404 `ResourceNotFoundException`, the error this operation models for a
-//! resource that was not found.
+//! would have materialised at the same instant.
+//!
+//! Two different absences, answered the two different ways the model separates them:
+//!
+//! * a resource this account HOLDS which has no policy attached is reported 200 with
+//!   `resourcePolicy` ABSENT — the member is not `@required`, so "this resource carries no
+//!   policy" is a reportable state of a resource that WAS found, not a failure;
+//! * an ARN naming no resource of this account is 404 `ResourceNotFoundException`, with
+//!   the sentence the model writes for that error ([`NO_SUCH_RESOURCE`]).
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +120,15 @@ impl From<GetResourcePolicyErrorModeled> for GetResourcePolicyError {
     }
 }
 
+/// What this operation's 404 states for an ARN naming no resource of this account: the
+/// sentence the MODEL writes for `ResourceNotFoundException`
+/// (`smithy_query(query="doc",shape="ResourceNotFoundException")`), word for word. Fixed
+/// text with no variable part — the error names the ARN class, and the ARN the request
+/// carried is already the one the caller sent.
+const NO_SUCH_RESOURCE: &str = "The specified resource Amazon Resource Name (ARN) was not \
+                                found. Check the Amazon Resource Name (ARN) and try your \
+                                request again.";
+
 /// The `GetResourcePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -165,20 +179,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        let Some(document) = store.resource_policy(&input.resource_arn, &region, now) else {
+        // The ARN first: what the 404 reports is an ARN naming no resource of this
+        // account, which is a different thing from a resource carrying no policy.
+        if store
+            .policy_resource(&input.resource_arn, &region, now)
+            .is_none()
+        {
             return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no resource policy is attached to {}",
-                        input.resource_arn
-                    )),
+                    message: Some(NO_SUCH_RESOURCE.to_string()),
                 },
             )
             .into());
-        };
+        }
 
+        // A resource that holds no policy reports the member ABSENT.
         Ok(GetResourcePolicyOutput {
-            resource_policy: Some(document.to_string()),
+            resource_policy: store
+                .resource_policy(&input.resource_arn, &region, now)
+                .map(str::to_string),
         })
     }
 }

@@ -659,8 +659,10 @@ async fn set_queue_attributes_changes_exactly_the_attributes_it_names() {
     );
 }
 
-/// Re-creating a name with the exact same attribute set returns the existing url;
-/// re-creating it with any different set is refused as `QueueNameExists`.
+/// Re-creating a name with the same values for every COMPARED attribute returns the
+/// existing url; re-creating it with a different value for one of them is refused as
+/// `QueueNameExists`. The attributes left out of that comparison have their own rows in
+/// `queue_lifecycle`.
 #[tokio::test]
 async fn re_creating_a_name_is_idempotent_only_for_an_identical_attribute_set() {
     let router = emulator();
@@ -692,14 +694,14 @@ async fn re_creating_a_name_is_idempotent_only_for_an_identical_attribute_set() 
         ),
         (
             "the second dropping an attribute the first set",
-            json!({"Policy": QUEUE_POLICY}),
+            json!({"SqsManagedSseEnabled": "true"}),
             json!({}),
             false,
         ),
         (
             "the second adding an attribute the first did not set",
             json!({}),
-            json!({"Policy": QUEUE_POLICY}),
+            json!({"SqsManagedSseEnabled": "true"}),
             false,
         ),
     ];

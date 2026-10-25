@@ -394,6 +394,20 @@ pub const FIELD_SUBNET_ARN: &str = "subnetArn";
 /// See [`FIELD_GLOBAL_NETWORK_ID`]: the same lowerCamelCase spelling of the request
 /// member, for the version id a put of a core network policy asserts the history ends at.
 pub const FIELD_LATEST_VERSION_ID: &str = "latestVersionId";
+/// See [`FIELD_CORE_NETWORK_ID`]: the segment a listing of one segment's routing
+/// information addresses, and the next-hop filter map that listing narrows itself with.
+pub const FIELD_SEGMENT_NAME: &str = "segmentName";
+/// See [`FIELD_SEGMENT_NAME`].
+pub const FIELD_NEXT_HOP_FILTERS: &str = "nextHopFilters";
+/// See [`FIELD_SEGMENT_NAME`]: the four lists a listing of routing information matches a
+/// route's BGP attributes against.
+pub const FIELD_LOCAL_PREFERENCE_MATCHES: &str = "localPreferenceMatches";
+/// See [`FIELD_LOCAL_PREFERENCE_MATCHES`].
+pub const FIELD_MED_MATCHES: &str = "medMatches";
+/// See [`FIELD_LOCAL_PREFERENCE_MATCHES`].
+pub const FIELD_EXACT_AS_PATH_MATCHES: &str = "exactAsPathMatches";
+/// See [`FIELD_LOCAL_PREFERENCE_MATCHES`].
+pub const FIELD_COMMUNITY_MATCHES: &str = "communityMatches";
 
 /// How a resource kind of this service reads in prose: the ARN resource type
 /// ([`GLOBAL_NETWORK_KIND`] and friends) with its hyphens as spaces and a leading
@@ -3397,6 +3411,23 @@ pub fn arn_resource_id(arn: &str) -> &str {
     resource.rsplit_once('/').map_or(resource, |(_, id)| id)
 }
 
+/// The TYPE of the resource an ARN names: the text of its resource segment ahead of the
+/// first `/`, or `None` for an ARN whose resource segment carries no `/` at all and so
+/// names no type of its own.
+///
+/// The companion of [`arn_resource_id`], and judges as little as it does: the ARN may
+/// belong to any service, because the resource an attachment attaches is owned by
+/// whichever service runs it (`arn:aws:ec2:<region>:<account>:vpc/<id>` for a VPC,
+/// `arn:aws:networkmanager::<account>:attachment/<id>` for the transport attachment a
+/// Connect attachment is carried over). So a next hop reports the kind and the id of the
+/// resource it reaches as that resource's own ARN spells them, rather than a second copy
+/// kept beside it.
+pub fn arn_resource_kind(arn: &str) -> Option<&str> {
+    let resource = arn.rsplit_once(':').map_or(arn, |(_, tail)| tail);
+    let (kind, id) = resource.split_once('/')?;
+    (!kind.is_empty() && !id.is_empty()).then_some(kind)
+}
+
 /// The account id an ARN carries (its fifth colon-separated field), or `None` when the
 /// string has no such field or carries it empty.
 ///
@@ -4538,12 +4569,46 @@ pub const MAX_FILTER_IDS: usize = 10;
 /// the documented maximum is refused before any listing is computed. Shared by every
 /// reporting operation that takes such a filter, so one rule reaches all of them.
 pub fn check_filter_ids(member: &str, ids: &[String]) -> Result<(), ValidationException> {
-    let given = ids.len();
+    check_filter_list(member, ids.len(), "name", "ids")
+}
+
+/// Check one VALUE-match filter of a reporting operation against [`MAX_FILTER_IDS`].
+///
+/// The sibling of [`check_filter_ids`] for a filter that selects on a VALUE rather than on
+/// a resource id: the match lists of a listing of routing information, and each value list
+/// of its next-hop filter map. Those lists are modelled as `ConstrainedStringList` /
+/// `FilterValues`, which constrain the member STRING only and carry no length of their own
+/// (`smithy_query shape=ConstrainedStringList,FilterValues`), so — exactly as for the id
+/// lists above — the pre-handler constraint walk cannot bound them and the handler does.
+///
+/// The bound MATTERS beyond tidiness: selecting a listing compares every entry it holds
+/// against every value a filter carries, so the work is the product of the two, and the
+/// count is what caps the caller's factor of it. It is the same number this service allows
+/// an id-list filter, so one maximum covers every filter of every reporting operation — but
+/// unlike that one it is CHOSEN rather than documented: no match list of this service
+/// carries a published maximum, so a request real AWS would plausibly accept is refused
+/// here past it.
+pub fn check_filter_values(member: &str, values: &[String]) -> Result<(), ValidationException> {
+    check_filter_list(member, values.len(), "carry", "values")
+}
+
+/// The shared body of the two above: ONE statement of the bound and of the refusal a list
+/// past it carries, so an id-list filter and a value-match filter cannot drift apart in
+/// either. `verb` and `things` are how the refusal reads about the list at fault ("name …
+/// ids", "carry … values"); `given` is how long that list was.
+fn check_filter_list(
+    member: &str,
+    given: usize,
+    verb: &str,
+    things: &str,
+) -> Result<(), ValidationException> {
     if given > MAX_FILTER_IDS {
         return Err(field_rejection(
             member,
             REASON_FIELD_VALIDATION_FAILED,
-            format!("{member} may name at most {MAX_FILTER_IDS} ids, but {given} were given"),
+            format!(
+                "{member} may {verb} at most {MAX_FILTER_IDS} {things}, but {given} were given"
+            ),
         ));
     }
     Ok(())
@@ -5162,6 +5227,27 @@ pub fn no_such_edge(
     )
 }
 
+/// The modelled `ValidationException` (HTTP 400) a request answers when the core network it
+/// addresses declares no segment of the name it carries.
+///
+/// The sibling of [`no_such_edge`] for the other half of a core network's topology: a
+/// segment of a core network is one its policy document declares
+/// ([`PolicyTopology::has_segment`]), so a request naming any other segment addresses
+/// nothing. The `Reason` is [`VALIDATION_REASON_OTHER`] for the same reason: the member
+/// satisfies every modelled constraint, it is the stored policy that declares no such
+/// segment.
+pub fn no_such_segment(
+    member: &str,
+    core_network_id: &str,
+    segment_name: &str,
+) -> ValidationException {
+    field_rejection(
+        member,
+        VALIDATION_REASON_OTHER,
+        format!("core network {core_network_id} declares no segment {segment_name}"),
+    )
+}
+
 /// Check a tag set a request asks to APPLY (`TagResource`, and the `Tags` of a create).
 ///
 /// Refuses an empty or over-long key, an over-long value, and any key carrying the
@@ -5327,6 +5413,16 @@ const POLICY_SHARE_WITH: &str = "share-with";
 const POLICY_EXCEPT: &str = "except";
 /// See [`POLICY_SEGMENT_ACTIONS`].
 const POLICY_VIA: &str = "via";
+/// See [`POLICY_SEGMENT_ACTIONS`]: the keys of a `create-route` entry, which declares the
+/// STATIC routes of the segment it acts on — the prefixes those routes carry, and the
+/// attachments of the segment they are reached through (or the string
+/// [`POLICY_DESTINATION_BLACKHOLE`], which reaches nothing).
+const POLICY_DESTINATION_CIDR_BLOCKS: &str = "destination-cidr-blocks";
+/// See [`POLICY_DESTINATION_CIDR_BLOCKS`].
+const POLICY_DESTINATIONS: &str = "destinations";
+/// See [`POLICY_DESTINATION_CIDR_BLOCKS`]: the `destinations` entry that names no
+/// attachment, so the route it declares is reached through nothing.
+pub const POLICY_DESTINATION_BLACKHOLE: &str = "blackhole";
 
 /// The `segment-actions[].action` values this slice derives the reported topology from:
 /// `share` decides which segments a segment's routes reach, and the two service-insertion
@@ -5339,6 +5435,10 @@ const POLICY_ACTION_SHARE: &str = "share";
 const POLICY_ACTION_SEND_VIA: &str = "send-via";
 /// See [`POLICY_ACTION_SHARE`].
 const POLICY_ACTION_SEND_TO: &str = "send-to";
+/// See [`POLICY_ACTION_SHARE`]: `create-route` declares the static routes a segment holds,
+/// which is what the routing information of that segment reports beside what its BGP
+/// peerings carry ([`PolicyTopology::static_routes_of`]).
+const POLICY_ACTION_CREATE_ROUTE: &str = "create-route";
 
 /// The `share-with` spelling that means every other segment of the core network.
 const POLICY_SHARE_WITH_ALL: &str = "*";
@@ -5418,6 +5518,22 @@ pub const MAX_POLICY_CONDITIONS_PER_RULE: usize = 20;
 /// [`MAX_POLICY_NETWORK_FUNCTION_GROUPS`] — the counts of the things they may name — so one
 /// entry's kept names, and the work of reporting them, are bounded by those caps too.
 pub const MAX_POLICY_SEGMENT_ACTIONS: usize = 100;
+
+/// See [`MAX_POLICY_EDGE_LOCATIONS`]: how many prefixes one `create-route` entry may
+/// declare, and how many destinations it may name. CHOSEN for the same reason — the routes
+/// one segment holds are the PRODUCT of the three counts, and every one of them is
+/// materialised to report that segment's routing information, so the work one listing costs
+/// and the answer it can grow to are bounded by
+/// `MAX_POLICY_SEGMENT_ACTIONS * MAX_POLICY_ROUTE_PREFIXES * MAX_POLICY_ROUTE_DESTINATIONS`
+/// routes rather than by the document's length. The numbers are generous against what an
+/// entry can usefully name: a destination names one attachment of the core network, or the
+/// blackhole, and a prefix is reached once per destination however often the document
+/// repeats it. AWS publishes no quota these follow, so a document real Cloud WAN would
+/// accept is refused here past either number — the same trade every other policy cap of
+/// this slice makes ([`MAX_POLICY_EDGE_LOCATIONS`]).
+pub const MAX_POLICY_ROUTE_PREFIXES: usize = 50;
+/// See [`MAX_POLICY_ROUTE_PREFIXES`].
+pub const MAX_POLICY_ROUTE_DESTINATIONS: usize = 10;
 
 /// How long one value inside a policy document may be, in characters.
 ///
@@ -5825,6 +5941,22 @@ pub fn validate_policy_document(document: &str) -> Result<(), Vec<CoreNetworkPol
                         ),
                         MAX_POLICY_NETWORK_FUNCTION_GROUPS,
                     ),
+                    (
+                        entry
+                            .get(POLICY_DESTINATION_CIDR_BLOCKS)
+                            .and_then(::serde_json::Value::as_array),
+                        format!(
+                            "$.{POLICY_SEGMENT_ACTIONS}[{index}].{POLICY_DESTINATION_CIDR_BLOCKS}"
+                        ),
+                        MAX_POLICY_ROUTE_PREFIXES,
+                    ),
+                    (
+                        entry
+                            .get(POLICY_DESTINATIONS)
+                            .and_then(::serde_json::Value::as_array),
+                        format!("$.{POLICY_SEGMENT_ACTIONS}[{index}].{POLICY_DESTINATIONS}"),
+                        MAX_POLICY_ROUTE_DESTINATIONS,
+                    ),
                 ] {
                     let held = listed.map_or(0, Vec::len);
                     if held > cap {
@@ -5887,6 +6019,33 @@ pub struct PolicyTopology {
     /// document carries, in the order it lists them: which segment's traffic is served by
     /// which network function groups.
     pub service_insertions: Vec<ServiceInsertion>,
+    /// One entry per `segment-actions[]` entry of action `create-route` the document
+    /// carries, in the order it lists them: the static routes it declares for the segment
+    /// it acts on.
+    pub static_routes: Vec<SegmentStaticRoute>,
+}
+
+/// One `segment-actions[]` entry of action `create-route`: the STATIC routes a policy
+/// document declares for one segment.
+///
+/// A static route is not a function of anything attached: the document states the prefix
+/// and what it is reached through, so the routes a segment holds follow from the policy in
+/// force on the core network and from nothing else. Kept as the document spells them — a
+/// destination is resolved against the stored attachments where the routing information is
+/// reported, so a destination naming an attachment that has since gone reaches nothing
+/// rather than being reported as a route to it.
+#[derive(Debug, Clone)]
+pub struct SegmentStaticRoute {
+    /// The entry's `segment`: the segment whose route table holds these routes. Always a
+    /// segment the document declares, since an entry naming any other segment is not kept.
+    pub segment: String,
+    /// The entry's `destination-cidr-blocks`: the prefix each route it declares carries, in
+    /// the order the document lists them, bounded by [`MAX_POLICY_ROUTE_PREFIXES`].
+    pub destination_cidr_blocks: Vec<String>,
+    /// The entry's `destinations`: what those prefixes are reached through — the id of an
+    /// attachment of the segment, or [`POLICY_DESTINATION_BLACKHOLE`] for a route that
+    /// reaches nothing — bounded by [`MAX_POLICY_ROUTE_DESTINATIONS`].
+    pub destinations: Vec<String>,
 }
 
 /// One `segment-actions[]` entry of action `share`: the segment whose routes are shared,
@@ -6137,6 +6296,43 @@ impl PolicyTopology {
         self.edges
             .iter()
             .any(|edge| edge.edge_location.as_deref() == Some(location))
+    }
+
+    /// Whether this core network declares a segment named `name`.
+    ///
+    /// The sibling of [`Self::has_edge_location`] for the other half of the topology: a
+    /// segment of a core network is one its policy document's `segments` declares, so a
+    /// request naming any other segment addresses nothing ([`no_such_segment`]).
+    pub fn has_segment(&self, name: &str) -> bool {
+        self.segments.iter().any(|group| group.name == name)
+    }
+
+    /// Whether the segment `name` is present at the edge location `location`: it is
+    /// declared, and either restricts itself to locations holding that one or restricts
+    /// itself to none at all — which places it at every edge this core network has, the same
+    /// expansion [`Self::to_segments`] reports, so ONE statement of that rule serves both.
+    ///
+    /// A segment that is not present at an edge has no route table there, so it holds no
+    /// routing information at that edge however much the core network holds elsewhere.
+    pub fn segment_present_at(&self, name: &str, location: &str) -> bool {
+        self.segments
+            .iter()
+            .filter(|group| group.name == name)
+            .any(|group| match group.edge_locations.as_deref() {
+                Some(listed) => listed.iter().any(|held| held == location),
+                None => self.everywhere().iter().any(|held| held == location),
+            })
+    }
+
+    /// The static routes this policy declares for the segment `name`, in the order the
+    /// document lists the `create-route` entries that declare them.
+    pub fn static_routes_of<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a SegmentStaticRoute> {
+        self.static_routes
+            .iter()
+            .filter(move |route| route.segment == name)
     }
 
     /// The ASN this policy assigns the edge it configures in `location`, or `None` where it
@@ -6601,9 +6797,11 @@ fn edges_by_location(topology: &PolicyTopology) -> BTreeMap<&str, &CoreNetworkEd
 /// `attachment-policies` rule is kept with its conditions and its action, ordered by the
 /// ascending `rule-number` the rules are evaluated in. The `segment-actions` entries say
 /// what each segment's routes reach: a `share` entry shares the routes of the segment it
-/// acts on with the segments its `share-with` names, and a `send-via` / `send-to` entry
+/// acts on with the segments its `share-with` names, a `send-via` / `send-to` entry
 /// sends that segment's traffic through the network function groups its
-/// `via.network-function-groups` names ([`segment_actions`]).
+/// `via.network-function-groups` names, and a `create-route` entry declares the static
+/// routes that segment holds — the prefixes its `destination-cidr-blocks` lists, reached
+/// through the attachments its `destinations` names ([`segment_actions`]).
 ///
 /// A document this service cannot parse describes no topology, so it answers the empty
 /// one rather than guessing: a document is only stored once
@@ -6690,43 +6888,57 @@ pub fn policy_topology(document: &str) -> PolicyTopology {
         named(POLICY_NETWORK_FUNCTION_GROUPS, MAX_POLICY_NETWORK_FUNCTION_GROUPS);
     // The segment actions are read LAST, because an action is only kept where the segments
     // and groups it names are ones the document declares.
-    let (shares, service_insertions) = segment_actions(root, &segments, &network_function_groups);
+    let actions = segment_actions(root, &segments, &network_function_groups);
     PolicyTopology {
         segments,
         network_function_groups,
         edges,
         attachment_policies: attachment_policies(root),
-        shares,
-        service_insertions,
+        shares: actions.shares,
+        service_insertions: actions.service_insertions,
+        static_routes: actions.static_routes,
     }
+}
+
+/// What [`segment_actions`] reads out of a document's `segment-actions`, one list per kind
+/// of action it derives something from.
+struct SegmentActions {
+    shares: Vec<SegmentShare>,
+    service_insertions: Vec<ServiceInsertion>,
+    static_routes: Vec<SegmentStaticRoute>,
 }
 
 /// The `segment-actions` entries of a policy document's root object this slice derives the
 /// reported topology from: the `share` entries, which decide which segments a segment's
-/// routes are shared with, and the `send-via` / `send-to` ones, which decide which segments
-/// a network function group serves.
+/// routes are shared with, the `send-via` / `send-to` ones, which decide which segments a
+/// network function group serves, and the `create-route` ones, which declare the static
+/// routes a segment's route tables hold.
 ///
 /// An entry is kept only where it is readable AND names declared resources: a segment or a
 /// network function group no entry of `segments` / `network-function-groups` declares is
 /// none of this core network's, so it is dropped rather than reported. An action of any
-/// other kind decides neither member and is passed over.
+/// other kind decides none of the three and is passed over.
 ///
 /// Every list this walks is capped, which is what bounds both the walk and what it retains:
 /// the entry count at [`MAX_POLICY_SEGMENT_ACTIONS`], and one entry's name lists at the
-/// segment and group caps — the counts [`validate_policy_document`] refuses a document
-/// past, so a STORED document carries none longer. The kept names are held as SETS, so a
-/// list repeating one name retains it once.
+/// segment and group caps, or at [`MAX_POLICY_ROUTE_PREFIXES`] /
+/// [`MAX_POLICY_ROUTE_DESTINATIONS`] for a `create-route` entry — the counts
+/// [`validate_policy_document`] refuses a document past, so a STORED document carries none
+/// longer. The kept names are held as SETS where an entry names things once, so a list
+/// repeating one name retains it once; a route's prefixes and destinations keep the
+/// document's order, which is the order the routes are reported in.
 fn segment_actions(
     root: &::serde_json::Map<String, ::serde_json::Value>,
     segments: &[NamedGroup],
     network_function_groups: &[NamedGroup],
-) -> (Vec<SegmentShare>, Vec<ServiceInsertion>) {
+) -> SegmentActions {
     fn declares(groups: &[NamedGroup], name: &str) -> bool {
         groups.iter().any(|group| group.name == name)
     }
 
     let mut shares = Vec::new();
     let mut service_insertions = Vec::new();
+    let mut static_routes = Vec::new();
     for entry in root
         .get(POLICY_SEGMENT_ACTIONS)
         .and_then(::serde_json::Value::as_array)
@@ -6779,10 +6991,41 @@ fn segment_actions(
                     });
                 }
             }
+            POLICY_ACTION_CREATE_ROUTE => {
+                let listed = |key: &str, cap: usize| -> Vec<String> {
+                    entry
+                        .get(key)
+                        .and_then(::serde_json::Value::as_array)
+                        .map_or(&[][..], Vec::as_slice)
+                        .iter()
+                        .take(cap)
+                        .filter_map(::serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                };
+                let destination_cidr_blocks =
+                    listed(POLICY_DESTINATION_CIDR_BLOCKS, MAX_POLICY_ROUTE_PREFIXES);
+                let destinations = listed(POLICY_DESTINATIONS, MAX_POLICY_ROUTE_DESTINATIONS);
+                // An entry declaring no prefix declares no route, and one naming no
+                // destination says nothing about what its prefixes reach — the published
+                // schema requires both of a `create-route` entry — so neither is kept
+                // rather than being completed with a rule the document did not state.
+                if !destination_cidr_blocks.is_empty() && !destinations.is_empty() {
+                    static_routes.push(SegmentStaticRoute {
+                        segment: segment.to_string(),
+                        destination_cidr_blocks,
+                        destinations,
+                    });
+                }
+            }
             _ => {}
         }
     }
-    (shares, service_insertions)
+    SegmentActions {
+        shares,
+        service_insertions,
+        static_routes,
+    }
 }
 
 /// How a `share` entry's `share-with` names the segments it shares with, or `None` where

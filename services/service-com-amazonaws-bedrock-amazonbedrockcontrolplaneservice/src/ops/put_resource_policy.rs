@@ -17,7 +17,9 @@
 //!   [`service_common::iam_policy`], so this service and every other handed the same
 //!   document agree about whether it is a policy. The member's `@length` and `@pattern`
 //!   are already enforced ahead of this handler, which is why only the grammar is read
-//!   here;
+//!   here. WHICH part of the grammar a document broke is not reported: every
+//!   non-conforming document is refused with the one fixed sentence
+//!   [`NONCONFORMING_POLICY_DOCUMENT`];
 //! * `resourceArn` must name a resource this account HOLDS
 //!   ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::policy_resource`]):
 //!   a resource policy is attached TO a resource, so an ARN of another vendor, another
@@ -133,6 +135,18 @@ impl From<PutResourcePolicyErrorModeled> for PutResourcePolicyError {
     }
 }
 
+/// Bedrock's refusal of a `resourcePolicy` that is not a policy document, WORD FOR WORD.
+///
+/// Entirely fixed text: it names neither the member, nor the document, nor which part of
+/// the grammar the document broke, so nothing of the request reaches it. What the service
+/// tells a caller is that the document is not one of the policy formats it supports, and
+/// where the formats are written down — a client recognises this refusal by that sentence,
+/// so a diagnosis of the parse failure in its place is a different error on the wire.
+const NONCONFORMING_POLICY_DOCUMENT: &str =
+    "The provided policy document does not conform to the supported policy formats. For \
+     more information about valid policy document formats, check out the Amazon Bedrock \
+     Guardrails documentation";
+
 /// Refuse this request with the MODELLED `ValidationException` (HTTP 400) — the error
 /// this operation declares for a request it cannot accept, so the refusal carries the
 /// model's own shape rather than the scaffold channel's synthetic one.
@@ -194,13 +208,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A document that is not an IAM resource-based policy is not a policy, whatever
         // else it is: accepting it would store text this service would then report as the
-        // resource's policy.
-        if let Some(defect) =
-            ::service_common::iam_policy::resource_policy_defect(&input.resource_policy)
+        // resource's policy. WHICH part of the grammar it broke decides nothing about the
+        // answer — every such document is the one refusal
+        // [`NONCONFORMING_POLICY_DOCUMENT`] states — so the defect is read as a verdict
+        // and not as a sentence.
+        if ::service_common::iam_policy::resource_policy_defect(&input.resource_policy)
+            .is_some()
         {
-            return Err(refused(format!(
-                "resourcePolicy is not a resource-based policy document: {defect}"
-            )));
+            return Err(refused(NONCONFORMING_POLICY_DOCUMENT.to_string()));
         }
 
         let mut store = state.lock();

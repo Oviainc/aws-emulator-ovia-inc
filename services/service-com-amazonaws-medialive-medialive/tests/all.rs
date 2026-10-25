@@ -200,6 +200,9 @@ mod multiplex_update;
 #[path = "all/network_deletion.rs"]
 mod network_deletion;
 
+#[path = "all/network_update.rs"]
+mod network_update;
+
 #[path = "all/networks.rs"]
 mod networks;
 

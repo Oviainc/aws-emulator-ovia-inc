@@ -50,7 +50,7 @@ use crate::detector_lifecycle::{call_in, error_code, error_shape, new_router, Ro
 
 /// The error CLASS every client rejection on this service carries in the body's
 /// `__type` discriminator.
-const INVALID_INPUT: &str = "InvalidInputException";
+pub(crate) const INVALID_INPUT: &str = "InvalidInputException";
 
 /// The modelled error SHAPE a 400 is enveloped in, as `x-amzn-errortype` carries
 /// it — the only client error any operation of this service declares.
@@ -58,17 +58,21 @@ const BAD_REQUEST: &str = "BadRequestException";
 
 /// `AdminStatus`'s two members (`smithy_query(shape="AdminStatus")`): the status a
 /// designation reports, and the status it reports while a removal is pending.
-const ENABLED: &str = "ENABLED";
-const DISABLE_IN_PROGRESS: &str = "DISABLE_IN_PROGRESS";
+pub(crate) const ENABLED: &str = "ENABLED";
+pub(crate) const DISABLE_IN_PROGRESS: &str = "DISABLE_IN_PROGRESS";
 
 /// Longer than the span the handler makes a removal due in, so a read after this
 /// wait is past it. Read from the service state rather than restated here, so the
 /// wait tracks the constant the handler uses.
-fn past_the_removal() -> std::time::Duration {
+pub(crate) fn past_the_removal() -> std::time::Duration {
     std::time::Duration::from_millis(ADMIN_DISABLE_SPAN_MILLIS as u64 + 400)
 }
 
-async fn enable_admin(router: &Router, region: &str, admin_account_id: &str) -> (u16, Value) {
+pub(crate) async fn enable_admin(
+    router: &Router,
+    region: &str,
+    admin_account_id: &str,
+) -> (u16, Value) {
     call_in(
         router,
         region,
@@ -79,7 +83,11 @@ async fn enable_admin(router: &Router, region: &str, admin_account_id: &str) -> 
     .await
 }
 
-async fn disable_admin(router: &Router, region: &str, admin_account_id: &str) -> (u16, Value) {
+pub(crate) async fn disable_admin(
+    router: &Router,
+    region: &str,
+    admin_account_id: &str,
+) -> (u16, Value) {
     call_in(
         router,
         region,
@@ -116,7 +124,7 @@ async fn admin_accounts(router: &Router, region: &str, case: &str) -> Vec<Value>
 }
 
 /// Assert that `region` reports exactly `admin_account_id` under `status`.
-async fn assert_reports(
+pub(crate) async fn assert_reports(
     router: &Router,
     region: &str,
     admin_account_id: &str,
@@ -132,7 +140,7 @@ async fn assert_reports(
 }
 
 /// Assert that `region` reports no delegated administrator at all.
-async fn assert_reports_none(router: &Router, region: &str, case: &str) {
+pub(crate) async fn assert_reports_none(router: &Router, region: &str, case: &str) {
     let reported = admin_accounts(router, region, case).await;
     assert!(
         reported.is_empty(),

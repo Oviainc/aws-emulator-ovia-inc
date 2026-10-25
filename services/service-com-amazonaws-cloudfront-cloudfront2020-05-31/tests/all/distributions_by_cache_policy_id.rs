@@ -39,11 +39,14 @@ use crate::distribution_lifecycle::{
 /// behaviour attaches, and which one each of its ordered cache behaviours attaches. An
 /// index is into the policies [`create_policies`] creates, in order; `None` is a behaviour
 /// that attaches no cache policy at all.
+///
+/// `pub(crate)` with [`config_xml`] so a sibling suite that needs a distribution attaching a
+/// given cache policy builds the same document rather than growing a copy of it.
 #[derive(Debug, Clone, Copy)]
-struct Row {
-    case: &'static str,
-    default_policy: Option<usize>,
-    ordered: &'static [Option<usize>],
+pub(crate) struct Row {
+    pub(crate) case: &'static str,
+    pub(crate) default_policy: Option<usize>,
+    pub(crate) ordered: &'static [Option<usize>],
 }
 
 impl Row {
@@ -183,7 +186,7 @@ async fn create_policies(router: &MultiServiceRouter) -> Vec<String> {
 
 /// The `DistributionConfig` a row submits: one origin, a default cache behaviour and the
 /// row's ordered cache behaviours, each attaching the policy the row names.
-fn config_xml(caller_reference: &str, row: &Row, policies: &[String]) -> String {
+pub(crate) fn config_xml(caller_reference: &str, row: &Row, policies: &[String]) -> String {
     let attachment = |index: Option<usize>| match index {
         Some(index) => format!("<CachePolicyId>{}</CachePolicyId>", policies[index]),
         None => String::new(),

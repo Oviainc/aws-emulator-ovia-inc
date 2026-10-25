@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_mediaconvert_mediaconvert::ops::types::PresetSettings;
+use service_com_amazonaws_mediaconvert_mediaconvert::ops::types::{
+    ContainerSettings, PresetSettings,
+};
 use service_com_amazonaws_mediaconvert_mediaconvert::state::{
     PresetRecord, TYPE_CUSTOM, TYPE_SYSTEM,
 };
@@ -227,7 +229,15 @@ fn seed_custom(emulator: &Emulator, name: &str, category: Option<&str>, created_
                 name: name.to_string(),
                 category: category.map(str::to_string),
                 description: Some(format!("{name} description")),
-                settings: PresetSettings::default(),
+                // A stored preset names the container of the output it describes
+                // (`ContainerSettings$Container`), as one created over HTTP has to.
+                settings: PresetSettings {
+                    container_settings: Some(ContainerSettings {
+                        container: Some("MP4".to_string()),
+                        ..ContainerSettings::default()
+                    }),
+                    ..PresetSettings::default()
+                },
                 preset_type: TYPE_CUSTOM.to_string(),
                 created_at,
                 last_updated: created_at,

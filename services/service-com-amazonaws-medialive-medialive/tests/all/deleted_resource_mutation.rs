@@ -272,8 +272,10 @@ async fn a_mutation_on_a_resource_whose_delete_was_accepted_is_not_found() {
             // `NetworkState` models a DELETING step, which the clock owes the
             // terminal DELETED.
             transient_delete: true,
-            // `UpdateNetwork` is a scaffold of its own, so the two tag writers
-            // are the mutations this row drives.
+            // `UpdateNetwork` follows the same rule, but its model declares no
+            // `NotFoundException`, so it refuses a dead id with its modelled
+            // `BadRequestException` instead of the 404 this table asserts; that
+            // row lives in the network update suite (`network_update`).
             mutations: &[CREATE_TAGS, DELETE_TAGS],
         },
     ];

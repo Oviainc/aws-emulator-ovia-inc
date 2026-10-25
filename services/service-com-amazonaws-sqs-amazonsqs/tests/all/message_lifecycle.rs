@@ -1388,7 +1388,7 @@ async fn an_unparameterised_list_queues_pages_at_the_default_size() {
             .await;
         assert_eq!(
             (status, error_code(&answer).as_str()),
-            (400, "ValidationException"),
+            (400, "InvalidParameterValue"),
             "case NextToken {bogus:?}: expected a refusal, got {status} {answer:?}"
         );
     }

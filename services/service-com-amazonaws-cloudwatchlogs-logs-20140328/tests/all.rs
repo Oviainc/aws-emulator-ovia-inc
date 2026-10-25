@@ -93,6 +93,8 @@ mod lookup_table_enumeration;
 mod lookup_tables;
 #[path = "all/metric_filters.rs"]
 mod metric_filters;
+#[path = "all/metric_transformation_exclusion_wording.rs"]
+mod metric_transformation_exclusion_wording;
 #[path = "all/query_compilation.rs"]
 mod query_compilation;
 #[path = "all/query_definitions.rs"]

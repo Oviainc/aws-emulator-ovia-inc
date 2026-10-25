@@ -114,11 +114,11 @@ fn cases() -> Vec<Case> {
             update: None,
         },
         Case {
-            label: "tagged, with an empty settings object",
+            label: "tagged, with settings naming only the container",
             name: "tagged",
             request: json!({
                 "name": "tagged",
-                "settings": {},
+                "settings": { "containerSettings": { "container": "WEBM" } },
                 "tags": { "team": "media" }
             }),
             update: Some(json!({ "category": "archive" })),
