@@ -336,14 +336,22 @@ pub const MAX_TAG_VALUE_CHARS: usize = 256;
 /// result. Called before anything is written, so a refused request leaves the resource's
 /// tags exactly as they were.
 ///
+/// `member_path` is the wire name of the member the tags arrived in, which differs per
+/// operation exactly as it does for [`reserved_tag_key_rejection`], so the sentence
+/// points the caller at the member it sent.
+///
 /// `ValidationExceptionType` enumerates no tag-quota member
 /// (`VALIDATION_EXCEPTION_TYPE_VALUES` in `ops::types`), so the discriminator is left
 /// unset rather than claiming a reason the service does not name for this case; the
-/// message states which bound was exceeded and the bound's value.
-pub fn tag_bounds_rejection(tags: &HashMap<String, String>) -> Option<ValidationException> {
-    let refuse = |message: String| {
+/// message states which bound was exceeded and the bound's value, in the one envelope
+/// [`validation_message`] gives every refusal this service makes.
+pub fn tag_bounds_rejection(
+    member_path: &str,
+    tags: &HashMap<String, String>,
+) -> Option<ValidationException> {
+    let refuse = |detail: String| {
         Some(ValidationException {
-            message: Some(message),
+            message: Some(validation_message(Some(member_path), &detail)),
             validation_exception_type: None,
         })
     };

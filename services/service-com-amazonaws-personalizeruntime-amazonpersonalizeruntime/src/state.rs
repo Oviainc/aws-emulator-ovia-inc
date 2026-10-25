@@ -146,6 +146,26 @@ pub enum RequiredInput {
     Item,
 }
 
+impl RequiredInput {
+    /// The personalization input a resource that needs `self` actually USES, out of a
+    /// request's `userId` and `itemId`: "USER_PERSONALIZATION - userId required, itemId
+    /// not used RELATED_ITEMS - itemId required, userId not used"
+    /// (`GetRecommendations` doc).
+    ///
+    /// The input a resource does not need is the input it does not use, so it never
+    /// reaches a score and therefore cannot change which entries come back or in what
+    /// order: sending it is simply ignored. A resource that needs NEITHER is not
+    /// personalized at all (a domain use case that asks for no user and no item), so it
+    /// uses neither and answers every caller the same way.
+    pub fn personalization<'a>(self, user_id: &'a str, item_id: &'a str) -> &'a str {
+        match self {
+            Self::Nothing => "",
+            Self::User => user_id,
+            Self::Item => item_id,
+        }
+    }
+}
+
 /// The domain (use-case) recommenders this emulator knows, and the request member
 /// each one requires.
 ///

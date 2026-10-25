@@ -236,13 +236,29 @@ fn created(record: &crate::state::PullRequestRecord) -> CreatePullRequestOutput 
     }
 }
 
-/// The idempotency token this request names. A blank token names no earlier
-/// request, the same as leaving the optional member out.
-fn client_request_token(input: &CreatePullRequestInput) -> Option<&str> {
-    input
-        .client_request_token
-        .as_deref()
-        .filter(|token| !token.is_empty())
+/// The idempotency token this request names, or the refusal for a token that is
+/// present but is not one CodeCommit accepts.
+///
+/// Which tokens are acceptable is `crate::state`'s rule
+/// ([`crate::state::is_client_request_token`]), so every operation carrying the
+/// member agrees about it; a request that leaves the member out names no earlier
+/// request, while a present token that names none (an empty one, one past the
+/// length bound) is MALFORMED rather than absent and is refused before anything
+/// is written.
+fn client_request_token(
+    input: &CreatePullRequestInput,
+) -> Result<Option<&str>, CreatePullRequestError> {
+    match input.client_request_token.as_deref() {
+        Some(token) if !crate::state::is_client_request_token(token) => Err(
+            CreatePullRequestErrorModeled::InvalidClientRequestTokenException(
+                InvalidClientRequestTokenException {
+                    message: Some(crate::state::INVALID_CLIENT_REQUEST_TOKEN_MESSAGE.to_string()),
+                },
+            )
+            .into(),
+        ),
+        token => Ok(token),
+    }
 }
 
 /// Is a repeated `clientRequestToken` carrying the request it was first accepted
@@ -301,6 +317,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The idempotency token the request names, judged BEFORE anything else:
+        // a present token that is not a token CodeCommit accepts is a malformed
+        // request, so no pull request is created for it.
+        let client_request_token = client_request_token(&input)?;
+
         // "A pull request title is required. It cannot be empty or null."
         // `Title`'s modelled length is 0..150, so an empty title reaches here.
         if input.title.trim().is_empty() {
@@ -504,7 +525,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // accepted for, so a later edit of the pull request does not turn a
             // replay of that request into a mismatch.
             let mut existing_token_answer = None;
-            if let Some(token) = client_request_token(&input) {
+            if let Some(token) = client_request_token {
                 if let Some(existing) = repository
                     .pull_request_tokens
                     .get(token)
@@ -654,7 +675,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_activity_date: now,
             status: crate::state::PULL_REQUEST_STATUS_OPEN.to_string(),
             author_arn,
-            client_request_token: client_request_token(&input).map(str::to_string),
+            client_request_token: client_request_token.map(str::to_string),
             targets: vec![crate::state::PullRequestTargetRecord {
                 repository_name: target.repository_name.clone(),
                 source_reference: crate::state::qualified_reference(&source_branch),

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUserAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUserAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUserAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The signed-in user gives up attributes of its own profile: the `AccessToken`
+//! the sign-in issued is what names the user, resolved through
+//! [`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::signed_in_user`],
+//! and every name the request lists is removed from that STORED user, together
+//! with the verified flag of a value that is gone. A name the user holds no
+//! value of removes nothing; a name the pool's schema does not declare,
+//! declares immutable or marks required is refused, and a refused request
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +170,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUserAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUserAttributes"))
+        // Request metadata only: the user whose attributes go is named by the
+        // access token in the body, not by the request's signature.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // An access token's lifetime is read against the clock, so an expired
+        // token is refused whether or not anything has swept it.
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // Decide the whole deletion against the STORED pool and user FIRST:
+        // every refusal below leaves the user exactly as it was, so a rejected
+        // request writes nothing.
+        let plan = {
+            let (pool, user) = guard
+                .signed_in_user(&input.access_token, now)
+                .map_err(token_rejected)?;
+            plan_deletion(pool, user, &input.user_attribute_names)?
+        };
+
+        let user = guard
+            .pool_mut(&plan.user_pool_id)
+            .and_then(|pool| pool.user_mut(&plan.username))
+            .ok_or_else(internal_error)?;
+        // Naming an attribute the user holds no value of removes nothing, so it
+        // is the values that WERE held that make this call a modification.
+        let mut removed = false;
+        for name in &plan.deletions {
+            removed |= user.attributes.remove(name).is_some();
+            // A value asked for but not confirmed yet is a value of the same
+            // attribute, so it goes with the attribute rather than outliving it.
+            removed |= user.pending_attributes.remove(name).is_some();
+        }
+        // A call that removed nothing changed nothing, so the user's
+        // last-modified instant stands.
+        if removed {
+            user.user_last_modified_date = now;
+        }
+
+        Ok(DeleteUserAttributesOutput {})
     }
+}
+
+/// The whole deletion: which stored user it applies to and which of that user's
+/// attributes it removes.
+#[derive(Debug)]
+struct Plan {
+    user_pool_id: String,
+    username: String,
+    /// Every attribute name to remove, each once: the names the request asked
+    /// for, plus the verified flag of each, which has nothing left to vouch for
+    /// once the value it describes is gone.
+    deletions: ::std::collections::BTreeSet<String>,
+}
+
+/// Decide what deleting `requested` does to `user` of `pool`, or the refusal it
+/// earns.
+///
+/// A pure read of the stored pool and user: it returns the plan rather than
+/// applying it, so a request refused halfway through leaves nothing written.
+///
+/// Every per-attribute step below is bounded by the POOL's schema rather than
+/// by the length of the submitted list: the names are reduced to the distinct
+/// ones and their count is capped before any per-attribute work.
+fn plan_deletion(
+    pool: &crate::state::UserPool,
+    user: &crate::state::User,
+    requested: &[String],
+) -> Result<Plan, DeleteUserAttributesError> {
+    // `AttributeNameListType` is a list of attribute NAMES, and a user holds at
+    // most one value per attribute: naming an attribute twice asks for the same
+    // single removal, so the distinct names are the whole request.
+    let names: Vec<String> = requested
+        .iter()
+        .collect::<::std::collections::BTreeSet<&String>>()
+        .into_iter()
+        .cloned()
+        .collect();
+    // A request cannot name more distinct attributes than the pool declares:
+    // past that it names one the schema does not declare, which is refused
+    // below. Checked FIRST, so nothing further is proportional to a list length
+    // the caller chose.
+    if names.len() > pool.schema.len() {
+        return Err(invalid_parameter(format!(
+            "Invalid attributes given, at most {} attributes of this user pool can be deleted in one request",
+            pool.schema.len()
+        )));
+    }
+    // An attribute the pool's schema does not declare cannot hold a value, so
+    // it is not one a user can be asked to give up.
+    if let Some(unknown) = pool.unknown_attribute(&names) {
+        return Err(invalid_parameter(format!(
+            "Invalid attributes given, {unknown} is not a valid attribute of this user pool"
+        )));
+    }
+
+    let mut deletions = ::std::collections::BTreeSet::new();
+    for name in names {
+        // `SchemaAttributeType.Mutable` is what says a stored value may change,
+        // and taking it away changes it, so an attribute the schema freezes
+        // cannot be deleted.
+        if !pool.attribute_mutable(&name) {
+            return Err(invalid_parameter(format!(
+                "Attribute {name} cannot be deleted: this user pool's schema declares it immutable"
+            )));
+        }
+        // An attribute the schema marks required must hold a value, so it is
+        // not one this operation may take away.
+        if pool.attribute_required(&name) {
+            return Err(invalid_parameter(format!(
+                "Attribute {name} cannot be deleted: this user pool's schema declares it required"
+            )));
+        }
+        // A deleted email address or phone number leaves its verified flag
+        // vouching for a value the user no longer holds, so the flag goes with
+        // it — exactly as a blank value submitted to `UpdateUserAttributes`
+        // takes it.
+        if let Some(flag) = crate::state::verified_flag(&name) {
+            deletions.insert(flag.to_string());
+        }
+        deletions.insert(name);
+    }
+
+    Ok(Plan {
+        user_pool_id: pool.id.clone(),
+        username: user.username.clone(),
+        deletions,
+    })
+}
+
+/// This operation's answer to an `AccessToken` that names no signed-in user.
+///
+/// Every rejection of the token itself answers `NotAuthorizedException`, which
+/// "is thrown when a user isn't authorized" (this service's model), while a
+/// token whose pool or user has since been deleted answers the error for the
+/// resource that is gone. Neither token message names a stored value, so the
+/// refusal reports why the token was not accepted and nothing else.
+fn token_rejected(rejection: crate::state::TokenRejection) -> DeleteUserAttributesError {
+    match rejection {
+        crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
+        crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::PoolGone => {
+            DeleteUserAttributesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                // The caller named no pool — the token did — so this message
+                // names none either.
+                message: Some("User pool does not exist.".to_string()),
+            })
+            .into()
+        }
+        crate::state::TokenRejection::UserGone => {
+            DeleteUserAttributesErrorModeled::UserNotFoundException(UserNotFoundException {
+                message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into()
+        }
+    }
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> DeleteUserAttributesError {
+    DeleteUserAttributesErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> DeleteUserAttributesError {
+    DeleteUserAttributesErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> DeleteUserAttributesError {
+    DeleteUserAttributesErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

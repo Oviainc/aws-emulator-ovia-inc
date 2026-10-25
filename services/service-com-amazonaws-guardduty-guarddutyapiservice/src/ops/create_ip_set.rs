@@ -161,6 +161,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The documented input rule the model cannot express is checked BEFORE
+        // anything is written or the clock is read, so a refused request leaves no
+        // IPSet behind: "allowed characters are alphanumeric, whitespace, dash (-),
+        // and underscores (_)"
+        // (`smithy_query(query="doc",shape="CreateIPSetRequest",member="Name")`),
+        // while the modelled constraint on the member is a length only.
+        if !crate::state::is_ip_set_name(&input.name) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::IP_SET_NAME_MEMBER),
+            ));
+        }
+
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
         let now = state.tick_millis();

@@ -33,7 +33,7 @@ const ACCOUNT: &str = "123456789012";
 /// `ResourceType` enum's values
 /// (`smithy_query(query="shape",shape="ResourceType")`) — so every kind is
 /// exercised, not only the load balancer the report named.
-const PROTECTED_RESOURCES: &[(&str, &str, &str)] = &[
+pub(crate) const PROTECTED_RESOURCES: &[(&str, &str, &str)] = &[
     (
         "an Application Load Balancer",
         "arn:aws:elasticloadbalancing:us-west-2:123456789012:loadbalancer/app/prod-alb/50dc6c495c0c9188",
@@ -78,7 +78,7 @@ const PROTECTED_RESOURCES: &[(&str, &str, &str)] = &[
 
 /// The resource ARNs the web ACL `web_acl_arn` is reported as being in front of,
 /// of `resource_type` — or of the type the call defaults to when it is `None`.
-async fn listed_resources(
+pub(crate) async fn listed_resources(
     waf: &Waf,
     web_acl_arn: &str,
     resource_type: Option<&str>,
@@ -92,13 +92,19 @@ async fn listed_resources(
         .as_array()
         .unwrap_or_else(|| panic!("ListResourcesForWebACL answers ResourceArns, got {listed}"))
         .iter()
-        .map(|arn| arn.as_str().unwrap_or_default().to_string())
+        .map(|arn| {
+            arn.as_str()
+                .unwrap_or_else(|| {
+                    panic!("ListResourcesForWebACL answers ARN strings, got the entry {arn}")
+                })
+                .to_string()
+        })
         .collect()
 }
 
 /// The web ACL `GetWebACLForResource` reports for `resource_arn`, or `None` when it
 /// reports a null web ACL.
-async fn web_acl_for_resource(waf: &Waf, resource_arn: &str) -> Option<Value> {
+pub(crate) async fn web_acl_for_resource(waf: &Waf, resource_arn: &str) -> Option<Value> {
     let reported = waf
         .ok(
             "GetWebACLForResource",

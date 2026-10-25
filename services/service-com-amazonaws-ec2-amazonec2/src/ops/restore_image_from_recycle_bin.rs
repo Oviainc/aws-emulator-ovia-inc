@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreImageFromRecycleBin
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreImageFromRecycleBin`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreImageFromRecycleBin::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes one AMI back out of the Recycle Bin in [`crate::state`]: the image the account
+//! deregistered goes back among the images it can see, under the same id and with every
+//! member it had, and the bin holds it no more. A MUTATION — "restores an AMI from the
+//! Recycle Bin" is what this call DOES — and the id it names is resolved in the BIN: an
+//! AMI that was never recycled, or one whose retention period has already run out and so
+//! has been permanently deleted, is no image this call can restore, and is refused
+//! `InvalidAMIID.Malformed` the way any other unresolvable id is
+//! ([`crate::state::require_recycled_image`]).
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +135,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreImageFromRecycleBin` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreImageFromRecycleBinErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreImageFromRecycleBin"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{internal_error, require_recycled_image, require_service_state};
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // A recycled AMI whose retention period has run out was permanently deleted when
+        // that instant passed, whether or not anybody called — so the clock's work is
+        // materialised BEFORE the id is looked up, and such an id resolves to nothing.
+        store.materialize_due_transitions();
+
+        // "The ID of the AMI to restore" (`ImageId`), resolved in the Recycle Bin: every id
+        // the bin holds no entry of this account's under is refused
+        // `InvalidAMIID.Malformed`, whether or not it is shaped like an AMI id.
+        require_recycled_image(&store, &input.image_id)?;
+
+        // DryRun sits AFTER the named resource has been resolved and BEFORE the first
+        // write: the flag asks whether the request WOULD have succeeded, so one that would
+        // have been refused is refused with that reason instead, and one that would have
+        // succeeded leaves the store untouched — the AMI stays in the bin.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The entry resolved a moment ago under the same lock, so the move cannot fail;
+        // answering `InternalError` rather than a success is what keeps a `Return` of
+        // `true` meaning the image really did go back into the store.
+        if !store.restore_recycled_image(&input.image_id) {
+            return Err(internal_error(format!(
+                "the recycled image '{}' resolved but could not be restored",
+                input.image_id
+            )));
+        }
+
+        // "Returns true if the request succeeds; otherwise, it returns an error"
+        // (`Return`): the restore above either moved the image back among the images
+        // `DescribeImages` reports or returned the error instead, so reaching here IS the
+        // success this member reports.
+        Ok(RestoreImageFromRecycleBinOutput {
+            r#return: Some(true),
+        })
     }
 }
