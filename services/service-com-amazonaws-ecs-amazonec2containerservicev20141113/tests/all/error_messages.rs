@@ -22,8 +22,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    awsvpc_network_configuration, create_cluster, identity_document, ok, refusal,
-    register_capacity, service, string, ACCOUNT, SIGNED_REGION,
+    awsvpc_network_configuration, create_cluster, identity_document,
+    identity_document_signature, ok, refusal, register_capacity, service, string, ACCOUNT,
+    SIGNED_REGION,
 };
 use crate::task_lifecycle::container;
 
@@ -159,6 +160,7 @@ async fn a_cluster_that_does_not_exist_is_refused_with_one_fixed_sentence() {
             json!({
                 "cluster": cluster,
                 "instanceIdentityDocument": identity_document("i-0a1b2c3d4e5f60718"),
+                "instanceIdentityDocumentSignature": identity_document_signature(),
             })
         }),
         ("ListContainerInstances", |cluster| {
@@ -404,12 +406,12 @@ async fn a_fargate_registration_names_the_single_member_it_is_missing() {
         (
             "bridge network mode",
             json!({ "networkMode": "bridge", "cpu": "256", "memory": "512" }),
-            "Fargate requires that 'networkMode' be set to 'awsvpc'.",
+            "Fargate only supports network mode \u{2018}awsvpc\u{2019}.",
         ),
         (
             "host network mode",
             json!({ "networkMode": "host", "cpu": "2048", "memory": "4096" }),
-            "Fargate requires that 'networkMode' be set to 'awsvpc'.",
+            "Fargate only supports network mode \u{2018}awsvpc\u{2019}.",
         ),
     ];
 
@@ -537,8 +539,9 @@ async fn a_registration_names_the_blank_member_of_the_identity_document() {
         );
     }
 
-    // A complete document registers the instance, which reads back through
-    // `DescribeContainerInstances` with the EC2 id the document named.
+    // A complete document, with the signature that vouches for it, registers the
+    // instance, which reads back through `DescribeContainerInstances` with the EC2 id
+    // the document named.
     let instance_id = "i-0abcdef1234567890";
     let registered = ok(
         &router,
@@ -546,6 +549,7 @@ async fn a_registration_names_the_blank_member_of_the_identity_document() {
         json!({
             "cluster": CLUSTER,
             "instanceIdentityDocument": identity_document(instance_id),
+            "instanceIdentityDocumentSignature": identity_document_signature(),
         }),
         "complete",
     )

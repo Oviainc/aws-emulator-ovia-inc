@@ -2293,6 +2293,12 @@ impl JobEntry {
         self.runs.iter().find(|run| run.id == run_id)
     }
 
+    /// The same run, to write to: what an operation that moves one run of this job
+    /// (`BatchStopJobRun`) addresses it through.
+    pub fn run_mut(&mut self, run_id: &str) -> Option<&mut JobRunEntry> {
+        self.runs.iter_mut().find(|run| run.id == run_id)
+    }
+
     /// How many of this job's runs have not finished.
     ///
     /// Call [`JobEntry::settle_due_runs`] first, or a run the clock has already finished
@@ -2406,27 +2412,35 @@ fn capacity_from(
 pub const JOB_RUN_STATE_STARTING: &str = "STARTING";
 /// See [`JOB_RUN_STATE_STARTING`].
 pub const JOB_RUN_STATE_FAILED: &str = "FAILED";
+/// The `JobRunState` a run is in once a stop has been submitted for it, before it comes
+/// to rest in [`JOB_RUN_STATE_STOPPED`]. See [`JOB_RUN_STATE_STARTING`].
+pub const JOB_RUN_STATE_STOPPING: &str = "STOPPING";
+/// The `JobRunState` a submitted stop brings a run to rest in. See
+/// [`JOB_RUN_STATE_STARTING`].
+pub const JOB_RUN_STATE_STOPPED: &str = "STOPPED";
 
 /// The `JobRunState` values a run never moves out of again: of the modelled enum quoted
 /// on [`JOB_RUN_STATE_STARTING`], the ones that name a finished run. The other four
 /// (`STARTING`, `RUNNING`, `STOPPING`, `WAITING`) each still owe a further state.
 pub const TERMINAL_JOB_RUN_STATES: [&str; 6] = [
-    "STOPPED",
+    JOB_RUN_STATE_STOPPED,
     "SUCCEEDED",
-    "FAILED",
+    JOB_RUN_STATE_FAILED,
     "TIMEOUT",
     "ERROR",
     "EXPIRED",
 ];
 
-/// How long a run stays in [`JOB_RUN_STATE_STARTING`] before the clock owes it its
-/// terminal state.
+/// How long a run stays in the state a call put it in before the clock owes it the next
+/// one: [`JOB_RUN_STATE_STARTING`] before the state the run comes to rest in, and
+/// [`JOB_RUN_STATE_STOPPING`] before [`JOB_RUN_STATE_STOPPED`].
 ///
-/// CHOSEN, not documented: Glue publishes no duration for starting a job run, so this is
-/// the emulator's own span — deliberately not zero, so a caller that polls `GetJobRun`
-/// straight after `StartJobRun` still observes the run in flight, and the concurrency
-/// limit that goes with it. The due instant is stored on the run and materialised by
-/// whichever later call reads it; nothing sleeps.
+/// CHOSEN, not documented: Glue publishes no duration for starting or for stopping a job
+/// run, so this is the emulator's own span — deliberately not zero, so a caller that
+/// polls `GetJobRun` straight after `StartJobRun` still observes the run in flight, and
+/// the concurrency limit that goes with it, and one that polls straight after a submitted
+/// stop still observes the run stopping. The due instant is stored on the run and
+/// materialised by whichever later call reads it; nothing sleeps.
 pub const JOB_RUN_SETTLES_AFTER: Duration = Duration::from_millis(500);
 
 /// `JobRun$ErrorMessage` for the terminal state the clock owes every run.
@@ -2509,6 +2523,10 @@ pub struct JobRunEntry {
     pub state: String,
     /// The instant the clock owes this run its next state; `None` once it has settled.
     pub settles_at: Option<SystemTime>,
+    /// The `JobRunState` the clock owes this run at [`JobRunEntry::settles_at`]: the
+    /// state a run nothing executed comes to rest in, and [`JOB_RUN_STATE_STOPPED`] once
+    /// a stop has been submitted for it.
+    pub settles_to: String,
     /// The job's `DefaultArguments` with this run's `Arguments` applied over them, then
     /// the job's `NonOverridableArguments`: "For this job run, they replace the default
     /// arguments set in the job definition itself" (`StartJobRun$Arguments`), except for
@@ -2589,6 +2607,9 @@ impl JobRunEntry {
             completed_on: None,
             state: JOB_RUN_STATE_STARTING.to_string(),
             settles_at: Some(now.checked_add(JOB_RUN_SETTLES_AFTER).unwrap_or(now)),
+            // Nothing executes the job script here, so the state the clock owes a run
+            // that nobody stops is the modelled failure state.
+            settles_to: JOB_RUN_STATE_FAILED.to_string(),
             arguments,
             // Nothing has failed yet: a run carries an error message only once it has.
             error_message: None,
@@ -2623,7 +2644,7 @@ impl JobRunEntry {
 
     /// Move this run into the state the clock owed it at `now`, if it owed one.
     ///
-    /// The run was due to leave [`JOB_RUN_STATE_STARTING`] at [`JobRunEntry::settles_at`]
+    /// The run was due to leave the state a call put it in at [`JobRunEntry::settles_at`]
     /// whether or not anybody called, and the instants recorded are that DUE instant, not
     /// the instant somebody read it — so two reads of a settled run report the same run.
     pub fn settle_if_due(&mut self, now: SystemTime) {
@@ -2634,10 +2655,41 @@ impl JobRunEntry {
             return;
         }
         self.settles_at = None;
-        self.state = JOB_RUN_STATE_FAILED.to_string();
-        self.error_message = Some(JOB_RUN_NOT_EXECUTED_MESSAGE.to_string());
-        self.completed_on = Some(due);
+        self.state = self.settles_to.clone();
+        // `JobRun$ErrorMessage` is "the error message associated with this job run": the
+        // run that comes to rest in the failure state carries the reason it never ran,
+        // while one a submitted stop brought to rest failed at nothing and carries none.
+        if self.state == JOB_RUN_STATE_FAILED {
+            self.error_message = Some(JOB_RUN_NOT_EXECUTED_MESSAGE.to_string());
+        }
+        if self.is_terminal() {
+            self.completed_on = Some(due);
+        }
         self.last_modified_on = due;
+    }
+
+    /// Submit a stop for this run, as `BatchStopJobRun` asks for one, and answer whether
+    /// the submission was accepted.
+    ///
+    /// A run that has not finished moves into [`JOB_RUN_STATE_STOPPING`] with
+    /// [`JOB_RUN_STATE_STOPPED`] owed one span later, so a caller reading straight after
+    /// the stop still sees the run stopping, and the slot it occupies is only freed once
+    /// it has stopped. A run already stopping keeps the stop already owed it — a second
+    /// submission for the same run neither postpones it nor records a different one — and
+    /// a run that has already finished accepts no stop at all: there is nothing left to
+    /// stop.
+    pub fn submit_stop(&mut self, now: SystemTime) -> bool {
+        if self.is_terminal() {
+            return false;
+        }
+        if self.state == JOB_RUN_STATE_STOPPING {
+            return true;
+        }
+        self.state = JOB_RUN_STATE_STOPPING.to_string();
+        self.settles_at = Some(now.checked_add(JOB_RUN_SETTLES_AFTER).unwrap_or(now));
+        self.settles_to = JOB_RUN_STATE_STOPPED.to_string();
+        self.last_modified_on = now;
+        true
     }
 
     /// `JobRun$ExecutionTime`: "The amount of time (in seconds) that the job run consumed

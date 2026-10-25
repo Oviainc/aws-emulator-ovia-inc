@@ -61,6 +61,8 @@ async fn register_with_attributes(
         json!({
             "cluster": cluster,
             "instanceIdentityDocument": identity_document(instance_id),
+            "instanceIdentityDocumentSignature":
+                crate::ecs_wire::identity_document_signature(),
             "attributes": attributes,
         }),
         case,

@@ -1745,6 +1745,17 @@ fn container_required_attributes(container: &ContainerDefinition, out: &mut Vec<
 /// user, which `user` names by its uid, as the recorded registration carries it.
 pub const FIRELENS_ROUTER_USER: &str = "0";
 
+/// Whether `network_mode` maps a container port onto the SAME host port — a static
+/// mapping.
+///
+/// `PortMapping$hostPort`: under `awsvpc` and `host` "the hostPort can either be left
+/// blank or set to the same value as the containerPort", while `bridge` binds an open
+/// host port of its own choosing. Read both where a mapping is rendered and where a
+/// registration is checked, so one rule decides both.
+pub fn is_static_port_mapping(network_mode: &str) -> bool {
+    network_mode == NETWORK_MODE_AWSVPC || network_mode == NETWORK_MODE_HOST
+}
+
 /// The `hostPort` and `protocol` Amazon ECS fills in for a port mapping the
 /// registration left partly blank, under `network_mode`.
 ///
@@ -1757,7 +1768,7 @@ pub const FIRELENS_ROUTER_USER: &str = "0";
 /// The `none` network mode never reaches here with a mapping: it "cannot specify port
 /// mappings", so `RegisterTaskDefinition` refuses one.
 fn defaulted_port_mapping(mapping: &PortMapping, network_mode: &str) -> PortMapping {
-    let static_mapping = network_mode == NETWORK_MODE_AWSVPC || network_mode == NETWORK_MODE_HOST;
+    let static_mapping = is_static_port_mapping(network_mode);
     let host_port = match (mapping.host_port, mapping.container_port) {
         (Some(declared), _) => Some(declared),
         (None, _) if mapping.container_port_range.is_some() => None,
@@ -2858,15 +2869,6 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     pub fn next_container_instance_id(&mut self) -> String {
         self.next_container_instance_seq += 1;
         format!("{:032x}", self.next_container_instance_seq)
-    }
-
-    /// Mint the managed-instance id an instance registered WITHOUT an EC2 instance
-    /// identity document reports. `ContainerInstance$ec2InstanceId`: "For external
-    /// instances, this value is the Amazon Web Services Systems Manager managed instance
-    /// ID", which Systems Manager writes as `mi-` followed by 17 hex digits.
-    pub fn next_managed_instance_id(&mut self) -> String {
-        self.next_container_instance_seq += 1;
-        format!("mi-{:017x}", self.next_container_instance_seq)
     }
 
     /// Mint the id of a service's next deployment. `Deployment$id` is an `ecs-svc/`
@@ -4721,6 +4723,17 @@ fn pair(name: &str, value: String) -> KeyValuePair {
     }
 }
 
+/// The values `DescribeClusters$include` accepts: the model's `ClusterField` enum, which
+/// [`ClusterFields::from_include`] reads. Also what identifies a refused `include` value
+/// as a CLUSTER read's, in `crate::service`.
+pub const CLUSTER_FIELDS: [&str; 5] = [
+    "ATTACHMENTS",
+    "CONFIGURATIONS",
+    "SETTINGS",
+    "STATISTICS",
+    "TAGS",
+];
+
 /// Which optional cluster fields a response carries, as `DescribeClusters$include`
 /// (the `ClusterField` enum: `ATTACHMENTS`, `CONFIGURATIONS`, `SETTINGS`, `STATISTICS`,
 /// `TAGS`) selects them.
@@ -4779,6 +4792,25 @@ pub fn missing_failure(arn: &str) -> Failure {
         reason: Some(FAILURE_MISSING.to_string()),
         detail: None,
     }
+}
+
+/// The `MISSING` `Failure` a batch read reports for an identifier that resolves to no
+/// resource of `resource_type`, naming the identifier AS THE CALLER SENT IT: the value
+/// itself when it is already an ARN, otherwise that id alone under the resource type.
+///
+/// The cluster segment of a task or container-instance ARN
+/// ([`task_arn`], [`container_instance_arn`]) identifies the cluster the resource is
+/// REGISTERED IN, which only a stored resource has; the id of one that does not exist
+/// identifies it account-wide by itself, so no cluster is inserted into the ARN the
+/// failure echoes. That is what lets a caller match each failure entry back to the
+/// identifier it sent.
+pub fn unresolved_failure(region: &str, resource_type: &str, reference: &str) -> Failure {
+    let arn = if reference.starts_with("arn:") {
+        reference.to_string()
+    } else {
+        ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("{resource_type}/{reference}"))
+    };
+    missing_failure(&arn)
 }
 
 /// Check a requested `launch_type` against the launch types `definition` supports,
@@ -5151,13 +5183,17 @@ pub fn daemon_task_definition_arn(region: &str, family: &str, revision: i32) -> 
     )
 }
 
+/// The ARN resource type a container instance is named under, as the resource segment of
+/// [`container_instance_arn`].
+pub const CONTAINER_INSTANCE_RESOURCE_TYPE: &str = "container-instance";
+
 /// The ARN of a container instance:
 /// `arn:aws:ecs:<region>:<account>:container-instance/<cluster>/<id>`.
 pub fn container_instance_arn(region: &str, cluster_name: &str, instance_id: &str) -> String {
     ::engine::emulator_arn(
         ARN_NAMESPACE,
         region,
-        &format!("container-instance/{cluster_name}/{instance_id}"),
+        &format!("{CONTAINER_INSTANCE_RESOURCE_TYPE}/{cluster_name}/{instance_id}"),
     )
 }
 
@@ -5423,12 +5459,15 @@ pub fn service_name_from_reference(reference: &str) -> String {
     cluster_and_service_from_reference(reference).1
 }
 
+/// The ARN resource type a task is named under, as the resource segment of [`task_arn`].
+pub const TASK_RESOURCE_TYPE: &str = "task";
+
 /// The ARN of a task: `arn:aws:ecs:<region>:<account>:task/<cluster>/<id>`.
 pub fn task_arn(region: &str, cluster_name: &str, task_id: &str) -> String {
     ::engine::emulator_arn(
         ARN_NAMESPACE,
         region,
-        &format!("task/{cluster_name}/{task_id}"),
+        &format!("{TASK_RESOURCE_TYPE}/{cluster_name}/{task_id}"),
     )
 }
 

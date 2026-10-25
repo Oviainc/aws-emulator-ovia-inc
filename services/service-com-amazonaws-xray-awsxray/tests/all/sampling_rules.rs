@@ -25,9 +25,11 @@
 //!   leaves the stored record alone, so N concurrent creates of one name have
 //!   exactly one winner;
 //! * a request the service cannot store — both selectors or neither, an unknown
-//!   sampling-rule `Version`, a `ResourceARN` that is neither the wildcard nor
-//!   an ARN, or any value outside a modelled `@range`/`@length` — is refused
-//!   with HTTP 400 and persists nothing;
+//!   sampling-rule `Version`, a `ResourceARN` whose text is not ARN syntax, or
+//!   any value outside a modelled `@range`/`@length` — is refused with HTTP 400
+//!   and persists nothing (a `ResourceARN` that constrains no resource is NOT
+//!   such a request: the rows that pin which values are accepted and how a
+//!   refused one is worded live in `refusal_message_rules`);
 //! * a paginated listing emits a `NextToken` only when it was truncated, and
 //!   resuming from that token yields the remainder exactly once.
 
@@ -528,12 +530,8 @@ async fn a_sampling_rule_the_service_cannot_store_is_refused_and_persists_nothin
             rule_with("ReservoirSize", json!(-1)),
         ),
         (
-            "a ResourceARN that is neither the wildcard nor an ARN",
+            "a ResourceARN that is not ARN syntax",
             rule_with("ResourceARN", json!("checkout-function")),
-        ),
-        (
-            "an empty ResourceARN",
-            rule_with("ResourceARN", json!("")),
         ),
         (
             "more Attributes than the modelled maximum of five",

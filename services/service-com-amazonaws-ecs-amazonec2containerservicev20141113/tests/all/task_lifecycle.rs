@@ -1213,7 +1213,10 @@ async fn describe_tasks_reports_missing_for_ids_that_name_nothing() {
         let expected_arn = if reference.starts_with("arn:") {
             reference.clone()
         } else {
-            format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{cluster}/{reference}")
+            // An id that names no task is echoed as the ARN of that id ALONE: the
+            // cluster segment of a task ARN names the cluster a stored task runs in.
+            // See [`crate::describe_failure_identifiers`].
+            format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{reference}")
         };
         assert_eq!(
             string(&failures[0], "arn", case),
