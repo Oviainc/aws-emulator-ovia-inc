@@ -43,7 +43,8 @@ use crate::ops::types::{
     IAMFederationOptionsOutput, IPAddressTypeStatus, IdentityCenterOptions,
     IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InstanceCountLimits, InstanceLimits,
     InstanceTypeDetails,
-    InvalidPaginationTokenException, JWTOptionsOutput, Limits, LogPublishingOption,
+    InvalidPaginationTokenException, JWTOptionsOutput, LimitExceededException, Limits,
+    LogPublishingOption,
     LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
     OffPeakWindowOptionsStatus, OptionStatus, OutboundConnection, OutboundConnectionStatus,
@@ -226,6 +227,71 @@ pub const DOMAIN_QUOTA: usize = 100;
 /// `ListDataSources` answers with, it also bounds the size of that answer, and with
 /// [`DOMAIN_QUOTA`] it bounds the whole data-source store.
 pub const DATA_SOURCE_QUOTA: usize = 20;
+
+/// How many tags ONE taggable resource carries before a call that would attach
+/// another is refused with the modelled `LimitExceededException`.
+///
+/// Documented by the service rather than chosen here: "A domain, data source, or
+/// application can have up to 10 tags"
+/// (`smithy_query(query="doc",shape="AddTags")`).
+pub const TAG_QUOTA: usize = 10;
+
+/// A taggable resource's tag set: the `TagValue` each `TagKey` carries.
+///
+/// A map rather than a list of the modelled `Tag`, because "Tag keys must be unique
+/// for the domain to which they are attached" (`Tag$Key`) — keying the store by the
+/// tag key is what makes that uniqueness structural instead of something each
+/// handler has to re-enforce. Iterating a `BTreeMap` is order-stable, which is what
+/// lets two reads of one resource's tags report them in the same order.
+pub type TagSet = BTreeMap<String, String>;
+
+/// The stored form of a modelled `TagList`: the last value a repeated key carries is
+/// the one the resource holds, because the set holds ONE value per key.
+pub fn tag_set(tag_list: Vec<Tag>) -> TagSet {
+    tag_list
+        .into_iter()
+        .map(|tag| (tag.key, tag.value))
+        .collect()
+}
+
+/// A stored tag set as the modelled `TagList` a response carries.
+pub fn tag_list(tags: &TagSet) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// The `LimitExceededException` payload for a call that would leave a resource
+/// carrying more than [`TAG_QUOTA`] tags.
+pub fn tag_quota_exceeded(arn: &str, requested: usize) -> LimitExceededException {
+    LimitExceededException {
+        message: Some(format!(
+            "{arn} would carry {requested} tags, more than the {TAG_QUOTA} a resource may have."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for an ARN that names no resource of this
+/// account — "an exception for accessing or deleting a resource that doesn't exist",
+/// which is how the tag-writing operations model that refusal (neither declares
+/// `ResourceNotFoundException`).
+pub fn tagged_resource_absent(arn: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!("Resource not found: {arn}")),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for the same miss on an operation that
+/// DOES model it — the mirror of [`tagged_resource_absent`], so one refusal reads
+/// like the other.
+pub fn tagged_resource_not_found(arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Resource not found: {arn}")),
+    }
+}
 
 /// How long work this control plane starts takes before the clock owes its outcome:
 /// a domain stays `Processing` after the call that started it (`CreateDomain`, or an
@@ -1162,7 +1228,10 @@ pub struct Domain {
     pub aiml_options: Option<AIMLOptionsOutput>,
     pub deployment_strategy_options: Option<DeploymentStrategyOptions>,
     pub automated_snapshot_pause_options: Option<AutomatedSnapshotPauseOptions>,
-    pub tags: Vec<Tag>,
+    /// The resource tags attached to this domain: the ONE copy `CreateDomain`'s
+    /// `TagList`, `AddTags`, `RemoveTags` and `ListTags` all write and read, so no
+    /// two of them can report the same domain's tags differently. See [`TagSet`].
+    pub tags: TagSet,
     pub created_at: SystemTime,
     /// The instant of the last call that changed any option.
     pub updated_at: SystemTime,
@@ -3157,6 +3226,31 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         for package in self.packages.values_mut() {
             package.settle(now);
         }
+    }
+
+    /// The tag set of the resource `arn` names, for a caller about to READ it.
+    ///
+    /// A domain is the taggable resource this store persists an ARN for
+    /// ([`domain_arn`]); the other two the tagging operations name — a data source
+    /// and an application — have no stored ARN to resolve against (a data source is
+    /// addressed by its domain and name, and no operation that mints an application
+    /// is implemented), so an ARN naming neither resolves to nothing and the caller
+    /// refuses it.
+    pub fn tagged_resource(&self, arn: &str) -> Option<&TagSet> {
+        self.domains
+            .values()
+            .find(|domain| domain.arn == arn)
+            .map(|domain| &domain.tags)
+    }
+
+    /// The tag set of the resource `arn` names, for a caller about to WRITE it —
+    /// resolved exactly as [`Self::tagged_resource`] resolves it, so a tag write and
+    /// a tag read can never disagree about which resource an ARN names.
+    pub fn tagged_resource_mut(&mut self, arn: &str) -> Option<&mut TagSet> {
+        self.domains
+            .values_mut()
+            .find(|domain| domain.arn == arn)
+            .map(|domain| &mut domain.tags)
     }
 
     /// The package `package_name` names, if the account holds one.
