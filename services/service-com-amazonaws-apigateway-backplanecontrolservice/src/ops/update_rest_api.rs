@@ -118,35 +118,22 @@
 use super::types::*;
 
 use crate::state::{
-    patch_bool, patch_enum_string, patch_optional_i32, patch_optional_string, patch_string_set,
-    Patch, PatchFailure, RestApiEntry, MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS,
+    patch_bool, patch_enum_string, patch_optional_string, patch_string_set, Patch, PatchFailure,
+    RestApiEntry, MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS,
 };
 
-/// The `path` values `UpdateRestApi` accepts: one per updateable member of the `RestApi`
-/// shape, the `endpointConfiguration` sub-members included. `id`, `createdDate`,
-/// `rootResourceId`, `warnings` and `apiStatus` are assigned by the service, and `tags`
-/// are changed through `TagResource`/`UntagResource`, so none of them is patchable; the
-/// API's resources have their own operations.
-const SUPPORTED_PATHS: &[&str] = &[
-    "/apiKeySource",
-    "/binaryMediaTypes/<media-type>",
-    "/description",
-    "/disableExecuteApiEndpoint",
-    "/endpointAccessMode",
-    "/endpointConfiguration/ipAddressType",
-    "/endpointConfiguration/types/<endpoint-type>",
-    "/endpointConfiguration/vpcEndpointIds/<vpc-endpoint-id>",
-    "/minimumCompressionSize",
-    "/name",
-    "/policy",
-    "/securityPolicy",
-    "/version",
-];
+// `minimumCompressionSize` is checked through the SAME checker `CreateRestApi` runs — the
+// member's documented range, "non-negative between 0 and 10485760 (10M) bytes, inclusive"
+// (`RestApi$minimumCompressionSize`) — so one size is refused with one sentence whichever
+// operation set it.
+use crate::ops::create_rest_api::accepted_compression_size;
 
-/// The documented range of `minimumCompressionSize`: "non-negative between 0 and
-/// 10485760 (10M) bytes, inclusive" (`RestApi$minimumCompressionSize`), the same range
-/// `CreateRestApi` enforces.
-const COMPRESSION_SIZE_RANGE: ::std::ops::RangeInclusive<i32> = 0..=10_485_760;
+// The `path` values `UpdateRestApi` accepts are the ones `apply_patch` below has an arm
+// for: one per updateable member of the `RestApi` shape, the `endpointConfiguration`
+// sub-members included. `id`, `createdDate`, `rootResourceId`, `warnings` and `apiStatus`
+// are assigned by the service, and `tags` are changed through
+// `TagResource`/`UntagResource`, so none of them is patchable; the API's resources have
+// their own operations.
 
 /// Apply one patch to a COPY of a stored API.
 fn apply_patch(entry: &mut RestApiEntry, patch: &Patch) -> Result<(), PatchFailure> {
@@ -172,10 +159,10 @@ fn apply_patch(entry: &mut RestApiEntry, patch: &Patch) -> Result<(), PatchFailu
             patch,
             ENDPOINT_ACCESS_MODE_VALUES,
         ),
-        "minimumCompressionSize" => patch_optional_i32(
+        "minimumCompressionSize" => crate::state::patch_optional_i32_checked(
             &mut entry.minimum_compression_size,
             patch,
-            COMPRESSION_SIZE_RANGE,
+            accepted_compression_size,
         ),
         "binaryMediaTypes" => {
             let media_type = patch.collection_entry(1)?;
@@ -189,7 +176,7 @@ fn apply_patch(entry: &mut RestApiEntry, patch: &Patch) -> Result<(), PatchFailu
             )
         }
         "endpointConfiguration" => apply_endpoint_patch(entry, patch),
-        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => Err(patch.unsupported_path()),
     }
 }
 
@@ -230,7 +217,7 @@ fn apply_endpoint_patch(entry: &mut RestApiEntry, patch: &Patch) -> Result<(), P
                 IP_ADDRESS_TYPE_VALUES,
             )?;
         }
-        _ => return Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => return Err(patch.unsupported_path()),
     }
     entry.endpoint_configuration = Some(configuration);
     Ok(())

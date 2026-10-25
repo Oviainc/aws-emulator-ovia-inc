@@ -8,7 +8,9 @@
 //! [`crate::state::ComAmazonawsSsmsapSsmsapState::resource_policy`] and adds no grant
 //! of its own, so reading a resource's policy cannot change what a later caller sees.
 //! A resource nobody has granted anything on carries NO policy, which is an absent
-//! `Policy` member rather than an invented document.
+//! `Policy` member rather than an invented document; an ARN that names no resource of
+//! this account and Region is refused with the modelled `ResourceNotFoundException`
+//! instead, so an empty policy is only ever reported for a resource that exists.
 //!
 //! ## Shape of an operation
 //!
@@ -155,19 +157,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(::std::time::SystemTime::now());
 
         // `ResourceArn` is modelled `@required` and `ActionType` is an optional enum,
-        // so reaching here means the reference is well formed. An `ActionType` narrows
-        // the document to that action's statements; without one the whole policy held
-        // for the resource is reported.
-        //
-        // No grant for the resource is reported as an absent `Policy` and not as the
-        // modelled `ResourceNotFoundException`: this emulator holds no database or
-        // component registry (`GetDatabase` and `ListDatabases` are still scaffolds),
-        // so an empty policy is all that can be known about such a resource. Reading a
-        // Region that holds nothing mints no partition for it (`region`, not
-        // `region_entry`).
-        let policy = state
-            .region(&region)
-            .resource_policy(&input.resource_arn, input.action_type.as_deref());
+        // so reaching here means the reference is well formed. What the model cannot
+        // state is whether the ARN names anything: the policy reported belongs to a
+        // resource this account and Region holds — a registered application or a SAP
+        // HANA database of one of its registrations — resolved the one way this crate
+        // resolves a resource named by ARN
+        // ([`crate::state::RegionState::holds_resource`]), which is the same resolution
+        // `PutResourcePermission` grants against. Reading a Region that holds nothing
+        // mints no partition for it (`region`, not `region_entry`).
+        let region_state = state.region(&region);
+        if !region_state.holds_resource(&region, &input.resource_arn) {
+            return Err(GetResourcePermissionErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::resource_not_found_message(
+                    &input.resource_arn,
+                )),
+            )
+            .into());
+        }
+
+        // An `ActionType` narrows the document to that action's statements; without one
+        // the whole policy held for the resource is reported. A resource that exists but
+        // has been granted nothing carries no policy, which is an ABSENT `Policy`.
+        let policy =
+            region_state.resource_policy(&input.resource_arn, input.action_type.as_deref());
 
         Ok(GetResourcePermissionOutput { policy })
     }

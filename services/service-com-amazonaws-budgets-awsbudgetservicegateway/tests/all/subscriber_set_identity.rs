@@ -79,14 +79,16 @@ fn collapse_rows() -> Vec<Row> {
     let billing = email("billing");
     let finance = email("finance");
     let topic = sns("alerts");
-    // `SubscriberAddress` carries no per-type format constraint (its `@pattern` is
-    // `^(.*[\n\r\t\f\ ]?)*$`), so one address can be supplied under each subscription
-    // type the model lists — two different subscribers, since the type is half of the
-    // identity.
-    let shared = "shared@example.com";
-    let shared_of_each_type: Vec<Value> = SUBSCRIPTION_TYPE_VALUES
+    // A subscriber's address has to be the form its own `SubscriptionType` names ("either
+    // an Amazon SNS topic or an email address", `Subscriber`), so one subscriber of each
+    // type the model lists is a set with nothing to collapse: the type is half of the
+    // identity and the address the other half, and both differ here.
+    let one_of_each_type: Vec<Value> = SUBSCRIPTION_TYPE_VALUES
         .iter()
-        .map(|subscription_type| json!({"SubscriptionType": subscription_type, "Address": shared}))
+        .map(|subscription_type| match *subscription_type {
+            "SNS" => sns("shared"),
+            _ => email("shared"),
+        })
         .collect();
 
     let mut interleaved = vec![
@@ -160,9 +162,9 @@ fn collapse_rows() -> Vec<Row> {
             distinct: topic_twice_and_emails_distinct,
         },
         Row {
-            case: "one address under each subscription type the model lists".to_string(),
-            supplied: shared_of_each_type.clone(),
-            distinct: shared_of_each_type,
+            case: "one subscriber of each subscription type the model lists".to_string(),
+            supplied: one_of_each_type.clone(),
+            distinct: one_of_each_type,
         },
         Row {
             case: "a set with nothing to collapse: the documented maximum of each type"

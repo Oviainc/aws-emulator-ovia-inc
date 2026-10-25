@@ -87,12 +87,9 @@
 use super::types::*;
 
 use crate::state::{
-    decode_page_token, encode_page_token, invalid_request_body, page_token_not_accepted,
-    ServerRecord, MAX_LIST_PAGE_SIZE, SERVER_CRITERIA_NOT_DEFINED, SERVER_PAGE_MARKER,
-    SORT_ASCENDING, SORT_DESCENDING,
+    filter_pair, list_page, page_token_not_accepted, selection_fingerprint, ListCursor,
+    ServerRecord, SERVER_PAGE_MARKER,
 };
-
-use ::sha2::{Digest, Sha256};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -129,175 +126,23 @@ impl From<ListServersErrorModeled> for ListServersError {
     }
 }
 
-/// What a `nextToken` carries, beside the marker: the list the page was taken from, and
-/// the server the next page starts at.
+/// Lift a refusal the service decided — an unusable value
+/// ([`crate::state::invalid_request_body`]) or an unresolvable one
+/// ([`crate::state::page_token_not_accepted`]) — into this operation's error channel.
 ///
-/// A token names a position in ONE list, so it carries a fingerprint of the SELECTION the
-/// list was taken under — the criteria and value, the order, and the groups. Handed back
-/// with a different selection it is refused, rather than resuming at whatever position
-/// that server happens to have in some other list. The page SIZE is deliberately not part
-/// of it: `maxResults` is documented per call ("if a previous call to this action returned
-/// 100 items, but you set maxResults to 10"), so changing it between pages is the
-/// caller's business.
-struct Cursor {
-    selection: String,
-    resume_at: String,
-}
-
-impl Cursor {
-    /// This cursor as the opaque `nextToken` the caller hands back, through the service's
-    /// one page-token codec.
-    fn to_token(&self) -> String {
-        encode_page_token(
-            SERVER_PAGE_MARKER,
-            &format!("{}:{}", self.selection, self.resume_at),
-        )
-    }
-
-    /// The cursor a token carries, or `None` for anything this operation did not mint.
-    fn from_token(token: &str) -> Option<Self> {
-        let payload = decode_page_token(SERVER_PAGE_MARKER, token)?;
-        let (selection, resume_at) = payload.split_once(':')?;
-        Some(Self {
-            selection: selection.to_string(),
-            resume_at: resume_at.to_string(),
-        })
-    }
-}
-
-/// A fingerprint of the selection a list was taken under: which servers it holds and in
-/// which order, independent of how they are paged.
-///
-/// A digest rather than the members themselves, so a token stays well inside
-/// `NextToken`'s `@length(0, 2048)` however many groups the filter names — and so it
-/// carries nothing a caller could read its own filter back out of.
-fn selection_fingerprint(
-    filter: Option<(&str, &str)>,
-    descending: bool,
-    groups: &[Group],
-) -> String {
-    // The group filter is a SET: the same groups in another order select the same
-    // servers, so the fingerprint must not depend on the order they were sent in.
-    let mut named: Vec<String> = groups
-        .iter()
-        .map(|group| {
-            format!(
-                "{:?}={:?}",
-                group.name.as_deref().unwrap_or_default(),
-                group.value.as_deref().unwrap_or_default()
-            )
-        })
-        .collect();
-    named.sort();
-    let (criteria, value) = filter.unwrap_or((SERVER_CRITERIA_NOT_DEFINED, ""));
-    let order = if descending {
-        SORT_DESCENDING
-    } else {
-        SORT_ASCENDING
-    };
-    let digest = <Sha256 as Digest>::digest(
-        format!("{criteria:?}/{value:?}/{order}/{}", named.join(",")).as_bytes(),
-    );
-    // Half the digest: the fingerprint only has to tell two selections of one account's
-    // inventory apart, and a shorter token is a shorter `nextToken`.
-    ::hex::encode(&digest[..16])
-}
-
-/// The page the request asks for: how many servers it takes, and the cursor it resumes
-/// from.
-struct Page {
-    size: usize,
-    resume_at: Option<String>,
-}
-
-/// This operation's refusal of a request the model admits member by member but that it
-/// cannot act on, in the service's own wording.
-fn refused() -> ListServersError {
-    ListServersErrorModeled::ValidationException(invalid_request_body()).into()
+/// The rules behind those refusals are the service's, shared by every list it serves
+/// ([`filter_pair`], [`crate::state::sort_descending`],
+/// [`crate::state::check_group_names`], [`list_page`]); this is the one place that says
+/// which of THIS operation's modelled errors carries them.
+fn refusal(exception: ValidationException) -> ListServersError {
+    ListServersErrorModeled::ValidationException(exception).into()
 }
 
 /// This operation's refusal of a `nextToken` it cannot resolve, worded the way the
 /// service words any unresolvable parameter — the same refusal `ListImportFileTask`
 /// answers for a cursor of its own that resolves to nothing.
 fn token_refused() -> ListServersError {
-    ListServersErrorModeled::ValidationException(page_token_not_accepted()).into()
-}
-
-/// Hold `maxResults` to the documented maximum and `nextToken` to a token this operation
-/// issued for THIS selection.
-///
-/// `maxResults` is documented "The maximum number of items to include in the response.
-/// The maximum value is 100" and its target shape carries no `@range`, so a request past
-/// that bound (or one asking for a page of nothing) is refused here rather than silently
-/// clamped: a caller that asked for more than the service gives has to learn it cannot
-/// have it. An absent `maxResults` takes the documented maximum.
-fn page_of(
-    max_results: Option<i32>,
-    next_token: Option<String>,
-    selection: &str,
-) -> Result<Page, ListServersError> {
-    let size = match max_results {
-        None => MAX_LIST_PAGE_SIZE,
-        Some(requested) if (1..=MAX_LIST_PAGE_SIZE).contains(&requested) => requested,
-        Some(_) => return Err(refused()),
-    };
-    let resume_at = match next_token {
-        None => None,
-        Some(token) => {
-            let cursor = Cursor::from_token(&token).ok_or_else(token_refused)?;
-            if cursor.selection != selection {
-                return Err(token_refused());
-            }
-            Some(cursor.resume_at)
-        }
-    };
-    Ok(Page {
-        size: usize::try_from(size).unwrap_or(0),
-        resume_at,
-    })
-}
-
-/// The (criteria, value) pair the request filters on, or `None` when it filters nothing.
-///
-/// A `serverCriteria` other than `NOT_DEFINED` names the member to compare, so it needs a
-/// `filterValue` to compare against and is refused without one; `NOT_DEFINED` (and an
-/// absent criteria) names no member, so it filters nothing and needs no value. Enum
-/// membership is checked here because the boundary validator does not enforce it: a value
-/// `ServerCriteria` does not declare is refused rather than quietly matching no server.
-fn filter_of<'a>(
-    criteria: Option<&'a str>,
-    filter_value: Option<&'a str>,
-) -> Result<Option<(&'a str, &'a str)>, ListServersError> {
-    let criteria = criteria.unwrap_or(SERVER_CRITERIA_NOT_DEFINED);
-    if !SERVER_CRITERIA_VALUES.contains(&criteria) {
-        return Err(refused());
-    }
-    if criteria == SERVER_CRITERIA_NOT_DEFINED {
-        return Ok(None);
-    }
-    let value = filter_value.ok_or_else(refused)?;
-    Ok(Some((criteria, value)))
-}
-
-/// Whether the list is reported in descending order.
-///
-/// `sort` is documented "Specifies whether to sort by ascending (ASC) or descending (DESC)
-/// order" and names no key, so the order is taken over the one total order every server
-/// has — its id, which is also what a page resumes at. An absent `sort` is ascending. A
-/// `SortOrder` value the model does not declare is refused, for the same reason as an
-/// undeclared criteria. The direction is read by the service's one
-/// [`crate::state::sort_descending`], which every list of this service shares; this
-/// wrapper lifts its refusal into this operation's error channel.
-fn descending(sort: Option<&str>) -> Result<bool, ListServersError> {
-    crate::state::sort_descending(sort).map_err(|_| refused())
-}
-
-/// Refuse a `groupIdFilter` entry whose `name` is not a `GroupName` the model declares —
-/// again a value the boundary validator lets through. The membership test is the
-/// service's [`crate::state::check_group_names`]; this wrapper lifts its refusal into
-/// this operation's error channel.
-fn check_group_filter(groups: &[Group]) -> Result<(), ListServersError> {
-    crate::state::check_group_names(groups).map_err(|_| refused())
+    refusal(page_token_not_accepted())
 }
 
 /// The `ListServers` operation.
@@ -347,15 +192,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Every refusal is decided from the request alone, before the store is read.
-        let filter = filter_of(input.server_criteria.as_deref(), input.filter_value.as_deref())?;
-        let descending = descending(input.sort.as_deref())?;
+        // Every refusal is decided from the request alone, before the store is read, by
+        // the service's own rules for a list request.
+        let filter = filter_pair(
+            input.server_criteria.as_deref(),
+            input.filter_value.as_deref(),
+            SERVER_CRITERIA_VALUES,
+        )
+        .map_err(refusal)?;
+        let descending = crate::state::sort_descending(input.sort.as_deref()).map_err(refusal)?;
         let groups = input.group_id_filter.unwrap_or_default();
-        check_group_filter(&groups)?;
+        crate::state::check_group_names(&groups).map_err(refusal)?;
         // The selection this call takes its list under: a token is only good for the
         // same one.
         let selection = selection_fingerprint(filter, descending, &groups);
-        let page = page_of(input.max_results, input.next_token, &selection)?;
+        let page = list_page(
+            input.max_results,
+            input.next_token,
+            SERVER_PAGE_MARKER,
+            &selection,
+        )
+        .map_err(refusal)?;
 
         // A read: the only write it makes is materialising what the clock already owed
         // this portfolio — an assessment whose completion was due at this same instant
@@ -409,11 +266,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         // The cursor the next page resumes from, or none once this page ended the list.
         let next_token = ordered.get(end).map(|server| {
-            Cursor {
+            ListCursor {
                 selection,
                 resume_at: server.id.clone(),
             }
-            .to_token()
+            .to_token(SERVER_PAGE_MARKER)
         });
 
         Ok(ListServersOutput {

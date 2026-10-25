@@ -276,10 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreateResourceErrorModeled::LimitExceededException(
                     LimitExceededException {
                         retry_after_seconds: None,
-                        message: Some(format!(
-                            "Maximum number of resources exceeded for this API: {}",
-                            crate::state::MAX_RESOURCES_PER_API
-                        )),
+                        message: Some(crate::state::quota_reached("Resources", "API")),
                     },
                 )
                 .into());

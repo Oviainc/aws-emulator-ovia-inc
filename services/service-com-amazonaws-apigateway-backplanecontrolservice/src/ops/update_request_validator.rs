@@ -84,11 +84,11 @@ use crate::state::{
     patch_bool, patch_optional_string, Patch, PatchFailure, RequestValidatorEntry, MAX_STRING_CHARS,
 };
 
-/// The `path` values `UpdateRequestValidator` accepts: one per updateable member of the
-/// `RequestValidator` shape. `id` is the validator's identity — the URI label addressing
-/// this very record, and what a `Method`'s `requestValidatorId` names — so it is reported
-/// but not patchable, exactly as `UpdateAuthorizer` treats an authorizer's `id`.
-const SUPPORTED_PATHS: &[&str] = &["/name", "/validateRequestBody", "/validateRequestParameters"];
+// The `path` values `UpdateRequestValidator` accepts are the ones `apply_patch` below has
+// an arm for: one per updateable member of the `RequestValidator` shape. `id` is the
+// validator's identity — the URI label addressing this very record, and what a `Method`'s
+// `requestValidatorId` names — so it is reported but not patchable, exactly as
+// `UpdateAuthorizer` treats an authorizer's `id`.
 
 /// Apply one patch to a COPY of a stored request validator.
 fn apply_patch(entry: &mut RequestValidatorEntry, patch: &Patch) -> Result<(), PatchFailure> {
@@ -101,7 +101,7 @@ fn apply_patch(entry: &mut RequestValidatorEntry, patch: &Patch) -> Result<(), P
         // `value` is a bare string on the wire, so the boolean is read here.
         "validateRequestBody" => patch_bool(&mut entry.validate_request_body, patch),
         "validateRequestParameters" => patch_bool(&mut entry.validate_request_parameters, patch),
-        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => Err(patch.unsupported_path()),
     }
 }
 

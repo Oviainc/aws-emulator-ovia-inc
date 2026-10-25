@@ -263,9 +263,8 @@ async fn a_stop_replaces_whatever_the_scan_still_owed() {
     // A stop of a running scan, with rows differing in the terminal status the scan was
     // still owed: the job winds down to STOPPED and never settles to the status its scan
     // would have reached, so the owed statuses the stop replaced cannot resurface. (A
-    // stop issued before the scan is running is outside the status the operation acts
-    // from and is refused instead; that is asserted in
-    // `stop_search_job_status_gate.rs`.)
+    // stop issued before the scan is running is accepted just the same; that is asserted
+    // in `stop_search_job_status_gate.rs` and `stop_search_job_cancel_window.rs`.)
     let stop_cases = [
         ("stopped while scanning a scope that resolved to one recovery point", vec![s3_point("stopped")]),
         ("stopped while scanning a scope that resolved to nothing", Vec::new()),

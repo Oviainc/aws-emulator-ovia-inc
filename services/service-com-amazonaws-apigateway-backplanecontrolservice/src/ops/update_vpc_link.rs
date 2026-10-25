@@ -91,17 +91,16 @@ use crate::state::{
     MAX_STRING_CHARS,
 };
 
-/// The `path` values `UpdateVpcLink` accepts: one per updateable member of the `VpcLink`
-/// shape.
-///
-/// `id`, `status` and `statusMessage` are the service's own — the id is minted by the
-/// create and the status is the provisioning state the clock moves — and `tags` are
-/// changed through `TagResource`/`UntagResource`, so none of them is patchable.
-/// `targetArns` is not either: it is "The ARN of the network load balancer of the VPC
-/// targeted by the VPC link" (`VpcLink$targetArns`), which is what the link was
-/// provisioned against when it was created, so retargeting it is a new link rather than
-/// an edit of this one.
-const SUPPORTED_PATHS: &[&str] = &["/description", "/name"];
+// The `path` values `UpdateVpcLink` accepts are the ones `apply_patch` below has an arm
+// for: one per updateable member of the `VpcLink` shape.
+//
+// `id`, `status` and `statusMessage` are the service's own — the id is minted by the
+// create and the status is the provisioning state the clock moves — and `tags` are
+// changed through `TagResource`/`UntagResource`, so none of them is patchable.
+// `targetArns` is not either: it is "The ARN of the network load balancer of the VPC
+// targeted by the VPC link" (`VpcLink$targetArns`), which is what the link was
+// provisioned against when it was created, so retargeting it is a new link rather than
+// an edit of this one.
 
 /// Apply one patch to a COPY of a stored link.
 fn apply_patch(entry: &mut VpcLinkEntry, patch: &Patch) -> Result<(), PatchFailure> {
@@ -113,7 +112,7 @@ fn apply_patch(entry: &mut VpcLinkEntry, patch: &Patch) -> Result<(), PatchFailu
         // The description is optional, so a `remove` clears it back to the state a link
         // created without one is in.
         "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
-        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => Err(patch.unsupported_path()),
     }
 }
 

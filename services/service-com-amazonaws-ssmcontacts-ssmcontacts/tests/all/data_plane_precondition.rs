@@ -236,10 +236,10 @@ pub(crate) async fn activation_status(
 /// One gated operation: how to build its request, and what an ONBOARDED account gets when
 /// that request names a resource nothing created.
 ///
-/// `pub(crate)` with the table below because `tests/all/default_onboarding.rs` asserts the
-/// other side of this rule — that the account a client finds is already onboarded, so each
-/// of these operations answers about its own subject — over the SAME table, which is what
-/// keeps the two suites' idea of "the gated surface" from drifting apart.
+/// `pub(crate)` with the table below because `tests/all/cold_account_gate.rs` asserts the
+/// same rule on the account a client actually meets — a freshly started emulator, whose
+/// account holds no replication set — over the SAME table, which is what keeps the two
+/// suites' idea of "the gated surface" from drifting apart.
 pub(crate) struct GatedOperation {
     pub(crate) operation: &'static str,
     pub(crate) body: fn(&Targets) -> Value,
@@ -280,6 +280,28 @@ pub(crate) const GATED_OPERATIONS: &[GatedOperation] = &[
         operation: "ListRotations",
         body: |_| json!({"RotationNamePrefix": "gated"}),
         absent_status: 200,
+    },
+    GatedOperation {
+        operation: "GetRotation",
+        body: |targets| json!({"RotationId": targets.rotation}),
+        absent_status: 404,
+    },
+    GatedOperation {
+        operation: "StartEngagement",
+        body: |targets| {
+            json!({
+                "ContactId": targets.contact,
+                "Sender": "cli",
+                "Subject": "disk pressure",
+                "Content": "node-7 is at 95%",
+            })
+        },
+        absent_status: 404,
+    },
+    GatedOperation {
+        operation: "StopEngagement",
+        body: |targets| json!({"EngagementId": targets.engagement}),
+        absent_status: 404,
     },
     GatedOperation {
         operation: "DescribeEngagement",

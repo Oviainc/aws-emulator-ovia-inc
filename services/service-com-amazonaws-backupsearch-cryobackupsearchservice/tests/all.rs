@@ -35,6 +35,8 @@ mod search_job_status_phases;
 mod search_jobs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stop_search_job_cancel_window.rs"]
+mod stop_search_job_cancel_window;
 #[path = "all/stop_search_job_status_gate.rs"]
 mod stop_search_job_status_gate;
 #[path = "all/success_status.rs"]

@@ -83,11 +83,10 @@ use super::types::*;
 
 use crate::state::{Patch, PatchFailure, PatchOpKind, ResourceEntry, RestApiEntry};
 
-/// The `path` values `UpdateResource` accepts: the resource's own segment and its place
-/// in the tree. `id` is assigned by the service and `path` is derived from the parent
-/// chain, so neither is patchable; a resource's methods are changed through the `Method`
-/// operations.
-const SUPPORTED_PATHS: &[&str] = &["/parentId", "/pathPart"];
+// The `path` values `UpdateResource` accepts are the ones `apply_patch` below has an arm
+// for: the resource's own segment and its place in the tree. `id` is assigned by the
+// service and `path` is derived from the parent chain, so neither is patchable; a
+// resource's methods are changed through the `Method` operations.
 
 /// Refuse a path part that another child of `parent_id` already holds: two siblings with
 /// one segment would share a path, and a path is what routes a request.
@@ -195,7 +194,7 @@ fn apply_patch(
             }
             Ok(())
         }
-        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => Err(patch.unsupported_path()),
     }
 }
 

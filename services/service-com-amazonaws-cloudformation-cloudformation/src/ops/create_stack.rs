@@ -36,7 +36,17 @@
 //! `Capabilities` is WEIGHED against the template's own declarations: a template declaring
 //! an IAM resource the request did not acknowledge is refused with the modelled
 //! `InsufficientCapabilitiesException`, before the stack is created — see
-//! [`crate::state::insufficient_capabilities`].
+//! [`crate::state::insufficient_capabilities`]. It is weighed against the PROCESSED
+//! template too, since a resource an included snippet contributes is one this stack would
+//! deploy.
+//!
+//! The template is PROCESSED before it is deployed: an `Fn::Transform` naming
+//! `AWS::Include` is the Amazon S3 object its `Location` names, read through this
+//! emulator's own in-process callback and spliced into the template
+//! ([`crate::state::include`]), so the members a snippet contributes reach the service that
+//! owns the resource and the intrinsic reaches nothing. A snippet that cannot be read fails
+//! the STACK — the create is accepted and answers a stack id, and the stack then fails and
+//! rolls back carrying the transform's own reason, with nothing provisioned.
 //!
 //! Two gaps are deliberate and predate the output evaluation, so a test author can see
 //! them: `ClientRequestToken` is stored as the operation's token but not checked for
@@ -390,6 +400,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 
+        // "CloudFormation processes the template fragments" a transform names BEFORE it
+        // does anything with the template's resources: an `Fn::Transform` of `AWS::Include`
+        // is the Amazon S3 object its `Location` names, read and spliced in here, so what
+        // deploys below is the PROCESSED template and no intrinsic reaches the service that
+        // owns a resource. A snippet that cannot be read fails this stack rather than this
+        // request — "after the call completes successfully, the stack creation starts", and
+        // the processing is part of that creation.
+        let processing = crate::state::include::process(ctx, &region, &template_body).await;
+        // The capabilities are weighed again over the PROCESSED template: a resource a
+        // snippet CONTRIBUTES is as much the stack's as one the body declares itself, so
+        // the acknowledgement this request carries is held to the template that really
+        // deploys — nothing mints a privileged identity a caller never acknowledged because
+        // an include is what brought it in.
+        if let crate::state::include::Processed::Expanded(processed) = &processing {
+            if let Some(message) = crate::state::insufficient_capabilities(
+                processed,
+                input.capabilities.as_deref().unwrap_or_default(),
+            ) {
+                return Err(CreateStackErrorModeled::InsufficientCapabilitiesException(
+                    InsufficientCapabilitiesException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         // The stack record, built before the store is locked: reading a caller-sized
         // template body is work the request paid for, and doing it outside the critical
         // section keeps one caller's template from holding the lock every other
@@ -429,10 +466,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         stack.stack_policy_body = input.stack_policy_body.clone();
         stack.resource_types = input.resource_types.clone().unwrap_or_default();
 
-        // Everything the template's resources and outputs are computed from is now in
-        // place: materialise the resources it declares and evaluate its outputs, which
-        // `DescribeStacks` reports once the create completes.
-        stack.deploy_template();
+        // What the template's processing left: the processed body is the one the stack
+        // deploys, and a processing FAILURE is the stack's own failure reason.
+        let transform_failure = match processing {
+            crate::state::include::Processed::Unchanged => None,
+            crate::state::include::Processed::Expanded(processed) => {
+                stack.set_processed_template_body(processed);
+                None
+            }
+            crate::state::include::Processed::Failed(reason) => Some(reason),
+        };
+
+        if transform_failure.is_some() {
+            // Processing the template failed, so the create never reached the stage that
+            // provisions anything: the stack declares no resource and no output, and the
+            // reason below is the transform's rather than an owning service's.
+            stack.deploy_nothing();
+        } else {
+            // Everything the template's resources and outputs are computed from is now in
+            // place: materialise the resources it declares and evaluate its outputs, which
+            // `DescribeStacks` reports once the create completes.
+            stack.deploy_template();
+        }
 
         // The store lock is taken for the write and RELEASED at the end of this block:
         // the calls that create the stack's resources run after it, and each of those
@@ -542,9 +597,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // created in the service that owns it, and what that service answered is what the
         // stack records for it. A create has nothing to reconcile against, so the previous
         // set is empty.
-        let materialised =
-            crate::state::provisioning::reconcile(ctx, &region, &provenance, declared, &[])
-                .await;
+        let materialised = match transform_failure {
+            // Nothing is asked of any owning service for a template that could not be
+            // processed: the failure the stack records is the transform's.
+            Some(reason) => crate::state::provisioning::Materialised {
+                resources: Vec::new(),
+                failure: Some(reason),
+                // No resource was asked of any service, so none transitioned: the stack's
+                // event log carries the transform's failure and nothing else.
+                transitions: Vec::new(),
+            },
+            None => {
+                crate::state::provisioning::reconcile(ctx, &region, &provenance, declared, &[])
+                    .await
+            }
+        };
 
         let output = CreateStackOutput {
             stack_id: Some(stack_id.clone()),

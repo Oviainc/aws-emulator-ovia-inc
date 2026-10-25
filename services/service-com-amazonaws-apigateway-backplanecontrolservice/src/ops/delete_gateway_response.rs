@@ -186,9 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if api.gateway_responses.remove(&input.response_type).is_none() {
             return Err(DeleteGatewayResponseErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::no_such_gateway_response(
-                        &input.response_type,
-                    )),
+                    message: Some(crate::state::NO_SUCH_GATEWAY_RESPONSE.to_string()),
                 },
             )
             .into());

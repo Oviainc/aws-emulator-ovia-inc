@@ -459,7 +459,7 @@ async fn count_tokens_and_converse_report_the_same_input_token_count() {
             body["stopReason"]
         );
         assert!(
-            body["metrics"]["latencyMs"].as_i64().unwrap_or(-1) >= 0,
+            body["metrics"]["latencyMs"].as_i64().unwrap_or(-1) > 0,
             "case {case:?}: expected a measured latency, got {:?}",
             body["metrics"]["latencyMs"]
         );
@@ -816,62 +816,234 @@ async fn invoke_input_tokens(
         .unwrap_or_else(|| panic!("the family envelope reports an input count: {served}"))
 }
 
-/// RULE: a `Converse` turn stops on `max_tokens` when the generated text reaches
-/// the cap `inferenceConfig.maxTokens` sets (bounded in turn by the model's own
-/// ceiling), and on `end_turn` when it does not; the output count never exceeds
-/// the cap.
-#[tokio::test]
-async fn converse_stops_on_max_tokens_exactly_when_the_cap_is_reached() {
-    let router = emulator();
-    let model_id = "amazon.nova-lite-v1:0";
-    let messages = serde_json::json!([{"role": "user", "content": [{"text": "hello"}]}]);
+/// One generation-cap row: the `inferenceConfig.maxTokens` a request carries and
+/// the model it is sent to.
+struct CapRow {
+    case: &'static str,
+    model_id: &'static str,
+    /// `inferenceConfig.maxTokens`, or `None` for a request that omits
+    /// `inferenceConfig` altogether.
+    max_tokens: Option<i64>,
+}
 
-    // One row per published bound of `maxTokens` (its modelled minimum, 1) and
-    // around the length of the text this emulator returns, plus a cap far above
-    // it.
-    for cap in [1_i64, 2, 5, 17, 100, 4096] {
+/// The generation-cap table: the published bound of
+/// `InferenceConfiguration.maxTokens` (`@range` min 1, from
+/// `smithy_query(query="shape", shape="InferenceConfiguration")`), caps just
+/// below, at and just above the shortest completion this emulator can serve,
+/// the modest cap a short turn is usually sent with, a cap far above any
+/// completion, and a request that supplies no cap at all — across several model
+/// families, which is what the cap rule generalises over.
+fn cap_rows() -> Vec<CapRow> {
+    let floor = i64::from(state::count_text_tokens(state::EMULATED_COMPLETION_FLOOR));
+    vec![
+        CapRow {
+            case: "the modelled minimum cap",
+            model_id: "amazon.nova-lite-v1:0",
+            max_tokens: Some(1),
+        },
+        CapRow {
+            case: "a cap of two tokens",
+            model_id: "anthropic.claude-3-sonnet-20240229-v1:0",
+            max_tokens: Some(2),
+        },
+        CapRow {
+            case: "one token below the shortest completion",
+            model_id: "amazon.nova-lite-v1:0",
+            max_tokens: Some(floor - 1),
+        },
+        CapRow {
+            case: "exactly the shortest completion",
+            model_id: "mistral.mistral-7b-instruct-v0:2",
+            max_tokens: Some(floor),
+        },
+        CapRow {
+            case: "one token above the shortest completion",
+            model_id: "amazon.titan-text-premier-v1:0",
+            max_tokens: Some(floor + 1),
+        },
+        CapRow {
+            case: "the modest cap a short turn is sent with",
+            model_id: "amazon.nova-lite-v1:0",
+            max_tokens: Some(20),
+        },
+        CapRow {
+            case: "a cap far above any completion",
+            model_id: "anthropic.claude-3-haiku-20240307-v1:0",
+            max_tokens: Some(4096),
+        },
+        CapRow {
+            case: "no inferenceConfig at all",
+            model_id: "amazon.nova-lite-v1:0",
+            max_tokens: None,
+        },
+    ]
+}
+
+/// RULE: `inferenceConfig.maxTokens` is the maximum number of tokens to ALLOW in
+/// the generated response — a ceiling, not a target — so a turn whose completion
+/// finishes inside that ceiling stops on `end_turn` however much of the budget
+/// is left over, and `max_tokens` is reported only by a completion the ceiling
+/// genuinely cut off; either way the output count never exceeds the ceiling.
+#[tokio::test]
+async fn converse_reports_max_tokens_only_for_a_completion_the_ceiling_cut_off() {
+    let router = emulator();
+    let floor = i64::from(state::count_text_tokens(state::EMULATED_COMPLETION_FLOOR));
+    let messages = serde_json::json!([{
+        "role": "user",
+        "content": [{"text": "Reply with only the lowercase English word for the result of 2+3."}],
+    }]);
+
+    for row in cap_rows() {
+        let case = row.case;
+        let mut request = serde_json::json!({ "messages": messages });
+        if let Some(cap) = row.max_tokens {
+            request["inferenceConfig"] = serde_json::json!({ "maxTokens": cap, "temperature": 0.0 });
+        }
         let call = post_json(
             &router,
-            &format!("/model/{model_id}/converse"),
-            &serde_json::json!({
-                "messages": messages,
-                "inferenceConfig": { "maxTokens": cap },
-            }),
+            &format!("/model/{}/converse", row.model_id),
+            &request,
         )
         .await;
         assert_eq!(
             call.status,
             200,
-            "case maxTokens={cap}: expected 200, got {} / {}",
+            "case {case:?}: expected 200, got {} / {}",
             call.status,
             String::from_utf8_lossy(&call.body)
         );
         let body = call.json();
         let output = body["usage"]["outputTokens"].as_i64().unwrap_or_default();
-        assert!(
-            output <= cap,
-            "case maxTokens={cap}: expected at most {cap} output tokens, got {output}"
-        );
+        if let Some(cap) = row.max_tokens {
+            assert!(
+                output <= cap,
+                "case {case:?}: expected at most {cap} output tokens, got {output}"
+            );
+        }
         let text = body["output"]["message"]["content"][0]["text"]
             .as_str()
-            .unwrap_or_default();
-        let untruncated = state::count_text_tokens(&state::emulated_completion_text(
-            model_id,
-            1,
-            body["usage"]["inputTokens"].as_i64().unwrap_or_default() as u32,
-        )) as i64;
-        let expected = if untruncated > cap {
-            "max_tokens"
-        } else {
-            "end_turn"
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            i64::from(state::count_text_tokens(&text)),
+            output,
+            "case {case:?}: expected outputTokens to be the tokens of {text:?}, got {output}"
+        );
+        // A completion is cut off only by a ceiling it cannot fit the shortest
+        // completion in; every other ceiling leaves the turn finished.
+        let expected = match row.max_tokens {
+            Some(cap) if cap < floor => "max_tokens",
+            _ => "end_turn",
         };
         assert_eq!(
             body["stopReason"].as_str(),
             Some(expected),
-            "case maxTokens={cap}: expected stopReason {expected} for a {untruncated}-token \
-             completion, got {:?} with text {text:?}",
+            "case {case:?}: expected stopReason {expected} for maxTokens={:?} against a \
+             {floor}-token shortest completion, got {:?} with text {text:?}",
+            row.max_tokens,
             body["stopReason"]
         );
+        // `metrics` is a required member reporting the latency this invocation
+        // itself took, and serving one takes time, so the value is positive.
+        assert!(
+            body["metrics"]["latencyMs"].as_i64().unwrap_or(-1) > 0,
+            "case {case:?}: expected a positive measured latency, got {:?}",
+            body["metrics"]["latencyMs"]
+        );
+        if expected == "end_turn" {
+            assert!(
+                !text.ends_with(" generated") && text.ends_with('.'),
+                "case {case:?}: a finished turn answers a whole completion, got {text:?}"
+            );
+        }
+    }
+}
+
+/// RULE (same ceiling rule, on the `InvokeModel` surface): the generation cap a
+/// model family's own request body carries is a ceiling too, so a body whose cap
+/// admits the completion is answered with that family's completed stop reason,
+/// and its length stop reason is reported only for a completion the cap cut off.
+#[tokio::test]
+async fn invoke_model_reports_a_length_stop_only_for_a_completion_the_cap_cut_off() {
+    let router = emulator();
+    let floor = state::count_text_tokens(state::EMULATED_COMPLETION_FLOOR);
+
+    // One row per family, each sent twice: once with a cap that admits the
+    // shortest completion and once with a cap below it. The cap member per
+    // family is the one `state::body_max_tokens` documents.
+    let rows: &[(&str, state::ModelFamily, &str, &str, &str)] = &[
+        (
+            "anthropic messages",
+            state::ModelFamily::AnthropicMessages,
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            r#"{"anthropic_version":"bedrock-2023-05-31","max_tokens":CAP,"messages":[{"role":"user","content":[{"type":"text","text":"Name one planet."}]}]}"#,
+            "/stop_reason",
+        ),
+        (
+            "titan text",
+            state::ModelFamily::TitanText,
+            "amazon.titan-text-premier-v1:0",
+            r#"{"inputText":"Name one planet.","textGenerationConfig":{"maxTokenCount":CAP}}"#,
+            "/results/0/completionReason",
+        ),
+        (
+            "nova",
+            state::ModelFamily::Nova,
+            "amazon.nova-lite-v1:0",
+            r#"{"messages":[{"role":"user","content":[{"text":"Name one planet."}]}],"inferenceConfig":{"max_new_tokens":CAP}}"#,
+            "/stopReason",
+        ),
+        (
+            "llama",
+            state::ModelFamily::Llama,
+            "meta.llama3-8b-instruct-v1:0",
+            r#"{"prompt":"Name one planet.","max_gen_len":CAP}"#,
+            "/stop_reason",
+        ),
+        (
+            "mistral",
+            state::ModelFamily::Mistral,
+            "mistral.mistral-7b-instruct-v0:2",
+            r#"{"prompt":"Name one planet.","max_tokens":CAP}"#,
+            "/outputs/0/stop_reason",
+        ),
+        (
+            "cohere command",
+            state::ModelFamily::CohereCommand,
+            "cohere.command-text-v14",
+            r#"{"prompt":"Name one planet.","max_tokens":CAP}"#,
+            "/generations/0/finish_reason",
+        ),
+    ];
+
+    for (case, family, model_id, template, stop_pointer) in rows {
+        for (cap, cut_off) in [(floor, false), (floor - 1, true), (1, true), (512, false)] {
+            let case = format!("{case} at a cap of {cap}");
+            let body = template.replace("CAP", &cap.to_string());
+            let call = send(
+                &router,
+                "POST",
+                &format!("/model/{model_id}/invoke"),
+                &[("content-type", "application/json"), ("accept", "application/json")],
+                body.into_bytes(),
+            )
+            .await;
+            assert_eq!(
+                call.status,
+                200,
+                "case {case:?}: expected 200, got {} / {}",
+                call.status,
+                String::from_utf8_lossy(&call.body)
+            );
+            let served = call.json();
+            let expected = state::family_stop_reason(*family, cut_off);
+            assert_eq!(
+                served.pointer(stop_pointer).and_then(serde_json::Value::as_str),
+                Some(expected),
+                "case {case:?}: expected the stop reason {expected:?} at {stop_pointer} \
+                 against a {floor}-token shortest completion, got {served}"
+            );
+        }
     }
 }
 

@@ -25,6 +25,8 @@ mod configuration_profile_type;
 mod control_plane_fidelity;
 #[path = "all/create_deployment_strategy.rs"]
 mod create_deployment_strategy;
+#[path = "all/delete_application.rs"]
+mod delete_application;
 #[path = "all/delete_configuration_profile.rs"]
 mod delete_configuration_profile;
 #[path = "all/delete_experiment_definition.rs"]

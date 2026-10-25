@@ -4,7 +4,8 @@
 //! wire — for both attach operations of the permission-set policy surface.
 //!
 //! THE RULE under test: an attach the model does not mark `@idempotent` refuses, with
-//! `ConflictException`, a request whose attachment the permission set already carries (a
+//! `ConflictException` whose `Message` names the attachment and the permission set the
+//! request sent, a request whose attachment the permission set already carries (a
 //! conflict with the previous successful write), and leaves the stored set exactly as it
 //! was; the same attachment is accepted on a permission set that does not carry it, and
 //! again after a detach has removed it. Which attach that is follows from the model:
@@ -15,7 +16,7 @@
 //!
 //! The rule is asserted over a TABLE whose rows differ along what it generalises over: the
 //! ATTACH OPERATION (an AWS managed policy ARN, a customer managed policy reference), the
-//! form of the attachment's identity (a plain policy name, a nested path, a suffixed
+//! PERMISSION SET the attachment is made on, the form of the attachment's identity (a plain policy name, a nested path, a suffixed
 //! partition, the character classes the members admit), the SPELLING the repeat is sent in
 //! (an omitted `Path` names the same reference as the default spelled out), and the NUMBER
 //! of repeats.
@@ -100,6 +101,33 @@ struct Row {
     repeat: Value,
     /// What [`Kind::identity_of`] must report for the stored attachment.
     identity: String,
+}
+
+impl Row {
+    /// The MESSAGE this row's conflict must carry: the fixed text the refusal of this
+    /// attachment kind is worded with, with the attachment's identity and the permission
+    /// set the request named filled in. Every variable part comes from the request and
+    /// from the permission set the test minted, so no value here is one a single run
+    /// happened to produce.
+    fn conflict_message(&self, permission_set_arn: &str) -> String {
+        match self.kind {
+            Kind::ManagedPolicy => format!(
+                "Managed policy with arn {} is already attached to permission set \
+                 {permission_set_arn}.",
+                self.identity
+            ),
+            Kind::CustomerReference => {
+                let (name, path) = self
+                    .identity
+                    .split_once('|')
+                    .expect("a reference identity is Name|Path");
+                format!(
+                    "A customer managed policy reference with name {name} and path {path} is \
+                     already attached to permission set {permission_set_arn}."
+                )
+            }
+        }
+    }
 }
 
 /// The `ManagedPolicyArn` prefix of the `aws` partition, per the member's pattern
@@ -374,6 +402,74 @@ async fn the_same_attachment_is_accepted_on_a_permission_set_that_does_not_carry
                 row.identity
             );
         }
+    }
+}
+
+/// The refusal's MESSAGE, which is as much a part of the answer as the status and the wire
+/// code: the conflict names the attachment the request sent and the permission set it sent
+/// it for, so a client reading it can tell WHICH of the request's resources is already
+/// attached. Asserted on TWO permission sets per row, so the message is shown to follow the
+/// request rather than being one fixed text.
+#[tokio::test]
+async fn the_conflict_message_names_the_attachment_and_the_permission_set_it_is_attached_to() {
+    let (router, instance_arn) = organization_router();
+    for (index, row) in rows().into_iter().enumerate() {
+        let mut messages: Vec<String> = Vec::new();
+        for (which, label) in [(0, "the first permission set"), (1, "a second one")] {
+            let permission_set_arn = create_permission_set(
+                &router,
+                &instance_arn,
+                &format!("Message{index}x{which}"),
+            )
+            .await;
+
+            let (status, body) = send(
+                &router,
+                row.kind.attach(),
+                &instance_arn,
+                &permission_set_arn,
+                &row.first,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: the attach on {label} expected 200, got {status} {body}",
+                row.label
+            );
+
+            let (status, body) = send(
+                &router,
+                row.kind.attach(),
+                &instance_arn,
+                &permission_set_arn,
+                &row.repeat,
+            )
+            .await;
+            assert_refused(
+                row.label,
+                &format!("the repeat on {label}"),
+                "ConflictException",
+                status,
+                &body,
+            );
+            // The model names the member `ConflictException$Message`, so that is where the
+            // detail text is read from.
+            let message = body["Message"].as_str().unwrap_or_default().to_string();
+            assert_eq!(
+                message,
+                row.conflict_message(&permission_set_arn),
+                "case {:?}: the conflict on {label} must name the attachment and that \
+                 permission set, got {message:?}",
+                row.label
+            );
+            messages.push(message);
+        }
+        assert_ne!(
+            messages[0], messages[1],
+            "case {:?}: the message follows the permission set the request named, got \
+             {messages:?}",
+            row.label
+        );
     }
 }
 

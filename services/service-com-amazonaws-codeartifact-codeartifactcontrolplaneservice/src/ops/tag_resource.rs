@@ -212,13 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: format!(
-                        "Cannot tag resource {}: the request would leave it holding {} tags, \
-                         more than the maximum of {} tags per resource.",
-                        input.resource_arn,
-                        merged.len(),
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    ),
+                    message: crate::state::tag_quota_exceeded_message(),
                     resource_id: Some(crate::state::reported_resource_id(&reference)),
                     resource_type: crate::state::reported_resource_type(&reference),
                 },
