@@ -692,6 +692,22 @@
 //! `TransitGatewayOptions$AssociationDefaultRouteTableId` and
 //! `$PropagationDefaultRouteTableId` report name that record.
 //!
+//! ## Virtual private gateways
+//!
+//! [`ComAmazonawsEc2Amazonec2State::vpn_gateways`] holds the account's virtual private
+//! gateways as [`VpnGatewayRecord`]s, keyed by `VpnGatewayId` in a [`BTreeMap`]: the
+//! modelled [`VpnGateway`] shape every operation that reports one answers with — so a
+//! member a writer sets round-trips through `DescribeVpnGateways` without a field-by-field
+//! copy — plus the one thing that shape carries no member for, the [`PendingStateMove`] the
+//! clock owes the gateway.
+//!
+//! `CreateVpnGateway` answers a gateway in the non-terminal `pending` state, so the clock
+//! owes it `available` one [`TRANSITION_DELAY`] later, and `DeleteVpnGateway` leaves it in
+//! the non-terminal `deleting` state with `deleted` owed the same way — `VpnState`'s four
+//! members are `pending`, `available`, `deleting` and `deleted`, so a deleted gateway is
+//! still a gateway the API reports rather than a record that vanishes.
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies both moves.
+//!
 //! ## Transit gateway policy tables and their associations
 //!
 //! [`ComAmazonawsEc2Amazonec2State::transit_gateway_policy_tables`] holds the account's
@@ -996,7 +1012,7 @@ use crate::ops::types::{
     TransitGatewayVpcAttachment,
     UserIdGroupPair, Vpc, VpcBlockPublicAccessExclusion, VpcCidrBlockAssociation,
     VpcCidrBlockState, VpcEndpoint,
-    VpcEndpointConnection,
+    VpcEndpointConnection, VpnGateway,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -2303,6 +2319,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// a pair either propagates or does not; ordered by route table and then by attachment,
     /// which is the order `GetTransitGatewayRouteTablePropagations` reports and pages over.
     pub transit_gateway_propagations: BTreeMap<(String, String), TransitGatewayPropagationRecord>,
+    /// Every virtual private gateway the account holds, by `VpnGatewayId`, as
+    /// [`VpnGatewayRecord`]s — the modelled [`VpnGateway`] shape plus the state move the
+    /// clock owes it (see the module docs). Ordered by id, which is the order
+    /// `DescribeVpnGateways` reports in.
+    pub vpn_gateways: BTreeMap<String, VpnGatewayRecord>,
     /// Which prefix list is referenced as a route of which transit gateway route table, by
     /// (`TransitGatewayRouteTableId`, `PrefixListId`) — see
     /// [`TransitGatewayPrefixListReferenceRecord`] and the module docs. One entry per pair,
@@ -2686,6 +2707,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_available_at: BTreeMap::new(),
             transit_gateway_route_tables: BTreeMap::new(),
             transit_gateway_propagations: BTreeMap::new(),
+            vpn_gateways: BTreeMap::new(),
             transit_gateway_prefix_list_references: BTreeMap::new(),
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
@@ -4885,6 +4907,21 @@ impl ComAmazonawsEc2Amazonec2State {
             }
         }
         for record in self.transit_gateway_route_table_announcements.values_mut() {
+            if let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            {
+                record.view.state = Some(state);
+                record.pending = None;
+            }
+        }
+        // A virtual private gateway `CreateVpnGateway` left `pending` or `DeleteVpnGateway`
+        // left `deleting`: each reaches the terminal `VpnState` the write recorded for it at
+        // the instant it was owed, whether or not anybody called again — the same contract
+        // as the records above.
+        for record in self.vpn_gateways.values_mut() {
             if let Some(state) = record
                 .pending
                 .as_ref()
@@ -17018,6 +17055,36 @@ pub const AMAZON_SIDE_ASN_16_BIT: ::std::ops::RangeInclusive<i64> = 64_512..=65_
 /// (`TransitGatewayRequestOptions$AmazonSideAsn`).
 pub const AMAZON_SIDE_ASN_32_BIT: ::std::ops::RangeInclusive<i64> = 4_200_000_000..=4_294_967_294;
 
+/// The Amazon-side ASN a create asks for, or [`DEFAULT_AMAZON_SIDE_ASN`] when it asks for
+/// none — refusing anything outside the two published private ranges rather than defaulting
+/// it, so a typo never reads as "the default".
+///
+/// The ONE place that rule lives: both operations that let a caller choose an Amazon-side
+/// ASN publish the same two ranges and the same default — "If you're using a 16-bit ASN, it
+/// must be in the 64512 to 65534 range. If you're using a 32-bit ASN, it must be in the
+/// 4200000000 to 4294967294 range. Default: 64512" (`CreateVpnGatewayRequest$AmazonSideAsn`,
+/// and `TransitGatewayRequestOptions$AmazonSideAsn` in the same words) — so neither can
+/// accept an ASN the other refuses.
+pub fn private_amazon_side_asn<E>(requested: Option<i64>) -> Result<i64, Scaffolded<E>> {
+    match requested {
+        None => Ok(DEFAULT_AMAZON_SIDE_ASN),
+        Some(asn)
+            if AMAZON_SIDE_ASN_16_BIT.contains(&asn) || AMAZON_SIDE_ASN_32_BIT.contains(&asn) =>
+        {
+            Ok(asn)
+        }
+        Some(asn) => Err(invalid_parameter_value(format!(
+            "Value ({asn}) for parameter amazonSideAsn is invalid. \
+             The range is {min_16} to {max_16} for 16-bit ASNs and \
+             {min_32} to {max_32} for 32-bit ASNs.",
+            min_16 = AMAZON_SIDE_ASN_16_BIT.start(),
+            max_16 = AMAZON_SIDE_ASN_16_BIT.end(),
+            min_32 = AMAZON_SIDE_ASN_32_BIT.start(),
+            max_32 = AMAZON_SIDE_ASN_32_BIT.end(),
+        ))),
+    }
+}
+
 /// The longest IPv4 prefix a transit gateway CIDR block may have: "Must be a size /24 CIDR
 /// block or larger for IPv4" (`TransitGatewayRequestOptions$TransitGatewayCidrBlocks`) —
 /// larger block, so a prefix no longer than this.
@@ -17132,25 +17199,7 @@ pub fn canonical_transit_gateway_cidr(value: &str) -> Result<String, CidrProblem
 pub fn transit_gateway_options<E>(
     requested: Option<&TransitGatewayRequestOptions>,
 ) -> Result<TransitGatewayOptions, Scaffolded<E>> {
-    let asn = match requested.and_then(|options| options.amazon_side_asn) {
-        None => DEFAULT_AMAZON_SIDE_ASN,
-        Some(asn)
-            if AMAZON_SIDE_ASN_16_BIT.contains(&asn) || AMAZON_SIDE_ASN_32_BIT.contains(&asn) =>
-        {
-            asn
-        }
-        Some(asn) => {
-            return Err(invalid_parameter_value(format!(
-                "Value ({asn}) for parameter amazonSideAsn is invalid. \
-                 The range is {min_16} to {max_16} for 16-bit ASNs and \
-                 {min_32} to {max_32} for 32-bit ASNs.",
-                min_16 = AMAZON_SIDE_ASN_16_BIT.start(),
-                max_16 = AMAZON_SIDE_ASN_16_BIT.end(),
-                min_32 = AMAZON_SIDE_ASN_32_BIT.start(),
-                max_32 = AMAZON_SIDE_ASN_32_BIT.end(),
-            )))
-        }
-    };
+    let asn = private_amazon_side_asn(requested.and_then(|options| options.amazon_side_asn))?;
     let mut cidr_blocks: Vec<String> = Vec::new();
     for requested_block in requested
         .and_then(|options| options.transit_gateway_cidr_blocks.as_deref())
@@ -25987,6 +26036,212 @@ impl ComAmazonawsEc2Amazonec2State {
         delta_id: &str,
     ) -> Option<&IpamRoutingPolicyRegistrationDeltaRecord> {
         self.ipam_routing_policy_registration_deltas.get(delta_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual private gateways
+// ---------------------------------------------------------------------------
+//
+// See the module docs for why a gateway is stored as the modelled shape beside the move the
+// clock owes it. The words below are members of the model's own enums, named here so the
+// operations that create, report and delete a gateway cannot spell one value two ways.
+
+/// The id prefix EC2 gives a virtual private gateway (`vgw-0123456789abcdef0`), which
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints the long form of.
+pub const VPN_GATEWAY_ID_PREFIX: &str = "vgw";
+
+/// `VpnState`'s `pending` member: a gateway a create has just minted, which is not usable
+/// yet. The generated catalog of the four states is
+/// [`crate::ops::types::VPN_STATE_VALUES`].
+pub const VPN_GATEWAY_STATE_PENDING: &str = "pending";
+
+/// `VpnState`'s `available` member: a gateway that has finished coming up.
+pub const VPN_GATEWAY_STATE_AVAILABLE: &str = "available";
+
+/// `VpnState`'s `deleting` member: a gateway a delete has started on, which is not gone yet.
+pub const VPN_GATEWAY_STATE_DELETING: &str = "deleting";
+
+/// `VpnState`'s `deleted` member: a gateway whose deletion has finished. The enum carries
+/// this state, so a deleted gateway is still a gateway `DescribeVpnGateways` reports rather
+/// than a record that vanished.
+pub const VPN_GATEWAY_STATE_DELETED: &str = "deleted";
+
+/// `GatewayType`'s only member: "Currently the only supported type is `ipsec.1`"
+/// (`DescribeVpnGatewaysRequest$Filters`). The generated catalog is
+/// [`crate::ops::types::GATEWAY_TYPE_VALUES`].
+pub const GATEWAY_TYPE_IPSEC_1: &str = "ipsec.1";
+
+/// The `ResourceType` a `CreateVpnGateway` tag specification may name: the virtual private
+/// gateway it creates ("The tags to apply to the virtual private gateway",
+/// `CreateVpnGatewayRequest$TagSpecifications`).
+pub const RESOURCE_TYPE_VPN_GATEWAY: &str = "vpn-gateway";
+
+/// EC2's error code for a request naming a virtual private gateway id this account holds no
+/// gateway for.
+pub const INVALID_VPN_GATEWAY_ID_NOT_FOUND: &str = "InvalidVpnGatewayID.NotFound";
+
+/// EC2's error code for a request naming something that is not a virtual private gateway id
+/// at all, so there is nothing to look up.
+pub const INVALID_VPN_GATEWAY_ID_MALFORMED: &str = "InvalidVpnGatewayID.Malformed";
+
+/// EC2's error code for a create that would take the account past its virtual private
+/// gateway quota.
+pub const VPN_GATEWAY_LIMIT_EXCEEDED: &str = "VpnGatewayLimitExceeded";
+
+/// The largest number of virtual private gateways this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_TRANSIT_GATEWAYS`], not an AWS quota: each
+/// gateway is a record in this process's memory, so the number a caller can create has to be
+/// finite. [`ComAmazonawsEc2Amazonec2State::has_vpn_gateway_capacity`] is the predicate a
+/// writer asks before inserting; a create past it refuses with
+/// [`vpn_gateway_limit_exceeded`].
+pub const MAX_VPN_GATEWAYS: usize = 1_000;
+
+/// One stored virtual private gateway: what every operation that reports one answers with,
+/// plus the move the clock owes it.
+#[derive(Debug, Clone)]
+pub struct VpnGatewayRecord {
+    /// The gateway as `CreateVpnGateway` and `DescribeVpnGateways` report it.
+    pub view: VpnGateway,
+    /// The state this gateway is due to move to, while it is in a non-terminal one:
+    /// `available` after a create, `deleted` after a delete. `None` once nothing is owed.
+    pub pending: Option<PendingStateMove>,
+}
+
+/// Everything [`ComAmazonawsEc2Amazonec2State::insert_vpn_gateway`] needs that it does not
+/// derive itself: what the REQUEST said.
+#[derive(Debug, Clone)]
+pub struct VpnGatewaySpec {
+    /// "The type of VPN connection this virtual private gateway supports"
+    /// (`CreateVpnGatewayRequest$Type`) — the modelled `GatewayType`, which the boundary
+    /// validator has already held to [`GATEWAY_TYPE_IPSEC_1`].
+    pub gateway_type: String,
+    /// "The Availability Zone for the virtual private gateway"
+    /// (`CreateVpnGatewayRequest$AvailabilityZone`), absent when the request named none —
+    /// "This field may be empty or not returned" (`VpnGateway$AvailabilityZone`).
+    pub availability_zone: Option<String>,
+    /// The resolved Amazon-side ASN ([`private_amazon_side_asn`]).
+    pub amazon_side_asn: i64,
+    /// The tags of a `vpn-gateway` tag specification.
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored virtual private gateway holds: its tags and the
+/// Availability Zone name the request named. Everything else on the record — the id, the
+/// state, the type, the ASN — is derived by this module or bounded by the model, so it is
+/// fixed-size.
+///
+/// The ONE definition of that charge: `CreateVpnGateway` asks it before the write and
+/// [`ComAmazonawsEc2Amazonec2State::insert_vpn_gateway`] charges exactly it.
+pub fn vpn_gateway_payload_bytes(spec: &VpnGatewaySpec) -> usize {
+    tag_list_bytes(&spec.tags)
+        .saturating_add(spec.availability_zone.as_deref().map_or(0, str::len))
+}
+
+/// Refuse a request that named a virtual private gateway id this account holds no gateway
+/// for: HTTP 400 [`INVALID_VPN_GATEWAY_ID_NOT_FOUND`], worded by the one place this module
+/// words a missing resource id ([`id_not_found`]).
+pub fn invalid_vpn_gateway_id_not_found<E>(vpn_gateway_id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_VPN_GATEWAY_ID_NOT_FOUND,
+        "vpnGateway ID",
+        vpn_gateway_id,
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_VPN_GATEWAYS`]: HTTP 400
+/// [`VPN_GATEWAY_LIMIT_EXCEEDED`].
+pub fn vpn_gateway_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        VPN_GATEWAY_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of virtual private gateways has been reached \
+             ({MAX_VPN_GATEWAYS})"
+        ),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another virtual private gateway fits inside the store's ceiling
+    /// ([`MAX_VPN_GATEWAYS`]).
+    ///
+    /// The same contract as [`Self::has_transit_gateway_capacity`]: a create asks first and
+    /// refuses with [`vpn_gateway_limit_exceeded`] when it answers `false`.
+    pub fn has_vpn_gateway_capacity(&self) -> bool {
+        self.vpn_gateways.len() < MAX_VPN_GATEWAYS
+    }
+
+    /// Insert a virtual private gateway in `pending`, and answer the `VpnGatewayId` it was
+    /// given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the caller
+    /// — the id and the state — so two writers cannot report the same gateway differently.
+    /// Like [`Self::insert_transit_gateway`], the caller-chosen bytes of the record are
+    /// charged against the store's byte budget here, so a writer cannot store them
+    /// uncharged, and the clock-owed `available` move is recorded rather than slept for.
+    pub fn insert_vpn_gateway(&mut self, spec: VpnGatewaySpec) -> String {
+        let vpn_gateway_id = self.next_id(VPN_GATEWAY_ID_PREFIX);
+        self.add_stored_bytes(vpn_gateway_payload_bytes(&spec));
+        let view = VpnGateway {
+            vpn_gateway_id: Some(vpn_gateway_id.clone()),
+            state: Some(VPN_GATEWAY_STATE_PENDING.to_string()),
+            r#type: Some(spec.gateway_type),
+            availability_zone: spec.availability_zone,
+            amazon_side_asn: Some(spec.amazon_side_asn),
+            // "Any VPCs attached to the virtual private gateway"
+            // (`VpnGateway$VpcAttachments`): a gateway is created detached — "You must
+            // first attach the virtual private gateway to the VPC" is `AttachVpnGateway`'s
+            // job — so it carries no attachment yet.
+            vpc_attachments: Some(Vec::new()),
+            tags: Some(spec.tags),
+        };
+        self.vpn_gateways.insert(
+            vpn_gateway_id.clone(),
+            VpnGatewayRecord {
+                view,
+                // What the clock now owes this gateway: `available`, one TRANSITION_DELAY
+                // from now — the same span, off the same monotonic clock, as a VPC's
+                // pending move.
+                pending: Some(PendingStateMove::starting_now(VPN_GATEWAY_STATE_AVAILABLE)),
+            },
+        );
+        vpn_gateway_id
+    }
+
+    /// The virtual private gateway `vpn_gateway_id` names, refusing an id that is not shaped
+    /// like one with [`INVALID_VPN_GATEWAY_ID_MALFORMED`] and one the account holds no
+    /// gateway for with [`INVALID_VPN_GATEWAY_ID_NOT_FOUND`] — in that order, so "not a
+    /// virtual private gateway id" is never reported as "no such gateway".
+    pub fn require_vpn_gateway<E>(
+        &self,
+        vpn_gateway_id: &str,
+    ) -> Result<&VpnGatewayRecord, Scaffolded<E>> {
+        require_well_formed_id(
+            VPN_GATEWAY_ID_PREFIX,
+            vpn_gateway_id,
+            INVALID_VPN_GATEWAY_ID_MALFORMED,
+        )?;
+        self.vpn_gateways
+            .get(vpn_gateway_id)
+            .ok_or_else(|| invalid_vpn_gateway_id_not_found(vpn_gateway_id))
+    }
+
+    /// [`Self::require_vpn_gateway`], for a writer: the same two refusals in the same order,
+    /// handing back the record to change.
+    pub fn require_vpn_gateway_mut<E>(
+        &mut self,
+        vpn_gateway_id: &str,
+    ) -> Result<&mut VpnGatewayRecord, Scaffolded<E>> {
+        require_well_formed_id(
+            VPN_GATEWAY_ID_PREFIX,
+            vpn_gateway_id,
+            INVALID_VPN_GATEWAY_ID_MALFORMED,
+        )?;
+        self.vpn_gateways
+            .get_mut(vpn_gateway_id)
+            .ok_or_else(|| invalid_vpn_gateway_id_not_found(vpn_gateway_id))
     }
 }
 

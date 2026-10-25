@@ -407,19 +407,23 @@ async fn getting_a_keyspace_that_is_not_stored_is_the_modelled_error() {
             .call("CreateKeyspace", json!({"keyspaceName": "orders_live"}))
             .await,
     );
-    // And one is created and then deleted, so absence can also be something that was there.
+    // And one is created and then deleted, so absence can also be something that was
+    // there. A keyspace is deletable once its creation has settled, and the deletion
+    // settles into absence a span later.
     assert_ok(
         "setup",
         emulator
             .call("CreateKeyspace", json!({"keyspaceName": "orders_old"}))
             .await,
     );
+    tokio::time::sleep(settle_wait()).await;
     assert_ok(
         "setup",
         emulator
             .call("DeleteKeyspace", json!({"keyspaceName": "orders_old"}))
             .await,
     );
+    tokio::time::sleep(settle_wait()).await;
 
     // (case, requested name, expected status, expected error code)
     let rows: Vec<(&str, String, u16, &str)> = vec![

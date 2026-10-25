@@ -983,9 +983,11 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
     /// `GetProtectionStatus` reports what is here, filtered by the request's
     /// policy, member account and time period, and never an attack it made up.
     ///
-    /// An entry outlives the deletion of its policy, and is then unreachable: a
-    /// `PolicyId` is minted once and never reused, so no later policy can read
-    /// another policy's attacks.
+    /// An entry outlives a deletion of its policy that asked for no cleanup of
+    /// the policy's resources, and is then unreachable: a `PolicyId` is minted
+    /// once and never reused, so no later policy can read another policy's
+    /// attacks. A deletion that DID ask for the cleanup takes the policy's
+    /// entries with it — see [`Self::delete_policy`].
     pub shield_attacks: BTreeMap<String, ShieldAttackRecord>,
     /// The resources a Firewall Manager policy evaluation found to violate a
     /// stored policy, keyed by [`policy_violation_key`] so one policy's
@@ -994,8 +996,10 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
     ///
     /// Like [`Self::discovered_resources`] and [`Self::shield_attacks`] this is
     /// an INVENTORY, not a cache: see [`PolicyViolationRecord`]. An entry
-    /// outlives the deletion of its policy and is then unreachable, because a
-    /// `PolicyId` is minted once and never reused.
+    /// outlives a deletion of its policy that asked for no cleanup of the
+    /// policy's resources and is then unreachable, because a `PolicyId` is
+    /// minted once and never reused; a deletion that DID ask for the cleanup
+    /// takes the policy's entries with it — see [`Self::delete_policy`].
     pub policy_violations: BTreeMap<String, PolicyViolationRecord>,
 }
 
@@ -1535,6 +1539,46 @@ impl ComAmazonawsFmsAwsfms20180101State {
         self.protocols_lists.remove(list_id);
         self.tags_by_arn.remove(&arn);
         true
+    }
+
+    /// Remove the policy `policy_id` names, and the records this store holds on
+    /// that policy's BEHALF when `delete_all_resources` asks for the cleanup.
+    /// Answers the removed [`PolicyRecord`], or `None` when no policy carries
+    /// that id — in which case nothing is removed at all.
+    ///
+    /// Two different things go in a policy delete, and the request's cleanup
+    /// selector decides only the second:
+    ///
+    /// * the POLICY itself — its record and its entry in the ARN-keyed tag index
+    ///   — always, since that is what the delete is for;
+    /// * the objects Firewall Manager holds BECAUSE of the policy, which the
+    ///   cleanup selector governs: a delete that asks for the cleanup takes them
+    ///   with the policy, and a delete that does not leaves them in place. Here
+    ///   those objects are what the policy's protections put in this store: the
+    ///   violations an evaluation of this policy recorded
+    ///   ([`Self::policy_violations`]) and the attacks recorded against the
+    ///   resources this policy protects ([`Self::shield_attacks`]). Each is
+    ///   keyed under exactly one `PolicyId`, so cleaning up one policy can never
+    ///   reach another policy's records — which is also why the cleanup is total
+    ///   rather than conditional on some other policy still covering them.
+    ///
+    /// Each record names the policy it belongs to, so the selection is made from
+    /// the RECORD rather than from the shape of its key: a change to either key
+    /// format cannot silently widen or narrow what a cleanup removes.
+    pub fn delete_policy(
+        &mut self,
+        policy_id: &str,
+        delete_all_resources: bool,
+    ) -> Option<PolicyRecord> {
+        let removed = self.policies.remove(policy_id)?;
+        self.tags_by_arn.remove(&removed.policy_arn);
+        if delete_all_resources {
+            self.policy_violations
+                .retain(|_, violation| violation.policy_id != policy_id);
+            self.shield_attacks
+                .retain(|_, attack| attack.policy_id != policy_id);
+        }
+        Some(removed)
     }
 }
 
