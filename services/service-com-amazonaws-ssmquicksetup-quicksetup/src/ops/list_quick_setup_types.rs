@@ -4,9 +4,12 @@
 //!
 //! Reports this service's whole Quick Setup type catalog: one
 //! `QuickSetupTypeOutput` per configuration type the service offers, carrying that
-//! type's name and the latest configuration version available for it. It is the
-//! discovery call a client makes before authoring a `ConfigurationDefinition`, whose
-//! `Type` and `TypeVersion` are chosen from this catalog.
+//! type's name and the latest configuration version available for it — the newest
+//! version of the service-owned template that type deploys, computed from that type's
+//! own published version history, so two types whose templates have advanced
+//! differently report different versions. It is the discovery call a client makes
+//! before authoring a `ConfigurationDefinition`, whose `Type` and `TypeVersion` are
+//! chosen from this catalog.
 //!
 //! `@readonly`, and the catalog is service data rather than per-account state, so this
 //! handler takes no lock and writes nothing: the answer is the same for every caller,
@@ -143,7 +146,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .iter()
                     .map(|entry| QuickSetupTypeOutput {
                         r#type: Some(entry.type_.to_string()),
-                        latest_version: Some(entry.latest_version.to_string()),
+                        // The newest version this type's published history holds, not
+                        // one version the whole catalog shares: each type's template
+                        // is versioned independently.
+                        latest_version: Some(entry.latest_version().to_string()),
                     })
                     .collect(),
             ),
