@@ -782,6 +782,16 @@ fn state_reason_data(
     document.insert(member.to_string(), Value::from(statistic.name()));
     document.insert("period".to_string(), Value::from(period));
     document.insert("threshold".to_string(), Value::from(threshold));
+    // The values the evaluation really had, oldest first — the order they were observed in.
+    // `evaluated` is newest first and holds a slot for every period the alarm evaluates, so
+    // the slots a missing-data treatment filled contribute no value here: this list reports
+    // the datapoints, and `evaluatedDatapoints` below reports the periods.
+    let recent: Vec<Value> = evaluated
+        .iter()
+        .rev()
+        .filter_map(|slot| slot.value.map(Value::from))
+        .collect();
+    document.insert("recentDatapoints".to_string(), Value::Array(recent));
 
     let datapoints: Vec<Value> = evaluated
         .iter()
