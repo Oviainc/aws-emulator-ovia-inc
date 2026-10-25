@@ -27,6 +27,8 @@ mod egress_access_log_group_names;
 mod empty_response_framing;
 #[path = "all/error_responses.rs"]
 mod error_responses;
+#[path = "all/manifest_list_required.rs"]
+mod manifest_list_required;
 #[path = "all/packaging_configuration_deletion.rs"]
 mod packaging_configuration_deletion;
 #[path = "all/packaging_configuration_listing.rs"]

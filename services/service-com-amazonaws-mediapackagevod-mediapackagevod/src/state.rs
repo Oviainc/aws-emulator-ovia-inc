@@ -613,6 +613,11 @@ pub fn playback_url(
 /// (`.m3u8`), DASH an MPD (`.mpd`), and Microsoft Smooth Streaming a server
 /// manifest (`.ism/Manifest`). The name is the manifest block's own
 /// `ManifestName`, or [`DEFAULT_MANIFEST_NAME`] when it names none.
+///
+/// A STORED configuration always carries at least one manifest configuration —
+/// [`check_manifest_lists`] refuses a create whose package block carries none — so the
+/// name read here is the first manifest's own, and the default stands in only for a
+/// manifest that named none.
 fn manifest_name_and_suffix(cfg: &PackagingConfigurationRecord) -> (String, &'static str) {
     if let Some(pkg) = &cfg.hls_package {
         let name = pkg.hls_manifests.first().and_then(|m| m.manifest_name.as_deref());
@@ -1207,6 +1212,53 @@ pub fn check_speke_role_arns(
         .map(|(path, role_arn)| (path.as_str(), *role_arn, IAM_ROLE_ARN))
         .collect();
     check_arn_members(&members)
+}
+
+/// The constraint phrase a manifest list that carries no manifest configuration
+/// violated, worded as a verb phrase about the member like every other phrase this
+/// service attributes (see [`crate::scaffolded::UnprocessableEntity::member`]).
+///
+/// Published so a test asserts the phrase the handler enforces rather than a copy of
+/// it.
+pub const MANIFEST_LIST_REQUIREMENT: &str = "must carry at least one manifest configuration";
+
+/// Read the manifest list of whichever package block a `CreatePackagingConfiguration`
+/// request carries, and refuse one that carries no manifest configuration.
+///
+/// A packaging configuration IS its manifests: every packaging format's manifest list
+/// (`HlsPackage$HlsManifests`, `CmafPackage$HlsManifests`, `DashPackage$DashManifests`,
+/// `MssPackage$MssManifests`) is a `required` list of manifest configurations, so a
+/// block carrying none describes no output manifest at all — there would be no parent
+/// manifest for the `EgressEndpoint$Url` of an asset in the group ("The URL of the
+/// parent manifest for the repackaged Asset") to point at. Each list is read under its
+/// OWN block's wire path, the same way [`check_speke_role_arns`] reads the SPEKE role
+/// under each format's path, so the refusal names the member the caller sent.
+///
+/// The list is a required member, so the boundary validator refuses a request that
+/// OMITS it (a missing required member) before a handler sees it; what reaches here is
+/// a request that sent the list and sent it empty.
+pub fn check_manifest_lists(
+    hls: Option<&HlsPackage>,
+    dash: Option<&DashPackage>,
+    cmaf: Option<&CmafPackage>,
+    mss: Option<&MssPackage>,
+) -> Result<(), crate::scaffolded::UnprocessableEntity> {
+    let lists = [
+        hls.map(|package| ("hlsPackage.hlsManifests", package.hls_manifests.len())),
+        dash.map(|package| ("dashPackage.dashManifests", package.dash_manifests.len())),
+        cmaf.map(|package| ("cmafPackage.hlsManifests", package.hls_manifests.len())),
+        mss.map(|package| ("mssPackage.mssManifests", package.mss_manifests.len())),
+    ];
+    let violations: Vec<(String, String)> = lists
+        .into_iter()
+        .flatten()
+        .filter(|(_, manifests)| *manifests == 0)
+        .map(|(member, _)| (member.to_string(), MANIFEST_LIST_REQUIREMENT.to_string()))
+        .collect();
+    match crate::scaffolded::UnprocessableEntity::members(violations) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
