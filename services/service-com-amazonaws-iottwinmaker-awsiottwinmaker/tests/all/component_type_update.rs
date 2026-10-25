@@ -73,10 +73,10 @@ fn baseline() -> Value {
 }
 
 /// An emulator holding the one workspace the cases are created in, plus the
-/// component types the patches below declare references to: an update's
-/// declared `extendsFrom` and `compositeComponentTypes` ids have to name
-/// component types the service holds, so the ones the rows name are created
-/// here.
+/// component types the baseline create and the patches below declare
+/// references to: a create's and an update's declared `extendsFrom` and
+/// `compositeComponentTypes` ids have to name component types the service
+/// holds, so the ones the rows name are created here.
 async fn baseline_emulator() -> Emulator {
     let emulator = Emulator::new();
     assert_eq!(
@@ -88,6 +88,7 @@ async fn baseline_emulator() -> Emulator {
         "com.example.parent",
         "com.example.other",
         "com.example.outlet",
+        "com.example.inlet",
     ] {
         assert_eq!(
             emulator

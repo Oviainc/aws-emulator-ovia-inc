@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTrialComponents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTrialComponents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTrialComponents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the account's trial components out of `crate::state` — the
+//! records `CreateTrialComponent` stored — filtered, sorted and paginated as the model
+//! documents, and writes nothing. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,6 +140,18 @@ impl<Eng> ListTrialComponents<Eng> {
     }
 }
 
+/// `MaxResults`' documented default for this operation ("The maximum number of components
+/// to return in the response. The default value is 10."), applied when the caller sends
+/// none. An explicit `MaxResults` is still capped by [`crate::state::MAX_PAGE_SIZE`].
+///
+/// `SortBy`'s and `SortOrder`'s documented defaults are [`crate::state::DEFAULT_SORT_BY`]
+/// and [`crate::state::DEFAULT_SORT_ORDER`] ("The property used to sort results. The
+/// default value is CreationTime." / "The sort order. The default value is Descending."),
+/// shared with the service's other listings; the accepted value sets are the generated
+/// `*_VALUES` slices in `super::types`, so a refusal stays in step with the model rather
+/// than with a transcription of it.
+const DEFAULT_MAX_RESULTS: i32 = 10;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListTrialComponents<Eng>
 {
@@ -161,20 +167,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTrialComponents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTrialComponentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTrialComponents"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // "You can also filter on ONE of the following: ExperimentName, SourceArn,
+        // TrialName" — each of the three members documents that specifying it rules the
+        // other two out, so a request carrying more than one is refused rather than
+        // served by some precedence this API does not define.
+        let entity_filters: [(&str, bool); 3] = [
+            ("ExperimentName", input.experiment_name.is_some()),
+            ("SourceArn", input.source_arn.is_some()),
+            ("TrialName", input.trial_name.is_some()),
+        ];
+        let named: Vec<&str> = entity_filters
+            .iter()
+            .filter(|(_, present)| *present)
+            .map(|(member, _)| *member)
+            .collect();
+        if named.len() > 1 {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Only one of ExperimentName, SourceArn or TrialName may be specified; \
+                 got {}.",
+                named.join(", ")
+            )));
+        }
+
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !SORT_TRIAL_COMPONENTS_BY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                SORT_TRIAL_COMPONENTS_BY_VALUES.join(", ")
+            )));
+        }
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER);
+        if !SORT_ORDER_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                SORT_ORDER_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+
+        let after = input.created_after.map(crate::state::timestamp_key);
+        let before = input.created_before.map(crate::state::timestamp_key);
+
+        let store = state.lock();
+        // The store keys the entity filter admits, or `None` when the request carried no
+        // entity filter at all and every component in the account is a candidate. The
+        // listing itself names no resource, so a filter naming a trial, an experiment or a
+        // source that holds no component selects nothing rather than being refused.
+        let admitted: Option<::std::collections::BTreeSet<String>> = match (
+            input.trial_name.as_deref(),
+            input.experiment_name.as_deref(),
+            input.source_arn.as_deref(),
+        ) {
+            // "only components that are part of the specified trial" / "part of the
+            // specified experiment": a component is part of a trial through the attachment
+            // `AssociateTrialComponent` records, and part of an experiment through any
+            // trial of that experiment.
+            (Some(trial), _, _) => Some(store.trial_component_keys_in_trial(trial)),
+            (_, Some(experiment), _) => Some(store.trial_component_keys_in_experiment(experiment)),
+            // "only components that have the specified source ARN": a component's source
+            // is the JOB that produced it, and a job is the only thing that gives a
+            // component one. Every component this store holds came from
+            // `CreateTrialComponent`, which models no source — so, as
+            // `DescribeTrialComponent` reports no `Source` for them, none carries a source
+            // ARN this filter could match.
+            (_, _, Some(_)) => Some(::std::collections::BTreeSet::new()),
+            _ => None,
+        };
+
+        // "Lists the trial components in your ACCOUNT": the store is keyed by the
+        // account-unique `TrialComponentName`, so the listing reports the account's
+        // components whatever Region each was created in, exactly as
+        // `DescribeTrialComponent` resolves one of them from any Region.
+        let mut matching: Vec<((i64, u32), &crate::state::TrialComponent)> = store
+            .trial_components
+            .iter()
+            .filter(|(key, _)| {
+                admitted
+                    .as_ref()
+                    .is_none_or(|admitted| admitted.contains(*key))
+            })
+            // The creation instant as the comparable key both the bounds and the sort
+            // read, computed once per component rather than once per comparison.
+            .map(|(_, component)| {
+                (
+                    crate::state::timestamp_key(crate::state::timestamp(component.creation_time)),
+                    component,
+                )
+            })
+            .filter(|(created, _)| {
+                // "created after" / "created before" are applied inclusively, the way this
+                // service's other listings apply their creation bounds, so a bound naming
+                // a stored instant exactly still selects the component carrying it.
+                after.is_none_or(|bound| *created >= bound)
+                    && before.is_none_or(|bound| *created <= bound)
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays `TrialComponentName`
+        // ascending in both directions — the name is unique in the account, so it orders
+        // two components created in the same instant the same way whichever way the page is
+        // sorted, and a `NextToken` resolved against a freshly computed result set lands on
+        // the same boundary.
+        matching.sort_by(|(left_created, left), (right_created, right)| {
+            let by_key = match sort_by {
+                "Name" => left.name.cmp(&right.name),
+                _ => left_created.cmp(right_created),
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| {
+                        matching
+                            .iter()
+                            .position(|(_, component)| component.name == name)
+                    })
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(crate::state::STALE_PAGE_TOKEN)
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // An absent `MaxResults` takes this operation's documented default of 10; an
+        // explicit one is capped by the service's own ceiling, so no single call can
+        // serialise the whole store. The token below is emitted whenever anything is
+        // left, so a paginating client walks the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_MAX_RESULTS, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some((_, last)) if end < matching.len() => {
+                Some(crate::state::encode_page_token(&last.name))
+            }
+            _ => None,
+        };
+
+        Ok(ListTrialComponentsOutput {
+            // The member is always present, the empty list included: a listing that
+            // selects nothing answers an empty list rather than omitting the member.
+            trial_component_summaries: Some(
+                page.iter()
+                    .map(|(_, component)| TrialComponentSummary {
+                        trial_component_name: Some(component.name.clone()),
+                        trial_component_arn: Some(component.arn.clone()),
+                        display_name: Some(component.display_name.clone()),
+                        // The source job of a component a job produced. One created
+                        // through this API has none, which is what
+                        // `DescribeTrialComponent` reports for the same component.
+                        trial_component_source: None,
+                        status: component.status.clone(),
+                        start_time: component.start_time,
+                        end_time: component.end_time,
+                        creation_time: Some(crate::state::timestamp(component.creation_time)),
+                        last_modified_time: Some(crate::state::timestamp(
+                            component.last_modified_time,
+                        )),
+                        // The identity recorded at create is reported for both: nothing
+                        // has modified the component since, so its last modifier is its
+                        // creator — the same pairing `DescribeTrialComponent` reports.
+                        created_by: Some(component.created_by.clone()),
+                        last_modified_by: Some(component.created_by.clone()),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

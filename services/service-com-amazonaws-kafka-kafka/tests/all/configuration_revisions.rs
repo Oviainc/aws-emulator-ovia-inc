@@ -15,61 +15,41 @@
 //! walked exhaustively over the stored revisions, which is stronger than
 //! sampling it.
 
-use serde_json::{json, Value};
 use service_com_amazonaws_kafka_kafka::state::{
     MAX_REVISIONS_PER_CONFIGURATION, MAX_SERVER_PROPERTIES_BYTES,
 };
 
-use super::kafka_harness::{pct, Emulator, Reply, REGION};
+use super::kafka_harness::{reported_server_properties, Emulator, Reply};
 
-/// `CreateConfiguration`, which the model binds to `POST /v1/configurations`.
+/// The description a create below stores with revision 1.
+const CREATED_DESCRIPTION: &str = "created";
+
+/// `CreateConfiguration`, asserted to succeed; the wire call itself lives on the
+/// shared harness.
 async fn create_ok(emulator: &Emulator, name: &str, body: &[u8]) -> String {
-    let reply = emulator
-        .call(
-            "POST",
-            "/v1/configurations",
-            Some(json!({
-                "name": name,
-                // A blob member travels base64-encoded in a restJson1 payload.
-                "serverProperties": ::aws_smithy_types::base64::encode(body),
-                "description": "created",
-            })),
-        )
-        .await;
-    assert_eq!(
-        reply.status, 200,
-        "case name={name:?}: expected CreateConfiguration to succeed, got {} {}",
-        reply.status, reply.body
-    );
-    reply.body["arn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case name={name:?}: CreateConfiguration returned no arn"))
-        .to_string()
+    emulator
+        .create_configuration_ok(name, Some(CREATED_DESCRIPTION), body)
+        .await
 }
 
-/// `UpdateConfiguration`, which the model binds to
-/// `PUT /v1/configurations/{Arn}`.
+/// `UpdateConfiguration` with this row's description and body.
 async fn update(emulator: &Emulator, arn: &str, row: &RevisionRow) -> Reply {
-    update_in(emulator, REGION, arn, row).await
+    emulator
+        .update_configuration(arn, row.description, &row.server_properties)
+        .await
 }
 
 /// The same update, as an endpoint for `region` serves it — only the region the
 /// configuration lives in holds it.
 async fn update_in(emulator: &Emulator, region: &str, arn: &str, row: &RevisionRow) -> Reply {
     emulator
-        .call_in(
-            region,
-            "PUT",
-            &format!("/v1/configurations/{}", pct(arn)),
-            Some(row.to_json()),
-        )
+        .update_configuration_in(region, arn, row.description, &row.server_properties)
         .await
 }
 
-/// `DescribeConfigurationRevision`, which the model binds to
-/// `GET /v1/configurations/{Arn}/revisions/{Revision}`.
+/// `DescribeConfigurationRevision`.
 async fn describe_revision(emulator: &Emulator, arn: &str, revision: i64) -> Reply {
-    describe_revision_in(emulator, REGION, arn, revision).await
+    emulator.describe_configuration_revision(arn, revision).await
 }
 
 /// The same read, as an endpoint for `region` serves it.
@@ -80,21 +60,13 @@ async fn describe_revision_in(
     revision: i64,
 ) -> Reply {
     emulator
-        .call_in(
-            region,
-            "GET",
-            &format!("/v1/configurations/{}/revisions/{revision}", pct(arn)),
-            None,
-        )
+        .describe_configuration_revision_in(region, arn, revision)
         .await
 }
 
-/// `DescribeConfiguration`, which the model binds to
-/// `GET /v1/configurations/{Arn}`.
+/// `DescribeConfiguration`.
 async fn describe(emulator: &Emulator, arn: &str) -> Reply {
-    emulator
-        .call("GET", &format!("/v1/configurations/{}", pct(arn)), None)
-        .await
+    emulator.describe_configuration(arn).await
 }
 
 /// One `UpdateConfiguration` request, as a row of a table.
@@ -108,16 +80,6 @@ struct RevisionRow {
 }
 
 impl RevisionRow {
-    fn to_json(&self) -> Value {
-        let mut body = json!({
-            "serverProperties": ::aws_smithy_types::base64::encode(&self.server_properties),
-        });
-        if let Some(description) = self.description {
-            body["description"] = json!(description);
-        }
-        body
-    }
-
     /// What `ConfigurationRevision$Description` must report: the description as
     /// given, and the empty string when the request named none.
     fn expected_description(&self) -> &str {
@@ -184,15 +146,6 @@ fn rows() -> Vec<RevisionRow> {
     ]
 }
 
-/// The `serverProperties` a reply reports, decoded from its base64 wire form.
-fn reported_properties(reply: &Reply, case: &str) -> Vec<u8> {
-    let encoded = reply.at("/serverProperties")
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case}: expected serverProperties, got {}", reply.body));
-    ::aws_smithy_types::base64::decode(encoded)
-        .unwrap_or_else(|error| panic!("case {case}: serverProperties is not base64: {error}"))
-}
-
 /// RULE: an update of a configuration appends a revision numbered one past its
 /// current latest, storing the submitted `server.properties` body and the
 /// description of that revision; a revision already stored is never rewritten,
@@ -205,9 +158,9 @@ async fn each_update_appends_the_next_revision_and_leaves_earlier_ones_untouched
 
     // Revision 1 is the body the create stored, with the description it gave.
     let mut stored: Vec<(String, i64, String, Vec<u8>)> = vec![(
-        "created".to_string(),
+        CREATED_DESCRIPTION.to_string(),
         1,
-        "created".to_string(),
+        CREATED_DESCRIPTION.to_string(),
         created_body,
     )];
 
@@ -309,7 +262,7 @@ async fn each_update_appends_the_next_revision_and_leaves_earlier_ones_untouched
                 "case {case} revision {revision}: expected description {description:?}, got {}",
                 read.body
             );
-            let reported = reported_properties(&read, case);
+            let reported = reported_server_properties(&read, case);
             assert_eq!(
                 reported,
                 *body,
@@ -552,14 +505,7 @@ async fn an_append_past_the_stored_ceilings_is_refused_and_changes_nothing() {
             // The same ceiling applies to the body a create stores, so the
             // bound is a property of a stored revision, not of one operation.
             let created = emulator
-                .call(
-                    "POST",
-                    "/v1/configurations",
-                    Some(json!({
-                        "name": "oversized-create",
-                        "serverProperties": ::aws_smithy_types::base64::encode(&body),
-                    })),
-                )
+                .create_configuration("oversized-create", None, &body)
                 .await;
             assert_eq!(
                 (created.status, created.error_code()),
@@ -620,7 +566,7 @@ async fn an_append_past_the_stored_ceilings_is_refused_and_changes_nothing() {
         first.status, first.body
     );
     assert_eq!(
-        reported_properties(&first, "past-the-history-ceiling"),
+        reported_server_properties(&first, "past-the-history-ceiling"),
         b"num.partitions=1\n".to_vec(),
         "case past-the-history-ceiling: revision 1 must still hold the created body, got {}",
         first.body

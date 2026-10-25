@@ -339,7 +339,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing.
         let session = match guard.session(&session_token, now) {
             crate::state::SessionLookup::Found(session) => session,
-            crate::state::SessionLookup::Expired => return Err(expired_session()),
+            crate::state::SessionLookup::Expired(_) => return Err(expired_session()),
             crate::state::SessionLookup::Unknown => return Err(invalid_session()),
         };
         if session.user_pool_id != input.user_pool_id || session.client_id != input.client_id {

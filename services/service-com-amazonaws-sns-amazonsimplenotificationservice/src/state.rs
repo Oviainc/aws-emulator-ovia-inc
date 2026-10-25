@@ -880,70 +880,139 @@ fn json_object(value: &str) -> Option<serde_json::Map<String, serde_json::Value>
     }
 }
 
-/// Why `value` is not one the subscription attribute `name` accepts, or `None` when it
-/// is — including every `name` SNS documents no constraint on the value of.
+/// The sentence SNS refuses a `FilterPolicy` it could not parse with: the attribute
+/// and the parse that failed. (The service appends its parser's own location detail,
+/// which is an implementation diagnostic of that parser rather than a rule.)
+pub const FILTER_POLICY_PARSE_REFUSAL: &str =
+    "Invalid parameter: Attributes Reason: FilterPolicy: failed to parse JSON.";
+
+/// The sentence SNS refuses a NESTED filter policy scoped to the message attributes
+/// with: a message attribute is a flat name and value, so only a policy scoped to the
+/// message BODY matches a property inside a property.
+pub const NESTED_FILTER_POLICY_REFUSAL: &str =
+    "Invalid parameter: Filter policy scope MessageAttributes does not support nested \
+     filter policy";
+
+/// Whether this filter policy NESTS: a member whose value is an object of further
+/// property names, rather than the list of values a property is matched against.
+fn filter_policy_is_nested(policy: &str) -> bool {
+    json_object(policy).is_some_and(|members| members.values().any(serde_json::Value::is_object))
+}
+
+/// Why the subscription attributes `attributes` would leave a record SNS cannot match
+/// messages against, or `None` when they would not.
 ///
-/// The reason names the attribute and the constraint its value failed, built from the
-/// request, the way every other refusal of this service states one; it never echoes a
-/// policy document back.
+/// The `FilterPolicy` and the `FilterPolicyScope` constrain EACH OTHER, so neither can
+/// be judged on its own: "MessageAttributes (default) – The filter is applied on the
+/// message attributes" (`SetSubscriptionAttributesInput$AttributeName` doc), and a
+/// message attribute is a flat name and value — a policy that matches a property
+/// INSIDE a property is only meaningful against the message body. The pair is
+/// therefore judged on the map the write WOULD leave, whichever of the two members the
+/// request carried.
+pub fn filter_policy_pair_refusal(attributes: &HashMap<String, String>) -> Option<String> {
+    let policy = attributes.get(FILTER_POLICY_ATTRIBUTE)?;
+    let scope = attributes
+        .get(FILTER_POLICY_SCOPE_ATTRIBUTE)
+        .map_or(DEFAULT_FILTER_POLICY_SCOPE, String::as_str);
+    (scope == DEFAULT_FILTER_POLICY_SCOPE && filter_policy_is_nested(policy))
+        .then(|| NESTED_FILTER_POLICY_REFUSAL.to_string())
+}
+
+/// The sentence SNS refuses a `FilterPolicyScope` outside its value set with: the
+/// attribute, the value the caller sent in brackets, and the two values it accepts.
+fn filter_policy_scope_refusal(value: &str) -> String {
+    format!(
+        "Invalid parameter: {FILTER_POLICY_SCOPE_ATTRIBUTE}: Invalid value [{value}]. \
+         Please use either MessageBody or MessageAttributes"
+    )
+}
+
+/// The sentence SNS refuses a `RedrivePolicy` that names no dead-letter target with:
+/// the required member of the document is the value that is missing.
+pub const REDRIVE_POLICY_MISSING_VALUE_REFUSAL: &str =
+    "Invalid parameter: RedrivePolicy: missing required value";
+
+/// The sentence SNS refuses a `RedrivePolicy` whose dead-letter target is not a queue
+/// with: "sends undeliverable messages to the specified Amazon SQS dead-letter queue"
+/// (`SetSubscriptionAttributesInput$AttributeName` doc), so only an SQS queue can be
+/// one.
+pub const REDRIVE_POLICY_NOT_A_QUEUE_REFUSAL: &str =
+    "Invalid parameter: RedrivePolicy: deadLetterTargetArn must be a SQS queue";
+
+/// The message a write of the subscription attribute `name` to `value` is refused
+/// with, or `None` when the value is one the attribute accepts — including every
+/// `name` SNS documents no constraint on the value of.
+///
+/// The message is the whole sentence SNS states for that condition, not a clause a
+/// caller wraps: the same condition reads the same whichever operation carried the
+/// write. It never echoes a policy document back, and names the value only where the
+/// sentence SNS states itself names it.
 ///
 /// This is ARGUMENT validation — it judges the value alone — so it runs before any
 /// record is looked up, and it is SHARED by every operation that writes a subscription
 /// attribute: a value `Subscribe` accepts cannot be one `SetSubscriptionAttributes`
 /// refuses.
-pub fn subscription_attribute_value_reason(name: &str, value: &str) -> Option<String> {
+pub fn subscription_attribute_refusal(name: &str, value: &str) -> Option<String> {
+    // The clause form the attributes SNS states no fixed sentence for keep: the
+    // attribute and the constraint its value failed.
+    let attribute_reason = |reason: String| format!("Invalid parameter: Attributes Reason: {reason}");
     match name {
         // A flag, carried as a word because SNS carries every attribute value as a
         // string (see [`attribute_flag`]).
         RAW_MESSAGE_DELIVERY_ATTRIBUTE => (value != RAW_MESSAGE_DELIVERY_ENABLED
             && value != RAW_MESSAGE_DELIVERY_DISABLED)
             .then(|| {
-                format!(
+                attribute_reason(format!(
                     "{name} - the value must be {RAW_MESSAGE_DELIVERY_ENABLED} or \
                      {RAW_MESSAGE_DELIVERY_DISABLED}"
-                )
+                ))
             }),
-        FILTER_POLICY_SCOPE_ATTRIBUTE => (!FILTER_POLICY_SCOPES.contains(&value))
-            .then(|| format!("{name} - the value must be one of {FILTER_POLICY_SCOPES:?}")),
+        FILTER_POLICY_SCOPE_ATTRIBUTE => {
+            (!FILTER_POLICY_SCOPES.contains(&value)).then(|| filter_policy_scope_refusal(value))
+        }
         // "The simple JSON object that lets your subscriber receive only a subset of
         // messages" (`SetSubscriptionAttributesInput$AttributeName` doc): the policy is
         // matched property by property, so it has to be an object to match anything.
-        FILTER_POLICY_ATTRIBUTE => json_object(value).is_none().then(|| {
-            format!(
+        FILTER_POLICY_ATTRIBUTE => match serde_json::from_str::<serde_json::Value>(value) {
+            // What SNS reports when its parse of the document failed, naming the
+            // attribute and the parse rather than the document the caller sent.
+            Err(_) => Some(FILTER_POLICY_PARSE_REFUSAL.to_string()),
+            Ok(serde_json::Value::Object(_)) => None,
+            Ok(_) => Some(attribute_reason(format!(
                 "{name} - the value must be a filter policy document: a JSON object of \
                  the message properties to match"
-            )
-        }),
+            ))),
+        },
         // The SAME parse the effective policy is computed with, so a document the read
         // path could not honour is never stored.
-        DELIVERY_POLICY_ATTRIBUTE => {
-            delivery_policy_refusal(value).map(|reason| format!("{name} - {reason}"))
-        }
+        DELIVERY_POLICY_ATTRIBUTE => delivery_policy_refusal(value)
+            .map(|reason| attribute_reason(format!("{name} - {reason}"))),
         REDRIVE_POLICY_ATTRIBUTE => match json_object(value) {
-            None => Some(format!(
-                "{name} - the value must be a redrive policy document: a JSON object \
-                 naming the dead-letter queue in {DEAD_LETTER_TARGET_ARN}"
-            )),
-            // "sends undeliverable messages to the specified Amazon SQS dead-letter
-            // queue" — a redrive policy that names no SQS queue redrives nowhere.
-            Some(members) => members
+            // A value that is not a policy document at all carries no dead-letter
+            // target either, which is the member the document is refused for.
+            None => Some(REDRIVE_POLICY_MISSING_VALUE_REFUSAL.to_string()),
+            Some(members) => match members
                 .get(DEAD_LETTER_TARGET_ARN)
                 .and_then(serde_json::Value::as_str)
-                .is_none_or(|arn| arn_resource(arn, "sqs").is_none())
-                .then(|| {
-                    format!(
-                        "{name} - {DEAD_LETTER_TARGET_ARN} must name an Amazon SQS queue"
-                    )
-                }),
+            {
+                None => Some(REDRIVE_POLICY_MISSING_VALUE_REFUSAL.to_string()),
+                // "sends undeliverable messages to the specified Amazon SQS dead-letter
+                // queue" — a redrive policy that names no SQS queue redrives nowhere.
+                Some(arn) if arn_resource(arn, "sqs").is_none() => {
+                    Some(REDRIVE_POLICY_NOT_A_QUEUE_REFUSAL.to_string())
+                }
+                Some(_) => None,
+            },
         },
         REPLAY_POLICY_ATTRIBUTE => json_object(value).is_none().then(|| {
-            format!("{name} - the value must be a replay policy document: a JSON object")
+            attribute_reason(format!(
+                "{name} - the value must be a replay policy document: a JSON object"
+            ))
         }),
         // "The ARN of the IAM role that has …" — only the ARN's shape is judged here;
         // whether that role exists is not this service's record to check.
-        SUBSCRIPTION_ROLE_ARN_ATTRIBUTE => {
-            arn_shape_reason(value).map(|reason| format!("{name} - {reason}"))
-        }
+        SUBSCRIPTION_ROLE_ARN_ATTRIBUTE => arn_shape_reason(value)
+            .map(|reason| attribute_reason(format!("{name} - {reason}"))),
         _ => None,
     }
 }
@@ -1078,8 +1147,11 @@ pub const DEFAULT_MAXIMUM_MESSAGE_SIZE: usize = 262_144;
 /// (`GetTopicAttributesResponse$Attributes` doc).
 pub const CONTENT_BASED_DEDUPLICATION_ATTRIBUTE: &str = "ContentBasedDeduplication";
 
-/// "Subjects must be UTF-8 text with no line breaks or control characters, and less
-/// than 100 characters long" (`PublishInput$Subject` doc).
+/// The longest `Subject` SNS accepts, in CHARACTERS: "Subjects must be UTF-8 text
+/// with no line breaks or control characters, and less than 100 characters long"
+/// (`PublishInput$Subject` doc). The limit counts the subject's CHARACTERS, not its
+/// UTF-8 bytes, and the recorded service accepts a subject of exactly this many and
+/// refuses the next one — so it is an inclusive bound here.
 pub const MAX_SUBJECT_CHARS: usize = 100;
 
 /// "The MessageGroupId can contain up to 128 alphanumeric characters (a-z, A-Z, 0-9)
@@ -1099,9 +1171,68 @@ fn ordering_id_is_valid(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c.is_ascii_punctuation())
 }
 
-/// Whether `subject` satisfies the rule SNS documents for it.
+/// The Unicode LINE SEPARATOR and PARAGRAPH SEPARATOR: the two line breaks that are
+/// not control characters, so a rule that reads "no line breaks or control
+/// characters" has to name them beside the control category.
+const LINE_SEPARATORS: [char; 2] = ['\u{2028}', '\u{2029}'];
+
+/// Whether `subject` satisfies the rule SNS documents for it: at most
+/// [`MAX_SUBJECT_CHARS`] characters (CHARACTERS, not UTF-8 bytes — any script is
+/// accepted), none of them a line break or a control character.
 fn subject_is_valid(subject: &str) -> bool {
-    subject.chars().count() < MAX_SUBJECT_CHARS && !subject.chars().any(char::is_control)
+    subject.chars().count() <= MAX_SUBJECT_CHARS
+        && !subject
+            .chars()
+            .any(|c| c.is_control() || LINE_SEPARATORS.contains(&c))
+}
+
+/// The sentence SNS refuses a publish that names no destination with: the members one
+/// of which a publish has to carry, and the reason it is refused — "If you don't
+/// specify a value for the TopicArn parameter, you must specify a value for the
+/// PhoneNumber or TargetArn parameters" (`PublishInput$TopicArn` doc).
+pub const NO_DESTINATION_REFUSAL: &str =
+    "Invalid parameter: TopicArn or TargetArn Reason: no value for required parameter";
+
+/// The sentence SNS refuses a publish that names MORE than one destination with: a
+/// message goes to one destination, so the destination members cannot be combined.
+pub const DESTINATIONS_NOT_EXCLUSIVE_REFUSAL: &str =
+    "Invalid parameter: TopicArn Reason: Both TopicArn and TargetArn cannot be \
+     specified at the same time.";
+
+/// The sentence SNS refuses a publish with no message body with.
+///
+/// SNS answers one FIXED sentence per refused condition — the parameter as the
+/// service names it, and the value or the bound only where that sentence itself
+/// carries them — so a client that reads `Error.Message` sees the same text for the
+/// same condition on every call. Recorded evidence: `Publish` with `Message=""`
+/// answers `400 InvalidParameter` with exactly this.
+pub const EMPTY_MESSAGE_REFUSAL: &str = "Invalid parameter: Empty message";
+
+/// The sentence SNS refuses a body past the topic's ceiling with: the condition, with
+/// neither the body's size nor the ceiling in it.
+pub const MESSAGE_TOO_LONG_REFUSAL: &str = "Invalid parameter: Message too long";
+
+/// The sentence SNS refuses an unacceptable `Subject` with: `Invalid parameter:` and
+/// the parameter, whichever of the member's rules the value broke (its length or a
+/// character it may not carry).
+pub const INVALID_SUBJECT_REFUSAL: &str = "Invalid parameter: Subject";
+
+/// The sentence SNS refuses a `MessageDeduplicationId` on a STANDARD topic with:
+/// deduplication is a FIFO property, so the parameter is not one this topic type
+/// takes.
+pub const DEDUPLICATION_ID_WRONG_TOPIC_TYPE_REFUSAL: &str =
+    "Invalid parameter: MessageDeduplicationId Reason: The request includes \
+     MessageDeduplicationId parameter that is not valid for this topic type";
+
+/// The sentence SNS refuses an ordering id (`MessageGroupId`,
+/// `MessageDeduplicationId`) that is not 1 to [`MAX_ORDERING_ID_CHARS`] alphanumeric
+/// or punctuation characters with: it names the parameter and states the rule, and
+/// never the value the caller sent.
+pub fn ordering_id_refusal(member: &str) -> String {
+    format!(
+        "Invalid parameter: The {member} parameter can only include alphanumeric and \
+         punctuation characters. 1 to {MAX_ORDERING_ID_CHARS} in length"
+    )
 }
 
 /// Check a `MessageStructure: json` body: a JSON object with a string `default`
@@ -1157,14 +1288,11 @@ pub fn message_refusal(request: MessageRequest<'_>) -> Option<String> {
     }
 
     if request.message.is_empty() {
-        return Some("Invalid parameter: Message - must not be empty".to_string());
+        return Some(EMPTY_MESSAGE_REFUSAL.to_string());
     }
 
     if request.subject.is_some_and(|subject| !subject_is_valid(subject)) {
-        return Some(format!(
-            "Invalid parameter: Subject - must be text with no control characters and \
-             fewer than {MAX_SUBJECT_CHARS} characters long"
-        ));
+        return Some(INVALID_SUBJECT_REFUSAL.to_string());
     }
 
     // The ordering ids follow one rule, whatever the topic type, and it is also what
@@ -1174,10 +1302,7 @@ pub fn message_refusal(request: MessageRequest<'_>) -> Option<String> {
         ("MessageDeduplicationId", request.message_deduplication_id),
     ] {
         if value.is_some_and(|value| !ordering_id_is_valid(value)) {
-            return Some(format!(
-                "Invalid parameter: {member} - must be 1 to {MAX_ORDERING_ID_CHARS} \
-                 alphanumeric or punctuation characters"
-            ));
+            return Some(ordering_id_refusal(member));
         }
     }
 
@@ -1213,19 +1338,12 @@ pub fn topic_message_refusal(
 ) -> Result<Option<String>, String> {
     let ceiling = max_message_size(topic);
     if request.message.len() > ceiling {
-        return Err(format!(
-            "Invalid parameter: Message - too long: {} bytes exceeds the topic's limit of \
-             {ceiling} bytes",
-            request.message.len()
-        ));
+        return Err(MESSAGE_TOO_LONG_REFUSAL.to_string());
     }
 
     if !topic.is_fifo {
         if request.message_deduplication_id.is_some() {
-            return Err(
-                "Invalid parameter: MessageDeduplicationId - applies only to FIFO topics"
-                    .to_string(),
-            );
+            return Err(DEDUPLICATION_ID_WRONG_TOPIC_TYPE_REFUSAL.to_string());
         }
         // A MessageGroupId is NOT refused here: for a standard topic "the
         // MessageGroupId is optional and is forwarded only to Amazon SQS standard
@@ -1376,7 +1494,12 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     pub sandbox_phone_numbers: HashMap<String, SandboxPhoneNumberRecord>,
     /// Delivered messages by subscription ARN, oldest first. Bounded: write through
     /// [`Self::record_delivery`], never by hand.
-    pub delivered: HashMap<String, Vec<PublishedMessage>>,
+    ///
+    /// ONE published message is held ONCE however many subscriptions received it: the
+    /// record is SHARED, so a publish to a topic with many subscriptions does not
+    /// allocate its body per subscription (the same sharing the queue deliveries of
+    /// `crate::ops::publish` use for the envelope they hand out).
+    pub delivered: HashMap<String, Vec<::std::sync::Arc<PublishedMessage>>>,
     /// The subscription each retained delivery belongs to, oldest delivery first:
     /// the eviction order of the whole log.
     delivery_order: VecDeque<String>,
@@ -1477,7 +1600,17 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// within [`MAX_RETAINED_MESSAGES_PER_SUBSCRIPTION`] and
     /// [`MAX_RETAINED_DELIVERY_BYTES`] by dropping the oldest deliveries. This is the
     /// ONLY way to write `delivered`: writing the map directly loses the bound.
-    pub fn record_delivery(&mut self, subscription_arn: &str, message: PublishedMessage) {
+    ///
+    /// The message arrives SHARED, so recording one publish to N subscriptions costs
+    /// N handles and one body. The retained-byte count still charges every recording
+    /// its whole [`PublishedMessage::retained_bytes`], which over-states what a shared
+    /// body costs and therefore evicts sooner than the ceiling demands — the bound
+    /// stays an upper bound on the bytes one caller can make the store hold.
+    pub fn record_delivery(
+        &mut self,
+        subscription_arn: &str,
+        message: ::std::sync::Arc<PublishedMessage>,
+    ) {
         self.retained_delivery_bytes = self
             .retained_delivery_bytes
             .saturating_add(message.retained_bytes());
@@ -1507,7 +1640,7 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// log is too, and the bytes it held are released.
     pub fn forget_deliveries(&mut self, subscription_arn: &str) {
         if let Some(held) = self.delivered.remove(subscription_arn) {
-            let released: usize = held.iter().map(PublishedMessage::retained_bytes).sum();
+            let released: usize = held.iter().map(|message| message.retained_bytes()).sum();
             self.retained_delivery_bytes =
                 self.retained_delivery_bytes.saturating_sub(released);
         }
@@ -1650,6 +1783,13 @@ pub fn arn_refusal(member: &str, value: &str) -> Option<String> {
 /// different number depending on which call put them there.
 pub const MAX_TAGS_PER_TOPIC: usize = 50;
 
+/// The sentence SNS refuses a write that would take a resource past
+/// [`MAX_TAGS_PER_TOPIC`] with: the quota that is exhausted, with neither the count
+/// held nor the count asked for in it. Shared by every operation that writes a
+/// topic's tags, so one condition reads the same whichever call carried the write.
+pub const TAG_QUOTA_EXCEEDED_REFUSAL: &str =
+    "Could not complete request: tag quota of per resource exceeded";
+
 /// The message a `ResourceArn` of one of SNS's TAG operations is refused with, or
 /// `None` when the value is a topic ARN.
 ///
@@ -1698,9 +1838,7 @@ pub enum TagRefusal {
 /// record past either ceiling by repeating a call with ever larger values.
 pub fn tag_map_refusal(tags: &HashMap<String, String>) -> Option<TagRefusal> {
     if tags.len() > MAX_TAGS_PER_TOPIC {
-        return Some(TagRefusal::TooMany(format!(
-            "Can't add more than {MAX_TAGS_PER_TOPIC} tags to a topic"
-        )));
+        return Some(TagRefusal::TooMany(TAG_QUOTA_EXCEEDED_REFUSAL.to_string()));
     }
     let held = attribute_bytes(tags);
     (held > MAX_TAG_BYTES_PER_TOPIC).then(|| {
@@ -1726,14 +1864,20 @@ pub const TOPIC_DOES_NOT_EXIST: &str = "Topic does not exist";
 /// the reason.
 pub const SUBSCRIPTION_DOES_NOT_EXIST: &str = "Subscription does not exist";
 
-/// The sentence SNS states for a resource an SMS sandbox call names and the account
-/// does not hold — the sandbox counterpart of [`TOPIC_DOES_NOT_EXIST`], worded the
-/// same way: the resource that is missing, with none of the caller's identifier
-/// echoed back (the sandbox's identifier is a phone number, which the model marks
-/// `@sensitive`, so echoing it would also reproduce a sensitive value in an error
-/// string). The HTTP 404 and the `ResourceNotFound` code are the requirement; this is
-/// SNS's wording of the reason.
-pub const SANDBOX_RESOURCE_DOES_NOT_EXIST: &str = "Resource does not exist";
+/// The sentence SNS states for a RESOURCE a call names and the account does not hold:
+/// the operations whose miss is the resource-scoped `ResourceNotFoundException` (the
+/// tag operations, the SMS sandbox) say "resource", where the topic-scoped
+/// `NotFoundException` names the topic ([`TOPIC_DOES_NOT_EXIST`]). Neither echoes the
+/// caller's identifier back — the sandbox's is a phone number, which the model marks
+/// `@sensitive`.
+pub const RESOURCE_DOES_NOT_EXIST: &str = "Resource does not exist";
+
+/// The sentence SNS refuses an attribute name it does not write with: `Invalid
+/// parameter:` and the parameter, whether the name is none SNS defines for that
+/// resource, one only the create call sets, or one the service computes. Shared by
+/// every operation that writes an attribute by name, so the sentence does not depend
+/// on which call carried it.
+pub const INVALID_ATTRIBUTE_NAME_REFUSAL: &str = "Invalid parameter: AttributeName";
 
 /// The sentence SNS refuses an unacceptable topic name with.
 ///

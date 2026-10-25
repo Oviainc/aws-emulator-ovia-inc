@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResendConfirmationCode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResendConfirmationCode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Re-sends the code that confirms a new user's sign-up, and reports where it went.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResendConfirmationCode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The pool's `AutoVerifiedAttributes` decide the destination, and the fresh code
+//! REPLACES the one the sign-up sent — so only the latest code is the one
+//! `ConfirmSignUp` accepts.
 //!
 //! ## Shape of an operation
 //!
@@ -231,18 +227,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResendConfirmationCode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResendConfirmationCodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResendConfirmationCode"))
+        // Request metadata only: the app client in the body names the pool, and
+        // `ClientMetadata` is input for the Lambda triggers this action would invoke,
+        // which this emulator invokes none of.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // This operation models no `UserPoolId`: the app client the request names is
+        // what resolves the pool the user signed up in.
+        let pool = guard
+            .pool_of_client(&input.client_id)
+            .ok_or_else(|| client_not_found(&input.client_id))?;
+        let user_pool_id = pool.id.clone();
+        let client = pool
+            .clients
+            .get(&input.client_id)
+            .ok_or_else(|| client_not_found(&input.client_id))?;
+        if !client.accepts_secret_hash(&input.username, input.secret_hash.as_deref()) {
+            return Err(unverified_secret_hash(&input.client_id));
+        }
+        let hides_user_existence = client.hides_user_existence();
+
+        let Some(user) = pool.user(&input.username) else {
+            return Err(if hides_user_existence {
+                not_authorized("Username/client id combination not found.")
+            } else {
+                user_not_found()
+            });
+        };
+        if !user.enabled {
+            return Err(not_authorized("User is disabled."));
+        }
+        // This operation "resends the code that confirms a new account for a user who
+        // has signed up in your user pool" (its own doc), so a user whose account is
+        // already confirmed has no such code to resend.
+        if user.status != crate::state::UserStatus::Unconfirmed {
+            return Err(invalid_parameter("User is already confirmed.".to_string()));
+        }
+        let username = user.username.clone();
+
+        // "Amazon Cognito sends confirmation codes to the user attribute in the
+        // `AutoVerifiedAttributes` property of your user pool" (this operation's own
+        // doc), so a pool that auto-verifies nothing the user holds a value for has
+        // nowhere to send the code.
+        let Some((attribute, destination)) = pool.confirmation_destination(user) else {
+            return Err(invalid_parameter(
+                "Cannot resend codes. No registered/verified email or phone_number".to_string(),
+            ));
+        };
+
+        // Sending the code is what this operation DOES: the fresh code becomes the ONE
+        // code outstanding for this user's sign-up, so the code the sign-up sent is
+        // superseded and no longer accepted.
+        let code = crate::state::VerificationCode::issued(&attribute, &destination, now);
+        let user = guard
+            .pool_mut(&user_pool_id)
+            .and_then(|pool| pool.user_mut(&username))
+            .ok_or_else(internal_error)?;
+        let stored = user.issue_code(crate::state::CodePurpose::SignUpConfirmation, code);
+
+        Ok(ResendConfirmationCodeOutput {
+            code_delivery_details: stored.delivery_details(),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
+fn client_not_found(client_id: &str) -> ResendConfirmationCodeError {
+    ResendConfirmationCodeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `NotAuthorizedException` for a request whose `SecretHash` is not the
+/// one the app client's stored secret expects — including a request that carries none.
+fn unverified_secret_hash(client_id: &str) -> ResendConfirmationCodeError {
+    not_authorized(&format!(
+        "Unable to verify secret hash for client {client_id}."
+    ))
+}
+
+/// This operation's `UserNotFoundException`. Carries the fixed message of
+/// [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no username.
+fn user_not_found() -> ResendConfirmationCodeError {
+    ResendConfirmationCodeErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> ResendConfirmationCodeError {
+    ResendConfirmationCodeErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> ResendConfirmationCodeError {
+    ResendConfirmationCodeErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ResendConfirmationCodeError {
+    ResendConfirmationCodeErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

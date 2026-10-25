@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op VerifyUserAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `VerifyUserAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Accepts the verification code sent for ONE attribute of the user an access token
+//! identifies, and confirms the value that code was sent to.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`VerifyUserAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Only the code OUTSTANDING for that attribute is accepted, and accepting it spends
+//! it: the confirmed value becomes the user's value — which is what promotes a value
+//! the pool held pending — and the attribute's verified flag says so.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +187,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `VerifyUserAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(VerifyUserAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("VerifyUserAttribute"))
+        // Request metadata only: the access token in the body names the pool and the
+        // user, not the request's signature.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // An access token's lifetime and a code's validity are both read against the
+        // clock, so an expired one is refused whether or not anything has swept it.
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // This operation models no `UserPoolId` and no `Username`: the access token is
+        // what names the pool and the user whose attribute is verified.
+        let (pool, user) = guard
+            .signed_in_user(&input.access_token, now)
+            .map_err(token_rejected)?;
+        let user_pool_id = pool.id.clone();
+        let username = user.username.clone();
+        let attribute = input.attribute_name.clone();
+
+        // The code is checked against the one STORED for THIS attribute of this user,
+        // so a code sent for another attribute verifies nothing here.
+        let accepted = user
+            .check_code(
+                &crate::state::CodePurpose::AttributeVerification(attribute.clone()),
+                &input.code,
+                now,
+            )
+            .map_err(code_rejected)?;
+        // The value the code vouches for is the one the message was ADDRESSED to, which
+        // is the value that becomes confirmed — the pending one where the pool held the
+        // update pending until the user confirmed it.
+        let confirmed = accepted.destination.clone();
+
+        // A confirmed email address or phone number is an ACTIVE alias of this user
+        // ([`crate::state::User::alias_is_active`]), and an alias value names ONE user
+        // of the pool, so a value another user already holds as its alias cannot become
+        // this user's.
+        if pool.is_alias_attribute(&attribute) && pool.alias_taken(&attribute, &confirmed, &username)
+        {
+            return Err(alias_exists(&attribute));
+        }
+
+        let user = guard
+            .pool_mut(&user_pool_id)
+            .and_then(|pool| pool.user_mut(&username))
+            .ok_or_else(internal_error)?;
+        // "If your user pool requires verification before Amazon Cognito updates the
+        // attribute value, this operation updates the affected attribute to its pending
+        // value" (this operation's own doc): the confirmed value is the user's value
+        // from now on, and nothing is left pending for it.
+        user.attributes.insert(attribute.clone(), confirmed);
+        user.pending_attributes.remove(&attribute);
+        // "When successful, the user's attribute becomes verified and the attribute
+        // `email_verified` or `phone_number_verified` becomes `true`" (this operation's
+        // own doc).
+        if let Some(flag) = crate::state::verified_flag(&attribute) {
+            user.attributes
+                .insert(flag.to_string(), crate::state::FLAG_CONFIRMED.to_string());
+        }
+        // The code is accepted ONCE: presenting it again finds nothing outstanding.
+        user.consume_code(&crate::state::CodePurpose::AttributeVerification(
+            attribute,
+        ));
+        user.user_last_modified_date = now;
+
+        Ok(VerifyUserAttributeOutput {})
     }
+}
+
+/// The modelled refusal a presented code earns: "this exception is thrown if the
+/// provided code doesn't match what the server was expecting"
+/// (`CodeMismatchException`) and "this exception is thrown if a code has expired"
+/// (`ExpiredCodeException`), both of this operation's own modelled errors.
+fn code_rejected(rejection: crate::state::CodeRejection) -> VerifyUserAttributeError {
+    match rejection {
+        crate::state::CodeRejection::Mismatch => {
+            VerifyUserAttributeErrorModeled::CodeMismatchException(CodeMismatchException {
+                message: Some(crate::state::CODE_MISMATCH_MESSAGE.to_string()),
+            })
+            .into()
+        }
+        crate::state::CodeRejection::Expired => {
+            VerifyUserAttributeErrorModeled::ExpiredCodeException(ExpiredCodeException {
+                message: Some(crate::state::EXPIRED_CODE_MESSAGE.to_string()),
+            })
+            .into()
+        }
+    }
+}
+
+/// This operation's answer to an `AccessToken` that names no signed-in user.
+///
+/// Every rejection of the token itself answers `NotAuthorizedException`, which "is
+/// thrown when a user isn't authorized" (this service's model), while a token whose
+/// pool or user has since been deleted answers the error for the resource that is
+/// gone. No message names a stored value.
+fn token_rejected(rejection: crate::state::TokenRejection) -> VerifyUserAttributeError {
+    match rejection {
+        crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
+        crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::PoolGone => {
+            VerifyUserAttributeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                // The caller named no pool — the token did — so this message names none
+                // either.
+                message: Some("User pool does not exist.".to_string()),
+            })
+            .into()
+        }
+        crate::state::TokenRejection::UserGone => {
+            VerifyUserAttributeErrorModeled::UserNotFoundException(UserNotFoundException {
+                message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into()
+        }
+    }
+}
+
+/// This operation's `AliasExistsException` for a value another user of the pool
+/// already holds as its alias. The message names the attribute and no stored value,
+/// so it reports which value collided without disclosing whose.
+fn alias_exists(attribute: &str) -> VerifyUserAttributeError {
+    VerifyUserAttributeErrorModeled::AliasExistsException(AliasExistsException {
+        message: Some(format!(
+            "An account with the given {attribute} already exists."
+        )),
+    })
+    .into()
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> VerifyUserAttributeError {
+    VerifyUserAttributeErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> VerifyUserAttributeError {
+    VerifyUserAttributeErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

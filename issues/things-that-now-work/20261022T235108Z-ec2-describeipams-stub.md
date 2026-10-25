@@ -31,3 +31,16 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the ec2 emulator
 Call DescribeIpams and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Status note (added by the `CreateIpam` fix)
+
+The evidence above is STALE. `DescribeIpams` was implemented as part of the `CreateIpam` fix
+(`issues/things-that-now-work/20261022T235108Z-ec2-createipam-stub.md`), because a create has
+to be proved by reading the resource back through an implemented describe: the handler no
+longer carries the `//! SCAFFOLDED, NOT IMPLEMENTED:` marker and no longer answers 501. It
+reports the account's IPAMs out of `crate::state`, narrowed by `IpamIds` and by the filters
+the `Ipam` shape's members give, paged in `IpamId` order, and is covered end to end by
+`services/service-com-amazonaws-ec2-amazonec2/tests/all/ipam_lifecycle.rs`.
+
+It is filed here, beside the other resolved reports, so a later scan does not re-file a stub
+that no longer exists. Whoever holds its work item should find nothing left to implement.

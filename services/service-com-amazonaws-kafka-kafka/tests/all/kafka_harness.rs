@@ -175,6 +175,114 @@ impl Emulator {
             .to_string()
     }
 
+    /// `CreateConfiguration`, which the model binds to
+    /// `POST /v1/configurations`. `description` is `None` where the request
+    /// omits the member; a blob member travels base64-encoded in a restJson1
+    /// payload.
+    pub async fn create_configuration(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        server_properties: &[u8],
+    ) -> Reply {
+        let mut body = json!({
+            "name": name,
+            "serverProperties": ::aws_smithy_types::base64::encode(server_properties),
+        });
+        if let Some(description) = description {
+            body["description"] = json!(description);
+        }
+        self.call("POST", "/v1/configurations", Some(body)).await
+    }
+
+    /// Create a configuration, assert it succeeded, and hand back the minted
+    /// ARN.
+    pub async fn create_configuration_ok(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        server_properties: &[u8],
+    ) -> String {
+        let reply = self
+            .create_configuration(name, description, server_properties)
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case name={name:?}: expected CreateConfiguration to succeed, got {} {}",
+            reply.status, reply.body
+        );
+        reply.body["arn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case name={name:?}: CreateConfiguration returned no arn"))
+            .to_string()
+    }
+
+    /// `UpdateConfiguration`, which the model binds to
+    /// `PUT /v1/configurations/{Arn}`.
+    pub async fn update_configuration(
+        &self,
+        arn: &str,
+        description: Option<&str>,
+        server_properties: &[u8],
+    ) -> Reply {
+        self.update_configuration_in(REGION, arn, description, server_properties)
+            .await
+    }
+
+    /// The same update, as an endpoint for `region` serves it — only the region
+    /// the configuration lives in holds it.
+    pub async fn update_configuration_in(
+        &self,
+        region: &str,
+        arn: &str,
+        description: Option<&str>,
+        server_properties: &[u8],
+    ) -> Reply {
+        let mut body = json!({
+            "serverProperties": ::aws_smithy_types::base64::encode(server_properties),
+        });
+        if let Some(description) = description {
+            body["description"] = json!(description);
+        }
+        self.call_in(
+            region,
+            "PUT",
+            &format!("/v1/configurations/{}", pct(arn)),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `DescribeConfiguration`, which the model binds to
+    /// `GET /v1/configurations/{Arn}`.
+    pub async fn describe_configuration(&self, arn: &str) -> Reply {
+        self.call("GET", &format!("/v1/configurations/{}", pct(arn)), None)
+            .await
+    }
+
+    /// `DescribeConfigurationRevision`, which the model binds to
+    /// `GET /v1/configurations/{Arn}/revisions/{Revision}`.
+    pub async fn describe_configuration_revision(&self, arn: &str, revision: i64) -> Reply {
+        self.describe_configuration_revision_in(REGION, arn, revision)
+            .await
+    }
+
+    /// The same read, as an endpoint for `region` serves it.
+    pub async fn describe_configuration_revision_in(
+        &self,
+        region: &str,
+        arn: &str,
+        revision: i64,
+    ) -> Reply {
+        self.call_in(
+            region,
+            "GET",
+            &format!("/v1/configurations/{}/revisions/{revision}", pct(arn)),
+            None,
+        )
+        .await
+    }
+
     /// `CreateVpcConnection`, which the model binds to `POST /v1/vpc-connection`.
     pub async fn create_vpc_connection(&self, request: &ConnectionRequest) -> Reply {
         self.call("POST", "/v1/vpc-connection", Some(request.to_json()))
@@ -248,6 +356,17 @@ impl Emulator {
             })
             .to_string()
     }
+}
+
+/// The `serverProperties` a configuration reply reports, decoded from its base64
+/// wire form — the member is a blob, so a suite compares the raw bytes.
+pub fn reported_server_properties(reply: &Reply, case: &str) -> Vec<u8> {
+    let encoded = reply
+        .at("/serverProperties")
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: expected serverProperties, got {}", reply.body));
+    ::aws_smithy_types::base64::decode(encoded)
+        .unwrap_or_else(|error| panic!("case {case}: serverProperties is not base64: {error}"))
 }
 
 /// The resource URI of one MSK VPC connection, with the ARN percent-encoded into

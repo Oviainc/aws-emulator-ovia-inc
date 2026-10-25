@@ -4,8 +4,8 @@
 //! IMPLEMENTED: lists the ids of the findings persisted for the detector, ordered,
 //! filtered through `FindingCriteria` and paginated through `maxResults` / `nextToken`.
 //! An unknown detector id is refused with `BadRequestException`, and so is a criterion
-//! or sort attribute this emulator does not model — silently ignoring a filter would
-//! return findings the caller asked it to exclude.
+//! key or sort attribute that names no field of a finding — silently ignoring a filter
+//! would return findings the caller asked it to exclude.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -184,16 +184,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Validated up front, so a detector with no findings refuses an unevaluable
         // criterion exactly as a populated one does.
         crate::state::validate_finding_criteria(input.finding_criteria.as_ref())
-            .map_err(|path| unsupported_attribute(&path, "findingCriteria"))?;
+            .map_err(|rejection| refusal(&rejection, FINDING_CRITERIA_MEMBER))?;
         for finding in detector.findings.values() {
             match crate::state::finding_matches(finding, input.finding_criteria.as_ref()) {
                 Ok(true) => matched.push(finding),
                 Ok(false) => {}
-                Err(path) => return Err(unsupported_attribute(&path, "findingCriteria")),
+                Err(rejection) => return Err(refusal(&rejection, FINDING_CRITERIA_MEMBER)),
             }
         }
         crate::state::sort_findings(&mut matched, input.sort_criteria.as_ref())
-            .map_err(|path| unsupported_attribute(&path, "sortCriteria.attributeName"))?;
+            .map_err(|rejection| refusal(&rejection, SORT_ATTRIBUTE_MEMBER))?;
 
         let ids: Vec<String> = matched.iter().map(|f| f.id.clone()).collect();
         let (page, next_token) = crate::state::paginate(
@@ -226,11 +226,13 @@ fn bad_request(message: impl Into<String>) -> ListFindingsError {
     crate::scaffolded::Scaffolded::invalid_input(message)
 }
 
-/// Refuse a finding attribute path this emulator does not model, naming the member
-/// and the paths it does support.
-fn unsupported_attribute(path: &str, member: &str) -> ListFindingsError {
-    bad_request(format!(
-        "{member}: '{path}' is not a finding attribute this service can filter or sort on. Supported attributes are {}.",
-        crate::state::FINDING_ATTRIBUTES.join(", ")
-    ))
+/// Refuse a criterion key or a sort attribute this service cannot answer, naming the
+/// member it arrived under.
+fn refusal(rejection: &crate::state::CriterionRejection, member: &str) -> ListFindingsError {
+    bad_request(rejection.message(member))
 }
+
+/// The wire paths a refusal names (`smithy_query(operation="ListFindings")`).
+const FINDING_CRITERIA_MEMBER: &str = "findingCriteria.criterion";
+/// See [`FINDING_CRITERIA_MEMBER`].
+const SORT_ATTRIBUTE_MEMBER: &str = "sortCriteria.attributeName";

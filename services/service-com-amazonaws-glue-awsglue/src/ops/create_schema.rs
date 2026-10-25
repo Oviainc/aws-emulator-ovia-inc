@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Creates a schema set in a schema registry and registers its first version. The record
+//! is written to [`crate::state::ComAmazonawsGlueAwsglueState::registries`], so `GetSchema`
+//! in a later request reads back exactly what was persisted, and a second create of the
+//! same name in the same registry is refused with `AlreadyExistsException`.
+//!
+//! The registry a create writes into is the one its `RegistryId` names, and a create that
+//! names none writes into the default registry, which is MATERIALISED here when it is not
+//! already present — that is what this operation documents ("When this API is called
+//! without a RegistryId, this will create an entry for a "default-registry" … if it is not
+//! already present"). Every OTHER registry name must already have been created, so a
+//! create naming one this endpoint does not hold is refused with
+//! `EntityNotFoundException` rather than quietly given a new, empty registry.
+//!
+//! `SchemaDefinition` is optional: with one, the create registers version
+//! [`crate::state::FIRST_SCHEMA_VERSION`] and reports its id and status; without one, the
+//! schema set exists holding no version, so its latest version is
+//! [`crate::state::NO_SCHEMA_VERSION`] and its next is the first. Whether a definition
+//! PARSES as the request's `DataFormat` is `CheckSchemaVersionValidity`'s own question and
+//! is left to that operation's issue; the modelled constraints on the member
+//! (len 1..170000, pattern `\S`) are already enforced before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +225,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSchema"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSchemaErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue schema registry store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Which registry this create writes into. A `RegistryId` the caller sent must
+        // resolve ("One of RegistryArn or RegistryName has to be provided"); no
+        // `RegistryId` at all means the default registry, which this operation documents.
+        let reference = match input.registry_id.as_ref() {
+            Some(registry_id) => match crate::state::registry_reference(registry_id, &region) {
+                Ok(reference) => reference,
+                Err(message) => {
+                    return Err(CreateSchemaErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(message),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => {
+                crate::state::Reference::Local(crate::state::DEFAULT_REGISTRY_NAME.to_string())
+            }
+        };
+        // A registry ARN of another account or another Region names a registry of an
+        // estate this endpoint does not serve, so it names none here whatever this store
+        // holds under that name.
+        let registry_name = match reference {
+            crate::state::Reference::Local(name) => name,
+            crate::state::Reference::Elsewhere(name) => {
+                return Err(CreateSchemaErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::registry_not_found(&name)),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Every refusal is decided BEFORE anything is written: a refused create must
+        // leave nothing behind, not even the default registry it would have materialised.
+        match store.registry(&registry_name) {
+            Some(registry) => {
+                if registry.schemas.contains_key(&input.schema_name) {
+                    return Err(CreateSchemaErrorModeled::AlreadyExistsException(
+                        AlreadyExistsException {
+                            message: Some(
+                                crate::state::messages::SCHEMA_ALREADY_EXISTS.to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                // The store is resident memory and this create is reachable by any
+                // caller, so the number of records one process will hold is bounded.
+                if !registry.can_store_schema() {
+                    return Err(
+                        CreateSchemaErrorModeled::ResourceNumberLimitExceededException(
+                            ResourceNumberLimitExceededException {
+                                message: Some(format!(
+                                    "Registry {registry_name} already holds the maximum of {} \
+                                     schemas",
+                                    crate::state::MAX_SCHEMAS_PER_REGISTRY
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            // Only the default registry is created on demand; any other name names a
+            // registry `CreateRegistry` has not made.
+            None if registry_name != crate::state::DEFAULT_REGISTRY_NAME => {
+                return Err(CreateSchemaErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::registry_not_found(&registry_name)),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+            None if !store.can_store_registry() => {
+                return Err(
+                    CreateSchemaErrorModeled::ResourceNumberLimitExceededException(
+                        ResourceNumberLimitExceededException {
+                            message: Some(format!(
+                                "This account already holds the maximum of {} schema registries",
+                                crate::state::MAX_REGISTRIES
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            None => {}
+        }
+        // The same bound across every registry: the per-registry ceiling alone would let
+        // one caller grow the store to the product of the two.
+        if !store.can_store_schema() {
+            return Err(
+                CreateSchemaErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} schemas",
+                            crate::state::MAX_STORED_SCHEMAS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let registry = store
+            .registries
+            .entry(registry_name.clone())
+            .or_insert_with(|| crate::state::RegistryEntry::default_registry(now));
+
+        // "When the schema set is created, a version checkpoint will be set to the first
+        // version" — so the checkpoint is the version this create registered, and a
+        // create that registered none has no checkpointed version yet.
+        let versions: Vec<crate::state::SchemaVersionEntry> = input
+            .schema_definition
+            .clone()
+            .map(|definition| {
+                vec![crate::state::SchemaVersionEntry::new(
+                    crate::state::FIRST_SCHEMA_VERSION,
+                    definition,
+                    now,
+                )]
+            })
+            .unwrap_or_default();
+        let checkpoint = versions
+            .last()
+            .map_or(crate::state::NO_SCHEMA_VERSION, |version| {
+                version.version_number
+            });
+        let entry = crate::state::SchemaEntry {
+            name: input.schema_name.clone(),
+            registry_name: registry_name.clone(),
+            description: input.description.clone(),
+            data_format: input.data_format.clone(),
+            compatibility: input
+                .compatibility
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_COMPATIBILITY.to_string()),
+            status: crate::state::SCHEMA_STATUS_AVAILABLE.to_string(),
+            checkpoint,
+            created_time: now,
+            updated_time: now,
+            tags: input.tags.clone().unwrap_or_default(),
+            versions,
+        };
+        let stored = registry
+            .schemas
+            .entry(input.schema_name.clone())
+            .or_insert(entry);
+
+        ::tracing::info!(
+            operation = "CreateSchema",
+            registry = %registry_name,
+            schema = %stored.name,
+            versions = stored.versions.len(),
+            "created a schema set in the Glue schema registry"
+        );
+
+        Ok(CreateSchemaOutput {
+            registry_name: Some(registry_name.clone()),
+            registry_arn: Some(crate::state::registry_arn(&region, &registry_name)),
+            schema_name: Some(stored.name.clone()),
+            schema_arn: Some(crate::state::schema_arn(
+                &region,
+                &registry_name,
+                &stored.name,
+            )),
+            description: stored.description.clone(),
+            data_format: Some(stored.data_format.clone()),
+            compatibility: Some(stored.compatibility.clone()),
+            schema_checkpoint: Some(stored.checkpoint),
+            latest_schema_version: Some(stored.latest_schema_version()),
+            next_schema_version: Some(stored.next_schema_version()),
+            schema_status: Some(stored.status.clone()),
+            // Definite, and EMPTY for a create that carried no tag: the answer to "which
+            // tags does this schema have" is the empty map, not an absent member.
+            tags: Some(stored.tags.clone()),
+            // The first version's id and status, absent exactly when the create
+            // registered no version because it carried no `SchemaDefinition`.
+            schema_version_id: stored
+                .latest_version()
+                .map(|version| version.version_id.clone()),
+            schema_version_status: stored
+                .latest_version()
+                .map(|version| version.status.clone()),
+        })
     }
 }

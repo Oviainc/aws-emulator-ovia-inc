@@ -171,6 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
+        // A probe whose teardown has run its course is not a resource any more,
+        // so the removal the clock already made due is materialised before an
+        // ARN is resolved against the store — the same write every read of this
+        // service performs.
+        store.settle_monitors_in(&region, now);
         let target = store
             .resolve_tagged_resource(&region, &input.resource_arn)
             .ok_or_else(|| {

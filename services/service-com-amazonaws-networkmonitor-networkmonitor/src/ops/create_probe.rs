@@ -237,6 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.prune_client_tokens(now);
+        // The transitions the clock already owed this monitor and its probes,
+        // among them the removal of a probe whose teardown has run its course,
+        // so this request sees exactly the probes a read of the monitor reports.
+        store.settle_monitor(&region, &input.monitor_name, now);
 
         // A repeat carrying the same idempotency token is a RETRY: it replays
         // the probe that token already minted rather than minting a second one.

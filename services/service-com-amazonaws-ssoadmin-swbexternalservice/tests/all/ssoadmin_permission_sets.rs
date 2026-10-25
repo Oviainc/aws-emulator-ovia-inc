@@ -20,11 +20,12 @@
 //!    type, principal id) tuple, so creating it twice grants it once.
 //!
 //! The permission-set / account-assignment surface is served on an ORGANIZATION instance
-//! of IAM Identity Center — which is the instance the account discovers through
-//! `ListInstances`. The tests of those rules run against an organization instance held
-//! under an id of its own ([`organization_router`]), so that "under the instance the
-//! request names" is not read off the only instance that exists; the account-instance
-//! restriction that withdraws the same surface is `account_instance_restriction.rs`.
+//! of IAM Identity Center, which is enabled through AWS Organizations rather than through
+//! this API. The tests of those rules run against an organization instance held under an
+//! id of its own ([`organization_router`]), so that "under the instance the request names"
+//! is not read off the only instance that exists; the account-instance restriction that
+//! withdraws the same surface is `account_instance_restriction.rs`, and the kind of
+//! instance an account DISCOVERS is `discovered_instance_surface.rs`.
 
 use std::sync::Arc;
 
@@ -128,13 +129,13 @@ const ORGANIZATION_IDENTITY_STORE_ID: &str = "d-1a2b3c4d5e";
 /// A router whose account holds an ORGANIZATION instance under an id of its own, and that
 /// instance's ARN.
 ///
-/// The account's ambient instance is already an organization instance, so this fixture's
-/// purpose is a DIFFERENT instance id: a rule asserted against it cannot be satisfied by
-/// reading the one id the emulator seeds. An organization instance is enabled through AWS
-/// Organizations rather than through this API (`CreateInstance` creates the account
-/// instance of a standalone account), so the test seeds it through the SAME
-/// `state::Instance` constructor the handlers use, and the calls below all go over the
-/// wire.
+/// The account's ambient instance is an ACCOUNT instance, so this fixture is how a test
+/// reaches the surface an organization instance serves — under an id of its own, so a rule
+/// asserted against it cannot be satisfied by reading the one id the emulator seeds. An
+/// organization instance is enabled through AWS Organizations rather than through this API
+/// (`CreateInstance` creates the account instance of a standalone account), so the test
+/// seeds it through the SAME `state::Instance` constructor the handlers use, and the calls
+/// below all go over the wire.
 pub(crate) fn organization_router() -> (MultiServiceRouter, String) {
     let (engine, instance_arn) = organization_engine();
     (router_over(engine), instance_arn)

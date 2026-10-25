@@ -41,6 +41,8 @@ mod filter_delete;
 mod filter_lifecycle;
 #[path = "all/filter_listing.rs"]
 mod filter_listing;
+#[path = "all/finding_field_catalog.rs"]
+mod finding_field_catalog;
 #[path = "all/findings_archive_state.rs"]
 mod findings_archive_state;
 #[path = "all/findings_feedback.rs"]
@@ -53,6 +55,8 @@ mod investigation_lifecycle;
 mod investigation_listing;
 #[path = "all/invitation_count.rs"]
 mod invitation_count;
+#[path = "all/invitation_delete.rs"]
+mod invitation_delete;
 #[path = "all/invitation_listing.rs"]
 mod invitation_listing;
 #[path = "all/ip_set_lifecycle.rs"]

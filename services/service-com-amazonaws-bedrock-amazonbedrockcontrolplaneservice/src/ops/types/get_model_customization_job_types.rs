@@ -17,7 +17,16 @@ pub struct GetModelCustomizationJobInput {
     pub job_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GetModelCustomizationJobResponse")]
+/// `GetModelCustomizationJobResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `creationTime`, `lastModifiedTime` and `endTime` carry
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation",operation="GetModelCustomizationJob")`), which the
+/// derive does not put on a member schema — see `types/date_time_wire.rs` for that whole
+/// story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetModelCustomizationJobOutput {
     pub job_arn: String,
@@ -45,3 +54,159 @@ pub struct GetModelCustomizationJobOutput {
     pub customization_config: Option<CustomizationConfig>,
 }
 
+bedrock_schema_and_codec!(
+    GetModelCustomizationJobOutput,
+    GET_MODEL_CUSTOMIZATION_JOB_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#GetModelCustomizationJobResponse",
+    "com.amazonaws.bedrock",
+    "GetModelCustomizationJobResponse",
+    (M_JOB_ARN, job_arn, "jobArn", 0, req, string),
+    (M_JOB_NAME, job_name, "jobName", 1, req, string),
+    (
+        M_OUTPUT_MODEL_NAME,
+        output_model_name,
+        "outputModelName",
+        2,
+        req,
+        string
+    ),
+    (
+        M_OUTPUT_MODEL_ARN,
+        output_model_arn,
+        "outputModelArn",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_CLIENT_REQUEST_TOKEN,
+        client_request_token,
+        "clientRequestToken",
+        4,
+        opt,
+        string
+    ),
+    (M_ROLE_ARN, role_arn, "roleArn", 5, req, string),
+    (M_STATUS, status, "status", 6, opt, string),
+    (
+        M_STATUS_DETAILS,
+        status_details,
+        "statusDetails",
+        7,
+        opt,
+        struct_of(StatusDetails)
+    ),
+    (
+        M_FAILURE_MESSAGE,
+        failure_message,
+        "failureMessage",
+        8,
+        opt,
+        string
+    ),
+    (
+        M_CREATION_TIME,
+        creation_time,
+        "creationTime",
+        9,
+        req,
+        date_time
+    ),
+    (
+        M_LAST_MODIFIED_TIME,
+        last_modified_time,
+        "lastModifiedTime",
+        10,
+        opt,
+        date_time
+    ),
+    (M_END_TIME, end_time, "endTime", 11, opt, date_time),
+    (
+        M_BASE_MODEL_ARN,
+        base_model_arn,
+        "baseModelArn",
+        12,
+        req,
+        string
+    ),
+    (
+        M_HYPER_PARAMETERS,
+        hyper_parameters,
+        "hyperParameters",
+        13,
+        opt,
+        map_of_string
+    ),
+    (
+        M_TRAINING_DATA_CONFIG,
+        training_data_config,
+        "trainingDataConfig",
+        14,
+        req,
+        struct_of(TrainingDataConfig)
+    ),
+    (
+        M_VALIDATION_DATA_CONFIG,
+        validation_data_config,
+        "validationDataConfig",
+        15,
+        req,
+        struct_of(ValidationDataConfig)
+    ),
+    (
+        M_OUTPUT_DATA_CONFIG,
+        output_data_config,
+        "outputDataConfig",
+        16,
+        req,
+        struct_of(OutputDataConfig)
+    ),
+    (
+        M_CUSTOMIZATION_TYPE,
+        customization_type,
+        "customizationType",
+        17,
+        opt,
+        string
+    ),
+    (
+        M_OUTPUT_MODEL_KMS_KEY_ARN,
+        output_model_kms_key_arn,
+        "outputModelKmsKeyArn",
+        18,
+        opt,
+        string
+    ),
+    (
+        M_TRAINING_METRICS,
+        training_metrics,
+        "trainingMetrics",
+        19,
+        opt,
+        struct_of(TrainingMetrics)
+    ),
+    (
+        M_VALIDATION_METRICS,
+        validation_metrics,
+        "validationMetrics",
+        20,
+        opt,
+        list_of_struct(ValidatorMetric)
+    ),
+    (
+        M_VPC_CONFIG,
+        vpc_config,
+        "vpcConfig",
+        21,
+        opt,
+        struct_of(VpcConfig)
+    ),
+    (
+        M_CUSTOMIZATION_CONFIG,
+        customization_config,
+        "customizationConfig",
+        22,
+        opt,
+        union_of(CustomizationConfig)
+    ),
+);

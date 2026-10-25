@@ -10,7 +10,8 @@
 //! [`StoredBuild`], `StartBuildBatch` writes a [`StoredBuildBatch`],
 //! `StartSandbox` writes a [`StoredSandbox`] and `StopSandbox` ends one,
 //! `StartCommandExecution` writes a [`StoredCommandExecution`],
-//! `CreateReportGroup` writes a [`StoredReportGroup`],
+//! `CreateReportGroup` writes a [`StoredReportGroup`] and `DeleteReportGroup`
+//! removes one,
 //! `ImportSourceCredentials` writes a [`StoredSourceCredentials`],
 //! `BatchDeleteBuilds` removes a build, and the reporting operations
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
@@ -1036,9 +1037,31 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     /// can never resolve to a local record, and the read stays logarithmic in
     /// the number of report groups held.
     pub fn report_group_by_arn(&self, arn: &str) -> Option<&StoredReportGroup> {
-        let (_, name) = arn.rsplit_once(":report-group/")?;
+        let name = report_group_name_from_arn(arn)?;
         let stored = self.report_groups.get(name)?;
         (stored.report_group.arn.as_deref() == Some(arn)).then_some(stored)
+    }
+
+    /// Drop the report group `arn` names, reporting whether this account held
+    /// one. Resolved exactly as [`Self::report_group_by_arn`] resolves a read,
+    /// so an ARN for another partition, region, account or resource type removes
+    /// nothing.
+    ///
+    /// The resource-based policy attached to that ARN goes with it: a
+    /// [`StoredResourcePolicy`] is meaningful only for a resource this account
+    /// holds, so leaving one behind would hand a later report group of the same
+    /// name a grant nobody wrote for it.
+    pub fn remove_report_group_by_arn(&mut self, arn: &str) -> bool {
+        if self.report_group_by_arn(arn).is_none() {
+            return false;
+        }
+        let Some(name) = report_group_name_from_arn(arn) else {
+            return false;
+        };
+        let name = name.to_string();
+        self.report_groups.remove(&name);
+        self.resource_policies.remove(arn);
+        true
     }
 
     /// Read a fleet, first materialising the transition the clock already owes
@@ -1770,6 +1793,33 @@ pub fn project_name_from_arn(arn: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
+/// The report group name an
+/// `arn:<partition>:codebuild:<region>:<account>:report-group/<name>` ARN identifies,
+/// or `None` when the value is not a CodeBuild report group ARN.
+///
+/// The inverse of [`report_group_arn`]'s resource segment, and the counterpart of
+/// [`project_name_from_arn`] for the other resource kind addressed by ARN alone: the
+/// name is what this store is keyed by. It answers the SYNTAX question only — whether
+/// the value is a report group ARN of this service at all — so a caller that resolves a
+/// record still keeps it only if its STORED ARN is exactly the one asked for, which is
+/// what keeps an ARN for another partition, region or account from resolving to a local
+/// record. The resource is the whole sixth field, everything after the fifth colon, so
+/// the name is recovered intact even though `ReportGroupName` constrains only its
+/// length and may therefore carry a colon itself.
+pub fn report_group_name_from_arn(arn: &str) -> Option<&str> {
+    // Walked field by field rather than collected, so resolving an ARN allocates
+    // nothing.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" || fields.next()?.is_empty() || fields.next()? != ARN_NAMESPACE {
+        return None;
+    }
+    // The region and the account are not checked here; see above.
+    fields.next()?;
+    fields.next()?;
+    let name = fields.next()?.strip_prefix("report-group/")?;
+    (!name.is_empty()).then_some(name)
+}
+
 /// A public project's `publicProjectAlias` — "the project identifier used with the
 /// public build APIs".
 ///
@@ -1882,6 +1932,8 @@ fn audit_field(value: &str) -> String {
 pub enum AuditOutcome {
     /// A report group was minted and stored.
     ReportGroupCreated,
+    /// A report group was removed from the store.
+    ReportGroupDeleted,
     /// A compute fleet was minted and stored.
     FleetCreated,
     /// The request was refused as invalid (400 `InvalidInputException`).
@@ -1905,6 +1957,7 @@ impl AuditOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReportGroupCreated => "report-group-created",
+            Self::ReportGroupDeleted => "report-group-deleted",
             Self::FleetCreated => "fleet-created",
             Self::ValidationRefused => "validation-refused",
             Self::AlreadyExists => "already-exists",

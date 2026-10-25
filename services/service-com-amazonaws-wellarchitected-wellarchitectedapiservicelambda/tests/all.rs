@@ -44,6 +44,9 @@ mod agent_recommendation_generations;
 #[path = "all/answer_updates.rs"]
 mod answer_updates;
 
+#[path = "all/custom_lens_answer_writes.rs"]
+mod custom_lens_answer_writes;
+
 #[path = "all/custom_lens_import.rs"]
 mod custom_lens_import;
 
@@ -160,6 +163,9 @@ mod state_roundtrip;
 
 #[path = "all/token_ledgers.rs"]
 mod token_ledgers;
+
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 
 #[path = "all/validation_envelopes.rs"]
 mod validation_envelopes;

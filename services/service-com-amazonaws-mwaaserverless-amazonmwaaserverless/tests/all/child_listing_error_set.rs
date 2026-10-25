@@ -137,7 +137,7 @@ fn operation_cases() -> Vec<OperationCase> {
 /// This service's model gives its service shape no common error list
 /// (`smithy_query(query="service_info")` reports no `common_errors`), so an operation's
 /// own `errors` list is the whole set it may answer.
-fn declared_errors(model: &serde_json::Value, operation: &str) -> Vec<String> {
+pub(crate) fn declared_errors(model: &serde_json::Value, operation: &str) -> Vec<String> {
     let id = format!("{NAMESPACE}#{operation}");
     model["shapes"][&id]["errors"]
         .as_array()
@@ -154,7 +154,10 @@ fn declared_errors(model: &serde_json::Value, operation: &str) -> Vec<String> {
 
 /// The short name of a shape id (`namespace#Name` -> `Name`) — the form the wire
 /// `__type` ends with.
-fn shape_name(id: &str) -> &str {
+///
+/// `pub(crate)` beside [`declared_errors`] so every suite asserting "only the errors this
+/// operation declares" reads that set through ONE definition.
+pub(crate) fn shape_name(id: &str) -> &str {
     id.split('#').next_back().unwrap_or(id)
 }
 
