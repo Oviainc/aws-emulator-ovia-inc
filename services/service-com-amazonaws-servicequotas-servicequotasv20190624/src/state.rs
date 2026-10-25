@@ -136,6 +136,39 @@ pub const CONTEXT_SCOPE_ACCOUNT: &str = "ACCOUNT";
 /// value of their own has been applied to, and to any new such resource.
 pub const CONTEXT_ID_EVERY_RESOURCE: &str = "*";
 
+/// `OptInType` member `NotifyOnly`: Automatic Management notifies, and adjusts
+/// nothing.
+pub const OPT_IN_TYPE_NOTIFY_ONLY: &str = "NotifyOnly";
+
+/// The `OptInType` members Automatic Management can currently be configured with — a
+/// SUBSET of the members the enum declares.
+///
+/// Source: the documentation of `StartAutoManagementRequest$OptInType` and
+/// `UpdateAutoManagementRequest$OptInType` (`smithy_query(query="doc", ...)`) — "There
+/// are two modes: Notify only and Notify and Auto-Adjust. Currently, only NotifyOnly is
+/// available." The enum declares both members, so the boundary validator admits both
+/// and the availability rule is the application layer's to enforce; a mode the service
+/// does not offer yet is refused rather than stored, so a configuration can only ever
+/// report a mode the service would act on.
+pub const AVAILABLE_OPT_IN_TYPES: &[&str] = &[OPT_IN_TYPE_NOTIFY_ONLY];
+
+/// Whether `opt_in_type` names an opt-in type Automatic Management currently offers.
+pub fn opt_in_type_is_available(opt_in_type: &str) -> bool {
+    AVAILABLE_OPT_IN_TYPES.contains(&opt_in_type)
+}
+
+/// How a write naming an opt-in type the service does not offer yet is worded: it names
+/// the member the caller got wrong and the rule it broke, and does NOT quote the
+/// rejected value back (a refusal states the rule; echoing input into a 400 body puts
+/// caller-supplied bytes in every client log).
+pub fn unavailable_opt_in_type_message() -> String {
+    format!(
+        "OptInType failed to satisfy constraint: Member must be an opt-in type Automatic \
+         Management currently offers: {}",
+        AVAILABLE_OPT_IN_TYPES.join(", ")
+    )
+}
+
 /// `OptInStatus` member `ENABLED`: Automatic Management is started.
 pub const OPT_IN_STATUS_ENABLED: &str = "ENABLED";
 /// `OptInStatus` member `DISABLED`: Automatic Management is stopped — and what an
@@ -463,7 +496,8 @@ type AppliedKey = (String, String, Option<String>);
 pub struct AutoManagementConfig {
     /// `OptInLevel` — an `OptInLevel` member, as the opt-in named it.
     pub opt_in_level: String,
-    /// `OptInType` — an `OptInType` member, as the opt-in named it.
+    /// `OptInType` — an `OptInType` member, as the opt-in named it. Only a member the
+    /// service currently offers reaches here: see [`AVAILABLE_OPT_IN_TYPES`].
     pub opt_in_type: String,
     /// `OptInStatus` — [`OPT_IN_STATUS_ENABLED`] while Automatic Management is
     /// started, [`OPT_IN_STATUS_DISABLED`] once it is stopped. Stopping keeps the
