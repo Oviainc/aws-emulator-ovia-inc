@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/absent_plan_reads.rs"]
 mod absent_plan_reads;
+#[path = "all/application_source_exclusivity.rs"]
+mod application_source_exclusivity;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
 #[path = "all/forecast_data.rs"]
