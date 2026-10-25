@@ -43,6 +43,8 @@ mod fhir_rest_and_validate_source;
 mod fhir_update_interaction;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/publish_data_transformation_profile.rs"]
+mod publish_data_transformation_profile;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/resource_untagging.rs"]
