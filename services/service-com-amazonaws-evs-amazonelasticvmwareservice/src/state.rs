@@ -109,12 +109,15 @@ pub fn check_id(environment_id: &str, check_type: &str) -> String {
 /// CREATE_FAILED | UPDATE_FAILED` (`smithy_query(query="shape", shape="HostState")`). The
 /// first two are the ones `CreateEnvironmentHost` produces: a host is `CREATING`
 /// while the ESX host is built and `CREATED` once it has joined the environment.
-/// `DELETED` is the terminal state a host that has been removed rests in, and the ONE
-/// state in which a host no longer occupies its environment
+/// `DELETING` is the state `DeleteEnvironmentHost` puts a host into while the ESX host
+/// is removed from the environment, and `DELETED` is the terminal state it then rests
+/// in — the ONE state in which a host no longer occupies its environment
 /// ([`StoredEnvironment::live_hosts`]).
 pub const HOST_CREATING: &str = "CREATING";
 /// See [`HOST_CREATING`].
 pub const HOST_CREATED: &str = "CREATED";
+/// See [`HOST_CREATING`].
+pub const HOST_DELETING: &str = "DELETING";
 /// See [`HOST_CREATING`].
 pub const HOST_DELETED: &str = "DELETED";
 
@@ -143,6 +146,11 @@ pub const HCX_FUNCTION: &str = "hcx";
 /// resource these operations address by id (`Connector`, "An object that represents a
 /// connector for an Amazon EVS environment").
 pub const RESOURCE_TYPE_CONNECTOR: &str = "connector";
+
+/// The resource type `ResourceNotFoundException` reports for a host — the resource
+/// `DeleteEnvironmentHost` addresses by DNS hostname (`Host`, "An ESX host that runs on
+/// an Amazon EC2 bare metal instance").
+pub const RESOURCE_TYPE_HOST: &str = "host";
 
 /// The `ConnectorState` values a stored connector moves through.
 ///
@@ -474,6 +482,20 @@ pub fn connector_not_found(resource_id: &str) -> ResourceNotFoundException {
         message: format!("Connector {resource_id} was not found"),
         resource_id: resource_id.to_string(),
         resource_type: RESOURCE_TYPE_CONNECTOR.to_string(),
+    }
+}
+
+/// The `ResourceNotFoundException` an operation answers for a host the addressed
+/// environment holds no record of.
+///
+/// Built from the request exactly as [`environment_not_found`] is: the service names the
+/// host the caller asked for — a host is addressed by its DNS hostname rather than by a
+/// minted id — so the text is a function of the lookup key and never of the store.
+pub fn host_not_found(resource_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("Host {resource_id} was not found"),
+        resource_id: resource_id.to_string(),
+        resource_type: RESOURCE_TYPE_HOST.to_string(),
     }
 }
 
@@ -1236,11 +1258,15 @@ impl StoredEnvironment {
     /// subnet's usable range is therefore also what bounds how many hosts one
     /// environment can hold: `None` means the subnet is full and a further host cannot
     /// be addressed.
+    ///
+    /// An address is held by the hosts that still OCCUPY the environment
+    /// ([`Self::live_hosts`]): a host that has reached the terminal `DELETED` state is
+    /// gone, its management interface with it, so the address it used is free for the
+    /// next host — the record is kept for reporting only.
     pub fn next_host_ip(&self) -> Option<String> {
         let vmk = self.vmk_management_vlan()?;
         let taken: Vec<&str> = self
-            .hosts
-            .values()
+            .live_hosts()
             .map(|host| host.ip_address.as_str())
             .collect();
         Ipv4Cidr::parse(&vmk.cidr)?
@@ -1314,6 +1340,30 @@ impl StoredEnvironment {
         self.live_entitlements()
             .filter(|entitlement| same_vcenter.contains(entitlement.connector_id.as_str()))
             .count()
+    }
+
+    /// Drop the oldest host records this environment is FINISHED with, until it holds no
+    /// more than [`MAX_HOSTS_PER_ENVIRONMENT`].
+    ///
+    /// The host counterpart of [`Self::purge_finished_connectors`], and retained on the
+    /// same terms: a `DELETED` host is kept so a later read still reports the deletion,
+    /// but only until the store needs the room, and a read of a purged host then answers
+    /// `ResourceNotFoundException`. A host that still occupies the environment
+    /// ([`Self::live_hosts`]) is never dropped, so a create/delete loop cannot grow the
+    /// map without bound.
+    pub fn purge_finished_hosts(&mut self) {
+        while self.hosts.len() > MAX_HOSTS_PER_ENVIRONMENT {
+            let Some(longest_deleted) = self
+                .hosts
+                .values()
+                .filter(|host| host.state == HOST_DELETED)
+                .min_by_key(|host| host.modified_at_ms)
+                .map(|host| host.host_name.clone())
+            else {
+                return;
+            };
+            self.hosts.remove(&longest_deleted);
+        }
     }
 
     /// Drop the oldest connector records this environment is FINISHED with, until it
@@ -1614,6 +1664,24 @@ pub const MAX_ENTITLEMENTS_PER_ENVIRONMENT: usize = 1024;
 /// per-environment connector quota, and this is far above the deletions of any ordinary
 /// workflow.
 pub const MAX_CONNECTORS_PER_ENVIRONMENT: usize = 64;
+
+/// The most host records one environment keeps — the cap that bounds caller-driven
+/// growth of an environment's host map.
+///
+/// The LIVE population is bounded by the environment's own `vmkManagement` VLAN subnet,
+/// since every host takes a management address out of it
+/// ([`StoredEnvironment::next_host_ip`]); what needs a cap is the records
+/// `DeleteEnvironmentHost` has finished with, because the name and the address of a
+/// deleted host are free again and a create/delete loop would otherwise keep every one
+/// of those records. The retention rule is the one [`MAX_ENVIRONMENTS`] states: at the
+/// cap the longest-deleted record is purged
+/// ([`StoredEnvironment::purge_finished_hosts`]), and a host that still occupies the
+/// environment is never dropped.
+///
+/// The number is the emulator's own bound, not a contract: Amazon EVS publishes its
+/// hosts-per-environment quota as adjustable, so no single value is the published one,
+/// and this is far above the deletions of any ordinary workflow.
+pub const MAX_HOSTS_PER_ENVIRONMENT: usize = 256;
 
 /// The most Elastic IP associations one VLAN subnet holds — the cap that bounds
 /// caller-driven growth of a VLAN's association list.
@@ -2261,9 +2329,17 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// environments and within VCF" (`HostInfoForCreate$hostName` doc), so the scope is
     /// every environment and not one — and not one Region either, since the uniqueness
     /// the doc states is within VCF rather than within an endpoint.
+    ///
+    /// A name is carried by the hosts that still OCCUPY their environment
+    /// ([`StoredEnvironment::live_hosts`]): a host that has reached the terminal
+    /// `DELETED` state is gone from VCF, so its DNS hostname is free for a new host, the
+    /// same reading [`StoredEnvironment::next_host_ip`] takes of its address.
     pub fn host_name_is_taken(&self, host_name: &str) -> bool {
         self.environments.values().any(|environment| {
-            environment.state != STATE_DELETED && environment.hosts.contains_key(host_name)
+            environment.state != STATE_DELETED
+                && environment
+                    .live_hosts()
+                    .any(|host| host.host_name == host_name)
         })
     }
 
