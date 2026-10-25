@@ -457,7 +457,7 @@ async fn update_stack_is_held_to_the_capabilities_the_request_acknowledges() {
     .await;
     assert_refused("an update adding an unacknowledged role", status, &refused, IAM);
 
-    let (status, kept) = get_template(&router, "gate-update").await;
+    let (status, kept) = get_template(&router, "gate-update", None).await;
     assert_eq!(status, 200, "GetTemplate answered {status}: {kept}");
     let stored = xml_text(&kept, "TemplateBody").unwrap_or_default();
     assert!(

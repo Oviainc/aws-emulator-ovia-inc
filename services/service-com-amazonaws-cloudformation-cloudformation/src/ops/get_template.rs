@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTemplate
-//! IMPLEMENTED: answers the template body `CreateStack`/`UpdateStack` persisted for the
-//! named stack — a byte-identical round trip — for a running or a deleted stack, at the
-//! `TemplateStage` the request asked for: the submitted body for `Original`, and for
-//! `Processed` (the documented default) the body with the macros this emulator processes
-//! expanded, which for a template declaring none is the submitted body itself. Where the
-//! deploying operation already PROCESSED part of the template — the `AWS::Include` snippets
-//! its `Fn::Transform`s named, which only that operation could read
-//! ([`crate::state::include`]) — that stored body is what the read expands the rest of, so a
-//! template naming both kinds of macro reports both expansions.
-//! A request naming a `ChangeSetName` instead answers the template that change set would
-//! put on the stack, with the stages the change set's own creation has reached.
+//! IMPLEMENTED: answers the named stack's template at the requested stage — `Original` is
+//! the exact body `CreateStack`/`UpdateStack` persisted (a byte-identical round trip),
+//! `Processed` (the documented default) is that body with its declared transforms applied,
+//! which for a template declaring none is the submitted body itself — for a running or a
+//! deleted stack. Where the deploying operation already processed part of the template —
+//! the `AWS::Include` snippets its `Fn::Transform`s named, which only that operation could
+//! read ([`crate::state::include`]) — the declared transforms were applied to that spliced
+//! body, so a template naming both kinds of macro reports both expansions. A request naming
+//! a `ChangeSetName` instead answers the template that change set would put on the stack,
+//! with the stages the change set's own creation has reached.
 //!
 //! ## Shape of an operation
 //!
@@ -195,21 +194,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?;
             // "For change sets, the Original template is always available. After
             // CloudFormation finishes creating the change set, the Processed template
-            // becomes available."
+            // becomes available" — the stage a transform PRODUCES is the one that waits for
+            // the creation to finish. Where the template declares no transform the two
+            // stages are one document ("If the template doesn't include transforms, Original
+            // and Processed return the same template"), so there is nothing to wait for and
+            // the processed stage is available at once. Either way the stage this read
+            // serves was computed by `CreateChangeSet`, once, before the store lock: this
+            // read expands nothing.
+            let stages_are_one_document =
+                change_set.processed_template == crate::state::template::Processed::Same;
+            let serveable_processed = (change_set.creation_settled() || stages_are_one_document)
+                .then(|| change_set.processed_template_body())
+                .flatten()
+                .map(str::to_string);
             let mut stages_available = vec![TEMPLATE_STAGE_ORIGINAL.to_string()];
-            if change_set.status == crate::state::change_set_status::CREATE_COMPLETE {
+            if serveable_processed.is_some() {
                 stages_available.push(TEMPLATE_STAGE_PROCESSED.to_string());
             }
-            let processed = stages_available
-                .iter()
-                .any(|stage| stage == TEMPLATE_STAGE_PROCESSED);
+            // The stage the response serves, which is ALWAYS one the response advertises as
+            // available: `Original` is the submitted body, `Processed` the one bound above.
+            // So a request for `Processed` over a change set that has no such stage — a
+            // transform this service cannot apply, or one whose expansion the creation has
+            // not finished — is refused rather than answered the other stage's document,
+            // and a request that names NO stage takes the documented default (`Processed`)
+            // and is refused the same way.
+            let requested = input.template_stage.as_deref();
+            let template_body = match (requested, serveable_processed) {
+                (Some(TEMPLATE_STAGE_ORIGINAL), _) => change_set.template_body.clone(),
+                (_, Some(processed)) => processed,
+                (_, None) => {
+                    // Two different conditions, answered differently. A transform this
+                    // service CANNOT apply has no processed stage at all: that is the
+                    // unimplemented one, so it is the 501. A stage it can compute but the
+                    // change set's creation has not reached yet is a request refusal, not
+                    // an unimplemented operation — "After CloudFormation finishes creating
+                    // the change set, the Processed template becomes available" — so it is
+                    // this service's own `ValidationError`, the code it refuses a request
+                    // it cannot satisfy with.
+                    return Err(match change_set.processed_template.unavailable_reason() {
+                        Some(reason) => crate::scaffolded::Scaffolded::not_implemented(&format!(
+                            "GetTemplate(TemplateStage={TEMPLATE_STAGE_PROCESSED}) for a \
+                             change set whose template cannot be processed here: {reason}"
+                        )),
+                        None => crate::scaffolded::Scaffolded::validation_error(format!(
+                            "The {TEMPLATE_STAGE_PROCESSED} template is not available for \
+                             change set [{}] in {} state",
+                            change_set.change_set_name, change_set.status
+                        )),
+                    });
+                }
+            };
             return Ok(GetTemplateOutput {
-                template_body: Some(reported_body(
-                    &change_set.template_body,
-                    None,
-                    input.template_stage.as_deref(),
-                    processed,
-                )),
+                template_body: Some(template_body),
                 stages_available: Some(stages_available),
             });
         }
@@ -236,48 +272,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // Which STAGE of the template the request asked for: the submitted body, or the
-        // one CloudFormation processed the template's macros into.
-        // "For stacks, the Original and Processed templates are always available."
+        // The one processed stage this read has: bound ONCE, so the stage advertised and
+        // the stage served are the same value rather than two independent lookups. It is
+        // the whole pipeline's stage — the declared transforms applied to the body the
+        // deploying operation spliced the `AWS::Include` snippets into.
+        let serveable_processed = stack.processed_stage_body().map(str::to_string);
+        // "For stacks, the Original and Processed templates are always available" — except
+        // for a template whose transform this emulator cannot apply, whose Processed stage
+        // is answered 501 below: a stage the read cannot serve is not advertised as
+        // available.
+        let mut stages_available = vec![TEMPLATE_STAGE_ORIGINAL.to_string()];
+        if serveable_processed.is_some() {
+            stages_available.push(TEMPLATE_STAGE_PROCESSED.to_string());
+        }
+
+        // "For templates that include transforms, the stage of the template that
+        // CloudFormation returns. To get the user-submitted template, specify Original. To
+        // get the template after CloudFormation has processed all transforms, specify
+        // Processed. [...] By default, CloudFormation specifies Processed."
+        let stage = input
+            .template_stage
+            .as_deref()
+            .unwrap_or(TEMPLATE_STAGE_PROCESSED);
+        let template_body = if stage == TEMPLATE_STAGE_ORIGINAL {
+            template_body
+        } else {
+            // A transform this emulator cannot apply leaves the stack with no processed
+            // stage: answered 501, never with the unprocessed body passed off as
+            // processed.
+            let Some(processed) = serveable_processed else {
+                let reason = stack
+                    .processed_template
+                    .unavailable_reason()
+                    .unwrap_or_default()
+                    .to_string();
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "GetTemplate(TemplateStage={TEMPLATE_STAGE_PROCESSED}) for a stack whose \
+                     template cannot be processed here: {reason}"
+                )));
+            };
+            processed
+        };
+
         Ok(GetTemplateOutput {
-            template_body: Some(reported_body(
-                &template_body,
-                stack.processed_template_body.as_deref(),
-                input.template_stage.as_deref(),
-                true,
-            )),
-            stages_available: Some(vec![
-                TEMPLATE_STAGE_ORIGINAL.to_string(),
-                TEMPLATE_STAGE_PROCESSED.to_string(),
-            ]),
+            template_body: Some(template_body),
+            stages_available: Some(stages_available),
         })
     }
 }
 
-/// The body one stage of a stored template reports.
-///
-/// "To get the user-submitted template, specify `Original`. To get the template after
-/// CloudFormation has processed all transforms, specify `Processed`. If the template doesn't
-/// include transforms, `Original` and `Processed` return the same template. By default,
-/// CloudFormation specifies `Processed`" — so the stored body is answered verbatim for
-/// `Original`, for a body declaring no macro this emulator processes (where the two stages
-/// are the same template), and wherever the processed stage is not available yet; otherwise
-/// the request is answered with the expansion.
-///
-/// The two expansions COMPOSE: a body may name both a macro only the deploying operation
-/// could process (`AWS::Include`, whose snippets it read and stored as `processed`) and one
-/// a read can process itself ([`crate::state::template::processed`], the SAM transform), so
-/// the stored processed body is the INPUT to the second rather than the answer, and a
-/// template naming both reports both expansions.
-fn reported_body(
-    stored: &str,
-    processed: Option<&str>,
-    stage: Option<&str>,
-    processed_available: bool,
-) -> String {
-    if stage == Some(TEMPLATE_STAGE_ORIGINAL) || !processed_available {
-        return stored.to_string();
-    }
-    let body = processed.unwrap_or(stored);
-    crate::state::template::processed(body).unwrap_or_else(|| body.to_string())
-}
+

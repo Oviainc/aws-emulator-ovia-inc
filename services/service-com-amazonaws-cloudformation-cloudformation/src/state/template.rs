@@ -19,6 +19,13 @@
 //!    parameters, its resources and the pseudo parameters, which is what
 //!    `DescribeStacks` reports as `Stack$Outputs`.
 //!
+//! Beside those three, [`process`] computes a body's PROCESSED stage — the document
+//! CloudFormation deploys and `GetTemplate(TemplateStage=Processed)` serves — by applying
+//! the transforms the template declares, under its own expansion bounds
+//! ([`MAX_EXPANDED_ENTRIES`], [`MAX_EXPANDED_BYTES`], [`MAX_EXPANSION_DEPTH`]). See the
+//! transform section further down for which transforms this service can apply and what it
+//! answers for the ones it cannot.
+//!
 //! A `Conditions` section decides what the stack HAS: a resource or an output the
 //! template declares under a condition that evaluates false is not part of it ("you can
 //! … create resources conditionally"), while a condition this module cannot evaluate
@@ -701,20 +708,6 @@ fn quota_violation_in(document: &Value) -> Option<String> {
             )
         })
     })
-}
-
-/// The template body as CloudFormation PROCESSED it: the expansion of the macros this
-/// emulator processes, spelled as a JSON template (one `serde_json::Value` represents
-/// either submitted spelling, so the processed form of a YAML body is its JSON
-/// equivalent).
-///
-/// `None` when the body declares no macro this emulator processes, which is the case
-/// `GetTemplate` documents as "if the template doesn't include transforms, Original and
-/// Processed return the same template": the caller answers the submitted body itself,
-/// byte for byte, rather than a re-serialisation of it.
-pub fn processed(body: &str) -> Option<String> {
-    let mut document = document(body)?;
-    super::sam::expand(&mut document).then(|| document.to_string())
 }
 
 /// The `Description` a template declares, if it declares one.
@@ -4440,6 +4433,12 @@ fn bounded(resolved: Resolved, budget: &mut Budget) -> Option<Resolved> {
 /// (`Fn::Equals`, `Fn::And`, `Fn::Or`, `Fn::Not`, `Condition`) are not values either:
 /// they are evaluated where CloudFormation allows them — the `Conditions` section and
 /// `Fn::If` — by [`boolean`].
+///
+/// `Fn::ToJsonString` and `Fn::Length` are the language-extensions DIRECTIVES, which
+/// [`process`] resolves in the processed stage: a deployment evaluates its outputs over
+/// that stage, so a template declaring `AWS::LanguageExtensions` has them resolved before
+/// this evaluator ever sees the document. In the stage that declares no transform they are
+/// not functions CloudFormation would resolve either, so they yield no value here.
 fn intrinsic(
     name: &str,
     argument: &Value,
@@ -5008,6 +5007,637 @@ fn substitute(
     budget.spend_text(rest.len())?;
     out.push_str(rest);
     (out.len() <= MAX_RESOLVED_TEXT_BYTES).then_some(out)
+}
+
+// ---------------------------------------------------------------------------
+// The TRANSFORM stage: the document CloudFormation deploys, and the one
+// `GetTemplate(TemplateStage=Processed)` serves.
+//
+// `GetTemplate` serves a template at a chosen stage — "To get the user-submitted template,
+// specify Original. To get the template after CloudFormation has processed all transforms,
+// specify Processed" — so a template that declares a transform has TWO stages, and the
+// processed one is what is deployed.
+//
+// Only ONE transform can be applied here: `AWS::LanguageExtensions`, whose directives are
+// rewrites of the template document itself and need nothing outside it. Every other
+// transform is a macro backed by a Lambda function (`CreateStackInput$Capabilities`: "Each
+// macro relies on an underlying Lambda service function for processing stack templates"),
+// which this emulator cannot run — so a template that declares one has NO processed stage
+// here, and the reads that would serve it say so rather than answering the unprocessed
+// document as if it had been processed.
+//
+// The stage is computed from the template as a DOCUMENT, read by the same JSON-or-YAML
+// reader every other path here uses, so whether a template can be processed (and therefore
+// deployed) does not depend on the spelling it was submitted in. It is SERVED as JSON:
+// `Original` is the submitted bytes, `Processed` is the expanded document.
+// ---------------------------------------------------------------------------
+
+/// The template member that declares the transforms to apply.
+const TRANSFORM: &str = "Transform";
+
+/// The one transform this service applies itself: AWS's language-extensions transform,
+/// whose directives (`Fn::ForEach`, `Fn::Length`, `Fn::ToJsonString`) are rewrites of the
+/// template document.
+pub const LANGUAGE_EXTENSIONS: &str = "AWS::LanguageExtensions";
+
+/// The loop directive's key prefix: `Fn::ForEach::<UniqueLoopName>`.
+const FOR_EACH_PREFIX: &str = "Fn::ForEach::";
+/// The directive that replaces itself with the number of items in a list.
+const FN_LENGTH: &str = "Fn::Length";
+/// The directive that replaces itself with the JSON text of its argument.
+const FN_TO_JSON_STRING: &str = "Fn::ToJsonString";
+/// `Fn::Sub`, whose template string is where a loop identifier is read inside a value.
+const FN_SUB: &str = "Fn::Sub";
+/// `Ref`, the other way a loop's output map reads the loop identifier.
+const REF_FUNCTION: &str = "Ref";
+
+/// How a transform declaration this service cannot read is named in the refusal that
+/// reports it.
+const UNREADABLE_TRANSFORM: &str = "a transform this service cannot read";
+
+/// The most entries the `Fn::ForEach` loops of ONE template may emit in total.
+///
+/// A loop's expansion is MULTIPLICATIVE — a loop nested in a loop runs once per outer item
+/// — so the submitted body's own byte bound does not bound the expansion: a tiny template
+/// can ask for a cross-product. This is the ceiling on that product, far above the
+/// documented [`MAX_RESOURCES_PER_TEMPLATE`] quota a real template expands towards, and a
+/// template that would pass it is reported as a stage this service cannot compute instead
+/// of being expanded.
+pub const MAX_EXPANDED_ENTRIES: usize = 10_000;
+
+/// The most bytes one template's expansion may materialise, counted before any copy is
+/// made: entries alone do not bound the work, because one entry can be a large subtree.
+/// Eight times the documented submitted-body maximum.
+pub const MAX_EXPANDED_BYTES: usize = 8 * super::TEMPLATE_BODY_MAX_BYTES;
+
+/// The deepest the expander descends into a template document.
+///
+/// Bounds the recursion in [`expand_directives`] and its helpers explicitly, rather than
+/// relying on the parser's own nesting limit: a document deeper than this is reported as a
+/// stage this service cannot compute. Set to the reader's own [`MAX_TEMPLATE_DEPTH`], so
+/// the two bounds state the same depth rather than one sitting unreachably above the
+/// other — a document the reader refuses never reaches the expander at all.
+pub const MAX_EXPANSION_DEPTH: usize = MAX_TEMPLATE_DEPTH;
+
+/// What one template's expansion may still spend.
+///
+/// Charged BEFORE each loop copies anything, so a template whose loops would cost more
+/// than the budget is refused instead of expanded: no allocation is made on account of
+/// work that is already over the ceiling.
+struct ExpansionBudget {
+    entries_left: usize,
+    bytes_left: usize,
+}
+
+impl ExpansionBudget {
+    const fn new() -> Self {
+        Self {
+            entries_left: MAX_EXPANDED_ENTRIES,
+            bytes_left: MAX_EXPANDED_BYTES,
+        }
+    }
+
+    /// Spend `entries` entries and `bytes` bytes of the budget, or refuse the whole
+    /// expansion. `what` names the directive being charged, for the refusal.
+    fn charge(&mut self, what: &str, entries: usize, bytes: usize) -> Result<(), String> {
+        if entries > self.entries_left || bytes > self.bytes_left {
+            return Err(format!(
+                "{what}: expanding this template would emit more than \
+                 {MAX_EXPANDED_ENTRIES} entries or {MAX_EXPANDED_BYTES} bytes"
+            ));
+        }
+        self.entries_left -= entries;
+        self.bytes_left -= bytes;
+        Ok(())
+    }
+}
+
+/// The refusal for a document deeper than [`MAX_EXPANSION_DEPTH`].
+fn too_deep() -> String {
+    format!("the template nests more than {MAX_EXPANSION_DEPTH} levels deep")
+}
+
+/// A template's `Processed` stage, as computed from the submitted body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Processed {
+    /// The template declares no transform this service has to apply, so "If the template
+    /// doesn't include transforms, Original and Processed return the same template" — the
+    /// submitted body, byte for byte.
+    Same,
+    /// Every declared transform was applied: this is the resulting document.
+    Applied(String),
+    /// A declared transform this service cannot apply, and why. Nothing is guessed: the
+    /// reads that serve the processed stage refuse instead.
+    Unavailable(String),
+}
+
+impl Processed {
+    /// The processed body of a stack whose submitted body is `original`, or `None` when
+    /// this service could not compute it.
+    pub fn body<'a>(&'a self, original: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Same => Some(original),
+            Self::Applied(body) => Some(body),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    /// Why the processed stage is unavailable, for the refusal that reports it.
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Unavailable(reason) => Some(reason),
+            Self::Same | Self::Applied(_) => None,
+        }
+    }
+}
+
+/// The names of the transforms a template BODY declares, read from the parsed document.
+///
+/// `Transform` is one name, a list of names, or a macro object (`{"Name": ...,
+/// "Parameters": ...}`) — or a list of those.
+///
+/// Read from the PARSED body, through the same JSON-or-YAML reader the rest of this module
+/// uses ([`document`]), so a transform declared in either spelling and in any form the
+/// parser accepts is seen — which is what both the `CAPABILITY_AUTO_EXPAND` refusal and
+/// the processed stage depend on. [`declared_transforms`] is the same reading of an
+/// ALREADY PARSED `Transform` section, for a caller that has the document in hand; this
+/// one additionally NAMES a declaration it cannot read, because a refusal has to report
+/// it.
+pub fn body_declared_transforms(body: &str) -> Vec<String> {
+    let Some(Value::Object(root)) = document(body) else {
+        return Vec::new();
+    };
+    root.get(TRANSFORM).map(transform_names).unwrap_or_default()
+}
+
+/// The transform names one `Transform` node declares.
+fn transform_names(node: &Value) -> Vec<String> {
+    match node {
+        Value::String(name) => vec![name.clone()],
+        Value::Array(items) => items.iter().flat_map(transform_names).collect(),
+        // A macro invoked with parameters: `{"Name": "MyMacro", "Parameters": {..}}`.
+        Value::Object(map) => match map.get("Name").and_then(Value::as_str) {
+            Some(name) => vec![name.to_string()],
+            // A declaration this service cannot read is still a declaration: it is named
+            // by its own text so the refusal can report it.
+            None => vec![UNREADABLE_TRANSFORM.to_string()],
+        },
+        _ => vec![UNREADABLE_TRANSFORM.to_string()],
+    }
+}
+
+/// The `Processed` stage of a submitted template body.
+///
+/// The transforms this service applies itself are AWS's own two: the SAM macro, whose
+/// expansion [`super::sam`] owns, and the language-extensions transform, whose directives
+/// are expanded here. Any OTHER declared transform is a macro backed by a Lambda function
+/// that runs outside this emulator, so the stage is reported UNAVAILABLE rather than
+/// computed from a macro nothing ran.
+pub fn process(body: &str) -> Processed {
+    // The documented submitted-body maximum, enforced here too: every handler checks it
+    // before storing a body, and this is the expander's own guard so no caller reaches the
+    // expansion with a body past that bound.
+    if body.len() > super::TEMPLATE_BODY_MAX_BYTES {
+        return Processed::Unavailable(format!(
+            "the template body exceeds {} bytes",
+            super::TEMPLATE_BODY_MAX_BYTES
+        ));
+    }
+    let declared = body_declared_transforms(body);
+    if declared.is_empty() {
+        return Processed::Same;
+    }
+    let unsupported: Vec<&str> = declared
+        .iter()
+        .map(String::as_str)
+        .filter(|name| *name != LANGUAGE_EXTENSIONS && *name != super::sam::TRANSFORM)
+        .collect();
+    if !unsupported.is_empty() {
+        return Processed::Unavailable(format!(
+            "the template declares the macro transform(s) [{}], which run as Lambda \
+             functions outside this emulator",
+            unsupported.join(", ")
+        ));
+    }
+    // The document itself, read through the same JSON-or-YAML reader every other path in
+    // this module uses, so the deployability of a template does not depend on the spelling
+    // it was submitted in. The processed stage is a DOCUMENT, not a re-spelling of the
+    // submitted text: it is serialised as JSON below whatever the body was spelled as,
+    // which is the form this service serves it in and deploys.
+    let Some(Value::Object(root)) = document(body) else {
+        return Processed::Unavailable(
+            "the template declares a transform and is not a document this service can read"
+                .to_string(),
+        );
+    };
+    let mut document = Value::Object(root);
+    // The SAM macro's expansion reads the `Transform` section itself, so it runs while that
+    // section is still there.
+    super::sam::expand(&mut document);
+    if let Some(sections) = document.as_object_mut() {
+        // The processed template is what CloudFormation deploys, and the transforms it
+        // declared have been applied by then: the member does not survive into it.
+        sections.remove(TRANSFORM);
+    }
+    let mut budget = ExpansionBudget::new();
+    if let Err(reason) = expand_directives(&mut document, &mut budget, 0) {
+        return Processed::Unavailable(reason);
+    }
+    // Serialised in KEY order, whatever map type `serde_json` was compiled with: see
+    // [`in_key_order`].
+    match ::serde_json::to_string(&in_key_order(document)) {
+        // The expansion is charged before it happens, so this is the belt to that brace:
+        // the document this service stores and serves is bounded whatever the directives
+        // were.
+        Ok(processed) if processed.len() > MAX_EXPANDED_BYTES => Processed::Unavailable(format!(
+            "the processed template would exceed {MAX_EXPANDED_BYTES} bytes"
+        )),
+        Ok(processed) => Processed::Applied(processed),
+        Err(error) => Processed::Unavailable(error.to_string()),
+    }
+}
+
+/// `value` with the members of every object in KEY order.
+///
+/// `serde_json`'s map type is chosen by a FEATURE any crate in the build may enable: with
+/// `preserve_order` it keeps insertion order, without it key order. The document this
+/// service serves may not depend on how the workspace happened to be compiled, so it is
+/// put in key order here — the order CloudFormation's own processed template comes back
+/// in.
+fn in_key_order(value: Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.into_iter().map(in_key_order).collect()),
+        Value::Object(map) => {
+            let mut members: Vec<(String, Value)> = map.into_iter().collect();
+            members.sort_by(|(left, _), (right, _)| left.cmp(right));
+            Value::Object(
+                members
+                    .into_iter()
+                    .map(|(key, member)| (key, in_key_order(member)))
+                    .collect(),
+            )
+        }
+        other => other,
+    }
+}
+
+/// One resource's `Properties` as the JSON document `StackEvent$ResourceProperties`
+/// carries ("BLOB of the properties used to create the resource"), in key order so the
+/// text does not depend on the build.
+pub fn properties_blob(properties: &Value) -> Option<String> {
+    if properties.is_null() {
+        return None;
+    }
+    ::serde_json::to_string(&in_key_order(properties.clone())).ok()
+}
+
+/// Apply the language-extensions directives in `node`, spending `budget` on what the loops
+/// copy and refusing below `depth`.
+///
+/// `Err(reason)` for a directive this service cannot resolve from the document alone, and
+/// for one that would cost more than the budget allows: nothing is guessed and nothing is
+/// expanded past the ceiling — the processed stage is reported unavailable rather than
+/// served half-expanded.
+fn expand_directives(
+    node: &mut Value,
+    budget: &mut ExpansionBudget,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_EXPANSION_DEPTH {
+        return Err(too_deep());
+    }
+    match node {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                expand_directives(item, budget, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            let mut expanded = Map::new();
+            for (key, mut value) in ::std::mem::take(map) {
+                match key.strip_prefix(FOR_EACH_PREFIX) {
+                    // A loop expands INTO the map that holds it, so its entries replace
+                    // the directive's own key.
+                    Some(loop_name) => {
+                        for (entry_key, entry_value) in
+                            expand_for_each(loop_name, &value, budget, depth + 1)?
+                        {
+                            insert_expanded(&mut expanded, entry_key, entry_value)?;
+                        }
+                    }
+                    None => {
+                        expand_directives(&mut value, budget, depth + 1)?;
+                        insert_expanded(&mut expanded, key, value)?;
+                    }
+                }
+            }
+            *map = expanded;
+            // The directives that REPLACE their own node, now their argument is expanded.
+            if let Some(replacement) = evaluate_directive(map, budget)? {
+                *node = replacement;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Insert one expanded entry, refusing a key that is already taken.
+///
+/// An expansion emits the KEYS its output map spells, and CloudFormation refuses a template
+/// that declares one logical id twice ("A duplicate logical ID was found"), so two entries
+/// claiming one key is a template this service will not expand — never a declaration
+/// silently dropped because another overwrote it.
+fn insert_expanded(
+    expanded: &mut Map<String, Value>,
+    key: String,
+    value: Value,
+) -> Result<(), String> {
+    if expanded.contains_key(&key) {
+        return Err(format!(
+            "the expansion would declare {key:?} more than once, which is a duplicate name \
+             in the processed template"
+        ));
+    }
+    expanded.insert(key, value);
+    Ok(())
+}
+
+/// One `Fn::ForEach::<loop_name>` loop's entries: the output map once per collection item,
+/// with the loop identifier resolved to that item.
+fn expand_for_each(
+    loop_name: &str,
+    node: &Value,
+    budget: &mut ExpansionBudget,
+    depth: usize,
+) -> Result<Vec<(String, Value)>, String> {
+    if depth > MAX_EXPANSION_DEPTH {
+        return Err(too_deep());
+    }
+    let malformed =
+        || format!("{FOR_EACH_PREFIX}{loop_name}: expected [Identifier, Collection, OutputMap]");
+    let Value::Array(parts) = node else {
+        return Err(malformed());
+    };
+    let [identifier, collection, output_map] = &parts[..] else {
+        return Err(malformed());
+    };
+    let (Value::String(identifier), Value::Object(output_map)) = (identifier, output_map) else {
+        return Err(malformed());
+    };
+    let mut collection = collection.clone();
+    expand_directives(&mut collection, budget, depth + 1)?;
+    let Value::Array(collection) = collection else {
+        return Err(format!(
+            "{FOR_EACH_PREFIX}{loop_name}: the collection is not a list this service can \
+             resolve from the template alone"
+        ));
+    };
+
+    // The text one instance of the output map starts from, and how many times this loop's
+    // identifier is READ in it — both ways: `${identifier}` inside a key or an `Fn::Sub`
+    // string, and a `{"Ref": "<identifier>"}` node that is replaced by the item whole.
+    // Substituting an item for either grows that text by at most the item's own JSON
+    // length, which is what makes the charge below cover what the copy will actually
+    // materialise.
+    let output_text = ::serde_json::to_string(output_map).unwrap_or_default();
+    let placeholder = format!("${{{identifier}}}");
+    // AWS's ForEach documents a second reference form, `&{Identifier}`, used where a
+    // logical id has to drop the collection value's non-alphanumeric characters. This
+    // service does not apply that form, and leaving it literal would emit ONE output key
+    // for every item of the collection, so the stage is reported unavailable instead of
+    // served with resources silently collapsed into one.
+    if output_text.contains(format!("&{{{identifier}}}").as_str()) {
+        return Err(format!(
+            "{FOR_EACH_PREFIX}{loop_name}: the &{{{identifier}}} form of the loop reference is \
+             not one this service can apply"
+        ));
+    }
+    let ref_node = format!("{{\"{REF_FUNCTION}\":\"{identifier}\"}}");
+    let reads = output_text
+        .matches(placeholder.as_str())
+        .count()
+        .saturating_add(output_text.matches(ref_node.as_str()).count());
+
+    let mut entries = Vec::new();
+    for item in &collection {
+        let Some(rendered) = rendered_item(item) else {
+            return Err(format!(
+                "{FOR_EACH_PREFIX}{loop_name}: a collection item is not a value a logical id \
+                 can be built from"
+            ));
+        };
+        // Charged BEFORE this item's copy is made, from the SUBSTITUTED size: nothing is
+        // allocated on account of work that is already over the ceiling. A loop nested
+        // inside this one charges the same budget again, so the PRODUCT of the nesting is
+        // what the ceiling bounds. The item's JSON spelling is its text plus its quotes.
+        budget.charge(
+            &format!("{FOR_EACH_PREFIX}{loop_name}"),
+            output_map.len(),
+            output_text
+                .len()
+                .saturating_add(reads.saturating_mul(rendered.len().saturating_add(2))),
+        )?;
+        let mut instance = Map::new();
+        for (key, value) in output_map {
+            let mut value = value.clone();
+            substitute_identifier(&mut value, &placeholder, item, &rendered, depth + 1)?;
+            // Through the duplicate-refusing helper, like every other entry this expansion
+            // emits: two keys of ONE output map can collide after substitution too, and a
+            // declaration is never dropped because another overwrote it.
+            insert_expanded(&mut instance, key.replace(&placeholder, &rendered), value)?;
+        }
+        // Expanded only now: a nested loop or an `Fn::Length` inside the output map is
+        // resolved against THIS item's substitutions.
+        let mut instance = Value::Object(instance);
+        expand_directives(&mut instance, budget, depth + 1)?;
+        let Value::Object(instance) = instance else {
+            return Err(malformed());
+        };
+        entries.extend(instance);
+    }
+    Ok(entries)
+}
+
+/// Resolve one loop identifier inside an output map's value: `{"Ref": "<identifier>"}`
+/// becomes the item, and `${<identifier>}` inside an `Fn::Sub` template string becomes the
+/// item's text. Refuses below [`MAX_EXPANSION_DEPTH`], like the expander itself.
+fn substitute_identifier(
+    node: &mut Value,
+    placeholder: &str,
+    item: &Value,
+    rendered: &str,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_EXPANSION_DEPTH {
+        return Err(too_deep());
+    }
+    match node {
+        Value::Array(items) => {
+            for value in items.iter_mut() {
+                substitute_identifier(value, placeholder, item, rendered, depth + 1)?;
+            }
+        }
+        Value::Object(map) => {
+            if map.len() == 1
+                && map
+                    .get(REF_FUNCTION)
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| format!("${{{name}}}") == placeholder)
+            {
+                *node = item.clone();
+                return Ok(());
+            }
+            let mut substituted = Map::new();
+            for (key, mut value) in ::std::mem::take(map) {
+                if key == FN_SUB {
+                    // `Fn::Sub` is where a value reads the loop identifier, in either
+                    // documented form: the bare template string, or the two-argument
+                    // `["<template>", {<variables>}]` whose first element is that string
+                    // and whose variable map may read the identifier too.
+                    match &mut value {
+                        Value::String(text) => *text = text.replace(placeholder, rendered),
+                        Value::Array(items) => {
+                            if let Some(Value::String(text)) = items.first_mut() {
+                                *text = text.replace(placeholder, rendered);
+                            }
+                            for variables in items.iter_mut().skip(1) {
+                                substitute_identifier(
+                                    variables,
+                                    placeholder,
+                                    item,
+                                    rendered,
+                                    depth + 1,
+                                )?;
+                            }
+                        }
+                        other => {
+                            substitute_identifier(other, placeholder, item, rendered, depth + 1)?
+                        }
+                    }
+                } else {
+                    substitute_identifier(&mut value, placeholder, item, rendered, depth + 1)?;
+                }
+                // The same refusal the expansion's own inserts follow: substituting the
+                // identifier into a nested key must not collapse two members into one.
+                insert_expanded(&mut substituted, key.replace(placeholder, rendered), value)?;
+            }
+            *map = substituted;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The value a language-extensions directive replaces its own node with, or `None` when
+/// this map is not one.
+fn evaluate_directive(
+    map: &Map<String, Value>,
+    budget: &mut ExpansionBudget,
+) -> Result<Option<Value>, String> {
+    // An intrinsic function is a single-member object, so a map with any other member
+    // beside it is a plain template fragment.
+    if map.len() != 1 {
+        return Ok(None);
+    }
+    let Some((name, argument)) = map.iter().next() else {
+        return Ok(None);
+    };
+    match name.as_str() {
+        FN_LENGTH => {
+            let Value::Array(items) = argument else {
+                return Err(format!(
+                    "{FN_LENGTH}: the argument is not a list this service can count from the \
+                     template alone"
+                ));
+            };
+            Ok(Some(Value::from(items.len())))
+        }
+        FN_TO_JSON_STRING => {
+            if holds_intrinsic(argument, 0) {
+                return Err(format!(
+                    "{FN_TO_JSON_STRING}: the argument still holds an intrinsic function this \
+                     service cannot resolve from the template alone"
+                ));
+            }
+            // Charged BEFORE the text is produced, from an upper bound computed without
+            // building it: this directive renders a document INTO a string, which escapes
+            // every quote and backslash, so one nested inside another would otherwise
+            // double its own input per level with nothing to stop it.
+            budget.charge(FN_TO_JSON_STRING, 1, escaped_size_bound(argument))?;
+            // Rendered in KEY order, like the processed document itself: see
+            // [`in_key_order`].
+            ::serde_json::to_string(&in_key_order(argument.clone()))
+                .map(|text| Some(Value::String(text)))
+                .map_err(|error| error.to_string())
+        }
+        _ => Ok(None),
+    }
+}
+
+/// An upper bound on the bytes rendering `node` into a JSON STRING costs, computed without
+/// building either: the document's own worst-case length, then doubled for the escaping a
+/// string spelling applies to it, plus its quotes.
+fn escaped_size_bound(node: &Value) -> usize {
+    json_size_bound(node, 0)
+        .saturating_mul(2)
+        .saturating_add(2)
+}
+
+/// An upper bound on `serde_json::to_string(node)`'s length, walked without allocating.
+///
+/// Every byte of a string can need escaping, so a string counts double; a subtree deeper
+/// than [`MAX_EXPANSION_DEPTH`] counts as unbounded, which refuses the directive that
+/// asked for it rather than walking further.
+fn json_size_bound(node: &Value, depth: usize) -> usize {
+    if depth > MAX_EXPANSION_DEPTH {
+        return usize::MAX;
+    }
+    match node {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(number) => number.to_string().len(),
+        Value::String(text) => text.len().saturating_mul(2).saturating_add(2),
+        Value::Array(items) => items.iter().fold(2, |sum, item| {
+            sum.saturating_add(json_size_bound(item, depth + 1))
+                .saturating_add(1)
+        }),
+        Value::Object(map) => map.iter().fold(2, |sum, (key, value)| {
+            sum.saturating_add(key.len().saturating_mul(2).saturating_add(4))
+                .saturating_add(json_size_bound(value, depth + 1))
+                .saturating_add(1)
+        }),
+    }
+}
+
+/// Whether `node` still holds an intrinsic function — a `Ref` or an `Fn::*` member — so a
+/// directive that needs a fully resolved argument knows it has not got one.
+///
+/// A subtree deeper than [`MAX_EXPANSION_DEPTH`] is reported as unresolved rather than
+/// walked further, which refuses the directive that asked.
+fn holds_intrinsic(node: &Value, depth: usize) -> bool {
+    if depth > MAX_EXPANSION_DEPTH {
+        return true;
+    }
+    match node {
+        Value::Array(items) => items.iter().any(|item| holds_intrinsic(item, depth + 1)),
+        Value::Object(map) => map.iter().any(|(key, value)| {
+            key == REF_FUNCTION || key.starts_with("Fn::") || holds_intrinsic(value, depth + 1)
+        }),
+        _ => false,
+    }
+}
+
+/// One collection item as the text a logical id or an `Fn::Sub` string is built from. A
+/// list or an object is not such a value, which is what `None` reports.
+fn rendered_item(item: &Value) -> Option<String> {
+    match item {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
