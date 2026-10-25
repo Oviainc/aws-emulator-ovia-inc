@@ -59,10 +59,16 @@
 //!   service there is the resource ARN, and it is NOT always readable: the list
 //!   operation carries it in the `arn` query parameter, but tag and untag carry it in
 //!   the request BODY, which the `Service::can_handle` seam is not handed. So the family
-//!   resolves this space by endpoint prefix ONLY, uniformly for all three operations:
-//!   no member claims a `/tags` request that names no family endpoint, and the router
-//!   answers its terminal `404 UnknownService` rather than serving one of five claimants
-//!   arbitrarily or resolving the list call while leaving tag and untag unroutable.
+//!   resolves this space by a DECLARED OWNER
+//!   ([`CHIME_FAMILY_TAGGING_ENDPOINT`], read through
+//!   [`claims_shared_tagging_space`]), uniformly for all three operations: a request
+//!   that names a family endpoint is served by that endpoint, and one that names none is
+//!   served by the owner. That is answerable for ANY member's resource because the tags
+//!   do not live in one member's own state: they live in the ARN-keyed directory the
+//!   family shares ([`crate::chime_tags`]), so a tag written through whichever member
+//!   serves the write is read back by whichever member serves the read. A member that
+//!   still keeps its create-time tags in its own state has not been migrated onto that
+//!   directory yet.
 //!
 //! A shared segment this list MISSES keeps the behaviour it has today — several
 //! claimants, so the router's `AmbiguousService` — rather than being mis-routed: the
@@ -70,12 +76,9 @@
 //!
 //! Two follow-ups this rule leaves open, named here so neither is implicit:
 //!
-//! * the `/tags` space is reachable only at a family endpoint host, so a client pointed
-//!   at a bare emulator endpoint cannot reach `ListTagsForResource` / `TagResource` /
-//!   `UntagResource` for any family member. Giving the space a default owner, or
-//!   resolving the LIST call through [`crate::shared_path`] from its `arn` query
-//!   parameter, would answer it from one service instead of the router's
-//!   `404 UnknownService`;
+//! * the members other than the tagging owner answer the `/tags` space only at their own
+//!   endpoint host, and each of them still records the tags given at CREATE time in its
+//!   own state, so those tags are not yet visible to a tagging call;
 //! * the `/app-instances` and `/meetings` splits are stated here as literal segment
 //!   readers; [`crate::addresses_modeled_route`] derives the same answer from each
 //!   model's own routing table and should replace them.
@@ -146,6 +149,37 @@ pub const CHIME_TELEPHONY_SHARED_SEGMENTS: &[&str] = &[
 #[must_use]
 pub fn addresses_app_instance_space(path: &str) -> bool {
     crate::nth_path_segment(path, 0) == Some("app-instances")
+}
+
+/// The `endpointPrefix` of the family member that serves the generic `/tags` space for a
+/// request that names NO family endpoint host.
+///
+/// One fixed member, because the router needs exactly one claimant and nothing in such a
+/// request names a service: the write operations carry the resource ARN in the body. It is
+/// answerable for any member's resource because the tags live in the family's shared,
+/// ARN-keyed directory ([`crate::chime_tags`]) rather than in one member's own state, so
+/// every member that serves a tagging call gives the same answer; this one is named
+/// because the Chime SDK Identity model's `app-instance` is the resource the other SDK
+/// members' resources hang their ARNs off.
+pub const CHIME_FAMILY_TAGGING_ENDPOINT: &str = "identity-chime";
+
+/// Whether `path` is in the generic tagging space the five SDK models bind identically
+/// (`/tags`).
+#[must_use]
+pub fn addresses_shared_tagging_space(path: &str) -> bool {
+    crate::nth_path_segment(path, 0) == Some("tags")
+}
+
+/// Whether the member whose `endpointPrefix` is `own_endpoint_prefix` claims this
+/// `/tags` request when it names no family endpoint host: the one named by
+/// [`CHIME_FAMILY_TAGGING_ENDPOINT`] does, and no other.
+///
+/// Every member reads THIS predicate for the space, so the five claims cannot drift into
+/// zero or two claimants for it.
+#[must_use]
+pub fn claims_shared_tagging_space(parts: &Parts, own_endpoint_prefix: &str) -> bool {
+    addresses_shared_tagging_space(parts.uri.path())
+        && CHIME_FAMILY_TAGGING_ENDPOINT.eq_ignore_ascii_case(own_endpoint_prefix.trim())
 }
 
 /// Whether `path` addresses `/app-instances/{AppInstanceArn}/streaming-configurations` —
@@ -225,7 +259,8 @@ fn routes_to_the_family(parts: &Parts) -> bool {
 ///   the generated `crate::ROUTE_PATH_SEGMENTS`.
 /// * `claims_shared_space` — this service's claim on the path spaces the family shares
 ///   ([`CHIME_FAMILY_SHARED_SEGMENTS`]); `|_| false` for a member that publishes none of
-///   them, or that claims its share of one only at its own endpoint.
+///   them, or that claims its share of one only at its own endpoint. A member that binds
+///   the generic tagging routes passes [`claims_shared_tagging_space`] here.
 ///
 /// See this module's header for why the three conjuncts are in this order and what each
 /// one is grounded in.
@@ -358,5 +393,47 @@ mod tests {
                 "case {path:?}: expected it outside the shared telephony space, got true"
             );
         }
+    }
+
+    #[test]
+    fn the_shared_tagging_space_is_claimed_by_the_declared_owner_alone() {
+        // The three routes the five SDK models bind identically, and a path outside the
+        // space; each is offered to every member of the family in turn.
+        let routes = [
+            "/tags?arn=arn%3Aaws%3Achime%3Aus-east-1%3A000000000000%3Aapp-instance%2Fai1",
+            "/tags?operation=tag-resource",
+            "/tags?operation=untag-resource",
+        ];
+
+        for route in routes {
+            let parts = parts_for(route);
+            let claimants: Vec<&&str> = CHIME_FAMILY_ENDPOINT_PREFIXES
+                .iter()
+                .filter(|prefix| claims_shared_tagging_space(&parts, prefix))
+                .collect();
+            assert_eq!(
+                claimants.as_slice(),
+                [&CHIME_FAMILY_TAGGING_ENDPOINT],
+                "case {route:?}: expected exactly the declared tagging owner to claim it, \
+                 got {claimants:?}"
+            );
+        }
+
+        for outside in ["/app-instances", "/channels", "/tagsets", "/"] {
+            let parts = parts_for(outside);
+            assert!(
+                !claims_shared_tagging_space(&parts, CHIME_FAMILY_TAGGING_ENDPOINT),
+                "case {outside:?}: expected it outside the shared tagging space, got a claim"
+            );
+        }
+    }
+
+    /// A request's `Parts` for `path_and_query`, the only thing the claim predicates read.
+    fn parts_for(path_and_query: &str) -> Parts {
+        let request = http::Request::builder()
+            .uri(format!("https://localhost:9297{path_and_query}"))
+            .body(())
+            .expect("a well-formed request");
+        request.into_parts().0
     }
 }

@@ -2257,27 +2257,16 @@ impl ManagedCachePolicy {
         StoredCachePolicy {
             id: self.id.to_string(),
             config: self.to_config(),
-            last_modified_time: managed_cache_policy_last_modified(),
+            last_modified_time: managed_policy_last_modified(),
             etag: self.etag(),
         }
     }
 
-    /// The version token a read of this managed policy reports.
-    ///
-    /// DERIVED from the published id rather than minted: nothing changes a managed policy,
-    /// so its version is the same on every read and in every process, which a drawn token
-    /// could not be. It takes the shape every version token of this service takes
-    /// ([`is_version_token`]): `E` followed by [`ID_BODY_LEN`] characters of the id
-    /// alphabet, here the leading hex digits of the id.
+    /// The version token a read of this managed policy reports, derived from its published
+    /// id by the one rule every published policy's version follows
+    /// ([`managed_policy_etag`]).
     pub fn etag(&self) -> String {
-        let body: String = self
-            .id
-            .chars()
-            .filter(char::is_ascii_hexdigit)
-            .map(|digit| digit.to_ascii_uppercase())
-            .take(ID_BODY_LEN)
-            .collect();
-        format!("E{body}")
+        managed_policy_etag(self.id)
     }
 
     /// The configuration AWS published for this policy.
@@ -2328,19 +2317,36 @@ fn name_list(names: &'static [&'static str]) -> Option<(i32, Option<Vec<String>>
     ))
 }
 
-/// The instant every managed cache policy reports as its `LastModifiedTime`.
+/// The instant every policy AWS published reports as its `LastModifiedTime`.
 ///
-/// A managed policy belongs to AWS and no call in this account changes one, so the instant
-/// is FIXED rather than drawn from the clock: every read of the catalog, in any process,
-/// reports the same one. It is this service's own API version date
+/// A published policy belongs to AWS and no call in this account changes one, so the
+/// instant is FIXED rather than drawn from the clock: every read of a published catalog, in
+/// any process, reports the same one. It is this service's own API version date
 /// (`2020-05-31T00:00:00Z`), the earliest instant any policy of this API could have been
 /// published at.
-pub fn managed_cache_policy_last_modified() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(MANAGED_CACHE_POLICY_LAST_MODIFIED_UNIX_SECONDS)
+pub fn managed_policy_last_modified() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(MANAGED_POLICY_LAST_MODIFIED_UNIX_SECONDS)
+}
+
+/// The version token a read of a policy AWS published reports.
+///
+/// DERIVED from the published id rather than minted: nothing changes a published policy, so
+/// its version is the same on every read and in every process, which a drawn token could
+/// not be. It takes the shape every version token of this service takes
+/// ([`is_version_token`]): `E` followed by [`ID_BODY_LEN`] characters of the id alphabet,
+/// here the leading hex digits of the id.
+pub fn managed_policy_etag(id: &str) -> String {
+    let body: String = id
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|digit| digit.to_ascii_uppercase())
+        .take(ID_BODY_LEN)
+        .collect();
+    format!("E{body}")
 }
 
 /// `2020-05-31T00:00:00Z` in seconds since the Unix epoch.
-const MANAGED_CACHE_POLICY_LAST_MODIFIED_UNIX_SECONDS: u64 = 1_590_883_200;
+const MANAGED_POLICY_LAST_MODIFIED_UNIX_SECONDS: u64 = 1_590_883_200;
 
 /// The AWS-managed cache policies, in the order their ids sort in — the same total order
 /// every listing of this service pages through, so the catalog can be merged with the
@@ -2476,6 +2482,490 @@ pub const MANAGED_CACHE_POLICIES: &[ManagedCachePolicy] = &[
 /// an id AWS published from one this account minted.
 pub fn managed_cache_policy(id: &str) -> Option<&'static ManagedCachePolicy> {
     MANAGED_CACHE_POLICIES
+        .iter()
+        .find(|managed| managed.id == id)
+}
+
+/// The `OriginRequestPolicyType` a policy this ACCOUNT created carries — "custom – Returns
+/// only the custom policies created in your Amazon Web Services account". One of the two
+/// values the model's `OriginRequestPolicyType` enum admits.
+pub const ORIGIN_REQUEST_POLICY_TYPE_CUSTOM: &str = "custom";
+
+/// The `OriginRequestPolicyType` a policy AWS created carries — "managed – Returns only the
+/// managed policies created by Amazon Web Services". The other value the same enum admits.
+pub const ORIGIN_REQUEST_POLICY_TYPE_MANAGED: &str = "managed";
+
+/// One entry of the catalog of AWS-MANAGED origin request policies.
+///
+/// The same reference data [`ManagedCachePolicy`] holds for the cache policy family, for
+/// the origin request policy family: AWS creates these policies, every account has the same
+/// ones under the identifier and name AWS publishes for each, and nothing a caller does
+/// here creates, changes or removes one — so the catalog is STATIC data read beside the
+/// mutable store rather than a slice of it.
+///
+/// Each entry's identifier, name and settings are the ones Amazon publishes in the
+/// CloudFront Developer Guide ("Using the managed origin request policies"); the model
+/// itself carries no list of them (`smithy_query(query="shape",
+/// shape="OriginRequestPolicyType")` admits only the two type values), so the catalog is
+/// written out here.
+#[derive(Debug, Clone)]
+pub struct ManagedOriginRequestPolicy {
+    /// `OriginRequestPolicy$Id` — the identifier AWS publishes for this policy, the same in
+    /// every account.
+    pub id: &'static str,
+    /// `OriginRequestPolicyConfig$Name` — the name AWS publishes for this policy.
+    pub name: &'static str,
+    /// `OriginRequestPolicyConfig$Comment` — what the policy is for.
+    pub comment: &'static str,
+    /// A value of `OriginRequestPolicyHeaderBehavior`.
+    pub header_behavior: &'static str,
+    /// The headers the behaviour names, when it names a list.
+    pub headers: &'static [&'static str],
+    /// A value of `OriginRequestPolicyCookieBehavior`.
+    pub cookie_behavior: &'static str,
+    /// The cookies the behaviour names, when it names a list.
+    pub cookies: &'static [&'static str],
+    /// A value of `OriginRequestPolicyQueryStringBehavior`.
+    pub query_string_behavior: &'static str,
+    /// The query strings the behaviour names, when it names a list.
+    pub query_strings: &'static [&'static str],
+}
+
+impl ManagedOriginRequestPolicy {
+    /// The `OriginRequestPolicy` projection a read of this published policy reports: its
+    /// published identity beside the configuration AWS gave it.
+    pub fn to_origin_request_policy(&self) -> OriginRequestPolicy {
+        self.to_stored().to_origin_request_policy()
+    }
+
+    /// This catalog entry as an origin request policy RECORD, so every read of an origin
+    /// request policy answers a published policy exactly as it answers one this account
+    /// created — the two are the same resource kind, differing only in who created them.
+    pub fn to_stored(&self) -> StoredOriginRequestPolicy {
+        StoredOriginRequestPolicy {
+            id: self.id.to_string(),
+            config: self.to_config(),
+            last_modified_time: managed_policy_last_modified(),
+            etag: self.etag(),
+        }
+    }
+
+    /// The version token a read of this published policy reports, by the one rule every
+    /// published policy's version follows ([`managed_policy_etag`]).
+    pub fn etag(&self) -> String {
+        managed_policy_etag(self.id)
+    }
+
+    /// The configuration AWS published for this policy.
+    fn to_config(&self) -> OriginRequestPolicyConfig {
+        OriginRequestPolicyConfig {
+            comment: Some(self.comment.to_string()),
+            name: self.name.to_string(),
+            headers_config: crate::ops::types::OriginRequestPolicyHeadersConfig {
+                header_behavior: self.header_behavior.to_string(),
+                headers: name_list(self.headers)
+                    .map(|(quantity, items)| crate::ops::types::Headers { quantity, items }),
+            },
+            cookies_config: crate::ops::types::OriginRequestPolicyCookiesConfig {
+                cookie_behavior: self.cookie_behavior.to_string(),
+                cookies: name_list(self.cookies)
+                    .map(|(quantity, items)| crate::ops::types::CookieNames { quantity, items }),
+            },
+            query_strings_config: crate::ops::types::OriginRequestPolicyQueryStringsConfig {
+                query_string_behavior: self.query_string_behavior.to_string(),
+                query_strings: name_list(self.query_strings).map(|(quantity, items)| {
+                    crate::ops::types::QueryStringNames { quantity, items }
+                }),
+            },
+        }
+    }
+}
+
+/// The AWS-managed origin request policies, in the order their ids sort in — the same total
+/// order every listing of this service pages through, so the catalog can be merged with the
+/// account's own policies without re-sorting it.
+///
+/// Each entry's identifier, name and settings are the ones Amazon publishes for it (see
+/// [`ManagedOriginRequestPolicy`] for the source).
+pub const MANAGED_ORIGIN_REQUEST_POLICIES: &[ManagedOriginRequestPolicy] = &[
+    ManagedOriginRequestPolicy {
+        id: "216adef6-5c7f-47e4-b989-5492eafa07d3",
+        name: "Managed-AllViewer",
+        comment: "Policy to forward all parameters in viewer requests",
+        header_behavior: "allViewer",
+        headers: &[],
+        cookie_behavior: "all",
+        cookies: &[],
+        query_string_behavior: "all",
+        query_strings: &[],
+    },
+    ManagedOriginRequestPolicy {
+        id: "33f36d7e-f396-46d9-90e0-52428a34d9dc",
+        name: "Managed-AllViewerAndCloudFrontHeaders-2022-06",
+        comment: "Policy to forward all parameters in viewer requests and all CloudFront \
+                  headers added through 2022-06",
+        header_behavior: "allViewerAndWhitelistCloudFront",
+        headers: &[
+            "CloudFront-Forwarded-Proto",
+            "CloudFront-Is-Android-Viewer",
+            "CloudFront-Is-Desktop-Viewer",
+            "CloudFront-Is-IOS-Viewer",
+            "CloudFront-Is-Mobile-Viewer",
+            "CloudFront-Is-SmartTV-Viewer",
+            "CloudFront-Is-Tablet-Viewer",
+            "CloudFront-Viewer-ASN",
+            "CloudFront-Viewer-Address",
+            "CloudFront-Viewer-City",
+            "CloudFront-Viewer-Country",
+            "CloudFront-Viewer-Country-Name",
+            "CloudFront-Viewer-Country-Region",
+            "CloudFront-Viewer-Country-Region-Name",
+            "CloudFront-Viewer-Http-Version",
+            "CloudFront-Viewer-Latitude",
+            "CloudFront-Viewer-Longitude",
+            "CloudFront-Viewer-Metro-Code",
+            "CloudFront-Viewer-Postal-Code",
+            "CloudFront-Viewer-TLS",
+            "CloudFront-Viewer-Time-Zone",
+        ],
+        cookie_behavior: "all",
+        cookies: &[],
+        query_string_behavior: "all",
+        query_strings: &[],
+    },
+    ManagedOriginRequestPolicy {
+        id: "59781a5b-3903-41f3-afcb-af62929ccde1",
+        name: "Managed-CORS-CustomOrigin",
+        comment: "Policy to forward the Origin header, for CORS requests to a custom origin",
+        header_behavior: "whitelist",
+        headers: &["Origin"],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
+    ManagedOriginRequestPolicy {
+        id: "775133bc-15f2-49f9-abea-afb2e0bf67d2",
+        name: "Managed-Elemental-MediaTailor-PersonalizedManifests",
+        comment: "Policy for an AWS Elemental MediaTailor origin serving personalized \
+                  manifests",
+        header_behavior: "whitelist",
+        headers: &[
+            "Origin",
+            "Access-Control-Request-Headers",
+            "Access-Control-Request-Method",
+            "User-Agent",
+            "X-Forwarded-For",
+        ],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "all",
+        query_strings: &[],
+    },
+    ManagedOriginRequestPolicy {
+        id: "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf",
+        name: "Managed-CORS-S3Origin",
+        comment: "Policy to forward the CORS request headers, for CORS requests to an \
+                  Amazon S3 origin",
+        header_behavior: "whitelist",
+        headers: &[
+            "Origin",
+            "Access-Control-Request-Headers",
+            "Access-Control-Request-Method",
+        ],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
+    ManagedOriginRequestPolicy {
+        id: "acba4595-bd28-49b8-b9fe-13317c0390fa",
+        name: "Managed-UserAgentRefererHeaders",
+        comment: "Policy to forward the User-Agent and Referer headers",
+        header_behavior: "whitelist",
+        headers: &["User-Agent", "Referer"],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
+    ManagedOriginRequestPolicy {
+        id: "b689b0a8-53d0-40ab-baf2-68738e2966ac",
+        name: "Managed-AllViewerExceptHostHeader",
+        comment: "Policy to forward all parameters in viewer requests except for the Host \
+                  header",
+        header_behavior: "allExcept",
+        headers: &["host"],
+        cookie_behavior: "all",
+        cookies: &[],
+        query_string_behavior: "all",
+        query_strings: &[],
+    },
+];
+
+/// The managed origin request policy `id` names, or `None` when the catalog holds none —
+/// what tells an id AWS published from one this account minted.
+pub fn managed_origin_request_policy(id: &str) -> Option<&'static ManagedOriginRequestPolicy> {
+    MANAGED_ORIGIN_REQUEST_POLICIES
+        .iter()
+        .find(|managed| managed.id == id)
+}
+
+/// The `ResponseHeadersPolicyType` a policy this ACCOUNT created carries — the custom
+/// policies "created in your Amazon Web Services account". One of the two values the
+/// model's `ResponseHeadersPolicyType` enum admits.
+pub const RESPONSE_HEADERS_POLICY_TYPE_CUSTOM: &str = "custom";
+
+/// The `ResponseHeadersPolicyType` a policy AWS created carries — the managed policies
+/// "created by Amazon Web Services". The other value the same enum admits.
+pub const RESPONSE_HEADERS_POLICY_TYPE_MANAGED: &str = "managed";
+
+/// The CORS settings a published response headers policy carries, when it carries any.
+///
+/// Every member here is one of `ResponseHeadersPolicyCorsConfig`'s; a policy that states no
+/// CORS behaviour at all carries no `CorsConfig` element rather than an empty one.
+#[derive(Debug, Clone)]
+pub struct ManagedCorsSettings {
+    /// `AccessControlAllowOrigins$Items` — the origins the policy allows.
+    pub allow_origins: &'static [&'static str],
+    /// `AccessControlAllowHeaders$Items` — the request headers the policy allows.
+    pub allow_headers: &'static [&'static str],
+    /// `AccessControlAllowMethods$Items` — the methods the policy allows, each a value of
+    /// `ResponseHeadersPolicyAccessControlAllowMethodsValues`.
+    pub allow_methods: &'static [&'static str],
+    /// `AccessControlAllowCredentials`.
+    pub allow_credentials: bool,
+    /// `AccessControlMaxAgeSec`, in seconds, for a policy that answers preflight requests.
+    pub max_age_seconds: Option<i32>,
+    /// `OriginOverride` — whether CloudFront overrides a header the origin already set.
+    pub origin_override: bool,
+}
+
+/// One entry of the catalog of AWS-MANAGED response headers policies.
+///
+/// The same reference data [`ManagedCachePolicy`] holds for the cache policy family, for
+/// the response headers policy family: AWS creates these policies, every account has the
+/// same ones under the identifier and name AWS publishes for each, and nothing a caller
+/// does here creates, changes or removes one.
+///
+/// Each entry's identifier, name and settings are the ones Amazon publishes in the
+/// CloudFront Developer Guide ("Using the managed response headers policies").
+#[derive(Debug, Clone)]
+pub struct ManagedResponseHeadersPolicy {
+    /// `ResponseHeadersPolicy$Id` — the identifier AWS publishes for this policy, the same
+    /// in every account.
+    pub id: &'static str,
+    /// `ResponseHeadersPolicyConfig$Name` — the name AWS publishes for this policy.
+    pub name: &'static str,
+    /// `ResponseHeadersPolicyConfig$Comment` — what the policy is for.
+    pub comment: &'static str,
+    /// The policy's `CorsConfig`, or `None` for a policy that states no CORS behaviour.
+    pub cors: Option<ManagedCorsSettings>,
+    /// Whether the policy carries the published security headers
+    /// ([`managed_security_headers_config`]). The published policies that add security
+    /// headers all add the SAME set, so the set is one constant here rather than repeated
+    /// per entry.
+    pub security_headers: bool,
+}
+
+impl ManagedResponseHeadersPolicy {
+    /// The `ResponseHeadersPolicy` projection a read of this published policy reports.
+    pub fn to_response_headers_policy(&self) -> ResponseHeadersPolicy {
+        self.to_stored().to_response_headers_policy()
+    }
+
+    /// This catalog entry as a response headers policy RECORD, so every read of a response
+    /// headers policy answers a published policy exactly as it answers one this account
+    /// created.
+    pub fn to_stored(&self) -> StoredResponseHeadersPolicy {
+        StoredResponseHeadersPolicy {
+            id: self.id.to_string(),
+            config: self.to_config(),
+            last_modified_time: managed_policy_last_modified(),
+            etag: self.etag(),
+        }
+    }
+
+    /// The version token a read of this published policy reports, by the one rule every
+    /// published policy's version follows ([`managed_policy_etag`]).
+    pub fn etag(&self) -> String {
+        managed_policy_etag(self.id)
+    }
+
+    /// The configuration AWS published for this policy.
+    fn to_config(&self) -> ResponseHeadersPolicyConfig {
+        ResponseHeadersPolicyConfig {
+            comment: Some(self.comment.to_string()),
+            name: self.name.to_string(),
+            cors_config: self.cors.as_ref().map(|cors| {
+                crate::ops::types::ResponseHeadersPolicyCorsConfig {
+                    access_control_allow_origins:
+                        crate::ops::types::ResponseHeadersPolicyAccessControlAllowOrigins {
+                            quantity: i32::try_from(cors.allow_origins.len()).unwrap_or(i32::MAX),
+                            items: cors
+                                .allow_origins
+                                .iter()
+                                .map(|origin| (*origin).to_string())
+                                .collect(),
+                        },
+                    access_control_allow_headers:
+                        crate::ops::types::ResponseHeadersPolicyAccessControlAllowHeaders {
+                            quantity: i32::try_from(cors.allow_headers.len()).unwrap_or(i32::MAX),
+                            items: cors
+                                .allow_headers
+                                .iter()
+                                .map(|header| (*header).to_string())
+                                .collect(),
+                        },
+                    access_control_allow_methods:
+                        crate::ops::types::ResponseHeadersPolicyAccessControlAllowMethods {
+                            quantity: i32::try_from(cors.allow_methods.len()).unwrap_or(i32::MAX),
+                            items: cors
+                                .allow_methods
+                                .iter()
+                                .map(|method| (*method).to_string())
+                                .collect(),
+                        },
+                    access_control_allow_credentials: cors.allow_credentials,
+                    // A policy that exposes no response header to script carries no
+                    // `AccessControlExposeHeaders` element at all, rather than an empty one.
+                    access_control_expose_headers: None,
+                    access_control_max_age_sec: cors.max_age_seconds,
+                    origin_override: cors.origin_override,
+                }
+            }),
+            security_headers_config: if self.security_headers {
+                Some(managed_security_headers_config())
+            } else {
+                None
+            },
+            // The published policies state no server-timing, custom or removed headers, so
+            // those elements are absent rather than empty.
+            server_timing_headers_config: None,
+            custom_headers_config: None,
+            remove_headers_config: None,
+        }
+    }
+}
+
+/// The security headers every published policy that adds them adds: the set Amazon
+/// publishes for `Managed-SecurityHeadersPolicy`, which the combined CORS-and-security
+/// policies carry unchanged.
+pub fn managed_security_headers_config() -> crate::ops::types::ResponseHeadersPolicySecurityHeadersConfig
+{
+    crate::ops::types::ResponseHeadersPolicySecurityHeadersConfig {
+        xss_protection: Some(crate::ops::types::ResponseHeadersPolicyXSSProtection {
+            r#override: false,
+            protection: true,
+            mode_block: Some(true),
+            report_uri: None,
+        }),
+        frame_options: Some(crate::ops::types::ResponseHeadersPolicyFrameOptions {
+            r#override: false,
+            frame_option: "SAMEORIGIN".to_string(),
+        }),
+        referrer_policy: Some(crate::ops::types::ResponseHeadersPolicyReferrerPolicy {
+            r#override: false,
+            referrer_policy: "strict-origin-when-cross-origin".to_string(),
+        }),
+        // The published policy states no Content-Security-Policy: the directives belong to
+        // the application, so AWS leaves that header to a policy the account writes.
+        content_security_policy: None,
+        content_type_options: Some(crate::ops::types::ResponseHeadersPolicyContentTypeOptions {
+            r#override: false,
+        }),
+        strict_transport_security: Some(
+            crate::ops::types::ResponseHeadersPolicyStrictTransportSecurity {
+                r#override: false,
+                include_subdomains: Some(true),
+                preload: Some(false),
+                access_control_max_age_sec: MANAGED_STRICT_TRANSPORT_SECURITY_MAX_AGE_SECONDS,
+            },
+        ),
+    }
+}
+
+/// `Strict-Transport-Security`'s `max-age` in the published security headers: one year, the
+/// value Amazon publishes for `Managed-SecurityHeadersPolicy`.
+const MANAGED_STRICT_TRANSPORT_SECURITY_MAX_AGE_SECONDS: i32 = 31_536_000;
+
+/// `Access-Control-Max-Age` in the published policies that answer preflight requests, the
+/// value Amazon publishes for them.
+const MANAGED_CORS_PREFLIGHT_MAX_AGE_SECONDS: i32 = 600;
+
+/// The CORS settings the published policies that allow a SIMPLE cross-origin request carry:
+/// any origin, any request header, and the methods a simple request uses.
+const MANAGED_SIMPLE_CORS: ManagedCorsSettings = ManagedCorsSettings {
+    allow_origins: &["*"],
+    allow_headers: &["*"],
+    allow_methods: &["GET", "HEAD", "POST"],
+    allow_credentials: false,
+    max_age_seconds: None,
+    origin_override: true,
+};
+
+/// The CORS settings the published policies that also answer PREFLIGHT requests carry: any
+/// origin, any request header, every method, and the published `Access-Control-Max-Age`.
+const MANAGED_PREFLIGHT_CORS: ManagedCorsSettings = ManagedCorsSettings {
+    allow_origins: &["*"],
+    allow_headers: &["*"],
+    allow_methods: &["ALL"],
+    allow_credentials: false,
+    max_age_seconds: Some(MANAGED_CORS_PREFLIGHT_MAX_AGE_SECONDS),
+    origin_override: true,
+};
+
+/// The AWS-managed response headers policies, in the order their ids sort in — the same
+/// total order every listing of this service pages through.
+///
+/// Each entry's identifier, name and settings are the ones Amazon publishes for it (see
+/// [`ManagedResponseHeadersPolicy`] for the source).
+pub const MANAGED_RESPONSE_HEADERS_POLICIES: &[ManagedResponseHeadersPolicy] = &[
+    ManagedResponseHeadersPolicy {
+        id: "5cc3b908-e619-4b99-88e5-2cf7f45965bd",
+        name: "Managed-CORS-With-Preflight",
+        comment: "Allows CORS requests from any origin, including preflight requests",
+        cors: Some(MANAGED_PREFLIGHT_CORS),
+        security_headers: false,
+    },
+    ManagedResponseHeadersPolicy {
+        id: "60669652-455b-4ae9-85a4-c4c02393f86c",
+        name: "Managed-SimpleCORS",
+        comment: "Allows simple CORS requests from any origin",
+        cors: Some(MANAGED_SIMPLE_CORS),
+        security_headers: false,
+    },
+    ManagedResponseHeadersPolicy {
+        id: "67f7725c-6f97-4210-82d7-5512b31e9d03",
+        name: "Managed-SecurityHeadersPolicy",
+        comment: "Adds a set of security headers to every response",
+        cors: None,
+        security_headers: true,
+    },
+    ManagedResponseHeadersPolicy {
+        id: "e61eb345-f6c1-4b97-f0d2-0bdcb2b0b6d3",
+        name: "Managed-CORS-and-SecurityHeadersPolicy",
+        comment: "Allows simple CORS requests from any origin and adds a set of security \
+                  headers to every response",
+        cors: Some(MANAGED_SIMPLE_CORS),
+        security_headers: true,
+    },
+    ManagedResponseHeadersPolicy {
+        id: "eaab4381-ed33-4a86-88ca-d9558dc6cd63",
+        name: "Managed-CORS-with-preflight-and-SecurityHeadersPolicy",
+        comment: "Allows CORS requests from any origin, including preflight requests, and \
+                  adds a set of security headers to every response",
+        cors: Some(MANAGED_PREFLIGHT_CORS),
+        security_headers: true,
+    },
+];
+
+/// The managed response headers policy `id` names, or `None` when the catalog holds none —
+/// what tells an id AWS published from one this account minted.
+pub fn managed_response_headers_policy(
+    id: &str,
+) -> Option<&'static ManagedResponseHeadersPolicy> {
+    MANAGED_RESPONSE_HEADERS_POLICIES
         .iter()
         .find(|managed| managed.id == id)
 }
@@ -2937,8 +3427,29 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     }
 
     /// The response headers policy `id` names, or `None` when the store holds none.
+    ///
+    /// The ACCOUNT's own policies only — what a mutation addresses, since nothing in this
+    /// account changes a policy AWS published. A READ addresses both, through
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::readable_response_headers_policy`].
     pub fn response_headers_policy(&self, id: &str) -> Option<&StoredResponseHeadersPolicy> {
         self.response_headers_policies.get(id)
+    }
+
+    /// The response headers policy `id` names wherever it came from: one this account
+    /// created with `CreateResponseHeadersPolicy`, or one AWS published
+    /// ([`MANAGED_RESPONSE_HEADERS_POLICIES`]).
+    ///
+    /// The same rule [`Self::readable_cache_policy`] states for the cache policy family.
+    pub fn readable_response_headers_policy(
+        &self,
+        id: &str,
+    ) -> Option<Cow<'_, StoredResponseHeadersPolicy>> {
+        match self.response_headers_policies.get(id) {
+            Some(stored) => Some(Cow::Borrowed(stored)),
+            None => {
+                managed_response_headers_policy(id).map(|managed| Cow::Owned(managed.to_stored()))
+            }
+        }
     }
 
     /// The response headers policy whose STORED configuration carries `name`, or `None`.
@@ -3013,8 +3524,31 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     }
 
     /// The origin request policy `id` names, or `None` when the store holds none.
+    ///
+    /// The ACCOUNT's own policies only — what a mutation addresses, since nothing in this
+    /// account changes a policy AWS published. A READ addresses both, through
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::readable_origin_request_policy`].
     pub fn origin_request_policy(&self, id: &str) -> Option<&StoredOriginRequestPolicy> {
         self.origin_request_policies.get(id)
+    }
+
+    /// The origin request policy `id` names wherever it came from: one this account created
+    /// with `CreateOriginRequestPolicy`, or one AWS published
+    /// ([`MANAGED_ORIGIN_REQUEST_POLICIES`]).
+    ///
+    /// The same rule [`Self::readable_cache_policy`] states for the cache policy family: an
+    /// origin request policy id addresses ONE policy whichever of the two created it, so
+    /// every read of a policy by id resolves both and an id outside both names no policy at
+    /// all. The account's store is consulted first, so a record it holds is always what
+    /// answers.
+    pub fn readable_origin_request_policy(
+        &self,
+        id: &str,
+    ) -> Option<Cow<'_, StoredOriginRequestPolicy>> {
+        match self.origin_request_policies.get(id) {
+            Some(stored) => Some(Cow::Borrowed(stored)),
+            None => managed_origin_request_policy(id).map(|managed| Cow::Owned(managed.to_stored())),
+        }
     }
 
     /// The cache policy `id` names, or `None` when the store holds none.
@@ -6372,6 +6906,44 @@ pub fn no_such_response_headers_policy() -> NoSuchResponseHeadersPolicy {
         message: Some(NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE.to_string()),
     }
 }
+
+/// The modelled `InvalidArgument` (HTTP 400) for a `ListResponseHeadersPolicies` `Marker`
+/// that is no resume point this service handed out.
+///
+/// ONE CONSTANT for the condition, for the same reason [`invalid_cache_policy_marker`] is
+/// one: what the refusal states is the CONSTRAINT on the parameter — a marker is a response
+/// headers policy id — which is a property of the parameter rather than of the value
+/// submitted, so nothing from the request belongs in the text.
+pub fn invalid_response_headers_policy_marker() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_RESPONSE_HEADERS_POLICY_MARKER_MESSAGE.to_string()),
+    }
+}
+
+/// The message `ListResponseHeadersPolicies` refuses an unusable `Marker` with, in the form
+/// this service states the constraint in ([`INVALID_CACHE_POLICY_MARKER_MESSAGE`] states the
+/// same one for the cache policy family).
+pub const INVALID_RESPONSE_HEADERS_POLICY_MARKER_MESSAGE: &str =
+    "Marker must be a valid CF response headers policy Id";
+
+/// The modelled `IllegalUpdate` (HTTP 400) for an update that would move a resource's
+/// `CallerReference` onto another value.
+///
+/// A `CallerReference` "uniquely identifies a request to create a resource" and names that
+/// resource for its whole life, so no update changes one — whichever resource is being
+/// updated. The sentence states that rule and NOTHING from the request or the stored
+/// record: it is the one fixed sentence the service refuses this modification with, so
+/// every refusal of it reads the same.
+pub fn illegal_update_caller_reference() -> crate::ops::types::IllegalUpdate {
+    crate::ops::types::IllegalUpdate {
+        message: Some(ILLEGAL_UPDATE_CALLER_REFERENCE_MESSAGE.to_string()),
+    }
+}
+
+/// `IllegalUpdate`'s message for an update that would change a `CallerReference`, on the
+/// wire.
+pub const ILLEGAL_UPDATE_CALLER_REFERENCE_MESSAGE: &str =
+    "You cannot update the value of CallerReference.";
 
 /// The modelled `MonitoringSubscriptionAlreadyExists` (HTTP 409) for a distribution that
 /// already carries a monitoring subscription.

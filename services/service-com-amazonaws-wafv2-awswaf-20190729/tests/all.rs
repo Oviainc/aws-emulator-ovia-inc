@@ -25,6 +25,8 @@ mod exception_messages;
 mod firewall_manager_rule_groups;
 #[path = "all/get_web_acl_for_resource.rs"]
 mod get_web_acl_for_resource;
+#[path = "all/invalid_permission_policy_message.rs"]
+mod invalid_permission_policy_message;
 #[path = "all/ip_set_listing.rs"]
 mod ip_set_listing;
 #[path = "all/ip_set_mutations.rs"]

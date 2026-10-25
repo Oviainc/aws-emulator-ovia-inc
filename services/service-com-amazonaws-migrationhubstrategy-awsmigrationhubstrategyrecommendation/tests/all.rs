@@ -26,6 +26,9 @@ mod application_component_listing;
 #[path = "all/application_component_strategies.rs"]
 mod application_component_strategies;
 
+#[path = "all/assessment_analysis.rs"]
+mod assessment_analysis;
+
 #[path = "all/assessment_error_paths.rs"]
 mod assessment_error_paths;
 

@@ -40,7 +40,7 @@ use service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test's SigV4 credential scope names.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// Room for the emulator's own scheduling on top of a span the clock owes, so a wait
 /// for a due transition is not a race.
@@ -48,7 +48,7 @@ const SETTLE_MARGIN: Duration = Duration::from_millis(150);
 
 /// An emulator holding only this service, with the engine it was built on, so the suite
 /// can admit a query the way the still-scaffolded `ExecuteQuery` will.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
@@ -60,7 +60,7 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 /// `graph_identifier` is sent as the `graphIdentifier` header, which is where the model
 /// binds it for the query operations (`smithy_query(query="operation",
 /// operation="CancelQuery,GetQuery")`: `httpHeader: graphIdentifier`).
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -98,7 +98,7 @@ async fn call(
 }
 
 /// `GET /queries/{queryId}` on one graph.
-async fn get_query(
+pub(crate) async fn get_query(
     router: &MultiServiceRouter,
     graph_identifier: &str,
     query_id: &str,
@@ -114,7 +114,7 @@ async fn get_query(
 }
 
 /// `DELETE /queries/{queryId}` on one graph.
-async fn cancel_query(
+pub(crate) async fn cancel_query(
     router: &MultiServiceRouter,
     graph_identifier: &str,
     query_id: &str,
@@ -130,7 +130,7 @@ async fn cancel_query(
 }
 
 /// The wire error code of a failure body (`__type`), without its namespace.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_default()
@@ -141,7 +141,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// Create a graph and wait until it is serving, returning its id.
-async fn graph_in_service(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn graph_in_service(router: &MultiServiceRouter, name: &str) -> String {
     let (status, created) = call(
         router,
         "POST",
@@ -174,7 +174,7 @@ async fn graph_in_service(router: &MultiServiceRouter, name: &str) -> String {
 
 /// Admit a query on `graph_id` the way `ExecuteQuery` will, in the state the case asks
 /// for.
-fn admit_query(
+pub(crate) fn admit_query(
     engine: &Arc<engine::InMemoryEngine>,
     graph_id: &str,
     query_id: &str,
@@ -195,7 +195,7 @@ fn admit_query(
 }
 
 /// The instant the stored query's termination is due, as the store holds it.
-fn termination_due(
+pub(crate) fn termination_due(
     engine: &Arc<engine::InMemoryEngine>,
     graph_id: &str,
     query_id: &str,

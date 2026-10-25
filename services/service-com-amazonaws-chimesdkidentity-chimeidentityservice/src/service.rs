@@ -99,17 +99,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // This model owns the `/app-instances` resource space it shares with Chime SDK
         // Messaging, which binds only the streaming-configuration sub-space of it — so
-        // this service claims the COMPLEMENT of that one sub-space. (`/tags` is shared by
-        // five of the six and is resolved by endpoint prefix only — see `chime_family`.)
+        // this service claims the COMPLEMENT of that one sub-space. It is also the
+        // family's declared owner of the generic `/tags` space five of the six bind
+        // identically, which it can serve for ANY member's resource because the tags live
+        // in the family's shared ARN-keyed directory rather than in this service's own
+        // state — see `chime_family`.
         service_common::chime_family::claims_chime_family_request(
             parts,
             OWN_ENDPOINT_PREFIX,
             crate::ROUTE_PATH_SEGMENTS,
             |parts| {
                 let path = parts.uri.path();
-                service_common::chime_family::addresses_app_instance_space(path)
+                (service_common::chime_family::addresses_app_instance_space(path)
                     && !service_common::chime_family::addresses_app_instance_streaming_configurations(
                         path,
+                    ))
+                    || service_common::chime_family::claims_shared_tagging_space(
+                        parts,
+                        OWN_ENDPOINT_PREFIX,
                     )
             },
         )

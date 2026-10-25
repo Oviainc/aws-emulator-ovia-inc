@@ -1924,7 +1924,7 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
 
     /// Every subscription of this account, oldest first (ARN breaking a tie), so a
     /// listing and its pagination token are stable across calls — see
-    /// [`Self::subscriptions_of`].
+    /// [`Self::subscriptions_of`], which is the one topic's.
     ///
     /// Selects on nothing but the record's existence: a subscription whose endpoint
     /// names a resource that is not there is still a subscription of the account, and

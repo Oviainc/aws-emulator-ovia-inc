@@ -18,8 +18,9 @@
 //!    stable order, cut into pages of at most `MaxResults` with a `NextToken` that
 //!    resumes exactly where the previous page stopped — for any page size.
 //! 4. A delete makes the resource observably gone to every later call, and is
-//!    refused as a conflict (409 `ConflictException`, naming the dependent) while
-//!    another resource still references it.
+//!    refused while another resource still references it — for a site whose Outposts
+//!    still name it, with the 400 `ValidationException` AWS publishes for that
+//!    refusal ([`crate::site_delete_refusal`]).
 //! 5. An identifier that names nothing is 404 `NotFoundException`; one that is not an
 //!    identifier at all is 400 `ValidationException`.
 //!
@@ -944,19 +945,9 @@ async fn delete_removes_the_record_and_is_refused_while_referenced() {
             .await;
         assert_eq!(
             (refused.status, refused.error_code.as_str()),
-            (409, "ConflictException"),
-            "case {identifier:?}: deleting a referenced site is refused as a \
-             conflict, got {:?}",
-            refused.body
-        );
-        assert_eq!(
-            (
-                text(&refused.body, "ResourceType"),
-                text(&refused.body, "ResourceId")
-            ),
-            ("OUTPOST".to_string(), outpost_id.clone()),
-            "case {identifier:?}: the conflict must name the Outpost that still \
-             references the site, got {:?}",
+            (400, "ValidationException"),
+            "case {identifier:?}: deleting a referenced site is refused as a bad \
+             parameter, got {:?}",
             refused.body
         );
         assert!(

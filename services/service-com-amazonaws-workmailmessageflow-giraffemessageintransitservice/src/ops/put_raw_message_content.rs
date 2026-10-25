@@ -179,15 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store against every other request.
         let resolved = {
             let state = store.lock();
-            match eligibility(&state, &request_region, &input.message_id) {
-                Eligibility::Missing => {
-                    return Err(refuse_missing(&akid, &input.message_id, &request_region))
-                }
-                Eligibility::Frozen => {
-                    return Err(refuse_frozen(&akid, &input.message_id, &request_region))
-                }
-                Eligibility::Updatable => {}
-            }
+            refuse_if_not_updatable(&state, &akid, &input.message_id, &request_region)?;
             resolve_content(&state, &reference, &request_region)
         };
 
@@ -238,15 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let content_octets = content.len();
         {
             let mut state = store.lock();
-            match eligibility(&state, &request_region, &input.message_id) {
-                Eligibility::Missing => {
-                    return Err(refuse_missing(&akid, &input.message_id, &request_region))
-                }
-                Eligibility::Frozen => {
-                    return Err(refuse_frozen(&akid, &input.message_id, &request_region))
-                }
-                Eligibility::Updatable => {}
-            }
+            refuse_if_not_updatable(&state, &akid, &input.message_id, &request_region)?;
             // The last content criterion is a COMPARISON, so it is decided here,
             // against the message as it stands in this critical section: the update
             // may not change a header the message carried on its way into the flow.
@@ -296,7 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Whether a message can take an update, as the two critical sections above ask it.
+/// Whether a message can take an update, as [`refuse_if_not_updatable`] asks it.
 enum Eligibility {
     /// No message is stored under that id in that region.
     Missing,
@@ -320,6 +304,28 @@ fn eligibility(
         None => Eligibility::Missing,
         Some(message) if message.frozen => Eligibility::Frozen,
         Some(_) => Eligibility::Updatable,
+    }
+}
+
+/// Let the update proceed, or refuse it with the answer this message's
+/// [`Eligibility`] earns: the ONE place that maps a state to its refusal.
+///
+/// Both of the handler's critical sections decide this question — the lock is
+/// released while the content is validated, so the eligibility the first section
+/// established has to be re-established under the guard that installs the bytes —
+/// and both decide it here rather than each spelling the mapping out, so a change
+/// to which refusal a state produces, or a new [`Eligibility`] variant, reaches
+/// the section that guards the write as well as the one on the happy path.
+fn refuse_if_not_updatable(
+    state: &crate::state::ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState,
+    akid: &str,
+    message_id: &str,
+    region: &str,
+) -> Result<(), PutRawMessageContentError> {
+    match eligibility(state, region, message_id) {
+        Eligibility::Missing => Err(refuse_missing(akid, message_id, region)),
+        Eligibility::Frozen => Err(refuse_frozen(akid, message_id, region)),
+        Eligibility::Updatable => Ok(()),
     }
 }
 

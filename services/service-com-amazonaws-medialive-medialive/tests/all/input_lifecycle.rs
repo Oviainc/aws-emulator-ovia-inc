@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_medialive_medialive::state::MAX_INPUTS;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::support::resolved_input_body;
 use crate::wire::{call, error_code, medialive, ACCOUNT};
 
 async fn create_input(router: &MultiServiceRouter, body: Value) -> Value {
@@ -151,6 +152,9 @@ async fn a_created_input_reports_the_class_and_source_type_its_endpoints_give_it
 
     for (case, request, expected_class, expected_source_type) in table {
         let router = medialive();
+        // The ids the row's configuration names are the ids of resources this
+        // account holds, so the row is pointed at freshly created ones.
+        let request = resolved_input_body(&router, request).await;
         let created = create_input(&router, request.clone()).await;
 
         let id = created["id"].as_str().unwrap_or_default().to_string();
@@ -475,6 +479,9 @@ async fn a_vpc_input_requires_a_role_and_refuses_input_security_groups() {
 
     for (case, body, expected_status) in table {
         let router = medialive();
+        // A group the row names is a group this account holds, so what the vpc
+        // rows refuse is the `Vpc` incompatibility and nothing else.
+        let body = resolved_input_body(&router, body).await;
         let (status, response) = call(&router, "POST", "/prod/inputs", Some(body)).await;
         assert_eq!(
             status, expected_status,

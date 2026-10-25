@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreTableFromBackup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreTableFromBackup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates a new table from a stored backup — the backup's schema, capacity
+//! mode, secondary indexes AND ITEMS, under the name the request names — and reports it
+//! back as the `TableDescription` of the stored table, carrying the `RestoreSummary` that
+//! records which backup it came from.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreTableFromBackup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The restored table is reported `CREATING` and becomes `ACTIVE` once
+//! [`crate::state::STATUS_TRANSITION`] has elapsed, exactly as a created one, so
+//! `RestoreSummary.RestoreInProgress` is true for that span and a caller that reads
+//! straight after the call still sees the restore in flight. For the same span the BACKUP
+//! is in use — "The backup is either being created, deleted or restored to a table"
+//! (`BackupInUseException`) — so a `DeleteBackup` or a second restore from it is refused
+//! while this one runs.
+//!
+//! What the backup does NOT carry over is what AWS says a caller must set up again on the
+//! restored table: "Auto scaling policies IAM policies Amazon CloudWatch metrics and
+//! alarms Tags Stream settings Time to Live (TTL) settings" (the doc below). So the
+//! restored table carries no tags, no stream and no resource policy, and its
+//! point-in-time recovery is off.
+//!
+//! `BillingModeOverride`, `ProvisionedThroughputOverride` and the two secondary-index
+//! overrides are applied to the restored table; `SSESpecificationOverride`,
+//! `VectorIndexOverride` and `OnDemandThroughputOverride` are members no table this
+//! service stores carries yet (`CreateTable` refuses the same three), so they answer the
+//! scaffold's 501 and are filed as their own gap issues — after the request's own
+//! contradictions, so an on-demand ceiling named for a table restored `PROVISIONED` is
+//! the `ValidationException` the two capacity models make it.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +202,534 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreTableFromBackup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreTableFromBackupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreTableFromBackup"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // The backup is addressed by its ARN, which must be one of this endpoint's
+        // ([`crate::state::check_backup_arn`]); the target table is NAMED, and the name is
+        // held to the form every table name takes.
+        crate::state::check_backup_arn(&input.backup_arn, &region).map_err(lift)?;
+        let target =
+            crate::state::resolve_table_name(&input.target_table_name).map_err(lift)?;
+        // Every caller-sized list this request carries is clamped BEFORE anything walks
+        // it, so the work below is bounded by constants rather than by the request body.
+        clamped_overrides(&input).map_err(lift)?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+
+        let backup = store.backup(&region, &input.backup_arn).map_err(lift)?;
+        // "There is another ongoing conflicting backup control plane operation on the
+        // table. The backup is either being created, deleted or restored to a table"
+        // (`BackupInUseException`): a backup another control-plane call still has — one
+        // the clock has not finished creating, or one a restore already took — is not one
+        // to restore from.
+        if let Some(message) = backup.in_use_message(now) {
+            return Err(RestoreTableFromBackupErrorModeled::BackupInUseException(
+                BackupInUseException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // The target name must be free. A table that is still being created, or already
+        // being deleted, is "a target table with the specified name [that] is either
+        // being created or deleted" (`TableInUseException`); a settled table under that
+        // name simply "already exists" (`TableAlreadyExistsException`).
+        if let Ok(existing) = store.table(&region, &target) {
+            return Err(if matches!(
+                existing.status(now),
+                crate::state::TableStatus::Creating | crate::state::TableStatus::Deleting
+            ) {
+                RestoreTableFromBackupErrorModeled::TableInUseException(TableInUseException {
+                    message: Some(format!("Table is being created or deleted: {target}")),
+                })
+                .into()
+            } else {
+                RestoreTableFromBackupErrorModeled::TableAlreadyExistsException(
+                    TableAlreadyExistsException {
+                        message: Some(format!("Table already exists: {target}")),
+                    },
+                )
+                .into()
+            });
+        }
+
+        let source = &backup.source;
+        let (billing_mode, provisioned_throughput) =
+            restored_capacity(&input, source).map_err(lift)?;
+        // An on-demand capacity ceiling cannot hold on a table whose capacity mode is the
+        // provisioned one ([`crate::state::check_on_demand_ceilings`]). That
+        // contradiction is in the REQUEST, so it is refused ahead of the scaffold refusal
+        // below.
+        crate::state::check_on_demand_ceilings(
+            &billing_mode,
+            input.on_demand_throughput_override.as_ref(),
+        )
+        .map_err(lift)?;
+        // A member no stored table carries yet is refused as "not written yet" rather
+        // than accepted and silently dropped.
+        if let Some(member) = unsupported_member(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "RestoreTableFromBackup with {member}"
+            )));
+        }
+
+        let global_secondary_indexes = restored_indexes(
+            &input,
+            source,
+            &billing_mode,
+            provisioned_throughput.as_ref(),
+            &region,
+            &target,
+            now,
+        )
+        .map_err(lift)?;
+        let local_secondary_indexes =
+            restored_local_indexes(&input, source, &region, &target, now).map_err(lift)?;
+
+        // A restore CREATES a table, so it is held to the same quotas a create is, plus
+        // the one restores have of their own.
+        if store.table_count_in(&region) >= crate::state::MAX_TABLES {
+            return Err(limit_exceeded(format!(
+                "Subscriber limit exceeded: this account already holds the maximum of {} \
+                 tables in {region}",
+                crate::state::MAX_TABLES
+            )));
+        }
+        if store.region_bucket_exhausted(&region) {
+            return Err(limit_exceeded(format!(
+                "Subscriber limit exceeded: this emulator holds tables for at most {} \
+                 regions, and {region} is not one of them",
+                crate::state::MAX_REGIONS
+            )));
+        }
+        if store.restores_in_progress(&region, now) >= crate::state::MAX_CONCURRENT_RESTORES {
+            return Err(limit_exceeded(format!(
+                "Subscriber limit exceeded: at most {} restores may run at a time",
+                crate::state::MAX_CONCURRENT_RESTORES
+            )));
+        }
+        // The restored table holds the backup's items, so the restore is a growth site of
+        // the store like an item write, and it is measured against the same budget —
+        // against the size the backup recorded, BEFORE the items are copied, so the bound
+        // precedes the allocation rather than following it.
+        if store.stored_bytes().saturating_add(backup.size_bytes)
+            > crate::state::MAX_STORE_SIZE_BYTES
+        {
+            return Err(limit_exceeded(format!(
+                "Subscriber limit exceeded: this emulator holds at most {} bytes of item \
+                 data",
+                crate::state::MAX_STORE_SIZE_BYTES
+            )));
+        }
+        let items = backup.items.clone();
+        let stored_bytes = items
+            .values()
+            .map(crate::state::item_size)
+            .fold(0, i64::saturating_add);
+
+        let active_at = now + crate::state::STATUS_TRANSITION;
+        let mut table = crate::state::Table {
+            arn: crate::state::table_arn(&region, &target),
+            name: target.clone(),
+            // A restored table is a NEW table, so it is minted its own `TableId` rather
+            // than carrying the source table's: "A unique identifier for the table, in
+            // UUID format, generated by DynamoDB when the table is created"
+            // (`TableDescription$TableId`).
+            id: crate::state::new_table_id(),
+            region: region.clone(),
+            // The primary key and the attributes it is declared over are the backup's:
+            // a restore cannot change them, and no override names them.
+            key_schema: source.key_schema.clone(),
+            attribute_definitions: source.attribute_definitions.clone(),
+            billing_mode: billing_mode.clone(),
+            provisioned_throughput: provisioned_throughput.clone(),
+            warm_throughput: crate::state::WarmThroughputSettings::tracking(
+                provisioned_throughput.as_ref(),
+                now,
+            ),
+            // A new table has no past capacity changes, whichever pair it starts life
+            // with.
+            throughput_history: crate::state::ThroughputHistory::default(),
+            global_secondary_indexes,
+            local_secondary_indexes,
+            // No `TableClass` is recorded by a backup and no override names one, so the
+            // restored table reports none, exactly as a create that names none does.
+            table_class: None,
+            deletion_protection_enabled: false,
+            point_in_time_recovery: crate::state::PointInTimeRecovery::default(),
+            // "You must manually set up the following on the restored table: ... Tags
+            // Stream settings Time to Live (TTL) settings" (the doc above), so none of
+            // them carries over from the source table.
+            tags: crate::state::ResourceTags::default(),
+            stream: None,
+            resource_policy: None,
+            creation_date_time: now,
+            active_at,
+            updated_at: None,
+            // A table restored on-demand has `PAY_PER_REQUEST` set as its capacity mode
+            // by this call, and the mode takes effect when the table does.
+            pay_per_request_at: (billing_mode == "PAY_PER_REQUEST").then_some(active_at),
+            removed_at: None,
+            items,
+            // Metered below, once the items are in place: this table holds the backup's
+            // data from its first instant.
+            reported_counters: crate::state::MeteredCounters::new(now),
+            stored_bytes,
+            // A new table has consumed none of the capacity it is provisioned for.
+            write_budget: crate::state::CapacityBudget::new(now),
+            contributor_insights: crate::state::ContributorInsights::default(),
+            restore: Some(crate::state::TableRestore {
+                source_backup_arn: Some(backup.arn.clone()),
+                source_table_arn: Some(backup.table_arn.clone()),
+                // "Point in time or source backup time"
+                // (`RestoreSummary$RestoreDateTime`): for a restore from a backup it is
+                // the instant that backup was taken.
+                restore_date_time: backup.created_at,
+            }),
+        };
+        // The figures `ItemCount`/`TableSizeBytes` report are metered when a table is
+        // created, and this one was created holding the restored items.
+        table.meter_counters(now);
+        let description = table.describe(now);
+        store.insert_table(table);
+        // The backup is being restored to a table for the span this restore takes, which
+        // is what makes it in use for another backup control-plane call.
+        store
+            .backup_mut(&region, &input.backup_arn)
+            .map_err(lift)?
+            .restored_until = Some(active_at);
+
+        // The audit record for a state-changing call: who asked, what was created and
+        // that it succeeded. Never a credential — only the access key id the caller
+        // presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %target,
+            backup_arn = %input.backup_arn,
+            items = description.item_count.unwrap_or_default(),
+            outcome = "restored",
+            "table restored from backup"
+        );
+
+        Ok(RestoreTableFromBackupOutput {
+            table_description: Some(description),
+        })
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> RestoreTableFromBackupError {
+    RestoreTableFromBackupErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The modelled limit error for a restore past one of the quotas it is held to: "For most
+/// purposes, up to 500 simultaneous table operations are allowed per account. These
+/// operations include CreateTable, UpdateTable, DeleteTable,UpdateTimeToLive,
+/// RestoreTableFromBackup, and RestoreTableToPointInTime" (`LimitExceededException`).
+fn limit_exceeded(message: String) -> RestoreTableFromBackupError {
+    RestoreTableFromBackupErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel: a `BackupArn` this region
+/// holds no backup for is the `BackupNotFoundException` this operation models, and a
+/// value that is no backup ARN of this endpoint at all — or any other bad member — is the
+/// `ValidationException` such an input is.
+fn lift(error: crate::state::RequestError) -> RestoreTableFromBackupError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            RestoreTableFromBackupErrorModeled::BackupNotFoundException(BackupNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
+    }
+}
+
+/// The first input member present that no stored table carries yet, if any.
+///
+/// The same three members `CreateTable` reports as unimplemented, under the names this
+/// operation declares them: a restore cannot store what a create cannot.
+fn unsupported_member(input: &RestoreTableFromBackupInput) -> Option<&'static str> {
+    if input
+        .vector_index_override
+        .as_ref()
+        .is_some_and(|indexes| !indexes.is_empty())
+    {
+        return Some("VectorIndexOverride");
+    }
+    if input
+        .sse_specification_override
+        .as_ref()
+        .is_some_and(|specification| specification.enabled.unwrap_or(false))
+    {
+        return Some("SSESpecificationOverride");
+    }
+    if input.on_demand_throughput_override.is_some() {
+        return Some("OnDemandThroughputOverride");
+    }
+    // The same two members an index may carry: this service stores an index's
+    // PROVISIONED throughput only.
+    for index in input.global_secondary_index_override.iter().flatten() {
+        if index.on_demand_throughput.is_some() {
+            return Some("GlobalSecondaryIndexOverride carrying OnDemandThroughput");
+        }
+        if index.warm_throughput.is_some() {
+            return Some("GlobalSecondaryIndexOverride carrying WarmThroughput");
+        }
+    }
+    None
+}
+
+/// Clamp every caller-sized list this operation walks, before anything walks it.
+///
+/// An override is matched against the indexes the backup recorded, so the work would
+/// otherwise be the product of a request-chosen count and a stored one. Both bounds are
+/// ones the contract already implies — a table carries at most
+/// [`crate::state::MAX_GLOBAL_SECONDARY_INDEXES`] global and
+/// [`crate::state::MAX_LOCAL_SECONDARY_INDEXES`] local secondary indexes, so an override
+/// past either names more indexes than any table has.
+fn clamped_overrides(
+    input: &RestoreTableFromBackupInput,
+) -> Result<(), crate::state::RequestError> {
+    let indexes = input
+        .global_secondary_index_override
+        .as_ref()
+        .map_or(0, Vec::len);
+    if indexes > crate::state::MAX_GLOBAL_SECONDARY_INDEXES {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid GlobalSecondaryIndexOverride: a table may carry at most {} global \
+             secondary indexes, got {indexes}",
+            crate::state::MAX_GLOBAL_SECONDARY_INDEXES
+        )));
+    }
+    let local_indexes = input
+        .local_secondary_index_override
+        .as_ref()
+        .map_or(0, Vec::len);
+    if local_indexes > crate::state::MAX_LOCAL_SECONDARY_INDEXES {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid LocalSecondaryIndexOverride: a table may carry at most {} local \
+             secondary indexes, got {local_indexes}",
+            crate::state::MAX_LOCAL_SECONDARY_INDEXES
+        )));
+    }
+    Ok(())
+}
+
+/// The capacity mode and provisioned throughput the restored table starts life with.
+///
+/// The backup records the source table's mode and pair, and the request may override
+/// either: "The billing mode of the restored table"
+/// (`RestoreTableFromBackup$BillingModeOverride`) and "Provisioned throughput settings
+/// for the restored table" (`$ProvisionedThroughputOverride`). What holds the two
+/// together is the rule both capacity models state — "If you set BillingMode as
+/// PROVISIONED, you must specify this property. If you set BillingMode as
+/// PAY_PER_REQUEST, you cannot specify this property"
+/// (`CreateTable$ProvisionedThroughput`) — measured against the mode IN FORCE for the
+/// restored table, which is the override where the request names one and the recorded
+/// mode otherwise. A `PROVISIONED` restore that names no override keeps the pair the
+/// backup recorded; a backup of an on-demand table records no usable pair (an on-demand
+/// table "does not use provisioned throughput", so its recorded capacity is zeroes), so
+/// restoring one `PROVISIONED` must name the override.
+fn restored_capacity(
+    input: &RestoreTableFromBackupInput,
+    source: &crate::state::SourceTableSnapshot,
+) -> Result<(String, Option<ProvisionedThroughput>), crate::state::RequestError> {
+    let billing_mode = input
+        .billing_mode_override
+        .clone()
+        .unwrap_or_else(|| source.billing_mode.clone());
+    let recorded = (source.provisioned_throughput.read_capacity_units >= 1
+        && source.provisioned_throughput.write_capacity_units >= 1)
+        .then(|| source.provisioned_throughput.clone());
+    match (
+        billing_mode.as_str(),
+        input.provisioned_throughput_override.clone(),
+    ) {
+        ("PAY_PER_REQUEST", None) => Ok((billing_mode, None)),
+        ("PAY_PER_REQUEST", Some(_)) => Err(crate::state::RequestError::Validation(
+            "ProvisionedThroughputOverride cannot be specified when BillingModeOverride is \
+             PAY_PER_REQUEST"
+                .to_string(),
+        )),
+        ("PROVISIONED", requested) => match requested.or(recorded) {
+            Some(throughput) => {
+                if throughput.read_capacity_units < 1 || throughput.write_capacity_units < 1 {
+                    return Err(crate::state::RequestError::Validation(format!(
+                        "Invalid ProvisionedThroughput: ReadCapacityUnits and \
+                         WriteCapacityUnits must be at least 1, got {} and {}",
+                        throughput.read_capacity_units, throughput.write_capacity_units
+                    )));
+                }
+                Ok((billing_mode, Some(throughput)))
+            }
+            None => Err(crate::state::RequestError::Validation(
+                "ProvisionedThroughputOverride must be specified when the restored table's \
+                 BillingMode is PROVISIONED and the backup records no provisioned capacity"
+                    .to_string(),
+            )),
+        },
+        (other, _) => Err(crate::state::RequestError::Validation(format!(
+            "Invalid BillingMode: {other} must be PROVISIONED or PAY_PER_REQUEST"
+        ))),
+    }
+}
+
+/// The global secondary indexes the restored table carries.
+///
+/// A restore carries over the indexes the BACKUP recorded, and the override SELECTS which
+/// of them: "The indexes provided should match existing secondary indexes. You can choose
+/// to exclude some or all of the indexes at the time of restore"
+/// (`RestoreTableFromBackup$GlobalSecondaryIndexOverride`). So an entry names one of the
+/// recorded indexes — the restored index's key schema and projection are the recorded
+/// ones, because an index's key schema is not something a restore can change — and may
+/// restate its provisioned throughput; an entry naming an index the backup never recorded
+/// is refused, since there is nothing to restore under that name. A request that names no
+/// override restores every recorded index.
+///
+/// An index's capacity mode is the TABLE's ("you must use either OnDemandThroughput or
+/// ProvisionedThroughput based on your table's capacity mode" —
+/// `GlobalSecondaryIndex$ProvisionedThroughput`), so the pair each index keeps is held to
+/// the restored table's mode by the same check `CreateTable` applies, over the pair the
+/// request restated, else the one the backup recorded, else the table's own.
+fn restored_indexes(
+    input: &RestoreTableFromBackupInput,
+    source: &crate::state::SourceTableSnapshot,
+    billing_mode: &str,
+    table_throughput: Option<&ProvisionedThroughput>,
+    region: &str,
+    table: &str,
+    now: ::std::time::SystemTime,
+) -> Result<Vec<crate::state::GlobalSecondaryIndex>, crate::state::RequestError> {
+    let selected: Vec<(String, Option<ProvisionedThroughput>)> =
+        match input.global_secondary_index_override.as_ref() {
+            Some(overrides) => overrides
+                .iter()
+                .map(|index| (index.index_name.clone(), index.provisioned_throughput.clone()))
+                .collect(),
+            None => source
+                .global_secondary_indexes
+                .iter()
+                .map(|info| {
+                    (
+                        info.index_name.clone().unwrap_or_default(),
+                        info.provisioned_throughput.clone(),
+                    )
+                })
+                .collect(),
+        };
+    let mut indexes: Vec<crate::state::GlobalSecondaryIndex> = Vec::new();
+    for (name, restated) in selected {
+        if indexes.iter().any(|stored| stored.name == name) {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid GlobalSecondaryIndexOverride: duplicate index name {name}"
+            )));
+        }
+        let Some(recorded) = source
+            .global_secondary_indexes
+            .iter()
+            .find(|info| info.index_name.as_deref() == Some(name.as_str()))
+        else {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid GlobalSecondaryIndexOverride: the backup records no global secondary \
+                 index named {name}"
+            )));
+        };
+        // An on-demand table's index carries no provisioned throughput at all, so a pair
+        // the backup recorded for a provisioned source table is not carried into an
+        // on-demand restore; one the request restates there is the contradiction the
+        // check below refuses.
+        let requested = if billing_mode == "PAY_PER_REQUEST" {
+            restated
+        } else {
+            restated
+                .or_else(|| recorded.provisioned_throughput.clone())
+                .or_else(|| table_throughput.cloned())
+        };
+        let throughput =
+            super::create_table::validated_index_throughput(&name, billing_mode, requested)?;
+        indexes.push(crate::state::GlobalSecondaryIndex {
+            arn: crate::state::index_arn(region, table, &name),
+            name,
+            key_schema: recorded.key_schema.clone().unwrap_or_default(),
+            projection: recorded.projection.clone().unwrap_or_default(),
+            provisioned_throughput: throughput.clone(),
+            // An index restored with the table is `CREATING` and becomes `ACTIVE` on the
+            // same clock-owed transition as the table, exactly as one created with it.
+            transient_status: crate::state::IndexStatus::Creating,
+            active_at: now + crate::state::STATUS_TRANSITION,
+            throughput_history: crate::state::ThroughputHistory::default(),
+            warm_throughput: crate::state::WarmThroughputSettings::tracking(
+                throughput.as_ref(),
+                now,
+            ),
+            reported_counters: crate::state::MeteredCounters::new(now),
+            contributor_insights: crate::state::ContributorInsights::default(),
+        });
+    }
+    Ok(indexes)
+}
+
+/// The local secondary indexes the restored table carries, by the same selection rule
+/// over the recorded ones ([`restored_indexes`]) — "The indexes provided should match
+/// existing secondary indexes. You can choose to exclude some or all of the indexes at
+/// the time of restore" (`RestoreTableFromBackup$LocalSecondaryIndexOverride`). A local
+/// index carries no throughput and no status of its own, so the name is the whole
+/// selector.
+fn restored_local_indexes(
+    input: &RestoreTableFromBackupInput,
+    source: &crate::state::SourceTableSnapshot,
+    region: &str,
+    table: &str,
+    now: ::std::time::SystemTime,
+) -> Result<Vec<crate::state::LocalSecondaryIndex>, crate::state::RequestError> {
+    let selected: Vec<String> = match input.local_secondary_index_override.as_ref() {
+        Some(overrides) => overrides
+            .iter()
+            .map(|index| index.index_name.clone())
+            .collect(),
+        None => source
+            .local_secondary_indexes
+            .iter()
+            .map(|info| info.index_name.clone().unwrap_or_default())
+            .collect(),
+    };
+    let mut indexes: Vec<crate::state::LocalSecondaryIndex> = Vec::new();
+    for name in selected {
+        if indexes.iter().any(|stored| stored.name == name) {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid LocalSecondaryIndexOverride: duplicate index name {name}"
+            )));
+        }
+        let Some(recorded) = source
+            .local_secondary_indexes
+            .iter()
+            .find(|info| info.index_name.as_deref() == Some(name.as_str()))
+        else {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid LocalSecondaryIndexOverride: the backup records no local secondary \
+                 index named {name}"
+            )));
+        };
+        indexes.push(crate::state::LocalSecondaryIndex {
+            arn: crate::state::index_arn(region, table, &name),
+            name,
+            key_schema: recorded.key_schema.clone().unwrap_or_default(),
+            projection: recorded.projection.clone().unwrap_or_default(),
+            reported_counters: crate::state::MeteredCounters::new(now),
+        });
+    }
+    Ok(indexes)
 }

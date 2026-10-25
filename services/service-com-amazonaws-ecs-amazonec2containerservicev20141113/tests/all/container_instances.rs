@@ -39,9 +39,9 @@ const CONTAINER_INSTANCE_STATUSES: [&str; 5] = [
 ];
 
 /// One row of the registration table: the case name, the EC2 instance id the identity
-/// document names (absent for an external instance), the `totalResources`, the
-/// `attributes` and the `tags` the agent reports.
-type RegistrationRow = (&'static str, Option<&'static str>, Value, Value, Value);
+/// document names, the `totalResources`, the `attributes` and the `tags` the agent
+/// reports.
+type RegistrationRow = (&'static str, &'static str, Value, Value, Value);
 
 /// One row of the describe table: the case name, the ids the request names, the ARNs
 /// expected back and the ARNs expected as `MISSING` failures.
@@ -90,13 +90,13 @@ async fn registered_container_instances_round_trip_through_list_and_describe() {
     let router = service();
     create_cluster(&router, "demo", "round trip").await;
 
-    // The rows differ along what registration generalises over: whether the agent sent
-    // an EC2 instance identity document at all, how many resources it reported and of
-    // which modelled types, how many attributes it carries, and whether it is tagged.
+    // The rows differ along what registration generalises over: the EC2 instance the
+    // identity document names, how many resources it reported and of which modelled
+    // types, how many attributes it carries, and whether it is tagged.
     let cases: [RegistrationRow; 4] = [
         (
             "ec2 instance with cpu, memory and ports",
-            Some("i-0abc1234def567890"),
+            "i-0abc1234def567890",
             json!([
                 { "name": "CPU", "type": "INTEGER", "integerValue": 2048 },
                 { "name": "MEMORY", "type": "INTEGER", "integerValue": 3955 },
@@ -109,15 +109,15 @@ async fn registered_container_instances_round_trip_through_list_and_describe() {
             json!([{ "key": "fleet", "value": "batch" }]),
         ),
         (
-            "external instance without an identity document",
-            None,
+            "one resource and an external capability attribute",
+            "i-3333333333333333b",
             json!([{ "name": "CPU", "type": "INTEGER", "integerValue": 1024 }]),
             json!([{ "name": "ecs.capability.external" }]),
             json!([]),
         ),
         (
             "long and double resource types",
-            Some("i-1111111111111111f"),
+            "i-1111111111111111f",
             json!([
                 { "name": "DISK", "type": "LONG", "longValue": 34359738368_i64 },
                 { "name": "GPU_SHARE", "type": "DOUBLE", "doubleValue": 0.5 },
@@ -130,7 +130,7 @@ async fn registered_container_instances_round_trip_through_list_and_describe() {
         ),
         (
             "no resources and no attributes at all",
-            Some("i-2222222222222222a"),
+            "i-2222222222222222a",
             json!([]),
             json!([]),
             json!([]),
@@ -145,9 +145,9 @@ async fn registered_container_instances_round_trip_through_list_and_describe() {
             "attributes": attributes.clone(),
             "tags": tags.clone(),
         });
-        if let Some(instance_id) = instance_id {
-            request["instanceIdentityDocument"] = json!(identity_document(instance_id));
-        }
+        request["instanceIdentityDocument"] = json!(identity_document(instance_id));
+        request["instanceIdentityDocumentSignature"] =
+            json!(crate::ecs_wire::identity_document_signature());
 
         let body = ok(&router, "RegisterContainerInstance", request, case).await;
         let instance = &body["containerInstance"];
@@ -168,20 +168,12 @@ async fn registered_container_instances_round_trip_through_list_and_describe() {
             "case {case:?}: every registration mints a distinct ARN, got {arn:?} twice"
         );
 
-        // "For Amazon EC2 instances, this value is the Amazon EC2 instance ID. For
-        // external instances, this value is the ... Systems Manager managed instance ID"
+        // "For Amazon EC2 instances, this value is the Amazon EC2 instance ID"
         let ec2_instance_id = string(instance, "ec2InstanceId", case);
-        match instance_id {
-            Some(expected) => assert_eq!(
-                ec2_instance_id, expected,
-                "case {case:?}: expected the identity document's instanceId, got {instance}"
-            ),
-            None => assert!(
-                ec2_instance_id.starts_with("mi-"),
-                "case {case:?}: expected a managed-instance id for an instance that sent no \
-                 identity document, got {ec2_instance_id:?}"
-            ),
-        }
+        assert_eq!(
+            ec2_instance_id, instance_id,
+            "case {case:?}: expected the identity document's instanceId, got {instance}"
+        );
 
         assert_eq!(
             string(instance, "status", case),
@@ -471,12 +463,14 @@ async fn registering_an_instance_again_updates_the_one_already_stored() {
     create_cluster(&router, "demo", "re-registration").await;
 
     let document = identity_document("i-0f0f0f0f0f0f0f0f0");
+    let signature = crate::ecs_wire::identity_document_signature();
     let first = ok(
         &router,
         "RegisterContainerInstance",
         json!({
             "cluster": "demo",
             "instanceIdentityDocument": document,
+            "instanceIdentityDocumentSignature": signature,
             "totalResources": [{ "name": "CPU", "type": "INTEGER", "integerValue": 1024 }],
         }),
         "first",
@@ -494,6 +488,7 @@ async fn registering_an_instance_again_updates_the_one_already_stored() {
             json!({
                 "cluster": "demo",
                 "instanceIdentityDocument": document.clone(),
+                "instanceIdentityDocumentSignature": signature.clone(),
                 "totalResources": [{ "name": "CPU", "type": "INTEGER", "integerValue": 2048 }],
             }),
             1,
@@ -504,6 +499,8 @@ async fn registering_an_instance_again_updates_the_one_already_stored() {
             json!({
                 "cluster": "demo",
                 "containerInstanceArn": arn.clone(),
+                "instanceIdentityDocument": document.clone(),
+                "instanceIdentityDocumentSignature": signature.clone(),
                 "totalResources": [{ "name": "CPU", "type": "INTEGER", "integerValue": 4096 }],
             }),
             2,
@@ -606,7 +603,11 @@ async fn registering_an_instance_again_updates_the_one_already_stored() {
     refused(
         &router,
         "RegisterContainerInstance",
-        json!({ "cluster": "nosuchcluster", "instanceIdentityDocument": document }),
+        json!({
+            "cluster": "nosuchcluster",
+            "instanceIdentityDocument": document,
+            "instanceIdentityDocumentSignature": signature,
+        }),
         "ClusterNotFoundException",
         "unknown cluster",
     )
@@ -622,8 +623,11 @@ async fn describe_container_instances_reports_ids_that_name_nothing_as_failures(
     let elsewhere = register_instance(&router, "other", "i-0808080808080808b", "describe").await;
 
     let unknown_id = "a".repeat(32);
+    // The ARN a failure echoes for an id that names nothing: the id alone, with no
+    // cluster in the resource path — the cluster qualifier belongs to an instance that
+    // IS registered. See [`crate::describe_failure_identifiers`].
     let unknown_arn =
-        format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:container-instance/demo/{unknown_id}");
+        format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:container-instance/{unknown_id}");
 
     // Rows: what the request names, which ARNs come back and which are reported MISSING
     // ("the described resource could not be found").

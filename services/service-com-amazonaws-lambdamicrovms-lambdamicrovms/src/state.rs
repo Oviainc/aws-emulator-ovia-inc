@@ -87,12 +87,14 @@ pub const MIN_MAXIMUM_DURATION_IN_SECONDS: i32 = 1;
 /// [`MIN_MAXIMUM_DURATION_IN_SECONDS`] for the `smithy_query` output it comes from.
 pub const MAX_MAXIMUM_DURATION_IN_SECONDS: i32 = 28_800;
 
-/// The largest page `ListMicrovms` serves when the caller names no `maxResults`.
+/// The largest page a paginated listing of this service serves, and the page size a
+/// caller that names no `maxResults` gets.
 ///
-/// This is the maximum the member's own `@range` allows:
-/// `smithy_query(query="operation",operation="ListMicrovms")` reports
-/// `maxResults` as `{"target": "Integer", "httpQuery": "maxResults",
-/// "range": {"min": 1, "max": 50}}`.
+/// This is the maximum the member's own `@range` allows, and every listing of this
+/// service declares the same one:
+/// `smithy_query(query="operation",operation="ListMicrovms,ListManagedMicrovmImages")`
+/// reports `maxResults` as `{"target": "Integer", "httpQuery": "maxResults",
+/// "range": {"min": 1, "max": 50}}` for both.
 pub const MAX_LIST_PAGE: usize = 50;
 
 /// How many MicroVM images one account may hold.
@@ -237,9 +239,9 @@ pub fn is_own_microvm_image_arn(arn: &str) -> bool {
 /// anything this account creates: `al2023-1` is the Amazon Linux 2023 base image the
 /// service publishes (recorded as
 /// `arn:aws:lambda:<region>:aws:microvm-image:al2023-1`). `ListManagedMicrovmImages`
-/// is the operation that serves this catalogue; it is still a stub (its own gap
-/// issue, deferred by the bootstrap issue), so today the catalogue is reached only
-/// through the resolution below.
+/// is the operation that serves this catalogue — through
+/// [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::managed_base_images`], the same
+/// set the base-image resolution below reads, so the two cannot disagree.
 pub const MANAGED_BASE_IMAGE_IDS: &[&str] = &["al2023-1"];
 
 /// The id an AWS-MANAGED MicroVM image ARN names, or `None` when `arn` names no
@@ -516,7 +518,7 @@ pub struct IdempotencyRecord {
 /// Every map here is bounded: `images` by [`MAX_MICROVM_IMAGES`], `microvms` by
 /// [`MAX_ACTIVE_MICROVMS`] plus the [`TERMINATED_MICROVM_RETENTION`] reclaim, and
 /// `idempotency` by [`MAX_IDEMPOTENCY_RECORDS`] and [`IDEMPOTENCY_RETENTION`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// Images by `name` (`ImageName` is unique within the account).
     pub images: BTreeMap<String, MicrovmImage>,
@@ -531,6 +533,48 @@ pub struct ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     pub idempotency: BTreeMap<String, IdempotencyRecord>,
     /// The sequence the next minted `microvmId` is formatted from.
     pub next_microvm_seq: u64,
+    /// When this store published the AWS-managed base-image catalogue
+    /// ([`MANAGED_BASE_IMAGE_IDS`]) — the `createdAt` every entry of it reports.
+    ///
+    /// The catalogue is AWS's, not an account's: nothing a caller does adds to it or
+    /// changes it, and this emulator does not hold AWS's own publication dates. So the
+    /// catalogue is published when this store comes up, stamped ONCE here, and every
+    /// read of it reports that same instant.
+    pub managed_catalogue_published_at: DateTime,
+}
+
+impl Default for ComAmazonawsLambdamicrovmsLambdamicrovmsState {
+    /// A store holding no account resources, with the AWS-managed catalogue published
+    /// as of now — see [`Self::managed_catalogue_published_at`].
+    fn default() -> Self {
+        Self {
+            images: BTreeMap::new(),
+            arn_index: BTreeMap::new(),
+            microvms: BTreeMap::new(),
+            microvm_arn_index: BTreeMap::new(),
+            idempotency: BTreeMap::new(),
+            next_microvm_seq: 0,
+            managed_catalogue_published_at: now_datetime(),
+        }
+    }
+}
+
+/// One entry of the AWS-managed base-image catalogue, as a reporting operation
+/// projects it for one region.
+#[derive(Debug, Clone)]
+pub struct ManagedBaseImage {
+    /// The catalogue id — one of [`MANAGED_BASE_IMAGE_IDS`], and the last segment of
+    /// [`Self::image_arn`].
+    pub image_id: String,
+    /// The ARN this entry carries in the region the request was signed for.
+    pub image_arn: String,
+    /// When the catalogue entry was published.
+    pub created_at: DateTime,
+    /// When the entry was last written. Publishing it is its first write, which is how
+    /// this service reports every record it holds (`CreateMicrovmImage` stamps the
+    /// created image's `updatedAt` from the same instant as its `createdAt`), and
+    /// nothing an account does writes a catalogue entry again.
+    pub updated_at: Option<DateTime>,
 }
 
 impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
@@ -634,6 +678,29 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             self.microvm_arn_index.remove(&arn);
         }
         self.idempotency.retain(|_, record| record.expires_at > now);
+    }
+
+    /// The AWS-managed base images this service publishes, in catalogue-id order and
+    /// projected into `region`.
+    ///
+    /// This is the ONE catalogue of the service, the same set
+    /// `CreateMicrovmImage$baseImageArn` is resolved against
+    /// ([`MANAGED_BASE_IMAGE_IDS`], [`is_published_managed_base_image`]), so a listing
+    /// of it and a create that builds on it cannot disagree about which base images
+    /// exist. The entries are AWS-owned, so each ARN carries `aws` in its account field
+    /// and the region the request named; nothing an account does changes an entry, so
+    /// each reports the instant the catalogue was published.
+    pub fn managed_base_images(&self, region: &str) -> Vec<ManagedBaseImage> {
+        let mut ids: Vec<&str> = MANAGED_BASE_IMAGE_IDS.to_vec();
+        ids.sort_unstable();
+        ids.into_iter()
+            .map(|image_id| ManagedBaseImage {
+                image_id: image_id.to_string(),
+                image_arn: managed_base_image_arn(region, image_id),
+                created_at: self.managed_catalogue_published_at,
+                updated_at: Some(self.managed_catalogue_published_at),
+            })
+            .collect()
     }
 
     /// How many MicroVMs are not terminated — what [`MAX_ACTIVE_MICROVMS`] caps.

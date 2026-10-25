@@ -13,7 +13,8 @@ use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
-    ResourceRef, SyncJob, DEFAULT_REGION,
+    Entity, ResourceRef, SyncJob, DEFAULT_REGION, MAX_ENTITIES_PER_WORKSPACE,
+    ROOT_PARENT_ENTITY_ID, STATE_ACTIVE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -607,6 +608,109 @@ impl Emulator {
 /// `^arn:((aws)|(aws-cn)|(aws-us-gov)):iam::[0-9]{12}:role/` with this
 /// emulator's own account segment.
 pub(crate) const SYNC_ROLE: &str = "arn:aws:iam::000000000000:role/TwinMakerSyncRole";
+
+/// The `PricingTier` a billable entity count places a bundled pricing plan in,
+/// written out here rather than asked of the service.
+///
+/// The tier catalogue is the model's own `PricingTier` enum
+/// (`smithy_query(query="shape",shape="PricingTier")`, mirrored in
+/// `ops::types::PRICING_TIER_VALUES`); the counts are the boundaries of the
+/// bands this emulator bills those tiers over, so each row sits exactly ON a
+/// boundary or one entity PAST it, and the last row is past the top band.
+pub(crate) const TIER_BY_ENTITY_COUNT: &[(usize, &str)] = &[
+    (0, "TIER_1"),
+    (1, "TIER_1"),
+    (100, "TIER_1"),
+    (101, "TIER_2"),
+    (1_000, "TIER_2"),
+    (1_001, "TIER_3"),
+    (10_000, "TIER_3"),
+    (10_001, "TIER_4"),
+];
+
+/// The smallest billable entity count [`TIER_BY_ENTITY_COUNT`] places in `tier`.
+pub(crate) fn entity_count_in_tier(tier: &str) -> usize {
+    TIER_BY_ENTITY_COUNT
+        .iter()
+        .find(|(_, banded)| *banded == tier)
+        .map(|(count, _)| *count)
+        .unwrap_or_else(|| panic!("no billable entity count is banded in {tier:?}"))
+}
+
+/// Give the account exactly `count` billable entities in [`REGION`], and answer
+/// the ids of the workspaces holding them.
+///
+/// The workspaces are created through `CreateWorkspace` over HTTP, so they are
+/// the records that operation writes; the entities themselves go straight into
+/// the store the handlers read, exactly as `CreateEntity` writes one — the
+/// record under its id and its ARN in the service's index — because the counts
+/// a tier band is bounded by run into the thousands and one HTTP call each would
+/// say nothing more about the rule under test. No workspace is given more
+/// entities than the service's own ceiling admits.
+///
+/// Called again with a larger `count`, it GROWS the account to that count: the
+/// workspaces and the entity records it already seeded are left where they are.
+pub(crate) async fn seed_entities(emulator: &Emulator, count: usize) -> Vec<String> {
+    let per_workspace = MAX_ENTITIES_PER_WORKSPACE;
+    let workspace_ids: Vec<String> = (0..count.div_ceil(per_workspace))
+        .map(|index| format!("seededEntities{index}"))
+        .collect();
+    for workspace_id in &workspace_ids {
+        let already_there = {
+            let state = emulator.state();
+            let state = state.lock();
+            state.region(REGION).workspaces.contains_key(workspace_id)
+        };
+        if already_there {
+            continue;
+        }
+        let resp = emulator.create_workspace(workspace_id).await;
+        assert_eq!(
+            resp.status, 200,
+            "seeding {count} entities: expected 200 from CreateWorkspace {workspace_id:?}, \
+             got {resp:?}"
+        );
+    }
+
+    let state = emulator.state();
+    let mut state = state.lock();
+    let state = state.region_mut(REGION);
+    for index in 0..count {
+        let workspace_id = workspace_ids[index / per_workspace].clone();
+        let entity_id = format!("seeded{index}");
+        let arn = entity_arn(&workspace_id, &entity_id);
+        let now = SystemTime::now();
+        let workspace = state
+            .workspaces
+            .get_mut(&workspace_id)
+            .unwrap_or_else(|| panic!("the workspace {workspace_id:?} must exist before seeding"));
+        workspace.entities.insert(
+            entity_id.clone(),
+            Entity {
+                entity_id: entity_id.clone(),
+                entity_name: entity_id.clone(),
+                arn: arn.clone(),
+                workspace_id: workspace_id.clone(),
+                description: String::new(),
+                parent_entity_id: ROOT_PARENT_ENTITY_ID.to_string(),
+                components: BTreeMap::new(),
+                tags: BTreeMap::new(),
+                creation_date_time: now,
+                update_date_time: now,
+                state: STATE_ACTIVE.to_string(),
+                settles_at: now,
+            },
+        );
+        state.arn_index.insert(
+            arn,
+            ResourceRef::Entity {
+                workspace_id,
+                entity_id,
+            },
+        );
+    }
+    workspace_ids
+}
 
 /// Store one sync job for `sync_source` in `workspace_id`, written into the very
 /// store the handlers read, exactly as `CreateSyncJob` writes one: the job

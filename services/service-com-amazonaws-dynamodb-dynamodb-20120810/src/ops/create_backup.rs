@@ -201,12 +201,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // Everything this backup reports is read off the table HERE, at the instant of
-        // the request, so the record stands on its own once the table moves on.
-        let backup = crate::state::Backup::taken_from(table, &input.backup_name, now);
-
-        // The catalogue is budgeted like every other growth site in this store.
-        if store.backup_count_in(&region) >= crate::state::MAX_BACKUPS_PER_REGION {
+        // The catalogue is budgeted like every other growth site in this store: by the
+        // records it holds, and by the item data they hold — a backup keeps the items its
+        // source table held, which is what a restore from it writes back. Checked BEFORE
+        // the snapshot below, so the budget precedes the copy rather than following it.
+        if store.backup_count_in(&region) >= crate::state::MAX_BACKUPS_PER_REGION
+            || store
+                .backup_bytes()
+                .saturating_add(table.stored_bytes)
+                > crate::state::MAX_BACKUP_CATALOGUE_BYTES
+        {
             return Err(CreateBackupErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(
@@ -216,6 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Everything this backup reports is read off the table HERE, at the instant of
+        // the request, so the record stands on its own once the table moves on.
+        let backup = crate::state::Backup::taken_from(table, &input.backup_name, now);
 
         let details = backup.details(backup.status(now));
         let backup_arn = details.backup_arn.clone();

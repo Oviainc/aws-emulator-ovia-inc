@@ -157,14 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TraceIds` carries no modelled length bound, so the bound is the
         // service's own: at most `MAX_TRACE_IDS_PER_CALL` ids per call, and a
         // longer list is an invalid request rather than a partly served one.
+        // The refusal states that limit, because the model does not.
         let requested = input.trace_ids.len();
         if requested > crate::state::MAX_TRACE_IDS_PER_CALL {
             return Err(BatchGetTracesErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(format!(
-                        "TraceIds carries {requested} ids; at most {} are accepted per call",
-                        crate::state::MAX_TRACE_IDS_PER_CALL
-                    )),
+                    message: Some(crate::state::exceeding_maximum_query_size_message()),
                 },
             )
             .into());
@@ -180,9 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(BatchGetTracesErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(format!(
-                        "TraceIds carries `{malformed}`, which is not a trace id of the form 1-<8 hex>-<24 hex>"
-                    )),
+                    message: Some(crate::state::malformed_trace_id_message(malformed)),
                 },
             )
             .into());

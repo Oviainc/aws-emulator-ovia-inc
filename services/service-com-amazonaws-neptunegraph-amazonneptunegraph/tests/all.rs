@@ -53,6 +53,8 @@ mod private_graph_endpoint_listing;
 mod private_graph_endpoint_read;
 #[path = "all/query_cancellation.rs"]
 mod query_cancellation;
+#[path = "all/query_status_reporting.rs"]
+mod query_status_reporting;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
 #[path = "all/resource_tagging.rs"]

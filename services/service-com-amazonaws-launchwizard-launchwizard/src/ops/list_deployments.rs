@@ -145,21 +145,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        let now = ::std::time::SystemTime::now();
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ListDeploymentsErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the Launch Wizard state store is unavailable".to_string()),
-            })
-        })?;
-        let mut store = state.lock();
-        // The only write a read makes: the status steps the clock already made due.
-        store.materialize_due(now);
-
         let filters = input.filters.unwrap_or_default();
+        // The request is judged BEFORE the store is reached, so no request-sized work
+        // happens while the shared state lock is held.
+        //
+        // A filter is a name-and-values PAIR, so a filter missing either half is
+        // refused rather than dropped — dropping it answers a BROADER result set than
+        // the caller asked for, with nothing on the wire to say so. The name's
+        // vocabulary is the boundary's own business (`DeploymentFilterKey` is an enum,
+        // so a name outside it never reaches here); what the model cannot express is
+        // that both halves have to be there.
+        if let Some(message) = crate::state::filter_pair_refusal(
+            "filters",
+            filters
+                .iter()
+                .map(|filter| (filter.name.as_deref(), filter.values.as_ref().map(Vec::len))),
+        ) {
+            return Err(
+                ListDeploymentsErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
         for filter in &filters {
-            let Some(name) = filter.name.as_deref() else {
-                continue;
-            };
+            // Belt and braces: the boundary refuses a name outside the modelled enum,
+            // and the pair check above refuses a filter carrying none, so this loop
+            // only guards against a key this handler cannot read reaching it — which
+            // must be a refusal, never a filter that quietly selects everything.
+            let name = filter.name.as_deref().unwrap_or_default();
             if !DEPLOYMENT_FILTER_KEY_VALUES.contains(&name) {
                 return Err(ListDeploymentsErrorModeled::ValidationException(
                     ValidationException {
@@ -172,6 +186,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
+
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDeploymentsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Launch Wizard state store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+        // The only write a read makes: the status steps the clock already made due.
+        store.materialize_due(now);
 
         // Only the summaries each matching deployment reports are materialised, so a
         // read does not copy the stored records (events and all) to serve one page.
@@ -204,19 +228,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// The member a filter reads is named by its `DeploymentFilterKey`
 /// (`DEPLOYMENT_FILTER_KEY_VALUES`), its values are compared case-sensitively as the
-/// model documents, and several values are joined with OR. A filter that carries no
-/// values constrains nothing; the caller gets the unfiltered result set rather than an
-/// empty one.
+/// model documents, and several values are joined with OR. Every filter that reaches
+/// here is a complete name-and-values pair naming one of those keys: a filter missing
+/// either half, or naming a key outside that set, was already refused, so nothing here
+/// turns a caller's constraint back into "matches everything".
 fn matches_filter(deployment: &crate::state::Deployment, filter: &DeploymentFilter) -> bool {
-    let values = match filter.values.as_deref() {
-        None | Some([]) => return true,
-        Some(values) => values,
-    };
     let field = match filter.name.as_deref() {
         Some("WORKLOAD_NAME") => &deployment.workload_name,
         Some("DEPLOYMENT_STATUS") => &deployment.status,
-        // No filter name: nothing is being filtered on.
-        _ => return true,
+        // Unreachable for a request this handler served: a filter naming no supported
+        // key is refused above, and a key this arm does not read would select
+        // everything, which is what a filter must never do.
+        _ => return false,
     };
-    values.iter().any(|value| value == field)
+    filter
+        .values
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|value| value == field)
 }

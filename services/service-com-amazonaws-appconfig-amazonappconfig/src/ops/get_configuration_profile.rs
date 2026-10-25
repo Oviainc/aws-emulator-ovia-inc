@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = state.lock();
 
-        let Some(application) = store.applications.get(&input.application_id) else {
+        let Some(application) = store.application(&input.application_id) else {
             return Err(GetConfigurationProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(

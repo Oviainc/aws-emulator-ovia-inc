@@ -381,6 +381,12 @@ async fn a_listed_group_is_the_group_describe_reports() {
                 Some(json!({
                     "name": "uses-the-group",
                     "type": "URL_PULL",
+                    // A pull input ingests through its source URLs ("The source
+                    // URLs for a PULL-type input"), so it carries them.
+                    "sources": [
+                        { "url": "https://example.com/a.m3u8" },
+                        { "url": "https://example.com/b.m3u8" },
+                    ],
                     "inputSecurityGroups": [id.clone()],
                 })),
             )

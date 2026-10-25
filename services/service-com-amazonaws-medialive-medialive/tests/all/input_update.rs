@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
+use crate::support::resolved_input_body;
 use crate::wire::{call, error_code, medialive};
 
 /// One row of a pull-source list, as `InputSourceRequest` shapes it.
@@ -27,10 +28,32 @@ fn baseline_body() -> Value {
         "name": "baseline",
         "type": "URL_PULL",
         "sources": [source("https://example.com/a.m3u8"), source("https://example.com/b.m3u8")],
-        "inputSecurityGroups": ["3456789"],
+        "inputSecurityGroups": ["a-group-this-account-does-not-hold-yet"],
         "roleArn": "arn:aws:iam::111122223333:role/Baseline",
         "tags": { "team": "video" },
     })
+}
+
+/// The baseline input, created after the setup has minted the resources its
+/// configuration names.
+async fn baseline_input(router: &MultiServiceRouter) -> Value {
+    let body = resolved_input_body(router, baseline_body()).await;
+    create_input(router, body).await
+}
+
+/// The members a patch's own REFERENCE lists land on the stored input, read out
+/// of the resolved patch rather than written into the row: the ids are the ones
+/// the setup minted, so the row says which lists it names and the patch says
+/// which ids they hold.
+fn reference_changes(patch: &Value) -> Vec<(&'static str, Value)> {
+    [
+        ("inputSecurityGroups", "securityGroups"),
+        ("sdiSources", "sdiSources"),
+        ("inputDevices", "inputDevices"),
+    ]
+    .into_iter()
+    .filter_map(|(member, reported)| patch.get(member).map(|value| (reported, value.clone())))
+    .collect()
 }
 
 async fn create_input(router: &MultiServiceRouter, body: Value) -> Value {
@@ -99,16 +122,19 @@ async fn an_update_replaces_only_the_members_the_request_names() {
             )],
         ),
         (
+            // The ids are the setup's: what this row is about is that the two
+            // groups the request names replace the one the input carried
+            // (`reference_changes` reads them back out of the request).
             "two security groups replace one",
-            json!({ "inputSecurityGroups": ["9999999", "8888888"] }),
-            vec![("securityGroups", json!(["9999999", "8888888"]))],
+            json!({ "inputSecurityGroups": ["first-replacement-group", "second-replacement-group"] }),
+            vec![],
         ),
         (
             // A list the request names is replaced by what it names, so an
             // empty list detaches every group.
             "an empty security group list",
             json!({ "inputSecurityGroups": [] }),
-            vec![("securityGroups", json!([]))],
+            vec![],
         ),
         (
             // One ingest endpoint is `SINGLE_PIPELINE` (`InputClass`'s doc), so
@@ -157,12 +183,12 @@ async fn an_update_replaces_only_the_members_the_request_names() {
             json!({ "inputDevices": [{ "id": "hd-0000001" }] }),
             // `InputClass` counts the WIDEST per-pipeline list, and the two
             // baseline sources are still the widest, so the class does not move.
-            vec![("inputDevices", json!([{ "id": "hd-0000001" }]))],
+            vec![],
         ),
         (
             "two sdi sources",
             json!({ "sdiSources": ["sdi-x", "sdi-y"] }),
-            vec![("sdiSources", json!(["sdi-x", "sdi-y"]))],
+            vec![],
         ),
         (
             "srt caller sources",
@@ -213,13 +239,19 @@ async fn an_update_replaces_only_the_members_the_request_names() {
 
     for (case, patch, changes) in table {
         let router = medialive();
-        let created = create_input(&router, baseline_body()).await;
+        let created = baseline_input(&router).await;
         let id = created["id"].as_str().unwrap_or_default().to_string();
         let (status, before) = describe_input(&router, &id).await;
         assert_eq!(
             status, 200,
             "case {case:?}: DescribeInput before the update: got {status}: {before}"
         );
+
+        // Every id the patch names is a resource this account holds, so what it
+        // exercises is the replacement and not a refused reference.
+        let patch = resolved_input_body(&router, patch).await;
+        let changes: Vec<(&'static str, Value)> =
+            changes.into_iter().chain(reference_changes(&patch)).collect();
 
         // What the stored input must look like afterwards: the one it had, with
         // the members this request names replaced.
@@ -368,7 +400,7 @@ async fn an_update_recomputes_the_members_derived_from_the_input() {
 #[tokio::test]
 async fn updating_an_unknown_input_is_not_found() {
     let router = medialive();
-    let created = create_input(&router, baseline_body()).await;
+    let created = baseline_input(&router).await;
     let id = created["id"].as_str().unwrap_or_default().to_string();
 
     for unknown in ["0000000", "nope", "1000001"] {
@@ -411,7 +443,7 @@ async fn updating_an_unknown_input_is_not_found() {
 #[tokio::test]
 async fn an_input_attached_to_a_channel_that_has_not_stopped_cannot_be_updated() {
     let router = medialive();
-    let created = create_input(&router, baseline_body()).await;
+    let created = baseline_input(&router).await;
     let input_id = created["id"].as_str().unwrap_or_default().to_string();
 
     let (status, channel) = call(

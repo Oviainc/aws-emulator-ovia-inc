@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -68,6 +68,26 @@ const TAGS_MEMBER: &str = "tags";
 /// it), which is what makes the refusal Tagris's rather than Batch's.
 fn is_tag_violation(violation: &Violation) -> bool {
     violation.path == TAGS_MEMBER || violation.path.starts_with(&format!("{TAGS_MEMBER}."))
+}
+
+/// The message Batch answers an ENUM-MEMBERSHIP refusal with, and `None` for a violation
+/// of any other class.
+///
+/// A value outside the closed set a member's enum declares is a rule AWS Batch states
+/// ITSELF: the frontend envelope over the service's own sentence for that rule
+/// ([`crate::state::enum_membership_detail`]), naming the member and the set it enforced
+/// and nothing of the value it rejected. Every enum member of this service is a plain
+/// `String` in the generated input types, so the boundary validator is what finds the
+/// value — but the words are the service's, which is why they are chosen here instead of
+/// left to the framework's generic constraint rendering.
+fn enum_membership_message(violation: &Violation) -> Option<String> {
+    let ViolationKind::EnumValue(allowed) = &violation.kind else {
+        return None;
+    };
+    Some(crate::state::client_exception_message(
+        &crate::state::enum_membership_detail(&violation.path, allowed),
+        &crate::state::new_request_id(),
+    ))
 }
 
 /// The `com-amazonaws-batch-awsbatchv20160810` emulated service: the generated [`ServiceDefinition`] plus
@@ -131,19 +151,37 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //   code recorded for a 51-entry `tags` map;
         // * every other refusal is the `ClientException` (HTTP 400) the model declares.
         //
-        // The message stays the one the framework built from the request: it names the
-        // member and the constraint it failed, which is what the caller has to fix.
-        // Authentication refusals keep the framework's wording (403 is not a Batch
-        // error shape at all).
+        // The MESSAGE is the service's own wherever Batch states the rule itself: a
+        // member outside the closed set its enum declares is answered with Batch's
+        // frontend envelope over that rule's sentence ([`enum_membership_message`]),
+        // because the framework's generic constraint rendering is not what this API
+        // emits — it names a dotted member path and echoes the rejected value, neither of
+        // which appears in a Batch refusal. Every other class keeps the message the
+        // framework built from the request: it names the member and the constraint it
+        // failed, which is what the caller has to fix. Authentication refusals keep the
+        // framework's wording (403 is not a Batch error shape at all).
         match refusal {
             Refusal::Invalid(violations) => {
-                let code = if violations.iter().any(is_tag_violation) {
-                    TAGGING_REFUSAL_CODE
-                } else {
-                    REFUSAL_CODE
-                };
+                if violations.iter().any(is_tag_violation) {
+                    return Some(Refused {
+                        code: TAGGING_REFUSAL_CODE.to_string(),
+                        message: aws_smithy_schema_server::envelope(violations)
+                            .unwrap_or_else(|| "invalid request".to_string()),
+                    });
+                }
+                // A member outside its enum's value set is a rule Batch words itself, in
+                // its own envelope. Only the FIRST violation is considered, so the order
+                // the validating walk found the rules in is the order they are reported
+                // in: a request that also breaks a rule the walk reports earlier is still
+                // refused with that one.
+                if let Some(message) = violations.first().and_then(enum_membership_message) {
+                    return Some(Refused {
+                        code: REFUSAL_CODE.to_string(),
+                        message,
+                    });
+                }
                 Some(Refused {
-                    code: code.to_string(),
+                    code: REFUSAL_CODE.to_string(),
                     message: aws_smithy_schema_server::envelope(violations)
                         .unwrap_or_else(|| "invalid request".to_string()),
                 })

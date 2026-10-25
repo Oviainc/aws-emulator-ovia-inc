@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIpamInternetRegistryAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIpamInternetRegistryAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: deletes the IPAM internet registry association the request names by moving
+//! it into the transient `delete-in-progress` state with the clock owing it
+//! `delete-complete`, and answers the association as the store then holds it. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIpamInternetRegistryAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The refusals, in the order the service answers them: something that is not an
+//! `IpamInternetRegistryAssociationId` at all is
+//! `InvalidIpamInternetRegistryAssociationId.Malformed`, before there is anything to look
+//! up; a `DryRun` request a caller holds the permissions for is `DryRunOperation` and writes
+//! nothing, because the flag asks whether the CALLER MAY make the request ("without actually
+//! making the request", `DryRun`) rather than anything about the named resource; then a
+//! well-formed id this account holds no association for is
+//! `InvalidIpamInternetRegistryAssociationId.NotFound`, an association whose deletion has
+//! already been asked for is `IncorrectState`, and one that still holds routing policy
+//! registrations is `DependencyViolation` — "before deleting, you must remove all routing
+//! policy registrations associated with the internet registry", which is what EC2's
+//! dependency refusal says of every resource something still depends on.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +76,39 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
+
+/// How many dependent prefixes the dependency refusal names before it counts the rest.
+///
+/// The refusal names what still has to be removed, and an association can hold as many
+/// registrations as the store keeps records ([`state::MAX_STORED_RECORDS_PER_STORE`]), so the
+/// list is capped: a one-line request cannot make this emulator build a refusal the size of
+/// the whole registration store.
+const MAX_NAMED_DEPENDENT_REGISTRATIONS: usize = 10;
+
+/// The refusal for an association that still holds routing policy registrations, naming the
+/// prefixes whose authorizations have to be withdrawn first.
+///
+/// `held` is the association's own list of what still depends on it, in the store's order.
+fn dependent_registrations_message(association_id: &str, held: &[&str]) -> String {
+    let named = held
+        .iter()
+        .take(MAX_NAMED_DEPENDENT_REGISTRATIONS)
+        .copied()
+        .collect::<Vec<&str>>()
+        .join(", ");
+    let unnamed = held.len().saturating_sub(MAX_NAMED_DEPENDENT_REGISTRATIONS);
+    let rest = if unnamed == 0 {
+        String::new()
+    } else {
+        format!(" and {unnamed} more")
+    };
+    format!(
+        "The {kind} '{association_id}' has routing policy registrations for {named}{rest} and \
+         cannot be deleted.",
+        kind = state::RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION,
+    )
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -136,18 +177,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIpamInternetRegistryAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIpamInternetRegistryAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIpamInternetRegistryAssociation"))
+        // `ctx` carries request metadata only; this operation reads none of it — the
+        // association is named in the request and carries its own Region. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        let association_id = input.ipam_internet_registry_association_id.as_str();
+        // The request's own FORM first, before anything is resolved: "not an id of this kind"
+        // is a malformed request rather than a missing resource, and it is not answered by
+        // the DryRun arm below.
+        if !state::ipam_internet_registry_association_id_is_well_formed(association_id) {
+            return Err(state::invalid_ipam_internet_registry_association_id_malformed(
+                association_id,
+            ));
+        }
+
+        // "Checks whether you have the required permissions for the operation, without
+        // actually making the request" (`DryRun`): a question about the CALLER, answered once
+        // the request's own form has been checked and before anything is resolved or written;
+        // every caller of this emulator is permitted.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // The clock first: an association whose `delete-complete`, or a registration whose
+        // own terminal state, has fallen due is already there, so every question below is
+        // asked of the state the store is ACTUALLY in. Each move was owed at this instant
+        // whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // The association the request names, resolved against the account's associations now
+        // that the request's own form has been accepted and the DryRun question answered: an
+        // id this account holds no association for is `.NotFound`.
+        state::require_known_ipam_internet_registry_association(&store, association_id)?;
+        let record = store
+            .ipam_internet_registry_association(association_id)
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the {kind} '{association_id}' resolved a moment ago is not in the store \
+                     any more",
+                    kind = state::RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION,
+                ))
+            })?;
+        // An association a delete has already been asked for has nothing left to delete, so a
+        // second delete is refused rather than restarting the clock on it.
+        if record.is_deleting() {
+            let current = record.state().to_string();
+            return Err(state::incorrect_state_of(
+                state::RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION,
+                association_id,
+                &current,
+            ));
+        }
+        // "Before deleting, you must remove all routing policy registrations associated with
+        // the internet registry": an association something still depends on is refused with
+        // EC2's dependency code, naming what has to be removed first. A registration counts
+        // until its withdrawal is FINISHED, which is the store's own definition of what still
+        // depends on an association.
+        let held = record.held_registration_cidrs();
+        if !held.is_empty() {
+            let message = dependent_registrations_message(association_id, &held);
+            return Err(state::dependency_violation(message));
+        }
+
+        // "Information about the deleted internet registry association"
+        // (`IpamInternetRegistryAssociation`): the association as it was STORED by the move
+        // this delete started, so the caller sees what a later report of the associations
+        // will see rather than a value built here.
+        let view = store
+            .begin_ipam_internet_registry_association_deletion(association_id)
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the {kind} '{association_id}' resolved a moment ago is not in the store \
+                     any more",
+                    kind = state::RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION,
+                ))
+            })?;
+
+        Ok(DeleteIpamInternetRegistryAssociationOutput {
+            ipam_internet_registry_association: Some(view),
+        })
     }
 }

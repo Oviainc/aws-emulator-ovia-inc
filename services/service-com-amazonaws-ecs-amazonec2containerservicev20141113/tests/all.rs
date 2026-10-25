@@ -31,10 +31,14 @@ mod container_instances;
 mod daemon_task_definition_deletion;
 #[path = "all/daemon_task_definitions.rs"]
 mod daemon_task_definitions;
+#[path = "all/describe_failure_identifiers.rs"]
+mod describe_failure_identifiers;
 #[path = "all/ecs_wire.rs"]
 mod ecs_wire;
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/invalid_request_refusals.rs"]
+mod invalid_request_refusals;
 #[path = "all/list_attributes.rs"]
 mod list_attributes;
 #[path = "all/list_clusters.rs"]

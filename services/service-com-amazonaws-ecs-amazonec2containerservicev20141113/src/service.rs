@@ -41,9 +41,69 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error this service answers a request refused before any handler ran with: "The
+/// specified parameter isn't valid. Review the available parameters for the API
+/// request", the one such failure this service's model declares. Every ECS operation
+/// that takes parameters declares it, and none declares a validation error shape
+/// besides it.
+const INVALID_PARAMETER_EXCEPTION: &str = "InvalidParameterException";
+
+/// The member a describe names the optional fields it wants back in.
+const INCLUDE_MEMBER: &str = "include";
+
+/// What Amazon ECS says when a CLUSTER read asks for a field that is not one of the
+/// fields a cluster can be described with.
+const INVALID_CLUSTER_IDENTIFIER: &str = "The cluster identifier is invalid";
+
+/// Whether `violation` is a value of a cluster read's `include` list that is not one of
+/// the fields a cluster can be described with.
+///
+/// The refused element names the `include` member it came from, and the values it was
+/// checked against are the cluster fields ([`crate::state::CLUSTER_FIELDS`]) — which is
+/// what distinguishes it from the `include` of a read of some other resource, whose
+/// member accepts that resource's own fields.
+fn is_unknown_cluster_field(violation: &Violation) -> bool {
+    let ViolationKind::EnumValue(allowed) = &violation.kind else {
+        return false;
+    };
+    violation
+        .path
+        .split('.')
+        .next()
+        .is_some_and(|member| member == INCLUDE_MEMBER)
+        && allowed.len() == crate::state::CLUSTER_FIELDS.len()
+        && allowed
+            .iter()
+            .all(|value| crate::state::CLUSTER_FIELDS.contains(&value.as_str()))
+}
+
+/// What the modelled refusal says when the walk reported no clause to state: the
+/// `InvalidParameterException` doc's own sentence. A refusal of this service carries a
+/// modelled code whatever the walk had to say about it, so this is the message of last
+/// resort rather than a reason to leave the refusal unworded.
+const INVALID_PARAMETER_MESSAGE: &str =
+    "The specified parameter isn't valid. Review the available parameters for the API \
+     request.";
+
+/// How this service words the refusal of a request whose values failed the rules the
+/// model declares.
+///
+/// A cluster read that asks for an unknown `include` field is the one such refusal
+/// Amazon ECS states in its own sentence ([`INVALID_CLUSTER_IDENTIFIER`]); every other
+/// one keeps the framework's clause, which states the value, the position and the
+/// requirement it failed, falling back to [`INVALID_PARAMETER_MESSAGE`] when there is no
+/// clause to state.
+fn refusal_message(violations: &[Violation]) -> String {
+    if violations.iter().any(is_unknown_cluster_field) {
+        return INVALID_CLUSTER_IDENTIFIER.to_string();
+    }
+    ::aws_smithy_schema_server::envelope(violations)
+        .unwrap_or_else(|| INVALID_PARAMETER_MESSAGE.to_string())
+}
 
 /// The `com-amazonaws-ecs-amazonec2containerservicev20141113` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +158,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Amazon ECS answers such a refusal with an error it MODELS: a client
+        // branches on the error type, and this service declares no validation
+        // error shape at all, so the code is the modeled
+        // `InvalidParameterException` (HTTP 400) rather than a shape no operation
+        // of this service can return. The wording comes from [`refusal_message`].
+        //
+        // An authentication refusal keeps the framework's wording: it is not a
+        // request-parameter failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: INVALID_PARAMETER_EXCEPTION.to_string(),
+                message: refusal_message(violations),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

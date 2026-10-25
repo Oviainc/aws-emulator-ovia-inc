@@ -186,26 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The two rules the `Vpc` member's own doc states: "This property
-        // requires setting the roleArn property on Input creation. Not
-        // compatible with the inputSecurityGroups property." Both are refusals
-        // of the request, so they answer with this operation's modelled 400.
-        if input.vpc.is_some() {
-            if input
-                .input_security_groups
-                .as_ref()
-                .is_some_and(|groups| !groups.is_empty())
-            {
-                return Err(bad_request(
-                    "vpc is not compatible with the inputSecurityGroups property",
-                ));
-            }
-            if input.role_arn.as_deref().unwrap_or_default().is_empty() {
-                return Err(bad_request(
-                    "vpc requires setting the roleArn property on Input creation",
-                ));
-            }
-        }
+        // The `Vpc` cross-member rules the member's own doc states, the
+        // reference resolution and the per-`Type` ingest requirements are all
+        // part of ONE rule, applied below to the record this request would
+        // store — the same rule `UpdateInput` applies to the record it would
+        // leave behind (`state::input_configuration_error`).
 
         let region = crate::state::request_region(ctx.parts());
 
@@ -244,12 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let id = state.mint_input_id();
-        let arn = ::engine::emulator_arn("medialive", &region, &format!("input:{id}"));
-        let mut record = crate::state::new_input(id.clone(), arn);
-
         // Everything the request supplied is stored; the response is then read
         // back out of the stored record, never from `input`.
+        let mut record = crate::state::new_input();
         record.name = input.name;
         record.input_type = input.r#type;
         if let Some(location) = input.input_network_location {
@@ -268,6 +250,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.router_settings = input.router_settings;
         record.vpc = input.vpc;
         record.tags = input.tags.unwrap_or_default();
+
+        // An input the service cannot ingest through is refused rather than
+        // created: the `Vpc` cross-member rules, every id the configuration
+        // names resolving to a resource this account holds, and the ingest list
+        // the requested `Type` ingests through. One rule, shared with
+        // `UpdateInput`, so the two cannot disagree about which configurations
+        // exist — and applied before any id is minted.
+        if let Some(message) = state.input_configuration_error(&record) {
+            return Err(bad_request(&message));
+        }
+
+        // The identity is minted only now, so a refused create spends no id.
+        let id = state.mint_input_id();
+        record.id = id.clone();
+        record.arn = ::engine::emulator_arn("medialive", &region, &format!("input:{id}"));
 
         state.inputs.insert(id.clone(), record);
         if let Some(token) = input.request_id {

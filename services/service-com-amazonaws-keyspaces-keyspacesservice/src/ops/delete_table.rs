@@ -251,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // captures the changes of a table that will not take another, and nothing can
             // read a stream of a table that is gone. `DELETING` is where that is settled,
             // because it is the one call that accepts the deletion.
-            streams.lock().forget_streams_for_table(
+            let forgotten = streams.lock().forget_streams_for_table(
                 &region,
                 &input.keyspace_name,
                 &input.table_name,
@@ -260,12 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // forgotten go with them: nothing may answer for a stream ARN the stream
             // store no longer holds, not even in the span before `settle` removes the
             // table itself.
-            if let Some(table) = store
-                .keyspace_mut(&region, &input.keyspace_name)
-                .and_then(|keyspace| keyspace.tables.get_mut(&input.table_name))
-            {
-                table.cdc_stream_tags.clear();
-            }
+            store.forget_stream_tags(&region, &forgotten);
         }
         drop(store);
 

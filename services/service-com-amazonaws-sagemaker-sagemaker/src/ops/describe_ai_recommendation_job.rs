@@ -187,17 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.ai_recommendation_job_name)
         else {
             // A name nothing created names no job, so the read is refused with the
-            // not-found failure this operation models. The ARN that refusal names is the
-            // one this name WOULD carry, minted from the Region the request signed for,
-            // because there is no stored record to read one from.
-            let arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                crate::state::AI_RECOMMENDATION_JOB_KIND,
-                &input.ai_recommendation_job_name,
-            );
+            // not-found failure this operation models, naming the job name the request
+            // presented because there is no stored record to report anything else from.
             return Err(DescribeAIRecommendationJobErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(crate::state::ai_recommendation_job_not_found(&arn)),
+                    message: Some(crate::state::ai_recommendation_job_not_found(
+                        &input.ai_recommendation_job_name,
+                    )),
                 },
             )
             .into());

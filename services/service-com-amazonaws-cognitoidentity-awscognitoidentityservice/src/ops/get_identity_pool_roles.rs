@@ -3,8 +3,10 @@
 //! @op GetIdentityPoolRoles
 //! Reports the role configuration `SetIdentityPoolRoles` stored for a pool: the pool's
 //! id, its `authenticated` / `unauthenticated` role ARNs and its per-provider role
-//! mappings. A pool nobody has set roles for has an EMPTY role map and no mappings — not
-//! a missing pool — while a pool this service does not store is a 404.
+//! mappings. A pool with no role of either kind — one nobody set roles for, or one whose
+//! last call stored none — has no role configuration to report, so the optional `Roles`
+//! and `RoleMappings` members are left out of the 200 rather than written as empty maps;
+//! that is not a missing pool, while a pool this service does not store is a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -174,22 +176,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A pool with no stored configuration has no role of either kind, which is an
-        // empty `Roles` map; `RoleMappings` is reported only when a call stored some.
+        // Both output members are optional and carry no default, and a role configuration
+        // with no entry is the ABSENCE of that configuration rather than a configuration
+        // that is empty: a pool nobody set roles for, and a pool whose last call stored no
+        // role of either kind, each have no role to report, so the member is left out of
+        // the body instead of being written as an empty map.
         let configured = store.identity_pool_roles.get(&input.identity_pool_id);
+        let roles = configured
+            .map(|configured| configured.roles.clone())
+            .filter(|roles| !roles.is_empty())
+            .map(|roles| roles.into_iter().collect());
+        let role_mappings = configured
+            .and_then(|configured| configured.role_mappings.clone())
+            .filter(|mappings| !mappings.is_empty())
+            .map(|mappings| mappings.into_iter().collect());
         Ok(GetIdentityPoolRolesOutput {
             identity_pool_id: Some(input.identity_pool_id),
-            roles: Some(
-                configured
-                    .map(|configured| configured.roles.clone().into_iter().collect())
-                    .unwrap_or_default(),
-            ),
-            role_mappings: configured.and_then(|configured| {
-                configured
-                    .role_mappings
-                    .clone()
-                    .map(|mappings| mappings.into_iter().collect())
-            }),
+            roles,
+            role_mappings,
         })
     }
 }

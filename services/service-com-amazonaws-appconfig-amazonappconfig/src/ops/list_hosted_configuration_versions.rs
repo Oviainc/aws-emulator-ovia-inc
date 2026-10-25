@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A hosted configuration version only exists under a profile, which only exists
         // under an application, so an unresolvable level of the path is not an empty
         // listing: it is the 404 this operation models, exactly as the reader answers it.
-        let Some(application) = store.applications.get(&input.application_id) else {
+        let Some(application) = store.application(&input.application_id) else {
             return Err(not_found(
                 crate::state::application_not_found(&input.application_id),
                 input.application_id,

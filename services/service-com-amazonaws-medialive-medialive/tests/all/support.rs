@@ -16,8 +16,10 @@
 //! collection's URI, its two implemented operations as one call each, the
 //! label encoder every `@httpLabel` suite shares ([`percent_encoded`]), the
 //! readers the group assertions need, the two clock readings a timestamp
-//! assertion compares ([`epoch_seconds`], [`unix_seconds`]) and the one channel
-//! a signal map's discovery is entered from ([`entry_point`]).
+//! assertion compares ([`epoch_seconds`], [`unix_seconds`]), the one channel
+//! a signal map's discovery is entered from ([`entry_point`]) and the input
+//! setup every suite that creates an input shares ([`input_security_group`],
+//! [`sdi_source`], [`claimed_device`], [`resolved_input_body`]).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -117,6 +119,157 @@ pub fn unix_seconds(instant: SystemTime) -> f64 {
         .duration_since(UNIX_EPOCH)
         .expect("the test clock is after the Unix epoch")
         .as_secs_f64()
+}
+
+/// One input security group, answering its minted `Id`.
+///
+/// The setup every suite whose input configuration carries an
+/// `InputSecurityGroups` entry — or whose `Type` is one an upstream system
+/// pushes to, which the whitelist is what admits — goes through, so no suite has
+/// to invent a group id that nothing minted.
+pub async fn input_security_group(router: &MultiServiceRouter) -> String {
+    let (status, created) = call(
+        router,
+        "POST",
+        "/prod/inputSecurityGroups",
+        Some(json!({ "whitelistRules": [{ "cidr": "10.0.0.0/16" }] })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "setup: expected CreateInputSecurityGroup to answer 201, got {status}: {created}"
+    );
+    created["securityGroup"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// One SdiSource named `name`, answering its minted `Id` — the setup a suite
+/// whose input ingests through `SdiSources` goes through.
+pub async fn sdi_source(router: &MultiServiceRouter, name: &str) -> String {
+    let (status, created) = call(
+        router,
+        "POST",
+        "/prod/sdiSources",
+        Some(json!({ "name": name })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "setup: expected CreateSdiSource to answer 201, got {status}: {created}"
+    );
+    created["sdiSource"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The input device `id`, claimed into this account, answering that same id —
+/// the setup a suite whose input ingests through `InputDevices` goes through.
+pub async fn claimed_device(router: &MultiServiceRouter, id: &str) -> String {
+    let (status, claimed) = call(router, "POST", "/prod/claimDevice", Some(json!({ "id": id }))).await;
+    assert_eq!(
+        status, 200,
+        "setup: expected ClaimDevice({id}) to answer 200, got {status}: {claimed}"
+    );
+    id.to_string()
+}
+
+/// Whether this account already holds the resource `uri` reads.
+async fn already_held(router: &MultiServiceRouter, uri: &str) -> bool {
+    let (status, _) = call(router, "GET", uri, None).await;
+    status == 200
+}
+
+/// The same `CreateInput` body, pointed at resources this account really holds.
+///
+/// Every id an input configuration names has to resolve to a resource of this
+/// account, and an input of a type an upstream system pushes to has to name the
+/// whitelist that admits it, so a suite's row says WHAT its input ingests
+/// through and this helper puts those resources in the account: an input
+/// security group per `inputSecurityGroups` entry (and one for a pushed-to row
+/// that names none), an SdiSource per `sdiSources` entry (the row's entry is
+/// used as its `Name`), a claim per `inputDevices` entry — a device id is the
+/// unit's own, so it is claimed exactly as the row spells it — and the pair of
+/// redundant source URLs a pulled-from row that names none needs.
+///
+/// An entry that ALREADY names a resource this account holds is left pointing at
+/// it, so a suite that created the resource itself keeps the id it chose and
+/// this helper is idempotent.
+///
+/// A row that is about the `Vpc` rules is left alone where it names no group: a
+/// VPC input's ingest addresses are created in the customer's VPC, and `Vpc` is
+/// "not compatible with the inputSecurityGroups property".
+pub async fn resolved_input_body(router: &MultiServiceRouter, body: Value) -> Value {
+    let mut body = body;
+    let pushed_to = matches!(
+        body.get("type").and_then(Value::as_str),
+        Some("RTMP_PUSH" | "RTP_PUSH" | "UDP_PUSH")
+    ) && body.get("vpc").is_none()
+        && body
+            .get("inputNetworkLocation")
+            .and_then(Value::as_str)
+            .unwrap_or("AWS")
+            == "AWS";
+    let requested_groups = body
+        .get("inputSecurityGroups")
+        .and_then(Value::as_array)
+        .cloned();
+    match requested_groups {
+        Some(entries) if !entries.is_empty() => {
+            let mut resolved = Vec::new();
+            for entry in entries {
+                let named = entry.as_str().unwrap_or_default().to_string();
+                if already_held(router, &format!("/prod/inputSecurityGroups/{named}")).await {
+                    resolved.push(json!(named));
+                } else {
+                    resolved.push(json!(input_security_group(router).await));
+                }
+            }
+            body["inputSecurityGroups"] = Value::Array(resolved);
+        }
+        _ if pushed_to => {
+            body["inputSecurityGroups"] = json!([input_security_group(router).await]);
+        }
+        _ => {}
+    }
+    if let Some(entries) = body.get("sdiSources").and_then(Value::as_array).cloned() {
+        let mut resolved = Vec::new();
+        for entry in entries {
+            let named = entry.as_str().unwrap_or("sdi-source").to_string();
+            if already_held(router, &format!("/prod/sdiSources/{named}")).await {
+                resolved.push(json!(named));
+            } else {
+                resolved.push(json!(sdi_source(router, &named).await));
+            }
+        }
+        body["sdiSources"] = Value::Array(resolved);
+    }
+    if let Some(entries) = body.get("inputDevices").and_then(Value::as_array).cloned() {
+        for entry in entries {
+            if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                if !already_held(router, &format!("/prod/inputDevices/{id}")).await {
+                    claimed_device(router, id).await;
+                }
+            }
+        }
+    }
+    // A row of a pulled-from type that names no source has nothing to ingest
+    // from — `Sources` is "The source URLs for a PULL-type input. Every PULL
+    // type input needs exactly two source URLs for redundancy" — so it is given
+    // that redundant pair.
+    if matches!(
+        body.get("type").and_then(Value::as_str),
+        Some("URL_PULL" | "RTMP_PULL" | "MP4_FILE" | "TS_FILE")
+    ) && body.get("sources").is_none()
+    {
+        body["sources"] = json!([
+            { "url": "https://example.com/a.m3u8" },
+            { "url": "https://example.com/b.m3u8" },
+        ]);
+    }
+    body
 }
 
 /// One channel named `name`, answering its ARN — the top-level resource a signal

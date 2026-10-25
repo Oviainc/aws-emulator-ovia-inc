@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterWebhookWithThirdParty
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterWebhookWithThirdParty`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterWebhookWithThirdParty::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## The rule this handler is
+//!
+//! "Configures a connection between the webhook that was created and the external tool
+//! with events to be detected": what the call names is "an existing webhook created
+//! with PutWebhook to register with a supported third party", so the name is RESOLVED
+//! against the stored webhooks and a name no stored webhook carries is refused with the
+//! error the model declares for that — `WebhookNotFoundException` — while a webhook
+//! whose target action is not the supported third party is refused with the other error
+//! it models, `ValidationException`. Which webhooks those are is the one rule its
+//! sibling `DeregisterWebhookWithThirdParty` asks too
+//! ([`crate::state::ComAmazonawsCodepipelineCodepipeline20150709State::webhook_targets_third_party`]).
+//!
+//! The connection itself is held by the external tool, not by this service: this
+//! emulator reaches no external tool and serves no webhook trigger plane, so there is
+//! nothing of a connection for it to make, and the acceptance asserts only what it
+//! checked — that the account holds a webhook of that name, targeting an action this
+//! operation supports.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +144,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterWebhookWithThirdParty` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterWebhookWithThirdPartyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterWebhookWithThirdParty"))
+        let _ = ctx;
+        let state = crate::state::require_state(&*self.engine)?;
+
+        // `webhookName` is not a modelled `@required` member, so a request carrying
+        // none reaches here: there is no webhook for it to name, and the operation
+        // models `ValidationException` for a request in an invalid format.
+        let Some(name) = input.webhook_name.as_deref() else {
+            return Err(RegisterWebhookWithThirdPartyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "webhookName must name the webhook to register".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Resolved against the stored webhooks under ONE guard, so the name and what
+        // the webhook targets are read from one snapshot of the store: only a webhook
+        // `PutWebhook` created can be registered, and it has to be a webhook of the
+        // supported third party, by the one rule both third-party webhook operations
+        // ask the store with. `WebhookNotFoundException` models no `message` member, so
+        // the code is the whole refusal.
+        let supported = {
+            let store = state.lock();
+            store
+                .webhooks
+                .get(name)
+                .map(|webhook| store.webhook_targets_third_party(&webhook.definition))
+        };
+        match supported {
+            None => {
+                return Err(
+                    RegisterWebhookWithThirdPartyErrorModeled::WebhookNotFoundException(
+                        WebhookNotFoundException {},
+                    )
+                    .into(),
+                )
+            }
+            Some(false) => {
+                return Err(
+                    RegisterWebhookWithThirdPartyErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "Webhook {name} does not target an action type of {}, and \
+                                 registering a webhook with a third party is supported \
+                                 only for those",
+                                crate::state::PROVIDER_GITHUB
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Some(true) => {}
+        }
+
+        Ok(RegisterWebhookWithThirdPartyOutput {})
     }
 }

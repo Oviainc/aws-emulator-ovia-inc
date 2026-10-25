@@ -45,7 +45,7 @@ use crate::asset_lifecycle::{
 use crate::support::now_seconds;
 
 /// The workspace every suite below starts its queries in.
-const WORKSPACE: &str = "Plant1";
+pub(crate) const WORKSPACE: &str = "Plant1";
 
 /// The `QueryStatus` values that are TERMINAL: a query in one of them never moves
 /// again. Source: `smithy_query(query="shape", shape="QueryStatus")` — SUBMITTED |
@@ -54,7 +54,7 @@ const WORKSPACE: &str = "Plant1";
 const TERMINAL_STATUSES: [&str; 3] = ["COMPLETED", "FAILED", "CANCELED"];
 
 /// Long enough that the whole span the clock owes a query has elapsed.
-fn settled() -> Duration {
+pub(crate) fn settled() -> Duration {
     2 * QUERY_STEP + Duration::from_millis(200)
 }
 
@@ -65,7 +65,7 @@ fn queries_uri(workspace: &str) -> String {
 }
 
 /// `GET /workspaces/{workspaceName}/queries/{queryId}`.
-fn query_uri(workspace: &str, query_id: &str) -> String {
+pub(crate) fn query_uri(workspace: &str, query_id: &str) -> String {
     format!("/workspaces/{workspace}/queries/{query_id}")
 }
 
@@ -87,7 +87,7 @@ async fn start_in(
 
 /// `StartQuery` in [`WORKSPACE`], asserting it was accepted, and the `queryId` it
 /// minted.
-async fn start(router: &MultiServiceRouter, statement: &str) -> String {
+pub(crate) async fn start(router: &MultiServiceRouter, statement: &str) -> String {
     let (status, body) = start_in(router, WORKSPACE, statement, None).await;
     assert_eq!(
         status, 202,
@@ -114,12 +114,12 @@ async fn start(router: &MultiServiceRouter, statement: &str) -> String {
 }
 
 /// `DescribeQuery` on a query of [`WORKSPACE`].
-async fn describe(router: &MultiServiceRouter, query_id: &str) -> (u16, Value) {
+pub(crate) async fn describe(router: &MultiServiceRouter, query_id: &str) -> (u16, Value) {
     call(router, "GET", &query_uri(WORKSPACE, query_id), None).await
 }
 
 /// `DescribeQuery`, asserting it answered, and the body it answered with.
-async fn described(router: &MultiServiceRouter, query_id: &str) -> Value {
+pub(crate) async fn described(router: &MultiServiceRouter, query_id: &str) -> Value {
     let (status, body) = describe(router, query_id).await;
     assert_eq!(status, 200, "describe {query_id}: got {status} {body}");
     body
@@ -161,7 +161,7 @@ fn queries_held(engine: &engine::InMemoryEngine) -> usize {
 
 /// Create `name` through `CreateWorkspace`, so a query started in it names a
 /// workspace this service really holds.
-async fn create_workspace(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn create_workspace(router: &MultiServiceRouter, name: &str) {
     let (status, body) = call(
         router,
         "POST",
@@ -178,7 +178,7 @@ async fn create_workspace(router: &MultiServiceRouter, name: &str) {
 /// Two assets of one model, the first carrying two samples on its DOUBLE property
 /// and one on its STRING property, inside a created [`WORKSPACE`]. Every view the
 /// query engine exposes therefore holds rows.
-async fn fixture(router: &MultiServiceRouter) {
+pub(crate) async fn fixture(router: &MultiServiceRouter) {
     create_workspace(router, WORKSPACE).await;
     let model_id = create_model(
         router,

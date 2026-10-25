@@ -252,3 +252,7 @@ mod agent_recommendation_paging;
 // list's sorted middle is what repeatedly refused to merge.
 #[path = "all/global_settings.rs"]
 mod global_settings;
+
+// Declared last for the same reason as the declarations above.
+#[path = "all/agent_context_updates.rs"]
+mod agent_context_updates;

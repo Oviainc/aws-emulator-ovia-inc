@@ -29,6 +29,8 @@ mod outpost_resolvers;
 mod resolver_dnssec_configs;
 #[path = "all/resolver_endpoints.rs"]
 mod resolver_endpoints;
+#[path = "all/resolver_rule_deletion.rs"]
+mod resolver_rule_deletion;
 #[path = "all/resolver_rules.rs"]
 mod resolver_rules;
 #[path = "all/state_roundtrip.rs"]

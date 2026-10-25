@@ -30,7 +30,11 @@
 //! parameter the request left out, a parameter value the operation does not define, a
 //! `DryRun` that would have succeeded, a mutation that is already done), which HTTP status
 //! that refusal carries (400 and 412), and whether the operation's modelled output is
-//! `smithy.api#Unit` or a result shape of its own. The one success row pins the lowercase
+//! `smithy.api#Unit` or a result shape of its own — and, in [`framework_rows`], WHICH
+//! LAYER refused: a request that never reaches an operation (it names an action this
+//! service has none of, or none at all, or declares a transfer framing its body does not
+//! carry) is answered by the same envelope, because the envelope is the service's and not
+//! one operation's. The one success row pins the lowercase
 //! element a 200 carries instead. The scaffold's 501 is rendered by the same
 //! `serialize_error`, so it carries the element by construction; no row names a scaffolded
 //! operation, because the operation this suite would have to name is one some other issue
@@ -72,6 +76,17 @@ const UNRESOLVED_ROUTE_TABLE_ID: &str = "tgw-rtb-0000000000000000f";
 
 /// A well-formed prefix list id for the same rows.
 const PREFIX_LIST_ID: &str = "pl-00000000000000ef1";
+
+/// The media type every EC2 ec2Query response declares.
+///
+/// Recorded behaviour: the model declares the protocol but not the media type's `charset`
+/// parameter, where the protocol's own default is the bare `text/xml`.
+const RESPONSE_CONTENT_TYPE: &str = "text/xml;charset=UTF-8";
+
+/// The `content-encoding` an AWS SDK sets to announce `aws-chunked` transfer framing — the
+/// header that makes the emulator decode the body as framed, and so the one that lets a
+/// body be refused as undecodable framing before any action is resolved.
+const AWS_CHUNKED: &[(&str, &str)] = &[("content-encoding", "aws-chunked")];
 
 /// One `action` call signed for the Region above, as its status and body.
 async fn invoke(router: &MultiServiceRouter, action: &str, params: &[Param]) -> (u16, String) {
@@ -180,6 +195,84 @@ fn refusal_rows() -> Vec<Row> {
             ],
             status: 400,
             code: ec2::state::MISSING_PARAMETER,
+        },
+    ]
+}
+
+/// The code the query protocols answer a request that named no operation of this service
+/// with, and the one they answer a body they could not read at all with. Both are the
+/// FRAMEWORK's codes, not the service's — this service declares no error shapes, and these
+/// two refusals happen before any operation of it is named — so they are spelled out here
+/// rather than taken from `ec2::state`, whose codes are the ones its handlers answer.
+const INVALID_ACTION: &str = "InvalidAction";
+const INVALID_REQUEST: &str = "InvalidRequest";
+
+/// One row the framework answers in front of this service's operations: the form body
+/// exactly as the client sent it, any headers it sent beside the ones every call carries,
+/// and the status and `<Code>` the request is refused with.
+struct FrameworkRow {
+    case: &'static str,
+    headers: &'static [(&'static str, &'static str)],
+    body: String,
+    status: u16,
+    code: &'static str,
+}
+
+/// Every row refused before an operation of this service is reached. Two layers refuse
+/// here: the one that resolves the action a body names (four ways of naming none this
+/// service has) and the one that decodes the body's transfer framing (three ways of
+/// declaring framing the bytes do not carry).
+fn framework_rows() -> Vec<FrameworkRow> {
+    let version = super::ec2_query::API_VERSION;
+    vec![
+        FrameworkRow {
+            case: "an action this service has no operation for",
+            headers: &[],
+            body: format!("Action=NotAnAction&Version={version}"),
+            status: 400,
+            code: INVALID_ACTION,
+        },
+        FrameworkRow {
+            case: "an action that names another service's operation",
+            headers: &[],
+            body: format!("Action=ListBuckets&Version={version}"),
+            status: 400,
+            code: INVALID_ACTION,
+        },
+        FrameworkRow {
+            case: "a body that names no action at all",
+            headers: &[],
+            body: format!("Version={version}"),
+            status: 400,
+            code: INVALID_ACTION,
+        },
+        FrameworkRow {
+            case: "an action field left empty",
+            headers: &[],
+            body: format!("Action=&Version={version}"),
+            status: 400,
+            code: INVALID_ACTION,
+        },
+        FrameworkRow {
+            case: "a body declaring aws-chunked framing whose chunk size is not a number",
+            headers: AWS_CHUNKED,
+            body: format!("zz\r\nAction=DescribeVpcs&Version={version}\r\n0\r\n\r\n"),
+            status: 400,
+            code: INVALID_REQUEST,
+        },
+        FrameworkRow {
+            case: "a body declaring aws-chunked framing whose chunk is shorter than it says",
+            headers: AWS_CHUNKED,
+            body: format!("ff\r\nAction=DescribeVpcs&Version={version}\r\n0\r\n\r\n"),
+            status: 400,
+            code: INVALID_REQUEST,
+        },
+        FrameworkRow {
+            case: "a body declaring aws-chunked framing with no chunk header at all",
+            headers: AWS_CHUNKED,
+            body: format!("Action=DescribeVpcs&Version={version}"),
+            status: 400,
+            code: INVALID_REQUEST,
         },
     ]
 }
@@ -427,4 +520,79 @@ async fn a_success_reports_the_request_in_its_own_lowercase_element() {
         "case {case:?}: the refusal reports its own request id, got the successful call's \
          {refused_id:?}"
     );
+}
+
+/// A refusal answered BEFORE any operation of this service runs reports the request it
+/// answers in the same one `<RequestID>`, and announces the same media type.
+///
+/// The envelope belongs to the service, not to an operation, so a request refused by the
+/// layer that resolves the action — or by the one that decodes the body's transfer framing —
+/// closes the same `<Response>` as a refusal a handler gave: the `<Code>` a client branches
+/// on, the `<Message>` saying why, and the id it quotes when it reports the failure.
+#[tokio::test]
+async fn every_refusal_answered_before_an_operation_runs_reports_the_request_too() {
+    // Each row's id is its own, exactly as for a refusal an operation gave.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for row in framework_rows() {
+        let (router, _engine) = super::ec2_query::emulator();
+        let (status, content_type, body) =
+            super::ec2_query::call_raw(&router, REGION, row.headers, &row.body).await;
+        let case = row.case;
+        assert_eq!(
+            status, row.status,
+            "case {case:?}: expected HTTP {}, got {status} with body {body}",
+            row.status
+        );
+        assert_eq!(
+            &error_code(&body),
+            row.code,
+            "case {case:?}: expected the code {}, got {body}",
+            row.code
+        );
+        assert_eq!(
+            content_type.as_deref(),
+            Some(RESPONSE_CONTENT_TYPE),
+            "case {case:?}: expected the media type {RESPONSE_CONTENT_TYPE:?}, got \
+             {content_type:?} with body {body}"
+        );
+        let request_id = refusal_request_id(case, &body, row.code);
+        assert!(
+            seen.insert(request_id.clone()),
+            "case {case:?}: the request id {request_id:?} was already reported for another \
+             response"
+        );
+        // The message is the refusal's own text, not the request id: splicing the id in
+        // must leave it readable.
+        assert!(
+            !unescaped(&body).contains(&format!("<Message>{request_id}")),
+            "case {case:?}: the request id must not displace the message, got {body}"
+        );
+    }
+}
+
+/// Two identical requests refused before any operation runs are two calls, so each is
+/// reported under its own request id.
+#[tokio::test]
+async fn two_identical_pre_operation_refusals_report_two_different_request_ids() {
+    let (router, _engine) = super::ec2_query::emulator();
+    for row in framework_rows() {
+        let case = format!("{}, sent twice", row.case);
+        let (first_status, _, first) =
+            super::ec2_query::call_raw(&router, REGION, row.headers, &row.body).await;
+        let (second_status, _, second) =
+            super::ec2_query::call_raw(&router, REGION, row.headers, &row.body).await;
+        assert_eq!(
+            (first_status, second_status),
+            (row.status, row.status),
+            "case {case:?}: both calls must be refused with HTTP {}, got {first_status} and \
+             {second_status} with bodies {first} / {second}",
+            row.status
+        );
+        let first_id = refusal_request_id(&case, &first, row.code);
+        let second_id = refusal_request_id(&case, &second, row.code);
+        assert_ne!(
+            first_id, second_id,
+            "case {case:?}: each response reports its own request id, got {first_id:?} twice"
+        );
+    }
 }

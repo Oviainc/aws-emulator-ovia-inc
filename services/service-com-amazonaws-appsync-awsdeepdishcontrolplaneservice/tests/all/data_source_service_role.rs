@@ -150,7 +150,7 @@ pub(crate) async fn get_data_source(
 }
 
 /// Every data-source name the API's listing reports, paged through to the end.
-async fn list_names(
+pub(crate) async fn list_names(
     router: &smithy_server_runtime::MultiServiceRouter,
     api_id: &str,
 ) -> Vec<String> {

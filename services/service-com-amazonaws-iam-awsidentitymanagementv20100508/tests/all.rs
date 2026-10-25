@@ -93,6 +93,8 @@ mod role_tags;
 mod role_trust_policy;
 #[path = "all/saml_provider_listing.rs"]
 mod saml_provider_listing;
+#[path = "all/saml_provider_tag_updates.rs"]
+mod saml_provider_tag_updates;
 #[path = "all/saml_provider_tags.rs"]
 mod saml_provider_tags;
 #[path = "all/saml_providers.rs"]

@@ -188,3 +188,5 @@ mod delete_documentation_version;
 mod delete_usage_plan;
 #[path = "all/update_integration_response.rs"]
 mod update_integration_response;
+#[path = "all/rest_api_import_security_warning.rs"]
+mod rest_api_import_security_warning;

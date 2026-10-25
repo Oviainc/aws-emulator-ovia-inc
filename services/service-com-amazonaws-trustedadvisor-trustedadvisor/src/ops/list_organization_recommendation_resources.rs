@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOrganizationRecommendationResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOrganizationRecommendationResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the resources of one stored ORGANIZATION recommendation from
+//! [`crate::state`], filtered by the request's `status` / `exclusionStatus` /
+//! `regionCode` / `affectedAccountId`, in resource-ARN order and cut into a page
+//! by the shared cursor helper.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOrganizationRecommendationResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An organization recommendation holds no resources of its own: it aggregates
+//! the member accounts' recommendations for the same check, so the resources it
+//! reports are those recommendations' resources, each read off the one stored
+//! copy (`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::resources_of`).
+//! That is also why `accountId` is reported per resource — the account that owns
+//! it, taken from the resource's own ARN — while
+//! `OrganizationRecommendationResourceSummary$recommendationArn` is modelled
+//! `OrganizationRecommendationArn`
+//! (`smithy_query(query="shape",shape="OrganizationRecommendationResourceSummary")`),
+//! i.e. the aggregate the caller asked about rather than the member account's
+//! own recommendation.
+//!
+//! A well-formed `organizationRecommendationIdentifier` that names nothing in
+//! the store is a `ResourceNotFoundException` (404) — an empty list would claim
+//! the organization recommendation exists and aggregates no resources.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +102,44 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// One member account's stored resource, as the modelled
+/// `OrganizationRecommendationResourceSummary`.
+///
+/// Every value but two is the resource's own stored one, so the account-level
+/// and the organization-level view of a resource cannot disagree. The two:
+///
+/// * `accountId` is the account segment of the resource's own ARN — the account
+///   that owns it — so no stored field can contradict the ARN a caller reads
+///   beside it;
+/// * `recommendationArn` is the ARN of the ORGANIZATION recommendation the
+///   resource is reported under, which is what that member is modelled to
+///   carry (`OrganizationRecommendationArn`, pattern
+///   `^arn:[\w-]+:trustedadvisor:::organization-recommendation\/[\w-]+$`) — the
+///   member account's own recommendation ARN does not satisfy it.
+fn organization_resource_summary(
+    resource: &crate::state::ResourceEntry,
+    organization_recommendation_arn: &str,
+) -> OrganizationRecommendationResourceSummary {
+    OrganizationRecommendationResourceSummary {
+        id: resource.id.clone(),
+        arn: resource.arn.clone(),
+        aws_resource_id: resource.aws_resource_id.clone(),
+        region_code: resource.region_code.clone(),
+        status: resource.status.clone(),
+        metadata: resource
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        last_updated_at: crate::state::date_time(resource.last_updated_at_millis),
+        exclusion_status: resource.exclusion_status.clone(),
+        account_id: crate::state::arn_account(&resource.arn)
+            .filter(|account| !account.is_empty())
+            .map(str::to_string),
+        recommendation_arn: organization_recommendation_arn.to_string(),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,30 +212,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // The support-level gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account's support plan does not include
-        // the Trusted Advisor API is refused with the modelled `AccessDeniedException`,
-        // which is the WHOLE answer the service gives such a request — no unimplemented
-        // behaviour is involved. An entitled caller still gets the 501 below. See
-        // [`crate::state::support_level_refusal`].
+        // `ctx` carries only request metadata; this operation reads nothing from it.
+        let _ = ctx;
+        // The support-level gate, ahead of everything else this handler does —
+        // ahead of resolving the identifier and of paginating, so an unentitled
+        // caller is never told whether an organization recommendation exists.
+        // See [`crate::state::support_level_refusal`].
         if let Some(denied) = crate::state::support_level_refusal(&*self.engine) {
             return Err(
                 ListOrganizationRecommendationResourcesErrorModeled::AccessDeniedException(denied)
                     .into(),
             );
         }
-        // Implement `ListOrganizationRecommendationResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOrganizationRecommendationResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListOrganizationRecommendationResourcesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the Trusted Advisor store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        let identifier = &input.organization_recommendation_identifier;
+        let Some(entry) = state.organization_recommendations.get(identifier) else {
+            return Err(
+                ListOrganizationRecommendationResourcesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "no organization recommendation with the identifier {identifier}"
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The resources of this aggregate recommendation are the resources of
+        // the member accounts' recommendations it aggregates: it stores none of
+        // its own. Each is reported from its one stored copy, so a status or
+        // exclusion change a member account made is what this list reports next.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOrganizationRecommendationResources"))
+        // The stored member list is an unordered set, so the page order is
+        // resource-ARN order over the union — a stable sequence a cursor can
+        // point into, as in every other list of this service. A member ARN
+        // repeated in that set contributes its resources once: the keys are
+        // resource ARNs, and one resource is one entry of this list.
+        let mut matching: Vec<(String, OrganizationRecommendationResourceSummary)> = entry
+            .member_recommendation_arns
+            .iter()
+            .flat_map(|member_arn| state.resources_of(member_arn))
+            .map(|(arn, resource)| {
+                (
+                    arn.clone(),
+                    organization_resource_summary(resource, &entry.arn),
+                )
+            })
+            .filter(|(_, summary)| {
+                input
+                    .status
+                    .as_ref()
+                    .is_none_or(|status| &summary.status == status)
+                    && input
+                        .exclusion_status
+                        .as_ref()
+                        .is_none_or(|exclusion| &summary.exclusion_status == exclusion)
+                    && input
+                        .region_code
+                        .as_ref()
+                        .is_none_or(|region| &summary.region_code == region)
+                    && input
+                        .affected_account_id
+                        .as_deref()
+                        .is_none_or(|account| summary.account_id.as_deref() == Some(account))
+            })
+            .collect();
+        matching.sort_by(|(left, _), (right, _)| left.cmp(right));
+        matching.dedup_by(|(left, _), (right, _)| left == right);
+
+        // The cursor's scope names this organization recommendation AND this
+        // read's filters, so a token issued for one organization
+        // recommendation's resources (or under another filter set) cannot
+        // resume another sequence.
+        let page = crate::state::paginate(
+            &crate::state::list_scope(
+                &format!("organizationRecommendationResources/{identifier}"),
+                &[
+                    ("status", input.status.as_deref()),
+                    ("exclusionStatus", input.exclusion_status.as_deref()),
+                    ("regionCode", input.region_code.as_deref()),
+                    ("affectedAccountId", input.affected_account_id.as_deref()),
+                ],
+            ),
+            matching,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            ListOrganizationRecommendationResourcesErrorModeled::ValidationException(
+                ValidationException {
+                    message: "nextToken is not a pagination token this service issued for this \
+                              list"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        Ok(ListOrganizationRecommendationResourcesOutput {
+            next_token: page.next_token,
+            organization_recommendation_resource_summaries: page.items,
+        })
     }
 }

@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ApplicationId` is an id rather than an "ID or name" identifier, so it is
         // looked up as the stored key, exactly as `GetApplication` and
         // `UpdateApplication` look it up.
-        let Some(removed) = store.applications.remove(&input.application_id) else {
+        let Some(removed) = store.remove_application(&input.application_id) else {
             // An attribution record for the refusal: which resource was addressed and
             // what this call answered, so a destructive call that changed nothing leaves
             // a trace beside the ones that did.

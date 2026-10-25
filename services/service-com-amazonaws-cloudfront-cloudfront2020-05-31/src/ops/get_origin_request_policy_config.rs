@@ -153,7 +153,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let store = state.lock();
 
-        let Some(stored) = store.origin_request_policy(&input.id) else {
+        // An origin request policy id addresses ONE policy whoever created it: one this
+        // account created, or one AWS published and every account holds.
+        let Some(stored) = store.readable_origin_request_policy(&input.id) else {
             return Err(
                 GetOriginRequestPolicyConfigErrorModeled::NoSuchOriginRequestPolicy(
                     crate::state::no_such_origin_request_policy(),

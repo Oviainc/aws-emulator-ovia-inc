@@ -152,8 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // listing is every application this service holds — read out of the same map
         // `CreateApplication` wrote them into and `GetApplication` reads them back from.
         let mut ordered: Vec<(String, CreateApplicationOutput)> = store
-            .applications
-            .values()
+            .all_applications()
             .map(|application| (application.id.clone(), reported(application)))
             .collect();
         // An application id is unique across this service, so ordering by id is a TOTAL

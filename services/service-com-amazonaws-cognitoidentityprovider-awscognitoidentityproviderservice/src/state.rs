@@ -812,6 +812,20 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         self.issued_tokens
             .retain(|_, t| t.user_pool_id != user_pool_id);
     }
+
+    /// Forget every outstanding challenge session started for the app client
+    /// `client_id` of `user_pool_id`. Called when that app client is deleted: a
+    /// response to such a challenge carries the `ClientId` the pool no longer
+    /// holds, so the session can never be answered.
+    ///
+    /// The tokens the client issued stay stored and keep resolving the user they
+    /// name until the clock expires them, exactly as an already-issued token
+    /// does; a refresh is refused where it stands, because the app client the
+    /// request has to name is gone.
+    pub fn forget_client_sessions(&mut self, user_pool_id: &str, client_id: &str) {
+        self.auth_sessions
+            .retain(|_, s| !(s.user_pool_id == user_pool_id && s.client_id == client_id));
+    }
 }
 
 /// One stored user pool, with the app clients and users it owns.

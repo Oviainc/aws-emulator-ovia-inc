@@ -87,6 +87,8 @@ mod transcription_jobs;
 mod vocabularies;
 #[path = "all/vocabulary_delete_and_tag_sets.rs"]
 mod vocabulary_delete_and_tag_sets;
+#[path = "all/vocabulary_download_uri_state.rs"]
+mod vocabulary_download_uri_state;
 #[path = "all/vocabulary_file_uri.rs"]
 mod vocabulary_file_uri;
 #[path = "all/vocabulary_filter_file_uri.rs"]

@@ -10,8 +10,9 @@
 //! in [`super::harness`].
 
 use serde_json::{json, Value};
+use service_com_amazonaws_route53resolver_route53resolver::state::MAX_STORED_FIREWALL_CONFIGS;
 
-use super::harness::{expect_error, ok, string_member, ACCOUNT};
+use super::harness::{call, error_type, expect_error, ok, string_member, ACCOUNT};
 
 /// Every value the model's `FirewallFailOpenStatus` enum declares
 /// (`smithy_query(query="shape",shape="FirewallFailOpenStatus")`), which is what
@@ -37,6 +38,21 @@ async fn get_config(
         router,
         "GetFirewallConfig",
         json!({ "ResourceId": resource_id }),
+    )
+    .await;
+    firewall_config(&body).clone()
+}
+
+/// Set one VPC's failure mode over the wire, through a call that must succeed.
+async fn update_config(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    resource_id: &str,
+    fail_open: &str,
+) -> Value {
+    let body = ok(
+        router,
+        "UpdateFirewallConfig",
+        json!({ "ResourceId": resource_id, "FirewallFailOpen": fail_open }),
     )
     .await;
     firewall_config(&body).clone()
@@ -210,4 +226,158 @@ async fn an_unmodelled_fail_open_status_is_refused_and_stores_nothing() {
             "case {case:?}: a refused update must leave the stored configuration alone, got {config}"
         );
     }
+}
+
+/// The failure mode a VPC reports is the one the LAST update set, whatever the
+/// order of the updates and however many there were; applying the same value
+/// twice changes nothing.
+///
+/// The rows differ in the length of the update sequence and in which values it
+/// walks, so what is pinned is "the last write decides" rather than one pair of
+/// values — and each row is read back through `GetFirewallConfig`.
+#[tokio::test]
+async fn the_last_update_decides_the_reported_failure_mode() {
+    let router = super::harness::emulator();
+
+    let sequences: &[&[&str]] = &[
+        &["ENABLED"],
+        &["ENABLED", "DISABLED"],
+        &["DISABLED", "USE_LOCAL_RESOURCE_SETTING"],
+        &["USE_LOCAL_RESOURCE_SETTING", "ENABLED", "DISABLED"],
+        &["ENABLED", "ENABLED", "ENABLED"],
+        &[
+            "DISABLED",
+            "ENABLED",
+            "USE_LOCAL_RESOURCE_SETTING",
+            "DISABLED",
+            "ENABLED",
+        ],
+    ];
+
+    for (index, sequence) in sequences.iter().enumerate() {
+        let case = format!("sequence {sequence:?}");
+        let resource_id = format!("vpc-sequence-{index}");
+
+        let mut last_answer = Value::Null;
+        for fail_open in sequence.iter() {
+            last_answer = update_config(&router, &resource_id, fail_open).await;
+        }
+        let expected = sequence
+            .last()
+            .expect("every sequence carries at least one update");
+        assert_identity(&case, &last_answer, &resource_id);
+        assert_eq!(
+            string_member(&last_answer, "FirewallFailOpen"),
+            *expected,
+            "case {case:?}: the update must report the value it stored, got {last_answer}"
+        );
+
+        let read_back = get_config(&router, &resource_id).await;
+        assert_eq!(
+            read_back, last_answer,
+            "case {case:?}: the read must report the value the last update set, got {read_back}"
+        );
+    }
+}
+
+/// `ResourceId`'s modelled length (1..64) bounds BOTH operations: a value past
+/// the maximum, or the empty string the minimum excludes, is refused. The
+/// lengths inside the bound are served by
+/// [`every_vpc_reports_a_firewall_configuration_at_its_documented_default`],
+/// whose table already carries the shortest and the longest id the model admits.
+#[tokio::test]
+async fn a_resource_id_outside_the_modelled_length_is_refused() {
+    let router = super::harness::emulator();
+
+    for (case, resource_id) in [
+        ("one character past the maximum", "v".repeat(65)),
+        ("far past the maximum", "v".repeat(200)),
+        ("empty, which length 1..64 excludes", String::new()),
+    ] {
+        expect_error(
+            &router,
+            "UpdateFirewallConfig",
+            json!({ "ResourceId": resource_id, "FirewallFailOpen": "ENABLED" }),
+            case,
+            "ValidationException",
+        )
+        .await;
+        expect_error(
+            &router,
+            "GetFirewallConfig",
+            json!({ "ResourceId": resource_id }),
+            case,
+            "ValidationException",
+        )
+        .await;
+    }
+}
+
+/// Both operations require the members the model marks required, and a request
+/// that omits one is refused and writes nothing.
+#[tokio::test]
+async fn a_request_missing_a_required_member_is_refused() {
+    let router = super::harness::emulator();
+
+    for (case, operation, body) in [
+        (
+            "UpdateFirewallConfig without ResourceId",
+            "UpdateFirewallConfig",
+            json!({ "FirewallFailOpen": "ENABLED" }),
+        ),
+        (
+            "UpdateFirewallConfig without FirewallFailOpen",
+            "UpdateFirewallConfig",
+            json!({ "ResourceId": "vpc-missing-member" }),
+        ),
+        (
+            "GetFirewallConfig without ResourceId",
+            "GetFirewallConfig",
+            json!({}),
+        ),
+    ] {
+        let (status, parsed) = call(&router, operation, body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a missing required member must be refused, got {status}: {parsed}"
+        );
+        assert!(
+            error_type(&parsed).contains("ValidationException"),
+            "case {case:?}: the refusal must name ValidationException, got {parsed}"
+        );
+    }
+
+    let config = get_config(&router, "vpc-missing-member").await;
+    assert_eq!(
+        string_member(&config, "FirewallFailOpen"),
+        FAIL_OPEN_DEFAULT,
+        "a refused update must leave the VPC at its default, got {config}"
+    );
+}
+
+/// The store is bounded: a VPC past the bound is refused, while a VPC already
+/// stored is still updatable there, because updating one allocates no record.
+#[tokio::test]
+async fn the_configuration_store_is_bounded() {
+    let router = super::harness::emulator();
+
+    for index in 0..MAX_STORED_FIREWALL_CONFIGS {
+        update_config(&router, &format!("vpc-bound-{index}"), "ENABLED").await;
+    }
+
+    expect_error(
+        &router,
+        "UpdateFirewallConfig",
+        json!({ "ResourceId": "vpc-one-too-many", "FirewallFailOpen": "ENABLED" }),
+        "one VPC past the bound",
+        "ThrottlingException",
+    )
+    .await;
+
+    let updated = update_config(&router, "vpc-bound-0", "DISABLED").await;
+    assert_eq!(
+        string_member(&updated, "FirewallFailOpen"),
+        "DISABLED",
+        "a VPC already stored must stay updatable at the bound, got {updated}"
+    );
 }
