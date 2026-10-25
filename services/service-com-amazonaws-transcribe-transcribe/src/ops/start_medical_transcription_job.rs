@@ -250,7 +250,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 StartMedicalTranscriptionJobErrorModeled::InternalFailureException(
@@ -323,34 +322,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The Region this request is served in: the job is started in — and only in —
+        // the Region the caller signed for.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // "The name of the custom vocabulary you want to use when processing your
         // medical transcription job" (model doc for
         // `MedicalTranscriptionSetting$VocabularyName`): a job may only apply a custom
-        // medical vocabulary this account holds, so a name no `CreateMedicalVocabulary`
-        // ever recorded is refused here rather than stored on a job that would report
+        // medical vocabulary this REGION holds, so a name no `CreateMedicalVocabulary`
+        // ever recorded here is refused rather than stored on a job that would report
         // it back — the rule every job family's settings follow, see
         // [`crate::state::unheld_reference_error`]. The name belongs to the MEDICAL
         // vocabulary family, which is a family of its own: a custom vocabulary of the
         // same name is a different resource.
-        if let Some(message) = store.unheld_reference_error(&[(
-            crate::state::ResourceFamily::MedicalVocabulary,
-            input
-                .settings
-                .as_ref()
-                .and_then(|settings| settings.vocabulary_name.as_deref()),
-        )]) {
+        if let Some(message) = store.unheld_reference_error(
+            &region,
+            &[(
+                crate::state::ResourceFamily::MedicalVocabulary,
+                input
+                    .settings
+                    .as_ref()
+                    .and_then(|settings| settings.vocabulary_name.as_deref()),
+            )],
+        ) {
             return Err(bad_request(&message));
         }
 
         // "This name is case sensitive, cannot contain spaces, and must be unique
         // within an Amazon Web Services account. If you try to create a new job with
-        // the same name as an existing job, you get a ConflictException error."
+        // the same name as an existing job, you get a ConflictException error." Unique
+        // within ONE Region of that account: a regional endpoint holds only the jobs
+        // started through it.
         if store
             .medical_transcription_jobs
-            .contains_key(&input.medical_transcription_job_name)
+            .contains(&region, &input.medical_transcription_job_name)
         {
             return Err(StartMedicalTranscriptionJobErrorModeled::ConflictException(
                 ConflictException {
@@ -364,12 +371,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The account's job quota is a CONCURRENCY one, exactly as it is for the
-        // non-medical family: only the jobs the service is still working on count
-        // against `crate::state::MAX_CONCURRENT_MEDICAL_TRANSCRIPTION_JOBS`, and a
+        // The job quota is a CONCURRENCY one, per account per Region exactly as it is
+        // for the non-medical family: only the jobs this REGION is still working on
+        // count against `crate::state::MAX_CONCURRENT_MEDICAL_TRANSCRIPTION_JOBS`, and a
         // job that has reached a terminal status has released its slot (see
         // [`crate::state::jobs_in_flight`]).
-        if crate::state::jobs_in_flight(&mut store.medical_transcription_jobs, now)
+        if crate::state::jobs_in_flight(&mut store.medical_transcription_jobs, &region, now)
             >= crate::state::MAX_CONCURRENT_MEDICAL_TRANSCRIPTION_JOBS
         {
             return Err(
@@ -378,6 +385,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(crate::state::concurrency_limit_message(
                             crate::state::MAX_CONCURRENT_MEDICAL_TRANSCRIPTION_JOBS,
                             crate::state::FAMILY_MEDICAL_TRANSCRIPTION_JOBS,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The Region comes from the request's own (unauthenticated) credential scope, so
+        // the concurrency quota above and the retention bound below bound this family's
+        // store only together with a cap on how many Regions it keeps job records for
+        // (see [`crate::state::MAX_REGIONS`]).
+        if store
+            .medical_transcription_jobs
+            .region_bucket_exhausted(&region)
+        {
+            return Err(
+                StartMedicalTranscriptionJobErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(crate::state::region_capacity_message(
+                            crate::state::FAMILY_MEDICAL_TRANSCRIPTION_JOBS,
+                            &region,
                         )),
                     },
                 )
@@ -422,12 +450,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status = %record.status,
             "medical transcription job started"
         );
+        let name = record.name.clone();
         store
             .medical_transcription_jobs
-            .insert(record.name.clone(), record);
+            .insert(&region, &name, record);
         // What keeps the store bounded, since the quota above counts only the jobs in
         // flight (see [`crate::state::evict_oldest_finished_jobs`]).
-        crate::state::evict_oldest_finished_jobs(&mut store.medical_transcription_jobs);
+        crate::state::evict_oldest_finished_jobs(&mut store.medical_transcription_jobs, &region);
 
         Ok(StartMedicalTranscriptionJobOutput {
             medical_transcription_job: Some(job),

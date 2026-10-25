@@ -41,6 +41,8 @@ mod idle_recommendations;
 mod lambda_function_recommendations;
 #[path = "all/license_recommendations.rs"]
 mod license_recommendations;
+#[path = "all/license_recommendations_export.rs"]
+mod license_recommendations_export;
 #[path = "all/organization_enrollment_statuses.rs"]
 mod organization_enrollment_statuses;
 #[path = "all/preference_records_hold_a_preference.rs"]

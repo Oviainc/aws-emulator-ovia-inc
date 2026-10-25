@@ -1085,15 +1085,11 @@ fn read_integration(extension: &Node, route_key: &str) -> Result<ImportedIntegra
     }
     // An imported api speaks HTTP, and three of the five integration types are
     // documented as supported only for WebSocket APIs, so an integration of one of
-    // those types is refused here exactly as `CreateIntegration` refuses it.
-    let integration_type_member = format!("IntegrationType {integration_type}");
-    let restricted = [crate::state::ProtocolRestrictedMember::websocket_only(
-        &integration_type_member,
-        crate::state::WEBSOCKET_ONLY_INTEGRATION_TYPES.contains(&integration_type.as_str()),
-    )];
-    if let Err(message) = crate::state::validate_protocol_restricted_members(
+    // those types is refused here exactly as `CreateIntegration` refuses it, through the
+    // gate they share.
+    if let Err(message) = crate::state::validate_integration_type_for_protocol(
         crate::state::HTTP_PROTOCOL_TYPE,
-        &restricted,
+        &integration_type,
     ) {
         return Err(refusal(&message));
     }

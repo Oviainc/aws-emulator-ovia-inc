@@ -77,6 +77,8 @@ mod product_rest_endpoint_page_update;
 mod protocol_type_gating;
 #[path = "all/quick_create_servable_set.rs"]
 mod quick_create_servable_set;
+#[path = "all/refusal_message_text.rs"]
+mod refusal_message_text;
 #[path = "all/route_request_parameter.rs"]
 mod route_request_parameter;
 #[path = "all/route_response_lifecycle.rs"]

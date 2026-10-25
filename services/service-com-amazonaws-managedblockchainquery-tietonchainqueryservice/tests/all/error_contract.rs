@@ -28,7 +28,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::ops::types::QUERY_NETWORK_VALUES;
 
-use crate::chain_query_slice::{error_code, unseeded_bitcoin_address, Emulator};
+use crate::chain_query_slice::{
+    error_code, unseeded_address, unseeded_bitcoin_address, Emulator,
+};
 
 /// `ChainAddress`'s `@pattern`, as a message must report it: the model spells it
 /// `^[-A-Za-z0-9]{13,74}$` and the anchors are not part of the expression a value has to
@@ -350,14 +352,19 @@ async fn a_request_at_a_published_bound_is_not_refused() {
             "/list-transactions",
             json!({"network": "ETHEREUM_MAINNET", "address": VALID_ADDRESS, "maxResults": 250}),
         ),
-        // ChainAddress @pattern, at both ends of its 13..74 length window.
+        // An address at both ends of what the queried chain's own encodings admit
+        // inside `ChainAddress`'s 13..74 window: a base58 Bitcoin address at its
+        // shortest published length (26) and a bech32 one at the longest the model's
+        // pattern leaves (74). The window's own bounds are NOT a row: no chain spells an
+        // address in 13 characters, and an address of no chain is refused on this
+        // service's own rule, which `cross_chain_address.rs` owns.
         (
             "/list-transactions",
-            json!({"network": "ETHEREUM_MAINNET", "address": "a".repeat(13)}),
+            json!({"network": "BITCOIN_MAINNET", "address": format!("1{}", "z".repeat(25))}),
         ),
         (
             "/list-transactions",
-            json!({"network": "ETHEREUM_MAINNET", "address": "a".repeat(74)}),
+            json!({"network": "BITCOIN_MAINNET", "address": format!("bc1q{}", "z".repeat(70))}),
         ),
     ];
 
@@ -536,15 +543,19 @@ async fn not_found_is_generic_and_names_the_resource_in_its_own_members() {
                 UNMINED_HASH.to_string(),
             ));
         }
+        // The owner is an address of the queried network's own chain that the ledger
+        // holds nothing for, so what the read reports is a missing resource and not a
+        // refused address.
+        let owner = unseeded_address(network);
         cases.push((
             "/get-token-balance",
             json!({
                 "tokenIdentifier": {"network": network, "tokenId": "eth"},
-                "ownerIdentifier": {"address": VALID_ADDRESS},
+                "ownerIdentifier": {"address": owner},
             }),
             // HoldingKey's resourceId joins the token half and the owner, with `-` for an
             // absent member: no ChainAddress or QueryTokenId can contain `/` or `-`.
-            format!("-/eth/{VALID_ADDRESS}"),
+            format!("-/eth/{owner}"),
         ));
     }
 

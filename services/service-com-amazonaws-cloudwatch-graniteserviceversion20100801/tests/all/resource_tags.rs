@@ -31,14 +31,14 @@ const TAGGING_OPERATIONS: [&str; 3] = ["TagResource", "ListTagsForResource", "Un
 /// Every resource kind this service can tag: "Currently, the only CloudWatch resources that
 /// can be tagged are alarms, dashboards, metric streams and Contributor Insights rules."
 /// (`TagResource`) — the alarm kinds are enumerated separately because each is written by a
-/// different operation into a different store, and a dashboard is left out because nothing
-/// in this emulator creates one.
-const TAGGABLE_KINDS: [&str; 5] = [
+/// different operation into a different store.
+const TAGGABLE_KINDS: [&str; 6] = [
     "metric alarm",
     "composite alarm",
     "log alarm",
     "metric stream",
     "Contributor Insights rule",
+    "dashboard",
 ];
 
 /// One tag set, as a table spells it out: (key, value) pairs in report order.
@@ -271,6 +271,23 @@ async fn write_resource(
             // caller builds it from the documented format, as this does.
             format!("arn:aws:cloudwatch:{REGION}:{ACCOUNT}:insight-rule/{name}")
         }
+        "dashboard" => {
+            ok(
+                router,
+                "PutDashboard",
+                &json!({
+                    "DashboardName": name,
+                    "DashboardBody": "{\"widgets\":[]}",
+                    "Tags": tags,
+                }),
+            )
+            .await;
+            let body = ok(router, "GetDashboard", &json!({"DashboardName": name})).await;
+            body.get("DashboardArn")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("dashboard {name}: GetDashboard answers a DashboardArn"))
+                .to_string()
+        }
         other => panic!("the table names no resource kind {other}"),
     }
 }
@@ -312,6 +329,7 @@ async fn tags_round_trip_through_every_taggable_resource_kind() {
             "Contributor Insights rule",
             vec![(longest_key.clone(), longest_value.clone())],
         ),
+        ("dashboard", pairs(&[("Env", "prod"), ("Owner", "ops")])),
     ];
 
     for (kind, created) in cases {
@@ -670,9 +688,8 @@ async fn every_tagging_operation_refuses_an_arn_that_names_no_cloudwatch_resourc
 
 #[tokio::test]
 async fn every_tagging_operation_reports_a_resource_this_store_does_not_hold() {
-    // Rows differ along the resource kind the well-formed ARN names, including a dashboard —
-    // a taggable kind nothing in this emulator creates — and an alarm name that belongs to no
-    // alarm of any kind.
+    // Rows differ along the resource kind the well-formed ARN names, including a dashboard,
+    // whose ARN carries no Region, and an alarm name that belongs to no alarm of any kind.
     let cases: [(&str, &str); 4] = [
         (
             "an alarm no writer created",
@@ -687,7 +704,7 @@ async fn every_tagging_operation_reports_a_resource_this_store_does_not_hold() {
             "arn:aws:cloudwatch:us-east-1:000000000000:insight-rule/no-such-rule",
         ),
         (
-            "a dashboard, which no writer here creates",
+            "a dashboard no writer created",
             "arn:aws:cloudwatch::000000000000:dashboard/no-such-dashboard",
         ),
     ];

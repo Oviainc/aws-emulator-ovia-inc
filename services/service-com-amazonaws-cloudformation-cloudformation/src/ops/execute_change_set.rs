@@ -410,6 +410,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match store.resolve_mut(&request_region, &stack_id) {
                 None => None,
                 Some(stack) => {
+                    // The resources' own transitions come BEFORE the stack's terminal
+                    // event: the event stream is what the execution did, in order.
+                    stack.record_resource_events(&materialised.transitions);
                     stack.record_materialised_resources(materialised.resources);
                     match materialised.failure {
                         None => None,
@@ -444,6 +447,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let deleted = crate::state::provisioning::unwind(ctx, &region, &resources).await;
             let mut store = state.lock();
             if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
+                stack.record_resource_events(&deleted.transitions);
                 stack.record_materialised_resources(deleted.resources);
                 if let Some(failure) = deleted.failure {
                     stack.fail_transition(

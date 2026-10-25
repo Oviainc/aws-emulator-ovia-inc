@@ -51,7 +51,9 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::{
     BLOCKING_EC2_INSTANCE, DECOMMISSION_STATUS_BLOCKED, DECOMMISSION_STATUS_SKIPPED,
 };
 
-use crate::capacity_task_lifecycle::{pool, start_ok, ABSENT_CAPACITY_TASK_ID};
+use crate::capacity_task_lifecycle::{
+    pool, settle_capacity_task, start_ok, ABSENT_CAPACITY_TASK_ID,
+};
 use crate::site_and_outpost_lifecycle::{
     query_value, refusal, segment, settle, text, Outposts, Refusal, ABSENT_OUTPOST_ID,
     ABSENT_SITE_ID, OUTPOST_ARN_PREFIX,
@@ -738,10 +740,12 @@ async fn an_absent_outpost_or_task_is_not_found_and_bad_input_is_refused() {
 
     // An Outpost that existed, had instances recorded on it and a task started, and was
     // then deleted: both went with it, so the route answers as it does for one that
-    // never was.
+    // never was. The task is let FINISH first — an Outpost whose capacity task is still
+    // outstanding cannot be deleted at all (`crate::delete_conflicts`).
     let deleted = an_outpost(&outposts, "deleted").await;
     record(&outposts, &deleted, &running(), "deleted");
     let deleted_task = a_task(&outposts, &deleted, &Exclude::default()).await;
+    settle_capacity_task();
     outposts
         .ok("DELETE", &format!("/outposts/{deleted}"), None)
         .await;

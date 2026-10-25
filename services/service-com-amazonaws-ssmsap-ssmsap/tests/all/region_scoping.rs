@@ -330,6 +330,17 @@ async fn a_call_signed_for_another_region_resolves_nothing_and_is_refused() {
             code: VALIDATION_EXCEPTION,
             by_arn: false,
         },
+        ForeignCall {
+            // A listing scoped to an application: it models
+            // `ResourceNotFoundException`, so an application of another Region is a 404
+            // here rather than another Region's components.
+            label: "ListComponents",
+            path: "/list-components",
+            home: 1,
+            status: 404,
+            code: RESOURCE_NOT_FOUND_EXCEPTION,
+            by_arn: false,
+        },
     ];
 
     for case in cases {

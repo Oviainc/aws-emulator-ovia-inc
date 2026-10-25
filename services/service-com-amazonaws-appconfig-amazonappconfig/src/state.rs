@@ -843,11 +843,14 @@ impl Application {
 
 /// The one resource of `candidates` whose name is `name`.
 ///
-/// AWS documents no behaviour for a name several resources of one kind share — nothing
-/// in this service makes a name unique except an experiment definition's, which
-/// `CreateExperimentDefinition` refuses to duplicate — so the match with the
-/// lexicographically smallest id is answered, which makes resolution deterministic
-/// rather than dependent on the order a `HashMap` happens to iterate in.
+/// AWS documents no behaviour for a name several resources of one kind share. Two kinds
+/// in this service cannot reach that state at all — an application's name is unique per
+/// account (`CreateApplication` and `UpdateApplication` refuse a name another
+/// application holds) and so is an experiment definition's within its application
+/// (`CreateExperimentDefinition` refuses to duplicate one) — while for every other kind
+/// a name may be shared, so the match with the lexicographically smallest id is
+/// answered, which makes resolution deterministic rather than dependent on the order a
+/// `HashMap` happens to iterate in.
 fn resolve_by_name<'store, T: 'store>(
     candidates: impl Iterator<Item = &'store T>,
     name: &str,
@@ -2180,6 +2183,22 @@ pub fn extension_version_not_found(extension_identifier: &str, version_number: i
 // `BadRequestException` messages
 // =============================================================================
 
+/// `Message` for a write refused because the name it asks for already addresses another
+/// application in the account.
+///
+/// Derived from the request's `Name`, the id of the application that holds that name and
+/// the one account this emulator presents ([`::engine::emulator_account_id`]), in the
+/// form AppConfig's recorded refusal uses: it names the colliding name and the id of the
+/// application already answering to it, so a caller can resolve the estate it already
+/// has instead of forking it.
+pub fn application_name_taken(name: &str, existing_application_id: &str) -> String {
+    format!(
+        "Application with name {name} already exists with id {existing_application_id} in \
+         account {}",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// `Message` for a delete refused because the addressed configuration profile still
 /// holds hosted configuration versions.
 ///
@@ -2443,6 +2462,29 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
     pub fn resolve_application(&self, identifier: &str) -> Option<&Application> {
         self.resolve_application_id(identifier)
             .and_then(|id| self.applications.get(&id))
+    }
+
+    /// The application holding `name`, or `None` when this account holds none under it —
+    /// the one lookup both writes that SET an application's name are guarded by.
+    ///
+    /// An application's name ADDRESSES it — every `ApplicationIdentifier` in this service
+    /// is documented as "the application ID or name" — so a name belongs to at most one
+    /// application in the account: `CreateApplication` and `UpdateApplication` refuse
+    /// rather than leave a second application holding a name this one answers to.
+    ///
+    /// `except` is the application the write is renaming, whose own name is not a
+    /// collision because the record holding it is itself; a create passes `None`. The
+    /// scan is [`resolve_by_name`], the same one every "ID or name" resolution in this
+    /// module uses, so a store that already held a shared name (one written before this
+    /// invariant was enforced) reports the same application to a guard and to a reader.
+    pub fn application_named(&self, name: &str, except: Option<&str>) -> Option<&Application> {
+        resolve_by_name(
+            self.applications
+                .values()
+                .filter(|application| except.is_none_or(|excluded| application.id != excluded)),
+            name,
+            |application| (&application.name, &application.id),
+        )
     }
 
     /// The id of the application `identifier` names, for a caller that goes on to

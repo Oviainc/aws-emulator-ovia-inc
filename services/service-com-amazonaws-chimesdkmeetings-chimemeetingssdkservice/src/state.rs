@@ -24,8 +24,9 @@
 //! | [`ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState::meetings`] | [`MAX_MEETINGS`] | `DeleteMeeting`, or `CreateMeeting` is refused |
 //! | [`StoredMeeting::attendees`] | [`attendee_ceiling`] per meeting | `DeleteAttendee`/`DeleteMeeting`, or `CreateAttendee` is refused |
 //! | [`ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState::meeting_by_client_request_token`] | one entry per live meeting | the entry is dropped with its meeting |
+//! | the record of ended meetings | [`MAX_ENDED_MEETINGS`] | the oldest id is forgotten when the next meeting ends |
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest as _, Sha256};
@@ -95,6 +96,18 @@ pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 /// exceeds the resource limit.").
 pub const MAX_MEETINGS: usize = 250;
 
+/// How many ENDED meetings this emulator remembers having ended.
+///
+/// A meeting that was deleted is reported differently from an id that never named one
+/// (see [`ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState::meeting_absent`]), so
+/// the ids of deleted meetings have to be remembered — and that record, unlike the
+/// meetings themselves, is never released by a client call. It is therefore a bounded
+/// FIFO: the oldest id is forgotten when the next one is recorded, after which that id
+/// reads as one that never named a meeting again. The bound is the EMULATOR's own, chosen
+/// to match [`MAX_MEETINGS`] so a caller that deletes every meeting it created still sees
+/// every one of them reported as ended.
+pub const MAX_ENDED_MEETINGS: usize = MAX_MEETINGS;
+
 // The failures these operations share. Each handler raises them through its OWN
 // operation's error enum (the variants a model declares differ per operation), but the
 // payload inside is the same refusal, and a payload built inline in seven places drifts
@@ -112,24 +125,49 @@ pub fn bad_request(message: impl Into<String>) -> BadRequestException {
     }
 }
 
-/// `NotFoundException`'s payload for a well-formed id that names no stored meeting.
-pub fn meeting_not_found(meeting_id: &str) -> NotFoundException {
+/// How this service words every `NotFoundException`: the kind of resource the request
+/// named, then the id it supplied for that resource in angle brackets, then `not found`.
+///
+/// The message is built from the REQUEST — the id in it is the one the caller sent, never
+/// a value from this store — so a client that logs or surfaces the message can see which
+/// of the ids it passed was the absent one. One function so every reader of a missing
+/// meeting or attendee (`GetMeeting`, `ListAttendees`, `CreateAttendee`, `GetAttendee`,
+/// `DeleteAttendee`) words the refusal identically.
+fn not_found(kind: &str, id: &str) -> NotFoundException {
     NotFoundException {
         code: Some("NotFound".to_string()),
-        message: Some(format!("no meeting with MeetingId {meeting_id}")),
+        message: Some(format!("{kind} <{id}> not found")),
+        request_id: None,
+    }
+}
+
+/// `NotFoundException`'s payload for a well-formed id that names no stored meeting.
+pub fn meeting_not_found(meeting_id: &str) -> NotFoundException {
+    not_found("Meeting", meeting_id)
+}
+
+/// `NotFoundException`'s payload for a meeting that EXISTED and has since been deleted.
+///
+/// `DeleteMeeting` is documented as disconnecting every client and preventing new ones
+/// from joining — it ENDS the meeting — so a later caller is told that outcome rather
+/// than that its id is unknown: the id did name a meeting, and no retry or correction of
+/// it will ever succeed. The message names no id because it reports a fact about the
+/// meeting's lifecycle, not a value from the request.
+pub fn meeting_ended() -> NotFoundException {
+    NotFoundException {
+        code: Some("NotFound".to_string()),
+        message: Some("The meeting has ended".to_string()),
         request_id: None,
     }
 }
 
 /// `NotFoundException`'s payload for an attendee that is not in the named meeting.
-pub fn attendee_not_found(meeting_id: &str, attendee_id: &str) -> NotFoundException {
-    NotFoundException {
-        code: Some("NotFound".to_string()),
-        message: Some(format!(
-            "no attendee with AttendeeId {attendee_id} in meeting {meeting_id}"
-        )),
-        request_id: None,
-    }
+///
+/// The absent resource is the ATTENDEE — the meeting it was looked for in exists, or the
+/// caller would have been refused with [`meeting_not_found`] instead — so the id this
+/// names is the `AttendeeId`.
+pub fn attendee_not_found(attendee_id: &str) -> NotFoundException {
+    not_found("Attendee", attendee_id)
 }
 
 /// `ServiceFailureException`'s payload for a state store that could not be reached — the
@@ -211,6 +249,10 @@ pub struct ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState {
     /// entry per live meeting: `DeleteMeeting` drops the meeting's entry with it, so this
     /// map is bounded by [`MAX_MEETINGS`] too.
     pub meeting_by_client_request_token: HashMap<String, String>,
+    /// The `MeetingId`s of meetings that EXISTED and have since been deleted, oldest
+    /// first, so a reader can tell a meeting that ended from an id that never named one.
+    /// Bounded by [`MAX_ENDED_MEETINGS`]: recording one past the bound drops the oldest.
+    ended_meetings: VecDeque<String>,
     /// Counter the minted ids and join tokens are derived from. Never an id itself.
     next_seq: u64,
 }
@@ -227,7 +269,9 @@ impl ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState {
                 "chime-sdk-meetings/meeting/{seq}/{}",
                 clock_nanos()
             ));
-            if !self.meetings.contains_key(&candidate) {
+            // Neither a live meeting's id nor one recorded as ended, so the two records
+            // stay disjoint and a fresh meeting is never read as an ended one.
+            if !self.meetings.contains_key(&candidate) && !self.has_ended(&candidate) {
                 return candidate;
             }
         }
@@ -274,11 +318,43 @@ impl ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState {
     /// it belongs to: its attendees (nested in the record) and its idempotency entry.
     ///
     /// Answers the removed record, or `None` when no meeting had that id.
+    ///
+    /// The id itself is remembered as ENDED, which is what lets every later reader of it
+    /// report the meeting's outcome instead of an unknown id.
     pub fn forget_meeting(&mut self, meeting_id: &str) -> Option<StoredMeeting> {
         let removed = self.meetings.remove(meeting_id)?;
         self.meeting_by_client_request_token
             .remove(&removed.client_request_token);
+        if !self.has_ended(meeting_id) {
+            self.ended_meetings.push_back(meeting_id.to_string());
+            while self.ended_meetings.len() > MAX_ENDED_MEETINGS {
+                self.ended_meetings.pop_front();
+            }
+        }
         Some(removed)
+    }
+
+    /// Whether this id named a meeting this store has since deleted.
+    pub fn has_ended(&self, meeting_id: &str) -> bool {
+        self.ended_meetings.iter().any(|ended| ended == meeting_id)
+    }
+
+    /// The `NotFoundException` payload for a `MeetingId` this store holds no meeting for.
+    ///
+    /// Two situations reach it and a caller acts differently on each: a meeting that
+    /// EXISTED and has ended (its media is gone, so the caller moves on to a new meeting),
+    /// and an id that never named a meeting here (the caller has the wrong id). The
+    /// distinction is the store's to make, so it is made once, here, for every operation
+    /// that resolves a `MeetingId`.
+    ///
+    /// The caller must have established that `self.meetings` holds no record under
+    /// `meeting_id`.
+    pub fn meeting_absent(&self, meeting_id: &str) -> NotFoundException {
+        if self.has_ended(meeting_id) {
+            meeting_ended()
+        } else {
+            meeting_not_found(meeting_id)
+        }
     }
 
     /// The next value of this store's monotonic id counter.
