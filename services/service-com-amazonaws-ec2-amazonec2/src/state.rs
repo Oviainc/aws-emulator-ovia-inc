@@ -1178,6 +1178,13 @@ pub use traffic_mirror_filters::*;
 pub mod public_ipv4_pools;
 pub use public_ipv4_pools::*;
 
+/// The Traffic Mirror session store's own primitives — the id prefix, the bounds, the byte
+/// charge and the error channel the Traffic Mirror session operations share. Re-exported,
+/// so a handler reaches them as `crate::state::<item>` like every other primitive of this
+/// module.
+pub mod traffic_mirror_sessions;
+pub use traffic_mirror_sessions::*;
+
 /// The `Reservation` shape, under the name the scaffold generated for it.
 ///
 /// `com.amazonaws.ec2#Reservation` is both `RunInstances`'s output shape and the
@@ -2047,6 +2054,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// minted, so a repeat of the same request answers with that filter instead of
     /// creating a second one.
     pub traffic_mirror_filter_client_tokens: HashMap<String, String>,
+    /// Every Traffic Mirror session the account holds, by `TrafficMirrorSessionId`, as the
+    /// modelled [`crate::ops::types::TrafficMirrorSession`] shape itself — so a member a
+    /// writer sets round-trips through a describe without a field-by-field copy that can
+    /// silently drop one, the way [`Self::traffic_mirror_filters`] holds a filter. Ordered
+    /// by id, the one stable order a describe reports and pages over, so a pagination token
+    /// can name the id the next page starts at. Starts EMPTY: a fresh account holds no
+    /// Traffic Mirror session until `CreateTrafficMirrorSession` mints one, and
+    /// `DeleteTrafficMirrorSession` takes one back out. See [`traffic_mirror_sessions`].
+    pub traffic_mirror_sessions: BTreeMap<String, crate::ops::types::TrafficMirrorSession>,
     /// Reservations by `ReservationId`.
     pub reservations: HashMap<String, ReservationRecord>,
     /// Reservation ids in launch order: the stable order `DescribeInstances`
@@ -2929,6 +2945,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
         let mut state = Self {
             traffic_mirror_filters: BTreeMap::new(),
             traffic_mirror_filter_client_tokens: HashMap::new(),
+            traffic_mirror_sessions: BTreeMap::new(),
             reservations: HashMap::new(),
             reservation_order: Vec::new(),
             instances: HashMap::new(),
@@ -6911,6 +6928,7 @@ impl ComAmazonawsEc2Amazonec2State {
             subnet_cidr_reservations,
             subnets,
             traffic_mirror_filters,
+            traffic_mirror_sessions,
             transit_gateway_connect_peers => view,
             transit_gateway_policy_tables => view,
             transit_gateway_route_tables,

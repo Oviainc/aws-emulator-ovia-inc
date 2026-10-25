@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTrafficMirrorSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTrafficMirrorSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: deletes the Traffic Mirror session the request names out of
+//! [`crate::state`] and answers with that session's id. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTrafficMirrorSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes the specified Traffic Mirror session" (`DeleteTrafficMirrorSession`): the
+//! session record is REMOVED from the store, because the modelled `TrafficMirrorSession`
+//! shape carries no state member for a deleted session to sit in and AWS returns a session
+//! ready, so there is no transition the clock owes - the delete is complete when it
+//! answers, and a repeat of the same call reports the id as naming nothing.
+//!
+//! The refusals, in the order EC2 answers them: an id the account holds no session for is
+//! `InvalidTrafficMirrorSessionId.NotFound` (400,
+//! [`crate::state::require_known_traffic_mirror_session`]), and only then `DryRun`
+//! (`DryRunOperation`, 412) - the flag asks whether the request WOULD have worked, so one
+//! that would have been refused is refused with that reason instead.
+//! `TrafficMirrorSessionId` publishes no pattern, so there is no second code for an id of
+//! the wrong shape: one not-found code covers every id this service never minted.
+//!
+//! `CreateTrafficMirrorSession` is still a scaffold stub with an issue of its own, so a
+//! fresh account holds no session - and that is the answer every id gets until one is
+//! created. The write path this delete gives back
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::insert_traffic_mirror_session`]) lives
+//! in [`crate::state`] so that create lands on this one record rather than on a second
+//! copy of a session beside it.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +149,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTrafficMirrorSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTrafficMirrorSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTrafficMirrorSession"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{require_known_traffic_mirror_session, require_service_state};
+
+        // `ctx` carries request metadata only; this operation reads none of it — a Traffic
+        // Mirror session is named by id, which is unique across Regions in this store, and
+        // the modelled shape names neither a Region nor an ARN. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The id is resolved BEFORE anything else: a delete that named a session the
+        // account does not hold is not a no-op, because a caller has to be able to tell the
+        // deletion it performed from one it did not — and a repeat of a delete that
+        // succeeded is exactly that case.
+        require_known_traffic_mirror_session(&store, &input.traffic_mirror_session_id)?;
+
+        // DryRun sits AFTER the named session has been resolved and BEFORE the write, so a
+        // request that would have been refused is refused with that reason instead, and one
+        // that would have succeeded leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The record the removal took OUT of the store, so the id reported is the one the
+        // store held rather than the request's own string.
+        let deleted = store
+            .remove_traffic_mirror_session(&input.traffic_mirror_session_id)
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the Traffic Mirror session '{}' checked a moment ago could not be deleted",
+                    input.traffic_mirror_session_id
+                ))
+            })?;
+
+        // "The ID of the deleted Traffic Mirror session"
+        // (`DeleteTrafficMirrorSessionResult$TrafficMirrorSessionId`).
+        Ok(DeleteTrafficMirrorSessionOutput {
+            traffic_mirror_session_id: deleted.traffic_mirror_session_id,
+        })
     }
 }
