@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers one namespace — a provisioned cluster's, or a serverless one — to the
+//! consumer account the request names, and reports the registration as under way. The
+//! registration is recorded in this service's store, which is what makes a later
+//! `DeregisterNamespace` of the same pair a release of something rather than a release
+//! of nothing. The cluster of a provisioned namespace is being modified from this call
+//! until the change falls due, applied by the store's clock-owed settle.
 //!
 //! ## Shape of an operation
 //!
@@ -87,12 +84,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `RegisterNamespaceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#RegisterNamespace")]
+// `DependentServiceUnavailableFault` is widened in, exactly as `RebootCluster`
+// widens it: the model does not list it for this operation, but the service
+// declares the shape, and it is the only modelled way to say "the control-plane
+// store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#RegisterNamespace",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum RegisterNamespaceErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     InvalidClusterStateFault(InvalidClusterStateFault),
     InvalidNamespaceFault(InvalidNamespaceFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -141,23 +146,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::REGISTER_NAMESPACE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Register the namespace the request names to the consumer account it
+    /// names.
+    ///
+    /// A MUTATION: the call records the registration, so the namespace is
+    /// registered to that account from here on and reports `Registering` while
+    /// the registration is being made. Registering the same pair again is the
+    /// same registration, not a second one.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterNamespace"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                RegisterNamespaceErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "An array containing the ID of the consumer account": the list is
+        // modelled `len 1..1`, so its one entry is the account the namespace is
+        // registered to, and it has to be an account identifier.
+        let Some(requested_consumer) = input.consumer_identifiers.first() else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "ConsumerIdentifiers must carry exactly one consumer account identifier.",
+            ));
+        };
+        let consumer_identifier = st::consumer_account_id(requested_consumer)
+            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
+
+        let started = ::std::time::Instant::now();
+        let mut store = state.lock();
+        store.settle(started);
+
+        // The namespace has to be one a registration change is admitted for,
+        // through the rule this operation shares with `DeregisterNamespace`.
+        let namespace = store
+            .registration_target(&input.namespace_identifier)
+            .map_err(refused)?;
+
+        match store.namespace_registration_position(&namespace, &consumer_identifier) {
+            // The same namespace registered to the same consumer again is the
+            // registration that is already there, put back under way: one pair
+            // is one registration.
+            Some(position) => {
+                let stored = &mut store.namespace_registrations[position];
+                stored.status = st::NAMESPACE_REGISTERING.to_string();
+                stored.removed_at = None;
+            }
+            None => {
+                // A registration is a record this request creates, and the
+                // serverless arm of its key is any identifier a caller sends,
+                // so the collection is bounded rather than grown without end.
+                // The model declares no quota fault for this operation, so the
+                // refusal is the 400 `InvalidParameterValue` Amazon Redshift
+                // answers a request it cannot honour with.
+                if store.namespace_registrations.len() >= st::NAMESPACE_REGISTRATION_QUOTA {
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                        format!(
+                            "The request would exceed the allowed number of namespace registrations ({}).",
+                            st::NAMESPACE_REGISTRATION_QUOTA
+                        ),
+                    ));
+                }
+                store
+                    .namespace_registrations
+                    .push(st::StoredNamespaceRegistration {
+                        namespace: namespace.clone(),
+                        consumer_identifier,
+                        status: st::NAMESPACE_REGISTERING.to_string(),
+                        removed_at: None,
+                    });
+            }
+        }
+
+        // Registering a provisioned cluster's namespace is a change to that
+        // cluster, so the cluster is being modified from this call until the
+        // change falls due.
+        store.begin_namespace_registration_change(&namespace, started);
+
+        Ok(RegisterNamespaceOutput {
+            status: Some(st::NAMESPACE_REGISTERING.to_string()),
+        })
     }
+}
+
+/// The modelled error this operation answers a namespace that can take no
+/// registration change with.
+///
+/// The three causes the store resolves are the three errors the model declares
+/// for this operation, so the mapping is total and `DeregisterNamespace` maps
+/// the same cause to the same error.
+fn refused(refusal: crate::state::NamespaceRefusal) -> RegisterNamespaceError {
+    use crate::state::NamespaceRefusal as Refusal;
+    match refusal {
+        Refusal::ClusterNotFound(message) => {
+            RegisterNamespaceErrorModeled::ClusterNotFoundFault(ClusterNotFoundFault {
+                message: Some(message),
+            })
+        }
+        Refusal::InvalidClusterState(message) => {
+            RegisterNamespaceErrorModeled::InvalidClusterStateFault(InvalidClusterStateFault {
+                message: Some(message),
+            })
+        }
+        Refusal::InvalidNamespace(message) => {
+            RegisterNamespaceErrorModeled::InvalidNamespaceFault(InvalidNamespaceFault {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }
