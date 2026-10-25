@@ -75,6 +75,23 @@ pub const MAX_READINESS_SCOPES_PER_RESOURCE: usize = 50;
 /// The maximum number of tags one record may carry (the emulator's own ceiling).
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The length a tag KEY must satisfy, and the maximum length of a tag VALUE.
+///
+/// This service's `Tags` map targets `__string` for both key and value with neither
+/// `@length` nor `@pattern` (`smithy_query(query="shape", shape="Tags,__string")`), so
+/// the boundary validator applies nothing and this is where the rule lives. The rule
+/// itself is the AWS resource-tagging contract, which is uniform across services: a key
+/// is 1-128 characters, a value at most 256, and a key may not begin with the prefix
+/// reserved for AWS-managed tags ([`RESERVED_TAG_PREFIX`]).
+pub const TAG_KEY_MIN_LENGTH: usize = 1;
+pub const TAG_KEY_MAX_LENGTH: usize = 128;
+pub const TAG_VALUE_MAX_LENGTH: usize = 256;
+
+/// The key prefix AWS reserves for the tags it manages itself: a caller may neither
+/// write nor edit a tag whose key begins with it. Matched without regard to case —
+/// the reservation is on the prefix, not on one spelling of it.
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
 /// The maximum number of nested cell ARNs one cell may carry (the emulator's own
 /// ceiling, for the same reason as [`MAX_RESOURCES_PER_SET`]: one accepted record must
 /// not be arbitrarily large).
@@ -819,13 +836,17 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), String> {
 }
 
 
-/// Refuse a tag map with more entries than this emulator stores per record.
+/// Refuse a tag map with more entries than this emulator stores per record, or one
+/// carrying a key or value the tagging contract does not admit.
 pub fn validate_tags(tags: Option<&HashMap<String, String>>) -> Result<(), String> {
     let count = tags.map_or(0, HashMap::len);
     if count > MAX_TAGS_PER_RESOURCE {
         return Err(count_message("Tags", count, MAX_TAGS_PER_RESOURCE));
     }
-    Ok(())
+    match tags {
+        Some(tags) => validate_tag_entries(tags),
+        None => Ok(()),
+    }
 }
 
 /// Refuse a nested-cell list longer than this emulator stores. Also what a recovery
@@ -852,7 +873,63 @@ pub fn validate_added_tags(
     if merged > MAX_TAGS_PER_RESOURCE {
         return Err(count_message("Tags", merged, MAX_TAGS_PER_RESOURCE));
     }
+    validate_tag_entries(incoming)
+}
+
+/// Refuse a tag map holding a key or a value the AWS tagging contract does not admit —
+/// the rule EVERY operation of this service that admits tags into the store applies, so
+/// no accepted record can carry a tag a caller could not have written.
+///
+/// A key must be [`TAG_KEY_MIN_LENGTH`]-[`TAG_KEY_MAX_LENGTH`] characters and must not
+/// begin with [`RESERVED_TAG_PREFIX`]; a value is at most [`TAG_VALUE_MAX_LENGTH`]
+/// characters (an EMPTY value is legal — only the key has a lower bound). Lengths are
+/// counted in CHARACTERS, as every other length rule here is, so a multi-byte key is
+/// measured the way the caller wrote it.
+///
+/// Entries are examined in key order, so the same request is always refused with the
+/// same clause however the submitted map happened to be hashed.
+pub fn validate_tag_entries(tags: &HashMap<String, String>) -> Result<(), String> {
+    let mut entries: Vec<(&String, &String)> = tags.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    for (key, value) in entries {
+        let length = key.chars().count();
+        if !(TAG_KEY_MIN_LENGTH..=TAG_KEY_MAX_LENGTH).contains(&length) {
+            return Err(validation_message(
+                "Tags",
+                key,
+                &format!(
+                    "Map keys must have length greater than or equal to \
+                     {TAG_KEY_MIN_LENGTH} and less than or equal to {TAG_KEY_MAX_LENGTH}"
+                ),
+            ));
+        }
+        if is_reserved_tag_key(key) {
+            return Err(validation_message(
+                "Tags",
+                key,
+                &format!("Map keys must not begin with {RESERVED_TAG_PREFIX}"),
+            ));
+        }
+        if value.chars().count() > TAG_VALUE_MAX_LENGTH {
+            return Err(validation_message(
+                &format!("Tags.{key}"),
+                value,
+                &format!(
+                    "Member must have length less than or equal to {TAG_VALUE_MAX_LENGTH}"
+                ),
+            ));
+        }
+    }
     Ok(())
+}
+
+/// True when `key` begins with the prefix reserved for AWS-managed tags, in any case.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    // Compared as BYTES: a key whose first characters are multi-byte cannot carry the
+    // (all-ASCII) prefix, and slicing it by characters would be a boundary hazard.
+    let prefix = RESERVED_TAG_PREFIX.as_bytes();
+    let key = key.as_bytes();
+    key.len() >= prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 /// One validation clause for a collection that is too large. The COUNT is reported
