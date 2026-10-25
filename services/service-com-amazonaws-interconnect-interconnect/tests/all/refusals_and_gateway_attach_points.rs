@@ -21,9 +21,9 @@ use crate::emulator::{
 /// "Unable to process request: Connection does not exist for …").
 const ENVELOPE: &str = "Unable to process request: ";
 
-/// A `DirectConnectGatewayAttachPoint` the caller may send: 36 characters in the UUID
-/// groups the member's pattern requires.
-const ANY_GATEWAY_UUID: &str = "12345678-1234-1234-1234-123456789012";
+/// A `DirectConnectGatewayAttachPoint` the caller may send that names no gateway of the
+/// account: 36 characters in the UUID groups the member's pattern requires.
+const UNOWNED_GATEWAY_UUID: &str = "12345678-1234-1234-1234-123456789012";
 
 /// How long a poll waits for a clock-owed transition before the case fails.
 ///
@@ -112,7 +112,7 @@ async fn an_unresolvable_environment_id_is_a_client_refusal_everywhere_it_is_res
                 json!({
                     "environmentId": id,
                     "bandwidth": "1Gbps",
-                    "attachPoint": { "directConnectGateway": ANY_GATEWAY_UUID },
+                    "attachPoint": { "directConnectGateway": UNOWNED_GATEWAY_UUID },
                 }),
             ),
         ] {
@@ -137,7 +137,10 @@ async fn an_unresolvable_environment_id_is_a_client_refusal_everywhere_it_is_res
     }
 
     // Positive control: every environment the catalog DOES hold resolves on all three
-    // paths, so what is refused above is the absent id and not the request.
+    // paths, so what is refused above is the absent id and not the request. The attach
+    // point is one of the account's own gateways, because a Connection is only
+    // provisioned onto an attach point that exists.
+    let gateway = emulator.attach_point().await;
     for environment in creatable_environments(&catalog) {
         let id = text(&environment, "environmentId");
         let bandwidth = available_bandwidths(&environment)[0].clone();
@@ -146,7 +149,7 @@ async fn an_unresolvable_environment_id_is_a_client_refusal_everywhere_it_is_res
             .ic_ok("ListAttachPoints", json!({ "environmentId": id }))
             .await;
         let created = emulator
-            .create_connection(&id, &bandwidth, ANY_GATEWAY_UUID, "positive control")
+            .create_connection(&id, &bandwidth, &gateway, "positive control")
             .await;
         assert_eq!(
             text(&created, "environmentId"),
@@ -247,6 +250,9 @@ async fn an_update_is_permitted_only_from_the_states_the_service_names() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
     let creatable = creatable_environments(&catalog);
+    // An attach point is a Direct Connect gateway of the account, so the one every row
+    // below attaches to is created through that service first.
+    let gateway = emulator.attach_point().await;
     assert!(
         creatable.len() >= 2,
         "case \"catalog\": expected at least two environments that take connections, got {}",
@@ -262,7 +268,7 @@ async fn an_update_is_permitted_only_from_the_states_the_service_names() {
 
         // A freshly created connection is `requested`, which the rule permits.
         let fresh = emulator
-            .create_connection(&environment_id, &bandwidth, ANY_GATEWAY_UUID, "fresh link")
+            .create_connection(&environment_id, &bandwidth, &gateway, "fresh link")
             .await;
         let fresh_id = text(&fresh, "id");
         assert!(
@@ -292,7 +298,7 @@ async fn an_update_is_permitted_only_from_the_states_the_service_names() {
                 .create_connection(
                     &environment_id,
                     &bandwidth,
-                    ANY_GATEWAY_UUID,
+                    &gateway,
                     "bandwidth change",
                 )
                 .await;
@@ -343,7 +349,7 @@ async fn an_update_is_permitted_only_from_the_states_the_service_names() {
         // A connection on its way out, and one already gone, are both outside the
         // permitted set: the refusal is the same and the record does not change.
         let doomed = emulator
-            .create_connection(&environment_id, &bandwidth, ANY_GATEWAY_UUID, "doomed link")
+            .create_connection(&environment_id, &bandwidth, &gateway, "doomed link")
             .await;
         let doomed_id = text(&doomed, "id");
         emulator
