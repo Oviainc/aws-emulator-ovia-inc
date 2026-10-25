@@ -126,7 +126,19 @@ pub struct NoSuchConfigurationAggregatorException {
     pub message: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.configservice#ResourceKey")]
+// `skip_validation = ["resourceType"]`: a resource key names the type of a resource
+// Config holds data about, which includes the ACCOUNT-level type Config itself uses for
+// an evaluation of the account rather than of a recorded resource — the model names it
+// on another member of this same service (`ExternalEvaluation$ComplianceResourceType`:
+// "Config accepts `AWS::::Account` resource type"), and `ResourceType`'s published value
+// set does not list it. Config judges the REQUEST a key belongs to rather than refusing
+// such a type at the boundary, so the enum trait is kept off the generated schema and
+// each operation checks what it needs of the key itself. `resourceId` keeps its modelled
+// constraints.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.configservice#ResourceKey",
+    skip_validation = ["resourceType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ResourceKey {
     pub resource_type: String,

@@ -32,6 +32,9 @@ mod set_subscription_attributes;
 #[path = "all/sms_sandbox_phone_numbers.rs"]
 mod sms_sandbox_phone_numbers;
 
+#[path = "all/sqs_delivery_authorization.rs"]
+mod sqs_delivery_authorization;
+
 #[path = "all/sqs_subscription_delivery.rs"]
 mod sqs_subscription_delivery;
 

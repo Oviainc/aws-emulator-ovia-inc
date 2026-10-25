@@ -116,11 +116,15 @@ impl From<ListProposalVotesErrorModeled> for ListProposalVotesError {
     }
 }
 
-/// This operation models NO `ResourceNotFoundException` (its client errors are
-/// `AccessDeniedException`, `InvalidRequestException` and `ThrottlingException`), so a
-/// proposal it cannot resolve is an invalid REQUEST — never a 404 the model does not
-/// declare, and never an empty page, which would claim the proposal exists and carries no
-/// votes. `ListNodes` answers an unresolvable member scope the same way.
+/// A proposal this listing cannot resolve: `InvalidRequestException` (HTTP 400) naming the
+/// proposal and the network.
+///
+/// The same shape as `ListNodes`'s unresolvable member scope, for the same reason: this
+/// call reports on the votes of ONE PROPOSAL, so the proposal is the scope the request must
+/// name, and an unresolvable one — including when it is the network label that resolves to
+/// nothing, since a network this store does not hold carries no proposal either — is the
+/// request to fix. It is never an empty page, which would claim the proposal
+/// exists and carries no votes.
 fn proposal_not_found(proposal_id: &str, network_id: &str) -> ListProposalVotesError {
     ListProposalVotesErrorModeled::InvalidRequestException(InvalidRequestException {
         message: Some(format!(

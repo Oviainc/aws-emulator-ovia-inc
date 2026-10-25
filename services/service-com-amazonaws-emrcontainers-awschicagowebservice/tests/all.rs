@@ -17,6 +17,8 @@ mod created_metadata_wire_form;
 mod job_template_idempotency;
 #[path = "all/job_template_lifecycle.rs"]
 mod job_template_lifecycle;
+#[path = "all/managed_endpoint_create_admission.rs"]
+mod managed_endpoint_create_admission;
 #[path = "all/managed_endpoint_describe.rs"]
 mod managed_endpoint_describe;
 #[path = "all/managed_endpoint_listing.rs"]

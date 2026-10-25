@@ -223,17 +223,17 @@ async fn two_different_client_errors_share_the_400_and_differ_by_type() {
     }
 
     // And the scaffold channel is untouched by the status rule: an operation nobody
-    // has implemented yet is still a 501, not a client error. `DeleteEnvironmentConnector`
+    // has implemented yet is still a 501, not a client error. `DeleteEnvironmentHost`
     // is one of the operations still carrying the scaffold marker (`grep -rl '^//!
     // SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`); the request below is one this service's
     // own validator accepts, so the 501 is the handler's answer and not a refusal before
     // it.
     let (status, body) = call(
         &router,
-        "DeleteEnvironmentConnector",
+        "DeleteEnvironmentHost",
         &json!({
             "environmentId": "env-0000000000",
-            "connectorId": "cnctr-0123456789",
+            "hostName": "esx-01",
         }),
     )
     .await;

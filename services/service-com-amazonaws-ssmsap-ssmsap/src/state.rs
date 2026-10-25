@@ -48,7 +48,11 @@
 //! or by a credential's `DatabaseName`
 //! ([`StoredApplication::databases`], projected onto the wire `DatabaseSummary` by
 //! [`ApplicationDatabase::summary`]) — which is what `ListDatabases` reports, so a
-//! database cannot outlive the registration it came from.
+//! database cannot outlive the registration it came from. `GetDatabase` reads ONE of
+//! those same records, resolved by its ARN or its `DatabaseId`
+//! ([`RegionState::resolve_database`]) and projected onto the wire `Database` by
+//! [`StoredApplication::database_view`], so the database a caller reads one by one is the
+//! database the listing reports.
 //!
 //! An application's COMPONENTS are held the same way: the [`StoredComponent`] records in
 //! [`StoredApplication::components`] are the ones the registration's `ComponentsInfo`
@@ -83,8 +87,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Application, ApplicationCredential, ApplicationSummary, AssociatedHost, Component,
-    ConfigurationCheckDefinition, ConfigurationCheckOperation, ConflictException, DatabaseSummary,
-    Filter, InternalServerException, Operation, OperationEvent, Resource,
+    ConfigurationCheckDefinition, ConfigurationCheckOperation, ConflictException, Database,
+    DatabaseSummary, Filter, InternalServerException, Operation, OperationEvent, Resource,
     ResourceNotFoundException, RuleResult, SubCheckResult, ValidationException,
     APPLICATION_TYPE_VALUES, CONFIGURATION_CHECK_TYPE_VALUES,
 };
@@ -216,6 +220,23 @@ pub const DATABASE_TYPE_SYSTEM: &str = "SYSTEM";
 
 /// `DatabaseType` of a tenant database of a HANA system.
 pub const DATABASE_TYPE_TENANT: &str = "TENANT";
+
+/// `DatabaseStatus` of a database of an application that is up. One of the model's
+/// `DatabaseStatus` values (see [`crate::ops::types::DATABASE_STATUS_VALUES`]).
+pub const DATABASE_STATUS_RUNNING: &str = "RUNNING";
+
+/// `DatabaseStatus` of a database being started.
+pub const DATABASE_STATUS_STARTING: &str = "STARTING";
+
+/// `DatabaseStatus` of a database being stopped.
+pub const DATABASE_STATUS_STOPPING: &str = "STOPPING";
+
+/// `DatabaseStatus` of a database that is not running.
+pub const DATABASE_STATUS_STOPPED: &str = "STOPPED";
+
+/// `DatabaseStatus` for a database whose status the service cannot state from what it
+/// knows about the application — which is what the model documents this value for.
+pub const DATABASE_STATUS_UNKNOWN: &str = "UNKNOWN";
 
 /// The longest `DatabaseId` the model admits
 /// (`smithy_query(query="shape", shape="DatabaseSummary")`: `DatabaseId` length 1..300),
@@ -633,6 +654,73 @@ impl StoredApplication {
             database_connection: None,
             last_updated: Some(::aws_smithy_types::DateTime::from(self.last_updated)),
             arn: Some(component_arn(region, &self.id, &component.id)),
+        }
+    }
+
+    /// Project `database` of this application onto the modelled `Database`.
+    ///
+    /// The stored half is the same [`ApplicationDatabase`] `ListDatabases` projects onto
+    /// `DatabaseSummary` ([`ApplicationDatabase::summary`]), so a database read one by one
+    /// and the same database in a listing report the same ids, type and ARN. What a
+    /// `Database` states BEYOND that summary is, again, what the registration declared
+    /// plus what this store knows about the application the database belongs to:
+    ///
+    /// * `Credentials` are the registration's `ApplicationCredential`s that name THIS
+    ///   database ([`Self::databases`] identifies a database by its name, so the same
+    ///   match decides which credentials reach it); a database no credential names
+    ///   carries none rather than the application's other credentials.
+    /// * `Status` follows the application's, as a component's does
+    ///   ([`database_status_for`]).
+    /// * `LastUpdated` is the instant the application record last changed, which is the
+    ///   last thing that could have changed its databases.
+    /// * `ConnectedComponentArns` are the ARNs of this application's components that this
+    ///   database belongs to — the same (database -> component) assignment
+    ///   `Component$Databases` ([`Self::component_view`]) and `ListDatabases` report, so
+    ///   the two cannot disagree about which component a database is connected to.
+    ///
+    /// `PrimaryHost` and `SQLPort` are read off the HANA instance by discovery, which the
+    /// emulator does not do, so they are left ABSENT rather than invented — the same
+    /// choice [`Self::component_view`] makes for the properties it would have to discover.
+    ///
+    /// `region` is the Region the application is registered in, which is the Region the
+    /// ARNs reported here carry.
+    pub fn database_view(&self, database: &ApplicationDatabase, region: &str) -> Database {
+        let credentials: Vec<ApplicationCredential> = self
+            .credentials
+            .iter()
+            .filter(|credential| {
+                database_id_from_name(&credential.database_name) == database.database_id
+            })
+            .cloned()
+            .collect();
+        let connected_component_arns: Vec<String> = self
+            .components
+            .iter()
+            .filter(|component| database.component_id.as_deref() == Some(component.id.as_str()))
+            .map(|component| component_arn(region, &self.id, &component.id))
+            .collect();
+        Database {
+            application_id: Some(self.id.clone()),
+            component_id: database.component_id.clone(),
+            credentials: if credentials.is_empty() {
+                None
+            } else {
+                Some(credentials)
+            },
+            database_id: Some(database.database_id.clone()),
+            database_name: Some(database.database_name.clone()),
+            database_type: Some(database.database_type.clone()),
+            arn: Some(database.arn.clone()),
+            status: Some(database_status_for(&self.status).to_string()),
+            // Discovered on the HANA instance; see this method's docs.
+            primary_host: None,
+            sql_port: None,
+            last_updated: Some(::aws_smithy_types::DateTime::from(self.last_updated)),
+            connected_component_arns: if connected_component_arns.is_empty() {
+                None
+            } else {
+                Some(connected_component_arns)
+            },
         }
     }
 }
@@ -1435,6 +1523,57 @@ impl RegionState {
         })
     }
 
+    /// The SAP HANA database a request names, resolved to the application it belongs to
+    /// and the database record itself.
+    ///
+    /// A database is named either by its own ARN (`database_arn`) or by its `DatabaseId`,
+    /// and `application_id` / `component_id` NARROW where the lookup runs: an application
+    /// the request names must hold the database, a component it names must be the one the
+    /// database belongs to. The databases searched are the ones the registrations named
+    /// ([`StoredApplication::databases`], which is also what `ListDatabases` reports), in
+    /// the same (application id, database id) order that listing walks, so a reference two
+    /// applications of this Region both answer resolves to the same one on every call.
+    ///
+    /// `None` when nothing this Region holds answers the reference — including a reference
+    /// to a database of another Region, since the lookup only ever reaches this partition.
+    /// A request that names NEITHER an ARN nor a database id names no database at all and
+    /// resolves to nothing here (see
+    /// [`MISSING_DATABASE_IDENTIFIER_MESSAGE`]).
+    ///
+    /// `region` is the Region this partition holds, which is the Region the ARNs the
+    /// databases carry embed.
+    pub fn resolve_database(
+        &self,
+        region: &str,
+        application_id: Option<&str>,
+        component_id: Option<&str>,
+        database_id: Option<&str>,
+        database_arn: Option<&str>,
+    ) -> Option<(&StoredApplication, ApplicationDatabase)> {
+        if database_arn.is_none() && database_id.is_none() {
+            return None;
+        }
+        // An `ApplicationId` the request names narrows the lookup to that application,
+        // which must be registered HERE; one that names none reaches every application of
+        // this Region, in id order.
+        let applications: Vec<&StoredApplication> = match application_id {
+            Some(application_id) => ::std::vec![self.applications.get(application_id)?],
+            None => self.applications.values().collect(),
+        };
+        applications.into_iter().find_map(|application| {
+            application
+                .databases(region)
+                .into_iter()
+                .find(|database| {
+                    database_arn.is_none_or(|arn| database.arn == arn)
+                        && database_id.is_none_or(|id| database.database_id == id)
+                        && component_id
+                            .is_none_or(|id| database.component_id.as_deref() == Some(id))
+                })
+                .map(|database| (application, database))
+        })
+    }
+
     /// Permit `source_resource_arn` to take `action_type` on `resource_arn`.
     ///
     /// Adding a grant that is already held changes nothing — the grant is the
@@ -1871,6 +2010,27 @@ pub fn component_status_for(application_status: &str) -> &'static str {
     }
 }
 
+/// The `DatabaseStatus` of a SAP HANA database of an application whose
+/// `ApplicationStatus` is `application_status`.
+///
+/// A database runs as part of its application, exactly as a component does
+/// ([`component_status_for`]): starting and stopping an application is what starts and
+/// stops the database of its HANA component, so the database is up exactly while the
+/// application is up and is in the same transition while the application is in one. For
+/// any other application status — one where the service has not established what the
+/// application is running (its registration or its deregistration is still under way, or
+/// discovery never succeeded) — no database status follows from it, which is what the
+/// model's `UNKNOWN` states.
+pub fn database_status_for(application_status: &str) -> &'static str {
+    match application_status {
+        APPLICATION_STATUS_ACTIVATED => DATABASE_STATUS_RUNNING,
+        APPLICATION_STATUS_STARTING => DATABASE_STATUS_STARTING,
+        APPLICATION_STATUS_STOPPING => DATABASE_STATUS_STOPPING,
+        APPLICATION_STATUS_STOPPED => DATABASE_STATUS_STOPPED,
+        _ => DATABASE_STATUS_UNKNOWN,
+    }
+}
+
 /// The ARN of the database `database_id` of the application `application_id` in
 /// `region`: `arn:aws:ssm-sap:<region>:<account>:database/<ApplicationId>/<DatabaseId>`.
 ///
@@ -2121,6 +2281,18 @@ pub fn no_component_message(application_id: &str, component_id: &str) -> String 
     format!("No component with ID {component_id} exists for application {application_id}")
 }
 
+/// Why a reference that names no SAP HANA database of this account and Region is
+/// refused.
+///
+/// `GetDatabase` models no `ResourceNotFoundException` (`smithy_query(query="operation",
+/// operation="GetDatabase")`: `ValidationException` 400 and `InternalServerException` 500
+/// only), so a reference that resolves to nothing is the `ValidationException` it does
+/// model rather than a 404 — and the refusal is built from the request, naming the
+/// `DatabaseArn` or `DatabaseId` the caller sent, whichever it resolved the database by.
+pub fn no_database_message(reference: &str) -> String {
+    format!("No database {reference} exists in this account and Region")
+}
+
 /// Why an `OperationId` that names no operation record of this account and Region is
 /// refused.
 ///
@@ -2198,6 +2370,18 @@ pub fn resource_not_found_message(resource_arn: &str) -> String {
 /// ordinarily referenced by.
 pub const MISSING_APPLICATION_IDENTIFIER_MESSAGE: &str =
     "applicationId or applicationArn need to be specified";
+
+/// The message `GetDatabase` reports when the request names no database at all.
+///
+/// A database is identified either by its own ARN or by its `DatabaseId`
+/// (`smithy_query(query="operation", operation="GetDatabase")` gives the operation those
+/// two beside the `ApplicationId`/`ComponentId` that narrow the lookup), so a request
+/// carrying neither names nothing to read. A fixed diagnostic for a fixed condition —
+/// the request carries nothing to build it from — stated in the same shape as
+/// [`MISSING_APPLICATION_IDENTIFIER_MESSAGE`], so a client reads one wording for the
+/// class.
+pub const MISSING_DATABASE_IDENTIFIER_MESSAGE: &str =
+    "databaseArn or databaseId need to be specified";
 
 /// This service's modelled `ConflictException` (HTTP 409) carrying `message`.
 pub fn conflict(message: impl Into<String>) -> ConflictException {

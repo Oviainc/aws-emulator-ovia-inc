@@ -6,7 +6,9 @@
 //! has made due, the creation and completion instants, the `StatusMessage` a failed
 //! export carries, the `ExportSpecification` it was started with and the ARN of the
 //! search job whose results it exports. An `ExportJobIdentifier` that names no export
-//! job is a `ResourceNotFoundException` (404).
+//! job is a `ResourceNotFoundException` (404), and one that is not a well-formed
+//! identifier at all is refused before the lookup as invalid input —
+//! `ValidationException` (400), see [`crate::state::check_job_identifier`].
 //!
 //! This operation is `@readonly`: the only write it makes is materialising the status
 //! transition the clock already owed (`crate::state::ComAmazonawsBackupsearchCryobackupsearchserviceState::settle`),
@@ -170,6 +172,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The identifier's SYNTAX is judged before any store lookup: a string that cannot
+        // be an identifier of this service is invalid input, not a missing resource.
+        crate::state::check_job_identifier(&input.export_job_identifier)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetSearchResultExportJobErrorModeled::InternalServerException(
                 InternalServerException {

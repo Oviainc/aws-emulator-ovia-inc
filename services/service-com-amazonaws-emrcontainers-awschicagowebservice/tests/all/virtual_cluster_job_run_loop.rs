@@ -150,11 +150,11 @@ impl Emr {
         self.send("POST", "/virtualclusters", Some(body)).await
     }
 
-    async fn describe_cluster(&self, id: &str) -> Answer {
+    pub(crate) async fn describe_cluster(&self, id: &str) -> Answer {
         self.send("GET", &format!("/virtualclusters/{id}"), None).await
     }
 
-    async fn delete_cluster(&self, id: &str) -> Answer {
+    pub(crate) async fn delete_cluster(&self, id: &str) -> Answer {
         self.send("DELETE", &format!("/virtualclusters/{id}"), None)
             .await
     }

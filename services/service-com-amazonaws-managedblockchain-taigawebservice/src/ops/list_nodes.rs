@@ -117,10 +117,16 @@ impl From<ListNodesErrorModeled> for ListNodesError {
     }
 }
 
-/// This operation models NO `ResourceNotFoundException` (its client errors are
-/// `AccessDeniedException`, `InvalidRequestException` and `ThrottlingException`), so a
-/// member scope it cannot resolve is an invalid REQUEST — never a 404, and never an empty
-/// page, which would claim the member exists and owns no nodes.
+/// A member scope this listing cannot resolve, as the service is recorded answering it:
+/// `InvalidRequestException` (HTTP 400) naming the member and the network.
+///
+/// A not-found condition is normally reported as such (`ListMembers` answers the service's
+/// `ResourceNotFoundException` for a `NetworkId` it cannot resolve, and so does
+/// `ListProposals`), but this listing reports on the nodes of ONE MEMBER: the member is the
+/// scope the request must name for the call to mean anything, and an unresolvable one is
+/// recorded as a request to fix — including when it is the network label that resolves to
+/// nothing, since a network this store does not hold has no member either. It is never an
+/// empty page, which would claim the member exists and owns no nodes.
 fn member_not_found(member_id: &str, network_id: &str) -> ListNodesError {
     ListNodesErrorModeled::InvalidRequestException(InvalidRequestException {
         message: Some(format!(
@@ -211,9 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A network this store does not hold in this Region has no framework to read the
         // member rule from, so the request is answered through the member scope it names —
-        // or through the one it omits. Either way the answer is this operation's own
-        // `InvalidRequestException`, never a `ResourceNotFoundException` its model does
-        // not declare.
+        // or through the one it omits.
         let Some(network) = guard.network(&region, &input.network_id) else {
             return Err(match input.member_id.as_deref() {
                 Some(member_id) => member_not_found(member_id, &input.network_id),

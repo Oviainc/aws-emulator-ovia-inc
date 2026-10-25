@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAPIKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAPIKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints one API key for the token domains the request names, stores it under the
+//! requested `Scope`, and answers the key value it stored — nothing else holds the
+//! domains the key was defined with, so `GetDecryptedAPIKey` and `ListAPIKeys` read
+//! them back out of that record rather than out of the key value.
 //!
-//! It does, however, REFUSE a request WAF would refuse, before reaching that 501:
+//! The key value itself is opaque ([`crate::state::new_api_key`]): "the generated,
+//! encrypted API key", unique and unpredictable per call, which a client copies into
+//! its JavaScript CAPTCHA integration and hands back to this service. It is not an
+//! AWS credential — no request is signed with it, and the credential store mints only
+//! the kinds that are (an access key, a session) — so it is minted here, as the key's
+//! own record, and the response is the only place it appears.
+//!
 //! `TokenDomains` is checked here rather than at the request boundary
 //! (`skip_validation` on the input struct, see `super::types::create_api_key_types`)
 //! so an element that fails `TokenDomain`'s constraints is reported the way WAF
 //! reports it — against the LIST member's path, with the value rendered as the whole
-//! list and every constraint of the element shape in one set. A refusal is not an
-//! implementation, so the marker above stays until the operation itself is written.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAPIKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! list and every constraint of the element shape in one set.
 //!
 //! ## Shape of an operation
 //!
@@ -173,9 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A validation-only pass: nothing here reaches the store, and `ctx` carries
-        // only request metadata, which this pass does not need.
-        let _ = (ctx, &self.engine);
+        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
+        // request metadata, which minting a key does not need.
+        let _ = ctx;
 
         // `TokenDomains`' modelled constraints, which this operation took over from
         // the boundary so the refusal is worded the way WAF words a collection whose
@@ -195,11 +195,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
-        // A well-formed request still reaches the 501: minting an API key is not
-        // implemented yet, which is why the SCAFFOLDED marker at the top of this file
-        // stays. Refusing a bad request is not implementing the operation — and
-        // answering 501 for one would claim "nobody has written this yet" about a
-        // request that can never succeed.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAPIKey"))
+        // `Scope`'s enum membership is refused at the request boundary, which words
+        // the member's own constraint, so this is the handler's own guard: a scope
+        // that ever reaches it unchecked is reported as WAF's own invalid-parameter
+        // refusal rather than minting a key into no namespace.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(CreateAPIKeyErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the API key lives in, and is one of CLOUDFRONT or REGIONAL",
+                ),
+            )
+            .into());
+        }
+
+        // "You can use a single key for up to 5 domains" (this operation's own doc),
+        // so a request naming more domains than one key can be used for is refused
+        // rather than stored: the key it asks for could not serve all of them.
+        if input.token_domains.len() > crate::state::MAX_TOKEN_DOMAINS_PER_API_KEY {
+            // The first domain past the bound — the value at fault, and a bounded
+            // echo: `TokenDomain` caps one domain's length, where the whole list's
+            // is caller-chosen. The branch is only reached with more domains than
+            // the bound, so the element is there.
+            let offending = input
+                .token_domains
+                .get(crate::state::MAX_TOKEN_DOMAINS_PER_API_KEY)
+                .map_or_else(String::new, String::clone);
+            crate::state::audit(
+                Self::NAME,
+                &input.scope,
+                "",
+                "",
+                "WAFInvalidParameterException",
+            );
+            return Err(CreateAPIKeyErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_TOKEN_DOMAIN,
+                    &offending,
+                    &format!(
+                        "a single API key can be used for up to {} token domains",
+                        crate::state::MAX_TOKEN_DOMAINS_PER_API_KEY
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAPIKeyErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let api_key = crate::state::new_api_key(&input.scope, &input.token_domains);
+        let created_at_millis = now_millis();
+        let mut state = state.lock();
+
+        // The store refuses a key past the per-scope bound, which is the quota
+        // refusal this operation models; everything else about the record — its
+        // place in the listing order, its creation instant, its version — is the
+        // store's own bookkeeping.
+        let Some(entry) = state.insert_api_key(
+            &input.scope,
+            &api_key,
+            input.token_domains.clone(),
+            created_at_millis,
+        ) else {
+            crate::state::audit(Self::NAME, &input.scope, "", "", "WAFLimitsExceededException");
+            return Err(CreateAPIKeyErrorModeled::WAFLimitsExceededException(
+                crate::state::limits_exceeded_exception(),
+            )
+            .into());
+        };
+        crate::state::audit(Self::NAME, &input.scope, "", &entry.cursor, "created");
+
+        // The key value as STORED, so the caller and a later reader of the store
+        // agree on it byte for byte.
+        Ok(CreateAPIKeyOutput {
+            api_key: Some(entry.api_key),
+        })
     }
+}
+
+/// Milliseconds since the Unix epoch, now — the instant a key is created at, at the
+/// resolution `crate::state::date_time_millis` compares a modelled timestamp at.
+fn now_millis() -> i64 {
+    ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
 }

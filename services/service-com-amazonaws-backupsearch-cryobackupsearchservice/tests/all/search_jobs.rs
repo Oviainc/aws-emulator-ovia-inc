@@ -815,46 +815,52 @@ async fn a_client_token_is_idempotent_for_the_same_body_and_conflicts_for_a_diff
 #[tokio::test]
 async fn an_identifier_no_job_exists_for_is_not_found_on_every_operation_that_takes_one() {
     let emulator = emulator();
+    // A WELL-FORMED identifier — the shape this service mints, which is what its syntax
+    // guard admits (`state::job_identifier_well_formed`) — that no call ever minted, so
+    // every refusal below is the LOOKUP's answer and not an input refusal. A string
+    // outside that shape is refused 400 instead; that table is
+    // `tests/all/job_identifier_syntax.rs`.
+    let unknown = "48434c42-40a0-4057-b04d-3b484c610e2b";
     // Routes that resolve a search job by identifier, and the tagging routes that
     // resolve one by ARN. The last element says whether the refusal carries this
     // service's fixed not-found text: every JOB-IDENTIFIER lookup does, and none of them
     // echoes the identifier back (`state::RESOURCE_NOT_FOUND`), while the tag APIs, which
     // resolve a resource by ARN, are recorded with a refusal of their own.
-    let cases: Vec<(&str, &str, &str, Option<Value>, bool)> = vec![
+    let cases: Vec<(&str, &str, String, Option<Value>, bool)> = vec![
         (
             "GetSearchJob",
             "GET",
-            "/search-jobs/does-not-exist",
+            format!("/search-jobs/{unknown}"),
             None,
             true,
         ),
         (
             "ListSearchJobResults",
             "GET",
-            "/search-jobs/does-not-exist/search-results",
+            format!("/search-jobs/{unknown}/search-results"),
             None,
             true,
         ),
         (
             "StopSearchJob",
             "PUT",
-            "/search-jobs/does-not-exist/actions/cancel",
+            format!("/search-jobs/{unknown}/actions/cancel"),
             None,
             true,
         ),
         (
             "GetSearchResultExportJob",
             "GET",
-            "/export-search-jobs/does-not-exist",
+            format!("/export-search-jobs/{unknown}"),
             None,
             true,
         ),
         (
             "StartSearchResultExportJob",
             "PUT",
-            "/export-search-jobs",
+            "/export-search-jobs".to_string(),
             Some(json!({
-                "SearchJobIdentifier": "does-not-exist",
+                "SearchJobIdentifier": unknown,
                 "ExportSpecification": {"s3ExportSpecification": {"DestinationBucket": "b"}}
             })),
             true,
@@ -862,21 +868,25 @@ async fn an_identifier_no_job_exists_for_is_not_found_on_every_operation_that_ta
         (
             "ListTagsForResource",
             "GET",
-            "/tags/arn%3Aaws%3Abackup-search%3Aus-west-2%3A000000000000%3Asearch-job%2Fdoes-not-exist",
+            format!(
+                "/tags/arn%3Aaws%3Abackup-search%3Aus-west-2%3A000000000000%3Asearch-job%2F{unknown}"
+            ),
             None,
             false,
         ),
         (
             "TagResource",
             "POST",
-            "/tags/arn%3Aaws%3Abackup-search%3Aus-west-2%3A000000000000%3Asearch-job%2Fdoes-not-exist",
+            format!(
+                "/tags/arn%3Aaws%3Abackup-search%3Aus-west-2%3A000000000000%3Asearch-job%2F{unknown}"
+            ),
             Some(json!({"Tags": {"env": "test"}})),
             false,
         ),
     ];
 
     for (operation, method, uri, body, fixed_text) in cases {
-        let answer = call(&emulator, "us-west-2", method, uri, body).await;
+        let answer = call(&emulator, "us-west-2", method, &uri, body).await;
         assert_eq!(
             answer.status, 404,
             "case {operation:?}: an unknown resource must be 404, got {} ({:?})",
@@ -902,7 +912,7 @@ async fn an_identifier_no_job_exists_for_is_not_found_on_every_operation_that_ta
                 "case {operation:?}: every handler must take that text from one constant, got {message:?}"
             );
             assert!(
-                !message.contains("does-not-exist"),
+                !message.contains(unknown),
                 "case {operation:?}: the fixed not-found text must not echo the requested identifier, got {message:?}"
             );
         }
