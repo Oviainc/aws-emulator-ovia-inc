@@ -188,12 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        // `Channel` is documented as "The ARN or UUID value of the channel", so both
-        // forms name the same channel; an `arn:`-prefixed value that is not a channel
-        // ARN cannot name one, so it is refused as a malformed ARN rather than
-        // reported absent. The reading is the registry's own
-        // (`crate::state::channels`), so every channel operation resolves an
-        // identifier the same way.
+        // `Channel` is documented as "The ARN or UUID value of the channel" — those two
+        // forms and no other — so a value in NEITHER of them names no channel and is
+        // refused as a malformed ARN rather than reported absent. The reading is the
+        // registry's own (`crate::state::channels`), so every channel operation resolves
+        // an identifier the same way.
         let address = store
             .addressed_channel(&input.channel, &region)
             .ok_or_else(|| {

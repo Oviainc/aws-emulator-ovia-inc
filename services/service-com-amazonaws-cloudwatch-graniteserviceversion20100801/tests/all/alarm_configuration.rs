@@ -280,12 +280,40 @@ async fn a_metric_math_alarm_is_created_only_when_its_queries_resolve_to_one_ser
     // the watched expression calls, how deeply a search is wrapped, whether a multi-series
     // call is reduced by an enclosing function, and whether the expression in question is the
     // one the alarm watches.
-    let rows: [(&str, Value, bool); 12] = [
+    let rows: [(&str, Value, bool); 15] = [
         (
             "an expression over a defined query",
             json!([
                 stat_query("m1"),
                 {"Id": "e1", "Expression": "m1 / 1000", "ReturnData": true},
+            ]),
+            true,
+        ),
+        (
+            // A bare word in a function's KEYWORD position names no query, so an alarm whose
+            // expression fills or orders is created rather than refused for an id called
+            // `REPEAT`, `SUM` or `DESC`.
+            "an expression whose keyword argument is a bare word",
+            json!([
+                stat_query("m1"),
+                {"Id": "e1", "Expression": "FILL(m1, REPEAT)", "ReturnData": true},
+            ]),
+            true,
+        ),
+        (
+            "an expression ordering one series by a statistic",
+            json!([
+                stat_query("m1"),
+                {"Id": "e1", "Expression": "SORT(m1, SUM, DESC)", "ReturnData": true},
+            ]),
+            true,
+        ),
+        (
+            "an expression filling with another defined query",
+            json!([
+                stat_query("m1"),
+                stat_query("m2"),
+                {"Id": "e1", "Expression": "FILL(m1, m2)", "ReturnData": true},
             ]),
             true,
         ),

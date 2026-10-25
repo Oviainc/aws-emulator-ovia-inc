@@ -3,13 +3,14 @@
 //! The CloudTrail Lake **channel** registry and the rules every channel operation
 //! shares.
 //!
-//! A channel identifier is a channel ARN or the bare id CloudTrail minted for it
-//! (`DeleteChannelRequest$Channel` / `GetChannelRequest$Channel`: "The ARN or the UUID
-//! value of the channel"), and the ARN carries the account that owns the channel and the
-//! Region it lives in. Reading those two forms, and the wording a channel operation
-//! refuses a malformed identifier and an absent channel with, live here — beside the
-//! registry they resolve against — so `CreateChannel`, `GetChannel`, `UpdateChannel`,
-//! `ListChannels` and `DeleteChannel` cannot drift from one another.
+//! A channel identifier is a channel ARN or the `UUID` CloudTrail minted as the
+//! channel's id (`DeleteChannelRequest$Channel` / `GetChannelRequest$Channel`: "The ARN
+//! or the `UUID` value of the channel") — those TWO forms and no other — and the ARN
+//! carries the account that owns the channel and the Region it lives in. Reading those
+//! two forms, and the wording a channel operation refuses a malformed identifier and an
+//! absent channel with, live here — beside the registry they resolve against — so
+//! `CreateChannel`, `GetChannel`, `UpdateChannel`, `ListChannels` and `DeleteChannel`
+//! cannot drift from one another.
 //!
 //! The registry itself is a field of [`super::ComAmazonawsCloudtrailCloudtrail20131101State`],
 //! the one store this service keeps; this module is where its rules are written, the way
@@ -27,7 +28,10 @@ use crate::ops::types::{Destination, Tag};
 /// `arn:aws:cloudtrail:<region>:<account>:channel/<uuid>`. The format is the one the
 /// model doc for `CloudTrailARNInvalidException` publishes: "The following is the
 /// format of a channel ARN: arn:aws:cloudtrail:us-east-2:123456789012:channel/01234567890".
-const CHANNEL_RESOURCE_PREFIX: &str = "channel/";
+///
+/// `pub(super)` so the tagging reader in `super` classifies a tagging ARN by the same
+/// prefix this module reads a channel identifier by.
+pub(super) const CHANNEL_RESOURCE_PREFIX: &str = "channel/";
 
 /// The resource TYPE of that ARN — [`CHANNEL_RESOURCE_PREFIX`] without its separator —
 /// which is what `::service_common::arn` reads the resource field by.
@@ -322,10 +326,10 @@ pub fn channel_arn(region: &str, channel_id: &str) -> String {
 /// resume key through whichever of these names the listing hands it, so a predicate of
 /// its own here could accept a position the other refuses.
 ///
-/// It is what a MINTED id looks like, not a rule a caller-supplied id is checked
-/// against: an id CloudTrail never minted names no channel, which is an absent channel
-/// and not a malformed identifier. Only the ARN FORM is checked, because only an ARN
-/// has a format to get wrong.
+/// It is what `CreateChannel` mints, and — because `Channel` admits exactly two forms,
+/// an ARN and this one — the form a caller-supplied BARE identifier is read by: a bare
+/// value of any other shape is in neither form, so it names no channel and has no
+/// channel to be absent.
 pub fn is_minted_channel_id(value: &str) -> bool {
     is_uuid(value)
 }
@@ -335,14 +339,23 @@ pub fn is_minted_channel_id(value: &str) -> bool {
 /// `ChannelARNInvalidException`.
 ///
 /// A value is read as an ARN as soon as it starts with `arn:`, and then it must BE a
-/// channel ARN, because an ARN is the only form that has a format to get wrong: the ARN
-/// itself is read through `::service_common::arn`, the one ARN parse the services share
-/// (the same one `super::parse_taggable_arn` reads a tagging ARN with), and this reader
-/// adds what the shared parse leaves to the service — the partition this emulator mints
-/// ([`AWS_PARTITION`]), a Region and an account to address a regional resource with, and
-/// the `channel` resource type. Anything else is read as a bare channel id whatever its
-/// syntax: an id CloudTrail never minted names no channel, which is an absent channel,
-/// not a malformed identifier.
+/// channel ARN: the ARN itself is read through `::service_common::arn`, the one ARN
+/// parse the services share (the same one `super::parse_taggable_arn` reads a tagging
+/// ARN with), and this reader adds what the shared parse leaves to the service — the
+/// partition this emulator mints ([`AWS_PARTITION`]), a Region and an account to address
+/// a regional resource with, and the `channel` resource type. The id inside a
+/// well-formed channel ARN is opaque — the format the model publishes carries one
+/// (`arn:aws:cloudtrail:us-east-2:123456789012:channel/01234567890`) that is not a UUID
+/// at all — so an ARN naming an id no channel carries is an ABSENT channel.
+///
+/// A value that does not start `arn:` must be the other documented form, the channel's
+/// `UUID` ([`is_minted_channel_id`]); a bare value of any other shape is in neither
+/// form, so it is not a channel identifier and is refused as a malformed one. The test
+/// is the CANONICAL rendering of that `UUID` and not every string the shape's
+/// `@pattern` admits, because a bare identifier addresses a channel BY the registry's
+/// key — the id as the service wrote it — so any other spelling of the same UUID
+/// addresses no key the registry orders, which is the reason
+/// [`super::is_minted_uuid_id`] states that form once for this service.
 pub fn parse_channel_identifier(value: &str) -> Option<ChannelIdentifier> {
     if value.starts_with("arn:") {
         let arn = ::service_common::arn::parse_of(value, SERVICE_NAMESPACE)?;
@@ -359,13 +372,15 @@ pub fn parse_channel_identifier(value: &str) -> Option<ChannelIdentifier> {
             id: id.to_string(),
         });
     }
-    if value.is_empty() {
+    if !is_minted_channel_id(value) {
         return None;
     }
     Some(ChannelIdentifier::Id(value.to_string()))
 }
 
-/// The `ChannelARNInvalidException` text for an `arn:` value that is not a channel ARN.
+/// The `ChannelARNInvalidException` text for a value in neither form a channel
+/// identifier takes: an `arn:` value that is not a channel ARN, or a bare value that is
+/// not a channel `UUID`.
 ///
 /// Built from the request, so a caller can see which value was refused; every channel
 /// operation words it the same way. The tagging path words its own channel-ARN refusal

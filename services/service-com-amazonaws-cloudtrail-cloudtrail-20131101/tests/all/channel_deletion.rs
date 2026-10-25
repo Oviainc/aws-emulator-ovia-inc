@@ -11,24 +11,27 @@
 //! The rules under test, each grounded in this service's Smithy model:
 //!
 //! * `DeleteChannel` releases exactly the channel its identifier addresses, and the
-//!   identifier is either the channel ARN or the bare id CloudTrail minted for it
+//!   identifier is either the channel ARN or the `UUID` CloudTrail minted as its id
 //!   (`DeleteChannelRequest$Channel`: "The ARN or the UUID value of the channel that you
 //!   want to delete");
 //! * a channel is a regional resource — its ARN carries a Region and an account — so an
 //!   identifier addresses the channel of that id in the ARN's own Region, or, for a bare
-//!   id, in the Region the call was made in;
-//! * an identifier that names no stored channel is `ChannelNotFoundException` ("thrown
-//!   when CloudTrail cannot find the specified channel"), and deleting is not
-//!   idempotent: the second delete of one channel is that refusal. A bare identifier is
-//!   read as a channel id whatever its syntax, so an id CloudTrail never minted is an
-//!   ABSENT channel;
-//! * an `arn:`-prefixed identifier that is not a channel ARN can name no channel and is
-//!   `ChannelARNInvalidException` ("thrown when the specified value of ChannelARN is not
-//!   valid"), and a refused request deletes nothing.
+//!   `UUID`, in the Region the call was made in;
+//! * an identifier in one of those two forms that names no stored channel is
+//!   `ChannelNotFoundException` ("thrown when CloudTrail cannot find the specified
+//!   channel"), and deleting is not idempotent: the second delete of one channel is that
+//!   refusal. The id inside a well-formed channel ARN is opaque, so an ARN carrying an id
+//!   CloudTrail never minted names an ABSENT channel;
+//! * an identifier in NEITHER form — an `arn:`-prefixed value that is not a channel ARN,
+//!   or a bare value that is not written as the modelled `UUID` (`@length 36` of
+//!   `^[a-f0-9\-]+$`) — can name no channel and is `ChannelARNInvalidException` ("thrown
+//!   when the specified value of ChannelARN is not valid"), and a refused request deletes
+//!   nothing.
 //!
 //! A delete is read back through the registry these cases seed — the same store the
 //! handler writes — and through the second delete's refusal, which is the same fact over
-//! the wire.
+//! the wire. `GetChannel` reads a channel back over the wire in
+//! `tests/all/channel_lifecycle.rs`.
 
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -265,14 +268,13 @@ async fn deleting_a_channel_releases_exactly_that_channel() {
     );
 }
 
-/// RULE: an identifier that names no stored channel is `ChannelNotFoundException`, and
-/// the refused request changes nothing. An id CloudTrail never minted is one of those:
-/// a bare identifier is read as a channel id whatever its syntax, because only an ARN
-/// has a format to get wrong.
+/// RULE: an identifier in one of the two documented forms that names no stored channel
+/// is `ChannelNotFoundException`, and the refused request changes nothing. The id inside
+/// a well-formed channel ARN is opaque — the format the model publishes carries one that
+/// is not a UUID at all — so an ARN whose id CloudTrail never minted is one of those.
 ///
-/// The rows differ in the form of the identifier, in whether the id has the shape of a
-/// minted one at all, in the Region the ARN pins, in the account the ARN names and in
-/// the case of the id's hex digits.
+/// The rows differ in the form of the identifier, in the Region the ARN pins, in the
+/// account the ARN names and in whether the ARN's id has the shape of a minted one.
 #[tokio::test]
 async fn an_identifier_naming_no_channel_is_not_found() {
     let emulator = Emulator::new();
@@ -303,26 +305,6 @@ async fn an_identifier_naming_no_channel_is_not_found() {
             "an ARN naming another account",
             format!("arn:aws:cloudtrail:{HOME_REGION}:111122223333:channel/{present}"),
             format!("arn:aws:cloudtrail:{HOME_REGION}:111122223333:channel/{present}"),
-        ),
-        (
-            "the stored id in upper-case hex, which is a different id",
-            present.to_uppercase(),
-            expected_channel_arn(HOME_REGION, &present.to_uppercase()),
-        ),
-        (
-            "a bare identifier that is not a minted id at all",
-            "my-channel".to_string(),
-            expected_channel_arn(HOME_REGION, "my-channel"),
-        ),
-        (
-            "a bare identifier one UUID group short",
-            "39032a83-30fe-4581-351632c2be72".to_string(),
-            expected_channel_arn(HOME_REGION, "39032a83-30fe-4581-351632c2be72"),
-        ),
-        (
-            "a bare identifier with a non-hex digit",
-            "39032a8z-30fe-4581-8bd3-351632c2be72".to_string(),
-            expected_channel_arn(HOME_REGION, "39032a8z-30fe-4581-8bd3-351632c2be72"),
         ),
         (
             "an ARN whose channel id is not a minted one",
@@ -376,15 +358,19 @@ async fn the_recorded_unknown_channel_is_answered_the_way_the_service_answers_it
         );
 }
 
-/// RULE: an `arn:`-prefixed identifier that is not a channel ARN can name no channel at
+/// RULE: an identifier in neither documented form — an `arn:`-prefixed value that is not
+/// a channel ARN, or a bare value that is not a channel `UUID` — can name no channel at
 /// all and is refused `ChannelARNInvalidException`; nothing is deleted.
 ///
-/// The rows differ in WHICH part of the ARN form is broken: the partition, the service,
-/// the field count, the account field, the resource prefix and the resource id. Every
-/// row satisfies the modelled `ChannelArn` constraints (len 3..256,
-/// `^[a-zA-Z0-9._/\-:]+$`), so the boundary validator passes it to the handler.
+/// The ARN rows differ in WHICH part of the ARN form is broken: the partition, the
+/// service, the field count, the account field, the resource prefix and the resource id.
+/// The bare rows differ in how the value misses the `UUID` the model writes (`@length 36`
+/// of `^[a-f0-9\-]+$`): the group count, a group's length, a non-hex digit, the case of
+/// its hex digits, and a value with no groups at all. Every row satisfies the modelled
+/// `ChannelArn` constraints (len 3..256, `^[a-zA-Z0-9._/\-:]+$`), so the boundary
+/// validator passes it to the handler.
 #[tokio::test]
-async fn an_arn_that_is_not_a_channel_arn_is_refused() {
+async fn an_identifier_in_neither_documented_form_is_refused() {
     let emulator = Emulator::new();
     let present = channel_id("39032a83");
     let present_arn = emulator.seed_channel(HOME_REGION, &present, "present-channel", 2, 1);
@@ -422,6 +408,33 @@ async fn an_arn_that_is_not_a_channel_arn_is_refused() {
         (
             "an ARN with an empty channel id",
             format!("arn:aws:cloudtrail:{HOME_REGION}:000000000000:channel/"),
+        ),
+        (
+            "a bare value with no UUID groups at all",
+            "my-channel".to_string(),
+        ),
+        (
+            "a bare value one UUID group short",
+            "39032a83-30fe-4581-351632c2be72".to_string(),
+        ),
+        (
+            "a bare value with a non-hex digit",
+            "39032a8z-30fe-4581-8bd3-351632c2be72".to_string(),
+        ),
+        (
+            "a bare value whose first group is one digit short",
+            "9032a83-30fe-4581-8bd3-351632c2be72".to_string(),
+        ),
+        (
+            // The `UUID` the model writes is lowercase hex, so the stored channel's
+            // own id in upper case is in neither form.
+            "the stored id in upper-case hex",
+            present.to_uppercase(),
+        ),
+        (
+            "the recorded bare value, which is in neither form",
+            // `cloudtrail-lake-read-surface-and-error-contracts#task#9`.
+            "not-a-channel-arn".to_string(),
         ),
     ];
 

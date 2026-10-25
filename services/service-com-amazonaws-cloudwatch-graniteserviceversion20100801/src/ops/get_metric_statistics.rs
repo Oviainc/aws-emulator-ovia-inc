@@ -253,28 +253,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Resolve every extended statistic BEFORE any data is read, so an unsupported name is
         // refused whether or not the requested range happens to hold datapoints.
-        let percentiles: Vec<(&str, f64)> = extended
-            .iter()
-            .map(|name| {
-                // The parse and the percentile itself are `crate::state`'s, shared with the
-                // metric-alarm evaluation that reads an alarm's `ExtendedStatistic` over the
-                // same stored datapoints, so the two cannot compute a different number for
-                // one span.
-                crate::state::parse_percentile(name)
-                    .map(|percentile| (*name, percentile))
-                    .ok_or_else(|| invalid_value(format!("{name} is not a supported statistic")))
-            })
-            .collect::<Result<_, _>>()?;
+        for name in &extended {
+            // The grammar and the statistic itself are `crate::state`'s, shared with
+            // `GetMetricData` and with the metric-alarm evaluation that reads an alarm's
+            // `ExtendedStatistic` over the same stored datapoints, so no two of them can
+            // compute a different number for one span.
+            if !crate::state::is_extended_statistic(name) {
+                return Err(invalid_value(format!("{name} is not a supported statistic")));
+            }
+        }
         validate_period(input.period)?;
 
-        let start = crate::state::from_timestamp(&input.start_time);
+        let requested_start = crate::state::from_timestamp(&input.start_time);
         let end = crate::state::from_timestamp(&input.end_time);
-        if end <= start {
+        if end <= requested_start {
             return Err(invalid_value(format!(
-                "EndTime must be later than StartTime; got StartTime {start} and EndTime {end} \
-                 (epoch seconds)"
+                "EndTime must be later than StartTime; got StartTime {requested_start} and \
+                 EndTime {end} (epoch seconds)"
             )));
         }
+        // "CloudWatch rounds the specified time stamp" (`GetMetricStatisticsInput$StartTime`):
+        // the first window begins at the rounded start time, not at the requested instant, so
+        // a request whose start is not on a period boundary is answered at the boundaries
+        // CloudWatch lays — by the one rule every read of a series shares.
+        let start = crate::state::rounded_start(
+            requested_start,
+            input.period,
+            crate::state::now_secs(),
+        );
         let period = f64::from(input.period);
         let windows = ((end - start) / period).ceil();
         if windows > MAX_DATAPOINTS {
@@ -302,8 +308,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // `StartTime` inclusive, `EndTime` exclusive; windows are `Period` seconds wide and
-        // anchored at `StartTime`, folded by the one shared helper every reader of a series
-        // uses ([`crate::state::windows_of`]).
+        // anchored at the ROUNDED start time, folded by the one shared helper every reader of
+        // a series uses ([`crate::state::windows_of`]).
         let series = store.metrics.get(&key).map_or(&[][..], Vec::as_slice);
         let buckets = crate::state::windows_of(series, start, end, period, input.unit.as_deref());
 
@@ -313,7 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::window_start(start, index, period),
                 &data,
                 &statistics,
-                &percentiles,
+                &extended,
                 input.unit.as_deref(),
             ));
         }
@@ -350,7 +356,7 @@ fn aggregate(
     window_start: f64,
     data: &[&crate::state::StoredDatum],
     statistics: &[&str],
-    percentiles: &[(&str, f64)],
+    extended: &[&str],
     requested_unit: Option<&str>,
 ) -> Datapoint {
     let folded = crate::state::BasicStatistics::of(data.iter().copied());
@@ -359,8 +365,8 @@ fn aggregate(
     let maximum = folded.maximum;
 
     let mut extended_statistics = std::collections::HashMap::new();
-    for (name, percentile) in percentiles {
-        if let Some(value) = crate::state::weighted_percentile(data, *percentile) {
+    for name in extended {
+        if let Some(value) = crate::state::extended_statistic_value(data, name) {
             extended_statistics.insert((*name).to_string(), value);
         }
     }

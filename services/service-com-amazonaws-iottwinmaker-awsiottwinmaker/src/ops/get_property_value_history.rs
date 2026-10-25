@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPropertyValueHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPropertyValueHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reads the HISTORY of a time series property out of stored state: the values
+//! `BatchPutPropertyValues` wrote into the series of each selected property,
+//! those of them the request's window and `propertyFilters` select, in the time
+//! direction `orderByTime` asks for. Nothing here writes: a read of a history
+//! leaves every later caller the same answer.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPropertyValueHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request addresses either ONE component — `entityId` with `componentName`,
+//! or `componentPath` for a composite component — or, for a cross-entity query,
+//! every instance of the component type `componentTypeId` names. Each selected
+//! property has to BE a property of what the request addressed and has to be a
+//! TIME SERIES property ([`crate::state::property_is_time_series`]): the history
+//! of a property that is not one is nothing this operation reads, so such a
+//! request is a `ValidationException` rather than an empty answer. An unknown
+//! workspace, entity, component or component type is a
+//! `ResourceNotFoundException`.
+//!
+//! The window is `startTime`/`endTime` — the ISO 8601 members — or the
+//! deprecated `startDateTime`/`endDateTime` they replaced, and both of its
+//! bounds are INCLUSIVE ("the date and time of the earliest/latest property
+//! value to return"). `interpolation` asks for the series resampled at a fixed
+//! interval across that window instead of as written. The answer is PAGED:
+//! `maxResults` caps how many values it carries and `nextToken` resumes it.
+//!
+//! Every pass is BOUNDED: the scope is capped at [`MAX_COMPONENTS_IN_SCOPE`]
+//! components, one request reads at most [`MAX_VALUES_READ`] values out of the
+//! store, it carries at most [`MAX_FILTERS`] filters, and an interpolated
+//! answer is capped at [`MAX_INTERPOLATED_VALUES`] points — so neither a wide
+//! scope nor a long window nor a tiny interval can make one request unbounded.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +203,905 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPropertyValueHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPropertyValueHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPropertyValueHistory"))
+        // Every call is recorded, successful or refused: the real service logs
+        // access, and this one reads tenant state.
+        ::tracing::info!(
+            operation = "GetPropertyValueHistory",
+            workspace_id = %input.workspace_id,
+            entity_id = input.entity_id.as_deref().unwrap_or(""),
+            component_type_id = input.component_type_id.as_deref().unwrap_or(""),
+            "serving a request"
+        );
+        // The Region this request is signed for picks the store that answers
+        // it: a workspace created through another Region's endpoint is not in
+        // it, so it holds no history to report.
+        let region = crate::state::request_region(ctx.parts());
+        // The page size served, under the rule every paginated operation of
+        // this service shares: THIS member documents a minimum of 1 and the
+        // service's default of 25, so an explicit zero is refused and a request
+        // that names none is served that default.
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::PageSizeRule::minimum_one(crate::state::DEFAULT_PAGE_SIZE),
+        )
+        .map_err(invalid)?;
+        let descending = time_order(&input)?;
+        let window = Window::of(&input)?;
+        let interpolation = Interpolation::of(&input, &window)?;
+
+        // Everything the answer is computed from is read under the store's lock
+        // and OWNED, so the resampling, ordering and paging below touch nothing
+        // another request is writing. The read is bounded by
+        // [`MAX_COMPONENTS_IN_SCOPE`] and [`MAX_VALUES_READ`].
+        let mut series = {
+            let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+                GetPropertyValueHistoryErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iottwinmaker store is unavailable".to_string()),
+                    },
+                )
+            })?;
+            let state = state.lock();
+            let state = state.region(&region);
+
+            let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+                return Err(not_found(crate::state::workspace_not_found_message(
+                    &input.workspace_id,
+                )));
+            };
+
+            let components = scope(workspace, &input)?;
+            let selected = selected_properties(workspace, &components, &input)?;
+            let filters = value_filters(workspace, &components, &input)?;
+            read_series(&components, &selected, &filters, &window)?
+        };
+
+        // Bounded by construction — at most [`MAX_VALUES_READ`] values, each
+        // resolved once while the lock was held, and at most
+        // [`MAX_INTERPOLATED_VALUES`] points across the WHOLE answer — but
+        // still CPU work a request chose the size of, so it runs on the
+        // blocking pool with the lock RELEASED: `spawn_blocking` is a real
+        // await point, so one history cannot starve the worker that serves
+        // health checks and every other request, and a cancellation or a
+        // timeout has somewhere to land.
+        let shaped = ::tokio::task::spawn_blocking(move || -> Result<Vec<Series>, String> {
+            if let Some(interpolation) = interpolation {
+                // The ceiling is on the points one ANSWER carries, not on one
+                // series': a request may address a series per property per
+                // component in scope, so what the resampling would take is
+                // settled over all of them BEFORE any of it is computed.
+                let points = series.len().saturating_mul(interpolation.points);
+                if points > MAX_INTERPOLATED_VALUES {
+                    return Err(format!(
+                        "interpolating the {} series this request addresses would take {points} \
+                         points, more than the {MAX_INTERPOLATED_VALUES} one answer carries; \
+                         narrow the window, the selection or the scope, or widen the interval",
+                        series.len()
+                    ));
+                }
+                for one in &mut series {
+                    one.values = interpolation.resample(&one.values);
+                }
+            }
+            // Read in time order out of the store (the series is keyed by its
+            // instant), so DESCENDING is that order reversed: "the time
+            // direction to use in the result order".
+            if descending {
+                for one in &mut series {
+                    one.values.reverse();
+                }
+            }
+            Ok(series)
+        })
+        .await;
+        let series = match shaped {
+            Ok(Ok(series)) => series,
+            // What the resampling would take is decided over the whole answer,
+            // which is known only once the series have been read, so the
+            // refusal it earns is carried back out of the pool.
+            Ok(Err(message)) => return Err(invalid(message)),
+            // A panic or a cancellation on the pool says nothing about the
+            // request, so it is reported as the server fault it is rather than
+            // as an empty history.
+            Err(error) => {
+                ::tracing::error!(
+                    operation = "GetPropertyValueHistory",
+                    error = %error,
+                    "the history answer did not complete"
+                );
+                return Err(GetPropertyValueHistoryErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the history answer did not complete".to_string()),
+                    },
+                )
+                .into());
+            }
+        };
+
+        page(series, page_size, &input)
     }
+}
+
+/// Refuse the request, naming what about it cannot be served. The operation
+/// models `ValidationException` itself, so the refusal is the modelled shape
+/// rather than the scaffold wrapper's.
+fn invalid(message: String) -> GetPropertyValueHistoryError {
+    GetPropertyValueHistoryErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Answer that something the request named does not exist.
+fn not_found(message: String) -> GetPropertyValueHistoryError {
+    GetPropertyValueHistoryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The most components one request reads histories out of.
+///
+/// A `componentTypeId` query's scope is every instance of that component type
+/// across the workspace's entities — request-chosen, over caller-grown state —
+/// so it is capped the way this service's other caller-driven query paths cap
+/// their own rows, and a request past the ceiling is refused rather than
+/// answered out of an unbounded scan.
+const MAX_COMPONENTS_IN_SCOPE: usize = 10_000;
+
+/// The most values one request reads out of the store.
+///
+/// One property's series holds up to
+/// [`crate::state::MAX_TIME_SERIES_VALUES_PER_PROPERTY`] values and a request
+/// may select ten properties of every component in scope, so the values a wide
+/// request would materialise are capped here; past the ceiling the request is
+/// refused rather than served out of an unbounded read.
+const MAX_VALUES_READ: usize = 20_000;
+
+/// The most `propertyFilters` one request may carry. The list is modelled
+/// `@length 1..10`, so the boundary validator has already refused anything
+/// longer; stating the ceiling here keeps this handler's own bound local rather
+/// than depending on that.
+const MAX_FILTERS: usize = 10;
+
+/// The most points one INTERPOLATED answer carries, across every series in it:
+/// the window divided by the interval is caller-chosen on both sides and the
+/// number of series is caller-grown, so the resampling is bounded by this
+/// emulator's own ceiling — settled over the whole answer before any of it is
+/// computed — rather than by what a request asks for.
+const MAX_INTERPOLATED_VALUES: usize = 10_000;
+
+/// The two values of the model's `OrderByTime` enum
+/// (`super::types::ORDER_BY_TIME_VALUES`). `ASCENDING` is the direction a
+/// request that names none is served in: a history reads forwards in time
+/// unless it asks not to.
+const ORDER_ASCENDING: &str = "ASCENDING";
+/// See [`ORDER_ASCENDING`].
+const ORDER_DESCENDING: &str = "DESCENDING";
+
+/// The `LINEAR` member of the model's `InterpolationType` enum
+/// (`super::types::INTERPOLATION_TYPE_VALUES`), the one interpolation this
+/// service computes because it is the only one the model declares.
+const INTERPOLATION_LINEAR: &str = "LINEAR";
+
+/// Whether the values are reported newest first: what `orderByTime` asks for,
+/// refused by name when it is neither of the enum's two values.
+fn time_order(input: &GetPropertyValueHistoryInput) -> Result<bool, GetPropertyValueHistoryError> {
+    match input.order_by_time.as_deref() {
+        None | Some(ORDER_ASCENDING) => Ok(false),
+        Some(ORDER_DESCENDING) => Ok(true),
+        Some(other) => Err(invalid(format!(
+            "orderByTime {other} is not one of {}",
+            ORDER_BY_TIME_VALUES.join(" ")
+        ))),
+    }
+}
+
+/// The span of time the request reads, as instants in nanoseconds since the
+/// Unix epoch — `None` on a side the request left open.
+///
+/// Both bounds are INCLUSIVE: `startTime` is "the ISO8601 DateTime of the
+/// EARLIEST property value to return" and `endTime` of the LATEST, so a value
+/// written exactly at a bound is one of the values asked for. Each side may be
+/// named by the ISO 8601 member or by the `Timestamp` member it deprecated
+/// ("this field is deprecated … use startTime instead"), so the ISO 8601 member
+/// is read where a request carries both.
+struct Window {
+    start: Option<i128>,
+    end: Option<i128>,
+}
+
+impl Window {
+    /// The window the request names, or the refusal an unreadable bound earns.
+    ///
+    /// A window whose later bound precedes its earlier one holds no instant at
+    /// all, so it is refused rather than answered with an empty history: the
+    /// request asks for the values between two instants, and those two name no
+    /// span.
+    fn of(input: &GetPropertyValueHistoryInput) -> Result<Self, GetPropertyValueHistoryError> {
+        let window = Self {
+            start: bound("startTime", input.start_time.as_deref(), input.start_date_time.as_ref())?,
+            end: bound("endTime", input.end_time.as_deref(), input.end_date_time.as_ref())?,
+        };
+        if let (Some(start), Some(end)) = (window.start, window.end) {
+            if start > end {
+                return Err(invalid(
+                    "the start of the window must not be later than its end: the earliest \
+                     property value to return cannot come after the latest"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(window)
+    }
+
+    /// Whether a value written at `at` is one this window asks for.
+    fn holds(&self, at: i128) -> bool {
+        self.start.is_none_or(|start| at >= start) && self.end.is_none_or(|end| at <= end)
+    }
+}
+
+/// One side of the window: the instant the ISO 8601 member names, else the one
+/// the deprecated `Timestamp` member names, else nothing.
+fn bound(
+    member: &str,
+    time: Option<&str>,
+    timestamp: Option<&::aws_smithy_types::DateTime>,
+) -> Result<Option<i128>, GetPropertyValueHistoryError> {
+    if let Some(time) = time {
+        return crate::state::instant_of_time(time).map(Some).ok_or_else(|| {
+            invalid(format!("{member} {time} is not an ISO8601 DateTime"))
+        });
+    }
+    Ok(timestamp.map(crate::state::instant_of_timestamp))
+}
+
+/// The resampling an `interpolation` asks for: one point every `interval`
+/// nanoseconds across the whole window.
+struct Interpolation {
+    start: i128,
+    end: i128,
+    interval: i128,
+    /// How many points ONE series is resampled to: the window divided by the
+    /// interval. The budget the whole answer is held to
+    /// ([`MAX_INTERPOLATED_VALUES`]) is settled against this times the number
+    /// of series, before any of the resampling runs.
+    points: usize,
+}
+
+impl Interpolation {
+    /// The resampling the request asks for, `None` when it asks for the series
+    /// as written.
+    ///
+    /// Interpolating needs the three things the request has to supply for the
+    /// points to be defined at all: an interpolation type the model declares, a
+    /// positive interval, and both ends of the window the points are spaced
+    /// across. A request naming an interpolation without them is refused rather
+    /// than served the raw series, which is not what it asked for.
+    fn of(
+        input: &GetPropertyValueHistoryInput,
+        window: &Window,
+    ) -> Result<Option<Self>, GetPropertyValueHistoryError> {
+        let Some(parameters) = input.interpolation.as_ref() else {
+            return Ok(None);
+        };
+        match parameters.interpolation_type.as_deref() {
+            Some(INTERPOLATION_LINEAR) => {}
+            None => {
+                return Err(invalid(
+                    "interpolation.interpolationType is required: it is what says how the \
+                     points between two values are computed"
+                        .to_string(),
+                ))
+            }
+            Some(other) => {
+                return Err(invalid(format!(
+                    "interpolation.interpolationType {other} is not one of {}",
+                    INTERPOLATION_TYPE_VALUES.join(" ")
+                )))
+            }
+        }
+        let Some(interval_in_seconds) = parameters.interval_in_seconds else {
+            return Err(invalid(
+                "interpolation.intervalInSeconds is required: it is the interval the values are \
+                 interpolated over"
+                    .to_string(),
+            ));
+        };
+        if interval_in_seconds <= 0 {
+            return Err(invalid(format!(
+                "interpolation.intervalInSeconds must be positive, got {interval_in_seconds}"
+            )));
+        }
+        let (Some(start), Some(end)) = (window.start, window.end) else {
+            return Err(invalid(
+                "startTime and endTime are required to interpolate: the interpolated points are \
+                 spaced across the window they bound"
+                    .to_string(),
+            ));
+        };
+        let interval = i128::from(interval_in_seconds) * crate::state::NANOS_PER_SECOND;
+        let points = (end.saturating_sub(start) / interval).saturating_add(1);
+        if points > MAX_INTERPOLATED_VALUES as i128 {
+            return Err(invalid(format!(
+                "interpolating this window every {interval_in_seconds} seconds would take \
+                 {points} points, more than the {MAX_INTERPOLATED_VALUES} one answer carries; \
+                 narrow the window or widen the interval"
+            )));
+        }
+        Ok(Some(Self {
+            start,
+            end,
+            interval,
+            // Inside the ceiling by the check above, so it is held as the
+            // count the whole answer's budget is settled against.
+            points: usize::try_from(points).unwrap_or(MAX_INTERPOLATED_VALUES),
+        }))
+    }
+
+    /// `samples` resampled at this interpolation's points, in time order.
+    ///
+    /// A point where the series itself holds a value reports that value. A point
+    /// BETWEEN two values reports the value `LINEAR` interpolation puts there:
+    /// the two neighbours placed on the double and read at the point's share of
+    /// the distance between them, so the point carries a `doubleValue` — a value
+    /// computed between two readings is a real number, whatever width the
+    /// readings travelled in. A point with no value on one side of it, or with a
+    /// neighbour carrying no number, carries nothing: there is nothing to
+    /// interpolate from, and a value invented for it would not be a reading.
+    fn resample(&self, samples: &[Sample]) -> Vec<Sample> {
+        let mut resampled = Vec::new();
+        let mut at = self.start;
+        while at <= self.end {
+            if let Some(value) = self.value_at(samples, at) {
+                if let Some(time) = crate::state::time_of_instant(at) {
+                    resampled.push(Sample { at, value, time });
+                }
+            }
+            at = at.saturating_add(self.interval);
+        }
+        resampled
+    }
+
+    /// The value the series reads as at `at`: the value written for that
+    /// instant, else the one linear interpolation puts between its neighbours.
+    fn value_at(&self, samples: &[Sample], at: i128) -> Option<DataValue> {
+        let next = samples.partition_point(|sample| sample.at <= at);
+        let before = next.checked_sub(1).and_then(|index| samples.get(index));
+        if let Some(before) = before {
+            if before.at == at {
+                return Some(before.value.clone());
+            }
+        }
+        let before = before?;
+        let after = samples.get(next)?;
+        let (from, to) = (
+            crate::state::data_value_as_double(&before.value)?,
+            crate::state::data_value_as_double(&after.value)?,
+        );
+        let span = (after.at - before.at) as f64;
+        let share = (at - before.at) as f64 / span;
+        Some(DataValue {
+            double_value: Some(from + (to - from) * share),
+            ..DataValue::default()
+        })
+    }
+}
+
+/// One component a request reads properties out of: where its stored properties
+/// live, and how a reported `EntityPropertyReference` names it.
+///
+/// A top-level component and a composite one are read the same way — the
+/// difference is only that a composite one is addressed by a `componentPath`,
+/// which the reference carries back.
+struct Scoped<'a> {
+    entity_id: &'a str,
+    component_name: &'a str,
+    /// The `componentPath` this component is addressed by, for a COMPOSITE
+    /// component; absent for a top-level one, which is addressed by name.
+    component_path: Option<&'a str>,
+    component_type_id: Option<&'a str>,
+    properties: &'a ::std::collections::BTreeMap<String, crate::state::PropertyRecord>,
+}
+
+/// One value of one series, owned: the instant it was written for, the value,
+/// and the instant as the writer spelled it.
+struct Sample {
+    at: i128,
+    value: DataValue,
+    time: String,
+}
+
+/// One reported history: the property of one component, and its values.
+struct Series {
+    reference: EntityPropertyReference,
+    values: Vec<Sample>,
+}
+
+/// One stored top-level component as a component the request reads.
+fn scoped<'a>(entity_id: &'a str, component: &'a crate::state::ComponentRecord) -> Scoped<'a> {
+    Scoped {
+        entity_id,
+        component_name: &component.component_name,
+        component_path: None,
+        component_type_id: component.component_type_id.as_deref(),
+        properties: &component.properties,
+    }
+}
+
+/// One stored composite component as a component the request reads. It carries
+/// the whole `ComponentPath` it was created under, which is what a reported
+/// reference to one of its properties names it by.
+fn scoped_composite<'a>(
+    entity_id: &'a str,
+    composite: &'a crate::state::CompositeComponentRecord,
+) -> Scoped<'a> {
+    Scoped {
+        entity_id,
+        component_name: &composite.component_name,
+        component_path: Some(&composite.component_path),
+        component_type_id: Some(&composite.component_type_id),
+        properties: &composite.properties,
+    }
+}
+
+/// The components the request addresses, resolved against stored state.
+///
+/// `entityId` addresses ONE component of one entity — "for entity-specific
+/// queries, specify values for componentName and entityId" — and
+/// `componentTypeId` every INSTANCE of that component type in the workspace (a
+/// component whose type is it, or extends it, at any depth), which is what a
+/// cross-entity query reads.
+fn scope<'a>(
+    workspace: &'a crate::state::Workspace,
+    input: &'a GetPropertyValueHistoryInput,
+) -> Result<Vec<Scoped<'a>>, GetPropertyValueHistoryError> {
+    if let Some(entity_id) = input.entity_id.as_deref() {
+        let Some(entity) = workspace.entities.get(entity_id) else {
+            return Err(not_found(crate::state::entity_not_found_message(
+                &input.workspace_id,
+                entity_id,
+            )));
+        };
+        return match (
+            input.component_path.as_deref(),
+            input.component_name.as_deref(),
+        ) {
+            (Some(component_path), _) => at_path(entity, component_path)
+                .map(|component| vec![component])
+                .ok_or_else(|| {
+                    not_found(format!(
+                        "entity {entity_id} of workspace {} has no component at componentPath \
+                         {component_path}",
+                        input.workspace_id
+                    ))
+                }),
+            (None, Some(component_name)) => entity
+                .components
+                .get(component_name)
+                .map(|component| vec![scoped(&entity.entity_id, component)])
+                .ok_or_else(|| {
+                    not_found(format!(
+                        "entity {entity_id} of workspace {} has no component {component_name}",
+                        input.workspace_id
+                    ))
+                }),
+            // A property belongs to a component, so an entity alone does not
+            // address one.
+            (None, None) => Err(invalid(format!(
+                "componentName or componentPath is required to read the property history of \
+                 entity {entity_id}"
+            ))),
+        };
+    }
+
+    let Some(component_type_id) = input.component_type_id.as_deref() else {
+        return Err(invalid(
+            "entityId or componentTypeId is required: one of them is what addresses the \
+             properties to read"
+                .to_string(),
+        ));
+    };
+    if !workspace.component_types.contains_key(component_type_id) {
+        return Err(not_found(crate::state::component_type_not_found_message(
+            &input.workspace_id,
+            component_type_id,
+        )));
+    }
+
+    // The component types an instance of the named one may name, resolved ONCE
+    // per request rather than per component tested against it. In (entityId,
+    // componentName) order, the order the store is keyed in, so two reads of
+    // unchanged state build the same answer and a page boundary does not depend
+    // on map iteration order.
+    let instance_type_ids = workspace.component_type_instance_ids(component_type_id);
+    let mut components = Vec::new();
+    for entity in workspace.entities.values() {
+        for component in entity.components.values() {
+            if component
+                .component_type_id
+                .as_deref()
+                .is_some_and(|instantiated| instance_type_ids.contains(instantiated))
+            {
+                components.push(scoped(&entity.entity_id, component));
+            }
+            for composite in component.composite_components.values() {
+                if instance_type_ids.contains(composite.component_type_id.as_str()) {
+                    components.push(scoped_composite(&entity.entity_id, composite));
+                }
+            }
+            if components.len() > MAX_COMPONENTS_IN_SCOPE {
+                return Err(invalid(format!(
+                    "componentType {component_type_id} has more instances in workspace {} than \
+                     the {MAX_COMPONENTS_IN_SCOPE} one request reads; name an entityId or a \
+                     narrower componentTypeId",
+                    input.workspace_id
+                )));
+            }
+        }
+    }
+    Ok(components)
+}
+
+/// The component of `entity` a `componentPath` addresses: "the path to the
+/// composite component, STARTING FROM the top-level component", so a path of
+/// one segment names that top-level component and a longer one the composite
+/// component stored under the rest of the path inside it.
+fn at_path<'a>(entity: &'a crate::state::Entity, component_path: &str) -> Option<Scoped<'a>> {
+    match component_path.split_once(crate::state::COMPONENT_PATH_SEPARATOR) {
+        None => Some(scoped(
+            &entity.entity_id,
+            entity.components.get(component_path)?,
+        )),
+        Some((component_name, composite_path)) => {
+            let component = entity.components.get(component_name)?;
+            Some(scoped_composite(
+                &entity.entity_id,
+                component.composite_components.get(composite_path)?,
+            ))
+        }
+    }
+}
+
+/// The properties the request selected, de-duplicated and in name order, each
+/// one checked to be a TIME SERIES property of what the request addressed.
+///
+/// A selected property is one of the addressed scope's when a definition for it
+/// is reachable — the component's own, one it inherits from the component type
+/// it instantiates, or one the named component type's own chain declares — or
+/// when a value has been written to it. Of those, this operation reads the ones
+/// whose definition says the property "consists of time series data": a
+/// property that is not one has no history to retrieve, so naming it is
+/// refused rather than answered with an empty series.
+///
+/// Sorted and de-duplicated because the selection is what the answer is ordered
+/// and paged by: one series per property, in a stable order, so a `nextToken`
+/// resumes at the same place whatever order the properties were asked in.
+fn selected_properties(
+    workspace: &crate::state::Workspace,
+    components: &[Scoped<'_>],
+    input: &GetPropertyValueHistoryInput,
+) -> Result<Vec<String>, GetPropertyValueHistoryError> {
+    let mut selected = input.selected_properties.clone();
+    selected.sort();
+    selected.dedup();
+    for property_name in &selected {
+        let definition = definition_in_scope(workspace, components, input, property_name);
+        if definition.is_none()
+            && !components
+                .iter()
+                .any(|component| component.properties.contains_key(property_name))
+        {
+            return Err(invalid(format!(
+                "selectedProperties {property_name} is not a property of what this request \
+                 addresses"
+            )));
+        }
+        if !crate::state::property_is_time_series(definition) {
+            return Err(invalid(format!(
+                "selectedProperties {property_name} is not a time series property, so it has no \
+                 value history"
+            )));
+        }
+    }
+    Ok(selected)
+}
+
+/// The definition that gives one property its meaning inside the request's
+/// scope: the one the named component TYPE's own chain declares for a
+/// cross-entity query, else the effective definition of the first addressed
+/// component that has one.
+fn definition_in_scope<'a>(
+    workspace: &'a crate::state::Workspace,
+    components: &[Scoped<'a>],
+    input: &GetPropertyValueHistoryInput,
+    property_name: &str,
+) -> Option<&'a crate::ops::types::PropertyDefinitionRequest> {
+    if let Some(component_type_id) = input.component_type_id.as_deref() {
+        if let Some(definition) = workspace
+            .component_type_chain(component_type_id)
+            .into_iter()
+            .find_map(|component_type| component_type.property_definitions.get(property_name))
+        {
+            return Some(definition);
+        }
+    }
+    components.iter().find_map(|component| {
+        workspace.effective_property_definition(
+            component.component_type_id,
+            component.properties,
+            property_name,
+        )
+    })
+}
+
+/// One `propertyFilters` entry, validated and owned.
+struct ValueFilter {
+    property_name: String,
+    operator: String,
+    value: DataValue,
+}
+
+/// The `propertyFilters` of the request, validated and owned.
+///
+/// A filter "filters the property value history request": it carries the
+/// property it selects on, a value to compare against and an operator this
+/// service recognises, and names a property of the addressed scope — the same
+/// rule the selection is held to, so a mistyped filter is refused rather than
+/// answered with an empty history.
+fn value_filters(
+    workspace: &crate::state::Workspace,
+    components: &[Scoped<'_>],
+    input: &GetPropertyValueHistoryInput,
+) -> Result<Vec<ValueFilter>, GetPropertyValueHistoryError> {
+    let requested = input.property_filters.as_deref().unwrap_or_default();
+    if requested.len() > MAX_FILTERS {
+        return Err(invalid(format!(
+            "propertyFilters carries {} filters, more than the {MAX_FILTERS} one request may \
+             apply",
+            requested.len()
+        )));
+    }
+    let mut filters = Vec::with_capacity(requested.len());
+    for filter in requested {
+        let Some(property_name) = filter.property_name.as_deref() else {
+            return Err(invalid(
+                "propertyFilters propertyName is required: a filter selects values by one \
+                 property's value"
+                    .to_string(),
+            ));
+        };
+        let Some(value) = filter.value.as_ref() else {
+            return Err(invalid(format!(
+                "propertyFilters filter on {property_name} carries no value to compare against"
+            )));
+        };
+        let operator = filter
+            .operator
+            .as_deref()
+            .unwrap_or(crate::state::COMPARISON_OPERATOR_EQUALS);
+        if !crate::state::COMPARISON_OPERATORS.contains(&operator) {
+            return Err(invalid(format!(
+                "propertyFilters operator {operator} is not one of {}",
+                crate::state::COMPARISON_OPERATORS.join(" ")
+            )));
+        }
+        if definition_in_scope(workspace, components, input, property_name).is_none()
+            && !components
+                .iter()
+                .any(|component| component.properties.contains_key(property_name))
+        {
+            return Err(invalid(format!(
+                "propertyFilters {property_name} is not a property of what this request addresses"
+            )));
+        }
+        filters.push(ValueFilter {
+            property_name: property_name.to_string(),
+            operator: operator.to_string(),
+            value: value.clone(),
+        });
+    }
+    Ok(filters)
+}
+
+/// The series the request asks for, read out of the store and OWNED: one per
+/// selected property per addressed component, carrying the values inside the
+/// window that every filter on that property selects.
+///
+/// In (property, entityId, componentName) order — the selection sorted, the
+/// store's own key order inside it — so two reads of unchanged state report the
+/// same series in the same order and a page boundary means the same thing on
+/// the next call. A property a component has written no value to contributes no
+/// series: there is no history of it to report for that component.
+fn read_series(
+    components: &[Scoped<'_>],
+    selected: &[String],
+    filters: &[ValueFilter],
+    window: &Window,
+) -> Result<Vec<Series>, GetPropertyValueHistoryError> {
+    let mut read = 0usize;
+    let mut series = Vec::new();
+    for property_name in selected {
+        for component in components {
+            let Some(property) = component.properties.get(property_name) else {
+                continue;
+            };
+            let mut values = Vec::new();
+            for (at, value) in &property.time_series {
+                if !window.holds(*at) {
+                    continue;
+                }
+                read = read.saturating_add(1);
+                if read > MAX_VALUES_READ {
+                    return Err(invalid(format!(
+                        "this request reads more than the {MAX_VALUES_READ} values one request \
+                         reports; narrow the window, the selection or the scope"
+                    )));
+                }
+                if !selects(filters, property_name, &value.value) {
+                    continue;
+                }
+                values.push(Sample {
+                    at: *at,
+                    value: value.value.clone(),
+                    time: value.time.clone(),
+                });
+            }
+            if values.is_empty() {
+                continue;
+            }
+            series.push(Series {
+                reference: EntityPropertyReference {
+                    component_name: Some(component.component_name.to_string()),
+                    component_path: component.component_path.map(str::to_string),
+                    // No external id: the reference names the entity and
+                    // component this service stores the property in, not a
+                    // primary key of some external system.
+                    external_id_property: None,
+                    entity_id: Some(component.entity_id.to_string()),
+                    property_name: property_name.clone(),
+                },
+                values,
+            });
+        }
+    }
+    Ok(series)
+}
+
+/// Whether every filter on `property_name` selects `value`.
+///
+/// A value of another kind than the one compared against, or of a kind with no
+/// order, satisfies no filter: the filter asks for values that compare, and
+/// that one does not compare.
+fn selects(filters: &[ValueFilter], property_name: &str, value: &DataValue) -> bool {
+    filters
+        .iter()
+        .filter(|filter| filter.property_name == property_name)
+        .all(|filter| {
+            crate::state::compare_data_values(value, &filter.value)
+                .is_some_and(|ordering| crate::state::comparison_satisfies(&filter.operator, ordering))
+        })
+}
+
+/// The answer: a page of the values, grouped into the series they belong to.
+///
+/// `maxResults` is "the maximum number of results to return at one time" and a
+/// result here is one VALUE, so the page is taken over the values of every
+/// series in order and a series the page covers only part of comes back with
+/// that part. A value has no key of its own — which values there are is what
+/// this request's own window and filters say — so the token resumes at the
+/// value's ORDINAL in that sequence, bound to the query that produced it so a
+/// token from another one is refused rather than resumed.
+fn page(
+    series: Vec<Series>,
+    page_size: usize,
+    input: &GetPropertyValueHistoryInput,
+) -> Result<GetPropertyValueHistoryOutput, GetPropertyValueHistoryError> {
+    let resume_at = match input.next_token.as_deref() {
+        None | Some("") => 0,
+        Some(token) => decode_token(input, token)
+            .ok_or_else(|| invalid(format!("nextToken {token} is not a valid token")))?,
+    };
+    let total: usize = series.iter().map(|one| one.values.len()).sum();
+
+    let mut skipped = 0usize;
+    let mut taken = 0usize;
+    let mut property_values = Vec::new();
+    for one in series {
+        if taken >= page_size {
+            break;
+        }
+        let Series { reference, values } = one;
+        let remaining = resume_at.saturating_sub(skipped);
+        skipped = skipped.saturating_add(values.len().min(remaining));
+        let page: Vec<PropertyValue> = values
+            .into_iter()
+            .skip(remaining)
+            .take(page_size.saturating_sub(taken))
+            .map(|sample| PropertyValue {
+                // The deprecated member is not reported: `time` is what
+                // replaced it ("use time instead"), and it carries the same
+                // instant.
+                timestamp: None,
+                value: sample.value,
+                time: Some(sample.time),
+            })
+            .collect();
+        if page.is_empty() {
+            continue;
+        }
+        taken = taken.saturating_add(page.len());
+        property_values.push(PropertyValueHistory {
+            entity_property_reference: reference,
+            values: Some(page),
+        });
+    }
+    let served = resume_at.saturating_add(taken);
+    let next_token = (served < total).then(|| encode_token(input, served));
+
+    Ok(GetPropertyValueHistoryOutput {
+        property_values,
+        next_token,
+    })
+}
+
+/// The envelope the `nextToken` of a history page carries, so a token minted
+/// elsewhere — for another query, or by hand — is recognisably not one of ours.
+const HISTORY_TOKEN_PREFIX: &str = "iottwinmaker:property-history:1:";
+
+/// What a `nextToken` is bound to besides its workspace: the members that
+/// decide WHICH values of which components the page is of, so a token is only
+/// resumed by the query that minted it.
+///
+/// Last of the token's scope parts, which is the one that may itself contain the
+/// separator ([`crate::state::encode_page_token`]), because the selected
+/// property names are free text. The selection is taken sorted and
+/// de-duplicated, the way the answer is ordered.
+fn token_scope(input: &GetPropertyValueHistoryInput) -> String {
+    let mut selected = input.selected_properties.clone();
+    selected.sort();
+    selected.dedup();
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        input.entity_id.as_deref().unwrap_or(""),
+        input.component_name.as_deref().unwrap_or(""),
+        input.component_path.as_deref().unwrap_or(""),
+        input.component_type_id.as_deref().unwrap_or(""),
+        input.order_by_time.as_deref().unwrap_or(ORDER_ASCENDING),
+        bound_key(input.start_time.as_deref(), input.start_date_time.as_ref()),
+        bound_key(input.end_time.as_deref(), input.end_date_time.as_ref()),
+        selected.join(","),
+    )
+}
+
+/// One window bound as the token's scope carries it: the instant it names, or
+/// nothing for a side the request left open.
+fn bound_key(time: Option<&str>, timestamp: Option<&::aws_smithy_types::DateTime>) -> String {
+    match bound("", time, timestamp) {
+        Ok(Some(at)) => at.to_string(),
+        // An unreadable bound never reaches a token: the request carrying it was
+        // refused before the answer was built.
+        Ok(None) | Err(_) => String::new(),
+    }
+}
+
+/// The opaque `nextToken` for a page that resumes at the value `ordinal`.
+fn encode_token(input: &GetPropertyValueHistoryInput, ordinal: usize) -> String {
+    crate::state::encode_page_token(
+        HISTORY_TOKEN_PREFIX,
+        &[&input.workspace_id, &token_scope(input)],
+        &ordinal.to_string(),
+    )
+}
+
+/// The value ordinal inside a `nextToken`, or `None` when the token is not one
+/// this query minted.
+fn decode_token(input: &GetPropertyValueHistoryInput, token: &str) -> Option<usize> {
+    crate::state::decode_page_token(
+        HISTORY_TOKEN_PREFIX,
+        &[&input.workspace_id, &token_scope(input)],
+        token,
+    )?
+    .parse()
+    .ok()
 }
