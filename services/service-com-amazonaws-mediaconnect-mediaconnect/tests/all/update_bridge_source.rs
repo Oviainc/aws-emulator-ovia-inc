@@ -18,6 +18,10 @@
 //! a stored value or not, and WHICH source of the bridge is addressed (the only one, the
 //! first, the middle, the last of three).
 //!
+//! Every value a row writes is one the store can resolve — a network the placement gateway
+//! declares, a flow the account holds — because a reference that resolves to nothing is
+//! refused; `bridge_update_references` is the suite that owns THAT rule.
+//!
 //! The harness is the one `flow_lifecycle` owns (one router, one shared engine), so every
 //! case here drives the same request path a MediaConnect client reaches.
 
@@ -28,8 +32,34 @@ use serde_json::{json, Value};
 use service_com_amazonaws_mediaconnect_mediaconnect::ops::types::PROTOCOL_VALUES;
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::{create_bridge, describe_bridge, minted_flow_arn, minted_gateway_arn};
+use crate::bridge_lifecycle::{cloud_flow, create_bridge, describe_bridge, gateway_with_networks};
 use crate::flow_lifecycle::{Emulator, REGION};
+
+/// The networks the fixture gateway declares, which are the only names a network source of
+/// a bridge placed on it may carry (`GatewayNetwork$Name`).
+const DECLARED_NETWORKS: [&str; 3] = ["net-1", "net-2", "net-3"];
+
+/// What every case below addresses: one gateway declaring [`DECLARED_NETWORKS`], and two
+/// cloud flows a flow source can be pointed at.
+struct Fixture {
+    placement_arn: String,
+    flow_a: String,
+    flow_b: String,
+}
+
+/// Create the gateway the bridges are placed on and the flows their flow sources name, so
+/// every reference the rows carry is one the store resolves.
+async fn fixture(emulator: &Emulator, suite: &str) -> Fixture {
+    let placement_arn =
+        gateway_with_networks(emulator, &format!("gw-{suite}"), &DECLARED_NETWORKS).await;
+    let flow_a = cloud_flow(emulator, &format!("{suite}-flow-a")).await;
+    let flow_b = cloud_flow(emulator, &format!("{suite}-flow-b")).await;
+    Fixture {
+        placement_arn,
+        flow_a,
+        flow_b,
+    }
+}
 
 async fn update_source(
     emulator: &Emulator,
@@ -62,14 +92,20 @@ fn flow_source(name: &str, flow_arn: &str) -> Value {
     json!({ "flowSource": { "flowArn": flow_arn, "name": name }})
 }
 
-/// Create one ingress bridge carrying `sources` and answer its ARN. The create is the
-/// subject of `bridge_lifecycle`; here it is only the fixture every update addresses.
-async fn bridge_with(emulator: &Emulator, name: &str, sources: Vec<Value>) -> (String, Value) {
+/// Create one ingress bridge carrying `sources`, placed on `placement_arn`, and answer its
+/// ARN. The create is the subject of `bridge_lifecycle`; here it is only the fixture every
+/// update addresses.
+async fn bridge_with(
+    emulator: &Emulator,
+    name: &str,
+    placement_arn: &str,
+    sources: Vec<Value>,
+) -> (String, Value) {
     let (status, code, created) = create_bridge(
         emulator,
         json!({
             "name": name,
-            "placementArn": minted_gateway_arn(1, "gw-update-source"),
+            "placementArn": placement_arn,
             "ingressGatewayBridge": { "maxBitrate": 20_000_000, "maxOutputs": 8 },
             "sources": sources,
         }),
@@ -98,9 +134,7 @@ struct UpdateCase {
     expected: Value,
 }
 
-fn update_cases() -> Vec<UpdateCase> {
-    let flow_a = minted_flow_arn(2, "flow-a");
-    let flow_b = minted_flow_arn(3, "flow-b");
+fn update_cases(flow_a: &str, flow_b: &str) -> Vec<UpdateCase> {
     let attachment = json!({ "vpcInterfaceName": "vpc-1" });
     let multicast_settings = json!({ "multicastSourceIp": "10.9.8.7" });
 
@@ -124,7 +158,7 @@ fn update_cases() -> Vec<UpdateCase> {
     vec![
         UpdateCase {
             case: "flow source, FlowArn alone: the only source of the bridge",
-            sources: vec![flow_source("flow-src", &flow_a)],
+            sources: vec![flow_source("flow-src", flow_a)],
             source_name: "flow-src",
             update: json!({ "flowSource": { "flowArn": flow_b } }),
             expected: json!({ "flowSource": { "flowArn": flow_b, "name": "flow-src" } }),
@@ -132,7 +166,7 @@ fn update_cases() -> Vec<UpdateCase> {
         UpdateCase {
             case: "flow source, FlowVpcInterfaceAttachment alone, none stored: the \
                    attachment is written and FlowArn keeps its stored value",
-            sources: vec![flow_source("flow-src", &flow_a)],
+            sources: vec![flow_source("flow-src", flow_a)],
             source_name: "flow-src",
             update: json!({ "flowSource": { "flowVpcInterfaceAttachment": attachment } }),
             expected: json!({ "flowSource": {
@@ -274,7 +308,7 @@ fn update_cases() -> Vec<UpdateCase> {
             case: "the FIRST of three sources: the other two are left alone",
             sources: vec![
                 network_source("first", 5100, "rtp"),
-                flow_source("middle", &flow_a),
+                flow_source("middle", flow_a),
                 network_source("last", 5102, "udp"),
             ],
             source_name: "first",
@@ -291,7 +325,7 @@ fn update_cases() -> Vec<UpdateCase> {
             case: "the MIDDLE of three sources, which is a flow source among network ones",
             sources: vec![
                 network_source("first", 5100, "rtp"),
-                flow_source("middle", &flow_a),
+                flow_source("middle", flow_a),
                 network_source("last", 5102, "udp"),
             ],
             source_name: "middle",
@@ -302,7 +336,7 @@ fn update_cases() -> Vec<UpdateCase> {
             case: "the LAST of three sources",
             sources: vec![
                 network_source("first", 5100, "rtp"),
-                flow_source("middle", &flow_a),
+                flow_source("middle", flow_a),
                 network_source("last", 5102, "udp"),
             ],
             source_name: "last",
@@ -324,8 +358,13 @@ fn update_cases() -> Vec<UpdateCase> {
 #[tokio::test]
 async fn update_bridge_source_applies_the_settings_it_carries_and_keeps_the_rest() {
     let emulator = Emulator::new();
+    let Fixture {
+        placement_arn,
+        flow_a,
+        flow_b,
+    } = fixture(&emulator, "update-source").await;
 
-    for (index, case) in update_cases().into_iter().enumerate() {
+    for (index, case) in update_cases(&flow_a, &flow_b).into_iter().enumerate() {
         let UpdateCase {
             case,
             sources,
@@ -333,8 +372,13 @@ async fn update_bridge_source_applies_the_settings_it_carries_and_keeps_the_rest
             update,
             expected,
         } = case;
-        let (bridge_arn, created) =
-            bridge_with(&emulator, &format!("bridge-update-source-{index}"), sources).await;
+        let (bridge_arn, created) = bridge_with(
+            &emulator,
+            &format!("bridge-update-source-{index}"),
+            &placement_arn,
+            sources,
+        )
+        .await;
         let created_sources = created["bridge"]["sources"]
             .as_array()
             .cloned()
@@ -419,9 +463,12 @@ fn source_name_of(source: &Value) -> String {
 #[tokio::test]
 async fn every_modelled_protocol_can_be_written_onto_a_bridge_network_source() {
     let emulator = Emulator::new();
+    let placement_arn =
+        gateway_with_networks(&emulator, "gw-source-protocols", &DECLARED_NETWORKS).await;
     let (bridge_arn, _) = bridge_with(
         &emulator,
         "bridge-source-protocols",
+        &placement_arn,
         vec![network_source("net-src", 5000, "rtp")],
     )
     .await;
@@ -475,9 +522,12 @@ async fn every_modelled_protocol_can_be_written_onto_a_bridge_network_source() {
 #[tokio::test]
 async fn repeating_one_update_bridge_source_request_leaves_the_same_source() {
     let emulator = Emulator::new();
+    let placement_arn =
+        gateway_with_networks(&emulator, "gw-source-idempotent", &DECLARED_NETWORKS).await;
     let (bridge_arn, _) = bridge_with(
         &emulator,
         "bridge-source-idempotent",
+        &placement_arn,
         vec![network_source("net-src", 5000, "rtp")],
     )
     .await;
@@ -516,10 +566,15 @@ async fn repeating_one_update_bridge_source_request_leaves_the_same_source() {
 async fn an_update_bridge_source_request_the_source_cannot_satisfy_is_refused_and_writes_nothing()
 {
     let emulator = Emulator::new();
-    let flow_arn = minted_flow_arn(4, "flow-refusals");
+    let Fixture {
+        placement_arn,
+        flow_a: flow_arn,
+        ..
+    } = fixture(&emulator, "source-refusals").await;
     let (bridge_arn, created) = bridge_with(
         &emulator,
         "bridge-source-refusals",
+        &placement_arn,
         vec![
             flow_source("flow-src", &flow_arn),
             network_source("net-src", 5000, "rtp"),

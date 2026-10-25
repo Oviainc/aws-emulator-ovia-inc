@@ -4,7 +4,11 @@
 //! Implemented: reports the settings of the configuration set the request names — a
 //! stored configuration template, or the configuration deployed to a stored
 //! environment, together with that environment's DRAFT configuration when it carries
-//! one — from the store. This is the ONLY file to touch for this operation.
+//! one — from the store, RESOLVED against the option catalog the platform version
+//! that set is for publishes: the set a read reports carries every option that
+//! platform defines a default for, at that default, with the settings the
+//! configuration itself holds over them. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,9 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // This operation reports what the store holds; nothing here is derived
-        // from the request's region.
-        let _ = ctx;
+        // The region the platform version a configuration set is for is named
+        // in: the settings are RESOLVED against that version's option catalog,
+        // whose ARNs are regional.
+        let region = crate::state::request_region(ctx);
 
         // "You must specify either this parameter or an EnvironmentName, but not
         // both. If you specify both, Elastic Beanstalk returns an
@@ -216,6 +221,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 vec![crate::state::configuration_settings_description!(
                     CreateConfigurationTemplateOutput,
+                    store,
+                    &region,
                     template
                 )]
             }
@@ -238,6 +245,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                     );
                 };
+                // "OptionSettings: a list of the configuration options and
+                // their values in this configuration set." The set in force is
+                // the RESOLVED one — the platform version's published option
+                // catalog at its defaults with the settings deployed to this
+                // environment over them — so an option nobody set is reported
+                // at the default it is running at rather than left out.
+                let deployed_settings = store.resolved_configuration_settings(
+                    &region,
+                    environment.solution_stack_name.as_deref(),
+                    environment.platform_arn.as_deref(),
+                    &environment.option_settings,
+                );
+                // The draft belongs to the platform version the update that
+                // created it deploys, so it resolves against THAT version's
+                // catalog rather than the running environment's.
                 // "When describing the settings for the configuration set
                 // associated with a running environment, it is possible to
                 // receive two sets of setting descriptions. One is the deployed
@@ -269,10 +291,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     deployment_status: Some(crate::state::DEPLOYMENT_STATUS_DEPLOYED.to_string()),
                     date_created: Some(environment.date_created),
                     date_updated: Some(environment.date_updated),
-                    option_settings: Some(environment.option_settings.clone()),
+                    option_settings: Some(deployed_settings),
                 };
-                let draft = environment.draft_configuration.as_ref().map(|draft| {
-                    CreateConfigurationTemplateOutput {
+                let draft = environment
+                    .draft_configuration
+                    .as_ref()
+                    .map(|draft| CreateConfigurationTemplateOutput {
                         // The platform version the DRAFT belongs to, which is
                         // the one the update that created it deploys.
                         solution_stack_name: draft.solution_stack_name.clone(),
@@ -294,9 +318,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // environment's instants.
                         date_created: Some(draft.date_created),
                         date_updated: Some(draft.date_updated),
-                        option_settings: Some(draft.option_settings.clone()),
-                    }
-                });
+                        option_settings: Some(store.resolved_configuration_settings(
+                            &region,
+                            draft.solution_stack_name.as_deref(),
+                            draft.platform_arn.as_deref(),
+                            &draft.option_settings,
+                        )),
+                    });
                 [Some(deployed), draft].into_iter().flatten().collect()
             }
         };

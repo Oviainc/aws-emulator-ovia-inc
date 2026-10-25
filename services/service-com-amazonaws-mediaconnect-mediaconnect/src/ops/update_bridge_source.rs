@@ -28,6 +28,14 @@
 //! partial update of nothing: it is accepted and the stored source is answered unchanged,
 //! the same way UpdateBridge answers a request that carries no setting.
 //!
+//! A source REFERENCES resources outside itself, and the request's value for such a member
+//! is resolved against the store before it is written: `BridgeFlowSource$FlowArn` is "the
+//! ARN of the cloud flow used as a source of this bridge", and
+//! `BridgeNetworkSource$NetworkName` is "the network source's gateway network name" — one
+//! of the networks declared on the gateway the bridge is placed on (`Bridge$PlacementArn`).
+//! A reference that resolves to nothing is `BadRequestException` (HTTP 400) too, in the
+//! same envelope as every other refusal about a request's content, and nothing is written.
+//!
 //! The model gives this operation no state member and documents no state change for it, so
 //! it leaves the bridge's state alone: it only settles a transition the clock had already
 //! made due, exactly as DescribeBridge, AddBridgeSources and UpdateBridge do.
@@ -247,8 +255,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due_transitions(now);
 
         // This operation updates a source of "an existing bridge", addressed by the
-        // bridge's own ARN.
-        let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
+        // bridge's own ARN. The bridge is resolved READ-ONLY first, so the references the
+        // request carries can be resolved against the rest of the store (the placement
+        // gateway's networks, the account's flows) before anything is written.
+        let Some(bridge) = store.bridges.get(&input.bridge_arn) else {
             return Err(not_found(&input.bridge_arn));
         };
         // The source updated is the one of THIS bridge's sources the bridge addresses by
@@ -258,19 +268,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(position) = bridge.source_position(&input.source_name) else {
             return Err(not_found(&input.source_name));
         };
+        let Some(stored) = bridge.sources.get(position).cloned() else {
+            return Err(not_found(&input.source_name));
+        };
+        // The gateway this bridge is placed on (`Bridge$PlacementArn`): the one gateway
+        // whose declared networks a network source of this bridge may ingest on.
+        let placement_arn = bridge.placement_arn.clone();
 
         // What the source becomes once this request is applied: the request's value for
         // every member it carries, the stored value for every member it does not. The
         // merged source is computed in full before anything is written, and a wrapper the
-        // addressed source has no counterpart for is refused rather than silently ignored,
-        // so a refused update leaves the bridge exactly as it was.
-        let stored = &bridge.sources[position];
+        // addressed source has no counterpart for — or a reference that resolves to no
+        // resource — is refused rather than silently ignored, so a refused update leaves
+        // the bridge exactly as it was.
         let updated = if let Some(update) = input.flow_source.as_ref() {
             let Some(stored_flow) = stored.flow_source.as_ref() else {
                 return Err(refused_by_source(
                     "FlowSource cannot be updated on a network source of a bridge.",
                 ));
             };
+            // "The ARN of the cloud flow used as a source of this bridge"
+            // (`BridgeFlowSource$FlowArn`): a flow source originates "in MediaConnect as an
+            // existing cloud flow", so the ARN is RESOLVED against the account's flows
+            // through the one function every operation of this service resolves a flow
+            // reference through.
+            if let Some(flow_arn) = update.flow_arn.as_deref() {
+                if let Some(rejection) = store.unknown_flow_rejection("FlowSource FlowArn", flow_arn)
+                {
+                    return Err(bad_request(rejection));
+                }
+            }
             BridgeSource {
                 flow_source: Some(BridgeFlowSource {
                     flow_arn: update
@@ -297,6 +324,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "NetworkSource cannot be updated on a flow source of a bridge.",
                 ));
             };
+            // "The network source's gateway network name"
+            // (`BridgeNetworkSource$NetworkName`): a network source ingests on one of the
+            // networks the gateway this bridge is placed on declares, so the name is
+            // resolved against that gateway's own networks.
+            if let Some(network_name) = update.network_name.as_deref() {
+                if let Some(rejection) = store.unknown_gateway_network_rejection(
+                    "NetworkSource NetworkName",
+                    &placement_arn,
+                    network_name,
+                ) {
+                    return Err(bad_request(rejection));
+                }
+            }
             BridgeSource {
                 flow_source: None,
                 network_source: Some(BridgeNetworkSource {
@@ -325,9 +365,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             // A request that carries neither wrapper updates no setting, so the stored
             // source stays as it is and is answered unchanged.
-            stored.clone()
+            stored
         };
-        bridge.sources[position] = updated;
+
+        // Nothing is written until every reference the request carries has resolved, so the
+        // bridge is reached mutably only here. The position was resolved on this same
+        // bridge under this same lock, so it still addresses the source the request named —
+        // and it is resolved again rather than indexed, so no arithmetic about the store's
+        // shape can reach a panic.
+        let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
+            return Err(not_found(&input.bridge_arn));
+        };
+        let Some(slot) = bridge.sources.get_mut(position) else {
+            return Err(not_found(&input.source_name));
+        };
+        *slot = updated;
+        let written = slot.clone();
 
         // "The ARN of the updated bridge source" and "the updated bridge source" — both read
         // back out of the STORED bridge rather than echoed from the request, so the answer
@@ -336,7 +389,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for an updated source.
         Ok(UpdateBridgeSourceOutput {
             bridge_arn: Some(bridge.bridge_arn.clone()),
-            source: Some(bridge.sources[position].clone()),
+            source: Some(written),
         })
     }
 }

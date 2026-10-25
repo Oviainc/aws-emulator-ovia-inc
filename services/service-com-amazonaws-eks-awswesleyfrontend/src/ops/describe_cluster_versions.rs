@@ -30,11 +30,13 @@
 //!   member in the `ClusterVersionStatus` spelling (`standard-support`), while the
 //!   reported `ClusterVersionInformation$status` carries the `VersionStatus`
 //!   spelling its replacement does (see `crate::state`).
-//! * `includeAll` — "Include all available versions in the response". It only ever
-//!   WIDENS a listing, and this calendar already publishes every version it knows
-//!   (narrowed only by whether the clock has reached a row's release date), so no
-//!   value of it can change the answer today. It is accepted and ignored, exactly
-//!   as `ListClusters` accepts and ignores `include`.
+//! * `includeAll` — "Include all available versions in the response". It WIDENS the
+//!   listing to the versions Amazon EKS no longer offers: an unfiltered call
+//!   publishes only the versions still inside standard or extended support, because
+//!   that is the set a caller picks a `CreateCluster` version from, so a row whose
+//!   extended support has ended is reported only to a caller that asked for it —
+//!   with `includeAll`, or with a `status`/`versionStatus` filter naming the
+//!   unsupported state.
 //! * `maxResults` / `nextToken` — pagination over the filtered rows.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
@@ -190,6 +192,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A version whose extended support has ENDED is no longer one Amazon EKS
+        // offers, so it belongs only to a listing that asked for it: `includeAll`
+        // ("Include all available versions in the response") widens the listing to
+        // every row the calendar holds, and a status filter naming the unsupported
+        // state asks for exactly those rows.
+        let include_unsupported = input.include_all.unwrap_or(false)
+            || status_filters.contains(&SupportStatus::Unsupported);
+
         let requested_versions = input.cluster_versions.unwrap_or_default();
         let requested_type = input.cluster_type;
         let default_only = input.default_only.unwrap_or(false);
@@ -236,6 +246,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|entry| {
                 let status = entry.support_status(now);
                 status_filters.iter().all(|wanted| *wanted == status)
+            })
+            // Which keeps the listing consistent with each row's own dates: an
+            // unfiltered call reports no row whose `endOfExtendedSupportDate` the
+            // clock has passed, so no reported row contradicts the status derived
+            // from it.
+            .filter(|entry| {
+                include_unsupported || entry.support_status(now) != SupportStatus::Unsupported
             })
             .collect();
 

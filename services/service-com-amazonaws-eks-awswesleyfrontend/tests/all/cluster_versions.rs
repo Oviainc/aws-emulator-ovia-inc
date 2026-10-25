@@ -338,7 +338,10 @@ async fn support_status_is_derived_from_the_clock() {
         ("2.13", "STANDARD_SUPPORT", "STANDARD_SUPPORT", false),
     ];
 
-    let answer = describe_versions(&router, "").await;
+    // Every row the calendar holds is read with `includeAll`, because an unfiltered
+    // listing publishes only the versions Amazon EKS still offers (the suite below
+    // pins that); what this case is about is the status each row reports.
+    let answer = describe_versions(&router, "includeAll=true").await;
     assert_eq!(
         answer.status, 200,
         "case clock-relative calendar: expected HTTP 200, got {} ({:?})",
@@ -387,16 +390,19 @@ async fn filters_narrow_the_listing() {
 
     // (case, query, expected versions in order)
     let cases: Vec<(&str, String, Vec<&str>)> = vec![
-        ("no filter", String::new(), vec!["2.12", "2.11", "2.10"]),
+        ("no filter", String::new(), vec!["2.12", "2.11"]),
         (
             "one named version",
             "clusterVersions=2.11".to_string(),
             vec!["2.11"],
         ),
         (
-            "two named versions",
+            // `clusterVersions` NARROWS the listing; it does not widen it to a
+            // version the service no longer offers, which only `includeAll` or a
+            // status filter naming the unsupported state does.
+            "two named versions, one of them past extended support",
             "clusterVersions=2.10&clusterVersions=2.12".to_string(),
-            vec!["2.12", "2.10"],
+            vec!["2.12"],
         ),
         (
             "a version the calendar does not publish",
@@ -411,7 +417,7 @@ async fn filters_narrow_the_listing() {
         (
             "the published cluster type",
             format!("clusterType={CLUSTER_TYPE_EKS}"),
-            vec!["2.12", "2.11", "2.10"],
+            vec!["2.12", "2.11"],
         ),
         (
             "another cluster type",
@@ -422,7 +428,7 @@ async fn filters_narrow_the_listing() {
         (
             "default only, off",
             "defaultOnly=false".to_string(),
-            vec!["2.12", "2.11", "2.10"],
+            vec!["2.12", "2.11"],
         ),
         (
             "versionStatus STANDARD_SUPPORT",
@@ -455,9 +461,19 @@ async fn filters_narrow_the_listing() {
             vec![],
         ),
         (
-            "includeAll only ever widens, and the calendar is already whole",
+            "includeAll widens the listing to the versions EKS no longer offers",
             "includeAll=true".to_string(),
             vec!["2.12", "2.11", "2.10"],
+        ),
+        (
+            "includeAll=false is the unfiltered listing",
+            "includeAll=false".to_string(),
+            vec!["2.12", "2.11"],
+        ),
+        (
+            "includeAll with a status filter still narrows to that status",
+            "includeAll=true&versionStatus=EXTENDED_SUPPORT".to_string(),
+            vec!["2.11"],
         ),
         (
             "a status filter and a named version that satisfies it",
@@ -519,7 +535,10 @@ async fn pagination_walks_every_row_once() {
     let now = SystemTime::now();
     seed_calendar(&engine, clock_relative_calendar(now));
 
-    let whole = reported_versions(&describe_versions(&router, "").await);
+    // Paged with `includeAll`, so the table has three rows to walk: what this suite
+    // is about is the paging, and an unfiltered listing offers only the two rows
+    // still inside support.
+    let whole = reported_versions(&describe_versions(&router, "includeAll=true").await);
     assert_eq!(
         whole,
         vec!["2.12", "2.11", "2.10"],
@@ -537,8 +556,10 @@ async fn pagination_walks_every_row_once() {
                 "case page size {page_size}: paging must terminate, walked {walked:?}"
             );
             let query = match &token {
-                None => format!("maxResults={page_size}"),
-                Some(next) => format!("maxResults={page_size}&nextToken={next}"),
+                None => format!("includeAll=true&maxResults={page_size}"),
+                Some(next) => {
+                    format!("includeAll=true&maxResults={page_size}&nextToken={next}")
+                }
             };
             let answer = describe_versions(&router, &query).await;
             assert_eq!(
@@ -570,7 +591,7 @@ async fn pagination_walks_every_row_once() {
 
     // A page token is honoured only with the filters it was minted under: the row
     // it names is not in a differently filtered listing.
-    let first = describe_versions(&router, "maxResults=1").await;
+    let first = describe_versions(&router, "includeAll=true&maxResults=1").await;
     let token = first
         .body
         .get("nextToken")
@@ -580,7 +601,7 @@ async fn pagination_walks_every_row_once() {
     // A token that names a row the differently filtered listing does NOT hold: the
     // second page's token names `2.11`, which the `defaultOnly` listing (just the
     // default version, `2.12`) has no position for.
-    let second = describe_versions(&router, "maxResults=2").await;
+    let second = describe_versions(&router, "includeAll=true&maxResults=2").await;
     let foreign_filter_token = second
         .body
         .get("nextToken")
@@ -620,7 +641,11 @@ async fn pagination_walks_every_row_once() {
     }
 
     // And the same token WITH the same filters resumes where the first page ended.
-    let resumed = describe_versions(&router, &format!("maxResults=1&nextToken={token}")).await;
+    let resumed = describe_versions(
+        &router,
+        &format!("includeAll=true&maxResults=1&nextToken={token}"),
+    )
+    .await;
     assert_eq!(
         reported_versions(&resumed),
         vec![whole[1].clone()],
@@ -641,6 +666,158 @@ async fn pagination_walks_every_row_once() {
             answer.status, 400,
             "case maxResults {case}: expected HTTP 400, got {} ({:?})",
             answer.status, answer.body
+        );
+    }
+}
+
+/// A version whose extended support has ENDED is no longer one Amazon EKS offers:
+/// an unfiltered listing reports only the versions still inside standard or
+/// extended support, and every row it does report agrees with its own dates — so a
+/// caller can hand any version it reads straight to `CreateCluster`. The row is
+/// still PUBLISHED: a caller that asks for it, with `includeAll` or with a status
+/// filter naming the unsupported state, gets it.
+#[tokio::test]
+async fn an_unfiltered_listing_offers_only_versions_still_in_support() {
+    let (router, engine) = emulator();
+    let now = SystemTime::now();
+
+    // The rows differ along where the clock sits relative to a row's two
+    // end-of-support dates, including BOTH published boundaries (a row whose
+    // standard support ends exactly now, and one whose extended support does) and
+    // one day either side of each: the rule is a comparison against those dates,
+    // so the boundary is where it can be wrong.
+    //
+    // (version, end of standard support, end of extended support, offered
+    //  unfiltered)
+    let calendar: Vec<(&str, SystemTime, SystemTime, bool)> = vec![
+        ("3.9", now - 400 * DAY, now - 300 * DAY, false),
+        ("3.10", now - 400 * DAY, now - DAY, false),
+        ("3.11", now - 400 * DAY, now, false),
+        ("3.12", now - 400 * DAY, now + DAY, true),
+        ("3.13", now - DAY, now + 300 * DAY, true),
+        ("3.14", now, now + 300 * DAY, true),
+        ("3.15", now + DAY, now + 300 * DAY, true),
+        ("3.16", now + 100 * DAY, now + 500 * DAY, true),
+    ];
+    seed_calendar(
+        &engine,
+        calendar
+            .iter()
+            .map(|(version, standard, extended, _)| ClusterVersionRecord {
+                cluster_version: (*version).to_string(),
+                cluster_type: CLUSTER_TYPE_EKS.to_string(),
+                default_version: false,
+                release_date: now - 1000 * DAY,
+                end_of_standard_support: *standard,
+                end_of_extended_support: *extended,
+            })
+            .collect(),
+    );
+
+    let offered: Vec<String> = calendar
+        .iter()
+        .filter(|(_, _, _, offered)| *offered)
+        .map(|(version, _, _, _)| (*version).to_string())
+        .collect();
+
+    // The listing holds whole and page by page: a filter that is applied per page
+    // would otherwise let an out-of-support row through on a later page.
+    for page_size in [None, Some(1), Some(2), Some(100)] {
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(size) = page_size {
+                parts.push(format!("maxResults={size}"));
+            }
+            if let Some(next) = &token {
+                parts.push(format!("nextToken={next}"));
+            }
+            let answer = describe_versions(&router, &parts.join("&")).await;
+            assert_eq!(
+                answer.status, 200,
+                "case page size {page_size:?}: expected HTTP 200, got {} ({:?})",
+                answer.status, answer.body
+            );
+            // Every reported row agrees with its own dates, and none of them is
+            // past its end of extended support.
+            let clock = now_secs();
+            for row in rows(&answer) {
+                let case = row["clusterVersion"].as_str().unwrap_or_default().to_owned();
+                let end_of_standard = epoch_secs(&row["endOfStandardSupportDate"]);
+                let end_of_extended = epoch_secs(&row["endOfExtendedSupportDate"]);
+                assert!(
+                    clock < end_of_extended,
+                    "case {case}: an unfiltered listing must not offer a version past extended \
+                     support, got end of extended support {end_of_extended} at now {clock}"
+                );
+                let (version_status, status) =
+                    expected_status(clock, end_of_standard, end_of_extended);
+                assert_eq!(
+                    row["versionStatus"].as_str(),
+                    Some(version_status),
+                    "case {case}: expected versionStatus {version_status:?} from its own dates, \
+                     got {:?}",
+                    row["versionStatus"]
+                );
+                assert_eq!(
+                    row["status"].as_str(),
+                    Some(status),
+                    "case {case}: expected status {status:?} from its own dates, got {:?}",
+                    row["status"]
+                );
+            }
+            walked.extend(reported_versions(&answer));
+            token = answer
+                .body
+                .get("nextToken")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            walked, offered,
+            "case page size {page_size:?}: expected only the versions still in support, got \
+             {walked:?}"
+        );
+    }
+
+    // Asked for, every row is reported — the out-of-support ones are hidden from
+    // the default listing, not dropped from the calendar.
+    let every_version: Vec<String> = calendar
+        .iter()
+        .map(|(version, _, _, _)| (*version).to_string())
+        .collect();
+    let out_of_support: Vec<String> = calendar
+        .iter()
+        .filter(|(_, _, _, offered)| !*offered)
+        .map(|(version, _, _, _)| (*version).to_string())
+        .collect();
+    for (case, query, expected) in [
+        ("includeAll", "includeAll=true", &every_version),
+        (
+            "the current status spelling naming the unsupported state",
+            "versionStatus=UNSUPPORTED",
+            &out_of_support,
+        ),
+        (
+            "the deprecated status spelling naming it",
+            "status=unsupported",
+            &out_of_support,
+        ),
+    ] {
+        let answer = describe_versions(&router, &format!("{query}&maxResults=100")).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected HTTP 200, got {} ({:?})",
+            answer.status, answer.body
+        );
+        let actual = reported_versions(&answer);
+        assert_eq!(
+            &actual, expected,
+            "case {case}: expected {expected:?}, got {actual:?}"
         );
     }
 }

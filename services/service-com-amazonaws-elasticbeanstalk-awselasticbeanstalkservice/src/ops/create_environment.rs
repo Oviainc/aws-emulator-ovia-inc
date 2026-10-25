@@ -401,16 +401,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the member stays absent rather than carrying a made-up value — a
         // CUSTOM platform version, in particular, has no solution stack name
         // this service can derive.
-        let resolved_stack = input
-            .solution_stack_name
-            .as_deref()
-            .and_then(crate::state::solution_stack_named)
-            .or_else(|| {
-                input
-                    .platform_arn
-                    .as_deref()
-                    .and_then(|arn| crate::state::managed_platform_version(&region, arn))
-            });
+        let resolved_stack = crate::state::configuration_platform(
+            &region,
+            input.solution_stack_name.as_deref(),
+            input.platform_arn.as_deref(),
+        );
         let platform_arn = input
             .platform_arn
             .clone()

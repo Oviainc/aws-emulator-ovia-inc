@@ -21,6 +21,8 @@ mod access_keys;
 mod account_aliases;
 #[path = "all/aws_managed_policy_catalog.rs"]
 mod aws_managed_policy_catalog;
+#[path = "all/custom_policy_context_keys.rs"]
+mod custom_policy_context_keys;
 #[path = "all/entities_for_policy.rs"]
 mod entities_for_policy;
 #[path = "all/group_listing.rs"]

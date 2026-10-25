@@ -101,9 +101,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `CreateCertificateAuthorityError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#CreateCertificateAuthority")]
+//
+// `ClientException` is widened in through `extra_errors`: this SERVICE models that
+// shape and many of its operations declare it, but this one does not list it — and it
+// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
+// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#CreateCertificateAuthority",
+    extra_errors = ["ClientException"]
+)]
 #[derive(Debug)]
 pub enum CreateCertificateAuthorityErrorModeled {
+    ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     ResourceInUseException(ResourceInUseException),
     ResourceLimitExceededException(ResourceLimitExceededException),
@@ -193,6 +202,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // A cluster certificate authority is the Amazon EKS control plane's own CA, and
+        // a cluster `RegisterCluster` connected has no such control plane: this operation
+        // does not apply to it. The gate is a fact about the CLUSTER, so it is answered
+        // as soon as the cluster is resolved.
+        if cluster.is_connected() {
+            return Err(CreateCertificateAuthorityErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&cluster_name),
+            )
+            .into());
+        }
 
         // Materialise the distribution moves the clock already owes this cluster's
         // certificate authorities, so the ceiling below counts their state at `now`

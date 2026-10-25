@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExtensionAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExtensionAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the extension associations this account holds, narrowed by the
+//! extension or the resource the request names, in association-id order, a page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExtensionAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The model documents this operation as listing "all AppConfig extension associations in
+//! the account", so the listing is every association
+//! [`crate::state::ComAmazonawsAppconfigAmazonappconfigState::extension_associations`]
+//! holds, and each of its filter members narrows that report: `ExtensionIdentifier` to the
+//! associations binding the extension it addresses, `ExtensionVersionNumber` to those
+//! binding that version of it, and `ResourceIdentifier` to those bound to the resource its
+//! ARN addresses. Every summary is read off the stored record, so the listing cannot
+//! disagree with `GetExtensionAssociation`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +156,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExtensionAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExtensionAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExtensionAssociations"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListExtensionAssociationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "AppConfig state is not reachable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        // "The name, the ID, or the Amazon Resource Name (ARN) of the extension", resolved
+        // the way every operation taking an `ExtensionIdentifier` resolves one, so all
+        // three forms narrow the listing over the whole catalogue the account can see. An
+        // identifier that addresses no extension has nothing associated to it, which is an
+        // empty report rather than a refusal: this operation models no not-found error.
+        let wanted_extension = match input.extension_identifier.as_deref() {
+            Some(identifier) => match store.resolve_extension(identifier, &region) {
+                Some((extension, pinned_version)) => Some((extension.id, pinned_version)),
+                None => return Ok(nothing_listed()),
+            },
+            None => None,
+        };
+        // "The version number for the extension defined in the association." An extension
+        // ARN addresses ONE version, so it narrows to the version it names unless the
+        // request states one itself — the precedence `CreateExtensionAssociation` binds by.
+        let wanted_version = input
+            .extension_version_number
+            .or_else(|| wanted_extension.as_ref().and_then(|(_, pinned)| *pinned));
+
+        // "The ARN of an application, configuration profile, or environment" — matched on
+        // the resource the ARN ADDRESSES rather than on the ARN text, so an association
+        // created against one Region's ARN is still reported to a request made in another:
+        // this emulator holds one tree, not one per Region. An ARN addressing no resource
+        // of this service likewise has nothing associated to it.
+        let wanted_resource = match input.resource_identifier.as_deref() {
+            Some(identifier) => match crate::state::parse_resource_arn(identifier) {
+                Some(resource) => Some(resource),
+                None => return Ok(nothing_listed()),
+            },
+            None => None,
+        };
+
+        // One summary per association left by the filters, every member read off the
+        // stored record, so the listing cannot disagree with what `GetExtensionAssociation`
+        // reports for the same association.
+        let mut listed: Vec<(String, ExtensionAssociationSummary)> = store
+            .extension_associations()
+            .filter(|association| {
+                wanted_extension
+                    .as_ref()
+                    .is_none_or(|(extension_id, _)| &association.extension_id == extension_id)
+                    && wanted_version
+                        .is_none_or(|number| association.extension_version_number == number)
+                    && wanted_resource.is_none_or(|resource| {
+                        crate::state::parse_resource_arn(&association.resource_arn)
+                            == Some(resource)
+                    })
+            })
+            .map(|association| {
+                (
+                    association.id.clone(),
+                    ExtensionAssociationSummary {
+                        id: Some(association.id.clone()),
+                        extension_arn: Some(association.extension_arn.clone()),
+                        resource_arn: Some(association.resource_arn.clone()),
+                    },
+                )
+            })
+            .collect();
+        // Association-id order, so the listing a caller pages through is the same listing
+        // on every call: an id is unique across every resource this service holds, so this
+        // order is TOTAL, which is what `paginate` keys its cursor on.
+        listed.sort_by(|left, right| left.0.cmp(&right.0));
+
+        // The same cursor the other listings of this service hand out. `None` means the
+        // `NextToken` is not one this service minted for THIS listing, which is a bad
+        // request rather than "start from the beginning" — answering the first page again
+        // would silently repeat entries the caller already walked.
+        let Some(page) = crate::state::paginate(
+            listed,
+            crate::state::LISTING_EXTENSION_ASSOCIATIONS,
+            input.next_token.as_deref(),
+            input.max_results,
+        ) else {
+            return Err(ListExtensionAssociationsErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(
+                        "NextToken is not a token this service issued for an extension \
+                         association listing."
+                            .to_string(),
+                    ),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(ListExtensionAssociationsOutput {
+            items: Some(page.items),
+            next_token: page.next_token,
+        })
+    }
+}
+
+/// The listing a filter nothing can match answers with: an empty `Items` and no
+/// `NextToken`. `ExtensionAssociationSummaries` is a list, so "none" is an empty list
+/// rather than an omitted member — the shape a fresh account's listing answers with too.
+fn nothing_listed() -> ListExtensionAssociationsOutput {
+    ListExtensionAssociationsOutput {
+        items: Some(Vec::new()),
+        next_token: None,
     }
 }
