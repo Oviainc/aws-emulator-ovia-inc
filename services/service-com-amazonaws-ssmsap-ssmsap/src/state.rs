@@ -52,6 +52,13 @@
 //! caller can read is one some run produced, and it is forgotten exactly when the run
 //! that produced it is.
 //!
+//! What an operation PASSED is derived from that same operation record rather than held
+//! beside it: its milestones ([`StoredOperation::events`], projected onto the wire
+//! `OperationEvent` by [`OperationEventRecord::view`]) are the start of its work and, once
+//! the clock has brought the record to a terminal status, the instant it reached it — so
+//! `ListOperationEvents` cannot report a milestone of an operation nobody filed, and the
+//! milestones a caller reads move exactly when `GetOperation`'s status does.
+//!
 //! Resource permissions work the same way: `PutResourcePermission` grants and
 //! `GetResourcePermission` reads the SAME triples in [`RegionState::resource_permissions`],
 //! and the `Policy` document both report is PROJECTED from them by
@@ -64,8 +71,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Application, ApplicationCredential, ApplicationSummary, ConfigurationCheckOperation,
     ConflictException, DatabaseSummary, Filter, InternalServerException, Operation,
-    ResourceNotFoundException, RuleResult, SubCheckResult, ValidationException,
-    CONFIGURATION_CHECK_TYPE_VALUES,
+    OperationEvent, Resource, ResourceNotFoundException, RuleResult, SubCheckResult,
+    ValidationException, CONFIGURATION_CHECK_TYPE_VALUES,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -141,6 +148,27 @@ pub const OPERATION_TYPE_DEREGISTER_APPLICATION: &str = "DEREGISTER_APPLICATION"
 /// names the resource kind every operation in this slice targets — the registered
 /// application.
 pub const APPLICATION_RESOURCE_TYPE: &str = "APPLICATION";
+
+/// `Resource$ResourceType` for the registered application an operation acted on.
+///
+/// `Operation$ResourceType` is an unconstrained string ([`APPLICATION_RESOURCE_TYPE`]),
+/// while the `Resource` an `OperationEvent` carries holds an `OperationEventResourceType`
+/// — pattern `^[\w]+::[\w]+::[\w]+$`, which `Resource$ResourceType`'s documentation
+/// spells `AWS::SystemsManagerSAP::Component` for this service's component resource — so
+/// this is that same spelling for its application resource. See [`event_resource_type`].
+pub const OPERATION_EVENT_RESOURCE_TYPE_APPLICATION: &str = "AWS::SystemsManagerSAP::Application";
+
+/// `OperationEventStatus` of a milestone of an operation that is still running. One of
+/// the model's `OperationEventStatus` values (see
+/// [`crate::ops::types::OPERATION_EVENT_STATUS_VALUES`]).
+pub const OPERATION_EVENT_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// `OperationEventStatus` of the milestone an operation that finished its work reached.
+pub const OPERATION_EVENT_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `OperationEventStatus` of the milestone an operation that ended without doing its work
+/// reached.
+pub const OPERATION_EVENT_STATUS_FAILED: &str = "FAILED";
 
 /// `ComponentType` of the SAP HANA database component of an application. One of the
 /// model's `ComponentType` values (see [`crate::ops::types::COMPONENT_TYPE_VALUES`]).
@@ -579,6 +607,72 @@ impl StoredOperation {
         self.last_updated_time = self.success_due_at.max(self.last_updated_time);
     }
 
+    /// The milestones this operation has reached, oldest first: the events
+    /// `ListOperationEvents` reports for it.
+    ///
+    /// DERIVED from this record rather than held beside it, the way an application's
+    /// databases are derived from its registration ([`StoredApplication::databases`]):
+    /// every record starts `INPROGRESS`, so its first milestone is the start of its work,
+    /// and a record the clock has brought to a terminal status has a second milestone at
+    /// the instant it reached it — `COMPLETED` for a success and `FAILED` for an error,
+    /// carrying whatever that record explains its status with. A milestone therefore
+    /// exists exactly because the operation passed it, and the events of an operation
+    /// still running move to its terminal milestone at the same instant
+    /// [`Self::settle`] moves its status.
+    ///
+    /// Nothing else is reported: the work this emulator does for an operation is the
+    /// record it keeps on the resource the call named, so the milestones it knows are
+    /// that record's own — it starts and stops nothing on any other service's resource
+    /// and reports no milestone for one.
+    pub fn events(&self) -> Vec<OperationEventRecord> {
+        // The resource kind as a `Resource$ResourceType`, and as the word a description
+        // names it by — the record's own kind either way, so neither is written out per
+        // operation type.
+        let resource_type = event_resource_type(&self.resource_type).map(str::to_string);
+        let kind = self.resource_type.to_lowercase();
+        let milestone = |ordinal: usize, description: String, status: &str, status_message, timestamp| {
+            OperationEventRecord {
+                ordinal,
+                description,
+                resource_arn: self.resource_arn.clone(),
+                resource_id: self.resource_id.clone(),
+                resource_type: resource_type.clone(),
+                status: status.to_string(),
+                status_message,
+                timestamp,
+            }
+        };
+        let mut events = vec![milestone(
+            0,
+            format!("{} started for {kind} {}", self.op_type, self.resource_id),
+            OPERATION_EVENT_STATUS_IN_PROGRESS,
+            // `StatusMessage` explains a status; work that has just begun has nothing
+            // to explain.
+            None,
+            self.start_time,
+        )];
+        let terminal = if self.status == OPERATION_STATUS_SUCCESS {
+            Some((OPERATION_EVENT_STATUS_COMPLETED, "completed"))
+        } else if self.status == OPERATION_STATUS_ERROR {
+            Some((OPERATION_EVENT_STATUS_FAILED, "failed"))
+        } else {
+            None
+        };
+        if let Some((status, verb)) = terminal {
+            events.push(milestone(
+                events.len(),
+                format!("{} {verb} for {kind} {}", self.op_type, self.resource_id),
+                status,
+                self.status_message.clone(),
+                // A record that reached a terminal status reached it at its `EndTime`;
+                // the fallback is for one that carries none, whose last change is the
+                // most this record knows about when that status was taken.
+                self.end_time.unwrap_or(self.last_updated_time),
+            ));
+        }
+        events
+    }
+
     /// Project the stored operation onto the modelled `Operation`.
     pub fn view(&self) -> Operation {
         Operation {
@@ -598,6 +692,89 @@ impl StoredOperation {
             end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
             last_updated_time: Some(::aws_smithy_types::DateTime::from(self.last_updated_time)),
         }
+    }
+}
+
+/// The `Resource$ResourceType` spelling of an operation record's own `ResourceType`, and
+/// `None` for a resource kind this service has no such spelling for.
+///
+/// The two members are different strings for the same thing: `Operation$ResourceType` is
+/// unconstrained while `OperationEventResourceType` carries a pattern, so a kind with no
+/// spelling here is reported ABSENT by [`StoredOperation::events`] rather than as a value
+/// that pattern refuses.
+pub fn event_resource_type(resource_type: &str) -> Option<&'static str> {
+    (resource_type == APPLICATION_RESOURCE_TYPE)
+        .then_some(OPERATION_EVENT_RESOURCE_TYPE_APPLICATION)
+}
+
+/// How many digits an event's ordinal is rendered with in its listing key: see
+/// [`OperationEventRecord::page_key`]. An operation has one milestone per status it has
+/// passed, so no record comes close to this many.
+const EVENT_PAGE_KEY_WIDTH: usize = 4;
+
+/// One milestone of an operation: the record `ListOperationEvents` reports as an
+/// `OperationEvent`.
+///
+/// Derived from the [`StoredOperation`] it belongs to by [`StoredOperation::events`], so
+/// it lives and dies with that record.
+#[derive(Debug, Clone)]
+pub struct OperationEventRecord {
+    /// Which milestone of its operation this is, counting from zero in the order they
+    /// happen — the key the listing is ordered and paged by ([`Self::page_key`]).
+    pub ordinal: usize,
+    /// `OperationEvent$Description`: what the milestone was.
+    pub description: String,
+    /// The `ResourceArn` of the resource the operation acted on.
+    pub resource_arn: String,
+    /// The id of that resource, which is what a `resourceID` filter compares against.
+    pub resource_id: String,
+    /// Its `Resource$ResourceType`; see [`event_resource_type`] for when it is absent.
+    pub resource_type: Option<String>,
+    /// An `OperationEventStatus` value; see the `OPERATION_EVENT_STATUS_*` constants.
+    pub status: String,
+    /// What the operation record explains that status with, when it explains it.
+    pub status_message: Option<String>,
+    /// When the operation reached this milestone.
+    pub timestamp: SystemTime,
+}
+
+impl OperationEventRecord {
+    /// Project the milestone onto the modelled `OperationEvent`.
+    pub fn view(&self) -> OperationEvent {
+        OperationEvent {
+            description: Some(self.description.clone()),
+            resource: Some(Resource {
+                resource_arn: Some(self.resource_arn.clone()),
+                resource_type: self.resource_type.clone(),
+            }),
+            status: Some(self.status.clone()),
+            status_message: self.status_message.clone(),
+            timestamp: Some(::aws_smithy_types::DateTime::from(self.timestamp)),
+        }
+    }
+
+    /// The value a `ListOperationEvents` filter whose `Name` is `name` compares against,
+    /// or `None` when this milestone has no such attribute (which nothing matches).
+    ///
+    /// The names are the ones `ListOperationEvents` documents for its `Filters`
+    /// ([`OPERATION_EVENT_FILTER_NAMES`]), each naming something the event itself
+    /// reports.
+    pub fn filter_attribute(&self, name: &str) -> Option<&str> {
+        match name {
+            "status" => Some(self.status.as_str()),
+            "resourceID" => Some(self.resource_id.as_str()),
+            "resourceType" => self.resource_type.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The key this listing is ordered and paged by: the milestone's ordinal, zero-padded
+    /// to [`EVENT_PAGE_KEY_WIDTH`] digits so ordering the keys as strings is ordering the
+    /// milestones by when they happened — which is what makes a `NextToken` resume at the
+    /// milestone the previous page stopped at, including across the later call at which a
+    /// terminal milestone has fallen due.
+    pub fn page_key(&self) -> String {
+        format!("{:0width$}", self.ordinal, width = EVENT_PAGE_KEY_WIDTH)
     }
 }
 
@@ -1602,6 +1779,17 @@ pub fn no_registered_application(reference: &str) -> ValidationException {
     ))
 }
 
+/// Why an `OperationId` that names no operation record of this account and Region is
+/// refused.
+///
+/// The operations that take one (`GetOperation`, `ListOperationEvents`) model no 404, so
+/// an id that resolves to nothing is the `ValidationException` they do model — and both
+/// refuse it in the same words, built from the request's own id, so a client reads one
+/// wording for one condition whichever of them it called.
+pub fn no_operation_message(operation_id: &str) -> String {
+    format!("No operation with ID {operation_id} exists in this account and Region")
+}
+
 /// Why an `OperationId` that names no configuration check operation of this account and
 /// Region is refused.
 ///
@@ -1687,6 +1875,14 @@ pub const FILTER_NAMES: &[&str] = &["Id", "DiscoveryStatus", "Type", "Arn"];
 /// documentation states. See [`StoredConfigurationCheckOperation::filter_attribute`].
 pub const CONFIGURATION_CHECK_FILTER_NAMES: &[&str] =
     &["Id", "ApplicationId", "Status", "ConfigurationCheckId"];
+
+/// The `Name` values a `ListOperationEvents` filter may carry, and the only operator it
+/// accepts for them is [`FILTER_OPERATOR_EQUALS`] — both as that operation documents its
+/// `Filters` member (`smithy_query(query="doc", shape="ListOperationEventsInput",
+/// member="Filters")`). Filter names are case-sensitive, as `Filter$Name`'s documentation
+/// states, so they are spelled here exactly as that member spells them. See
+/// [`OperationEventRecord::filter_attribute`].
+pub const OPERATION_EVENT_FILTER_NAMES: &[&str] = &["status", "resourceID", "resourceType"];
 
 /// `FilterOperator` for exact equality; one of the model's `FilterOperator` values
 /// (see [`crate::ops::types::FILTER_OPERATOR_VALUES`]).

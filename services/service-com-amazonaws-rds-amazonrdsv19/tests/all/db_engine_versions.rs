@@ -53,8 +53,8 @@ const MODELLED_ENGINES: [&str; 21] = [
 
 /// The engines whose versions are CUSTOM engine versions the ACCOUNT mints: RDS Custom
 /// for Oracle, whose CEVs `CreateCustomDBEngineVersion` creates from customer-supplied
-/// installation media. That operation is still a scaffolded 501, so this service holds
-/// none and must report none for these engines — rather than inventing one. RDS Custom
+/// installation media. This service therefore carries no catalogue version for them and
+/// must report one only where a create has stored it — never as reference data. RDS Custom
 /// for SQL Server is NOT among them: its custom engine versions are AWS-provided, so they
 /// are catalogue data (see `db_engine_version_catalog.rs`).
 ///
@@ -168,8 +168,8 @@ async fn every_modelled_engine_reports_its_own_versions_and_nothing_else() {
             assert!(
                 reported.is_empty(),
                 "case {engine:?}: a custom engine version exists only once \
-                 CreateCustomDBEngineVersion stores one, so the report must be empty, \
-                 got {:?}",
+                 CreateCustomDBEngineVersion stores one, and this emulator stored none, so \
+                 the report must be empty, got {:?}",
                 reported
                     .iter()
                     .map(|version| version.engine_version.clone())

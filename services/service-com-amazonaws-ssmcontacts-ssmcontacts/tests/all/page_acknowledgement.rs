@@ -60,7 +60,7 @@ use crate::contact_updates::{active_replication_set, onboard, set_replication_se
 /// The channels the fixture contact holds: one per value of the model's own `ChannelType`
 /// set (`CHANNEL_TYPE_VALUES` in `src/ops/types/shared_types.rs`), so a page is asserted over
 /// every kind of channel a plan can target.
-const CHANNELS: &[(&str, &str, &str)] = &[
+pub(crate) const CHANNELS: &[(&str, &str, &str)] = &[
     ("email", "EMAIL", "ops@example.com"),
     ("sms", "SMS", "+15550100"),
     ("voice", "VOICE", "+15550101"),
@@ -239,12 +239,12 @@ async fn fixture(emulator: &Emulator) -> Fixture {
 }
 
 /// A plan target naming one contact channel.
-fn channel_target(channel_arn: &str) -> Value {
+pub(crate) fn channel_target(channel_arn: &str) -> Value {
     json!({"ChannelTargetInfo": {"ContactChannelId": channel_arn}})
 }
 
 /// Replace `contact`'s engagement plan, asserting the update succeeded.
-async fn set_plan(emulator: &Emulator, contact: &str, plan: Value, case: &str) {
+pub(crate) async fn set_plan(emulator: &Emulator, contact: &str, plan: Value, case: &str) {
     let (status, body) = emulator
         .call("UpdateContact", json!({"ContactId": contact, "Plan": plan}))
         .await;
@@ -269,7 +269,7 @@ fn start_request(contact: &str) -> Value {
 
 /// Start an engagement of `contact`, asserting it succeeded, and answer its
 /// `EngagementArn`.
-async fn start_engagement(emulator: &Emulator, contact: &str, case: &str) -> String {
+pub(crate) async fn start_engagement(emulator: &Emulator, contact: &str, case: &str) -> String {
     let (status, body) = emulator
         .call("StartEngagement", start_request(contact))
         .await;
@@ -287,7 +287,7 @@ async fn start_engagement(emulator: &Emulator, contact: &str, case: &str) -> Str
 ///
 /// The store is read directly because `ListPagesByEngagement` is a stub of its own: this
 /// suite is about the pages themselves, not about listing them.
-fn pages_of(emulator: &Emulator, engagement_arn: &str) -> Vec<PageRecord> {
+pub(crate) fn pages_of(emulator: &Emulator, engagement_arn: &str) -> Vec<PageRecord> {
     let state = service_state(&*emulator.engine).expect("the engine holds this service's state");
     let state = state.lock();
     let mut pages: Vec<PageRecord> = state
@@ -312,7 +312,7 @@ fn page_record(emulator: &Emulator, page_arn: &str) -> PageRecord {
 }
 
 /// `DescribePage`, answering the status and the body.
-async fn describe_page(emulator: &Emulator, page_arn: &str) -> (u16, Value) {
+pub(crate) async fn describe_page(emulator: &Emulator, page_arn: &str) -> (u16, Value) {
     emulator
         .call("DescribePage", json!({"PageId": page_arn}))
         .await

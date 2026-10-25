@@ -11,6 +11,14 @@
 //! document a client reads back is the one the last put stored, and a feed that leaves
 //! the store takes its policy with it.
 //!
+//! A deletion that has COMPLETED is reported rather than erased: both delete operations
+//! are `@idempotent` and their responses carry the resource's status, `DELETED` being
+//! the value each status enum gives a deletion that has succeeded, so the record stays
+//! behind to answer a retry of the deletion it served ([`Feed::retire`],
+//! [`Dictionary::retire`]). It is no longer a live resource — it is not read, listed,
+//! referenced, tagged or mutated, and it consumes no quota — and the oldest of them are
+//! pruned past [`MAX_COMPLETED_DELETIONS`] per Region, so the store stays bounded.
+//!
 //! The dictionary is this service's other resource — a named, language-tagged payload
 //! of custom words a subtitling output can reference. `CreateDictionary` mints one,
 //! `GetDictionary` reports it, `UpdateDictionary` mutates it and `DeleteDictionary`
@@ -143,15 +151,30 @@ pub const MAX_DICTIONARIES: usize = 100;
 /// the real service's Regions meets it.
 pub const MAX_REGIONS: usize = 32;
 
+/// The most completed deletions this store keeps for ONE Region, of each kind of
+/// resource.
+///
+/// A deletion that has COMPLETED is still reported rather than refused: both delete
+/// operations are `@idempotent` and their responses carry the resource's status, with
+/// `DELETED` the value each status enum gives a deletion that has succeeded, so a retry
+/// of an accepted deletion answers that same success instead of a not-found. The record
+/// that answers it is what this bound limits. Such a record is not a live resource — it
+/// is neither read, listed nor mutated ([`FeedStatus::Deleted`],
+/// [`DictionaryStatus::Deleted`]) and it consumes no quota — so it is held beside the
+/// Region's own [`MAX_FEEDS`] / [`MAX_DICTIONARIES`] live records, and past this figure
+/// the Region's OLDEST completed deletions are dropped, which is what keeps the store
+/// bounded however many resources a caller creates and deletes. A delete naming a record
+/// dropped that long ago is a `ResourceNotFoundException` once more, as any id the store
+/// holds nothing for is.
+pub const MAX_COMPLETED_DELETIONS: usize = 100;
+
 /// The `FeedStatus` values this slice of the service produces.
 ///
-/// The model's enum also carries `CREATING`, `DELETED` and `UPDATING`, and none of the
-/// three is ever reported. `CREATING` is not: the recorded service hands back a feed
+/// The model's enum also carries `CREATING` and `UPDATING`, and neither is ever
+/// reported. `CREATING` is not: the recorded service hands back a feed
 /// that is immediately usable, so `CreateFeed` stores it `AVAILABLE` and there is no
 /// window in which a caller is told to wait ("After creation of the feed has succeeded,
-/// the status will be AVAILABLE", `CreateFeedResponse$status`). A feed whose deletion
-/// has completed is removed from the store instead of reporting `DELETED` (`GetFeed`
-/// then answers `ResourceNotFoundException`). `UpdateFeed` answers HTTP
+/// the status will be AVAILABLE", `CreateFeedResponse$status`). `UpdateFeed` answers HTTP
 /// 200 rather than 202 — "UpdateFeed is a PUT operation, which means that the payload
 /// that you specify completely overwrites the existing payload" and that overwrite is
 /// done when the call returns — so the update reports the feed's SETTLED status, as
@@ -163,8 +186,14 @@ pub enum FeedStatus {
     /// A resource (the source media) is associated with the feed: `AssociateFeed`
     /// claims the feed for one resource, and that claim is what `ACTIVE` reports.
     Active,
-    /// A `DeleteFeed` has been accepted; the feed disappears when it completes.
+    /// A `DeleteFeed` has been accepted; the deletion completes when it falls due.
     Deleting,
+    /// The accepted deletion has COMPLETED ("When deletion of the feed has succeeded,
+    /// the status will be DELETED", `DeleteFeedResponse$status`). Terminal, and not a
+    /// live feed: the record only reports that completion to a retry of the delete that
+    /// earned it, so a feed in this status is read, listed and mutated as one the store
+    /// does not hold ([`ComAmazonawsElementalinferenceElementalinferenceState::feed`]).
+    Deleted,
     /// The feed's resource has been released by `DisassociateFeed`. Terminal: a
     /// released feed takes no further association.
     Archived,
@@ -177,6 +206,7 @@ impl FeedStatus {
             Self::Available => "AVAILABLE",
             Self::Active => "ACTIVE",
             Self::Deleting => "DELETING",
+            Self::Deleted => "DELETED",
             Self::Archived => "ARCHIVED",
         }
     }
@@ -379,20 +409,24 @@ pub fn too_many_outputs_message() -> String {
 /// The `DictionaryStatus` values this slice of the service produces.
 ///
 /// These are the LIFECYCLE statuses a dictionary record holds. The model's enum also
-/// carries `REFERENCED` and `DELETED`, and neither is a stored value: `REFERENCED` is
-/// DERIVED from the feeds whose subtitling outputs name the dictionary (see
-/// [`Dictionary::reported_status`]), and a dictionary whose deletion has completed is
-/// removed from the store instead, so `GetDictionary` then answers
-/// `ResourceNotFoundException`.
+/// carries `REFERENCED`, which is not a stored value: it is DERIVED from the feeds whose
+/// subtitling outputs name the dictionary (see [`Dictionary::reported_status`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DictionaryStatus {
     /// The dictionary has been accepted and is not usable yet.
     Creating,
     /// The dictionary is settled and can be referenced by an output.
     Available,
-    /// A `DeleteDictionary` has been accepted; the dictionary disappears when the
-    /// removal falls due.
+    /// A `DeleteDictionary` has been accepted; the deletion completes when it falls
+    /// due.
     Deleting,
+    /// The accepted deletion has COMPLETED ("The status of the dictionary after
+    /// deletion", `DeleteDictionaryResponse$status`). Terminal, and not a live
+    /// dictionary: as with [`FeedStatus::Deleted`], the record only reports that
+    /// completion to a retry of the delete that earned it, so a dictionary in this
+    /// status is read, listed, referenced and mutated as one the store does not hold
+    /// ([`ComAmazonawsElementalinferenceElementalinferenceState::dictionary`]).
+    Deleted,
 }
 
 impl DictionaryStatus {
@@ -403,6 +437,7 @@ impl DictionaryStatus {
             Self::Creating => "CREATING",
             Self::Available => "AVAILABLE",
             Self::Deleting => "DELETING",
+            Self::Deleted => "DELETED",
         }
     }
 }
@@ -425,9 +460,30 @@ pub struct Dictionary {
     pub tags: BTreeMap<String, String>,
     /// When the clock owes this dictionary's transient status its next move, if any.
     pub transition_due_at: Option<Instant>,
+    /// When this dictionary's accepted deletion COMPLETED, and `None` while it holds a
+    /// status of a live dictionary — the dictionary's counterpart of
+    /// [`Feed::deleted_at`], and what orders the pruning of completed deletions.
+    pub deleted_at: Option<Instant>,
 }
 
 impl Dictionary {
+    /// Whether this dictionary's deletion has COMPLETED, so the store no longer holds
+    /// it as a live dictionary — the dictionary's counterpart of [`Feed::is_deleted`].
+    pub fn is_deleted(&self) -> bool {
+        self.status == DictionaryStatus::Deleted
+    }
+
+    /// Complete this dictionary's accepted deletion, as [`Feed::retire`] does for a
+    /// feed: the record reports `DELETED` from `now` on and keeps only the identity
+    /// `DeleteDictionary` answers with.
+    pub fn retire(&mut self, now: Instant) {
+        self.status = DictionaryStatus::Deleted;
+        self.transition_due_at = None;
+        self.deleted_at = Some(now);
+        self.entries.clear();
+        self.tags.clear();
+    }
+
     /// Put this dictionary into a transient status the clock will move on by itself,
     /// and return the instant that move falls due — the dictionary's counterpart of
     /// [`Feed::enter_transient`]. The caller hands that instant to
@@ -589,9 +645,46 @@ pub struct Feed {
     pub tags: BTreeMap<String, String>,
     /// When the clock owes this feed's transient status its next move, if any.
     pub transition_due_at: Option<Instant>,
+    /// When this feed's accepted deletion COMPLETED, and `None` while the feed holds a
+    /// status of a live feed.
+    ///
+    /// A completed deletion is still REPORTED rather than refused (see
+    /// [`FeedStatus::Deleted`]), so the record outlives the resource; this instant is
+    /// when it stopped being a live feed, and so the order in which such records are
+    /// dropped once a Region holds more than [`MAX_COMPLETED_DELETIONS`] of them.
+    pub deleted_at: Option<Instant>,
 }
 
 impl Feed {
+    /// Whether this feed's deletion has COMPLETED, so the store no longer holds it as a
+    /// live feed: every operation but a retry of that delete answers for it as it does
+    /// for an id the store holds nothing for.
+    pub fn is_deleted(&self) -> bool {
+        self.status == FeedStatus::Deleted
+    }
+
+    /// Complete this feed's accepted deletion: the feed reports `DELETED` from `now` on
+    /// ("When deletion of the feed has succeeded, the status will be DELETED") and is no
+    /// longer a live feed.
+    ///
+    /// What the record keeps is the identity `DeleteFeed` answers with \u2014 its id, its ARN
+    /// and the Region that holds it. The configuration the feed served with does not
+    /// outlive it: its outputs, data endpoints, access role, association, resource-based
+    /// policy and tags all go, so nothing a later request could report survives the
+    /// resource they belonged to.
+    pub fn retire(&mut self, now: Instant) {
+        self.status = FeedStatus::Deleted;
+        self.transition_due_at = None;
+        self.deleted_at = Some(now);
+        self.data_endpoints.clear();
+        self.outputs.clear();
+        self.access_role_arn = None;
+        self.association = None;
+        self.released_resource_name = None;
+        self.policy = None;
+        self.tags.clear();
+    }
+
     /// Put this feed into a transient status the clock will move on by itself, and
     /// return the instant that move falls due. The caller hands that instant to
     /// [`ComAmazonawsElementalinferenceElementalinferenceState::note_due`], which is
@@ -831,8 +924,8 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
         self.earliest_due = Some(self.earliest_due.map_or(due, |earliest| earliest.min(due)));
     }
 
-    /// The one feed `id` names IN `region`, or `None` when that Region holds no such
-    /// feed.
+    /// The one LIVE feed `id` names IN `region`, or `None` when that Region holds no
+    /// such feed.
     ///
     /// This service is regional: a feed exists for the Region whose endpoint created it
     /// and for no other, so a lookup is a (Region, id) lookup and an id that names a
@@ -840,55 +933,99 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
     /// a feed by its `FeedId` goes through this (and every mutating one through
     /// [`Self::feed_mut`]), so none of them can disagree about which feeds a Region
     /// holds, or answer for another Region's.
+    ///
+    /// A feed whose deletion has COMPLETED is not one of them: the resource is gone, so
+    /// the record that still reports that completion ([`FeedStatus::Deleted`]) resolves
+    /// here no more than an id the store holds nothing for does, and every operation but
+    /// the delete's own retry ([`Self::feed_including_deleted_mut`]) answers for it as it
+    /// does for an unknown id.
     pub fn feed(&self, region: &str, id: &str) -> Option<&Feed> {
-        self.feeds.get(id).filter(|feed| feed.region == region)
+        self.feeds
+            .get(id)
+            .filter(|feed| feed.region == region && !feed.is_deleted())
     }
 
-    /// The one feed `id` names in `region`, for a caller that writes it — the mutating
-    /// half of [`Self::feed`], with the same Region rule.
+    /// The one live feed `id` names in `region`, for a caller that writes it — the
+    /// mutating half of [`Self::feed`], with the same Region rule and the same rule
+    /// about a completed deletion.
     pub fn feed_mut(&mut self, region: &str, id: &str) -> Option<&mut Feed> {
+        self.feeds
+            .get_mut(id)
+            .filter(|feed| feed.region == region && !feed.is_deleted())
+    }
+
+    /// The feed record `id` names in `region`, INCLUDING one whose deletion has already
+    /// completed.
+    ///
+    /// Only `DeleteFeed` resolves a feed through here, because only a delete may report a
+    /// completed deletion: the operation is `@idempotent` and its response carries the
+    /// feed's status, so a retry of a deletion this store already served answers that
+    /// deletion's own success (`DELETED`) rather than refusing a call the service
+    /// accepted. Every other operation goes through [`Self::feed`] / [`Self::feed_mut`]
+    /// and so sees only live feeds.
+    pub fn feed_including_deleted_mut(&mut self, region: &str, id: &str) -> Option<&mut Feed> {
         self.feeds.get_mut(id).filter(|feed| feed.region == region)
     }
 
-    /// Every feed of `region`, in `FeedId` order — what `ListFeeds` pages over, since
-    /// a list reports the feeds of the endpoint it was sent to and nothing else.
+    /// Every LIVE feed of `region`, in `FeedId` order — what `ListFeeds` pages over,
+    /// since a list reports the feeds of the endpoint it was sent to and nothing else,
+    /// and a feed whose deletion has completed is no longer one of them.
     pub fn feeds_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Feed> + 'a {
-        self.feeds.values().filter(move |feed| feed.region == region)
+        self.feeds
+            .values()
+            .filter(move |feed| feed.region == region && !feed.is_deleted())
     }
 
     /// The one dictionary `id` names in `region`, or `None` when that Region holds no
-    /// such dictionary — the dictionary's counterpart of [`Self::feed`].
+    /// such dictionary — the dictionary's counterpart of [`Self::feed`], with the same
+    /// rule about a completed deletion.
     pub fn dictionary(&self, region: &str, id: &str) -> Option<&Dictionary> {
         self.dictionaries
             .get(id)
-            .filter(|dictionary| dictionary.region == region)
+            .filter(|dictionary| dictionary.region == region && !dictionary.is_deleted())
     }
 
-    /// The one dictionary `id` names in `region`, for a caller that writes it.
+    /// The one live dictionary `id` names in `region`, for a caller that writes it.
     pub fn dictionary_mut(&mut self, region: &str, id: &str) -> Option<&mut Dictionary> {
+        self.dictionaries
+            .get_mut(id)
+            .filter(|dictionary| dictionary.region == region && !dictionary.is_deleted())
+    }
+
+    /// The dictionary record `id` names in `region`, INCLUDING one whose deletion has
+    /// already completed — the dictionary's counterpart of
+    /// [`Self::feed_including_deleted_mut`], and resolved only by `DeleteDictionary`,
+    /// for the same reason.
+    pub fn dictionary_including_deleted_mut(
+        &mut self,
+        region: &str,
+        id: &str,
+    ) -> Option<&mut Dictionary> {
         self.dictionaries
             .get_mut(id)
             .filter(|dictionary| dictionary.region == region)
     }
 
-    /// Every dictionary of `region`, in `DictionaryId` order — what `ListDictionaries`
-    /// pages over.
+    /// Every LIVE dictionary of `region`, in `DictionaryId` order — what
+    /// `ListDictionaries` pages over, and so not one whose deletion has completed.
     pub fn dictionaries_in<'a>(
         &'a self,
         region: &'a str,
     ) -> impl Iterator<Item = &'a Dictionary> + 'a {
         self.dictionaries
             .values()
-            .filter(move |dictionary| dictionary.region == region)
+            .filter(move |dictionary| dictionary.region == region && !dictionary.is_deleted())
     }
 
     /// The refusal `CreateFeed` answers in `region`, or `None` while that Region may
     /// take one more feed.
     ///
     /// A service quota is a PER-REGION figure, so what the Region already holds is what
-    /// decides it: another Region's feeds neither consume it nor are consumed by it.
+    /// decides it: another Region's feeds neither consume it nor are consumed by it, and
+    /// a feed whose deletion has completed holds nothing, since what it consumed went
+    /// with the resource ([`Self::feeds_in`]).
     /// The second clause is the STORE's own bound rather than a quota of the service
-    /// (see [`MAX_REGIONS`]): a Region this store holds no feed of is a new partition,
+    /// (see [`MAX_REGIONS`]): a Region this store holds no record of is a new partition,
     /// and there are at most that many. Each refusal states the bound it was decided
     /// from and reports nothing else about what the account holds.
     pub fn feed_quota_refusal(&self, region: &str) -> Option<String> {
@@ -899,7 +1036,8 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                  Delete unused feeds or request a quota increase."
             ));
         }
-        if held == 0 && self.feed_region_count() >= MAX_REGIONS {
+        let new_partition = !self.feeds.values().any(|feed| feed.region == region);
+        if new_partition && self.feed_region_count() >= MAX_REGIONS {
             return Some(format!(
                 "This account already holds feeds in the maximum of {MAX_REGIONS} Regions. \
                  Delete the feeds of a Region you no longer use or request a quota increase."
@@ -919,7 +1057,11 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                  this Region. Delete unused dictionaries or request a quota increase."
             ));
         }
-        if held == 0 && self.dictionary_region_count() >= MAX_REGIONS {
+        let new_partition = !self
+            .dictionaries
+            .values()
+            .any(|dictionary| dictionary.region == region);
+        if new_partition && self.dictionary_region_count() >= MAX_REGIONS {
             return Some(format!(
                 "This account already holds dictionaries in the maximum of {MAX_REGIONS} \
                  Regions. Delete the dictionaries of a Region you no longer use or request a \
@@ -929,7 +1071,9 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
         None
     }
 
-    /// How many distinct Regions this store holds a feed in.
+    /// How many distinct Regions this store holds a feed record in — live feeds and the
+    /// completed deletions it still reports alike, since what this bounds is how many
+    /// PARTITIONS the store holds (see [`MAX_REGIONS`]).
     fn feed_region_count(&self) -> usize {
         self.feeds
             .values()
@@ -938,7 +1082,8 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
             .len()
     }
 
-    /// How many distinct Regions this store holds a dictionary in.
+    /// How many distinct Regions this store holds a dictionary record in, on the same
+    /// rule as [`Self::feed_region_count`].
     fn dictionary_region_count(&self) -> usize {
         self.dictionaries
             .values()
@@ -960,6 +1105,10 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
     ///
     /// One resolution shared by every operation that reaches a resource by its
     /// `resourceArn`, so none of them can disagree about what an ARN names.
+    ///
+    /// A record whose deletion has COMPLETED is not a resource this store holds: the ARN
+    /// of a deleted feed or dictionary resolves here no more than one of a resource that
+    /// never existed, so a tagging call about it is refused exactly as that one is.
     pub fn tagged_resource_mut(&mut self, resource_arn: &str) -> Option<TaggedResourceMut<'_>> {
         // `arn:<partition>:<service>:<region>:<account>:<kind>/<id>` — field 5 is the
         // resource segment, which the modelled `resourceArn` pattern spells
@@ -969,12 +1118,12 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
             "feed" => self
                 .feeds
                 .get_mut(id)
-                .filter(|feed| feed.arn == resource_arn)
+                .filter(|feed| feed.arn == resource_arn && !feed.is_deleted())
                 .map(TaggedResourceMut::Feed),
             "dictionary" => self
                 .dictionaries
                 .get_mut(id)
-                .filter(|dictionary| dictionary.arn == resource_arn)
+                .filter(|dictionary| dictionary.arn == resource_arn && !dictionary.is_deleted())
                 .map(TaggedResourceMut::Dictionary),
             _ => None,
         }
@@ -1032,49 +1181,57 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
     /// were due at this instant whether or not anybody called, so applying them on a
     /// read changes nothing a later caller would not have seen anyway.
     ///
+    /// A deletion that falls due COMPLETES rather than erases: the record it leaves
+    /// reports that completion ([`Feed::retire`], [`Dictionary::retire`]) and is no
+    /// longer a live resource, and it is pruned once its Region holds more than
+    /// [`MAX_COMPLETED_DELETIONS`] of them.
+    ///
     /// Returns immediately while no move is owed; the scan it then does is over at
-    /// most [`MAX_FEEDS`] + [`MAX_DICTIONARIES`] entries.
+    /// most [`MAX_FEEDS`] + [`MAX_DICTIONARIES`] live entries and the completed
+    /// deletions beside them.
     pub fn settle_due_transitions(&mut self, now: Instant) {
         if self.earliest_due.is_none_or(|due| now < due) {
             return;
         }
-        self.feeds.retain(|_, feed| {
-            let due = feed.transition_due_at.is_some_and(|due| now >= due);
-            if !due {
-                return true;
+        for feed in self.feeds.values_mut() {
+            if feed.transition_due_at.is_none_or(|due| now < due) {
+                continue;
             }
             match feed.status {
-                // A feed whose deletion has completed is gone, so a later GetFeed
-                // answers ResourceNotFoundException.
-                FeedStatus::Deleting => false,
+                // "When deletion of the feed has succeeded, the status will be
+                // DELETED": the accepted deletion is now complete, and the record
+                // reports it to a retry of that delete while no longer being a feed
+                // GetFeed reports or ListFeeds lists.
+                FeedStatus::Deleting => feed.retire(now),
                 // A settled status owes the clock nothing; clear the stale instant.
-                FeedStatus::Available | FeedStatus::Active | FeedStatus::Archived => {
+                FeedStatus::Available
+                | FeedStatus::Active
+                | FeedStatus::Archived
+                | FeedStatus::Deleted => {
                     feed.transition_due_at = None;
-                    true
                 }
             }
-        });
-        self.dictionaries.retain(|_, dictionary| {
+        }
+        for dictionary in self.dictionaries.values_mut() {
             if dictionary.transition_due_at.is_none_or(|due| now < due) {
-                return true;
+                continue;
             }
             match dictionary.status {
-                // A dictionary whose deletion has completed is gone, so a later
-                // GetDictionary answers ResourceNotFoundException.
-                DictionaryStatus::Deleting => false,
+                // The accepted deletion is complete, on the same rule the feed's is:
+                // the record reports it and is no longer a live dictionary.
+                DictionaryStatus::Deleting => dictionary.retire(now),
                 // "After creation succeeds, the status will be AVAILABLE."
                 DictionaryStatus::Creating => {
                     dictionary.status = DictionaryStatus::Available;
                     dictionary.transition_due_at = None;
-                    true
                 }
                 // A settled status owes the clock nothing; clear the stale instant.
-                DictionaryStatus::Available => {
+                DictionaryStatus::Available | DictionaryStatus::Deleted => {
                     dictionary.transition_due_at = None;
-                    true
                 }
             }
-        });
+        }
+        self.prune_completed_deletions();
         self.earliest_due = self
             .feeds
             .values()
@@ -1086,6 +1243,66 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
             )
             .min();
     }
+
+    /// Drop the completed deletions a Region holds past [`MAX_COMPLETED_DELETIONS`],
+    /// oldest first, for feeds and dictionaries alike.
+    ///
+    /// This is what bounds the store: a live resource is already bounded by its Region's
+    /// quota, and the records a completed deletion leaves behind — which consume no
+    /// quota, so nothing else limits how many a caller can accumulate by creating and
+    /// deleting — are bounded here. An id whose record is dropped is one the store holds
+    /// nothing for again, so a delete naming it is refused as any unknown id is.
+    fn prune_completed_deletions(&mut self) {
+        let surplus_feeds = surplus_deletions(self.feeds.values().filter_map(|feed| {
+            feed.deleted_at
+                .map(|at| (feed.region.as_str(), at, feed.id.as_str()))
+        }));
+        for id in surplus_feeds {
+            self.feeds.remove(&id);
+        }
+        let surplus_dictionaries =
+            surplus_deletions(self.dictionaries.values().filter_map(|dictionary| {
+                dictionary
+                    .deleted_at
+                    .map(|at| (dictionary.region.as_str(), at, dictionary.id.as_str()))
+            }));
+        for id in surplus_dictionaries {
+            self.dictionaries.remove(&id);
+        }
+    }
+}
+
+/// The ids to drop so that no Region holds more than [`MAX_COMPLETED_DELETIONS`]
+/// completed deletions, from `(region, deleted_at, id)` for every completed deletion of
+/// one kind of resource.
+///
+/// The surplus is taken from the OLDEST deletions of each Region, so the deletions a
+/// client is most likely to be retrying are the ones that keep being reported, and the
+/// bound is per Region because each Region's records are its own.
+fn surplus_deletions<'a, I>(deletions: I) -> Vec<String>
+where
+    I: Iterator<Item = (&'a str, Instant, &'a str)>,
+{
+    let mut by_region: BTreeMap<&str, Vec<(Instant, &str)>> = BTreeMap::new();
+    for (region, deleted_at, id) in deletions {
+        by_region.entry(region).or_default().push((deleted_at, id));
+    }
+    let mut surplus = Vec::new();
+    for mut held in by_region.into_values() {
+        if held.len() <= MAX_COMPLETED_DELETIONS {
+            continue;
+        }
+        // Oldest first, and by id where two deletions completed in the same settle
+        // pass, so the choice is the same whatever order the store was walked in.
+        held.sort_unstable();
+        let drop_count = held.len() - MAX_COMPLETED_DELETIONS;
+        surplus.extend(
+            held.into_iter()
+                .take(drop_count)
+                .map(|(_, id)| id.to_string()),
+        );
+    }
+    surplus
 }
 
 /// A resource one of this service's tagging operations has reached by its

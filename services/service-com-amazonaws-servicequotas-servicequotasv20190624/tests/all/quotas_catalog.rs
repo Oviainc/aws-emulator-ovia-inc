@@ -16,7 +16,7 @@
 //!   listing, and the applied and default views;
 //! * a listing reports the catalog's PUBLISHED order (not the `QuotaCode` order),
 //!   whatever page size it is walked with, and carries a `NextToken` for exactly as
-//!   long as rows remain.
+//!   long as rows remain after a page a CALLER cut short with `MaxResults`.
 //!
 //! The ARN rule of the two views (an AWS default's account segment is empty) is
 //! pinned by `default_quota_catalog.rs`; the harness (`Client`, `walk_pages`) is the
@@ -25,7 +25,6 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_servicequotas_servicequotasv20190624::state::UNASKED_PAGE_SIZE;
 
 use crate::quota_workflow::{client, emulator, walk_pages, Client};
 
@@ -374,33 +373,30 @@ async fn a_listing_reports_the_published_order_and_pages_with_a_next_token() {
             );
         }
 
-        // A caller that names no MaxResults is served the page size the listing
-        // itself applies (`state::UNASKED_PAGE_SIZE`): the first rows of the
-        // published order, with a token for exactly as long as rows remain —
-        // `MaxResults` "defaults to a value appropriate to the operation", and the
-        // walk from that page yields the same listing.
+        // A caller that names no MaxResults is served the service's WHOLE published
+        // order in one page, with no token after it (`state::UNASKED_PAGE_SIZE`):
+        // `MaxResults` bounds what a caller may ask for, not what the listing serves
+        // when none is named.
         let defaulted = client
             .ok("ListServiceQuotas", json!({"ServiceCode": service_code}))
             .await;
         let unasked = defaulted["Quotas"].as_array().cloned().unwrap_or_default();
-        let expected = UNASKED_PAGE_SIZE.min(quotas.len());
         assert_eq!(
             unasked.len(),
-            expected,
-            "case {service_code} no MaxResults: expected {expected} rows on the unasked page, \
-             got {defaulted}"
+            quotas.len(),
+            "case {service_code} no MaxResults: expected the whole listing of {} rows on the \
+             unasked page, got {defaulted}",
+            quotas.len()
         );
         assert_eq!(
-            unasked,
-            quotas[..expected],
-            "case {service_code} no MaxResults: the unasked page must be the first rows of the \
-             published order"
+            unasked, quotas,
+            "case {service_code} no MaxResults: the unasked page must be the published order \
+             itself"
         );
-        assert_eq!(
-            defaulted["NextToken"].is_string(),
-            expected < quotas.len(),
-            "case {service_code} no MaxResults: a NextToken is present exactly while rows \
-             remain, got {defaulted}"
+        assert!(
+            defaulted["NextToken"].is_null(),
+            "case {service_code} no MaxResults: the whole listing is the last page, so no \
+             NextToken follows it, got {defaulted}"
         );
     }
 

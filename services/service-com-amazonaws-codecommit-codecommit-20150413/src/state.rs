@@ -155,6 +155,18 @@ pub const MAX_OBJECT_BYTES_PER_REPOSITORY: usize = 64 * 1024 * 1024;
 /// by `DeleteRepository`.
 pub const MAX_BRANCHES_PER_REPOSITORY: usize = 64;
 
+/// How many commits that no ref names one repository keeps readable — the
+/// commits `CreateUnreferencedMergeCommit` writes.
+///
+/// The emulator's OWN bound, for exactly the reason
+/// [`MAX_BRANCHES_PER_REPOSITORY`] gives and at the same figure: a retained
+/// unreferenced commit roots its own history against
+/// [`Repository::prune_history`], so an unbounded number of them would pin an
+/// unbounded number of commits and defeat [`MAX_COMMITS_RETAINED`]. The oldest
+/// are released first ([`Repository::retain_unreferenced`]), and every record is
+/// released by `DeleteRepository`.
+pub const MAX_UNREFERENCED_COMMITS: usize = MAX_BRANCHES_PER_REPOSITORY;
+
 /// How many tags one repository holds before a push refuses to create another.
 ///
 /// The emulator's OWN bound, for exactly the reason
@@ -203,6 +215,32 @@ pub const MAX_COMMITS_PROJECTED_PER_REQUEST: usize = MAX_COMMITS_RETAINED;
 /// runs off the async worker — see `crate::service`'s `off_the_async_worker`.
 pub const MAX_PROJECTION_SECONDS: u64 = 2;
 
+/// A wall-clock deadline: the instant a piece of caller-driven CPU work has to
+/// be finished by.
+///
+/// One type, so the two budgets this crate threads through such work — the push
+/// projection's [`ProjectionBudget`] and a merge's
+/// [`merge::MergeBudget`] — keep one reading of "out of time" rather than two
+/// copies of it, each wording the refusal its own caller needs.
+#[derive(Debug)]
+pub struct Deadline {
+    at: std::time::Instant,
+}
+
+impl Deadline {
+    /// A deadline `seconds` from now.
+    pub fn in_seconds(seconds: u64) -> Self {
+        Self {
+            at: std::time::Instant::now() + std::time::Duration::from_secs(seconds),
+        }
+    }
+
+    /// Whether the work is already out of time.
+    pub fn passed(&self) -> bool {
+        std::time::Instant::now() > self.at
+    }
+}
+
 /// What ONE request's whole projection may still spend: commits, tree entries
 /// and time.
 ///
@@ -215,7 +253,7 @@ pub const MAX_PROJECTION_SECONDS: u64 = 2;
 pub struct ProjectionBudget {
     commits_left: usize,
     entries_left: usize,
-    deadline: std::time::Instant,
+    deadline: Deadline,
 }
 
 impl Default for ProjectionBudget {
@@ -230,8 +268,7 @@ impl ProjectionBudget {
         Self {
             commits_left: MAX_COMMITS_PROJECTED_PER_REQUEST,
             entries_left: MAX_TREE_ENTRIES_PER_REQUEST,
-            deadline: std::time::Instant::now()
-                + std::time::Duration::from_secs(MAX_PROJECTION_SECONDS),
+            deadline: Deadline::in_seconds(MAX_PROJECTION_SECONDS),
         }
     }
 
@@ -268,7 +305,7 @@ impl ProjectionBudget {
     }
 
     fn check_deadline(&self) -> Result<(), String> {
-        if std::time::Instant::now() > self.deadline {
+        if self.deadline.passed() {
             return Err(format!(
                 "this request took longer than the {MAX_PROJECTION_SECONDS} seconds this emulator spends projecting a push"
             ));
@@ -813,6 +850,14 @@ pub struct Repository {
     /// The sequence number the next comment takes: comments are reported in the
     /// order they were posted.
     pub next_comment_sequence: u64,
+    /// Commits this repository keeps although NO ref names them: what
+    /// `CreateUnreferencedMergeCommit` writes, which "can only be accessed using
+    /// the GetCommit API or through git commands such as git fetch". They are
+    /// roots for [`Repository::prune_history`] exactly as a ref is — an id a
+    /// response handed out has to stay readable — but they are NOT refs, so they
+    /// are never advertised to a git client by [`Repository::refs`]. Bounded by
+    /// [`MAX_UNREFERENCED_COMMITS`].
+    pub unreferenced_commits: BTreeSet<String>,
     /// Pull requests opened against this repository, keyed by the numeric
     /// `pullRequestId`, so the map's order IS the order the ids were minted in.
     /// Bounded by [`MAX_PULL_REQUESTS_PER_REPOSITORY`].
@@ -1117,8 +1162,38 @@ impl Repository {
             comments: BTreeMap::new(),
             comment_tokens: BTreeMap::new(),
             next_comment_sequence: 0,
+            unreferenced_commits: BTreeSet::new(),
             pull_requests: BTreeMap::new(),
             pull_request_tokens: BTreeMap::new(),
+        }
+    }
+
+    /// Keep a commit no ref names readable: record it as a retained unreferenced
+    /// commit, so [`Repository::prune_history`] treats it as a root.
+    ///
+    /// The oldest retained ids are released once there are more than
+    /// [`MAX_UNREFERENCED_COMMITS`] of them, which is what keeps a repository's
+    /// retained history bounded when nothing ever references these commits.
+    pub fn retain_unreferenced(&mut self, commit_id: String) {
+        self.unreferenced_commits.insert(commit_id);
+        while self.unreferenced_commits.len() > MAX_UNREFERENCED_COMMITS {
+            // The commit with the lowest write sequence is the oldest; an id
+            // whose projection is already gone is older than any still held.
+            let oldest = self
+                .unreferenced_commits
+                .iter()
+                .min_by_key(|id| {
+                    self.commits
+                        .get(id.as_str())
+                        .map_or(0, |commit| commit.sequence.saturating_add(1))
+                })
+                .cloned();
+            match oldest {
+                Some(id) => {
+                    self.unreferenced_commits.remove(&id);
+                }
+                None => break,
+            }
         }
     }
 
@@ -1655,7 +1730,15 @@ impl Repository {
     /// beyond [`MAX_COMMITS_RETAINED`] (never a ref's tip), so an older commit id
     /// becomes one the repository no longer holds while every ref stays readable.
     pub fn prune_history(&mut self) {
-        let roots: Vec<String> = self.refs().into_iter().map(|(_, id)| id).collect();
+        // Every ref, AND every unreferenced commit this repository was asked to
+        // keep: an id `CreateUnreferencedMergeCommit` handed a caller has to stay
+        // readable, so it roots its objects just as a ref does.
+        let roots: Vec<String> = self
+            .refs()
+            .into_iter()
+            .map(|(_, id)| id)
+            .chain(self.unreferenced_commits.iter().cloned())
+            .collect();
         let reachable = self.reachable_from(&roots);
         self.objects.retain(|id, _| reachable.contains(id));
         self.commits.retain(|id, _| reachable.contains(id));
@@ -2577,15 +2660,41 @@ pub fn qualified_reference(branch: &str) -> String {
     format!("{HEADS_PREFIX}{branch}")
 }
 
+/// The folder a path lives in: everything before its last `/`, and the empty string
+/// for a path at the root of the tree. The ONE place this crate keys a tree snapshot
+/// by folder, so no reading of CodeCommit's folder rule can key it differently.
+pub fn folder_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(folder, _)| folder)
+}
+
 /// The total content size of the folder a path lives in, over the sizes a tree
 /// snapshot records for that folder's immediate entries.
+///
+/// A caller charging EVERY folder of a tree reads them in one pass instead
+/// ([`folder_content_bytes_by_folder`]); this is the per-path question, for a
+/// write that touches one folder.
 pub fn folder_content_bytes(files: &BTreeMap<String, FileEntry>, path: &str) -> i64 {
-    let folder = path.rsplit_once('/').map_or("", |(folder, _)| folder);
+    let folder = folder_of(path);
     files
         .iter()
-        .filter(|(other, _)| other.rsplit_once('/').map_or("", |(folder, _)| folder) == folder)
+        .filter(|(other, _)| folder_of(other) == folder)
         .map(|(_, entry)| entry.size)
         .fold(0i64, i64::saturating_add)
+}
+
+/// The total content size of EVERY folder of a tree snapshot, keyed by that folder
+/// ([`folder_of`], so the root folder is the empty key).
+///
+/// [`folder_content_bytes`] for the whole tree in ONE pass, for a caller that charges
+/// every folder a write touches rather than the one folder a single path lives in —
+/// the same sizes, summed the same saturating way, so the two cannot drift.
+pub fn folder_content_bytes_by_folder(files: &BTreeMap<String, FileEntry>) -> BTreeMap<&str, i64> {
+    let mut folders: BTreeMap<&str, i64> = BTreeMap::new();
+    for (path, entry) in files {
+        let total = folders.entry(folder_of(path)).or_insert(0);
+        *total = total.saturating_add(entry.size);
+    }
+    folders
 }
 
 /// The `blobId` of a file's bytes.
@@ -2998,6 +3107,13 @@ pub fn keep_empty_folders<'a>(
     candidates.dedup();
     let mut written: Vec<String> = Vec::new();
     for folder in candidates {
+        // A name the tree now holds as a FILE is not a folder to keep: a git tree
+        // holds one or the other under a name, never both, so a placeholder there
+        // would build a snapshot no tree can encode. The file the write put there
+        // is what the folder's name now holds.
+        if files.contains_key(folder) {
+            continue;
+        }
         let prefix = format!("{folder}/");
         if files.keys().any(|path| path.starts_with(&prefix)) {
             continue;

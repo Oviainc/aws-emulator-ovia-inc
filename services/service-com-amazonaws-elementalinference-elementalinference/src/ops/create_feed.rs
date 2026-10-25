@@ -337,6 +337,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy: None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             transition_due_at: None,
+            // A feed that has just been created holds no completed deletion to report.
+            deleted_at: None,
         };
 
         // Built from the record that is about to be stored, so GetFeed answers with

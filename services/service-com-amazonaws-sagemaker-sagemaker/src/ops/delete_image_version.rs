@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteImageVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteImageVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteImageVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: releases the ONE version of the request's image that its `Version` or its
+//! `Alias` names, leaving every other version of that image, and the image itself, in
+//! `crate::state`. A version a Studio app is still running on is refused with the modelled
+//! `ResourceInUse`, an image or a selection that resolves to nothing with the modelled
+//! `ResourceNotFound`, and a request naming neither or both selectors with a 400
+//! `ValidationException`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +134,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteImageVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteImageVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteImageVersion"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `Version` and `Alias` are two ways to name ONE version, and this operation —
+        // unlike the sibling reader, whose model documents the latest version as its
+        // default — documents no default at all: a request carrying both, or neither,
+        // states no single version to release. The model can express neither rule, so
+        // each refusal is a 400 naming both members rather than a guess at which version
+        // was meant.
+        let selection = match (input.version, input.alias.as_deref()) {
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Version and Alias both select a single image version, so exactly one \
+                     of them must be specified.",
+                ))
+            }
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Exactly one of Version and Alias must be specified to select the \
+                     image version to delete.",
+                ))
+            }
+            (Some(version), None) => Selection::Version(version),
+            (None, Some(alias)) => Selection::Alias(alias),
+        };
+
+        let region = crate::state::request_region(ctx);
+        let image_arn = crate::state::resource_arn(&region, "image", &input.image_name);
+
+        let mut store = state.lock();
+
+        // A version only exists as a version OF an image, so an `ImageName` no image is
+        // stored under resolves nothing, and is reported exactly as the image reader
+        // reports it.
+        if !store.images.contains_key(&input.image_name) {
+            return Err(DeleteImageVersionErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::image_does_not_exist(&image_arn)),
+            })
+            .into());
+        }
+
+        // The selection resolves against the image's stored versions: an explicit
+        // `Version` is the version number itself, an `Alias` is the version that alias is
+        // attached to.
+        let selected = match selection {
+            Selection::Version(version) => store
+                .image_versions
+                .contains_key(&(input.image_name.clone(), version))
+                .then_some(version),
+            Selection::Alias(alias) => store
+                .versions_of(&input.image_name)
+                .find(|version| version.aliases.iter().any(|held| held == alias))
+                .map(|version| version.version),
+        };
+
+        let Some(selected) = selected else {
+            // The image is there but holds no version the selection resolves to —
+            // including one a previous delete already released — so the resource being
+            // accessed is not found, named by what of it could not be resolved.
+            return Err(DeleteImageVersionErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(selection.not_found_message(
+                    &region,
+                    &input.image_name,
+                    &image_arn,
+                )),
+            })
+            .into());
+        };
+
+        let key = (input.image_name.clone(), selected);
+        let version_arn = store
+            .image_versions
+            .get(&key)
+            .map(|version| version.arn.clone())
+            .ok_or_else(|| {
+                // Unreachable: the key was just resolved from this same locked store.
+                crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE)
+            })?;
+
+        // An app launched on this version keeps the spec it launched with, so the version
+        // is in use for as long as that app is in the store: releasing it would leave the
+        // app naming a version nothing holds. `ResourceInUse` is the in-use failure this
+        // operation models.
+        if let Some(app_arn) = store.app_running_on_image_version(&version_arn) {
+            let message =
+                format!("Image version \"{version_arn}\" is in use by app \"{app_arn}\".");
+            return Err(DeleteImageVersionErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        // ONE version leaves the store: the image itself and its other versions stay, and
+        // the image's version counter is NOT rewound — a version number is part of a
+        // version's ARN, so it is never handed to a second container image. The container
+        // image this version represents is external to this service, so nothing of it is
+        // touched.
+        store.image_versions.remove(&key);
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &version_arn, ctx);
+        Ok(DeleteImageVersionOutput {})
+    }
+}
+
+/// Which of the two selectors a request used to name ONE version of an image. They are
+/// alternatives, so the resolution reads one of them instead of two `Option`s whose
+/// remaining combinations the handler already refused.
+#[derive(Debug, Clone, Copy)]
+enum Selection<'request> {
+    Version(i32),
+    Alias(&'request str),
+}
+
+impl Selection<'_> {
+    /// The `ResourceNotFound` message for a selection that resolves to no stored version
+    /// of the image, worded as the sibling reader words the same failure: a version
+    /// identified by its NUMBER is named by that version's own ARN, while an alias
+    /// determines no ARN and so is named beside the image's.
+    fn not_found_message(&self, region: &str, image_name: &str, image_arn: &str) -> String {
+        match self {
+            Self::Version(version) => crate::state::image_version_does_not_exist(
+                &crate::state::image_version_arn(region, image_name, *version),
+            ),
+            Self::Alias(alias) => crate::state::image_version_not_resolved(
+                image_arn,
+                &format!("alias \"{alias}\""),
+            ),
+        }
     }
 }

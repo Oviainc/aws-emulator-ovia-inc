@@ -228,7 +228,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
+        // The account this call acts on. An absent `AccountId` is the standalone
+        // call on the caller's own account; a PRESENT one names a member account
+        // of the caller's organization, which the caller's own account is not —
+        // so naming it is the modelled authorization refusal.
+        let account_id = match crate::state::target_account_id(input.account_id.as_deref()) {
+            Ok(account_id) => account_id,
+            Err(denied) => {
+                return Err(ListRegionsErrorModeled::AccessDeniedException(denied).into())
+            }
+        };
         let now = ::std::time::SystemTime::now();
         let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
             .unwrap_or(MAX_PAGE_SIZE as usize);

@@ -184,7 +184,11 @@ fn lifecycle_rows() -> Vec<Row> {
                 "BudgetLimit": {"Amount": "3.5", "Unit": "GB"},
                 "TimeUnit": "DAILY",
                 "BudgetType": "USAGE",
-                "TimePeriod": {"Start": 1_704_067_200, "End": 1_735_689_600},
+                // The window has to END in the future: a budget past its
+                // `TimePeriod$End` is deleted with everything hanging off it
+                // (`tests/all/budget_end_date_expiry.rs`), so a lifecycle row needs one
+                // that is still running.
+                "TimePeriod": {"Start": 1_704_067_200, "End": 3_471_292_800_i64},
                 "CostTypes": {"IncludeTax": false, "UseAmortized": true}
             }),
             notifications: json!([]),
@@ -193,7 +197,7 @@ fn lifecycle_rows() -> Vec<Row> {
                 "BudgetLimit": {"Amount": "7", "Unit": "GB"},
                 "TimeUnit": "DAILY",
                 "BudgetType": "USAGE",
-                "TimePeriod": {"Start": 1_704_067_200, "End": 1_767_225_600}
+                "TimePeriod": {"Start": 1_704_067_200, "End": 3_502_828_800_i64}
             }),
         },
         Row {
@@ -1412,7 +1416,9 @@ async fn mutually_exclusive_budget_members_are_refused() {
                 "TimeUnit": "CUSTOM",
                 "BudgetType": "COST",
                 "BudgetLimit": limit.clone(),
-                "TimePeriod": {"Start": 1_704_067_200, "End": 1_735_689_600}
+                // An end date that is still ahead: a window that has already ended
+                // takes the budget with it (`tests/all/budget_end_date_expiry.rs`).
+                "TimePeriod": {"Start": 1_704_067_200, "End": 3_471_292_800_i64}
             }),
         ),
     ];

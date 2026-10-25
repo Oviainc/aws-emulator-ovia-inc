@@ -3,9 +3,11 @@
 //! @op DeleteFeed
 //! IMPLEMENTED: moves the stored feed into the transient `DELETING` status (HTTP 202
 //! accepts the deletion rather than completing it) and records when the deletion
-//! falls due; once it does, the feed is gone from state, so GetFeed answers
-//! `ResourceNotFoundException` and ListFeeds no longer lists it. An id no live feed
-//! has is a `ResourceNotFoundException` (HTTP 404).
+//! falls due; once it does the deletion has SUCCEEDED, so the feed is no longer a live
+//! feed — GetFeed answers `ResourceNotFoundException` and ListFeeds no longer lists it —
+//! and the completed deletion is what a retry of this `@idempotent` call reports, with
+//! the documented `DELETED` status. An id this Region holds no feed and no completed
+//! deletion for is a `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -174,8 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The feed is resolved WITHIN the request's Region: a delete may only accept
         // the removal of a feed this endpoint holds, so an id naming another Region's
-        // feed earns the modelled not-found refusal and nothing is retired.
-        let Some(feed) = state.feed_mut(&region, &input.id) else {
+        // feed earns the modelled not-found refusal and nothing is retired. A feed whose
+        // deletion this store has already COMPLETED resolves here too, and only here:
+        // this call is `@idempotent`, so a retry of a deletion the service accepted is
+        // answered with that deletion's own outcome rather than refused.
+        let Some(feed) = state.feed_including_deleted_mut(&region, &input.id) else {
             return Err(DeleteFeedErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::NOT_FOUND_MESSAGE.to_string(),
@@ -184,10 +189,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A deletion that has already SUCCEEDED is reported as such ("When deletion of
+        // the feed has succeeded, the status will be DELETED",
+        // `DeleteFeedResponse$status`): the retry repeats the answer the served deletion
+        // earned, and the clock owes that feed nothing more.
+        if feed.is_deleted() {
+            return Ok(DeleteFeedOutput {
+                arn: feed.arn.clone(),
+                id: feed.id.clone(),
+                status: feed.status.as_wire().to_string(),
+            });
+        }
+
         // 202: the deletion is accepted, not completed. The feed reports DELETING
-        // until the clock makes the removal due, after which it is gone. Repeating
-        // the call inside that window is idempotent: the removal stays due at the
-        // instant the first call set, so polling DeleteFeed cannot postpone it.
+        // until the clock makes the deletion due. Repeating the call inside that window
+        // is idempotent: the deletion stays due at the instant the first call set, so
+        // polling DeleteFeed cannot postpone it.
         let due = match (feed.status, feed.transition_due_at) {
             (crate::state::FeedStatus::Deleting, Some(due)) => due,
             _ => feed.enter_transient(crate::state::FeedStatus::Deleting, now),

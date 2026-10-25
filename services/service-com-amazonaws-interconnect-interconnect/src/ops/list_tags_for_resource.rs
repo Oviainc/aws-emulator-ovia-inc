@@ -70,14 +70,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 #[smithy_macros::operation_error(
     "com.amazonaws.interconnect#ListTagsForResource",
     extra_errors = [
-        "ResourceNotFoundException",
+        "InterconnectClientException",
         "InterconnectValidationException",
         "InterconnectServerException",
     ]
 )]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
-    ResourceNotFoundException(ResourceNotFoundException),
+    InterconnectClientException(InterconnectClientException),
     InterconnectValidationException(InterconnectValidationException),
     InterconnectServerException(InterconnectServerException),
 }
@@ -136,14 +136,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// `UntagResource` last left in the store, with no key the store does not hold
     /// and none of the ones it does left out. Listing tags never changes a tag set,
     /// so two calls with no tag write in between answer the same, and an `arn` that
-    /// names no resource of this service is a 404 rather than an empty listing: "no
-    /// tags" and "no resource" are different answers.
+    /// names no resource of this service is refused rather than answered with an
+    /// empty listing: "no tags" and "no resource" are different answers. The two
+    /// ways an `arn` can name no resource are refused with DIFFERENT codes, so a
+    /// caller can tell them apart: one outside the scope the request addresses is a
+    /// fault in the request, and one inside it that names nothing is this service's
+    /// own client fault.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InterconnectServerException(
                 InterconnectServerException {
@@ -159,12 +162,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of the connection whose tags these are. An ARN the boundary validator let
         // through that still does not parse as one is refused as invalid INPUT,
         // never with a 501.
-        if crate::state::connection_id_from_arn(&input.arn).is_none() {
+        let Some(parsed) = crate::state::parse_connection_arn(&input.arn) else {
             return Err(
                 ListTagsForResourceErrorModeled::InterconnectValidationException(
                     InterconnectValidationException {
                         message: crate::state::not_a_connection_arn_message(&input.arn),
                     },
+                )
+                .into(),
+            );
+        };
+
+        // An ARN identifies its resource in FULL, so one whose partition, Region or
+        // account is not the one this request addresses names a resource outside the
+        // scope the caller is talking to — a fault in the REQUEST, refused as
+        // invalid input, and a DIFFERENT code from an in-scope ARN that merely names
+        // nothing (below), which is what lets a caller tell "wrong account" from "no
+        // such resource".
+        if let Some(message) =
+            crate::state::arn_scope_violation(&parsed, &crate::state::request_region(ctx))
+        {
+            return Err(
+                ListTagsForResourceErrorModeled::InterconnectValidationException(
+                    InterconnectValidationException { message },
                 )
                 .into(),
             );
@@ -183,10 +203,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|stored| stored.connection.tags.clone())
         };
 
+        // In scope and well-formed, but naming no connection this account holds (an
+        // id that was never allocated, or one whose connection has reached the
+        // terminal deleted state): this service's own CLIENT fault, the modelled 400,
+        // not a 404.
         let Some(tags) = found else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::connection_not_retrievable_message(&input.arn)),
+            return Err(ListTagsForResourceErrorModeled::InterconnectClientException(
+                InterconnectClientException {
+                    message: crate::state::connection_not_retrievable_message(&input.arn),
                 },
             )
             .into());

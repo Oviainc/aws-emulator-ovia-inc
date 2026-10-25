@@ -48,23 +48,10 @@ pub const INVALID_TARGET_TYPE_MESSAGE: &str =
      Redshift Managed Storage (RMS) as the target.";
 
 /// The id this service assigns a new integration: the 8-4-4-4-12 lowercase-hexadecimal
-/// token `IntegrationArn`'s pattern requires, derived from the store's one monotone
-/// counter through the maintained `sha2` digest so two integrations cannot share one.
+/// token `IntegrationArn`'s pattern requires, minted from the store's one monotone counter
+/// by [`super::mint_uuid_token`] so two integrations cannot share one.
 pub fn mint_integration_id(mint: u64) -> String {
-    use ::sha2::{Digest, Sha256};
-
-    let digest = Sha256::digest(format!("integration:{mint}"));
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    let hex = ::hex::encode(bytes);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
+    super::mint_uuid_token("integration", mint)
 }
 
 /// Refuse a `TargetArn` that is not the ARN of an acceptable integration target.

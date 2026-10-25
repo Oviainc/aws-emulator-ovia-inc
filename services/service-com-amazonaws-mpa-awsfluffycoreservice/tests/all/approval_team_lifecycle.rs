@@ -1324,6 +1324,7 @@ async fn the_store_refuses_to_grow_past_its_team_quota() {
                 policies: vec![policy_arn(1)],
                 version_id: "1".to_string(),
                 version: 1,
+                version_seq: 1,
                 status: state::TeamStatus::Active,
                 status_code: None,
                 status_message: None,
@@ -1331,6 +1332,7 @@ async fn the_store_refuses_to_grow_past_its_team_quota() {
                 last_update_time: None,
                 deletion_start_time: None,
                 deletion_completion_time: None,
+                pending_update: None,
                 tags: std::collections::BTreeMap::new(),
                 seq,
             });

@@ -5,9 +5,10 @@
 //! The rule under test: for every `imageIds` entry, the call reports the manifest of
 //! the stored image that answers to every part of that entry, and reports the entry
 //! itself in `failures` — with the `ImageFailureCode` that says why — when no stored
-//! image does; the call as a whole fails only when the repository it names is not in
-//! this registry, or when it names another registry. So a batch is per-entry: a miss
-//! never hides a hit, and an empty repository answers 200 with every entry failed.
+//! image does; the call as a whole fails only when the repository it names is not here,
+//! or when it names another registry. So a batch is per-entry: a miss never hides a hit,
+//! and an empty repository answers 200 with every entry failed. Which SCHEMA each
+//! manifest is served in is the `manifest_media_type_negotiation` suite's rule.
 //!
 //! The wire plumbing is the crate's shared harness (`tests/all/wire.rs`); the seeding
 //! helpers are the lifecycle suite's.
@@ -442,11 +443,14 @@ async fn an_empty_repository_reports_each_entry_as_a_failure() {
     );
 }
 
-/// `acceptedMediaTypes` says which manifest schemas the client understands. This
-/// registry stores every manifest as it was pushed and converts nothing, so the list
-/// never changes which identifier resolves or what is reported for it.
+/// `acceptedMediaTypes` says which manifest schemas the client understands, and the
+/// registry serves each image in one of them: the negotiation itself — which schema is
+/// served, and what the served document is — is the
+/// `manifest_media_type_negotiation` suite's. What belongs here is that it changes nothing
+/// about RESOLUTION: the same identifier resolves to the same stored image, reported with
+/// the same digest, tag, registry and repository, whatever the list says.
 #[tokio::test]
-async fn accepted_media_types_do_not_change_the_answer() {
+async fn accepted_media_types_do_not_change_which_image_resolves() {
     let router = seeded("media-types").await;
 
     // The media types the member documents, plus a list naming none of the stored
@@ -483,16 +487,25 @@ async fn accepted_media_types_do_not_change_the_answer() {
             request["acceptedMediaTypes"] = accepted.clone();
         }
         let answer = ok(&router, case, "BatchGetImage", &request).await;
-        assert_single(
-            case,
-            "media-types",
-            &json!({"imageTag": "v1"}),
-            &answer,
-            &Expected::Image {
-                manifest: MANIFEST_DOCKER_V2,
-                media_type: Some("application/vnd.docker.distribution.manifest.v2+json"),
-                tag: Some("v1"),
-            },
+        assert_eq!(
+            at(&answer, "/failures"),
+            json!([]),
+            "case {case:?}: the stored image resolves whatever is accepted, got {answer:?}"
+        );
+        assert_eq!(
+            at(&answer, "/images/0/imageId"),
+            json!({"imageDigest": manifest_digest(MANIFEST_DOCKER_V2), "imageTag": "v1"}),
+            "case {case:?}: the same identifier resolves to the same image, got {answer:?}"
+        );
+        assert_eq!(
+            at(&answer, "/images/0/repositoryName"),
+            json!("media-types"),
+            "case {case:?}: expected the repository named, got {answer:?}"
+        );
+        assert_eq!(
+            at(&answer, "/images/0/registryId"),
+            json!(REGISTRY_ID),
+            "case {case:?}: expected this registry named, got {answer:?}"
         );
     }
 }
