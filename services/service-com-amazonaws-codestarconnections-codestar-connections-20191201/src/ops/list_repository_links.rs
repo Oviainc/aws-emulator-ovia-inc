@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRepositoryLinks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRepositoryLinks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRepositoryLinks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the repository links this service holds, a page at a time.
+//! A page is computed from the persisted link store, never fabricated.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +149,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRepositoryLinks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRepositoryLinksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRepositoryLinks"))
+        // A pure report over the link store: it pages the records this service HOLDS,
+        // each rendered through the store's ONE projection onto the wire shape
+        // (`StoredRepositoryLink::to_repository_link_info`), so what a page carries and
+        // what `CreateRepositoryLink` / `GetRepositoryLink` answered for the same link
+        // are the same record. Nothing is written, so listing never perturbs what a
+        // later caller sees.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRepositoryLinksErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "CodeStar connections state is unavailable on this engine".to_string(),
+                ),
+            })
+        })?;
+
+        // `MaxResults` is modeled `range 0..100` with `default 0`, so an omitted page
+        // size arrives as 0 and means "no page size requested"; the modeled maximum is
+        // then the largest page this operation may return.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => crate::state::MAX_PAGE_SIZE,
+            Ok(requested) => requested.min(crate::state::MAX_PAGE_SIZE),
+        };
+
+        // The cursor is this service's own opaque token
+        // ([`crate::state::encode_next_token`]); nothing else is a valid one. A value
+        // that is not one names no page, which is a malformed input rather than an
+        // absent resource, so it is refused with the modeled `InvalidInputException`
+        // naming the member.
+        let resume_from = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_next_token(token).ok_or_else(|| {
+                ListRepositoryLinksErrorModeled::InvalidInputException(InvalidInputException {
+                    message: Some(format!(
+                        "The input is not valid. NextToken is not a pagination token \
+                         issued by this service: {token}"
+                    )),
+                })
+            })?,
+        };
+
+        let store = state.lock();
+        // The ordered suffix the cursor names: every link from the resume point on, of
+        // which the page below is the first `page_size`.
+        let mut from_cursor = store
+            .repository_links_in_creation_order()
+            .into_iter()
+            .filter(|link| link.sequence >= resume_from);
+
+        // Only this page is CLONED into the response, plus a peek at the one record that
+        // says where the next page starts; ordering the store's links beforehand is what
+        // makes that resume point well defined.
+        let repository_links: Vec<RepositoryLinkInfo> = from_cursor
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::StoredRepositoryLink::to_repository_link_info)
+            .collect();
+        // A token is emitted only when a further page exists, and it names where that
+        // page starts — so paging through N links yields each exactly once.
+        let next_token = from_cursor
+            .next()
+            .map(|link| crate::state::encode_next_token(link.sequence));
+        drop(store);
+
+        Ok(ListRepositoryLinksOutput {
+            repository_links,
+            next_token,
+        })
     }
 }

@@ -36,9 +36,9 @@
 //! link's own ARN (a link is a resource of this service, so it is taggable) together
 //! with `CreateRepositoryLink`'s duplicate-triple refusal; `GetRepositoryLink` reads the
 //! same records back by id, and the rules it follows are asserted in
-//! `repository_link_reads`, which reuses this suite's table. `ListRepositoryLinks` is
-//! still a scaffold stub with its own open issue
-//! (`20261023T122922Z-codestar-connections-listrepositorylinks-stub.md`).
+//! `repository_link_reads`, which reuses this suite's table. `ListRepositoryLinks` pages
+//! over the same records, and the rules it follows are asserted in
+//! `repository_link_listing`, which reuses this suite's table too.
 
 use serde_json::{Value, json};
 
