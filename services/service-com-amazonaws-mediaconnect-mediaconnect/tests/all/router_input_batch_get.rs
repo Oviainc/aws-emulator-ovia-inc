@@ -31,7 +31,7 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 use crate::flow_lifecycle::Emulator;
 use crate::router_input_deletion::seed_router_input;
 use crate::router_input_restart::{
-    configuration_rows, create_body, create_router_input, get_router_input, union_member,
+    create_body, create_router_input, get_router_input, minted_configuration_rows, union_member,
 };
 
 /// An ARN satisfying the modelled `RouterInputArn` pattern
@@ -110,7 +110,7 @@ async fn batch_get_reports_the_stored_router_input_every_arn_addresses() {
     // One input per configuration union variant (and per ingest protocol for a standard
     // one): what the input's `InputType` and `StreamDetails` follow from, so the rule is
     // asserted over the whole class.
-    let rows = configuration_rows();
+    let rows = minted_configuration_rows(&emulator, "batch").await;
     let mut created: Vec<(String, String, &'static str, &'static str, &'static str)> = Vec::new();
     for (kind, member_name, json_name, configuration, expected_input_type) in rows {
         let name = format!("batch-{kind}").replace('/', "-");
@@ -253,7 +253,8 @@ async fn batch_get_answers_each_requested_arn_once_and_errors_for_the_rest() {
     let emulator = Emulator::new();
 
     // Three stored inputs to address, created through the wire like any client's.
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "batch-arns")
+        .await
         .into_iter()
         .next()
         .expect("the configuration catalog has a row");

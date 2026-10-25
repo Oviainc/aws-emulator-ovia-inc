@@ -20,6 +20,13 @@
 //! [`crate::state::ComAmazonawsEventbridgeAwseventsState::invocations`] (see
 //! [`deliver`]).
 //!
+//! Routing also feeds the ARCHIVES of the entry's bus: "if you do not specify a
+//! pattern to filter events sent to the archive, all events are sent to the
+//! archive" (`CreateArchive`), so every archive of that bus that has reached
+//! `ENABLED` and whose `EventPattern` matches captures the envelope
+//! ([`crate::state::ArchiveRecord::capture`]), which is what `DescribeArchive`
+//! counts.
+//!
 //! An entry naming a bus this account does not hold is nonetheless ACCEPTED and
 //! given an `EventId`: the destination is not a property of the entry, and this
 //! operation models no error for a missing one. Such an event is routed nowhere
@@ -230,8 +237,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (entry, rule) pair. No pattern is evaluated under the lock.
         let mut routing: ::std::collections::BTreeMap<String, Option<Vec<CompiledRule>>> =
             ::std::collections::BTreeMap::new();
+        // The archives of each bus these entries name, compiled the same way and
+        // for the same reason: an archive's `EventPattern` is parsed ONCE here and
+        // evaluated with no lock held.
+        let mut archiving: ::std::collections::BTreeMap<String, Vec<CompiledArchive>> =
+            ::std::collections::BTreeMap::new();
         {
             let mut store = state.lock();
+            // An archive whose clock has already made its `ENABLED` state due is
+            // settled first, so one that became due before this request captures
+            // this request's events.
+            store.settle_archives(now);
             for slot in &mut screened {
                 let Screened::Accepted(accepted) = slot else {
                     continue;
@@ -241,6 +257,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         bus.rules.values().filter_map(CompiledRule::of).collect::<Vec<_>>()
                     });
                     routing.insert(accepted.bus.clone(), compiled);
+                    archiving.insert(
+                        accepted.bus.clone(),
+                        store
+                            .archives
+                            .values()
+                            .filter(|archive| archive.event_bus_name == accepted.bus)
+                            .filter_map(CompiledArchive::of)
+                            .collect(),
+                    );
                 }
                 // Minted for every accepted entry, whether or not the bus it
                 // names is one this account holds: the id is the ingestion
@@ -266,6 +291,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // target receives is the whole envelope, rendered ONCE per event rather
         // than per target.
         let mut dispatches: Vec<Dispatch> = Vec::new();
+        // What each archive of the entry's bus captured, appended to the archives
+        // in the next pass under the lock.
+        let mut captures: Vec<Capture> = Vec::new();
         let mut failed = 0usize;
         for slot in screened {
             let accepted = match slot {
@@ -290,8 +318,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
                 continue;
             };
-            match evaluate(&accepted, &region, rules) {
-                Routed::Matched { matched, rendered } => {
+            // The archives of this bus see the event independently of its rules:
+            // an archive captures what its OWN `EventPattern` matches, so an
+            // event that matched no rule is archived all the same.
+            let archives: &[CompiledArchive] =
+                archiving.get(&accepted.bus).map_or(&[], Vec::as_slice);
+            match evaluate(&accepted, &region, rules, archives) {
+                Routed::Matched {
+                    matched,
+                    rendered,
+                    captured,
+                } => {
+                    captures.extend(captured);
                     deliveries.push(crate::state::DeliveredEvent {
                         event_id: accepted.event_id.clone(),
                         bus: accepted.bus.clone(),
@@ -335,11 +373,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // PASS 4 — back under the lock, briefly, to append the routing log.
-        if !deliveries.is_empty() {
+        // PASS 4 — back under the lock, briefly, to append the routing log and
+        // what the archives of each bus captured.
+        if !deliveries.is_empty() || !captures.is_empty() {
             let mut store = state.lock();
             for delivery in deliveries {
                 store.record_delivery(delivery);
+            }
+            for capture in captures {
+                if let Some(archive) = store.archive_mut(&capture.archive) {
+                    archive.capture(capture.event);
+                }
             }
         }
 
@@ -653,12 +697,13 @@ fn screen(
 
 /// What routing made of one accepted entry.
 enum Routed {
-    /// The rules it matched, and the text to hand each of their targets —
-    /// `None` when no matched rule has a target, so nothing is delivered and
-    /// the envelope is never rendered.
+    /// The rules it matched, the text to hand each of their targets — `None`
+    /// when no matched rule has a target, so nothing is delivered — and what
+    /// the archives of its bus captured.
     Matched {
         matched: Vec<MatchedRule>,
         rendered: Option<String>,
+        captured: Vec<Capture>,
     },
     /// The entry's matching budget was spent before every rule was evaluated,
     /// so no verdict was reached.
@@ -666,7 +711,7 @@ enum Routed {
 }
 
 /// Evaluate one accepted entry: build its event envelope, match it against the
-/// rules of its bus, and render what a target receives.
+/// rules and the archives of its bus, and render what a target receives.
 ///
 /// The three are done TOGETHER, and the parse tree never leaves this call: the
 /// envelope carries the entry's `Detail` parsed, so building it, matching
@@ -674,7 +719,12 @@ enum Routed {
 /// nests. Doing them in one place is what makes that depth paid for ONCE per
 /// entry, bounded by `crate::state::MAX_DETAIL_DEPTH` — the published depth a
 /// document may nest to, which the parse charges itself.
-fn evaluate(accepted: &Accepted, region: &str, rules: &[CompiledRule]) -> Routed {
+fn evaluate(
+    accepted: &Accepted,
+    region: &str,
+    rules: &[CompiledRule],
+    archives: &[CompiledArchive],
+) -> Routed {
     let envelope = crate::state::event_envelope(
         &accepted.event_id,
         region,
@@ -687,14 +737,32 @@ fn evaluate(accepted: &Accepted, region: &str, rules: &[CompiledRule]) -> Routed
     let Some(matched) = route(&envelope, rules) else {
         return Routed::BudgetSpent;
     };
+    let capturing = capturing_archives(&envelope, archives);
     // Rendered ONCE per event, and only for an event that has somewhere to go:
     // the text is as large as the entry, so an event no target is waiting for
-    // is never serialized.
-    let rendered = matched
-        .iter()
-        .any(|rule| !rule.targets.is_empty())
-        .then(|| envelope.to_string());
-    Routed::Matched { matched, rendered }
+    // and no archive keeps is never serialized.
+    let delivers = matched.iter().any(|rule| !rule.targets.is_empty());
+    let text = if delivers || !capturing.is_empty() {
+        envelope.to_string()
+    } else {
+        String::new()
+    };
+    let captured: Vec<Capture> = capturing
+        .into_iter()
+        .map(|archive| Capture {
+            archive,
+            event: crate::state::ArchivedEvent {
+                event_id: accepted.event_id.clone(),
+                envelope: text.clone(),
+                time: accepted.time,
+            },
+        })
+        .collect();
+    Routed::Matched {
+        matched,
+        rendered: delivers.then_some(text),
+        captured,
+    }
 }
 
 /// Route one accepted entry's envelope: the rules whose `EventPattern` matches
@@ -766,6 +834,73 @@ struct CompiledRule {
     name: String,
     pattern: ::serde_json::Map<String, ::serde_json::Value>,
     targets: Vec<CompiledTarget>,
+}
+
+/// One archive of a bus, ready to capture: its name and the parsed `EventPattern`
+/// that decides what it keeps, `None` for an archive that keeps everything.
+///
+/// Built once per request from the stored archive, for the reason
+/// [`CompiledRule`] gives.
+struct CompiledArchive {
+    name: String,
+    pattern: Option<::serde_json::Map<String, ::serde_json::Value>>,
+}
+
+impl CompiledArchive {
+    /// The compiled form of `archive`, or `None` when it captures nothing: one
+    /// that has not reached `ENABLED` yet ("incoming events might not immediately
+    /// start being sent to the archive"), or whose pattern no longer parses.
+    fn of(archive: &crate::state::ArchiveRecord) -> Option<Self> {
+        if !archive.captures_events() {
+            return None;
+        }
+        let pattern = match archive.event_pattern.as_deref() {
+            // "If you do not specify a pattern to filter events sent to the
+            // archive, all events are sent to the archive".
+            None => None,
+            Some(pattern) => Some(crate::state::event_pattern::parse(pattern).ok()?),
+        };
+        Some(Self {
+            name: archive.name.clone(),
+            pattern,
+        })
+    }
+}
+
+/// One event an archive captured, and which archive captured it.
+struct Capture {
+    archive: String,
+    event: crate::state::ArchivedEvent,
+}
+
+/// The names of the archives that capture this envelope.
+///
+/// Spends its OWN budget, separate from routing's: an archive's pattern cannot
+/// make the entry's routing verdict unreliable, and an exhausted budget means the
+/// remaining archives capture nothing rather than capturing on a half-evaluated
+/// verdict.
+fn capturing_archives(
+    envelope: &::serde_json::Value,
+    archives: &[CompiledArchive],
+) -> Vec<String> {
+    let mut budget =
+        crate::state::event_pattern::Budget::new(crate::state::MAX_MATCH_BYTES_PER_ENTRY);
+    let mut capturing: Vec<String> = Vec::new();
+    for archive in archives {
+        let held = match &archive.pattern {
+            None => true,
+            Some(pattern) => {
+                crate::state::event_pattern::matches_parsed(pattern, envelope, &mut budget)
+            }
+        };
+        if held {
+            capturing.push(archive.name.clone());
+        }
+        if budget.spent() {
+            break;
+        }
+    }
+    capturing
 }
 
 /// One target of a matched rule, with what decides WHAT it receives, who it is

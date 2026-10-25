@@ -856,10 +856,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `VoiceId` decides which engines and languages the request may name, and the
         // voice catalog is where that is recorded — so the check reads the same state
-        // `DescribeVoices` reports and the two cannot disagree. A voice the seeded
-        // catalog does not carry is not narrowed at all: the catalog is a stated
-        // subset of Amazon Polly's voices, and refusing a real `VoiceId` because this
-        // emulator has not seeded it yet would be worse than not checking.
+        // `DescribeVoices` reports and the two cannot disagree. The catalog carries
+        // every voice the model declares, so every `VoiceId` that reaches here is
+        // narrowed by the voice's own engines and languages.
         if let Some(voice) = state
             .lock()
             .voices

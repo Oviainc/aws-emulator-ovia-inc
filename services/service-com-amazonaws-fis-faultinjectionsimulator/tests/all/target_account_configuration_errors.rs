@@ -134,8 +134,15 @@ async fn send(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
 }
 
 /// A `CreateExperimentTemplate` body carrying `role_arn`, with everything else the
-/// operation requires.
+/// operation requires, and the `accountTargeting` a target account configuration belongs
+/// to: `accountTargeting` and the configurations a template holds state the same thing
+/// between them, so a configuration is only created on a template that targets MULTIPLE
+/// accounts.
 fn template_body(label: &str, role_arn: &str) -> Value {
+    template_body_targeting(label, role_arn, "multi-account")
+}
+
+fn template_body_targeting(label: &str, role_arn: &str, targeting: &str) -> Value {
     let token: String = label
         .chars()
         .map(|c| if c.is_whitespace() { '-' } else { c })
@@ -145,6 +152,7 @@ fn template_body(label: &str, role_arn: &str) -> Value {
         "description": format!("target account configuration refusal suite: {label}"),
         "roleArn": role_arn,
         "stopConditions": [{ "source": "none" }],
+        "experimentOptions": { "accountTargeting": targeting },
         // `aws:fis:wait` takes a required `duration` parameter (an ISO 8601 duration
         // within the documented 1 to 720 minutes), which the create refuses without.
         "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT5M" } } }
@@ -154,16 +162,31 @@ fn template_body(label: &str, role_arn: &str) -> Value {
 /// Create an experiment template to hang target account configurations off, and report
 /// its minted id.
 async fn template(router: &MultiServiceRouter, label: &str) -> String {
-    let answer = send(
+    created_template(
         router,
-        "POST",
-        "/experimentTemplates",
-        Some(template_body(
+        label,
+        template_body(label, "arn:aws:iam::000000000000:role/fis-refusals"),
+    )
+    .await
+}
+
+/// Create an experiment template that targets a SINGLE account — the documented default —
+/// for a case whose experiment holds no target account configuration.
+async fn single_account_template(router: &MultiServiceRouter, label: &str) -> String {
+    created_template(
+        router,
+        label,
+        template_body_targeting(
             label,
             "arn:aws:iam::000000000000:role/fis-refusals",
-        )),
+            "single-account",
+        ),
     )
-    .await;
+    .await
+}
+
+async fn created_template(router: &MultiServiceRouter, label: &str, body: Value) -> String {
+    let answer = send(router, "POST", "/experimentTemplates", Some(body)).await;
     assert_eq!(
         answer.status, 200,
         "case {label:?}: expected HTTP 200 from CreateExperimentTemplate, got {} with {:?}",
@@ -700,7 +723,7 @@ async fn an_experiment_scoped_configuration_miss_names_the_experiment_and_the_ac
 #[tokio::test]
 async fn a_next_token_no_list_issued_answers_the_services_constant_message() {
     let router = emulator();
-    let template_id = template(&router, "next-token-rule").await;
+    let template_id = single_account_template(&router, "next-token-rule").await;
     let configurations = format!("/experimentTemplates/{template_id}/targetAccountConfigurations");
     let experiment_id = start_experiment(&router, &template_id, "next-token-rule").await;
     let experiment_configurations =

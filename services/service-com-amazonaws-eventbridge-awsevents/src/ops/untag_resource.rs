@@ -158,6 +158,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let mut store = state.lock();
+        // "You cannot modify these managed rules by using DisableRule, EnableRule,
+        // PutTargets, PutRule, TagResource, or UntagResource"
+        // (`ManagedRuleException`).
+        if let Some(rule) = store.managed_rule_of(&resource) {
+            return Err(UntagResourceErrorModeled::ManagedRuleException(
+                ManagedRuleException {
+                    message: Some(crate::state::managed_rule_tag_refusal(&rule)),
+                },
+            )
+            .into());
+        }
         let Some(stored) = store.tags_of_mut(&resource) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

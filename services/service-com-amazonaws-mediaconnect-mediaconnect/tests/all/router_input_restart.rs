@@ -23,14 +23,6 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::{Emulator, REGION};
 
-/// A router network interface ARN, as the modelled `RouterNetworkInterfaceArn` pattern
-/// fixes it (`^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerNetworkInterface:[a-z0-9]{12}$`).
-///
-/// An ARN of that form no CreateRouterNetworkInterface minted, so this account holds no
-/// such interface: the member is a reference this emulator stores as given (CreateRouterInput
-/// models no `NotFoundException`, so a create cannot refuse an interface it cannot resolve).
-const NETWORK_INTERFACE_ARN: &str =
-    "arn:aws:mediaconnect:us-east-1:000000000000:routerNetworkInterface:0000000000a1";
 
 /// Long enough for a transition the clock owes to be due: twice
 /// [`mc::TRANSITION_SPAN`], so a settled state is never read early.
@@ -135,6 +127,16 @@ pub(crate) fn union_member<'a>(payload: &'a Value, member_name: &str, json_name:
         .unwrap_or(&Value::Null)
 }
 
+/// One row of [`configuration_rows`]: `(case, union member name, jsonName, configuration,
+/// expected InputType)`.
+pub(crate) type ConfigurationRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Value,
+    &'static str,
+);
+
 /// The five `RouterInputConfiguration` union members the model declares
 /// (`smithy_query(query="shape",shape="RouterInputConfiguration")`: Standard,
 /// MediaLiveChannel, Failover, MediaConnectFlow, Merge), as
@@ -144,17 +146,17 @@ pub(crate) fn union_member<'a>(payload: &'a Value, member_name: &str, json_name:
 /// `StreamDetails` follow from, so the restart rule is asserted over the whole class rather
 /// than over one configuration.
 ///
+/// `interface_arn` is the router network interface a STANDARD / FAILOVER / MERGE input
+/// ingests on and `flow_arn` the flow a MEDIACONNECT FLOW input takes its content from: both
+/// are resources of THIS service, which the create resolves against the store, so both must
+/// be ones the account HOLDS — see [`minted_configuration_rows`], which mints them over the
+/// wire. The MediaLive channel belongs to another service, so it stays a constant.
+///
 /// `pub(crate)` because the router input START suite spans the same class (see
 /// `tests/all/router_input_start.rs`), as does the batch read suite (see
 /// `tests/all/router_input_batch_get.rs`), so there is one configuration table rather than
 /// one per suite.
-pub(crate) fn configuration_rows() -> Vec<(
-    &'static str,
-    &'static str,
-    &'static str,
-    Value,
-    &'static str,
-)> {
+pub(crate) fn configuration_rows(interface_arn: &str, flow_arn: &str) -> Vec<ConfigurationRow> {
     let automatic_decryption = json!({
         "encryptionKeyType": "AUTOMATIC",
         "encryptionKeyConfiguration": union("Automatic", "automatic", json!({})),
@@ -168,7 +170,7 @@ pub(crate) fn configuration_rows() -> Vec<(
                 "Standard",
                 "standard",
                 json!({
-                    "networkInterfaceArn": NETWORK_INTERFACE_ARN,
+                    "networkInterfaceArn": interface_arn,
                     "protocol": "RTP",
                     "protocolConfiguration": union(
                         "Rtp",
@@ -187,7 +189,7 @@ pub(crate) fn configuration_rows() -> Vec<(
                 "Standard",
                 "standard",
                 json!({
-                    "networkInterfaceArn": NETWORK_INTERFACE_ARN,
+                    "networkInterfaceArn": interface_arn,
                     "protocol": "SRT_LISTENER",
                     "protocolConfiguration": union(
                         "SrtListener",
@@ -206,7 +208,7 @@ pub(crate) fn configuration_rows() -> Vec<(
                 "Failover",
                 "failover",
                 json!({
-                    "networkInterfaceArn": NETWORK_INTERFACE_ARN,
+                    "networkInterfaceArn": interface_arn,
                     "sourcePriorityMode": "PRIMARY_SECONDARY",
                     "primarySourceIndex": 0,
                     "protocolConfigurations": [
@@ -229,7 +231,7 @@ pub(crate) fn configuration_rows() -> Vec<(
                 "Merge",
                 "merge",
                 json!({
-                    "networkInterfaceArn": NETWORK_INTERFACE_ARN,
+                    "networkInterfaceArn": interface_arn,
                     "mergeRecoveryWindowMilliseconds": 500,
                     "protocolConfigurations": [
                         union("Rtp", "rtp", json!({ "port": 5004 })),
@@ -251,7 +253,7 @@ pub(crate) fn configuration_rows() -> Vec<(
                 "MediaConnectFlow",
                 "mediaConnectFlow",
                 json!({
-                    "flowArn": "arn:aws:mediaconnect:us-east-1:000000000000:flow:1-0000000a:upstream",
+                    "flowArn": flow_arn,
                     "sourceTransitDecryption": automatic_decryption.clone(),
                 }),
             ),
@@ -273,6 +275,24 @@ pub(crate) fn configuration_rows() -> Vec<(
             "MEDIALIVE_CHANNEL",
         ),
     ]
+}
+
+/// [`configuration_rows`] against resources this account HOLDS: one router network interface
+/// and one flow, both minted over the wire on `emulator` through the helpers the router
+/// output suite owns, named after `prefix` so one emulator can hold several sets.
+///
+/// Every suite that creates a router input goes through this, because the create resolves
+/// every reference of THIS service a configuration names against the store (see
+/// `tests/all/router_input_configuration_targets.rs`).
+pub(crate) async fn minted_configuration_rows(
+    emulator: &Emulator,
+    prefix: &str,
+) -> Vec<ConfigurationRow> {
+    let interface_arn =
+        crate::router_outputs::minted_network_interface(emulator, &format!("rni-{prefix}")).await;
+    let (flow_arn, _) =
+        crate::router_outputs::minted_flow_source(emulator, &format!("flow-{prefix}")).await;
+    configuration_rows(&interface_arn, &flow_arn)
 }
 
 /// A minimal valid CreateRouterInput body for `configuration`.
@@ -407,7 +427,7 @@ async fn restart_recovers_every_kind_of_router_input_and_the_clock_returns_it() 
 
     let mut restarted: Vec<(String, String, &str)> = Vec::new();
     for (kind, member_name, json_name, configuration, expected_input_type) in
-        configuration_rows()
+        minted_configuration_rows(&emulator, "restart-kinds").await
     {
         for (started_in, expected_settled) in state_rows {
             let case = format!("{kind} from {started_in}");
@@ -509,7 +529,8 @@ async fn restart_recovers_every_kind_of_router_input_and_the_clock_returns_it() 
 #[tokio::test]
 async fn a_restart_is_refused_while_a_state_change_is_in_flight() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "in-flight")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
@@ -663,7 +684,8 @@ async fn an_arn_that_addresses_no_router_input_is_not_found() {
 #[tokio::test]
 async fn a_created_router_input_round_trips_through_get() {
     let emulator = Emulator::new();
-    let (_, _, _, standard_configuration, _) = configuration_rows()
+    let (_, _, _, standard_configuration, _) = minted_configuration_rows(&emulator, "round-trip")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
@@ -836,7 +858,8 @@ async fn a_created_router_input_round_trips_through_get() {
 #[tokio::test]
 async fn a_router_input_may_not_exceed_the_bitrate_its_tier_allows() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "tier-bitrate")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
@@ -920,7 +943,8 @@ async fn routed_outputs_counts_the_router_outputs_routed_to_the_input() {
     let emulator = Emulator::new();
     let output_interface =
         crate::router_outputs::minted_network_interface(&emulator, "rni-ri-routed").await;
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "routed-outputs")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
@@ -1000,7 +1024,8 @@ async fn routed_outputs_counts_the_router_outputs_routed_to_the_input() {
 #[tokio::test]
 async fn a_restart_is_refused_while_the_input_is_being_deleted() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "being-deleted")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
@@ -1057,7 +1082,8 @@ async fn a_restart_is_refused_while_the_input_is_being_deleted() {
 #[tokio::test]
 async fn create_refuses_past_the_router_input_store_ceiling() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "store-ceiling")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
@@ -1111,7 +1137,8 @@ async fn create_refuses_past_the_router_input_store_ceiling() {
 #[tokio::test]
 async fn an_availability_zone_must_belong_to_the_router_inputs_region() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "zone")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");

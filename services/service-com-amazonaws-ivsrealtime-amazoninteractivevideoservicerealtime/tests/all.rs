@@ -39,6 +39,8 @@ mod participant_events;
 mod participant_replication;
 #[path = "all/participants.rs"]
 mod participants;
+#[path = "all/response_headers.rs"]
+mod response_headers;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
 #[path = "all/stage_sessions.rs"]
