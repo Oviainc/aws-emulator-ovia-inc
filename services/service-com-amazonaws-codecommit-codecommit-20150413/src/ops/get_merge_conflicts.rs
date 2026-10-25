@@ -1,15 +1,49 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMergeConflicts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMergeConflicts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: evaluates merging the source commit into the destination commit, both
+//! resolved out of `crate::state`, against their merge base, and reports the paths whose
+//! two sides cannot both be taken, with `mergeable` true exactly when none remain.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMergeConflicts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! WHICH paths those are is `crate::state::merge::evaluate`, the one merge evaluation
+//! every merge question in this service shares (`GetMergeOptions` answers from the same
+//! one): it walks both tips' histories to their merge base, compares the union of the
+//! three snapshots at the requested detail level and resolution strategy, and charges
+//! every phase of that to one per-request budget. What this file adds is the REPORT this
+//! operation makes about each path that evaluation names — the three sides of the path and
+//! which of its facets they disagree about — plus the paging the output models.
+//!
+//! Where the model leaves a choice, this handler's chosen reading is:
+//!
+//! * `FAST_FORWARD_MERGE` is mergeable exactly when the destination commit is already an
+//!   ancestor of the source — the evaluation's `is_fast_forward` — and its
+//!   `conflictMetadataList` is always empty, which the output member documents outright.
+//!   `SQUASH_MERGE` and `THREE_WAY_MERGE` both take the same comparison: they differ in
+//!   the commit a merge WRITES, not in what conflicts.
+//! * A facet of a path (its content, its mode, its kind of object) is a disagreement only
+//!   where both sides moved that facet away from the base and moved it differently; a
+//!   facet only one side moved is that side's change. Content is a disagreement too where
+//!   one side deleted the path the other changed, since that change cannot be carried
+//!   into a file that is gone.
+//! * `numberOfConflicts` is how many of those facets disagree — "the number of conflicts,
+//!   including both hunk conflicts and metadata conflicts" — and never fewer than the one
+//!   disagreement that put the path in the list.
+//! * A commit specifier that cannot name a commit at all — neither a git object id nor a
+//!   reference name — is refused as `Invalid{Source,Destination}CommitSpecifierException`,
+//!   while one that is well formed but names nothing stored is
+//!   `CommitDoesNotExistException`.
+//! * `TipsDivergenceExceededException` is what two tips sharing no commit at all answer:
+//!   there is no base to evaluate either side's changes against, which is what the model
+//!   words "the divergence between the tips of the provided commit specifiers is too great
+//!   to determine whether there might be any merge conflicts".
+//!
+//! `MaximumItemsToCompareExceededException` and `MaximumFileContentToLoadExceededException`
+//! are what bound the comparison: the shared evaluation's budget charges every commit
+//! walked, every path compared and every byte of content loaded into a three-way merge,
+//! refuses a single file version past its byte or LINE bound rather than merging it, and
+//! carries the deadline, so a caller cannot drive an unbounded span of work. The
+//! evaluation also runs off the async worker (`crate::service::off_the_async_worker`), so
+//! the store lock it holds is never held on a worker thread that other requests need.
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +176,259 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+
+use crate::state::{FileEntry, Repository};
+
+// ---------------------------------------------------------------------------
+// Describing a conflicting path
+//
+// WHICH paths a merge cannot reconcile is `crate::state::merge`, the merge
+// evaluation every merge question in this service shares (`GetMergeOptions`
+// answers from the same one). What this file adds is the REPORT this operation
+// makes about a path that evaluation named: the three sides of it, and which of
+// its facets they disagree about.
+// ---------------------------------------------------------------------------
+
+/// `objectType` values the model's `ObjectTypeEnum` declares, catalogued by the
+/// generated `OBJECT_TYPE_ENUM_VALUES`. A commit's tree in this store holds
+/// files and the folders their paths imply, so `GIT_LINK` — a submodule — is a
+/// type no stored tree reports.
+pub const OBJECT_TYPE_FILE: &str = "FILE";
+pub const OBJECT_TYPE_DIRECTORY: &str = "DIRECTORY";
+pub const OBJECT_TYPE_SYMBOLIC_LINK: &str = "SYMBOLIC_LINK";
+
+/// `changeType` values the model's `ChangeTypeEnum` declares, catalogued by the
+/// generated `CHANGE_TYPE_ENUM_VALUES`: what one side of a merge did to a path —
+/// added it, modified it, deleted it.
+pub const CHANGE_TYPE_ADDED: &str = "A";
+pub const CHANGE_TYPE_MODIFIED: &str = "M";
+pub const CHANGE_TYPE_DELETED: &str = "D";
+
+/// How many of a blob's leading bytes are examined before it is called binary:
+/// git's own test, which looks for a NUL byte in the first 8000 bytes of a file.
+const BINARY_SNIFF_BYTES: usize = 8_000;
+
+/// Is this blob binary rather than text? A NUL byte in the leading
+/// [`BINARY_SNIFF_BYTES`] is git's own test, and content whose leading bytes are
+/// not valid UTF-8 is binary here too, because its lines cannot be compared at
+/// all. Only that prefix is examined, whatever the file's size, so the test costs
+/// the same for every blob.
+fn is_binary(content: &[u8]) -> bool {
+    let sniffed = &content[..content.len().min(BINARY_SNIFF_BYTES)];
+    if sniffed.contains(&0) {
+        return true;
+    }
+    match ::std::str::from_utf8(sniffed) {
+        Ok(_) => false,
+        // An error with no length is the prefix ending in the middle of a
+        // character — the cut, not the content, so the content is still text.
+        Err(error) => error.error_len().is_some(),
+    }
+}
+
+// Which paths a merge of two commits cannot reconcile is
+// `crate::state::merge::evaluate` — the crate's ONE merge evaluation, shared
+// with `GetMergeOptions` and whatever merge operation lands next, so no two of
+// them can answer the same question differently. It also owns the bounds one
+// request's evaluation may spend (paths compared, content loaded, commits
+// walked, time) and reports what it ran out of as
+// `crate::state::merge::MergeProblem`, which this handler reports as the
+// modelled error for that limit.
+//
+// What is left here is what this operation reports ON TOP of that answer: for
+// each conflicting path, the metadata `ConflictMetadata` carries about the three
+// sides of it.
+
+/// What one commit's tree holds at one path: the file entry, if any, and whether
+/// the tree holds entries BELOW the path, which is what makes that path a
+/// directory in that commit.
+#[derive(Debug, Clone, Copy)]
+struct TreeSlot<'tree> {
+    entry: Option<&'tree FileEntry>,
+    directory: bool,
+}
+
+impl<'tree> TreeSlot<'tree> {
+    /// Read what `files` holds at `path`.
+    ///
+    /// The directory test walks the keys just above `path` for as long as they
+    /// still begin with it — those are the only keys that could sit BELOW it —
+    /// and asks whether one of them continues with a separator. No prefix string
+    /// is built, because this runs three times (base, source, destination) for
+    /// every path a merge compares.
+    fn at(files: &'tree BTreeMap<String, FileEntry>, path: &str) -> Self {
+        let directory = files
+            .range::<str, _>((::std::ops::Bound::Excluded(path), ::std::ops::Bound::Unbounded))
+            .take_while(|(other, _)| other.starts_with(path))
+            .any(|(other, _)| other.as_bytes().get(path.len()) == Some(&b'/'));
+        Self {
+            entry: files.get(path),
+            directory,
+        }
+    }
+
+    /// The modeled `ObjectTypeEnum` value for what sits here, or `None` where
+    /// this commit holds nothing at the path at all.
+    fn object_type(&self) -> Option<&'static str> {
+        match self.entry {
+            Some(entry) if entry.file_mode == crate::state::FILE_MODE_SYMLINK => {
+                Some(OBJECT_TYPE_SYMBOLIC_LINK)
+            }
+            Some(_) => Some(OBJECT_TYPE_FILE),
+            None => self.directory.then_some(OBJECT_TYPE_DIRECTORY),
+        }
+    }
+
+    /// Do two commits hold the very same thing here? The file entries are
+    /// compared by [`crate::state::merge::same_entry`], the same reading the
+    /// shared merge evaluation decides "unchanged" by, plus whether the path is
+    /// a directory in both.
+    fn same_as(&self, other: &Self) -> bool {
+        self.directory == other.directory
+            && crate::state::merge::same_entry(self.entry, other.entry)
+    }
+
+    /// The `ChangeTypeEnum` value for how this slot differs from the merge
+    /// base's, or `None` where this side left the path exactly as the base had
+    /// it.
+    fn change_from(&self, base: &Self) -> Option<&'static str> {
+        if self.same_as(base) {
+            return None;
+        }
+        match (base.object_type().is_some(), self.object_type().is_some()) {
+            (false, true) => Some(CHANGE_TYPE_ADDED),
+            (true, false) => Some(CHANGE_TYPE_DELETED),
+            _ => Some(CHANGE_TYPE_MODIFIED),
+        }
+    }
+
+    /// The size this side records for the file, and `0` where it holds none —
+    /// the default the model gives every `FileSizes` member.
+    fn size(&self) -> i64 {
+        self.entry.map_or(0, |entry| entry.size)
+    }
+
+    /// The modeled `fileMode` of the file this side holds, absent where it holds
+    /// none.
+    fn file_mode(&self) -> Option<String> {
+        self.entry.map(|entry| entry.file_mode.clone())
+    }
+}
+
+/// The metadata this operation reports for ONE path a merge evaluation could not
+/// reconcile: which facet of the path the two sides disagree about, and what each
+/// of the three sides holds there.
+///
+/// WHETHER a path conflicts is [`crate::state::merge::evaluate`]'s answer, shared
+/// with every other merge question this service answers; this function only
+/// describes a path that evaluation already named, by reading the three tree
+/// snapshots and the stored blobs of the sides that hold a file.
+///
+/// A facet is a disagreement when both sides hold the path and moved that facet
+/// away from the base DIFFERENTLY — a different blob (content), a different mode,
+/// a different kind of object: a facet only one side moved is that side's change
+/// and reconciles, which is the same reading [`crate::state::merge`] decides a
+/// conflict by. Content is also a disagreement where one side no longer holds the
+/// path at all, because the other side's change cannot be carried into a file
+/// that is gone. At `LINE_LEVEL` a path is reported only when its lines could not
+/// be merged, so a content difference on a reported path is a content conflict
+/// there too.
+fn conflict_metadata(
+    repository: &Repository,
+    path: &str,
+    base: TreeSlot<'_>,
+    source: TreeSlot<'_>,
+    destination: TreeSlot<'_>,
+) -> ConflictMetadata {
+    let content_of =
+        |slot: &TreeSlot<'_>| slot.entry.and_then(|entry| repository.blob(&entry.blob_id));
+
+    let object_type_conflict = match (source.object_type(), destination.object_type()) {
+        (Some(mine), Some(theirs)) => {
+            mine != theirs
+                && base
+                    .object_type()
+                    .is_none_or(|base| base != mine && base != theirs)
+        }
+        _ => false,
+    };
+    let file_mode_conflict = match (source.entry, destination.entry) {
+        (Some(mine), Some(theirs)) => {
+            mine.file_mode != theirs.file_mode
+                && base.entry.is_none_or(|base| {
+                    base.file_mode != mine.file_mode && base.file_mode != theirs.file_mode
+                })
+        }
+        _ => false,
+    };
+    let content_conflict = match (source.entry, destination.entry) {
+        (Some(mine), Some(theirs)) => {
+            mine.blob_id != theirs.blob_id
+                && base.entry.is_none_or(|base| {
+                    base.blob_id != mine.blob_id && base.blob_id != theirs.blob_id
+                })
+        }
+        // One side no longer holds a file where the other does: that side has no
+        // content left to carry the other side's change into.
+        (Some(_), None) | (None, Some(_)) => true,
+        // Neither side holds a file at the path — whatever these two sides
+        // disagree about here, it is not the file's content.
+        (None, None) => false,
+    };
+
+    // "The number of conflicts, including both hunk conflicts and metadata
+    // conflicts": the facets above that disagree, and never fewer than the one
+    // disagreement that put this path in the list.
+    let counted = usize::from(content_conflict)
+        + usize::from(file_mode_conflict)
+        + usize::from(object_type_conflict);
+    let number_of_conflicts = i32::try_from(counted.max(1)).unwrap_or(i32::MAX);
+
+    ConflictMetadata {
+        file_path: Some(path.to_string()),
+        file_sizes: Some(FileSizes {
+            source: source.size(),
+            destination: destination.size(),
+            base: base.size(),
+        }),
+        file_modes: Some(FileModes {
+            source: source.file_mode(),
+            destination: destination.file_mode(),
+            base: base.file_mode(),
+        }),
+        object_types: Some(ObjectTypes {
+            source: source.object_type().map(str::to_string),
+            destination: destination.object_type().map(str::to_string),
+            base: base.object_type().map(str::to_string),
+        }),
+        number_of_conflicts,
+        // A sniff of each side's leading bytes (see [`is_binary`]), so the test
+        // costs the same whatever the file's size.
+        is_binary_file: Some(IsBinaryFile {
+            source: content_of(&source).map(is_binary),
+            destination: content_of(&destination).map(is_binary),
+            base: content_of(&base).map(is_binary),
+        }),
+        content_conflict,
+        file_mode_conflict,
+        object_type_conflict,
+        merge_operations: Some(MergeOperations {
+            source: source.change_from(&base).map(str::to_string),
+            destination: destination.change_from(&base).map(str::to_string),
+        }),
+    }
+}
+
+/// Can this specifier name a commit at all? `CommitName` is "the branch, tag,
+/// HEAD, or other fully qualified reference used to identify a commit (for
+/// example, a branch name or a full commit ID)", so a git object id and any git
+/// reference name can; anything git itself would refuse as a reference name
+/// cannot, and that is what the `Invalid…CommitSpecifierException` pair reports.
+fn names_a_commit(specifier: &str) -> bool {
+    crate::state::is_object_id(specifier) || crate::state::is_valid_branch_name(specifier)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -231,18 +518,325 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMergeConflicts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMergeConflictsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMergeConflicts"))
+        let _ = ctx;
+
+        // The three enum members. A value outside an enum is already refused at
+        // the boundary (as the modelled `Invalid…Exception`, see
+        // `crate::service`); these keep the handler's own invariant explicit, and
+        // settle the defaults the members document. The catalogs they are checked
+        // against are the model-generated ones in `super::types`, so a model
+        // change cannot leave a second, divergent copy here. Every member is
+        // read EXACTLY as it arrived: an enum value is the value the model
+        // declares, so surrounding space makes it a different value, not the same
+        // one — the service refuses it, and so does this handler.
+        let merge_option = input.merge_option.as_str();
+        if merge_option.is_empty() {
+            return Err(GetMergeConflictsErrorModeled::MergeOptionRequiredException(
+                MergeOptionRequiredException {
+                    message: Some("a merge option or strategy is required".to_string()),
+                },
+            )
+            .into());
+        }
+        if !MERGE_OPTION_TYPE_ENUM_VALUES.contains(&merge_option) {
+            return Err(GetMergeConflictsErrorModeled::InvalidMergeOptionException(
+                InvalidMergeOptionException {
+                    message: Some(format!("the merge option {merge_option} is not valid")),
+                },
+            )
+            .into());
+        }
+        let detail_level = input
+            .conflict_detail_level
+            .as_deref()
+            .unwrap_or(crate::state::merge::CONFLICT_DETAIL_FILE_LEVEL);
+        if !CONFLICT_DETAIL_LEVEL_TYPE_ENUM_VALUES.contains(&detail_level) {
+            return Err(
+                GetMergeConflictsErrorModeled::InvalidConflictDetailLevelException(
+                    InvalidConflictDetailLevelException {
+                        message: Some(format!(
+                            "the conflict detail level {detail_level} is not valid"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let resolution_strategy = input
+            .conflict_resolution_strategy
+            .as_deref()
+            .unwrap_or(crate::state::merge::CONFLICT_RESOLUTION_NONE);
+        if !CONFLICT_RESOLUTION_STRATEGY_TYPE_ENUM_VALUES.contains(&resolution_strategy) {
+            return Err(
+                GetMergeConflictsErrorModeled::InvalidConflictResolutionStrategyException(
+                    InvalidConflictResolutionStrategyException {
+                        message: Some(format!(
+                            "the conflict resolution strategy {resolution_strategy} is not valid"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Both specifiers are required, so the boundary already refused an absent
+        // one; one that carries nothing at all specifies no commit, and one that
+        // is neither an object id nor a reference name cannot name a commit —
+        // which is what a specifier of spaces is, since git refuses a reference
+        // name holding one.
+        let source_specifier = input.source_commit_specifier.as_str();
+        let destination_specifier = input.destination_commit_specifier.as_str();
+        if source_specifier.is_empty() || destination_specifier.is_empty() {
+            return Err(GetMergeConflictsErrorModeled::CommitRequiredException(
+                CommitRequiredException {
+                    message: Some("a commit was not specified".to_string()),
+                },
+            )
+            .into());
+        }
+        if !names_a_commit(source_specifier) {
+            return Err(
+                GetMergeConflictsErrorModeled::InvalidSourceCommitSpecifierException(
+                    InvalidSourceCommitSpecifierException {
+                        message: Some(format!(
+                            "the source commit specifier {source_specifier} is not valid: \
+                             provide a valid branch name, tag, or full commit ID"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !names_a_commit(destination_specifier) {
+            return Err(
+                GetMergeConflictsErrorModeled::InvalidDestinationCommitSpecifierException(
+                    InvalidDestinationCommitSpecifierException {
+                        message: Some(format!(
+                            "the destination commit specifier {destination_specifier} is not \
+                             valid: provide a valid branch name, tag, or full commit ID"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The repository name is the store's key, read exactly as it arrived. The
+        // boundary refuses a value outside the model's `RepositoryName`
+        // constraints (len 1..100, pattern ^[\w\.-]+$) as
+        // `InvalidRepositoryNameException` / `RepositoryNameRequiredException`,
+        // see `crate::service`; the check here is the same invariant stated for a
+        // caller that does not come through the wire, as the handlers beside this
+        // one state it.
+        let repository_name = input.repository_name.as_str();
+        if repository_name.is_empty() {
+            return Err(
+                GetMergeConflictsErrorModeled::RepositoryNameRequiredException(
+                    RepositoryNameRequiredException {
+                        message: Some("a repository name is required".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+
+        // The comparison is CPU-bound and runs under this service's store lock,
+        // so it is moved off the async worker — the same construct the git
+        // transport's work uses — and bounded by one request's `MergeBudget`:
+        // paths compared, file content read and time.
+        crate::service::off_the_async_worker(move || {
+            let store = state.lock();
+            let repository = store
+                .repositories
+                .get(repository_name)
+                .ok_or_else(|| {
+                    GetMergeConflictsErrorModeled::RepositoryDoesNotExistException(
+                        RepositoryDoesNotExistException {
+                            message: Some(crate::state::repository_does_not_exist_message(
+                                repository_name,
+                            )),
+                        },
+                    )
+                })?;
+
+            // The message is `crate::state::commit_does_not_exist_message`, the one
+            // place this crate words this code, so every handler that cannot
+            // resolve a specifier words it identically.
+            let commit_does_not_exist = |specifier: &str| {
+                GetMergeConflictsErrorModeled::CommitDoesNotExistException(
+                    CommitDoesNotExistException {
+                        message: Some(crate::state::commit_does_not_exist_message(specifier)),
+                    },
+                )
+            };
+            let source = repository
+                .resolve_commit(source_specifier)
+                .ok_or_else(|| commit_does_not_exist(source_specifier))?;
+            let destination = repository
+                .resolve_commit(destination_specifier)
+                .ok_or_else(|| commit_does_not_exist(destination_specifier))?;
+
+            // ONE evaluation per request, through the merge module every merge
+            // question in this service shares: it walks both histories to their
+            // merge base, compares the union of the three snapshots at the
+            // requested detail level and resolution strategy, and charges every
+            // phase to one budget, so the work a caller can drive is bounded in
+            // commits, paths, content bytes and time.
+            let mut budget = crate::state::merge::MergeBudget::for_one_request();
+            let evaluation = crate::state::merge::evaluate(
+                repository,
+                source,
+                destination,
+                detail_level,
+                resolution_strategy,
+                &mut budget,
+            )
+            .map_err(|problem| match problem {
+                // Two tips with no commit in common: there is no base to
+                // evaluate either side's changes against, which is what the
+                // model words "the divergence between the tips of the provided
+                // commit specifiers is too great to determine whether there
+                // might be any merge conflicts".
+                crate::state::merge::MergeProblem::NoMergeBase => {
+                    GetMergeConflictsErrorModeled::TipsDivergenceExceededException(
+                        TipsDivergenceExceededException {
+                            message: Some(format!(
+                                "the divergence between {source_specifier} and \
+                                 {destination_specifier} is too great to determine whether \
+                                 there might be any merge conflicts. Locally compare the \
+                                 specifiers using git diff or a diff tool."
+                            )),
+                        },
+                    )
+                }
+                crate::state::merge::MergeProblem::ItemsToCompare => {
+                    GetMergeConflictsErrorModeled::MaximumItemsToCompareExceededException(
+                        MaximumItemsToCompareExceededException {
+                            message: Some(format!(
+                                "comparing {source_specifier} and {destination_specifier} \
+                                 exceeds the {} items this emulator compares against the merge \
+                                 base at once",
+                                crate::state::merge::MAX_ITEMS_TO_COMPARE_PER_REQUEST
+                            )),
+                        },
+                    )
+                }
+                // A comparison that ran past the deadline is reported as the
+                // same refusal: of the errors this operation models, that is the
+                // one whose meaning covers a comparison this emulator will not
+                // carry to the end, and the message says time is what ran out.
+                crate::state::merge::MergeProblem::Deadline => {
+                    GetMergeConflictsErrorModeled::MaximumItemsToCompareExceededException(
+                        MaximumItemsToCompareExceededException {
+                            message: Some(format!(
+                                "comparing {source_specifier} and {destination_specifier} took \
+                                 longer than the {} seconds this emulator spends comparing two \
+                                 commits",
+                                crate::state::merge::MAX_MERGE_SECONDS
+                            )),
+                        },
+                    )
+                }
+                crate::state::merge::MergeProblem::ContentToLoad => {
+                    GetMergeConflictsErrorModeled::MaximumFileContentToLoadExceededException(
+                        MaximumFileContentToLoadExceededException {
+                            message: Some(format!(
+                                "comparing {source_specifier} and {destination_specifier} line \
+                                 by line exceeds the {} bytes of file content this emulator \
+                                 loads at once",
+                                crate::state::merge::MAX_CONTENT_BYTES_PER_REQUEST
+                            )),
+                        },
+                    )
+                }
+            })?;
+
+            // "If the specified merge strategy is FAST_FORWARD_MERGE, this list
+            // is always empty", and that strategy asks one question of the
+            // evaluation instead: can the destination simply advance to the
+            // source? Every other option is mergeable when the evaluation left
+            // no conflict at all — the whole evaluation, not just this page.
+            let fast_forward = merge_option == crate::state::merge::MERGE_OPTION_FAST_FORWARD;
+            let mergeable = if fast_forward {
+                evaluation.is_fast_forward()
+            } else {
+                evaluation.is_mergeable()
+            };
+            let ordered: Vec<String> = if fast_forward {
+                Vec::new()
+            } else {
+                evaluation.conflicts.clone()
+            };
+
+            // One page of the conflicting paths, in the path order the
+            // evaluation reports them in. The whole evaluation is a pure
+            // function of stored state, so the next page picks up exactly where
+            // this one stopped; the token belongs to THIS evaluation, so one
+            // issued for another pair of commits (or another detail level) is
+            // not a token here.
+            let scope = format!(
+                "GetMergeConflicts:{repository_name}:{}:{}:\
+                 {merge_option}:{detail_level}:{resolution_strategy}",
+                evaluation.source_commit_id, evaluation.destination_commit_id
+            );
+            let (page, next_token) = crate::state::page_of(
+                &scope,
+                &ordered,
+                input.next_token.as_deref(),
+                input.max_conflict_files,
+            )
+            .map_err(|problem| match problem {
+                crate::state::PageProblem::InvalidMaxResults(message) => {
+                    GetMergeConflictsErrorModeled::InvalidMaxConflictFilesException(
+                        InvalidMaxConflictFilesException {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::PageProblem::InvalidContinuationToken(message) => {
+                    GetMergeConflictsErrorModeled::InvalidContinuationTokenException(
+                        InvalidContinuationTokenException {
+                            message: Some(message),
+                        },
+                    )
+                }
+            })?;
+
+            // The metadata is built for the paths this page returns, reading the
+            // three snapshots the evaluation compared.
+            let base_files = repository
+                .commits
+                .get(&evaluation.base_commit_id)
+                .map(|base| &base.files);
+            let empty: BTreeMap<String, FileEntry> = BTreeMap::new();
+            let base_files = base_files.unwrap_or(&empty);
+            let conflict_metadata_list: Vec<ConflictMetadata> = page
+                .iter()
+                .map(|path| {
+                    conflict_metadata(
+                        repository,
+                        path,
+                        TreeSlot::at(base_files, path),
+                        TreeSlot::at(&source.files, path),
+                        TreeSlot::at(&destination.files, path),
+                    )
+                })
+                .collect();
+
+            Ok(GetMergeConflictsOutput {
+                mergeable,
+                destination_commit_id: evaluation.destination_commit_id.clone(),
+                source_commit_id: evaluation.source_commit_id.clone(),
+                base_commit_id: Some(evaluation.base_commit_id.clone()),
+                conflict_metadata_list,
+                next_token,
+            })
+        })
     }
 }

@@ -70,8 +70,9 @@ const GIT_HOST_LABEL: &str = "git-codecommit";
 ///
 /// `pub(crate)` because a modeled handler whose CPU-bound work also runs under the
 /// store lock uses the same construct for the same reason: a merge evaluation
-/// (`crate::ops::get_merge_options`) compares two tree snapshots and may merge
-/// file content, and a merge that WRITES its result
+/// (`crate::ops::get_merge_options`, `crate::ops::get_merge_conflicts`) compares
+/// two tree snapshots against their merge base and may merge file content, and a
+/// merge that WRITES its result
 /// (`crate::ops::create_unreferenced_merge_commit`, through `crate::state::merge`)
 /// walks history and runs a diff3 over whole blobs — each holding the guard it
 /// reads them through for that whole span, so each takes this function plus its
@@ -349,6 +350,25 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ("nextToken", _) => (
             "InvalidContinuationTokenException",
             "The specified continuation token is not valid.",
+        ),
+        // The two commit specifiers a merge is evaluated between: each models the
+        // error named for it, and each "must provide a valid branch name, tag, or
+        // full commit ID"; an absent one specifies no commit at all.
+        ("sourceCommitSpecifier" | "destinationCommitSpecifier", _) if missing => (
+            "CommitRequiredException",
+            "A commit was not specified.",
+        ),
+        ("sourceCommitSpecifier", _) => (
+            "InvalidSourceCommitSpecifierException",
+            "The source commit specifier is not valid. You must provide a valid branch name, tag, or full commit ID.",
+        ),
+        ("destinationCommitSpecifier", _) => (
+            "InvalidDestinationCommitSpecifierException",
+            "The destination commit specifier is not valid. You must provide a valid branch name, tag, or full commit ID.",
+        ),
+        ("maxConflictFiles", _) => (
+            "InvalidMaxConflictFilesException",
+            "The specified value for the number of conflict files to return is not valid.",
         ),
         // `title` and `description` carry a pull request's text: the only members
         // of either name in this model belong to the pull request operations,
