@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableHostedZoneDNSSEC
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableHostedZoneDNSSEC`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableHostedZoneDNSSEC::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +70,23 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{no_such_hosted_zone, normalize_zone_id};
+
+/// The modelled `DNSSECNotFound` (HTTP 400) for a zone that holds no DNSSEC
+/// resource to disable.
+///
+/// The message is REQUEST-DERIVED, like this service's other not-found wording
+/// (see `crate::state::no_such_hosted_zone`): it names the zone the request
+/// asked about, as the request wrote it, which is what lets a caller driving
+/// several zones tell which one had nothing to disable.
+fn dnssec_not_found(requested_id: &str) -> DNSSECNotFound {
+    DNSSECNotFound {
+        message: Some(format!(
+            "Couldn't find DNSSEC information for Hosted Zone with Id '{requested_id}'."
+        )),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,20 +161,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableHostedZoneDNSSEC` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableHostedZoneDNSSECErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableHostedZoneDNSSEC"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            DisableHostedZoneDNSSECErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The caller may pass the bare id or the `/hostedzone/`-prefixed `Id` a
+        // HostedZone handed it back; both name the same zone.
+        let id = normalize_zone_id(&input.hosted_zone_id);
+        let mut store = state.lock();
+        let zone = store.zones.get_mut(id).ok_or_else(|| {
+            DisableHostedZoneDNSSECErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                &input.hosted_zone_id,
+            ))
+        })?;
+
+        // There is nothing to disable on a zone that holds no DNSSEC resource at
+        // all — neither signing nor a key-signing key — which is exactly the
+        // zone `DNSSECNotFound` is for. A zone that DOES hold one is served,
+        // including one whose signing is already off: the operation "disables
+        // DNSSEC signing in a specific hosted zone" and "does not deactivate any
+        // key-signing keys", so what it promises is the end state.
+        if !zone.holds_dnssec_resources() {
+            return Err(DisableHostedZoneDNSSECErrorModeled::DNSSECNotFound(dnssec_not_found(
+                &input.hosted_zone_id,
+            ))
+            .into());
+        }
+
+        // Only the zone's signing state moves: the KSKs stay as they are ("This
+        // action does not deactivate any key-signing keys (KSKs) that are active
+        // in the hosted zone").
+        zone.dnssec_signing_enabled = false;
+        // Unsigning is a change to the zone's records, so it propagates like any
+        // other: the caller polls the returned change through GetChange.
+        let change = store.submit_change(None);
+
+        Ok(DisableHostedZoneDNSSECOutput {
+            change_info: change.to_change_info(),
+        })
     }
 }

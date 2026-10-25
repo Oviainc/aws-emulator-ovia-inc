@@ -31,8 +31,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::ops::types::get_change_types::NoSuchChange;
 use crate::ops::types::shared_types::{
     ChangeInfo, DelegationSet, HealthCheck, HealthCheckConfig, HostedZone, HostedZoneConfig,
-    NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy, ResourceRecordSet, Tag, TrafficPolicy,
-    VPC, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
+    KeySigningKey, NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy, ResourceRecordSet, Tag,
+    TrafficPolicy, VPC, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
 };
 
 /// How long after a change is submitted it reaches `INSYNC`.
@@ -50,6 +50,31 @@ pub const CHANGE_PROPAGATION: Duration = Duration::from_millis(500);
 pub const STATUS_PENDING: &str = "PENDING";
 /// The `Status` of a change that has propagated (`ChangeStatus` enum).
 pub const STATUS_INSYNC: &str = "INSYNC";
+
+/// The signing status of a hosted zone Route 53 signs.
+///
+/// `DNSSECStatus$ServeSignature`'s own documentation: "SIGNING: DNSSEC signing
+/// is enabled for the hosted zone."
+pub const SERVE_SIGNATURE_SIGNING: &str = "SIGNING";
+
+/// The signing status of a hosted zone Route 53 does not sign.
+///
+/// `DNSSECStatus$ServeSignature`'s own documentation: "NOT_SIGNING: DNSSEC
+/// signing is not enabled for the hosted zone."
+pub const SERVE_SIGNATURE_NOT_SIGNING: &str = "NOT_SIGNING";
+
+/// The `Status` of a key-signing key Route 53 signs with.
+///
+/// `KeySigningKey$Status`'s own documentation: "ACTIVE: The KSK is being used
+/// for signing."
+pub const SIGNING_KEY_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `Status` of a key-signing key a failed request left in error.
+///
+/// `KeySigningKey$Status`'s own documentation: "INTERNAL_FAILURE: There was an
+/// error during a request. Before you can continue to work with DNSSEC signing,
+/// including actions that involve this KSK, you must correct the problem."
+pub const SIGNING_KEY_STATUS_INTERNAL_FAILURE: &str = "INTERNAL_FAILURE";
 
 /// The most hosted zones the account may hold.
 ///
@@ -450,6 +475,29 @@ pub struct StoredZone {
     /// the zone takes its tags with it and no second map can disagree about
     /// them. Bounded by [`MAX_TAGS_PER_RESOURCE`].
     pub tags: BTreeMap<String, String>,
+    /// Whether DNSSEC signing is enabled for this zone — the state a DNSSEC
+    /// read reports as `ServeSignature`.
+    ///
+    /// A zone is created with signing OFF: `CreateHostedZone` carries no DNSSEC
+    /// input, so a new zone is one "DNSSEC signing is not enabled for"
+    /// (`DNSSECStatus$ServeSignature`'s `NOT_SIGNING`). `EnableHostedZoneDNSSEC`
+    /// turns it on and `DisableHostedZoneDNSSEC` turns it back off; both are
+    /// still scaffolds, so every zone this store holds reports it off, exactly
+    /// as Route 53 reports a zone nobody enabled signing for. It is held on the
+    /// zone rather than answered as a constant by the read, so the day one of
+    /// those operations sets it, the read already reports what was set.
+    pub dnssec_signing_enabled: bool,
+    /// This zone's key-signing keys (KSKs), keyed — and therefore ordered — by
+    /// the `Name` that is unique within one zone (`KeySigningKey$Name`: "Name
+    /// must be unique for each key-signing key in the same hosted zone").
+    ///
+    /// Held ON the zone, like the record sets and tags beside it, so deleting
+    /// the zone takes its KSKs with it and no second map can disagree about
+    /// which zone they belong to. `CreateKeySigningKey` is the operation that
+    /// adds one and `DeleteKeySigningKey` the one that removes it; both are
+    /// still scaffolds, so a zone in this store holds none of them, exactly as
+    /// Route 53 reports a zone no KSK was created for.
+    pub key_signing_keys: BTreeMap<String, KeySigningKey>,
     /// Whether deletion protection is enabled for this zone, as a hosted-zone
     /// read reports it.
     ///
@@ -505,6 +553,51 @@ impl StoredZone {
     /// [`tags_to_list`].
     pub fn to_tag_list(&self) -> Vec<Tag> {
         tags_to_list(&self.tags)
+    }
+
+    /// The `ServeSignature` a DNSSEC read reports for this zone: `SIGNING`
+    /// while signing is enabled for it, `NOT_SIGNING` while it is not.
+    ///
+    /// Derived from the zone's own signing state, so enabling or disabling
+    /// signing moves what the read reports by itself.
+    pub fn serve_signature(&self) -> &'static str {
+        if self.dnssec_signing_enabled {
+            SERVE_SIGNATURE_SIGNING
+        } else {
+            SERVE_SIGNATURE_NOT_SIGNING
+        }
+    }
+
+    /// This zone's key-signing keys as a DNSSEC read's `KeySigningKeys` carries
+    /// them: one entry per KSK the zone holds, in `Name` order.
+    pub fn to_key_signing_keys(&self) -> Vec<KeySigningKey> {
+        self.key_signing_keys.values().cloned().collect()
+    }
+
+    /// Whether this zone holds a key-signing key Route 53 could sign with: one
+    /// in `ACTIVE` status ("The KSK is being used for signing").
+    pub fn has_active_key_signing_key(&self) -> bool {
+        self.key_signing_keys
+            .values()
+            .any(|ksk| ksk.status.as_deref() == Some(SIGNING_KEY_STATUS_ACTIVE))
+    }
+
+    /// Whether one of this zone's key-signing keys is in `INTERNAL_FAILURE`,
+    /// the status that has to be corrected "before you can continue to work
+    /// with DNSSEC signing" (`KeySigningKey$Status`).
+    pub fn has_key_signing_key_in_internal_failure(&self) -> bool {
+        self.key_signing_keys
+            .values()
+            .any(|ksk| ksk.status.as_deref() == Some(SIGNING_KEY_STATUS_INTERNAL_FAILURE))
+    }
+
+    /// Whether this zone holds any DNSSEC resource at all: a key-signing key,
+    /// or signing enabled over one.
+    ///
+    /// `DNSSECNotFound`'s own documentation — "The hosted zone doesn't have any
+    /// DNSSEC resources" — describes exactly the zone this answers `false` for.
+    pub fn holds_dnssec_resources(&self) -> bool {
+        self.dnssec_signing_enabled || !self.key_signing_keys.is_empty()
     }
 
     /// Whether the zone still holds a record other than the default SOA and NS
