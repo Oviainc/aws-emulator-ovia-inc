@@ -19,3 +19,5 @@ mod raw_message_content;
 mod regional_message_namespace;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_eligibility.rs"]
+mod update_eligibility;
