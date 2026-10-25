@@ -2,10 +2,10 @@
 
 //! @op CreateDiskFromSnapshot
 //! Inserts one block storage disk restored from a disk snapshot this account holds
-//! into this service's store, under the disk name the request names, in the zone it
-//! names and at the size it asks for — never below the snapshotted volume's — and
-//! answers the operation-log entry the insert appended. The snapshot itself is only
-//! read.
+//! and has finished taking into this service's store, under the disk name the
+//! request names, in the zone it names and at the size it asks for — never below the
+//! snapshotted volume's — and answers the operation-log entry the insert appended.
+//! The snapshot itself is only read.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -272,7 +272,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // own record is the source of truth for its size and its region;
             // nothing here reads the disk the snapshot was taken of, which may
             // have been resized or deleted since.
-            let (snapshot_name, snapshot_region, snapshot_size_in_gb) = match &source {
+            let (snapshot_name, snapshot_region, snapshot_size_in_gb, snapshot_state) = match
+                &source
+            {
                 RequestedSource::Snapshot(requested) => {
                     let snapshot = store.disk_snapshot(requested).ok_or_else(|| {
                         not_found(crate::state::RESOURCE_TYPE_DISK_SNAPSHOT, requested)
@@ -281,6 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         snapshot.name.clone(),
                         snapshot.location.region_name.clone(),
                         snapshot.size_in_gb,
+                        snapshot.state,
                     )
                 }
                 // An AUTOMATIC snapshot is one the `AutoSnapshot` add-on takes on
@@ -308,6 +311,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "diskSnapshotName '{snapshot_name}' is a snapshot of region \
                      {snapshot_region}, which cannot be restored into availabilityZone \
                      '{availability_zone}' of region {region}"
+                )));
+            }
+            // A snapshot is restorable only once every block it captures is
+            // captured: while Lightsail is still taking it the snapshot reports
+            // `pending` (`DiskSnapshot$state`, "the status of the disk snapshot
+            // operation"), and one whose capture ended any other way than
+            // `completed` holds no usable copy either — in neither case is there
+            // a complete volume to restore from. That is a well-formed request
+            // the resources' state does not allow, which is what the modelled
+            // `OperationFailureException` is for, and it is the same check the
+            // other restore operations of this service apply to their own
+            // sources.
+            if snapshot_state != crate::state::DISK_SNAPSHOT_STATE_COMPLETED {
+                return Err(operation_failure(format!(
+                    "The disk snapshot {snapshot_name} is {snapshot_state}: a disk can be \
+                     restored only from a snapshot that is {}.",
+                    crate::state::DISK_SNAPSHOT_STATE_COMPLETED
                 )));
             }
             // A restored volume holds every block the snapshot captured, so it
@@ -444,6 +464,18 @@ fn requested_source(
                 .to_string(),
         )),
     }
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// resource that is in the way and the state it is in.
+fn operation_failure(message: String) -> CreateDiskFromSnapshotError {
+    CreateDiskFromSnapshotErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// This operation's 400 refusal for a request the model admits but the service

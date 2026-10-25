@@ -3,8 +3,11 @@
 //! @op GetLogGroupFields
 //! Implemented: counts the fields the log events persisted for the named log group carry
 //! inside the searched time window, and reports each one with the percentage of those
-//! events that carried it, highest percentage first. This is the ONLY file to touch for
-//! this operation.
+//! events that carried it, highest percentage first. The count is taken over the field
+//! index of the NAME the request gave, without first checking that a log group carries it,
+//! so a window holding no indexed event — including one under a name no group carries —
+//! reports an empty list rather than refusing the request. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -380,13 +383,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with everything ever ingested nor serialises every other caller.
         let messages: Vec<String> = {
             let store = state.lock();
+            // The field index is queried for the NAME the request gave: this operation does
+            // not check that a log group of that name exists, so a name no group carries —
+            // like a group that has ingested nothing — answers an empty result rather than a
+            // missing-resource refusal. The not-found boundary of this surface is on the
+            // pointers and data sources a query names, not on this name.
             let Some(group) = store.log_groups.get(&log_group_name) else {
-                return Err(GetLogGroupFieldsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::resource_not_found_message("log group")),
-                    },
-                )
-                .into());
+                return Ok(GetLogGroupFieldsOutput {
+                    log_group_fields: Some(Vec::new()),
+                });
             };
             let mut taken: Vec<String> = Vec::new();
             let mut taken_bytes = 0usize;

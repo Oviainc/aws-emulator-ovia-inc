@@ -70,6 +70,7 @@ pub fn derived_slack_workspace_name(team_id: &str) -> String {
         trimmed.to_string()
     }
 }
+
 /// Whether the single account this emulator presents is an organization's management
 /// or member account, as `RegisterSlackWorkspaceForOrganization` reports it in
 /// `accountType`.

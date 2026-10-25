@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutUserPermissionsBoundary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutUserPermissionsBoundary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutUserPermissionsBoundary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -174,20 +165,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // `ctx` carries request metadata only: nothing about a boundary depends on
+        // it — IAM is global, and both the user and the policy are named by the
+        // request.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutUserPermissionsBoundary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutUserPermissionsBoundaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutUserPermissionsBoundary"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutUserPermissionsBoundaryErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The boundary is "the ARN of the managed POLICY that is used to set the
+        // permissions boundary", and `arnType` asks only for a 20..2048 character
+        // string — so the ARN still has to BE a managed policy's,
+        // `arn:<partition>:iam::<account>:policy/<path><name>`. Anything else is an
+        // "invalid … value … supplied for an input parameter", read through the one
+        // definition of that grammar in `crate::state`, as `PutRolePermissionsBoundary`
+        // does.
+        let Some(policy) = crate::state::parse_policy_arn(&input.permissions_boundary) else {
+            return Err(PutUserPermissionsBoundaryErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "ARN {} is not valid: PermissionsBoundary must be an IAM managed \
+                         policy ARN",
+                        input.permissions_boundary
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // The user is named (friendly name, not ARN) and IAM entity names "are not
+        // distinguished by case", so the case-folded name is the identity. A name the
+        // account holds no user under "referenced a resource entity that does not
+        // exist".
+        let user_key = crate::state::name_key(&input.user_name);
+        if !store.users.contains_key(&user_key) {
+            return Err(PutUserPermissionsBoundaryErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A policy can set a boundary only if it exists. An AWS-managed policy
+        // (account segment `aws`) belongs to AWS rather than to this account, so it is
+        // not account state and is taken as present — this emulator carries no catalog
+        // of AWS's managed policies, and an entry invented for one would not be
+        // knowledge it has. A customer-managed policy exists exactly when this account
+        // holds it, which is what `CreatePolicy` records. The same rule
+        // `PutRolePermissionsBoundary` applies to the policy it bounds a role with.
+        let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;
+        if !aws_managed && store.policy_by_arn(&input.permissions_boundary).is_none() {
+            return Err(PutUserPermissionsBoundaryErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Policy {} does not exist or is not attachable.",
+                        input.permissions_boundary
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Amazon Web Services service role policies can only be attached to the
+        // service-linked role for that service" (`PolicyNotAttachableException`): such
+        // a policy is one AWS files under the reserved service-linked role path, and no
+        // USER is a service-linked role, so no user can be bounded by one.
+        if crate::state::is_service_linked_role_path(&policy.path) {
+            return Err(
+                PutUserPermissionsBoundaryErrorModeled::PolicyNotAttachableException(
+                    PolicyNotAttachableException {
+                        message: Some(format!(
+                            "Policy {} is not attachable: a service role policy can only be \
+                             attached to the service-linked role for that service",
+                            input.permissions_boundary
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Adds or UPDATES the policy that is specified as the IAM user's permissions
+        // boundary": one boundary at a time, so a second put replaces the first. The
+        // attachment is reported with the one type the model's
+        // `PermissionsBoundaryAttachmentType` enum declares, exactly as `CreateUser`
+        // records the boundary its own request carried — so a user is indistinguishable
+        // whichever operation set its boundary.
+        let Some(user) = store.users.get_mut(&user_key) else {
+            return Err(PutUserPermissionsBoundaryErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        };
+        user.permissions_boundary = Some(AttachedPermissionsBoundary {
+            permissions_boundary_type: Some(crate::state::PERMISSIONS_BOUNDARY_TYPE.to_string()),
+            permissions_boundary_arn: Some(input.permissions_boundary),
+        });
+
+        Ok(PutUserPermissionsBoundaryOutput)
     }
 }
+

@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the tag keys the request names from the resource its
+//! `ResourceArn` names, and persists nothing else.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The ARN is resolved — not parsed and trusted — through
+//! [`crate::state::ComAmazonawsGuarddutyGuarddutyapiserviceState::tagged_resource_tags_mut`],
+//! which hands back the tag map on the resource's OWN record, so a later
+//! `GetDetector`/`GetIPSet`/`GetFilter`/`GetThreatIntelSet`/`GetTrustedEntitySet`/
+//! `GetThreatEntitySet`/`DescribePublishingDestination` reports exactly the map this
+//! call left behind. Removal is by KEY and is idempotent: a key the resource does not
+//! carry is removed by having never been there, which is the state the request asks
+//! for, and every other key — and every other resource — is left alone.
+//!
+//! An ARN this endpoint resolves no resource for is refused with HTTP 400 under the
+//! `InvalidInputException` class rather than answered with a hollow 204.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +145,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        let mut state = state.lock();
+        let Some(tags) = state.tagged_resource_tags_mut(&region, &input.resource_arn) else {
+            // Classified from the REQUEST, the way every other unresolvable
+            // reference on this service is classified, and without echoing the ARN.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::resource_arn_rejection(&input.resource_arn),
+            ));
+        };
+
+        // "Removes tags from a resource" (this operation's own documentation), by
+        // key: `TagKeys` is "the tag keys to remove from the resource", so each key
+        // the request names stops being carried and nothing else about the resource
+        // moves. A key the resource never carried removes nothing — the request asks
+        // for a resource without it, which is the state it is already in — so a
+        // repeated removal is accepted and changes nothing.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+
+        // `Unit` output: success is the modelled 204 and an empty body.
+        Ok(UntagResourceOutput {})
     }
 }

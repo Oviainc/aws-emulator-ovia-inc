@@ -3188,9 +3188,8 @@ impl ApplicationVersion {
 ///
 /// A template is NEVER associated with an environment: "Templates aren't
 /// associated with any environment. The `EnvironmentName` response element is
-/// always null", and `DeploymentStatus` is documented as "null: This
-/// configuration is not associated with a running environment" — so neither
-/// member is stored here, and the projection below reports both as absent.
+/// always null" — so no environment name is stored here and the projection
+/// below reports that member as absent.
 #[derive(Debug, Clone)]
 pub struct ConfigurationTemplate {
     pub application_name: String,
@@ -3206,6 +3205,13 @@ pub struct ConfigurationTemplate {
     /// supplied, de-duplicated by the key an option is identified by
     /// (`Namespace`, `OptionName`, `ResourceName`).
     pub option_settings: Vec<ConfigurationOptionSetting>,
+    /// The deployment status of this configuration set: a stored template IS
+    /// the configuration set the saved configuration holds — there is no
+    /// in-flight or failed delivery of it to wait on, because a write to a
+    /// template takes effect as soon as it is stored — so the status a stored
+    /// record carries is [`DEPLOYMENT_STATUS_DEPLOYED`], and the projection
+    /// reports what the record carries rather than deciding it per call site.
+    pub deployment_status: String,
     pub date_created: ::aws_smithy_types::DateTime,
     pub date_updated: ::aws_smithy_types::DateTime,
     pub tags: Vec<Tag>,
@@ -3411,11 +3417,15 @@ macro_rules! configuration_settings_description {
             template_name: Some(template.template_name.clone()),
             description: template.description.clone(),
             // "Templates aren't associated with any environment. The
-            // EnvironmentName response element is always null", and a
-            // configuration that is not associated with a running environment
-            // reports a null `DeploymentStatus`.
+            // EnvironmentName response element is always null."
             environment_name: None,
-            deployment_status: None,
+            // The status the stored record carries — see
+            // `ConfigurationTemplate::deployment_status`. Every described
+            // configuration set reports one of the modelled
+            // `ConfigurationDeploymentStatus` values, so a client can tell a
+            // settled configuration set from a draft without special-casing an
+            // absent member.
+            deployment_status: Some(template.deployment_status.clone()),
             date_created: Some(template.date_created),
             date_updated: Some(template.date_updated),
             option_settings: Some(template.option_settings.clone()),

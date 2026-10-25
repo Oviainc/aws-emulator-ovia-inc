@@ -23,6 +23,8 @@ mod create_app_authorization_contract;
 mod ingestion_deletion;
 #[path = "all/ingestion_destination_lifecycle.rs"]
 mod ingestion_destination_lifecycle;
+#[path = "all/ingestion_enablement.rs"]
+mod ingestion_enablement;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

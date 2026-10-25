@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetExtension
-//! IMPLEMENTED: reports one version of an extension out of this service's state.
+//! IMPLEMENTED: reports one version of an extension out of the account's catalogue —
+//! either an extension a `CreateExtension` call wrote, or one of AppConfig's AWS-authored
+//! extensions, which every account can read without having created it.
 //!
 //! ## Shape of an operation
 //!
@@ -144,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetExtensionErrorModeled::InternalServerException(
@@ -154,13 +156,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
 
         // `ExtensionIdentifier` is "the name, the ID, or the Amazon Resource Name (ARN)
         // of the extension", and all three resolve through the one state function every
-        // extension operation uses. An ARN addresses one VERSION, so it pins the version
-        // to report unless the request names one explicitly.
-        let Some((extension, pinned_version)) = store.resolve_extension(&input.extension_identifier)
+        // extension operation uses — over both halves of the account's catalogue, so one
+        // of AppConfig's AWS-authored extensions reads back here exactly as the listing
+        // reported it. An ARN addresses one VERSION, so it pins the version to report
+        // unless the request names one explicitly.
+        let Some((extension, pinned_version)) =
+            store.resolve_extension(&input.extension_identifier, &region)
         else {
             return Err(not_found(crate::state::extension_not_found()));
         };

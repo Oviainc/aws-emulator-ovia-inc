@@ -164,6 +164,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // The account/region device precondition, FIRST: a Region this account has
+        // activated no device in is refused before the addressed id is resolved and
+        // before the requested instance ids are looked at, so a malformed instance
+        // id, a well-formed unknown one and an empty list are all answered the same
+        // way there.
+        if !store.has_devices_in(&region) {
+            return Err(DescribeDeviceEc2InstancesErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
+
         // The addressed id is RESOLVED, and an id that names no device of this
         // account in the signed Region is the modelled `ResourceNotFoundException`
         // — "the request references a resource that doesn't exist" — not a

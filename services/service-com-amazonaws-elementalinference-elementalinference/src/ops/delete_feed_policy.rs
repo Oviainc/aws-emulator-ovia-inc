@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFeedPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFeedPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFeedPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: detaches the resource-based policy document from the stored feed, so the
+//! grant it carried is revoked and `GetFeedPolicy` has nothing left to report. Refuses an
+//! id no live feed of the request's Region has with `ResourceNotFoundException`
+//! (HTTP 404), and answers the modelled 204 for a feed that holds no policy, since the
+//! call is `@idempotent` and that is the state a served delete leaves behind.
 //!
 //! ## Shape of an operation
 //!
@@ -173,17 +169,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFeedPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFeedPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFeedPolicy"))
+        // request metadata — here the Region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteFeedPolicyErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = std::time::Instant::now();
+
+        let mut state = state.lock();
+        state.settle_due_transitions(now);
+
+        // The feed is resolved WITHIN the request's Region, exactly as `GetFeedPolicy` and
+        // `PutFeedPolicy` resolve it: a policy is a resource under the feed
+        // (`/v1/feed/{id}/policy`), so an id no live feed of this endpoint has — one of
+        // another Region, one the store holds nothing for, and one whose feed's deletion
+        // has already completed — earns the modelled not-found refusal and nothing is
+        // written. The message is this service's one fixed not-found sentence, so the
+        // refusal reports neither the id that was probed nor which of those reasons it
+        // was.
+        let Some(feed) = state.feed_mut(&region, &input.id) else {
+            return Err(DeleteFeedPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A feed holds AT MOST ONE policy, so the delete CLEARS that member whether or
+        // not a document was there: the call is `@idempotent`, so repeating it answers
+        // the modelled 204 again rather than refusing the state the first call left
+        // behind, and a feed that was never given a policy is already in that state. The
+        // policy is the only thing a delete touches — the feed's own status, outputs,
+        // association and tags are not a policy's to move — and a feed whose deletion is
+        // already accepted is not refused here: this operation models no conflict error,
+        // and revoking a grant on a feed that is on its way out runs with its removal
+        // rather than against it.
+        feed.policy = None;
+
+        Ok(DeleteFeedPolicyOutput)
     }
 }

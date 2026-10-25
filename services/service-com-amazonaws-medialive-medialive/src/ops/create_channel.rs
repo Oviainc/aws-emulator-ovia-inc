@@ -200,9 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let attachment_count = input.input_attachments.as_ref().map_or(0, Vec::len);
         if attachment_count > crate::state::MAX_INPUT_ATTACHMENTS {
             return Err(CreateChannelErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "inputAttachments carries {attachment_count} attachments; this emulator accepts at most {}",
-                    crate::state::MAX_INPUT_ATTACHMENTS
+                message: Some(crate::state::too_many_channel_entries_message(
+                    "inputAttachments",
+                    attachment_count,
+                    crate::state::MAX_INPUT_ATTACHMENTS,
                 )),
             })
             .into());
@@ -215,9 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let destination_count = input.destinations.as_ref().map_or(0, Vec::len);
         if destination_count > crate::state::MAX_CHANNEL_DESTINATIONS {
             return Err(CreateChannelErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "destinations carries {destination_count} destinations; this emulator accepts at most {}",
-                    crate::state::MAX_CHANNEL_DESTINATIONS
+                message: Some(crate::state::too_many_channel_entries_message(
+                    "destinations",
+                    destination_count,
+                    crate::state::MAX_CHANNEL_DESTINATIONS,
                 )),
             })
             .into());

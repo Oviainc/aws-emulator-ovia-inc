@@ -1,0 +1,47 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: eks.cancel-update-non-cancelable-state-rejected
+Issue-Shape-Id: com.amazonaws.eks#AWSWesleyFrontend
+Issue-Key: eks.cancel-update-non-cancelable-state-rejected|run#10|AssertionError|assert code == _NOT_CANCELLABLE, f"expected InvalidParameterException, got {code}"
+Issue-Commit: ef659389d11311dc27a7ee58cb593d22d3f663cf
+
+# EKS CancelUpdate refuses a non-cancellable update with InvalidRequestException instead of InvalidParameterException
+
+> _Note: this issue was identified against the code base at commit `ef659389d11311dc27a7ee58cb593d22d3f663cf`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CancelUpdate
+
+## Description
+Replaying the behavioral suite against the EKS emulator (service crate services/service-com-amazonaws-eks-awswesleyfrontend) surfaces ONE net-new root cause on this service that no open issue carries. It is NOT covered by the open issues on this crate: 20261022T154613Z-eks-control-plane-operations-answer-501-notimplemented-or.md (ten causes, none of them CancelUpdate) and 20261024T081355Z-eks-connected-clusters-are-never-gated-status-error.md (connected-cluster gate, version catalog, ListClusters include, DeleteAccessEntry) say nothing about the cancellation path and do not carry this check's replay key.
+
+Cause 1 of 1 - CancelUpdate's "not in a cancellable state" refusal uses the wrong modeled error class.
+AWS: Smithy (com-amazonaws-eks-awswesleyfrontend) CancelUpdate is POST /clusters/{name}/updates/{updateId}/cancel-update, success 200 with `update`; it models ClientException (httpError 400), InvalidParameterException (400), InvalidRequestException (400), InvalidStateException (400), ResourceInUseException (409), ResourceNotFoundException (404), ServerException (500) and ThrottlingException (429). The operation's own documentation states "Cancellation is only performed if the update can be cancelled. Currently, this is supported for VersionRollback update types on EKS Auto Mode clusters when nodes are rolling back." Recorded behavior: when the named update exists on the named cluster but is NOT of a cancellable type, AWS refuses it with HTTP 400 and error code InvalidParameterException; the refusal names the boundary it enforces and is built from the operation's contract rather than from the update's instantaneous status (recorded message example, as an example only: "Update is not in a cancellable state. Supported update types: VersionRollback"). The recording establishes that this is a TYPE boundary, not a terminal-vs-in-progress one: the identical InvalidParameterException is returned both for an UpdateClusterConfig(logging) update that has already reached status Successful and for a freshly started UpdateClusterConfig(logging) update that is still InProgress on the same cluster. The rejected call has no effect: the update keeps its status and acquires no `cancellation` member, and an in-progress update runs on to Successful unaffected.
+Emulator: the refusal is classified as InvalidRequestException (400) and keyed on the update's status rather than its type. services/service-com-amazonaws-eks-awswesleyfrontend/src/ops/cancel_update.rs builds every non-cancellable outcome through one `invalid_request` closure (InvalidRequestException) and takes the `!update.is_in_progress()` branch first, answering e.g. "Update <id> is in status Successful and is no longer in progress, so it cannot be cancelled." For the still-InProgress logging update the next branch (`update.r#type != UPDATE_TYPE_VERSION_ROLLBACK`) fires and is ALSO InvalidRequestException, so both legs of the boundary carry the wrong code.
+Why: the error code is the only thing a client branches on. On AWS, InvalidParameterException is a permanent argument-level refusal meaning "this update can never be cancelled", so a client stops and reports; InvalidRequestException is modeled as "the request is invalid given the state of the cluster", i.e. a state-dependent refusal a client or waiter legitimately retries once the cluster/update settles. Against this emulator an SDK caller or a rollback-orchestration retry loop waits for a cancellable state that will never arrive, and a test asserting the documented refusal class fails against the emulator while passing against AWS. Because the emulator also decides on status instead of type, it would wrongly ACCEPT (or differently refuse) a non-VersionRollback update that happens to be in progress on an Auto Mode cluster, which is the same boundary stated the other way round.
+Fix: the refusal classification and the branch order in the CancelUpdate handler - the cancellability branches should refuse with InvalidParameterException naming the supported update type, and the type/Auto-Mode check should be the boundary rather than `is_in_progress()`. ResourceNotFoundException for an absent cluster/update id and the clientRequestToken idempotent replay path in the same handler already behave and must stay as they are.
+Traces: eks.cancel-update-non-cancelable-state-rejected.
+
+## Evidence
+Suite: simparity-behavioral-ga-prod-v1, 15/111 passed; eks 14/90 (76 failed - every other eks failure in this run is an already-filed scaffold-stub cluster or owned by an open issue).
+
+[mismatch] eks.cancel-update-non-cancelable-state-rejected - AssertionError at check_eks_cancel_update_non_cancelable_state_rejected.py:50: `assert code == _NOT_CANCELLABLE, f"expected InvalidParameterException, got {code}"` ->
+  expected InvalidParameterException, got ('InvalidRequestException', 'Update 4c95dbae-1a9f-46fe-bef5-2d8d893e62fc is in status Successful and is no longer in progress, so it cannot be cancelled.')
+The check reached this assertion only after its setup succeeded end to end: IAM role created, dedicated VPC + two subnets created, CreateCluster polled to ACTIVE, UpdateClusterConfig(logging api) issued and polled to status Successful. So the cluster, the update record and DescribeUpdate all work; only the refusal class of CancelUpdate diverges. The check's expected pair is ('InvalidParameterException', 'Update is not in a cancellable state. Supported update types: VersionRollback') - the code and the 400 status are the requirement; the sentence is the recorded example.
+The check would have gone on to assert (a) the rejected cancel left the update at status Successful with no `cancellation` member, (b) the SAME InvalidParameterException for a second, still-InProgress UpdateClusterConfig(logging audit) update on the same cluster, and (c) that that second update ran on to Successful unaffected - it never got there.
+
+Source confirmation: services/service-com-amazonaws-eks-awswesleyfrontend/src/ops/cancel_update.rs lines 177-185 define `invalid_request` as InvalidRequestException, and lines 236-268 route all four non-cancellable outcomes (not in progress, wrong type, not Auto Mode, control-plane phase begun) through it, with `!update.is_in_progress()` tested before the type check.
+
+Model evidence used: smithy_query query="operation" operation="CancelUpdate,DescribeUpdate" model_path="services/service-com-amazonaws-eks-awswesleyfrontend/smithy-model/com-amazonaws-eks-awswesleyfrontend.json" - CancelUpdate declares both InvalidParameterException and InvalidRequestException at httpError 400, so the choice between them is a modeled distinction, not an approximation.
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout and point an EKS client (and IAM/EC2 clients) at its data listener.
+2. iam.create_role with an eks.amazonaws.com trust policy and attach arn:aws:iam::aws:policy/AmazonEKSClusterPolicy; ec2.create_vpc(10.42.0.0/16) plus two subnets in two distinct AZs.
+3. eks.create_cluster(name=C, roleArn=R, resourcesVpcConfig={'subnetIds': [S1, S2]}) and poll eks.describe_cluster until status == ACTIVE.
+4. U1 = eks.update_cluster_config(name=C, logging={'clusterLogging': [{'types': ['api'], 'enabled': True}]})['update']['id']; poll eks.describe_update(name=C, updateId=U1) until status == 'Successful'.
+5. eks.cancel_update(name=C, updateId=U1). EXPECT HTTP 400 with error code InvalidParameterException (recorded message example: "Update is not in a cancellable state. Supported update types: VersionRollback"). OBSERVE HTTP 400 InvalidRequestException "Update <id> is in status Successful and is no longer in progress, so it cannot be cancelled."
+6. eks.describe_update(name=C, updateId=U1) again: the rejected call must leave status == 'Successful' and must NOT have added a `cancellation` member.
+7. U2 = eks.update_cluster_config(name=C, logging={'clusterLogging': [{'types': ['audit'], 'enabled': True}]})['update']['id'] and immediately eks.cancel_update(name=C, updateId=U2) while it is still InProgress. EXPECT the SAME 400 InvalidParameterException (the boundary is the update's type, not its progress); OBSERVE InvalidRequestException. Then poll U2 to 'Successful' to confirm the rejected cancel did not disturb it.
+8. Controls that must keep working: cancel_update on a cluster name never created -> 404 ResourceNotFoundException "No cluster found for name: <name>."; cancel_update with an unknown updateId on C -> 404 ResourceNotFoundException "No update found for ID: <id>."
+9. Re-replay eks.cancel-update-non-cancelable-state-rejected to confirm the fix.
