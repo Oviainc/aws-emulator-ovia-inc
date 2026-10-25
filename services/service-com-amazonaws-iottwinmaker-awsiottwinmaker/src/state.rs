@@ -2,7 +2,17 @@
 
 //! Engine state for the com-amazonaws-iottwinmaker-awsiottwinmaker service.
 //!
-//! IoT TwinMaker's control plane is a two-level tree: a *workspace* owns the
+//! The store is REGIONAL before it is anything else: IoT TwinMaker is a
+//! regional service, so everything below lives inside one
+//! [`RegionalState`] and the top-level
+//! [`ComAmazonawsIottwinmakerAwsiottwinmakerState`] is just the map from a
+//! Region to its store. A request is served out of the store of the Region its
+//! own credential scope names ([`request_region`]), so a resource created
+//! through one Region's endpoint is invisible through another's and the same id
+//! may name an independent resource in each.
+//!
+//! Inside one Region, IoT TwinMaker's control plane is a two-level tree: a
+//! *workspace* owns the
 //! *entities*, *component types*, *scenes* and *sync jobs* created inside it.
 //! That containment is modelled literally here — `Workspace::entities`,
 //! `Workspace::component_types`, `Workspace::scenes` and
@@ -113,9 +123,29 @@ pub const ENTITY_SETTLE_SPAN: Duration = Duration::from_millis(500);
 /// initialize. See [`ComponentType::is_schema_initialized`].
 pub const SCHEMA_INITIALIZER_FUNCTION: &str = "schemaInitializer";
 
-/// The region an emulated ARN is built in when a request carries no SigV4
-/// credential scope to read one from.
+/// The Region a request is served in when it carries no SigV4 credential scope
+/// to read one from: the Region its ARNs are built in, and the Region whose
+/// store ([`RegionalState`]) answers it.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The most Regions this store holds resources for at once, counted per Region
+/// and not per resource: past it a create that would give a further Region its
+/// FIRST resource is refused as a full store is, and nothing is written.
+///
+/// The Region of a request is its own SigV4 credential scope, which the caller
+/// chooses, so without a ceiling a caller could repeat a create under fresh
+/// Region names until the process ran out of memory, each name carrying its own
+/// [`RegionalState`] and its own per-Region room for resources. A partition's
+/// Regions are a fixed, published set; AWS publishes no limit of this kind, so
+/// the figure is this emulator's own, set well above the largest partition.
+pub const MAX_REGIONS: usize = 64;
+
+/// The message a create refused for want of room for a further Region carries:
+/// it names the ceiling that was reached, the way the per-Region workspace
+/// quota's refusal names its own.
+pub fn region_ceiling_message() -> String {
+    format!("the limit of {MAX_REGIONS} regions has been reached")
+}
 
 /// The largest page any list operation of this service serves, applied
 /// SERVER-SIDE so a request cannot ask for an unbounded one, and the page size
@@ -630,19 +660,110 @@ pub fn pricing_mode_is_bundled(pricing_mode: &str) -> bool {
 }
 
 /// Per-service state for com-amazonaws-iottwinmaker-awsiottwinmaker. A handler reaches it through [`service_state`].
+///
+/// IoT TwinMaker is a REGIONAL service, so this holds ONE store per Region
+/// ([`RegionalState`]) rather than one store for the account: a resource exists
+/// only in the Region whose endpoint created it, the same id may name a
+/// different resource in another Region, and every resource's ARN carries the
+/// Region of the store that holds it. A handler picks its store with
+/// [`region`](Self::region) (to report) or [`region_mut`](Self::region_mut) (to
+/// write), passing the Region of the request's own credential scope
+/// ([`request_region`]) — never the Region stored on another record.
 #[derive(Debug)]
 pub struct ComAmazonawsIottwinmakerAwsiottwinmakerState {
+    /// The Regions this account has created something in, keyed by Region.
+    ///
+    /// Private: a Region's store is reached through
+    /// [`region`](Self::region)/[`region_mut`](Self::region_mut), so no caller
+    /// can read one Region's resources while serving another's request.
+    regions: BTreeMap<String, RegionalState>,
+    /// When this account's store came into being.
+    ///
+    /// Every Region's store dates from here rather than from the first call
+    /// that touched that Region, so the pricing plan an untouched Region
+    /// reports ([`PricingPlanRecord::default_plan`]) does not move when a
+    /// later create materialises the Region's store — a read and the write
+    /// after it report one plan.
+    created_at: SystemTime,
+    /// The read view of a Region nothing has been created in: an empty store,
+    /// so a REPORTING operation answers for such a Region (no resources, the
+    /// default pricing plan) without materialising anything a later caller
+    /// could observe. Never mutated.
+    empty_region: RegionalState,
+}
+
+impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
+    /// The store of `region`, for a caller that REPORTS: the Region's own
+    /// store, or an empty one when nothing has been created in that Region.
+    pub fn region(&self, region: &str) -> &RegionalState {
+        self.regions.get(region).unwrap_or(&self.empty_region)
+    }
+
+    /// The store of `region`, for a caller that WRITES: materialised on first
+    /// use, since a Region's store comes into being with the first resource
+    /// created in it.
+    ///
+    /// Materialising one is never what GROWS this map: a store holding nothing
+    /// a caller put there answers every read exactly as the absence of one does
+    /// ([`region`](Self::region)), so the stores left behind by calls that
+    /// wrote nothing are dropped here rather than kept — a caller cannot grow
+    /// the map by naming Regions it creates nothing in, and what it CAN create
+    /// is bounded by [`MAX_REGIONS`] through
+    /// [`region_ceiling_reached`](Self::region_ceiling_reached).
+    pub fn region_mut(&mut self, region: &str) -> &mut RegionalState {
+        let created_at = self.created_at;
+        if !self.regions.contains_key(region) {
+            let default_plan = PricingPlanRecord::default_plan(created_at);
+            self.regions
+                .retain(|_, store| !store.is_untouched(&default_plan));
+        }
+        self.regions
+            .entry(region.to_string())
+            .or_insert_with(|| RegionalState::new(created_at))
+    }
+
+    /// Whether this store has no room to give `region` its FIRST resource: it
+    /// already holds resources for [`MAX_REGIONS`] Regions and `region` is not
+    /// one of them.
+    ///
+    /// Checked by every CREATE, which is the only kind of call that gives a
+    /// Region its first resource; a Region the store already holds something
+    /// for is never refused, and neither is a call that only changes or removes
+    /// what is already there.
+    pub fn region_ceiling_reached(&self, region: &str) -> bool {
+        let default_plan = PricingPlanRecord::default_plan(self.created_at);
+        let holds_something = |store: &RegionalState| !store.is_untouched(&default_plan);
+        if self.regions.get(region).is_some_and(holds_something) {
+            return false;
+        }
+        self.regions
+            .values()
+            .filter(|store| holds_something(store))
+            .count()
+            >= MAX_REGIONS
+    }
+}
+
+/// One Region's store: everything this service holds for the account in a
+/// single Region.
+///
+/// Keyed by nothing — the Region is the key it is filed under in
+/// [`ComAmazonawsIottwinmakerAwsiottwinmakerState::regions`] — so a record in
+/// here cannot be reached while serving another Region's request.
+#[derive(Debug)]
+pub struct RegionalState {
     /// Workspaces by `workspaceId`.
     pub workspaces: BTreeMap<String, Workspace>,
     /// Every ARN this service has minted, so an operation whose input accepts an
     /// id *or* an ARN (`GetWorkspace`, and the tagging operations in a later
     /// slice) resolves one without scanning every workspace.
     pub arn_index: BTreeMap<String, ResourceRef>,
-    /// The pricing plan this account is billed under for the current billing
-    /// cycle — the one `GetPricingPlan` reports as `currentPricingPlan`.
+    /// The pricing plan this account is billed under in this Region for the
+    /// current billing cycle — the one `GetPricingPlan` reports as
+    /// `currentPricingPlan`.
     ///
-    /// Account-wide, not per workspace: the pricing operations carry no
-    /// workspace in their input, so there is ONE plan per account and region,
+    /// Region-wide, not per workspace: the pricing operations carry no
+    /// workspace in their input, so there is ONE plan per account and Region,
     /// held here beside the workspaces rather than on each of them. Present
     /// rather than optional, because an account always HAS a plan: until
     /// something changes it, that plan is the service default
@@ -663,10 +784,10 @@ pub struct ComAmazonawsIottwinmakerAwsiottwinmakerState {
     /// to report whichever the store holds rather than assume there is only
     /// ever one.
     pub pending_pricing_plan: Option<PricingPlanRecord>,
-    /// The metadata transfer jobs this account holds, keyed by
+    /// The metadata transfer jobs this account holds in this Region, keyed by
     /// `metadataTransferJobId`.
     ///
-    /// Account-wide, beside the workspaces rather than inside one: a job is
+    /// Region-wide, beside the workspaces rather than inside one: a job is
     /// addressed as `/metadata-transfer-jobs/{metadataTransferJobId}`, which
     /// names no workspace, and one job's source and destination may name
     /// different workspaces (or none at all, for an Amazon S3 or an IoT
@@ -680,16 +801,45 @@ pub struct ComAmazonawsIottwinmakerAwsiottwinmakerState {
 
 impl Default for ComAmazonawsIottwinmakerAwsiottwinmakerState {
     fn default() -> Self {
+        // The account's plan dates from the moment the account's store exists,
+        // so the default plan's instants are captured here, ONCE, rather than
+        // by whichever call happens to read it first — or by whichever Region
+        // is touched first.
+        let created_at = SystemTime::now();
+        Self {
+            regions: BTreeMap::new(),
+            created_at,
+            empty_region: RegionalState::new(created_at),
+        }
+    }
+}
+
+impl RegionalState {
+    /// An empty Region store whose default pricing plan dates from
+    /// `created_at`, the instant the account's store came into being.
+    fn new(created_at: SystemTime) -> Self {
         Self {
             workspaces: BTreeMap::new(),
             arn_index: BTreeMap::new(),
-            // The account's plan dates from the moment the account's store
-            // exists, so the default plan's instants are captured here, ONCE,
-            // rather than by whichever call happens to read it first.
-            pricing_plan: PricingPlanRecord::default_plan(SystemTime::now()),
+            pricing_plan: PricingPlanRecord::default_plan(created_at),
             pending_pricing_plan: None,
             metadata_transfer_jobs: BTreeMap::new(),
         }
+    }
+
+    /// Whether this store holds nothing a caller put in this Region: no
+    /// workspace, no metadata transfer job, nothing pending, and still the
+    /// `default_plan` an untouched Region is on.
+    ///
+    /// Such a store answers every read exactly as the absence of one does, so
+    /// it is the store [`ComAmazonawsIottwinmakerAwsiottwinmakerState`] may drop
+    /// and the one that counts against no Region ceiling. The ARN index is not
+    /// consulted: it only ever holds the ARNs of the resources above.
+    fn is_untouched(&self, default_plan: &PricingPlanRecord) -> bool {
+        self.workspaces.is_empty()
+            && self.metadata_transfer_jobs.is_empty()
+            && self.pending_pricing_plan.is_none()
+            && &self.pricing_plan == default_plan
     }
 }
 
@@ -697,7 +847,7 @@ impl Default for ComAmazonawsIottwinmakerAwsiottwinmakerState {
 ///
 /// `billableEntityCount` is NOT a field here. It is the account's current
 /// billable entity count, which the stored entities already say
-/// ([`ComAmazonawsIottwinmakerAwsiottwinmakerState::billable_entity_count`]) —
+/// ([`RegionalState::billable_entity_count`]) —
 /// keeping a copy beside the plan would let an entity created or deleted after
 /// the plan was set leave it stale, the same reason `hasChildEntities` is
 /// derived.
@@ -763,7 +913,7 @@ impl PricingPlanRecord {
     }
 }
 
-/// What an ARN in [`ComAmazonawsIottwinmakerAwsiottwinmakerState::arn_index`] points at.
+/// What an ARN in [`RegionalState::arn_index`] points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceRef {
     /// A workspace, by id.
@@ -1324,7 +1474,7 @@ pub struct SyncJob {
     pub sync_role: String,
     /// The tags the create supplied. `CreateSyncJob` accepts a `tags` map, so a
     /// sync job is a taggable resource of this service: its ARN is indexed in
-    /// [`ComAmazonawsIottwinmakerAwsiottwinmakerState::arn_index`] and the
+    /// [`RegionalState::arn_index`] and the
     /// tagging operations reach this map through it, exactly as they reach a
     /// scene's.
     pub tags: BTreeMap<String, String>,
@@ -2134,7 +2284,7 @@ const BUILT_IN_COMPONENT_TYPES: &[BuiltInComponentType] = &[
 /// ([`ComponentType::settle`] is a no-op on it). It carries no tags and no
 /// friendly name or description — this emulator does not invent the service's
 /// prose — and its ARN is deliberately NOT put in
-/// [`ComAmazonawsIottwinmakerAwsiottwinmakerState::arn_index`], for the same
+/// [`RegionalState::arn_index`], for the same
 /// reason a metadata transfer job's is not: that index resolves an id-or-ARN
 /// input and finds a TAGGABLE resource's tag map, and a built-in is the
 /// service's own resource, which carries no caller's tags.
@@ -2583,9 +2733,9 @@ impl PropertyGroupRecord {
     }
 }
 
-impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
-    /// The account's billable entity count: how many entities this service
-    /// currently holds, across every workspace.
+impl RegionalState {
+    /// The account's billable entity count in this Region: how many entities
+    /// this service currently holds there, across every workspace.
     ///
     /// IoT TwinMaker bills the entities an account keeps in its workspaces, so
     /// the count a pricing plan is reported with is a count of the stored
@@ -2611,7 +2761,7 @@ impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
     /// `updateDateTime`. The service publishes no rule for deferring an accepted
     /// change to some later instant, so this emulator defers none — which also
     /// means a change that was accepted but had not taken effect
-    /// ([`ComAmazonawsIottwinmakerAwsiottwinmakerState::pending_pricing_plan`])
+    /// ([`RegionalState::pending_pricing_plan`])
     /// is SUPERSEDED here rather than left to land later, and after this call
     /// nothing is pending.
     ///
@@ -2874,8 +3024,14 @@ pub fn already_exists_message(kind: &str, resource_id: &str, workspace_id: Optio
     }
 }
 
-/// The region to build an ARN in for this request: the region of its SigV4
-/// credential scope, or [`DEFAULT_REGION`] when it is unsigned.
+/// The Region this request is served in: the region of its SigV4 credential
+/// scope, or [`DEFAULT_REGION`] when it is unsigned.
+///
+/// The ONE answer to "which Region is this?", used both to pick the store that
+/// answers the request
+/// ([`region`](ComAmazonawsIottwinmakerAwsiottwinmakerState::region)) and to
+/// build the ARNs it mints, so a resource can never be filed in one Region and
+/// stamped with another.
 ///
 /// A scope region that is not of the shape the modelled `TwinMakerArn` admits
 /// for its region segment (`[a-z0-9-]+`) is replaced by the default, so a
@@ -2911,7 +3067,7 @@ const WORKSPACE_ARN_RESOURCE_PREFIX: &str = "workspace/";
 /// comparing it against an id.
 ///
 /// Unlike
-/// [`resolve_workspace_id`](ComAmazonawsIottwinmakerAwsiottwinmakerState::resolve_workspace_id),
+/// [`resolve_workspace_id`](RegionalState::resolve_workspace_id),
 /// this reads the id out of the ARN rather than resolving it against the stored
 /// workspaces, so it still names the workspace of an ARN whose workspace has
 /// been deleted. An ARN's resource portion is its sixth colon-separated field.

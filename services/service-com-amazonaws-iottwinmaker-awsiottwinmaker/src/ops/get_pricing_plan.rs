@@ -152,19 +152,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every call is recorded, successful or refused, as the other readers of
         // this service's state do: the real service logs control-plane access.
         ::tracing::info!(operation = "GetPricingPlan", "serving a request");
-        // `GetPricingPlanRequest` has no members, and the plan is account-wide:
-        // there is nothing in the request or its metadata to read.
-        let _ = (&input, ctx);
+        // `GetPricingPlanRequest` has no members, so the only thing to read off
+        // the request is the Region it is signed for: the plan is per account
+        // and Region, so a plan set through another Region's endpoint is not
+        // this Region's.
+        let _ = &input;
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetPricingPlanErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),
             })
         })?;
         let state = state.lock();
+        let state = state.region(&region);
 
         // One count for both reported plans: `billableEntityCount` describes the
-        // ACCOUNT, not the plan, so the pending plan is reported with the same
-        // number as the current one.
+        // ACCOUNT in this Region, not the plan, so the pending plan is reported
+        // with the same number as the current one.
         let billable_entity_count = state.billable_entity_count();
         Ok(GetPricingPlanOutput {
             current_pricing_plan: state.pricing_plan.as_pricing_plan(billable_entity_count),

@@ -28,10 +28,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::emulator::{
-    code, create_with_tags, message, placements, tags_of, text, without_tags, Emulator,
+    code, create_with_tags, message, placements, remote_account_for, tags_of, text, without_tags,
+    Emulator,
 };
 
 /// The account id every emulator ARN carries.
@@ -637,18 +638,21 @@ async fn tag_resource_bounds_the_tags_one_resource_holds() {
         let tags: BTreeMap<String, String> = (0..count)
             .map(|index| (format!("key-{index:02}"), format!("value-{index:02}")))
             .collect();
-        let (status, body) = emulator
-            .ic(
-                "CreateConnection",
-                json!({
-                    "environmentId": placements[0].0,
-                    "bandwidth": placements[0].1,
-                    "attachPoint": { "directConnectGateway": format!("aaaaaaaa-bbbb-4ccc-8ddd-{:012}", 1100 + count) },
-                    "description": format!("cap case {count}"),
-                    "tags": tags,
-                }),
-            )
-            .await;
+        let mut request = Map::new();
+        request.insert("environmentId".to_string(), json!(placements[0].0));
+        request.insert("bandwidth".to_string(), json!(placements[0].1));
+        request.insert(
+            "attachPoint".to_string(),
+            json!({ "directConnectGateway": emulator.attach_point().await }),
+        );
+        request.insert("description".to_string(), json!(format!("cap case {count}")));
+        if let Some(remote_account) =
+            remote_account_for(&emulator.environment(&placements[0].0).await)
+        {
+            request.insert("remoteAccount".to_string(), remote_account);
+        }
+        request.insert("tags".to_string(), json!(tags));
+        let (status, body) = emulator.ic("CreateConnection", Value::Object(request)).await;
         assert_eq!(
             status, expected,
             "case {name:?} ({count} tags): expected HTTP {expected}, got {status} with {body:?}"

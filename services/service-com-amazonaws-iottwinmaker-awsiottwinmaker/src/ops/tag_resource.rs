@@ -177,7 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tag_count = input.tags.len(),
             "serving a request"
         );
-        let _ = ctx;
+        // The Region this request is signed for picks the store it acts on: an
+        // ARN minted in another Region names no resource here, so a
+        // cross-Region ARN is a resource this Region does not hold.
+        let region = crate::state::request_region(ctx.parts());
 
         // The reserved namespace is AWS's own, so a key under it is not one this
         // call may write — decided on the request alone, before the store is
@@ -199,6 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
+        let state = state.region_mut(&region);
 
         let resource_arn = input.resource_arn;
         let Some(tags) = state.tags_for_resource_mut(&resource_arn) else {

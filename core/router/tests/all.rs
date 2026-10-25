@@ -310,3 +310,5 @@ mod cloudformation_provisions_event_rules_and_ssm_parameters;
 mod cloudformation_provisions_sfn_activities;
 #[path = "all/cloudformation_provisions_s3vectors_resources.rs"]
 mod cloudformation_provisions_s3vectors_resources;
+#[path = "all/cloudformation_provisions_msk_clusters.rs"]
+mod cloudformation_provisions_msk_clusters;

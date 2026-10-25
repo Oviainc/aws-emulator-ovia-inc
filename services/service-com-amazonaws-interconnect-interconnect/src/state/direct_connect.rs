@@ -96,6 +96,46 @@ fn descriptor_of(
     })
 }
 
+/// What resolving ONE attach-point identifier against the account's gateways found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachPointResolution {
+    /// The identifier names a gateway of the account that is a valid attach point.
+    Valid,
+    /// The account's gateways were read, and none of them is that identifier.
+    NotAnAttachPoint,
+    /// The account's gateways could not be read to the end, so whether the identifier
+    /// names one is UNKNOWN. That is this emulator failing to resolve the account's own
+    /// state, not a caller naming something that does not exist, so the two are never
+    /// answered the same way.
+    Unresolvable,
+}
+
+/// Resolve `identifier` against the attach points of the account.
+///
+/// Answered from the same walk [`attach_points`] reports, so what a Connection may be
+/// attached to is exactly what `ListAttachPoints` offers for the Environment — the two
+/// cannot drift apart. A gateway the account does not hold and one that is not ready
+/// for use are both [`AttachPointResolution::NotAnAttachPoint`]; a walk that could not
+/// be completed is [`AttachPointResolution::Unresolvable`], unless the pages it did
+/// read already hold the identifier, which settles the question on its own.
+pub async fn resolve_attach_point(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    identifier: &str,
+) -> AttachPointResolution {
+    let (descriptors, complete) = walk_attach_points(ctx, region).await;
+    if descriptors
+        .iter()
+        .any(|descriptor| descriptor.identifier == identifier)
+    {
+        AttachPointResolution::Valid
+    } else if complete {
+        AttachPointResolution::NotAnAttachPoint
+    } else {
+        AttachPointResolution::Unresolvable
+    }
+}
+
 /// Every Direct Connect gateway of the account that is a valid attach point, as the
 /// descriptors `ListAttachPoints` reports.
 ///
@@ -108,6 +148,17 @@ pub async fn attach_points(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> Vec<AttachPointDescriptor> {
+    walk_attach_points(ctx, region).await.0
+}
+
+/// The walk both readers above share: the descriptors it gathered, and whether it
+/// reached the END of the account's gateways — `false` when Direct Connect could not be
+/// asked, and when the page bound was reached with a cursor still outstanding, so the
+/// descriptors are not a complete account of what the account holds.
+async fn walk_attach_points(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> (Vec<AttachPointDescriptor>, bool) {
     let client = direct_connect(ctx, region);
     let mut descriptors: Vec<AttachPointDescriptor> = Vec::new();
     let mut token: Option<String> = None;
@@ -129,13 +180,13 @@ pub async fn attach_points(
                     error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                     "the account's Direct Connect gateways could not be resolved"
                 );
-                break;
+                return (descriptors, false);
             }
         };
         descriptors.extend(page.direct_connect_gateways().iter().filter_map(descriptor_of));
         token = page.next_token().map(str::to_string);
         if token.is_none() {
-            break;
+            return (descriptors, true);
         }
         // The page bound is reached with a cursor still outstanding, so this listing is
         // SHORT of what the peer holds. Said out loud: a short answer a caller cannot
@@ -148,5 +199,5 @@ pub async fn attach_points(
             );
         }
     }
-    descriptors
+    (descriptors, false)
 }
