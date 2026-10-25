@@ -421,6 +421,18 @@ impl ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
         hosts
     }
 
+    /// Every repository link in creation order — the order `ListRepositoryLinks` pages
+    /// over.
+    ///
+    /// Borrowed, not cloned, for the same reason as
+    /// [`Self::connections_in_creation_order`]: the request sorts POINTERS and clones
+    /// only the page it returns.
+    pub fn repository_links_in_creation_order(&self) -> Vec<&StoredRepositoryLink> {
+        let mut links: Vec<&StoredRepositoryLink> = self.repository_links.values().collect();
+        links.sort_unstable_by_key(|link| link.sequence);
+        links
+    }
+
     /// Every sync blocker recorded for one `(sync_type, resource_name)` pair, MOST
     /// RECENT FIRST, borrowed out of the one blocker store.
     ///

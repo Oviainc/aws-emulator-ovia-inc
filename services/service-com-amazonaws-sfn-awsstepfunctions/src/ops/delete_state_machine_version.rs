@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStateMachineVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStateMachineVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes ONE published version of a state machine from the records in
+//! [`crate::state`], so a later `DescribeStateMachine` on that version ARN and a
+//! later `ListStateMachineVersions` no longer answer for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStateMachineVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A version is an immutable snapshot keyed by its own qualified ARN
+//! (`<stateMachineArn>:<version>`), so this deletes exactly that record and nothing
+//! else: the state machine keeps its current configuration and its version counter,
+//! and "deleting a state machine version won't terminate its in-progress executions",
+//! so every execution started through it keeps the ARN it was attributed to.
+//!
+//! Two rules shape the answers:
+//!
+//! * "You can't delete a state machine version currently referenced by one or more
+//!   aliases. Before you delete a version, you must either delete the aliases or
+//!   update them to point to another state machine version" — a version an alias
+//!   still routes to is the modelled `ConflictException`, and nothing is removed;
+//! * the operation models no resource-absent error at all, so a well-formed version
+//!   ARN the store holds nothing for is a SUCCESS: the post-condition the caller
+//!   asked for already holds, which is what makes a repeat of one delete answer the
+//!   same way.
+//!
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +159,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStateMachineVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStateMachineVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStateMachineVersion"))
+        // `stateMachineVersionArn` (len 1..2000) is a modelled constraint, so the
+        // centralized walk has already refused anything outside it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is judged BEFORE anything is resolved from it: text that is not a
+        // state machine VERSION ARN of this service in the region this endpoint
+        // serves — a malformed ARN, another service's, another region's, an
+        // unqualified state machine ARN, a Distributed Map labeled ARN, an alias
+        // ARN — is a defect in the REQUEST, which `InvalidArn` reports, and never a
+        // version that is absent.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let (state_machine_arn, _version) = match crate::state::read_state_machine_version_arn(
+            &input.state_machine_version_arn,
+            &endpoint_region,
+        ) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                return Err(
+                    DeleteStateMachineVersionErrorModeled::InvalidArn(InvalidArn {
+                        message: Some(message),
+                    })
+                    .into(),
+                )
+            }
+        };
+
+        let mut store = state.lock();
+        // The one write this call makes before it looks anything up: a state machine
+        // whose removal the clock already owed is gone, and its versions went with
+        // it, so no version is deleted from a record that no longer exists.
+        store.settle(crate::state::now());
+
+        // "You can't delete a state machine version currently referenced by one or
+        // more aliases. Before you delete a version, you must either delete the
+        // aliases or update them to point to another state machine version." The
+        // aliases come from the store, so what a create or an update of an alias
+        // wrote is what decides this.
+        let referencing: Vec<String> = store
+            .aliases_routing_to(&state_machine_arn, &input.state_machine_version_arn)
+            .into_iter()
+            .map(|alias| alias.arn.clone())
+            .collect();
+        if !referencing.is_empty() {
+            return Err(
+                DeleteStateMachineVersionErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "'{}' is referenced by the state machine alias(es) {}, which must be \
+                         deleted or pointed at another version before it can be deleted",
+                        input.state_machine_version_arn,
+                        referencing.join(", ")
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // Deleting a version the store does not hold is a success all the same: this
+        // operation models no resource-absent error, and the post-condition the
+        // caller asked for already holds.
+        store.remove_state_machine_version(&input.state_machine_version_arn);
+
+        Ok(DeleteStateMachineVersionOutput {})
     }
 }

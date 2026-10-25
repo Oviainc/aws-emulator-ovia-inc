@@ -35,7 +35,7 @@ use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::TABLE_CATALOG;
 
-use crate::export_lifecycle::{cases, error_code, Client, NOT_FOUND_STATUS};
+use crate::export_lifecycle::{cases, error_code, Client};
 
 /// The modelled input member every refusal of a query statement names
 /// (`DataQuery$QueryStatement`, reached through `Export$DataQuery`).
@@ -283,18 +283,26 @@ fn assert_refused(case: &str, status: u16, body: &Value, statement: &str) {
     );
 }
 
-/// The ARN `CreateExport` mints for `name` in the region the harness signs for — what a
-/// refused create must leave naming nothing.
-fn export_arn(name: &str) -> String {
-    engine::emulator_arn("bcm-data-exports", "us-east-1", &format!("export/{name}"))
-}
-
 /// RULE: a `CreateExport` whose query statement this service cannot read as a single query
 /// over published tables is refused with the modelled 400 naming the statement, and
 /// nothing is persisted.
 #[tokio::test]
 async fn a_create_refuses_a_query_statement_outside_the_published_subset() {
     let client = Client::new();
+
+    // The ANCHOR: one accepted export, whose name every listing below must carry. Without
+    // it the "name is absent" check would also pass on a listing that reported no name at
+    // all.
+    let accepted = export_name("accepted_statement");
+    client
+        .ok(
+            "CreateExport",
+            &create_request(
+                &accepted,
+                &format!("SELECT identity_line_item_id FROM {PUBLISHED_TABLE}"),
+            ),
+        )
+        .await;
 
     for (index, (label, statement)) in statements_outside_the_subset().into_iter().enumerate() {
         let case = format!("{label}: {statement:?}");
@@ -304,24 +312,45 @@ async fn a_create_refuses_a_query_statement_outside_the_published_subset() {
             .await;
         assert_refused(&case, status, &body, &statement);
 
-        // Nothing was stored: the ARN this name would have minted names nothing.
-        let (status, body) = client
-            .call("GetExport", &json!({ "ExportArn": export_arn(&name) }))
-            .await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (NOT_FOUND_STATUS, "ResourceNotFoundException"),
-            "case {case:?}: a refused create must have stored nothing, got {status} with {body}"
+        // Nothing was stored. A minted ARN carries a per-export generated id this test
+        // cannot predict, so the store is asked BY NAME: no export of that name is listed.
+        let listed = client.ok("ListExports", &json!({})).await;
+        let stored_names: Vec<&str> = listed["Exports"]
+            .as_array()
+            .map(|references| {
+                references
+                    .iter()
+                    .filter_map(|reference| reference["ExportName"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            stored_names.contains(&accepted.as_str()),
+            "case {case:?}: the listing must report the accepted export's name, got \
+             {stored_names:?}"
+        );
+        assert!(
+            !stored_names.contains(&name.as_str()),
+            "case {case:?}: a refused create must have stored nothing, got {stored_names:?}"
         );
     }
 
-    // And the store is empty of them: no refused row is listed.
+    // And the store holds nothing but the anchor: no refused row is listed.
     let listed = client.ok("ListExports", &json!({})).await;
-    let count = listed["Exports"]
+    let names: Vec<&str> = listed["Exports"]
         .as_array()
-        .map(Vec::len)
+        .map(|references| {
+            references
+                .iter()
+                .filter_map(|reference| reference["ExportName"].as_str())
+                .collect()
+        })
         .unwrap_or_default();
-    assert_eq!(count, 0, "no refused create may be listed, got {listed}");
+    assert_eq!(
+        names,
+        vec![accepted.as_str()],
+        "no refused create may be listed, got {listed}"
+    );
 }
 
 /// RULE, the other half: a statement this service CAN read as a query over published

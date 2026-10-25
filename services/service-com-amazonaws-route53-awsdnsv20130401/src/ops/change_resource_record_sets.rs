@@ -107,10 +107,11 @@
 use super::types::*;
 
 use crate::state::{
-    dns_sort_key, name_is_in_zone, no_such_hosted_zone, normalize_dns_name, normalize_zone_id,
-    RecordKey, MAX_CHANGES_PER_BATCH, MAX_RECORD_SETS_PER_ZONE, MAX_REPORTED_CHANGE_PROBLEMS,
+    canonical_dns_name, dns_sort_key, name_is_in_zone, no_such_hosted_zone, normalize_zone_id,
+    DnsNameKey, RecordKey, MAX_CHANGES_PER_BATCH, MAX_RECORD_SETS_PER_ZONE,
+    MAX_REPORTED_CHANGE_PROBLEMS,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// An `InvalidChangeBatch` naming one problem per refused change.
 ///
@@ -162,15 +163,28 @@ impl Problems {
 }
 
 /// How a change names the record set it was refused over: `[name='<name>',
-/// type='<type>']`, both values taken from the request.
+/// type='<type>']`, and `set-identifier='<id>'` as well when the record set
+/// carries one.
 ///
-/// The record is named by what IDENTIFIES it in DNS — the name it answers for
-/// and its record type — so a caller with several changes in one batch can tell
-/// which one was refused. Nothing internal to this handler goes in: the action
-/// is already stated by the sentence the label sits in, and a member the request
-/// did not give is not reported as a literal `null`.
+/// The record is named by what IDENTIFIES it — the name it answers for, its
+/// record type and, for a member of a routing group, the identifier that tells
+/// it from its siblings — so a caller with several changes in one batch can tell
+/// which one was refused, and a caller whose group reuses an identifier can tell
+/// a collision on one sibling from a collision on the whole name-and-type group.
+/// Nothing internal to this handler goes in: the action is already stated by the
+/// sentence the label sits in, and a member the request did not give is not
+/// reported as a literal `null`.
 fn change_label(record: &ResourceRecordSet) -> String {
-    format!("[name='{}', type='{}']", record.name, record.r#type)
+    let set_identifier = record
+        .set_identifier
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(|id| format!(", set-identifier='{id}'"))
+        .unwrap_or_default();
+    format!(
+        "[name='{}', type='{}'{set_identifier}]",
+        record.name, record.r#type
+    )
 }
 
 /// The record data values of a record set, sorted, for comparing two sets of
@@ -184,6 +198,82 @@ fn sorted_values(record: &ResourceRecordSet) -> Vec<String> {
         .collect();
     values.sort();
     values
+}
+
+/// The record sets at one record set's (name, type), which a `BTreeMap` keyed by
+/// [`RecordKey`] holds as a CONTIGUOUS range: the key order is name, then type,
+/// then set identifier, and `None` sorts before every `Some`, so the range opens
+/// at the simple record set's key and ends at the first key of another name or
+/// type. Walking the range is therefore bounded by the group, not by the zone.
+fn group_members<'a, V>(
+    map: &'a BTreeMap<RecordKey, V>,
+    of: &RecordKey,
+) -> impl Iterator<Item = (&'a RecordKey, &'a V)> + 'a {
+    let name_sort_key = of.name_sort_key.clone();
+    let rr_type = of.rr_type.clone();
+    let from = RecordKey {
+        name_sort_key: name_sort_key.clone(),
+        rr_type: rr_type.clone(),
+        set_identifier: None,
+    };
+    map.range(from..)
+        .take_while(move |(key, _)| key.name_sort_key == name_sort_key && key.rr_type == rr_type)
+}
+
+/// The record sets at one (name, type) in the state the batch would LEAVE:
+/// those `stored` ones the overlay does not touch, plus those the overlay
+/// WRITES. Bounded by the group, since both walks are [`group_members`] ranges.
+fn surviving_group<'a>(
+    stored: &'a BTreeMap<RecordKey, ResourceRecordSet>,
+    staged: &'a BTreeMap<RecordKey, Option<ResourceRecordSet>>,
+    of: &RecordKey,
+) -> impl Iterator<Item = &'a RecordKey> + 'a {
+    group_members(stored, of)
+        .filter(move |(member, _)| !staged.contains_key(*member))
+        .map(|(member, _)| member)
+        .chain(
+            group_members(staged, of)
+                .filter(|(_, pending)| pending.is_some())
+                .map(|(member, _)| member),
+        )
+}
+
+/// Why the record sets at one name and type may not stand together, if they may
+/// not.
+///
+/// One name and type are served EITHER by a single simple record set, which
+/// carries no `SetIdentifier`, OR by a group of record sets with "a routing
+/// policy other than simple" (`SetIdentifier`'s own documentation), each told
+/// apart by its identifier. The two cannot be mixed: a simple record set beside
+/// a group member would leave two answers for one query with no routing rule to
+/// choose between them. Judged against the state the batch would LEAVE — the
+/// stored record sets with the whole `staged` overlay applied — so a batch that
+/// replaces a simple record set with a group, or a group with a simple record
+/// set, is accepted whatever order its changes are written in, while one that
+/// would leave the two mixed is not.
+fn routing_conflict(
+    stored: &BTreeMap<RecordKey, ResourceRecordSet>,
+    staged: &BTreeMap<RecordKey, Option<ResourceRecordSet>>,
+    key: &RecordKey,
+    record: &ResourceRecordSet,
+    zone_name: &str,
+) -> Option<String> {
+    let mut simple = false;
+    let mut grouped = false;
+    for member in surviving_group(stored, staged, key) {
+        if member.set_identifier.is_none() {
+            simple = true;
+        } else {
+            grouped = true;
+        }
+    }
+    (simple && grouped).then(|| {
+        format!(
+            "RRSet of type {} with DNS name {} is not permitted as it conflicts with other \
+             records with the same DNS name and type in zone {zone_name}",
+            record.r#type, record.name
+        )
+    })
 }
 
 /// Why this record set cannot be written, if it cannot.
@@ -384,7 +474,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         for change in &input.change_batch.changes {
             let mut record = change.resource_record_set.clone();
-            record.name = normalize_dns_name(&record.name);
+            // A record set is stored, keyed and reported under the ONE canonical
+            // form of its name, whatever spelling the change was written with;
+            // the same holds for the DNS name an alias routes to.
+            record.name = canonical_dns_name(&record.name);
+            if let Some(alias) = record.alias_target.as_mut() {
+                alias.dns_name = canonical_dns_name(&alias.dns_name);
+            }
             let action = change.action.as_str();
             let key = RecordKey::of_record(&record);
 
@@ -433,22 +529,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "Tried to delete resource record set {} but it was not found",
                         change_label(&record)
                     )),
-                    // The zone's own delegation records are not the caller's to
-                    // remove: deleting the apex NS or SOA record would leave a
-                    // zone that answers no delegation query and would also let
-                    // DeleteHostedZone's "only the default SOA and NS records"
-                    // rule pass on a zone that no longer has them.
-                    Some(_)
-                        if key.name_sort_key == apex
-                            && key.set_identifier.is_none()
-                            && matches!(key.rr_type.as_str(), "NS" | "SOA") =>
-                    {
-                        problems.push(format!(
-                            "Tried to delete resource record set {} but it is one of the hosted \
-                             zone's own default NS and SOA records, which cannot be deleted",
-                            change_label(&record)
-                        ));
-                    }
                     // "To delete a resource record set, you must specify all the
                     // same values that you specified when you created it" — so a
                     // DELETE has to carry the record's data, and it has to be
@@ -474,6 +554,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "Invalid Action: {other} is not one of CREATE, DELETE or UPSERT"
                 )),
             }
+        }
+
+        // Routing exclusivity, over the state the batch would LEAVE: each
+        // (name, type) the batch wrote to is checked once, so the outcome does
+        // not depend on the order the changes were written in.
+        let mut groups_checked: BTreeSet<(DnsNameKey, String)> = BTreeSet::new();
+        for (key, record) in staged
+            .iter()
+            .filter_map(|(key, pending)| pending.as_ref().map(|record| (key, record)))
+        {
+            if !groups_checked.insert((key.name_sort_key.clone(), key.rr_type.clone())) {
+                continue;
+            }
+            if let Some(problem) =
+                routing_conflict(&zone.records, &staged, key, record, &zone_name)
+            {
+                problems.push(problem);
+            }
+        }
+
+        // The zone's own apex records are a ZONE-LEVEL CARDINALITY constraint,
+        // not a protection on individual records: a hosted zone holds exactly
+        // one SOA record and at least one NS record for the zone itself (the
+        // "default SOA and NS records" `DeleteHostedZone` is documented around),
+        // so a batch is refused when the record sets it would LEAVE do not
+        // satisfy that. Counted over the state after the overlay, so replacing
+        // an apex record in one batch is as acceptable as never touching it,
+        // while removing the last one is not.
+        let apex_record_count = |rr_type: &str| {
+            let apex_key = RecordKey {
+                name_sort_key: apex.clone(),
+                rr_type: rr_type.to_string(),
+                set_identifier: None,
+            };
+            surviving_group(&zone.records, &staged, &apex_key).count()
+        };
+        if apex_record_count("SOA") != 1 {
+            problems.push("A HostedZone must contain exactly one SOA record.".to_string());
+        }
+        if apex_record_count("NS") == 0 {
+            problems.push(
+                "A HostedZone must contain at least one NS record for the zone itself.".to_string(),
+            );
         }
 
         // The zone's own quota: a zone cannot be grown past it by repeated

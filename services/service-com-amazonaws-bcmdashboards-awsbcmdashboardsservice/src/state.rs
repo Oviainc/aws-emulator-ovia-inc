@@ -633,6 +633,41 @@ pub fn check_tag_keys_not_reserved<'a>(
     ))
 }
 
+/// The tag list to STORE when `incoming` is applied to the resource that currently
+/// carries `stored`: the tags resolved by tag key, so one key holds one value.
+///
+/// A resource's tags are a map keyed by tag key, while `ResourceTagList` is a plain
+/// list the model lets repeat a key (length 0..200, no `@uniqueItems`,
+/// `smithy_query(query="shape",shape="ResourceTagList")`), so every path that accepts
+/// caller-supplied tags resolves that list the same way here rather than each one
+/// deciding for itself:
+///
+/// * a key the resource already carries takes the applied value IN PLACE, keeping its
+///   position in the stored list, so the order a tagging read reports stays stable;
+/// * a key it does not carry yet is appended in the order `incoming` first names it;
+/// * a key the request repeats settles on its LAST value — the same answer as applying
+///   those entries one request at a time;
+/// * a key `incoming` does not name keeps its stored value.
+///
+/// Create-time tagging passes an empty `stored`, which is the same rule with nothing to
+/// update: the request's own repeated keys are resolved, so no resource ever enters the
+/// store carrying one key twice — a state no later tagging call could produce, and one
+/// that would make a read report two values for one key and an update reach only the
+/// first copy.
+pub fn merge_resource_tags(
+    stored: Vec<ResourceTag>,
+    incoming: impl IntoIterator<Item = ResourceTag>,
+) -> Vec<ResourceTag> {
+    let mut merged = stored;
+    for tag in incoming {
+        match merged.iter_mut().find(|stored| stored.key == tag.key) {
+            Some(stored) => stored.value = tag.value,
+            None => merged.push(tag),
+        }
+    }
+    merged
+}
+
 /// The `scheduleConfig` to store for a create or an update: the supplied config with
 /// `state` resolved to [`SCHEDULE_STATE_ENABLED`] when the request left it unset, so
 /// every reader sees a schedule whose state is decided once, at write time, rather
