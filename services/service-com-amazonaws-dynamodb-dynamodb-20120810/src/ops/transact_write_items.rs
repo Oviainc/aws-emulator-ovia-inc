@@ -315,8 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         TransactWriteItemsErrorModeled::IdempotentParameterMismatchException(
                             IdempotentParameterMismatchException {
                                 message: Some(
-                                    "Request parameters differ from those of a request \
-                                     already completed with this ClientRequestToken"
+                                    crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE
                                         .to_string(),
                                 ),
                             },
@@ -921,25 +920,20 @@ fn lift(error: crate::state::RequestError) -> TransactWriteItemsError {
     }
 }
 
-/// The clause every refusal of a parameter value in this service opens with, which the
-/// documented `ValidationError` cancellation reason also states ("Message: One or more
-/// parameter values were invalid").
-const INVALID_PARAMETER_CLAUSE: &str = "One or more parameter values were invalid";
-
 /// Report a refusal the transaction decided for ONE element — the item it writes
 /// carrying a key attribute of a type the table does not declare, for its own key schema
 /// or for a secondary index's — as the cancellation it is.
 ///
 /// "All of which must either succeed or fail": an element the transaction itself
 /// refuses when it prepares that element's item against the TABLE's schema cancels the
-/// whole request, so the answer is the `TransactionCanceledException` whose
-/// `CancellationReasons` name that element with `ValidationError` and every other
-/// element with `None`, since nothing was wrong with those ("Cancellation reason codes
-/// and possible error messages"). A refusal about the REQUEST rather than about the item
-/// as the table's schema sees it — a `Key` member that does not name this table's key
-/// attributes, a key value that is empty or past its size limit, an item addressed
-/// twice, an entry naming no operation, a table that is not there — is still answered
-/// directly, which is what [`lift`] does with it.
+/// whole request, so the answer is the `TransactionCanceledException`
+/// [`crate::state::cancelled_by_element_reasons`] builds — the documented reason shape,
+/// shared with every other transactional operation — wrapped in this operation's error.
+/// A refusal about the REQUEST rather than about the item as the table's schema sees it
+/// — a `Key` member that does not name this table's key attributes, a key value that is
+/// empty or past its size limit, an item addressed twice, an entry naming no operation,
+/// a table that is not there — is still answered directly, which is what [`lift`] does
+/// with it.
 fn cancelled_by_element(
     at: usize,
     elements: usize,
@@ -948,36 +942,10 @@ fn cancelled_by_element(
     let crate::state::RequestError::Validation(message) = error else {
         return lift(error);
     };
-    // "ValidationError - Code: ValidationError, Message: One or more parameter values
-    // were invalid" ("Cancellation reason codes and possible error messages"): the
-    // reason's message states the documented clause, and keeps the detail of what the
-    // request got wrong behind it, the way every other validation refusal of a
-    // parameter value in this service words it.
-    let detail = if message.starts_with(INVALID_PARAMETER_CLAUSE) {
-        message
-    } else {
-        format!("{INVALID_PARAMETER_CLAUSE}: {message}")
-    };
-    let codes: Vec<&str> = (0..elements)
-        .map(|element| {
-            if element == at {
-                crate::state::CANCELLATION_CODE_VALIDATION_ERROR
-            } else {
-                crate::state::CANCELLATION_CODE_NONE
-            }
-        })
-        .collect();
-    let cancellation_reasons: Vec<CancellationReason> = codes
-        .iter()
-        .enumerate()
-        .map(|(element, code)| CancellationReason {
-            code: Some((*code).to_string()),
-            message: (element == at).then(|| detail.clone()),
-            item: None,
-        })
-        .collect();
+    let (message, cancellation_reasons) =
+        crate::state::cancelled_by_element_reasons(at, elements, &message);
     TransactWriteItemsErrorModeled::TransactionCanceledException(TransactionCanceledException {
-        message: Some(crate::state::transaction_cancelled_message(&codes)),
+        message: Some(message),
         cancellation_reasons: Some(cancellation_reasons),
     })
     .into()
