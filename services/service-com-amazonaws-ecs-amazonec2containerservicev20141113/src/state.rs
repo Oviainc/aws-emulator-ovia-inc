@@ -49,7 +49,7 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    Attachment, Attribute, AutoScalingGroupProvider, CapacityProvider,
+    Attachment, Attribute, AutoScalingGroupProvider, AwsVpcConfiguration, CapacityProvider,
     CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterServiceConnectDefaults,
     ClusterSetting, Container, ContainerDefinition, ContainerInstance, Deployment,
     DeploymentCircuitBreaker, DeploymentConfiguration, DeploymentController, EphemeralStorage,
@@ -568,6 +568,84 @@ const DOCUMENTED_STATISTICS_LAUNCH_TYPES: usize = 2;
 /// modelled for.
 pub const PLATFORM_VERSIONS: [&str; 6] = ["LATEST", "1.4.0", "1.3.0", "1.2.0", "1.1.0", "1.0.0"];
 
+/// The `platformVersion` alias that asks for whatever the newest platform version is,
+/// rather than naming one: "If one isn't specified, the LATEST platform version is used."
+pub const PLATFORM_VERSION_LATEST: &str = "LATEST";
+
+/// The Fargate platform version [`PLATFORM_VERSION_LATEST`] resolves to for a LINUX
+/// task, as the `platformVersion` doc's "Fargate platform versions" page states: `1.4.0`
+/// is the newest Linux platform version.
+pub const LATEST_LINUX_PLATFORM_VERSION: &str = "1.4.0";
+
+/// The Fargate platform version [`PLATFORM_VERSION_LATEST`] resolves to for a Windows
+/// task: the same page publishes exactly one Windows platform version, `1.0.0`.
+pub const LATEST_WINDOWS_PLATFORM_VERSION: &str = "1.0.0";
+
+/// The launch type whose tasks run on Fargate, and so the one the Fargate-only members
+/// (`platformFamily`, `platformVersion`) are reported for.
+pub const LAUNCH_TYPE_FARGATE: &str = "FARGATE";
+
+/// The capacity providers Amazon ECS manages for every account in every Region, which
+/// place tasks on Fargate: the `UpdateService$capacityProviderStrategy` doc — "When you
+/// use Fargate, the capacity providers are FARGATE or FARGATE_SPOT". They are not created
+/// by `CreateCapacityProvider` (their names are reserved,
+/// [`CAPACITY_PROVIDER_RESERVED_PREFIXES`]) and exist whether or not anybody asked, so
+/// they are resolved rather than stored ([`managed_capacity_provider`]).
+pub const MANAGED_CAPACITY_PROVIDERS: [&str; 2] = ["FARGATE", "FARGATE_SPOT"];
+
+/// The `OSFamily` a revision that declares no `runtimePlatform` runs on. `RuntimePlatform
+/// $operatingSystemFamily` is "The operating system", whose `OSFamily` enum
+/// (`smithy_query(query="shape", shape="OSFamily")`) spans `LINUX` and the Windows
+/// Server families; a task definition that names none runs on Linux.
+pub const DEFAULT_OS_FAMILY: &str = "LINUX";
+
+/// The DISPLAY spelling of an `OSFamily` value, which is what `Service$platformFamily`
+/// and `Deployment$platformFamily` report ("The operating system that your tasks in the
+/// service run on").
+///
+/// The enum's own name, rendered for display: the `_`-separated words become `-`-separated
+/// words, and a word that is all letters is capitalised (`LINUX` -> `Linux`,
+/// `WINDOWS_SERVER_2019_FULL` -> `Windows-Server-2019-Full`). A word that is not all
+/// letters is a release designation rather than a word and is kept exactly as the enum
+/// spells it (`2019`, `20H2`), so every value of the enum — including the ones no request
+/// here names — renders deterministically.
+pub fn os_family_display(os_family: &str) -> String {
+    os_family
+        .split('_')
+        .map(|word| {
+            if !word.chars().all(|character| character.is_ascii_alphabetic()) {
+                return word.to_string();
+            }
+            let mut characters = word.chars();
+            match characters.next() {
+                None => String::new(),
+                Some(first) => {
+                    first.to_ascii_uppercase().to_string() + &characters.as_str().to_lowercase()
+                }
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("-")
+}
+
+/// The platform version a DEPLOYMENT runs, resolved from the one the service asks for and
+/// the operating-system family its tasks run on.
+///
+/// A service may ask for [`PLATFORM_VERSION_LATEST`], which names no version: the
+/// deployment runs the newest platform version published for its operating system
+/// ([`LATEST_LINUX_PLATFORM_VERSION`], [`LATEST_WINDOWS_PLATFORM_VERSION`]). A service
+/// that named a version runs that one.
+pub fn resolved_platform_version(requested: &str, os_family: &str) -> String {
+    if requested != PLATFORM_VERSION_LATEST {
+        return requested.to_string();
+    }
+    if os_family == DEFAULT_OS_FAMILY {
+        LATEST_LINUX_PLATFORM_VERSION.to_string()
+    } else {
+        LATEST_WINDOWS_PLATFORM_VERSION.to_string()
+    }
+}
+
 /// The message a `PlatformUnknownException` carries: the FIXED sentence Amazon ECS
 /// answers for this condition, as the recorded refusal carries it (the error shape's
 /// own doc words the same condition as "The specified platform version doesn't
@@ -653,6 +731,21 @@ pub const SERVICE_INACTIVE: &str = "INACTIVE";
 /// `Deployment$status` for the service's current deployment — the member's doc:
 /// "`PRIMARY`: The most recent deployment of a service."
 pub const DEPLOYMENT_PRIMARY: &str = "PRIMARY";
+
+/// `Deployment$status` for a deployment a newer one is replacing — the same doc:
+/// "`ACTIVE`: A service deployment that still has running tasks, but are in the process of
+/// being replaced with a new launch type, platform version, task definition, or Docker
+/// image." A deployment with no task left is "completely replaced" (`INACTIVE`), so it is
+/// no longer one of the service's deployments at all.
+pub const DEPLOYMENT_ACTIVE: &str = "ACTIVE";
+
+/// How many superseded deployments one service keeps at once.
+///
+/// A deployment leaves that list as soon as its replacement falls due, so a service holds
+/// one or two of them in practice. The bound is what keeps a burst of updates inside a
+/// single span from growing the record without limit; the NEWEST are kept, since they are
+/// the ones still being replaced.
+pub const MAX_SUPERSEDED_DEPLOYMENTS: usize = 10;
 
 /// `Deployment$rolloutState` while the deployment is still placing tasks — the member's
 /// doc: "When a service deployment is started, it begins in an `IN_PROGRESS` state."
@@ -1387,6 +1480,11 @@ fn container_required_attributes(container: &ContainerDefinition, out: &mut Vec<
     }
 }
 
+/// The `ContainerDefinition$user` Amazon ECS materialises on a task's LOG ROUTER — the
+/// container that carries a `firelensConfiguration`. The FireLens router runs as the root
+/// user, which `user` names by its uid, as the recorded registration carries it.
+pub const FIRELENS_ROUTER_USER: &str = "0";
+
 /// The `hostPort` and `protocol` Amazon ECS fills in for a port mapping the
 /// registration left partly blank, under `network_mode`.
 ///
@@ -1423,8 +1521,12 @@ fn defaulted_port_mapping(mapping: &PortMapping, network_mode: &str) -> PortMapp
 /// Amazon ECS fills in at registration time filled in, so every later read of the
 /// revision reports the same rendered definition.
 ///
-/// Only the port-mapping defaults ([`defaulted_port_mapping`]) are rendered here;
-/// nothing else is invented for a member the caller left out.
+/// Two members are rendered here: a port mapping's ([`defaulted_port_mapping`]), and the
+/// `user` of a LOG ROUTER. A container that carries a `firelensConfiguration` is the
+/// task's log router ("The FireLens configuration for the container. This is used to
+/// specify and configure a log router for container logs"), which Amazon ECS runs as root
+/// — [`FIRELENS_ROUTER_USER`] — so the registered definition carries that user when the
+/// caller named none. Nothing else is invented for a member the caller left out.
 pub fn defaulted_container_definitions(
     containers: &[ContainerDefinition],
     network_mode: &str,
@@ -1438,6 +1540,11 @@ pub fn defaulted_container_definitions(
                     .map(|mapping| defaulted_port_mapping(mapping, network_mode))
                     .collect()
             }),
+            user: match (&container.user, &container.firelens_configuration) {
+                (Some(user), _) => Some(user.clone()),
+                (None, Some(_)) => Some(FIRELENS_ROUTER_USER.to_string()),
+                (None, None) => None,
+            },
             ..container.clone()
         })
         .collect()
@@ -1543,7 +1650,12 @@ impl TaskDefinitionRecord {
             placement_constraints: Some(self.placement_constraints.clone()),
             compatibilities: Some(self.compatibilities()),
             runtime_platform: self.runtime_platform.clone(),
-            requires_compatibilities: Some(self.requires_compatibilities.clone()),
+            // "The task launch types the task definition was validated against" is
+            // `compatibilities`, which Amazon ECS DERIVES; `requiresCompatibilities` is
+            // what the REGISTRATION asked for, so a registration that asked for nothing
+            // surfaces nothing rather than an explicit empty list the caller never sent.
+            requires_compatibilities: (!self.requires_compatibilities.is_empty())
+                .then(|| self.requires_compatibilities.clone()),
             cpu: self.cpu.clone(),
             memory: self.memory.clone(),
             inference_accelerators: None,
@@ -1680,6 +1792,10 @@ pub struct ServiceRecord {
     pub launch_type: Option<String>,
     pub capacity_provider_strategy: Vec<CapacityProviderStrategyItem>,
     pub platform_version: Option<String>,
+    /// The IAM role the CREATE named, resolved to an ARN, and `None` when it named none
+    /// — in which case the service-linked role is reported for exactly the services that
+    /// need one (see
+    /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::service_role_arn`]).
     pub role_arn: Option<String>,
     pub load_balancers: Vec<LoadBalancer>,
     pub service_registries: Vec<ServiceRegistry>,
@@ -1727,6 +1843,46 @@ pub struct ServiceRecord {
     /// deployment transitions to a COMPLETED state" — so a rollout is never COMPLETED in
     /// the same instant the call that started it answers; the CLOCK settles it.
     pub deployment_steady_due_at: Option<SystemTime>,
+    /// The deployments this one REPLACED and whose tasks are still being replaced,
+    /// newest first. `Deployment$status`: "ACTIVE: A service deployment that still has
+    /// running tasks, but are in the process of being replaced with a new launch type,
+    /// platform version, task definition, or Docker image" — so an entry lives here for
+    /// the span that replacement takes, and the clock pass that finds that span elapsed
+    /// drops it ("INACTIVE: A deployment that has been completely replaced").
+    pub superseded_deployments: Vec<SupersededDeployment>,
+}
+
+/// A deployment a later one replaced, kept beside the service while the task set it
+/// placed is still being replaced.
+///
+/// It holds the configuration that deployment rolled out, which is NOT the service's
+/// current configuration any more — that is the point of reporting it: a client watching a
+/// rolling update reads the old deployment's task definition, launch type and network
+/// configuration beside the new one's.
+#[derive(Debug, Clone)]
+pub struct SupersededDeployment {
+    /// The `Deployment$id` it was reported under, and the `startedBy` of every task it
+    /// placed — which is how its remaining tasks are counted.
+    pub id: String,
+    pub task_definition_arn: Option<String>,
+    pub desired_count: i32,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub launch_type: Option<String>,
+    pub capacity_provider_strategy: Vec<CapacityProviderStrategyItem>,
+    pub platform_version: Option<String>,
+    pub network_configuration: Option<NetworkConfiguration>,
+    pub service_connect_configuration: Option<ServiceConnectConfiguration>,
+    pub volume_configurations: Vec<ServiceVolumeConfiguration>,
+    pub vpc_lattice_configurations: Vec<VpcLatticeConfiguration>,
+    /// Whether this rollout had already reached its steady state when it was superseded,
+    /// so the `rolloutState` it is reported with is the one it actually got to rather
+    /// than one asserted now.
+    pub rollout_completed: bool,
+    /// When the task set this deployment placed has been replaced, and so when the
+    /// deployment stops being one of the service's: the clock-owed span of the stop the
+    /// scheduler asked its tasks for ([`TRANSITION_SPAN`]), stored rather than slept on.
+    pub replaced_due_at: SystemTime,
 }
 
 /// One entry of a service's event stream (`ServiceEvent`), as stored.
@@ -1777,6 +1933,51 @@ impl ServiceRecord {
     /// reported and the value filtered on cannot drift.
     pub fn resource_management_type(&self) -> &'static str {
         RESOURCE_MANAGEMENT_CUSTOMER
+    }
+
+    /// Whether this service's tasks run on Fargate — the launch type the request named,
+    /// or the Fargate capacity providers a strategy names ("When you use Fargate, the
+    /// capacity providers are FARGATE or FARGATE_SPOT").
+    ///
+    /// This is what gates the members AWS documents as Fargate-only: `platformFamily`
+    /// ("A platform family is specified only for tasks using the Fargate launch type")
+    /// and `platformVersion` ("A platform version is only specified for tasks using the
+    /// Fargate launch type").
+    pub fn runs_on_fargate(&self) -> bool {
+        self.launch_type.as_deref() == Some(LAUNCH_TYPE_FARGATE)
+            || self.capacity_provider_strategy.iter().any(|item| {
+                MANAGED_CAPACITY_PROVIDERS.contains(&item.capacity_provider.as_str())
+            })
+    }
+
+    /// Move the deployment this service currently reports as `PRIMARY` onto
+    /// [`Self::superseded_deployments`], as the deployment a new one replaces.
+    ///
+    /// Called by the operation that starts a new deployment, BEFORE the record is moved
+    /// onto the new deployment's id and configuration, so the entry holds what that
+    /// rollout was actually rolling out.
+    pub fn supersede_deployment(&mut self, now: SystemTime) {
+        self.superseded_deployments.insert(
+            0,
+            SupersededDeployment {
+                id: self.deployment_id.clone(),
+                task_definition_arn: self.task_definition_arn.clone(),
+                desired_count: self.desired_count,
+                created_at: self.deployment_created_at,
+                updated_at: self.deployment_updated_at,
+                launch_type: self.launch_type.clone(),
+                capacity_provider_strategy: self.capacity_provider_strategy.clone(),
+                platform_version: self.platform_version.clone(),
+                network_configuration: self.network_configuration.clone(),
+                service_connect_configuration: self.service_connect_configuration.clone(),
+                volume_configurations: self.volume_configurations.clone(),
+                vpc_lattice_configurations: self.vpc_lattice_configurations.clone(),
+                rollout_completed: self.deployment_steady_due_at.is_none(),
+                replaced_due_at: now + TRANSITION_SPAN,
+            },
+        );
+        self.superseded_deployments
+            .truncate(MAX_SUPERSEDED_DEPLOYMENTS);
     }
 }
 
@@ -2054,6 +2255,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 self.current_service_deployment(service)
                     .map(|deployment| deployment.arn.clone())
             });
+            // A superseded deployment is reported while it is "in the process of being
+            // replaced"; once that replacement is due it "has been completely replaced"
+            // and is no longer one of the service's deployments. The instant it falls due
+            // is stored with the deployment, so this pass applies what the clock already
+            // owed whether or not anybody called.
+            let replaced: Vec<String> = service
+                .superseded_deployments
+                .iter()
+                .filter(|superseded| superseded.replaced_due_at <= now)
+                .map(|superseded| superseded.id.clone())
+                .collect();
 
             let events = match settled {
                 // The two events the scheduler writes when a rollout reaches its steady
@@ -2095,6 +2307,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             }
             if drained {
                 service.status = SERVICE_INACTIVE.to_string();
+            }
+            if !replaced.is_empty() {
+                service
+                    .superseded_deployments
+                    .retain(|superseded| !replaced.contains(&superseded.id));
             }
             // The rollout's own record ends where the rollout did. Guarded on an OPEN
             // deployment, so a rollout the clock already finished is not re-finished when
@@ -2468,6 +2685,70 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         tally
     }
 
+    /// What the task map counts for ONE deployment of a service: the tasks that deployment
+    /// placed and that have not stopped yet.
+    ///
+    /// A service's task carries the id of the deployment that placed it as its `startedBy`
+    /// ([`ServiceRecord::deployment_id`]), which is what tells a superseded deployment's
+    /// remaining tasks from the current one's. Tasks being replaced are counted here even
+    /// though they are on their way out: they are what makes that deployment one that
+    /// "still has running tasks".
+    fn deployment_tally(&self, cluster_name: &str, deployment_id: &str) -> ServiceTally {
+        let mut tally = ServiceTally::default();
+        for task in self.tasks.values().filter(|task| {
+            task.cluster_name == cluster_name && task.started_by.as_deref() == Some(deployment_id)
+        }) {
+            if task.last_status == STATUS_RUNNING {
+                tally.running += 1;
+            } else if task.last_status != STATUS_STOPPED {
+                tally.pending += 1;
+            }
+        }
+        tally
+    }
+
+    /// The operating-system family the tasks of `service` run on, as an `OSFamily` value.
+    ///
+    /// DERIVED from the revision the service runs: `RuntimePlatform$operatingSystemFamily`
+    /// is what a task definition declares its operating system as, and a revision that
+    /// declares no `runtimePlatform` runs on [`DEFAULT_OS_FAMILY`] — which is also what a
+    /// service that runs no revision of its own (its tasks come from a task set) reports.
+    fn service_os_family(&self, service: &ServiceRecord) -> String {
+        service
+            .task_definition
+            .as_ref()
+            .and_then(|key| self.task_definitions.get(key))
+            .and_then(|definition| definition.runtime_platform.as_ref())
+            .and_then(|platform| platform.operating_system_family.clone())
+            .unwrap_or_else(|| DEFAULT_OS_FAMILY.to_string())
+    }
+
+    /// The ARN of the IAM role `Service$roleArn` reports — "The ARN of the IAM role
+    /// that's associated with the service" — or `None` for a service that has none.
+    ///
+    /// The role the create named, when it named one. Otherwise the ECS SERVICE-LINKED
+    /// role, for exactly the services `CreateService$role` says need one: "The
+    /// service-linked role is required if your task definition uses the `awsvpc` network
+    /// mode or if the service is configured to use service discovery, an external
+    /// deployment controller, multiple target groups, or Elastic Inference accelerators in
+    /// which case you don't specify a role here." A service outside that list that named
+    /// no role has no role associated with it, so it reports none.
+    fn service_role_arn(&self, service: &ServiceRecord) -> Option<String> {
+        if let Some(requested) = service.role_arn.clone() {
+            return Some(requested);
+        }
+        let awsvpc = service
+            .task_definition
+            .as_ref()
+            .and_then(|key| self.task_definitions.get(key))
+            .is_some_and(|definition| definition.network_mode == NETWORK_MODE_AWSVPC);
+        let requires_service_linked_role = awsvpc
+            || !service.places_tasks()
+            || !service.service_registries.is_empty()
+            || service.load_balancers.len() > 1;
+        requires_service_linked_role.then(service_linked_role_arn)
+    }
+
     /// The `Service` every service-returning operation reports, built from what is
     /// stored.
     ///
@@ -2497,6 +2778,27 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             Some(launch_type) => (Some(launch_type.clone()), None),
             None => (None, Some(service.capacity_provider_strategy.clone())),
         };
+        // The Fargate-only members: "A platform family is specified only for tasks using
+        // the Fargate launch type", and so is a platform version. A service that does not
+        // run on Fargate carries neither, whatever its request happened to say.
+        let fargate = service.runs_on_fargate();
+        let os_family = self.service_os_family(service);
+        // "The operating system that your tasks in the service run on", derived from the
+        // revision's `runtimePlatform` and reported in its display spelling.
+        let platform_family = fargate.then(|| os_family_display(&os_family));
+        // "If one isn't specified, the LATEST platform version is used": the SERVICE
+        // reports the version it asks for, which is that alias when it named none, while
+        // its DEPLOYMENT reports the version that alias resolves to for its operating
+        // system — the version the tasks of the rollout actually run.
+        let requested_platform_version = fargate.then(|| {
+            service
+                .platform_version
+                .clone()
+                .unwrap_or_else(|| PLATFORM_VERSION_LATEST.to_string())
+        });
+        let deployment_platform_version = requested_platform_version
+            .as_deref()
+            .map(|requested| resolved_platform_version(requested, &os_family));
         let deployment = Deployment {
             id: Some(service.deployment_id.clone()),
             status: Some(DEPLOYMENT_PRIMARY.to_string()),
@@ -2511,8 +2813,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             updated_at: Some(service.deployment_updated_at),
             capacity_provider_strategy: capacity_provider_strategy.clone(),
             launch_type: launch_type.clone(),
-            platform_version: service.platform_version.clone(),
-            platform_family: None,
+            platform_version: deployment_platform_version,
+            platform_family: platform_family.clone(),
             network_configuration: service.network_configuration.clone(),
             // "When a service deployment is started, it begins in an IN_PROGRESS state.
             // When the service reaches a steady state, the deployment transitions to a
@@ -2548,11 +2850,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             pending_count: tally.pending,
             launch_type,
             capacity_provider_strategy,
-            platform_version: service.platform_version.clone(),
-            // `platformFamily` is "the operating system that your tasks in the service
-            // run on ... specified only for tasks using the Fargate launch type", which
-            // nothing here resolves, so it stays absent.
-            platform_family: None,
+            platform_version: requested_platform_version,
+            platform_family,
             task_definition: service.task_definition_arn.clone(),
             deployment_configuration: Some(service.deployment_configuration.clone()),
             task_sets: if scheduler_owned {
@@ -2561,11 +2860,22 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 Some(Vec::new())
             },
             deployments: Some(if scheduler_owned {
-                vec![deployment]
+                // The current rollout, then the deployments it is replacing — which are
+                // reported for as long as they still hold a task of their own
+                // (`Deployment$status`: "ACTIVE: A service deployment that still has
+                // running tasks, but are in the process of being replaced").
+                let mut deployments = vec![deployment];
+                deployments.extend(
+                    service
+                        .superseded_deployments
+                        .iter()
+                        .map(|superseded| self.superseded_deployment_view(service, superseded)),
+                );
+                deployments
             } else {
                 Vec::new()
             }),
-            role_arn: service.role_arn.clone(),
+            role_arn: self.service_role_arn(service),
             // "The event stream for your service. A maximum of 100 of the latest events
             // are displayed" — newest first, which is the order the service's own event
             // stream reads in.
@@ -2602,7 +2912,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             health_check_grace_period_seconds: service.health_check_grace_period_seconds,
             scheduling_strategy: Some(service.scheduling_strategy.clone()),
             deployment_controller: Some(service.deployment_controller.clone()),
-            tags: if fields.tags {
+            // `DescribeServices$include`: "Determines whether you want to see the resource
+            // tags for the service" — the member is reported only when the request asked
+            // for the tags AND the service carries some, as the recorded responses of the
+            // real service do: an untagged service omits the key rather than reporting an
+            // empty list.
+            tags: if fields.tags && !service.tags.is_empty() {
                 Some(service.tags.clone())
             } else {
                 None
@@ -2617,6 +2932,98 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             availability_zone_rebalancing: Some(service.availability_zone_rebalancing.clone()),
             resource_management_type: Some(service.resource_management_type().to_string()),
         }
+    }
+
+    /// The `Deployment` a SUPERSEDED deployment is reported as: the configuration it was
+    /// rolling out, with the tasks it still holds counted off the task map.
+    ///
+    /// `Deployment$status` [`DEPLOYMENT_ACTIVE`] — it "still has running tasks, but are in
+    /// the process of being replaced". Its `rolloutState` is the one that rollout had
+    /// reached when it was superseded, not one asserted here.
+    fn superseded_deployment_view(
+        &self,
+        service: &ServiceRecord,
+        superseded: &SupersededDeployment,
+    ) -> Deployment {
+        let tally = self.deployment_tally(&service.cluster_name, &superseded.id);
+        let fargate = superseded.launch_type.as_deref() == Some(LAUNCH_TYPE_FARGATE)
+            || superseded.capacity_provider_strategy.iter().any(|item| {
+                MANAGED_CAPACITY_PROVIDERS.contains(&item.capacity_provider.as_str())
+            });
+        let os_family = self.service_os_family(service);
+        let platform_version = fargate.then(|| {
+            resolved_platform_version(
+                superseded
+                    .platform_version
+                    .as_deref()
+                    .unwrap_or(PLATFORM_VERSION_LATEST),
+                &os_family,
+            )
+        });
+        Deployment {
+            id: Some(superseded.id.clone()),
+            status: Some(DEPLOYMENT_ACTIVE.to_string()),
+            task_definition: superseded.task_definition_arn.clone(),
+            desired_count: superseded.desired_count,
+            pending_count: tally.pending,
+            running_count: tally.running,
+            failed_tasks: 0,
+            created_at: Some(superseded.created_at),
+            updated_at: Some(superseded.updated_at),
+            capacity_provider_strategy: superseded
+                .launch_type
+                .is_none()
+                .then(|| superseded.capacity_provider_strategy.clone()),
+            launch_type: superseded.launch_type.clone(),
+            platform_version,
+            platform_family: fargate.then(|| os_family_display(&os_family)),
+            network_configuration: superseded.network_configuration.clone(),
+            rollout_state: Some(
+                if superseded.rollout_completed {
+                    ROLLOUT_COMPLETED
+                } else {
+                    ROLLOUT_IN_PROGRESS
+                }
+                .to_string(),
+            ),
+            rollout_state_reason: Some(rollout_state_reason(
+                &superseded.id,
+                superseded.rollout_completed,
+            )),
+            service_connect_configuration: superseded.service_connect_configuration.clone(),
+            service_connect_resources: Some(Vec::new()),
+            volume_configurations: Some(superseded.volume_configurations.clone()),
+            fargate_ephemeral_storage: None,
+            vpc_lattice_configurations: Some(superseded.vpc_lattice_configurations.clone()),
+        }
+    }
+
+    /// The capacity provider `name` names, or `None` when nothing holds that name.
+    ///
+    /// Either one a caller created or one of the providers Amazon ECS manages for every
+    /// account ([`managed_capacity_provider`]), so every operation that resolves a
+    /// provider by name sees the same set — and `region` is the request's own, which is
+    /// the Region the ARN of a managed provider reports.
+    pub fn capacity_provider(&self, name: &str, region: &str) -> Option<CapacityProviderRecord> {
+        self.capacity_providers
+            .get(name)
+            .cloned()
+            .or_else(|| managed_capacity_provider(name, region))
+    }
+
+    /// Every capacity provider this account holds: the ones a caller created, plus the
+    /// ones Amazon ECS manages. A created provider that somehow holds a managed name
+    /// shadows it, so a name is reported once.
+    pub fn all_capacity_providers(&self, region: &str) -> Vec<CapacityProviderRecord> {
+        let mut providers: Vec<CapacityProviderRecord> =
+            self.capacity_providers.values().cloned().collect();
+        providers.extend(
+            MANAGED_CAPACITY_PROVIDERS
+                .iter()
+                .filter(|name| !self.capacity_providers.contains_key(**name))
+                .filter_map(|name| managed_capacity_provider(name, region)),
+        );
+        providers
     }
 
     /// The cluster an operation may act IN: one that exists and has not been deleted.
@@ -3936,17 +4343,14 @@ fn default_deployment_circuit_breaker() -> DeploymentCircuitBreaker {
     }
 }
 
-/// The ARN of the IAM role a service reports in `Service$roleArn`, from the `role` the
-/// request named and the deployment controller the service uses.
+/// The ARN of the IAM role the CREATE named, resolved from the `role` reference it
+/// carried, and `None` when it named none.
 ///
-/// `Service$roleArn` is "The ARN of the IAM role that's associated with the service",
-/// and `CreateService$role` names the role that gets associated: the one the request
-/// named — "The name or full Amazon Resource Name (ARN) of the IAM role" — or, when it
-/// named none, the ECS service-linked role, which "is required if ... the service is
-/// configured to use ... an external deployment controller ... in which case you don't
-/// specify a role here". A service whose own scheduler runs the rollout and that named
-/// no role has no role associated with it, so it reports none.
-pub fn service_role_arn(requested: Option<&str>, scheduler_owned: bool) -> Option<String> {
+/// `CreateService$role`: "The name or full Amazon Resource Name (ARN) of the IAM role".
+/// Which services report the ECS SERVICE-LINKED role instead is decided by what the
+/// service IS, not by this request alone, so it is resolved where the service is reported
+/// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::service_role_arn`]).
+pub fn requested_role_arn(requested: Option<&str>) -> Option<String> {
     match requested {
         // "If your specified role has a path other than /, then you must either specify
         // the full role ARN (this is recommended) or prefix the role name with the path."
@@ -3956,7 +4360,6 @@ pub fn service_role_arn(requested: Option<&str>, scheduler_owned: bool) -> Optio
             "",
             &format!("role/{}", name.trim_start_matches('/')),
         )),
-        None if !scheduler_owned => Some(service_linked_role_arn()),
         None => None,
     }
 }
@@ -4100,6 +4503,32 @@ pub fn is_valid_name(name: &str) -> bool {
 /// The ARN of a capacity provider: `arn:aws:ecs:<region>:<account>:capacity-provider/<name>`.
 pub fn capacity_provider_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("capacity-provider/{name}"))
+}
+
+/// The record of one of the capacity providers Amazon ECS MANAGES
+/// ([`MANAGED_CAPACITY_PROVIDERS`]), or `None` for a name that is not one of them.
+///
+/// Every account holds these in every Region: nothing creates them and nothing can take
+/// their names, so they are resolved from the name and the request's own Region rather
+/// than stored — which is also what keeps the ARN they report in the Region the caller
+/// asked in. They bind onto Fargate capacity, which is neither a caller's Auto Scaling
+/// group nor the managed instances Amazon ECS runs for a cluster, so they carry neither
+/// provider configuration and no `type`; `CapacityProvider$status` is
+/// [`CAPACITY_PROVIDER_ACTIVE`] — they are there and usable, and nothing can delete them.
+pub fn managed_capacity_provider(name: &str, region: &str) -> Option<CapacityProviderRecord> {
+    if !MANAGED_CAPACITY_PROVIDERS.contains(&name) {
+        return None;
+    }
+    Some(CapacityProviderRecord {
+        name: name.to_string(),
+        arn: capacity_provider_arn(region, name),
+        status: CAPACITY_PROVIDER_ACTIVE.to_string(),
+        cluster: None,
+        auto_scaling_group_provider: None,
+        managed_instances_provider: None,
+        provider_type: None,
+        tags: Vec::new(),
+    })
 }
 
 /// The message the refusal of a capacity-provider `name` carries. A fixed sentence, as
@@ -4347,6 +4776,45 @@ pub fn tags_per_resource_limit_message(merged_count: usize) -> String {
         "The limit of {MAX_TAGS_PER_RESOURCE} tags per resource was exceeded: the request \
          would leave the resource with {merged_count} tags"
     )
+}
+
+/// `AwsVpcConfiguration$assignPublicIp` as Amazon ECS materialises it when a service
+/// leaves it out — the member's own doc: "When you use `create-service` or
+/// `update-service`, the default is `DISABLED`." One of the `AssignPublicIp` enum's two
+/// values (`smithy_query(query="shape", shape="AssignPublicIp")`).
+pub const ASSIGN_PUBLIC_IP_DISABLED: &str = "DISABLED";
+
+/// The network configuration a service STORES: the one the request carried, with the
+/// members Amazon ECS fills in filled in, so every later read reports the same rendered
+/// configuration rather than only what the caller sent.
+///
+/// `assignPublicIp` takes the value its own doc gives it — "When you use `create-service`
+/// or `update-service`, the default is `DISABLED`" — and `securityGroups`, which a
+/// request may leave out, is MATERIALISED as an empty list, as the recorded read-back of
+/// a configuration that named none carries it: the group the task actually gets is then
+/// "the default security group for the VPC", whose id belongs to the VPC rather than to
+/// this configuration, so none is invented in its place. `subnets` is required, so there
+/// is nothing to fill in for it.
+pub fn defaulted_network_configuration(
+    requested: Option<&NetworkConfiguration>,
+) -> Option<NetworkConfiguration> {
+    let configuration = requested?;
+    let awsvpc_configuration = configuration
+        .awsvpc_configuration
+        .as_ref()
+        .map(|awsvpc| AwsVpcConfiguration {
+            assign_public_ip: Some(
+                awsvpc
+                    .assign_public_ip
+                    .clone()
+                    .unwrap_or_else(|| ASSIGN_PUBLIC_IP_DISABLED.to_string()),
+            ),
+            security_groups: Some(awsvpc.security_groups.clone().unwrap_or_default()),
+            ..awsvpc.clone()
+        });
+    Some(NetworkConfiguration {
+        awsvpc_configuration,
+    })
 }
 
 /// The refusal a launch earns when its `networkConfiguration` does not agree with the

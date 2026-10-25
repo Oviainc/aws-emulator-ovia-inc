@@ -97,3 +97,5 @@ mod delete_pending_aggregation_request;
 mod aggregate_config_rule_compliance_summary;
 #[path = "all/external_evaluation.rs"]
 mod external_evaluation;
+#[path = "all/configuration_aggregator_sources_status.rs"]
+mod configuration_aggregator_sources_status;

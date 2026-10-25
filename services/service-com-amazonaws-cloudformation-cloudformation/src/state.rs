@@ -37,9 +37,12 @@
 //! ## Bounds
 //!
 //! Every growth site in this store is bounded, because a caller chooses both how many
-//! records it writes and how big each one is: [`MAX_STACKS`] live stacks per Region and
-//! [`MAX_LIVE_STACKS`] across every Region (past either `CreateStack` answers the modelled
-//! `LimitExceededException`),
+//! records it writes and how big each one is: [`MAX_STACKS`] live stacks per Region,
+//! [`MAX_LIVE_STACKS`] across every Region and [`MAX_CONCURRENT_RESOURCES`] resources
+//! across them (past any of those `CreateStack` answers the modelled
+//! `LimitExceededException`, and the per-Region stack ceiling and the resource ceiling are
+//! what `DescribeAccountLimits` reports as this account's limits — see
+//! [`ComAmazonawsCloudformationCloudformationState::account_limits`]),
 //! [`MAX_DELETED_STACKS_RETAINED`] completed deletions (the oldest deletion is reclaimed
 //! past that, which is this emulator's stand-in for CloudFormation's 90-day retention of
 //! deleted-stack summaries), [`MAX_EVENTS_PER_STACK`] events per stack (oldest-first),
@@ -105,6 +108,16 @@
 //! ([`ComAmazonawsCloudformationCloudformationState::apply_drift_result`]) onto the stack
 //! (`Stack$DriftInformation`) and each resource it covered
 //! (`StackResource$DriftInformation`), where every stack read reports it.
+//!
+//! ## Generated templates
+//!
+//! Beside those it holds this account and Region's GENERATED TEMPLATES
+//! ([`generated_template`]): `CreateGeneratedTemplate` records one and hands back its id,
+//! and `DescribeGeneratedTemplate` reads the progress of its generation back. The
+//! generation rides a clock of its own — answered in flight and concluded
+//! [`generated_template::GENERATION_DELAY`] later — which is also what makes the modelled
+//! cap on CONCURRENT generations transient: it counts the records still in a pending or
+//! in-progress status, so it lifts as those conclude.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -144,6 +157,10 @@ pub mod registry;
 /// The resource schema the registry holds for a resource type: the document that defines
 /// which properties the type has.
 pub mod resource_schema;
+
+/// The generated templates this account and Region holds: what `CreateGeneratedTemplate`
+/// starts and `DescribeGeneratedTemplate` reads the progress of.
+pub mod generated_template;
 
 /// How long after the call that starts it a stack's terminal status becomes due.
 ///
@@ -247,6 +264,17 @@ pub const DEPLOYMENT_MODE_STANDARD: &str = "STANDARD";
 /// log per live stack.
 pub const MAX_STACKS: usize = 2_000;
 
+/// The most resources the account's stacks hold at once.
+///
+/// CloudFormation meters concurrent resources per account — it is the first of the three
+/// per-account limits `AccountLimit` documents ("Number of concurrent resources") — and
+/// the documented default is 2,500, adjustable through Service Quotas, so this is that
+/// default as this emulator's own ceiling. It is what bounds the resource records the
+/// store holds across its stacks, and `CreateStack` — the operation that brings new
+/// resources into the account and the one that models `LimitExceededException` for a
+/// quota already reached — is what refuses a create past it.
+pub const MAX_CONCURRENT_RESOURCES: usize = 2_500;
+
 /// The most LIVE stacks this store holds across EVERY Region together.
 ///
 /// [`MAX_STACKS`] is the documented quota, and it is metered per Region — and the Region a
@@ -318,6 +346,23 @@ pub fn validate_template_body(template_body: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `Err(message)` for a template body past one of the documented per-template quotas —
+/// the rule every operation that SUBMITS a template is held to, before anything is
+/// created.
+///
+/// Those quotas are the ceilings `DescribeAccountLimits` advertises for this account (see
+/// [`ComAmazonawsCloudformationCloudformationState::account_limits`]), so a body past one
+/// is refused rather than accepted and then deployed with none of what it declares:
+/// an advertised ceiling a write is not held to is no ceiling. `Ok(())` for a body this
+/// service's reader will not read at all, which is a template-FORM question the submitting
+/// operation answers on its own terms.
+pub fn validate_template_quotas(template_body: &str) -> Result<(), String> {
+    match template::quota_violation(template_body) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
 /// `Err(message)` for a template body declaring a resource type CloudFormation does not
 /// recognise — the rule every operation that SUBMITS a template is held to, before
 /// anything is created ([`resource_types`] is where the recognised set lives).
@@ -347,6 +392,20 @@ pub fn insufficient_capabilities(template_body: &str, capabilities: &[String]) -
     let parsed = template::parse(template_body)?;
     let missing = template::missing_capabilities(&parsed, capabilities);
     (!missing.is_empty()).then(|| template::insufficient_capabilities_message(&missing))
+}
+
+/// The `LimitName` values CloudFormation meters per account, as the model documents them
+/// on `AccountLimit$Name` ("Values: ConcurrentResourcesLimit | StackLimit |
+/// StackOutputsLimit") and `AccountLimit` itself lists them ("Number of concurrent
+/// resources", "Number of stacks", "Number of stack outputs").
+pub mod account_limit_name {
+    /// "Number of concurrent resources": [`MAX_CONCURRENT_RESOURCES`](super::MAX_CONCURRENT_RESOURCES).
+    pub const CONCURRENT_RESOURCES: &str = "ConcurrentResourcesLimit";
+    /// "Number of stacks": [`MAX_STACKS`](super::MAX_STACKS).
+    pub const STACK: &str = "StackLimit";
+    /// "Number of stack outputs": the outputs one template may declare,
+    /// [`template::MAX_OUTPUTS_PER_TEMPLATE`](super::template::MAX_OUTPUTS_PER_TEMPLATE).
+    pub const STACK_OUTPUTS: &str = "StackOutputsLimit";
 }
 
 /// `StackStatus` values this service puts a stack into (all from the model's
@@ -1176,6 +1235,16 @@ impl StoredStack {
         }
     }
 
+    /// How many resources the stack holds right now — [`Self::current_resources`] counted
+    /// rather than cloned, for the account-wide resource ceiling
+    /// ([`ComAmazonawsCloudformationCloudformationState::current_resource_count`]).
+    pub fn current_resource_count(&self) -> usize {
+        match &self.pending_deployment {
+            Some(deployment) => deployment.resources.len(),
+            None => self.resources.len(),
+        }
+    }
+
     /// What CloudFormation records on, and propagates to, every resource it provisions for
     /// this stack: the stack's identity and the stack-level `Tags` in force
     /// ([`provisioning::StackProvenance`]).
@@ -1625,6 +1694,13 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// `DetectStackDrift` handed out. Bounded at [`MAX_DRIFT_DETECTIONS`], oldest
     /// reclaimed first.
     pub drift_detections: Vec<StoredDriftDetection>,
+    /// Every generated template, in creation order, so `DescribeGeneratedTemplate` reads
+    /// back exactly what `CreateGeneratedTemplate` wrote (see [`generated_template`]). A
+    /// generated template is a record of its own rather than a stack's, so it is neither
+    /// settled on the stack clock nor reclaimed with a stack; its own generation clock is
+    /// what [`Self::settle`] advances, and
+    /// [`generated_template::MAX_GENERATED_TEMPLATES`] is what bounds the list.
+    pub generated_templates: Vec<generated_template::StoredGeneratedTemplate>,
 }
 
 impl ComAmazonawsCloudformationCloudformationState {
@@ -1640,8 +1716,46 @@ impl ComAmazonawsCloudformationCloudformationState {
             change_set.settle(now);
         }
         self.settle_drift_detections(now);
+        for template in &mut self.generated_templates {
+            template.settle(now);
+        }
         self.reclaim_retired_stacks();
         self.reclaim_orphaned_change_sets();
+    }
+
+    /// The generated template `name_or_id` addresses in the request's Region, if this store
+    /// holds it: `GeneratedTemplateName` is "the name or Amazon Resource Name (ARN) of a
+    /// generated template", and nothing outside that Region is addressable.
+    pub fn resolve_generated_template(
+        &self,
+        region: &str,
+        name_or_id: &str,
+    ) -> Option<&generated_template::StoredGeneratedTemplate> {
+        self.generated_templates
+            .iter()
+            .find(|template| template.is_addressed_by(region, name_or_id))
+    }
+
+    /// The generated templates of one Region, in creation order: the set a name has to be
+    /// unique within and the one its quotas are metered over.
+    pub fn generated_templates_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a generated_template::StoredGeneratedTemplate> {
+        self.generated_templates
+            .iter()
+            .filter(move |template| template.region == region)
+    }
+
+    /// How many generations of one Region are in a pending or in-progress status right
+    /// now — the set [`generated_template::MAX_CONCURRENT_GENERATIONS`] meters.
+    ///
+    /// Counted off the stored statuses, so it is accurate only once [`Self::settle`] has
+    /// retired the generations the clock already completed; every caller settles first.
+    pub fn generations_in_flight(&self, region: &str) -> usize {
+        self.generated_templates_in(region)
+            .filter(|template| template.is_in_flight())
+            .count()
     }
 
     /// Materialise every drift-detection STATUS whose due instant has passed.
@@ -1912,6 +2026,52 @@ impl ComAmazonawsCloudformationCloudformationState {
     /// caller chooses.
     pub fn live_stack_count(&self) -> usize {
         self.stacks.iter().filter(|stack| stack.is_live()).count()
+    }
+
+    /// How many resources this store's live stacks hold at once, across every Region: what
+    /// [`MAX_CONCURRENT_RESOURCES`] bounds, since the Region a request is served in is one
+    /// the caller chooses (the same reason [`Self::live_stack_count`] is a flat count).
+    ///
+    /// A deleted stack's resources are not counted — CloudFormation keeps reporting them
+    /// for as long as it reports the stack, but nothing of theirs exists any more, so they
+    /// do not occupy the account's concurrent-resource quota.
+    pub fn current_resource_count(&self) -> usize {
+        self.stacks
+            .iter()
+            .filter(|stack| stack.is_live())
+            .map(StoredStack::current_resource_count)
+            .sum()
+    }
+
+    /// The account limits this store reports and enforces, in `LimitName` order.
+    ///
+    /// `DescribeAccountLimits` "retrieves your account's CloudFormation limits", and
+    /// `AccountLimit` names exactly three of them: the concurrent resources, the stacks and
+    /// the stack outputs this account may hold. Each value is the ceiling this store itself
+    /// holds a caller to — [`MAX_CONCURRENT_RESOURCES`], [`MAX_STACKS`] and
+    /// [`template::MAX_OUTPUTS_PER_TEMPLATE`] — so the limits a caller reads are the limits
+    /// its next write is measured against, rather than numbers nothing honours.
+    pub fn account_limits(&self) -> Vec<crate::ops::types::AccountLimit> {
+        [
+            (
+                account_limit_name::CONCURRENT_RESOURCES,
+                MAX_CONCURRENT_RESOURCES,
+            ),
+            (account_limit_name::STACK, MAX_STACKS),
+            (
+                account_limit_name::STACK_OUTPUTS,
+                template::MAX_OUTPUTS_PER_TEMPLATE,
+            ),
+        ]
+        .into_iter()
+        .map(|(name, value)| crate::ops::types::AccountLimit {
+            name: Some(name.to_string()),
+            // Every ceiling above is a small count, so the modelled `LimitValue`
+            // (an integer) carries it; a ceiling past what it can carry is reported
+            // saturated rather than wrapped into a negative limit.
+            value: Some(i32::try_from(value).unwrap_or(i32::MAX)),
+        })
+        .collect()
     }
 
     /// The stack a resource with this physical id belongs to, which is what
@@ -2283,6 +2443,21 @@ pub fn new_change_set_id(region: &str, change_set_name: &str) -> String {
     )
 }
 
+/// Mint a generated template's id, which is its ARN: `GeneratedTemplateId` is "the Amazon
+/// Resource Name (ARN) of the generated template. The format is
+/// `arn:${Partition}:cloudformation:${Region}:${Account}:generatedtemplate/${Id}`" — the
+/// same 8-4-4-4-12 id every other identifier this service mints carries.
+pub fn new_generated_template_id(region: &str, generated_template_name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!(
+            "generatedtemplate/{}",
+            new_identifier(generated_template_name)
+        ),
+    )
+}
+
 /// The message CloudFormation answers when a request names a change set that is not
 /// addressable: no change set of the named stack carries that name and no change set has
 /// that ARN.
@@ -2393,6 +2568,8 @@ pub enum PageOf {
     StackResourceSummaries,
     /// `DescribeChangeSet`'s `Changes`.
     Changes,
+    /// `DescribeAccountLimits`'s `AccountLimits`.
+    AccountLimits,
 }
 
 impl PageOf {
@@ -2404,6 +2581,7 @@ impl PageOf {
             Self::StackEvents => "events",
             Self::StackResourceSummaries => "resources",
             Self::Changes => "changes",
+            Self::AccountLimits => "account-limits",
         }
     }
 }
@@ -2433,7 +2611,8 @@ pub fn decode_next_token(page_of: PageOf, token: &str) -> Option<usize> {
 /// last page).
 ///
 /// `Err(message)` for a token this service never issued for this collection — a bad
-/// request, not an empty page.
+/// request, not an empty page. The message names the token that was rejected, in the form
+/// this service words that refusal (`<token> is not a valid NextToken`).
 pub fn paginate<T>(
     page_of: PageOf,
     items: Vec<T>,
@@ -2443,7 +2622,7 @@ pub fn paginate<T>(
         None => 0,
         Some(token) => decode_next_token(page_of, token)
             .filter(|offset| *offset <= items.len())
-            .ok_or_else(|| format!("Invalid NextToken: {token}"))?,
+            .ok_or_else(|| format!("{token} is not a valid NextToken"))?,
     };
     let remaining = items.len() - offset;
     let next_token =

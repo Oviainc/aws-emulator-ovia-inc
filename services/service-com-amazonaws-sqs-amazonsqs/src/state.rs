@@ -1423,6 +1423,18 @@ pub fn is_valid_batch_entry_id(id: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
 }
 
+/// The modelled refusal for an attribute name the call does not accept: it names no
+/// attribute of the value set that member carries.
+///
+/// One wording for every call that takes attribute names — a queue attribute map, a
+/// queue attribute name list, or a message system attribute name list — so two
+/// operations cannot drift on how they word the same defect.
+pub fn unknown_attribute_name(name: &str) -> InvalidAttributeName {
+    InvalidAttributeName {
+        message: Some(format!("Unknown Attribute {name}.")),
+    }
+}
+
 /// Why an `Attributes` map was refused. Each handler renders it as its own modelled
 /// error variant, so the wire code is the one that operation declares.
 #[derive(Debug)]
@@ -1449,9 +1461,7 @@ pub fn validate_attributes(
     for name in names {
         let value = &supplied[name];
         if !QUEUE_ATTRIBUTE_NAME_VALUES.contains(&name.as_str()) {
-            return Err(AttributeRefusal::Name(InvalidAttributeName {
-                message: Some(format!("Unknown Attribute {name}.")),
-            }));
+            return Err(AttributeRefusal::Name(unknown_attribute_name(name)));
         }
         let Some(spec) = settable_attribute(name) else {
             return Err(AttributeRefusal::Name(InvalidAttributeName {

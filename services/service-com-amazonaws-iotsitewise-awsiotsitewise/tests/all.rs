@@ -69,6 +69,12 @@ mod pipeline_lifecycle;
 // Same reasoning: declared outside the sorted list, which is the stretch every
 // concurrent iotsitewise change edits. Fold it into the list once the churn
 // settles.
+#[path = "all/search_lifecycle.rs"]
+mod search_lifecycle;
+
+// Same reasoning: declared outside the sorted list, which is the stretch every
+// concurrent iotsitewise change edits. Fold it into the list once the churn
+// settles.
 #[path = "all/default_encryption_configuration.rs"]
 mod default_encryption_configuration;
 
@@ -202,6 +208,8 @@ mod single_property_aggregates;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/tag_key_refusals.rs"]
+mod tag_key_refusals;
 #[path = "all/time_series.rs"]
 mod time_series;
 #[path = "all/time_series_disassociation.rs"]

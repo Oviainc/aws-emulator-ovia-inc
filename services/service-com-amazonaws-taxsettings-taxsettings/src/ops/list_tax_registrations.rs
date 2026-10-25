@@ -19,8 +19,12 @@
 //! [`crate::state::TAX_REGISTRATIONS_PAGE_BOUNDS`]): `maxResults` when the
 //! request names one, the documented default when it does not, capped at the
 //! documented ceiling either way. A request that names no page size therefore
-//! cannot ask for the whole store in one response, and the work done while the
-//! state lock is held is bounded by the page, not by the store.
+//! cannot ask for the whole store in one response.
+//!
+//! The page itself is built by the shared page-builder
+//! [`crate::state::build_page`], which every listing of this service pages
+//! through, so the skip-to-cursor, the page bound and the cursor are decided in
+//! one place rather than once per listing.
 //!
 //! ## Shape of an operation
 //!
@@ -181,61 +185,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // The page is built while the state lock is held, so the work done under
-        // it is bounded by `page_size` records, not by the size of the store; the
-        // guard is released before the response is assembled.
-        let (account_details, more_remain) = {
+        // The page and its cursor come from the one shared page-builder
+        // ([`crate::state::build_page`]), which every listing of this service
+        // pages through, so the skip-to-cursor, the page bound and the cursor are
+        // decided in a single place. The state lock is held only while the page is
+        // built; the guard is released before the response is assembled.
+        let page = {
             let mut store = state.lock();
             // Enumerating the registrations settles the TRN validations the clock
             // has already made due, so the listing reports each record in the
-            // same state `GetTaxRegistration` does.
+            // same state `GetTaxRegistration` does. This settles every stored
+            // record, so it costs the size of the store rather than the page.
             store.settle_due(::std::time::Instant::now());
-            let mut remaining = store
-                .registrations
-                .iter()
-                .filter(|(account_id, _)| {
-                    resume_after
-                        .as_ref()
-                        .is_none_or(|after| *account_id > after)
-                })
-                .peekable();
-            let page: Vec<AccountDetails> = remaining
-                .by_ref()
-                .take(page_size)
-                .map(|(account_id, stored)| AccountDetails {
-                    account_id: Some(account_id.clone()),
-                    tax_registration: Some(stored.to_tax_registration_with_jurisdiction()),
-                    // `taxInheritanceDetails` reports the PARENT entity an
-                    // account inherited its tax settings from, which is a fact
-                    // about an organization this service neither models nor is
-                    // told about by any request it serves, so there is nothing
-                    // stored to report.
-                    tax_inheritance_details: None,
-                    // `accountMetaData` is the account's legal profile, and the
-                    // listing exists to report that profile beside the TRN: it
-                    // is projected from the stored record, the same projection
-                    // every reader of that record goes through.
-                    account_meta_data: Some(stored.to_account_meta_data()),
-                })
-                .collect();
-            let more_remain = remaining.peek().is_some();
-            (page, more_remain)
-        };
-
-        // A cursor is issued only when a further account remains, so the last
-        // page carries none.
-        let next_token = if more_remain {
-            account_details
-                .last()
-                .and_then(|last| last.account_id.as_deref())
-                .map(crate::state::encode_page_token)
-        } else {
-            None
+            crate::state::build_page(
+                &store.registrations,
+                resume_after.as_deref(),
+                page_size,
+                |account_id, stored| {
+                    // Every stored registration is reported: an account has a
+                    // record only once a write gave it one.
+                    Some(AccountDetails {
+                        account_id: Some(account_id.to_string()),
+                        tax_registration: Some(stored.to_tax_registration_with_jurisdiction()),
+                        // `taxInheritanceDetails` reports the PARENT entity an
+                        // account inherited its tax settings from, which is a
+                        // fact about an organization this service neither models
+                        // nor is told about by any request it serves, so there is
+                        // nothing stored to report.
+                        tax_inheritance_details: None,
+                        // `accountMetaData` is the account's legal profile, and
+                        // the listing exists to report that profile beside the
+                        // TRN: it is projected from the stored record, the same
+                        // projection every reader of that record goes through.
+                        account_meta_data: Some(stored.to_account_meta_data()),
+                    })
+                },
+            )
         };
 
         Ok(ListTaxRegistrationsOutput {
-            account_details,
-            next_token,
+            account_details: page.items,
+            next_token: page.next_token,
         })
     }
 }

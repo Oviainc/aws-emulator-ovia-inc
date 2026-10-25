@@ -85,6 +85,8 @@ mod list_artifacts;
 mod list_code_repositories;
 #[path = "all/list_endpoints.rs"]
 mod list_endpoints;
+#[path = "all/list_images.rs"]
+mod list_images;
 #[path = "all/list_model_card_export_jobs.rs"]
 mod list_model_card_export_jobs;
 #[path = "all/list_model_packages.rs"]
@@ -154,3 +156,5 @@ mod trial_component_tracking;
 mod hyperpod_cluster_lifecycle;
 #[path = "all/create_cluster_admission.rs"]
 mod create_cluster_admission;
+#[path = "all/hyperpod_cluster_node_listing.rs"]
+mod hyperpod_cluster_node_listing;

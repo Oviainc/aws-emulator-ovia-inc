@@ -202,6 +202,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             display_order: None,
             last_modified: ::std::time::SystemTime::now(),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // A freshly created product owns no product REST endpoint pages; each one is
+            // added by its own `CreateProductRestEndpointPage` call, which mints the
+            // page's id from the seed beside this map.
+            product_rest_endpoint_pages: ::std::collections::BTreeMap::new(),
+            product_rest_endpoint_page_id_seed: 0,
         };
 
         // Persist, then read the response back out of the STORE, so what the caller gets

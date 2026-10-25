@@ -223,6 +223,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The boundary validator reaches a map's VALUES but not its KEYS, so
+        // `TagKey`'s own bound is enforced here, the way `CreatePipeline` enforces
+        // it, and before anything is stored.
+        for tag_key in input.tags.iter().flatten().map(|(tag_key, _)| tag_key) {
+            crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
+        }
+
         let mut store = state.lock();
 
         // The store is bounded: a create is the only thing that adds a dataset and

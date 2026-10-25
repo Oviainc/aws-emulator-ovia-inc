@@ -25,6 +25,11 @@
 //! data that fetch brought with it ([`ServerDiscovery`]), which is what
 //! `ListAnalyzableServers` reports.
 //!
+//! Beside the servers sit the **data collectors** installed in the account's environment
+//! ([`CollectorRecord`]), which `ListCollectors` reports a page at a time: each one is
+//! reported exactly as its registration recorded it, so that read derives nothing from the
+//! request that makes it.
+//!
 //! Beside the servers, the account's **application components**
 //! ([`ApplicationComponentRecord`]) — the processes and databases the assessment found
 //! running on those servers — which `GetApplicationComponentDetails` reports one at a
@@ -58,7 +63,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AnalyzableServerSummary, AppUnitError, ApplicationComponentDetail, ApplicationComponentStrategy,
     ApplicationPreferences,
-    AssessmentTarget, AssociatedApplication, ConflictException, DataCollectionDetails, DatabaseConfigDetail,
+    AssessmentTarget, AssociatedApplication, Collector, ConfigurationSummary, ConflictException,
+    DataCollectionDetails, DatabaseConfigDetail,
     DatabasePreferences, GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
     OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
     ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy, SourceCodeRepository,
@@ -318,6 +324,14 @@ pub const SERVER_DETAIL_PAGE_MARKER: &str = "migrationhubstrategy:server-applica
 /// one of its own handed to `ListServers`) is foreign and refused instead of resuming at
 /// whatever position its server happens to have in the other list.
 pub const ANALYZABLE_SERVER_PAGE_MARKER: &str = "migrationhubstrategy:analyzable-servers:";
+
+/// The marker a `ListCollectors` cursor carries.
+///
+/// That list pages over the installed collectors rather than over any list of servers, so
+/// it gets its own marker: a token issued by one of this service's other lists is foreign
+/// here (and one of these is foreign there) and refused instead of resolving against
+/// another list's records.
+pub const COLLECTOR_PAGE_MARKER: &str = "migrationhubstrategy:collectors:";
 
 /// Encode the key a page stopped at as an opaque `nextToken` carrying `marker`.
 ///
@@ -1071,6 +1085,75 @@ impl ApplicationComponentRecord {
     }
 }
 
+/// One data collector installed in the account's environment, as this emulator persists
+/// it.
+///
+/// A collector is NOT created through this API: `Collector` is documented "Process data
+/// collector that runs in the environment that you specify" and `registeredTimeStamp` is
+/// "Time when the collector registered with the service", so a collector enters the store
+/// when the appliance installed on-premises registers itself — a path outside the modelled
+/// surface, which is why a freshly booted emulator holds none and `ListCollectors` answers
+/// the empty list it honestly holds.
+///
+/// Every member is what that registration recorded, so a read derives nothing from the
+/// request that reads it and a member the registration did not carry stays `None` rather
+/// than being filled with a value nothing reported. The two time stamps are held as
+/// strings because the model types them as `String` rather than as a `timestamp`
+/// (`Collector$registeredTimeStamp`, `Collector$lastActivityTimeStamp`): the record keeps
+/// exactly the text the collector reported.
+#[derive(Debug, Clone, Default)]
+pub struct CollectorRecord {
+    /// `Collector$collectorId` — a `String` bounded to 1024 with pattern `.*\S.*`. It is
+    /// also this collector's key in [`RegionState::collectors`], which is what gives the
+    /// list a stable total order to paginate over.
+    pub id: String,
+    /// `Collector$ipAddress` — "IP address of the server that is hosting the collector."
+    pub ip_address: Option<String>,
+    /// `Collector$hostName` — "Hostname of the server that is hosting the collector."
+    pub host_name: Option<String>,
+    /// `Collector$collectorHealth`, one of `CollectorHealth`'s values
+    /// ([`COLLECTOR_HEALTH_VALUES`](crate::ops::types::COLLECTOR_HEALTH_VALUES)).
+    pub health: Option<String>,
+    /// `Collector$collectorVersion` — the version of the collector running in the
+    /// environment.
+    pub version: Option<String>,
+    /// `Collector$registeredTimeStamp` — when the collector registered with the service.
+    pub registered_time_stamp: Option<String>,
+    /// `Collector$lastActivityTimeStamp` — when the collector last pinged the service.
+    pub last_activity_time_stamp: Option<String>,
+    /// `Collector$configurationSummary` — the remote sources this collector is configured
+    /// to analyse, as the collector reported them. `None` for a collector that reported no
+    /// configuration, so the read answers nothing rather than a tree of empty lists.
+    pub configuration_summary: Option<ConfigurationSummary>,
+}
+
+impl CollectorRecord {
+    /// The `Collector` a read reports for this record: its own members, and nothing for
+    /// the ones the registration did not carry.
+    pub fn to_collector(&self) -> Collector {
+        Collector {
+            collector_id: Some(self.id.clone()),
+            ip_address: self.ip_address.clone(),
+            host_name: self.host_name.clone(),
+            collector_health: self.health.clone(),
+            collector_version: self.version.clone(),
+            registered_time_stamp: self.registered_time_stamp.clone(),
+            last_activity_time_stamp: self.last_activity_time_stamp.clone(),
+            configuration_summary: self.configuration_summary.clone(),
+        }
+    }
+}
+
+/// One page of collectors, as `ListCollectors` answers it.
+#[derive(Debug, Default)]
+pub struct CollectorPage {
+    /// The collectors of this page, in the store's total order.
+    pub collectors: Vec<Collector>,
+    /// The cursor the next call resumes from, set only when another collector follows
+    /// this page.
+    pub next_token: Option<String>,
+}
+
 /// The account's migration and modernization preferences, as `PutPortfolioPreferences`
 /// saved them and `GetPortfolioPreferences` reports them.
 ///
@@ -1131,6 +1214,11 @@ pub struct RegionState {
     /// `StartRecommendationReportGeneration` mints and `GetRecommendationReportDetails`
     /// reports.
     pub recommendation_reports: BTreeMap<String, RecommendationReport>,
+    /// Every data collector installed in this account's environment, keyed by its id —
+    /// the collectors `ListCollectors` reports. A `BTreeMap` is what gives that list a
+    /// stable total order to paginate over, and it is empty until a collector registers
+    /// itself (see [`CollectorRecord`]).
+    pub collectors: BTreeMap<String, CollectorRecord>,
     /// The id of the most recently started assessment, which is what
     /// `GetLatestAssessmentId` answers. `None` until one is started.
     pub latest_assessment_id: Option<String>,
@@ -1328,6 +1416,59 @@ impl RegionState {
 
         Ok(ImportTaskPage {
             task_infos,
+            next_token,
+        })
+    }
+
+    /// One page of this Region's collectors, continuing after the collector a
+    /// `nextToken` names.
+    ///
+    /// The order is the store's own total order over the collector ids, and a token is
+    /// emitted only when another collector actually follows the page, so a caller
+    /// following tokens never makes a call that returns nothing. Nothing here writes: the
+    /// page is taken off the stored records, so two identical calls answer the same thing.
+    ///
+    /// Refused with the service's `ValidationException` when `max_results` is outside the
+    /// documented 1..=[`MAX_LIST_PAGE_SIZE`], or when the token is not one this list
+    /// issued for a collector the store still holds.
+    pub fn page_of_collectors(
+        &self,
+        next_token: Option<&str>,
+        max_results: Option<i32>,
+    ) -> Result<CollectorPage, ValidationException> {
+        let limit = match max_results {
+            None => MAX_LIST_PAGE_SIZE,
+            Some(requested) if (1..=MAX_LIST_PAGE_SIZE).contains(&requested) => requested,
+            Some(_) => return Err(invalid_request_body()),
+        };
+        let limit = usize::try_from(limit).unwrap_or(1);
+
+        let after = match next_token {
+            Some(token) => {
+                let resume_after = decode_page_token(COLLECTOR_PAGE_MARKER, token)
+                    .ok_or_else(page_token_not_accepted)?;
+                if !self.collectors.contains_key(&resume_after) {
+                    return Err(page_token_not_accepted());
+                }
+                Bound::Excluded(resume_after)
+            }
+            None => Bound::Unbounded,
+        };
+
+        let mut rest = self.collectors.range((after, Bound::Unbounded));
+        let mut collectors = Vec::new();
+        let mut last: Option<&String> = None;
+        for (id, collector) in rest.by_ref().take(limit) {
+            collectors.push(collector.to_collector());
+            last = Some(id);
+        }
+        let next_token = match (rest.next(), last) {
+            (Some(_), Some(key)) => Some(encode_page_token(COLLECTOR_PAGE_MARKER, key)),
+            _ => None,
+        };
+
+        Ok(CollectorPage {
+            collectors,
             next_token,
         })
     }

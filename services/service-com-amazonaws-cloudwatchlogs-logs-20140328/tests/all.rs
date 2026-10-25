@@ -61,6 +61,8 @@ mod log_group_auth_and_encryption;
 mod log_group_fields;
 #[path = "all/log_group_name_pattern_lists.rs"]
 mod log_group_name_pattern_lists;
+#[path = "all/log_group_tags.rs"]
+mod log_group_tags;
 #[path = "all/log_stream_removal.rs"]
 mod log_stream_removal;
 #[path = "all/lookup_tables.rs"]

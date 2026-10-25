@@ -12,7 +12,9 @@
 //! whole permission-set / account-assignment surface is withdrawn on it — see
 //! [`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_surface_withdrawn`] and
 //! [`ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE`], which every operation of that surface asks
-//! before looking anything up.
+//! before looking anything up. The account's AMBIENT instance — the one `ListInstances`
+//! hands out ([`SEED_INSTANCE_TYPE`]) — is the ORGANIZATION instance, so that surface is
+//! served on it by default.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -166,12 +168,18 @@ impl InstanceType {
     }
 }
 
-/// The kind of instance this emulator's account holds.
+/// The kind of instance the account's AMBIENT instance is: the instance a client
+/// discovers through `ListInstances` because IAM Identity Center was already enabled on
+/// this account before the session started.
 ///
-/// It is an ACCOUNT instance: nothing in this emulator models an AWS Organizations
-/// organization, so the account is the standalone account `CreateInstance`'s
-/// documentation describes, and the instance of such an account is an account instance.
-pub const SEED_INSTANCE_TYPE: InstanceType = InstanceType::Account;
+/// It is an ORGANIZATION instance. An account whose Identity Center was enabled through
+/// AWS Organizations holds the organization instance, and that is the instance whose ARN
+/// `ListInstances` hands out, so multi-account permissions — permission sets, the account
+/// assignments built from them and the ABAC attribute configuration — are served on it
+/// (`DescribeInstance$PermissionSetsEnabled` reports `true`). The account-instance
+/// restriction belongs to an instance a caller creates through `CreateInstance`, which
+/// AWS documents as creating the instance of a standalone account.
+pub const SEED_INSTANCE_TYPE: InstanceType = InstanceType::Organization;
 
 /// The refusal every operation of the permission-set / account-assignment surface
 /// answers with when the instance it resolves is an ACCOUNT instance, as the message of
@@ -2012,8 +2020,9 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// holds, the stand-in for an account whose IAM Identity Center was enabled before
     /// this session started.
     ///
-    /// It is an ACCOUNT instance ([`SEED_INSTANCE_TYPE`]): the emulator's account is a
-    /// standalone account, not an Organizations-managed one. It is enabled at most once
+    /// It is an ORGANIZATION instance ([`SEED_INSTANCE_TYPE`]): the instance an account
+    /// discovers through `ListInstances` is the one its Organizations enablement created,
+    /// so the permission-set surface is served on it. It is enabled at most once
     /// per store, and not at all when the store already holds an instance (one instance
     /// per account), so no request ever adds a second instance or revives a deleted one.
     fn enable_ambient_instance(&mut self, region: &str, now: SystemTime) {

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveIpRoutes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveIpRoutes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveIpRoutes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops routing IP address blocks a directory carries: each named block is resolved
+//! among the directory's stored routes and put into the modelled `Removing` status the
+//! clock then takes out of the store, and a request that names a block the directory
+//! does not route is refused without removing anything.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +137,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveIpRoutes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveIpRoutesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveIpRoutes"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Each member names the blocks of its own family, and a route's identity within
+        // a directory is the block it routes, so the two lists together are the set of
+        // routes this call asks the directory to stop carrying.
+        let cidr_ips = input.cidr_ips.unwrap_or_default();
+        let cidr_ipv6s = input.cidr_ipv6s.unwrap_or_default();
+
+        // Nothing caller-sized reaches the store, or the store LOCK, unchecked: a
+        // directory carries at most `MAX_IP_ROUTES` blocks, so a longer list can only
+        // repeat them, and it is refused before anything is allocated from it. This
+        // operation models no `IpRouteLimitExceededException`, so the bound is reported
+        // as the invalid parameter it is.
+        let named_count = cidr_ips.len() + cidr_ipv6s.len();
+        if named_count > crate::state::MAX_IP_ROUTES {
+            return Err(invalid_parameter(format!(
+                "CidrIps and CidrIpv6s may name at most {max} IP address blocks between \
+                 them, got {named_count}",
+                max = crate::state::MAX_IP_ROUTES
+            )));
+        }
+        // A request that names no block at all asks for no removal, whatever is stored,
+        // so it is refused on the INPUT — before the directory is resolved — naming the
+        // two members that carry the blocks.
+        let named: Vec<String> = cidr_ips.into_iter().chain(cidr_ipv6s).collect();
+        if named.is_empty() {
+            return Err(invalid_parameter(
+                "CidrIps or CidrIpv6s must name at least one IP address block".to_string(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                RemoveIpRoutesErrorModeled::EntityDoesNotExistException(crate::state::refusal(
+                    crate::state::no_such_directory(&input.directory_id),
+                ))
+            })?;
+
+        // Dropping an address block changes the directory's own networking, exactly as
+        // adding one does, so it needs a directory that is in service: one still being
+        // built by the transition its create owes is unavailable, which is the modelled
+        // refusal for exactly that.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(
+                RemoveIpRoutesErrorModeled::DirectoryUnavailableException(crate::state::refusal(
+                    format!(
+                        "Directory {id} is in stage {stage} and is not available for \
+                         IP route changes",
+                        id = directory.directory_id,
+                        stage = directory.stage
+                    ),
+                ))
+                .into(),
+            );
+        }
+
+        // The whole request is checked BEFORE anything is written, so a request that
+        // names a block the directory does not route leaves the stored routes exactly as
+        // they were.
+        if let Some(missing) = named
+            .iter()
+            .find(|block| !directory.ip_routes.contains_key(*block))
+        {
+            return Err(RemoveIpRoutesErrorModeled::EntityDoesNotExistException(
+                crate::state::refusal(format!(
+                    "Directory {id} does not route the address block {missing}",
+                    id = directory.directory_id
+                )),
+            )
+            .into());
+        }
+
+        // The call answers while the block is still being taken out of service: the
+        // route is recorded in the modelled transient `Removing` status and the clock is
+        // what finishes the job, so a caller reading straight afterwards still sees the
+        // teardown, and once it falls due the block is gone from the directory. A repeat
+        // of the removal is therefore not a refusal while the first one is still due: it
+        // names a block that is still being removed, and leaves its due instant alone.
+        for block in &named {
+            let Some(route) = directory.ip_routes.get_mut(block) else {
+                continue;
+            };
+            if route.status != crate::state::IP_ROUTE_STATUS_REMOVING {
+                route.status = crate::state::IP_ROUTE_STATUS_REMOVING.to_string();
+                route.status_due_at = Some(now + crate::state::TRANSITION_SPAN);
+            }
+        }
+
+        Ok(RemoveIpRoutesOutput {})
     }
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the members
+/// and the rule they broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> RemoveIpRoutesError {
+    RemoveIpRoutesErrorModeled::InvalidParameterException(crate::state::refusal(message)).into()
 }

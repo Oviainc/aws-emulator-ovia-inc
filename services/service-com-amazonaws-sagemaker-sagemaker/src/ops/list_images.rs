@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListImages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListImages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListImages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: filters, sorts and pages the custom images stored in `crate::state`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -133,6 +126,30 @@ impl<Eng> ListImages<Eng> {
     }
 }
 
+/// `ImageSortBy`'s documented default ("The property used to sort results. The default
+/// value is `CREATION_TIME`." — this operation's `SortBy` member doc). `ListImages` has
+/// its own enum tokens, which is why it does not share `crate::state::DEFAULT_SORT_BY`.
+const DEFAULT_SORT_BY: &str = "CREATION_TIME";
+
+/// `ImageSortBy`'s member that sorts by the last-modified instant.
+const SORT_BY_LAST_MODIFIED_TIME: &str = "LAST_MODIFIED_TIME";
+
+/// `ImageSortBy`'s member that sorts by `ImageName`.
+const SORT_BY_IMAGE_NAME: &str = "IMAGE_NAME";
+
+/// `ImageSortOrder`'s descending member, spelled in this enum's own tokens rather than
+/// `crate::state::ORDER_DESCENDING`'s. Named so the sort DIRECTION below is read off the
+/// member itself rather than off whichever member happens to be the documented default.
+const ORDER_DESCENDING: &str = "DESCENDING";
+
+/// `ImageSortOrder`'s documented default ("The sort order. The default value is
+/// `DESCENDING`." — this operation's `SortOrder` member doc).
+const DEFAULT_SORT_ORDER: &str = ORDER_DESCENDING;
+
+/// `MaxResults`' documented default ("The maximum number of images to return in the
+/// response. The default value is 10."), applied when the caller sends none.
+const DEFAULT_MAX_RESULTS: i32 = 10;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListImages<Eng>
 {
@@ -150,18 +167,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListImages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListImagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListImages"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // Both accepted sets are the generated member lists of the modelled enums, so a
+        // refusal cannot drift from the model.
+        let sort_by = input.sort_by.as_deref().unwrap_or(DEFAULT_SORT_BY);
+        if !IMAGE_SORT_BY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                IMAGE_SORT_BY_VALUES.join(", ")
+            )));
+        }
+        let sort_order = input.sort_order.as_deref().unwrap_or(DEFAULT_SORT_ORDER);
+        if !IMAGE_SORT_ORDER_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                IMAGE_SORT_ORDER_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == ORDER_DESCENDING;
+
+        let created_after = input.creation_time_after.map(crate::state::timestamp_key);
+        let created_before = input.creation_time_before.map(crate::state::timestamp_key);
+        let modified_after = input
+            .last_modified_time_after
+            .map(crate::state::timestamp_key);
+        let modified_before = input
+            .last_modified_time_before
+            .map(crate::state::timestamp_key);
+
+        let mut store = state.lock();
+
+        // The only write this reporting call makes: the `CREATING` -> `CREATED`
+        // transition the clock already owed each image. It was due at the stored instant
+        // whether or not anybody listed the images, so listing them changes nothing a
+        // later caller sees that the clock had not already changed — and it happens
+        // BEFORE the bounds below are applied, so the last-modified filter and the
+        // reported status describe the same settled record.
+        let now = ::std::time::SystemTime::now();
+        let settled: Vec<String> = store
+            .images
+            .values_mut()
+            .filter_map(|image| image.settle_status(now).then(|| image.arn.clone()))
+            .collect();
+
+        let mut matching: Vec<&crate::state::Image> = store
+            .images
+            .values()
+            .filter(|image| {
+                input
+                    .name_contains
+                    .as_deref()
+                    .is_none_or(|needle| image.name.contains(needle))
+            })
+            .filter(|image| {
+                // Every bound is inclusive, so a timestamp copied straight out of a prior
+                // response's `CreationTime` or `LastModifiedTime` still selects that image.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(image.creation_time));
+                let modified =
+                    crate::state::timestamp_key(crate::state::timestamp(image.last_modified_time));
+                created_after.is_none_or(|bound| created >= bound)
+                    && created_before.is_none_or(|bound| created <= bound)
+                    && modified_after.is_none_or(|bound| modified >= bound)
+                    && modified_before.is_none_or(|bound| modified <= bound)
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays `ImageName`
+        // ascending in both directions, so two images created in the same instant keep one
+        // order whichever way the page is sorted — and a `NextToken` resolved against a
+        // freshly computed result set lands on the same boundary.
+        matching.sort_by(|left, right| {
+            let by_key = if sort_by == SORT_BY_IMAGE_NAME {
+                left.name.cmp(&right.name)
+            } else if sort_by == SORT_BY_LAST_MODIFIED_TIME {
+                crate::state::timestamp_key(crate::state::timestamp(left.last_modified_time)).cmp(
+                    &crate::state::timestamp_key(crate::state::timestamp(
+                        right.last_modified_time,
+                    )),
+                )
+            } else {
+                // The only remaining member is `CREATION_TIME`, this operation's default.
+                crate::state::timestamp_key(crate::state::timestamp(left.creation_time)).cmp(
+                    &crate::state::timestamp_key(crate::state::timestamp(right.creation_time)),
+                )
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| matching.iter().position(|image| image.name == name))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(crate::state::STALE_PAGE_TOKEN)
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` caps the page — at its documented default of 10 when the caller
+        // sends none — and so does the service's own ceiling: a larger `MaxResults` still
+        // cannot make one call serialise the whole store. The token below is emitted
+        // whenever anything is left, so a paginating client walks the full result set
+        // exactly once either way.
+        let start = start.min(matching.len());
+        // The clamp leaves the value in `1..=MAX_PAGE_SIZE`, so the conversion cannot lose
+        // anything; the fallback keeps that invariant stated rather than asserted.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(DEFAULT_MAX_RESULTS)
+                .clamp(1, crate::state::MAX_PAGE_SIZE),
+        )
+        .unwrap_or(DEFAULT_MAX_RESULTS as usize);
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => Some(crate::state::encode_page_token(&last.name)),
+            _ => None,
+        };
+
+        let output = ListImagesOutput {
+            images: Some(
+                page.iter()
+                    .map(|image| Image {
+                        creation_time: crate::state::timestamp(image.creation_time),
+                        description: image.description.clone(),
+                        display_name: image.display_name.clone(),
+                        failure_reason: image.failure_reason.clone(),
+                        image_arn: image.arn.clone(),
+                        image_name: image.name.clone(),
+                        image_status: image.status.clone(),
+                        last_modified_time: crate::state::timestamp(image.last_modified_time),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        };
+        drop(store);
+
+        for arn in &settled {
+            // Each transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+        Ok(output)
     }
 }

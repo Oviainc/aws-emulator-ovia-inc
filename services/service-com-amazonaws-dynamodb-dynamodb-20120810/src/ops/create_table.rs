@@ -430,6 +430,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             local_secondary_indexes,
             table_class: input.table_class.clone(),
             deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
+            // A new table's continuous backups are on and its point-in-time recovery is
+            // off: `CreateTable` carries no `PointInTimeRecoverySpecification`, so
+            // `UpdateContinuousBackups` is the only way to turn recovery on.
+            point_in_time_recovery: crate::state::PointInTimeRecovery::default(),
             // The seeded set propagates to `ListTagsOfResource` like any other tag
             // change — "the metadata for your tags or table might not be available at
             // that moment" (the `TagResource` doc) — so it is readable once the create
@@ -444,6 +448,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stream,
             items: ::std::collections::BTreeMap::new(),
             stored_bytes: 0,
+            // A new table has consumed none of the capacity it is provisioned for, so
+            // its first write has the whole documented burst behind it.
+            write_budget: crate::state::CapacityBudget::new(now),
             // A new table has been metered once, at zero: `ItemCount`/`TableSizeBytes` are
             // refreshed "approximately every six hours", not by the writes that follow.
             reported_counters: crate::state::MeteredCounters::new(now),

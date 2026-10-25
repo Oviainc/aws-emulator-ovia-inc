@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIdentityPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIdentityPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIdentityPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the configuration of a stored identity pool with the one the request carries.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +190,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIdentityPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIdentityPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIdentityPool"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateIdentityPoolErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the identity-pool store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // An update names an existing pool: there is nothing to update about one this
+        // service does not hold, whether it was never created or has been deleted.
+        if !store.identity_pools.contains_key(&input.identity_pool_id) {
+            return Err(UpdateIdentityPoolErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "IdentityPool '{}' not found.",
+                        input.identity_pool_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "If you don't provide a value for a parameter, Amazon Cognito sets it to its
+        // default value" (this service's model), so the request REPLACES the pool's
+        // configuration rather than merging into it: a member the request omits is left
+        // unset on the stored record, not carried over from the previous one. The id is
+        // the pool's name and is the one thing the request cannot change.
+        let record = crate::state::IdentityPool {
+            identity_pool_id: input.identity_pool_id.clone(),
+            identity_pool_name: input.identity_pool_name,
+            allow_unauthenticated_identities: input.allow_unauthenticated_identities,
+            allow_classic_flow: input.allow_classic_flow,
+            supported_login_providers: input
+                .supported_login_providers
+                .map(|providers| providers.into_iter().collect()),
+            developer_provider_name: input.developer_provider_name,
+            open_id_connect_provider_arns: input.open_id_connect_provider_ar_ns,
+            cognito_identity_providers: input.cognito_identity_providers,
+            saml_provider_arns: input.saml_provider_ar_ns,
+            identity_pool_tags: input
+                .identity_pool_tags
+                .map(|tags| tags.into_iter().collect()),
+        };
+
+        // The response is the stored record, so what the caller reads back is what the
+        // pool's readers will report — because they are the same thing.
+        let output = UpdateIdentityPoolOutput {
+            identity_pool_id: record.identity_pool_id.clone(),
+            identity_pool_name: record.identity_pool_name.clone(),
+            allow_unauthenticated_identities: record.allow_unauthenticated_identities,
+            allow_classic_flow: record.allow_classic_flow,
+            supported_login_providers: record
+                .supported_login_providers
+                .clone()
+                .map(|providers| providers.into_iter().collect()),
+            developer_provider_name: record.developer_provider_name.clone(),
+            open_id_connect_provider_ar_ns: record.open_id_connect_provider_arns.clone(),
+            cognito_identity_providers: record.cognito_identity_providers.clone(),
+            saml_provider_ar_ns: record.saml_provider_arns.clone(),
+            identity_pool_tags: record
+                .identity_pool_tags
+                .clone()
+                .map(|tags| tags.into_iter().collect()),
+        };
+        store
+            .identity_pools
+            .insert(input.identity_pool_id, record);
+        Ok(output)
     }
 }

@@ -354,8 +354,10 @@ async fn a_filter_past_the_maximum_is_refused_before_the_listing_is_computed() {
         "case unknown ids past the maximum: expected ValidationException, got {body}"
     );
 
-    // The same request inside the bound is answered normally — ids that name nothing
-    // simply match nothing — so the refusal above is the length, not the ids.
+    // The same request inside the bound is answered by resolving the ids — the filter is
+    // this operation's only resource reference — so it is refused as not found, which is
+    // the proof that the refusal above is the LENGTH: a request past the bound never
+    // reaches the resolution step and answers 400, not 404.
     let query: Vec<String> = unknown
         .iter()
         .take(MAX_FILTER_IDS)
@@ -365,13 +367,13 @@ async fn a_filter_past_the_maximum_is_refused_before_the_listing_is_computed() {
         .get(&format!("/global-networks?{}", query.join("&")))
         .await;
     assert_eq!(
-        status, 200,
-        "case unknown ids inside the maximum: expected 200, got {status} with {body}"
+        status, 404,
+        "case unknown ids inside the maximum: expected 404, got {status} with {body}"
     );
     assert_eq!(
-        body["GlobalNetworks"],
-        json!([]),
-        "case unknown ids inside the maximum: expected an empty page, got {body}"
+        error_code(&body),
+        "ResourceNotFoundException",
+        "case unknown ids inside the maximum: expected ResourceNotFoundException, got {body}"
     );
 
     // The network the fixture created is still listed, so nothing the refused request

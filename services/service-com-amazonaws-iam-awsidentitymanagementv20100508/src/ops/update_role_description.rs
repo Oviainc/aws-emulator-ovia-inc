@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRoleDescription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRoleDescription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRoleDescription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +138,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // `ctx` carries request metadata only; this operation is driven entirely by
+        // its input and the store.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRoleDescription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRoleDescriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRoleDescription"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRoleDescriptionErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The role is named by its friendly name and IAM entity names "are not
+        // distinguished by case", so the case-folded name is the identity. This
+        // operation CHANGES the account's own record of a role, so it answers from the
+        // store alone: a name only `crate::state::service_provisioned_role` resolves is
+        // still "a resource entity that does not exist" here, as that function's own
+        // documentation records.
+        let key = crate::state::name_key(&input.role_name);
+        let Some(role) = store.roles.get(&key) else {
+            return Err(UpdateRoleDescriptionErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role with name {} cannot be found.",
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+        let role_name = role.role_name.clone();
+        // Which service a role is linked to is carried by its path, read through the
+        // one definition of that rule in `crate::state`.
+        let linked_service =
+            crate::state::service_linked_role_principal(&role.path).map(str::to_string);
+
+        // "Service-linked roles are protected Amazon Web Services resources. Only the
+        // service that depends on the service-linked role can modify or delete the role
+        // on your behalf", so a caller's description change is refused with the modelled
+        // `UnmodifiableEntityException`, whose documentation says the message "includes
+        // the name of the service that depends on this service-linked role".
+        if let Some(linked_service) = linked_service {
+            return Err(
+                UpdateRoleDescriptionErrorModeled::UnmodifiableEntityException(
+                    UnmodifiableEntityException {
+                        message: Some(format!(
+                            "Service role {role_name} cannot be modified: it is a \
+                             service-linked role, so the change must be requested through \
+                             {linked_service}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Modifies only the description of a role": the new description REPLACES the
+        // one the role held, spelled exactly as the request sent it, and no other member
+        // of the record is touched. The response then "contains details about the
+        // modified role" — the stored record as it now stands, the same view `GetRole`
+        // reports.
+        let Some(role) = store.roles.get_mut(&key) else {
+            return Err(UpdateRoleDescriptionErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role with name {} cannot be found.",
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+        role.description = Some(input.description);
+
+        Ok(UpdateRoleDescriptionOutput {
+            role: Some(role.clone()),
+        })
     }
 }

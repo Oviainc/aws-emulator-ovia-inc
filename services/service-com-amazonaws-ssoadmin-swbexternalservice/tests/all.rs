@@ -35,6 +35,8 @@ mod application_authentication_methods;
 mod application_create;
 #[path = "all/application_create_providers.rs"]
 mod application_create_providers;
+#[path = "all/application_describe.rs"]
+mod application_describe;
 #[path = "all/application_grants.rs"]
 mod application_grants;
 #[path = "all/application_grants_list.rs"]
@@ -47,6 +49,8 @@ mod application_providers;
 mod application_update;
 #[path = "all/customer_managed_policy_references.rs"]
 mod customer_managed_policy_references;
+#[path = "all/discovered_instance_surface.rs"]
+mod discovered_instance_surface;
 #[path = "all/inline_policy.rs"]
 mod inline_policy;
 #[path = "all/inline_policy_independence.rs"]

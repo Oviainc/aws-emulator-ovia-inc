@@ -5,11 +5,11 @@
 //! router uses (`POST /` with `X-Amz-Target: Invoicing.<OperationName>` and an awsJson1_0
 //! body), so what these tests see is exactly what an SDK client sees.
 //!
-//! 1. `BatchGetInvoiceProfile` answers a profile for every account OF the requester's
-//!    organization — the requester's own management account included, whatever this
-//!    service's state does or does not say about it — and reserves the modelled 403
-//!    `AccessDeniedException` for a well-formed account id the organization does not
-//!    contain, refusing such a request WHOLE.
+//! 1. `BatchGetInvoiceProfile` answers a profile for every account this service's state
+//!    names as a LINKED account of the requester's organization, and reserves the
+//!    modelled 403 `AccessDeniedException` for a well-formed account id it does not name
+//!    — the requester's own management account included, which is not a linked account
+//!    under itself — refusing such a request WHOLE.
 //! 2. A `ResourceNotFoundException` of the PROCUREMENT-PORTAL-PREFERENCE plane states a
 //!    message BUILT FROM THE REQUEST: the kind of resource asked about and the exact ARN
 //!    supplied for it, whichever operation of that plane answers. The invoice-unit and
@@ -154,12 +154,13 @@ async fn create_unit(
         .to_string()
 }
 
-/// RULE 1, the positive half: the requester's own account resolves to its invoice
-/// profile, on a FRESH emulator (no invoice unit names it) and with every organization
-/// shape beside it — alone, repeated, and interleaved with linked accounts, in which case
-/// the answer is one profile per account asked about in request order.
+/// RULE 1, the positive half: an account a rule names as a linked account resolves to its
+/// invoice profile — the requester's own account among them, once a rule names it — with
+/// every organization shape beside it: alone, repeated, and interleaved with other linked
+/// accounts, in which case the answer is one profile per account asked about in request
+/// order.
 #[tokio::test]
-async fn the_requesters_own_account_resolves_to_its_invoice_profile() {
+async fn a_named_linked_account_resolves_to_its_invoice_profile() {
     let own = management_account().to_string();
 
     // Rows differing along what the rule generalises over: how much state exists, and the
@@ -201,10 +202,21 @@ async fn the_requesters_own_account_resolves_to_its_invoice_profile() {
 
     for (label, requested, expected) in shapes {
         let router = emulator();
-        // The batch rows name linked accounts too, so the organization has to hold them;
-        // the "alone" and "repeated" rows are driven against this same state, which never
-        // names the requester's own account.
-        create_unit(&router, "profiles-unit", &account(9), &linked).await;
+        // The rows name other linked accounts too, so the organization has to hold them;
+        // the requester's own account is in it for the one reason any account is — a rule
+        // names it as a linked account.
+        create_unit(
+            &router,
+            "profiles-unit",
+            &account(9),
+            &[
+                own.clone(),
+                linked[0].clone(),
+                linked[1].clone(),
+                linked[2].clone(),
+            ],
+        )
+        .await;
 
         let (status, body) = batch_get(&router, &requested).await;
         assert_eq!(
@@ -219,24 +231,23 @@ async fn the_requesters_own_account_resolves_to_its_invoice_profile() {
     }
 
     // The bare case: nothing at all in state, which is how a client first meets this
-    // operation — its own account is still readable.
+    // operation — no account is a linked account of any organization yet, not even the
+    // requester's own, so the read is refused.
     let router = emulator();
     let (status, body) = batch_get(&router, std::slice::from_ref(&own)).await;
     assert_eq!(
-        status, 200,
-        "case empty organization ({own}): expected HTTP 200, got {status} {body}"
+        status, 403,
+        "case empty organization ({own}): expected HTTP 403, got {status} {body}"
     );
-    let actual = reported_accounts(&body);
-    assert_eq!(
-        actual,
-        vec![own.clone()],
-        "case empty organization ({own}): expected one profile for the own account, got {actual:?}"
+    assert!(
+        error_code(&body).contains("AccessDeniedException"),
+        "case empty organization ({own}): expected an AccessDeniedException, got {body}"
     );
 }
 
-/// RULE 1, the negative half: a well-formed account id the organization does not contain
-/// is the modelled 403, and the request is refused WHOLE — so the denial is
-/// distinguishable from the own-account read, which succeeds.
+/// RULE 1, the negative half: a well-formed account id the organization does not name as a
+/// linked account is the modelled 403, and the request is refused WHOLE — so the denial is
+/// distinguishable from the read of an account it does name, which succeeds.
 #[tokio::test]
 async fn an_account_outside_the_organization_is_refused_whole_with_the_modelled_403() {
     let router = emulator();
@@ -246,7 +257,7 @@ async fn an_account_outside_the_organization_is_refused_whole_with_the_modelled_
         &router,
         "refusal-unit",
         &account(9),
-        std::slice::from_ref(&member),
+        &[member.clone(), own.clone()],
     )
     .await;
 

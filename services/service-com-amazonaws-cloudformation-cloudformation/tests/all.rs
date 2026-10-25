@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/account_limits.rs"]
+mod account_limits;
 #[path = "all/agentcore_stack_outputs.rs"]
 mod agentcore_stack_outputs;
 #[path = "all/appconfig_resource_types.rs"]
@@ -43,6 +45,8 @@ mod extension_registry;
 mod failed_create_rollback;
 #[path = "all/generated_physical_names.rs"]
 mod generated_physical_names;
+#[path = "all/generated_templates.rs"]
+mod generated_templates;
 #[path = "all/iam_capability_gate.rs"]
 mod iam_capability_gate;
 #[path = "all/list_stack_resources.rs"]
@@ -93,6 +97,8 @@ mod stack_tag_propagation;
 mod state_roundtrip;
 #[path = "all/template_outputs.rs"]
 mod template_outputs;
+#[path = "all/template_quotas.rs"]
+mod template_quotas;
 #[path = "all/unprovisioned_resources.rs"]
 mod unprovisioned_resources;
 #[path = "all/unrecognized_resource_types.rs"]

@@ -20,9 +20,11 @@
 //!    type, principal id) tuple, so creating it twice grants it once.
 //!
 //! The permission-set / account-assignment surface is served on an ORGANIZATION instance
-//! of IAM Identity Center, so the tests of those rules run against one ([`
-//! organization_router`]); the account-instance restriction that withdraws the same
-//! surface is `account_instance_restriction.rs`.
+//! of IAM Identity Center — which is the instance the account discovers through
+//! `ListInstances`. The tests of those rules run against an organization instance held
+//! under an id of its own ([`organization_router`]), so that "under the instance the
+//! request names" is not read off the only instance that exists; the account-instance
+//! restriction that withdraws the same surface is `account_instance_restriction.rs`.
 
 use std::sync::Arc;
 
@@ -123,14 +125,16 @@ const ORGANIZATION_INSTANCE_ID: &str = "ssoins-0a1b2c3d4e5f6071";
 /// Its identity store: `d-` + 10 hex digits, per `InstanceIdentityStoreArn`.
 const ORGANIZATION_IDENTITY_STORE_ID: &str = "d-1a2b3c4d5e";
 
-/// A router whose account holds an ORGANIZATION instance, and that instance's ARN.
+/// A router whose account holds an ORGANIZATION instance under an id of its own, and that
+/// instance's ARN.
 ///
-/// The permission-set / account-assignment surface is a feature of the organization
-/// instance, and an organization instance is enabled through AWS Organizations rather
-/// than through this API (`CreateInstance` creates the account instance of a standalone
-/// account), so the test seeds one into state exactly as the service's own `Default`
-/// seeds the account instance — through the SAME `state::Instance` constructor the
-/// handlers use — and the calls below all go over the wire.
+/// The account's ambient instance is already an organization instance, so this fixture's
+/// purpose is a DIFFERENT instance id: a rule asserted against it cannot be satisfied by
+/// reading the one id the emulator seeds. An organization instance is enabled through AWS
+/// Organizations rather than through this API (`CreateInstance` creates the account
+/// instance of a standalone account), so the test seeds it through the SAME
+/// `state::Instance` constructor the handlers use, and the calls below all go over the
+/// wire.
 pub(crate) fn organization_router() -> (MultiServiceRouter, String) {
     let (engine, instance_arn) = organization_engine();
     (router_over(engine), instance_arn)
@@ -156,15 +160,46 @@ pub(crate) fn organization_engine() -> (Arc<engine::InMemoryEngine>, String) {
             TEST_REGION,
         );
         let instance_arn = instance.instance_arn.clone();
-        // One instance per account: the organization instance is the account's instance,
+        // One instance per account: this organization instance is the account's instance,
         // so inserting it here is what the account holds — and because the store already
-        // holds an instance, no request enables the ambient account instance beside it.
+        // holds an instance, no request enables the ambient instance beside it.
         store.instances.clear();
         store.instances.insert(instance_arn.clone(), instance);
         store.ambient_instance_enabled = true;
         instance_arn
     };
     (engine, instance_arn)
+}
+
+/// A router whose account holds an ACCOUNT instance — the instance of a single
+/// standalone account — and that instance's ARN.
+///
+/// Built entirely over the WIRE: a fresh store has decided nothing about the account's
+/// IAM Identity Center enablement, and `CreateInstance` is the call that decides it, as
+/// "an instance of IAM Identity Center for a standalone Amazon Web Services account".
+/// Its activation instant is then moved into the past through the activation helper
+/// `instance_create.rs` owns — the clock's business, not the wire's, exactly as
+/// [`hold_deletion`] moves a deletion instant — so the instance the test calls against is
+/// the ACTIVE instance a caller sees once creation has finished.
+pub(crate) async fn account_instance_router() -> (MultiServiceRouter, String) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router_over(Arc::clone(&engine));
+    let (status, body) = call(
+        &router,
+        "CreateInstance",
+        &json!({"Name": "StandaloneAccount"}),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateInstance expected 200, got {status} {body}");
+    let instance_arn = body["InstanceArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateInstance minted no InstanceArn: {body}"))
+        .to_string();
+    crate::instance_create::hold_activation(
+        &engine,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+    );
+    (router, instance_arn)
 }
 
 /// The Region every call of this harness signs for unless a test names another one: the

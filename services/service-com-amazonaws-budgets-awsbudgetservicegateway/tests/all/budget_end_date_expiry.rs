@@ -344,6 +344,19 @@ async fn an_expired_budget_takes_its_notifications_subscribers_and_tags_with_it(
                     "Subscribers": [subscriber.clone()]
                 }),
             ),
+            (
+                "UpdateNotification",
+                json!({
+                    "AccountId": &account_id,
+                    "BudgetName": case,
+                    "OldNotification": notification.clone(),
+                    "NewNotification": {
+                        "NotificationType": "ACTUAL",
+                        "ComparisonOperator": "GREATER_THAN",
+                        "Threshold": 95
+                    }
+                }),
+            ),
         ];
         for (operation, request) in &requests {
             let (status, body) = call(&router, operation, request).await;

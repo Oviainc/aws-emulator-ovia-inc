@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSMSSandboxPhoneNumber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSMSSandboxPhoneNumber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSMSSandboxPhoneNumber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +77,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,23 +147,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_SMS_SANDBOX_PHONE_NUMBER_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Add `PhoneNumber` to this account's SMS sandbox as a pending destination
+    /// number, so a listing reports it and `DeleteSMSSandboxPhoneNumber` can remove
+    /// it.
+    ///
+    /// A number the sandbox ALREADY holds keeps the record it has — and with it the
+    /// verification status it reached: the operation adds a destination number, and
+    /// adding one that is already there takes nothing away. No modelled error says
+    /// "this number is already in the sandbox", so the call succeeds.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSMSSandboxPhoneNumber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSMSSandboxPhoneNumberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSMSSandboxPhoneNumber"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSMSSandboxPhoneNumberErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        if store.sandbox_phone_numbers.contains_key(&input.phone_number) {
+            return Ok(CreateSMSSandboxPhoneNumberOutput {});
+        }
+        if store.sandbox_phone_numbers.len() >= state::MAX_RECORDS_PER_STORE {
+            return Err(CreateSMSSandboxPhoneNumberErrorModeled::UserErrorException(
+                UserErrorException {
+                    message: Some(state::limit_exceeded_message(state::SANDBOX_NUMBER_RECORD)),
+                },
+            )
+            .into());
+        }
+        store.sandbox_phone_numbers.insert(
+            input.phone_number.clone(),
+            state::SandboxPhoneNumberRecord {
+                phone_number: input.phone_number,
+                // The number is pending until its one-time password is verified; the
+                // OTP travels by SMS, which is out of band for this emulator, so
+                // nothing here moves the status on.
+                status: state::SANDBOX_NUMBER_PENDING.to_string(),
+                created_at: std::time::SystemTime::now(),
+            },
+        );
+
+        Ok(CreateSMSSandboxPhoneNumberOutput {})
     }
 }

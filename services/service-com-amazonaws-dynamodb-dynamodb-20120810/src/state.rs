@@ -18,9 +18,11 @@ use bigdecimal::BigDecimal;
 
 use crate::ops::types::{
     AttributeDefinition, AttributeValue, AttributeValueUpdate, BillingModeSummary, Capacity,
-    ConsumedCapacity, ExpectedAttributeValue, GlobalSecondaryIndexDescription,
+    ConsumedCapacity, ContinuousBackupsDescription, ExpectedAttributeValue,
+    GlobalSecondaryIndexDescription,
     GlobalSecondaryIndexWarmThroughputDescription,
-    ItemCollectionMetrics, KeySchemaElement, LocalSecondaryIndexDescription, Projection,
+    ItemCollectionMetrics, KeySchemaElement, LocalSecondaryIndexDescription,
+    PointInTimeRecoveryDescription, Projection,
     ProvisionedThroughput, ProvisionedThroughputDescription, StreamSpecification, Tag,
     TableClassSummary, TableDescription, TableThroughputModeSummary,
     TableWarmThroughputDescription, WarmThroughput,
@@ -265,6 +267,13 @@ pub const COUNTER_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// [`derived_warm_throughput`].
 pub const DEFAULT_WARM_READ_UNITS_PER_SECOND: i64 = 12_000;
 pub const DEFAULT_WARM_WRITE_UNITS_PER_SECOND: i64 = 4_000;
+
+/// How much unused capacity a provisioned table keeps for a burst: "DynamoDB currently
+/// retains up to 300 seconds (5 minutes) of unused read and write capacity" (DynamoDB
+/// Developer Guide, "Using burst capacity effectively"). It is the CEILING on what the
+/// budget in [`CapacityBudget`] can hold, so a table that has been idle admits a burst
+/// of this many seconds' worth of writes at once and no more.
+pub const BURST_CAPACITY_WINDOW: Duration = Duration::from_secs(300);
 
 /// One write capacity unit covers a write of up to 1 KB (DynamoDB Developer Guide,
 /// "Read/write capacity mode").
@@ -1302,6 +1311,68 @@ impl MeteredCounters {
     }
 }
 
+/// What is left of the capacity a PROVISIONED table is provisioned for, and when that
+/// figure was last advanced.
+///
+/// "Provisioned throughput is the maximum amount of capacity that an application can
+/// consume from a table or index" per second (DynamoDB Developer Guide, "Read/write
+/// capacity mode"), and "DynamoDB currently retains up to 300 seconds (5 minutes) of
+/// unused read and write capacity" for a burst — so the budget refills at the
+/// provisioned rate and never holds more than [`BURST_CAPACITY_WINDOW`] of it. The
+/// rate is PASSED IN rather than stored, because the capacity in force is the table's
+/// own and an `UpdateTable` moves it.
+///
+/// Only the figure and the instant are kept, so nothing runs on a timer: how much has
+/// refilled is derived from the clock when the next write asks for it.
+#[derive(Debug, Clone)]
+pub struct CapacityBudget {
+    /// What was left at [`Self::measured_at`], or `None` while nothing has been spent:
+    /// an untouched budget holds the whole ceiling, whatever rate is in force by the
+    /// time it is first spent from.
+    remaining: Option<f64>,
+    /// When `remaining` was measured.
+    measured_at: SystemTime,
+}
+
+impl CapacityBudget {
+    /// The budget a resource created at `now` starts life with: it has consumed
+    /// nothing, so the first write it is asked to admit has the whole burst ceiling
+    /// behind it.
+    pub fn new(now: SystemTime) -> Self {
+        Self {
+            remaining: None,
+            measured_at: now,
+        }
+    }
+
+    /// Take `units` from the budget a rate of `units_per_second` refills, reporting
+    /// whether the budget covered them.
+    ///
+    /// A request the budget cannot cover takes NOTHING from it: capacity is consumed by
+    /// the work that was done, so a throttled write leaves the budget where it was.
+    pub fn take(&mut self, units_per_second: i64, units: f64, now: SystemTime) -> bool {
+        let rate = units_as_f64(units_per_second);
+        let ceiling = rate * BURST_CAPACITY_WINDOW.as_secs_f64();
+        let elapsed = now
+            .duration_since(self.measured_at)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let available = match self.remaining {
+            None => ceiling,
+            Some(remaining) => (remaining + elapsed * rate).min(ceiling),
+        };
+        self.measured_at = now;
+        let covered = available >= units;
+        self.remaining = Some(if covered { available - units } else { available });
+        covered
+    }
+}
+
+/// A capacity figure the store holds as an integer, as the arithmetic above takes it.
+fn units_as_f64(units: i64) -> f64 {
+    f64::from(u32::try_from(units.max(0)).unwrap_or(u32::MAX))
+}
+
 /// One table's or index's warm throughput: the read and write units per second it keeps
 /// warm, and when the pair in force became (or becomes) `ACTIVE`.
 ///
@@ -1602,6 +1673,124 @@ impl ResourceTags {
     }
 }
 
+/// The `ContinuousBackupsStatus` a table reports: "Continuous backups are ENABLED on
+/// all tables at table creation" (the `UpdateContinuousBackups` doc), and nothing in
+/// this API turns them off — `PointInTimeRecoverySpecification` carries only the
+/// point-in-time recovery flag — so every table reports the same one of the two values
+/// the model declares for that member
+/// ([`crate::ops::types::CONTINUOUS_BACKUPS_STATUS_VALUES`]).
+pub const CONTINUOUS_BACKUPS_STATUS: &str = "ENABLED";
+
+/// The two values `PointInTimeRecoveryStatus` takes: "ENABLED - Point in time recovery
+/// is enabled. DISABLED - Point in time recovery is disabled"
+/// (`PointInTimeRecoveryDescription$PointInTimeRecoveryStatus`), which are the model's
+/// own value table ([`crate::ops::types::POINT_IN_TIME_RECOVERY_STATUS_VALUES`]) named
+/// here one per meaning, so a reader of this store sees which one a setting reports.
+pub const POINT_IN_TIME_RECOVERY_ENABLED: &str = "ENABLED";
+pub const POINT_IN_TIME_RECOVERY_DISABLED: &str = "DISABLED";
+
+/// The recovery period an enable that names none settles on: "This parameter is
+/// optional. If no value is provided, the value will default to 35"
+/// (`PointInTimeRecoverySpecification$RecoveryPeriodInDays`).
+pub const DEFAULT_RECOVERY_PERIOD_IN_DAYS: i32 = 35;
+
+/// How far behind the present the newest restorable point sits:
+/// "`LatestRestorableDateTime` is typically 5 minutes before the current time" (the
+/// `UpdateContinuousBackups` doc and
+/// `PointInTimeRecoveryDescription$LatestRestorableDateTime`).
+pub const RESTORE_WINDOW_LAG: Duration = Duration::from_secs(5 * 60);
+
+/// One day, the unit `RecoveryPeriodInDays` counts the recovery window in.
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A table's point-in-time recovery settings: what `UpdateContinuousBackups` writes and
+/// what both it and `DescribeContinuousBackups` report.
+///
+/// Only the SETTINGS are stored. The restorable window is DERIVED from them at every
+/// read, because it moves with the clock rather than with any call: its newest point is
+/// one [`RESTORE_WINDOW_LAG`] behind now and its oldest the configured period behind
+/// that, bounded below by the instant recovery started — before which there is nothing
+/// to restore from.
+#[derive(Debug, Clone, Default)]
+pub struct PointInTimeRecovery {
+    /// When point-in-time recovery was last turned on, or `None` while it is off (which
+    /// is how every table starts: this API is the only way to turn it on, and
+    /// `CreateTable` carries no `PointInTimeRecoverySpecification`).
+    enabled_at: Option<SystemTime>,
+    /// The recovery period in force while recovery is on, in days.
+    recovery_period_in_days: i32,
+}
+
+impl PointInTimeRecovery {
+    /// Apply one `PointInTimeRecoverySpecification`.
+    ///
+    /// Turning recovery on while it is ALREADY on does not restart the window — the
+    /// recoverable period is as old as the recovery that has been running — so only the
+    /// period is re-stated; turning it off forgets where the window started, so a later
+    /// enable starts a new one.
+    pub fn apply(&mut self, enabled: bool, recovery_period_in_days: Option<i32>, now: SystemTime) {
+        if enabled {
+            self.enabled_at = Some(self.enabled_at.unwrap_or(now));
+            self.recovery_period_in_days =
+                recovery_period_in_days.unwrap_or(DEFAULT_RECOVERY_PERIOD_IN_DAYS);
+        } else {
+            self.enabled_at = None;
+            self.recovery_period_in_days = 0;
+        }
+    }
+
+    /// Whether point-in-time recovery is on, which is what a restore from a point in
+    /// time is served against.
+    pub fn enabled(&self) -> bool {
+        self.enabled_at.is_some()
+    }
+
+    /// The continuous-backups settings as the two continuous-backups operations report
+    /// them: the table's continuous-backups status, and the point-in-time recovery
+    /// description — the window only while recovery is on, since a table with recovery
+    /// off has no point in time to restore to.
+    pub fn describe(&self, now: SystemTime) -> ContinuousBackupsDescription {
+        let recovery = match self.enabled_at {
+            Some(enabled_at) => {
+                // The newest restorable point, never earlier than the instant recovery
+                // started: a table whose recovery is younger than the lag can be
+                // restored to when it started and no further back.
+                let latest = now
+                    .checked_sub(RESTORE_WINDOW_LAG)
+                    .unwrap_or(now)
+                    .max(enabled_at);
+                let period = u32::try_from(self.recovery_period_in_days).unwrap_or_default();
+                // The oldest restorable point: the configured period behind now, held
+                // inside the window the recovery itself has been running for. The bounds
+                // are ordered by construction — `latest` is at least `enabled_at` — so
+                // this cannot be an empty range.
+                let earliest = now
+                    .checked_sub(DAY * period)
+                    .unwrap_or(now)
+                    .clamp(enabled_at, latest);
+                PointInTimeRecoveryDescription {
+                    point_in_time_recovery_status: Some(
+                        POINT_IN_TIME_RECOVERY_ENABLED.to_string(),
+                    ),
+                    recovery_period_in_days: Some(self.recovery_period_in_days),
+                    earliest_restorable_date_time: Some(::aws_smithy_types::DateTime::from(
+                        earliest,
+                    )),
+                    latest_restorable_date_time: Some(::aws_smithy_types::DateTime::from(latest)),
+                }
+            }
+            None => PointInTimeRecoveryDescription {
+                point_in_time_recovery_status: Some(POINT_IN_TIME_RECOVERY_DISABLED.to_string()),
+                ..PointInTimeRecoveryDescription::default()
+            },
+        };
+        ContinuousBackupsDescription {
+            continuous_backups_status: CONTINUOUS_BACKUPS_STATUS.to_string(),
+            point_in_time_recovery_description: Some(recovery),
+        }
+    }
+}
+
 /// One stored table: its configuration, its lifecycle instants, and its items.
 #[derive(Debug)]
 pub struct Table {
@@ -1638,6 +1827,10 @@ pub struct Table {
     pub local_secondary_indexes: Vec<LocalSecondaryIndex>,
     pub table_class: Option<String>,
     pub deletion_protection_enabled: bool,
+    /// This table's continuous-backups settings: whether point-in-time recovery is on
+    /// and for how long a period, as `UpdateContinuousBackups` left them and both
+    /// continuous-backups operations report them.
+    pub point_in_time_recovery: PointInTimeRecovery,
     /// The tags this table carries: the set `CreateTable` seeded and every later
     /// `TagResource`/`UntagResource` edited, together with the set the eventually
     /// consistent `ListTagsOfResource` can see yet (see [`ResourceTags`]).
@@ -1686,6 +1879,10 @@ pub struct Table {
     /// [`Table::refresh_due_counters`] maintains, so a client is never told this number.
     /// Keeping it lets `PutItem` check its budget without walking the table.
     pub stored_bytes: i64,
+    /// What is left of the write capacity this table is provisioned for
+    /// ([`Table::admit_write`]). Like [`Table::stored_bytes`] it is admission-control
+    /// bookkeeping: no response reports it.
+    pub write_budget: CapacityBudget,
 }
 
 impl Table {
@@ -2200,6 +2397,33 @@ impl Table {
             }
         }
         capacity
+    }
+
+    /// Admit a write that consumes `units` write capacity units, reporting whether the
+    /// capacity this table is provisioned for covered it.
+    ///
+    /// "Provisioned throughput is the maximum amount of capacity that an application can
+    /// consume from a table or index" per second (DynamoDB Developer Guide, "Read/write
+    /// capacity mode"), so a PROVISIONED table admits its provisioned write units each
+    /// second plus whatever of them went unused inside [`BURST_CAPACITY_WINDOW`], and a
+    /// write past that is throttled rather than applied. A table on-demand
+    /// (`PAY_PER_REQUEST`) is provisioned for no capacity to exceed, so every write of
+    /// one is admitted.
+    ///
+    /// Only writes are admitted from a budget: a read in this emulator leaves nothing
+    /// behind it, so what a later caller is told never depends on how much has been
+    /// read.
+    pub fn admit_write(&mut self, units: f64, now: SystemTime) -> bool {
+        let provisioned = match (
+            self.billing_mode.as_str(),
+            self.provisioned_throughput.as_ref(),
+        ) {
+            ("PROVISIONED", Some(throughput)) if throughput.write_capacity_units > 0 => {
+                throughput.write_capacity_units
+            }
+            _ => return true,
+        };
+        self.write_budget.take(provisioned, units, now)
     }
 
     /// The `ItemCollectionKey` of an item: "The partition key value of the item

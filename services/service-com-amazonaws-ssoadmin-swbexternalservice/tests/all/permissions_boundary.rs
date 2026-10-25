@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call, error_code, organization_router, router, seeded_instance_arn, UNKNOWN_INSTANCE_ARN,
+    account_instance_router, call, error_code, organization_router, UNKNOWN_INSTANCE_ARN,
 };
 
 /// A pattern-valid `PermissionSetArn` that was never minted, for the not-found rows.
@@ -655,8 +655,7 @@ async fn an_unknown_instance_or_permission_set_is_not_found() {
 /// before any resource lookup.
 #[tokio::test]
 async fn both_operations_are_refused_on_an_account_instance() {
-    let router = router();
-    let account_instance_arn = seeded_instance_arn(&router).await;
+    let (router, account_instance_arn) = account_instance_router().await;
     let permission_set_arn = format!(
         "arn:aws:sso:::permissionSet/{}/ps-0123456789abcdef",
         account_instance_arn.rsplit('/').next().unwrap_or_default()

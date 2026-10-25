@@ -15,6 +15,8 @@
 mod arn_scope_refusals;
 #[path = "all/attach_points.rs"]
 mod attach_points;
+#[path = "all/caller_created_gateways_are_attach_points.rs"]
+mod caller_created_gateways_are_attach_points;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
 #[path = "all/connection_proposal.rs"]

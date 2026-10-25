@@ -23,7 +23,12 @@
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dataset_export_jobs`], keyed by
 //! the workspace and the minted job id, each record carrying the request that
 //! started it and the instant it started, from which a read DERIVES how far the
-//! job has got. A workspace's asynchronous queries live in
+//! job has got. A workspace's searches live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::searches`], keyed by the
+//! workspace and the search id, each record carrying the request the search was
+//! started from and the instants its lifecycle transitions fall due, so the
+//! status a poll reports is derived rather than stored. A workspace's
+//! asynchronous queries live in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::queries`], keyed the same way,
 //! each record carrying what running its statement produced and the instant it
 //! was submitted, from which a read DERIVES the status the clock has made due. An
@@ -70,10 +75,9 @@ use crate::ops::types::{
     ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, HierarchyMapping, Identity,
     ImageLocation, LoggingOptions, Mount, MountOverrides, PipelineExecutionStatus, PortalStatus,
     PortalTypeEntry, ProcessingInput, PropertyMapping, PropertyType, QueryStatistics, ResolveTo,
-    Resource, ResourceStatus, TargetResource, TaskConfiguration, TimeInNanos, TrimSettings, Variant,
-    WorkspaceEncryptionConfiguration,
-    WorkspaceEncryptionConfigurationInfo, WorkspaceStatus, ENCRYPTION_TYPE_VALUES,
-    VIDEO_DATA_TYPE_VALUES,
+    Resource, ResourceStatus, SearchFilters, TargetResource, TaskConfiguration, TimeInNanos,
+    TrimSettings, Variant, WorkspaceEncryptionConfiguration, WorkspaceEncryptionConfigurationInfo,
+    WorkspaceStatus, ENCRYPTION_TYPE_VALUES, VIDEO_DATA_TYPE_VALUES,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -1984,6 +1988,127 @@ pub fn pipeline_arn(region: &str, workspace_name: &str, pipeline_name: &str) -> 
     )
 }
 
+/// The `SearchStatus` a search reports before it has begun running — the status
+/// `StartSearch` answers with, as the operation documents it ("the response
+/// returns immediately with a searchId and an initial status of QUEUED").
+pub const SEARCH_QUEUED: &str = "QUEUED";
+/// The `SearchStatus` a search reports while it runs.
+pub const SEARCH_RUNNING: &str = "RUNNING";
+/// The terminal `SearchStatus` of a search whose run finished, and the one
+/// `GetSearchResults` is documented to need ("retrieve the results once the
+/// search reaches SUCCEEDED").
+pub const SEARCH_SUCCEEDED: &str = "SUCCEEDED";
+
+/// The `searchType` a `StartSearch` call that named none runs under, as the
+/// `SearchType` shape documents it: "When `searchType` is omitted on a request,
+/// the search defaults to QUICK".
+pub const DEFAULT_SEARCH_TYPE: &str = "QUICK";
+
+/// How long after the `StartSearch` call the queued-to-running transition it
+/// owes falls due.
+///
+/// CHOSEN, not documented: AWS publishes no duration for a search's lifecycle,
+/// only that the call answers immediately with `QUEUED` and that the search
+/// runs "in the background". Deliberately non-zero, and towards the long end of
+/// the span this emulator allows itself, so a caller that polls straight after
+/// the call reliably observes the `QUEUED` the real service reports.
+pub const SEARCH_QUEUED_FOR: Duration = Duration::from_millis(600);
+
+/// How long a running search takes to reach [`SEARCH_SUCCEEDED`], counted from
+/// the instant it STARTED RUNNING — the transition this one owes is the one the
+/// run itself starts, not the one the call starts.
+///
+/// CHOSEN for the same reason as [`SEARCH_QUEUED_FOR`], and non-zero for the
+/// same reason: `RUNNING` is a status `DescribeSearch` is documented to report,
+/// so a search has to be observable in it for long enough to be polled.
+pub const SEARCH_RUNS_FOR: Duration = Duration::from_millis(600);
+
+/// How many searches one workspace holds.
+///
+/// The same kind of bound, and for the same reason, as
+/// [`MAX_PIPELINES_PER_WORKSPACE`]: `StartSearch` is the only thing that adds a
+/// search and nothing evicts one, so the map needs a maximum entry count. The
+/// emulator's own bound, not a published AWS quota, and high enough that no
+/// ordinary workflow meets it; `StartSearch` refuses past it with the modelled
+/// `LimitExceededException` (HTTP 410).
+pub const MAX_SEARCHES_PER_WORKSPACE: usize = 100;
+
+/// How many searches the store holds in total, across every workspace.
+///
+/// The per-workspace cap cannot bound the store on its own: the store holds up
+/// to [`MAX_WORKSPACES`] workspaces and each of them its own searches, so the
+/// whole map needs an entry count of its own, refused past the cap with the
+/// modelled `LimitExceededException` (HTTP 410).
+pub const MAX_SEARCHES: usize = 1_000;
+
+/// A search `StartSearch` started: the request it was started from and the
+/// instants its lifecycle transitions fall due.
+///
+/// The status is DERIVED from those instants ([`Self::status`]) rather than
+/// stored, so polling a search never has to write and two readers at the same
+/// instant see the same status.
+#[derive(Debug, Clone)]
+pub struct SearchRecord {
+    /// The workspace the search runs against. A search is addressed by
+    /// `(workspaceName, searchId)`, so the pair is its identity.
+    pub workspace_name: String,
+    pub search_id: String,
+    /// The `queryStatement` the call carried, which `DescribeSearch` reports
+    /// back and a results read answers from.
+    pub query_statement: String,
+    /// The search strategy this search runs under: the one the call named, or
+    /// [`DEFAULT_SEARCH_TYPE`] when it named none.
+    pub search_type: String,
+    /// The filters the call carried, kept as an `Option` so a search started
+    /// without any reports none rather than empty lists it never carried.
+    pub search_filters: Option<SearchFilters>,
+    pub group_id: Option<String>,
+    /// The `clientToken` of the call that started this search, if it carried
+    /// one, so a repeat of that same call answers from this search instead of
+    /// starting another.
+    pub client_token: Option<String>,
+    /// When the call that started the search landed — what `startedAt` reports.
+    pub started_at: SystemTime,
+    /// The instant the owed `QUEUED` -> `RUNNING` transition falls due.
+    pub running_at: SystemTime,
+    /// The instant the owed `RUNNING` -> `SUCCEEDED` transition falls due.
+    pub succeeded_at: SystemTime,
+}
+
+impl SearchRecord {
+    /// The search's `SearchStatus` as of `now`: queued until its run falls due,
+    /// running until its run finishes, succeeded from then on. Derived, so a
+    /// poll never has to write.
+    ///
+    /// No run of this emulator fails, so `FAILED` — and the `statusReason` the
+    /// model documents as "Populated when the search has FAILED" — is a status
+    /// nothing here reports.
+    ///
+    /// This status is a RECORD of the lifecycle the start owed, not a report on
+    /// work something performed: the search's query is persisted but nothing
+    /// evaluates it, and the results read is honestly refused while it is
+    /// unimplemented. An operation that comes to answer a search's results must
+    /// derive them from the store and this record's own query, never synthesise
+    /// them to match the status reached here.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.running_at {
+            SEARCH_QUEUED
+        } else if now < self.succeeded_at {
+            SEARCH_RUNNING
+        } else {
+            SEARCH_SUCCEEDED
+        }
+    }
+}
+
+/// The key a search is stored under in
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::searches`]: the workspace it
+/// runs against and its own id, so a search is reachable only through the
+/// workspace it belongs to.
+pub fn search_key(workspace_name: &str, search_id: &str) -> (String, String) {
+    (workspace_name.to_string(), search_id.to_string())
+}
+
 /// One version of a task: the caller-owned configuration as of the call that
 /// wrote it.
 ///
@@ -2909,6 +3034,11 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub logging_options: HashMap<String, LoggingOptionsRecord>,
     /// Datasets by `datasetId`.
     pub datasets: HashMap<String, DatasetRecord>,
+    /// Searches by [`search_key`] — the workspace they run against and their
+    /// own id — because a search is addressed by that pair. Bounded at
+    /// [`MAX_SEARCHES`] / [`MAX_SEARCHES_PER_WORKSPACE`], which `StartSearch`
+    /// refuses past.
+    pub searches: HashMap<(String, String), SearchRecord>,
     /// Executions of actions by `executionId`, which `ListExecutions`
     /// summarises for the target resource a request names.
     pub executions: HashMap<String, ExecutionRecord>,
@@ -3416,6 +3546,37 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         if let Some(properties) = self.property_values.get_mut(asset_id) {
             properties.remove(property_id);
         }
+    }
+
+    /// The search `workspace` holds under `search_id`, or `None` when that
+    /// workspace holds none: a search is reachable only through the workspace it
+    /// was started in.
+    pub fn search(&self, workspace_name: &str, search_id: &str) -> Option<&SearchRecord> {
+        self.searches.get(&search_key(workspace_name, search_id))
+    }
+
+    /// The search `workspace` already started under `client_token`, if any.
+    ///
+    /// What makes `StartSearch` idempotent on its token: a repeat of a call that
+    /// carried one answers from the search it already started. Scoped to the
+    /// workspace, since that is what a search is addressed within.
+    pub fn search_for_client_token(
+        &self,
+        workspace_name: &str,
+        client_token: &str,
+    ) -> Option<&SearchRecord> {
+        self.searches.values().find(|record| {
+            record.workspace_name == workspace_name
+                && record.client_token.as_deref() == Some(client_token)
+        })
+    }
+
+    /// How many searches `workspace` holds — what the per-workspace bound reads.
+    pub fn searches_in_workspace(&self, workspace_name: &str) -> usize {
+        self.searches
+            .keys()
+            .filter(|(workspace, _)| workspace == workspace_name)
+            .count()
     }
 
     /// Store `segment` on the capture source `(workspace_name, time_series_id)`
@@ -4109,6 +4270,9 @@ pub const RESOURCE_TASK: &str = "Task";
 
 /// The resource kind those errors name for a dataset.
 pub const RESOURCE_DATASET: &str = "Dataset";
+
+/// The resource kind those errors name for a search.
+pub const RESOURCE_SEARCH: &str = "Search";
 
 /// The resource kind those errors name for a dataset export job.
 pub const RESOURCE_DATASET_EXPORT_JOB: &str = "Dataset Export Job";
