@@ -13,13 +13,15 @@
 //! and refuses a `ResourceType` outside the three the member documents, and a global
 //! network the store does not hold.
 //!
-//! The operations that register such a connection
-//! (`AssociateTransitGatewayConnectPeer`, `AssociateConnectPeer`,
-//! `RegisterTransitGateway` / `AssociateCustomerGateway`) are still scaffold stubs, each
-//! with its own issue, so there is no request that creates one yet: these suites SEED the
+//! The remaining operations that register such a connection
+//! (`AssociateTransitGatewayConnectPeer`, `RegisterTransitGateway`) are still scaffold
+//! stubs, each
+//! with its own issue, so no request of this suite's own creates one: these suites SEED the
 //! store through `crate::state` and then read it back over the wire. Nothing else about
 //! the answer is seeded — the ids, account ids and health a telemetry entry reports are
-//! computed by the handler out of those records.
+//! computed by the handler out of those records. The one registration a request DOES make
+//! is covered by `crate::connect_peer_association_lifecycle`, which associates a core
+//! network Connect peer and reads its session back through this operation.
 
 use std::time::{Duration, SystemTime};
 

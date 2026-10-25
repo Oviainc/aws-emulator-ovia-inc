@@ -24,7 +24,10 @@
 //! takes. A Connect
 //! attachment in turn carries CONNECT PEERS, each a BGP peering between one edge of the
 //! core network and one appliance outside AWS, and each a resource of its own with an id,
-//! an ARN and tags. The policy's
+//! an ARN and tags. A Connect peer can in turn be ASSOCIATED with one device of the global
+//! network that owns its core network, optionally over one of that device's links: like a
+//! link association that tie has no id of its own and is keyed by the peer it ties. The
+//! policy's
 //! `attachment-policies` rules decide what becomes of each attachment created on the core
 //! network — which segment or network function group it joins, and whether its attachment
 //! request has to be ACCEPTED first, which is what holds it in
@@ -46,7 +49,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AWSLocation, AccountStatus, Attachment, AttachmentRoutingPolicyAssociationSummary, Bandwidth,
     ConnectAttachment, ConnectAttachmentOptions,
-    ConnectPeer, ConnectPeerBgpConfiguration, ConnectPeerConfiguration, ConnectPeerSummary,
+    ConnectPeer, ConnectPeerAssociation, ConnectPeerBgpConfiguration, ConnectPeerConfiguration,
+    ConnectPeerSummary,
     Connection, ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
     CustomerGatewayAssociation,
     CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment,
@@ -2408,6 +2412,60 @@ impl ConnectPeerRecord {
     }
 }
 
+/// A stored Connect peer association: the tie between one core network Connect peer and
+/// one DEVICE of a global network, optionally over one of that device's links.
+///
+/// "Associates a core network Connect peer with a device and optionally, with a link."
+/// (`smithy_query query="doc" shape="AssociateConnectPeer"`) — like a link association the
+/// tie carries no id and no ARN of its own (the modelled `ConnectPeerAssociation` is the
+/// peer, the global network, the device, the link and a state, `smithy_query
+/// shape=ConnectPeerAssociation`), so the PEER is its identity: one peer reaches its
+/// appliance over one device, and the store keys the association by `ConnectPeerId`. That
+/// is also what `DisassociateConnectPeer` addresses, which names the peer and nothing else
+/// (`smithy_query query="operation" operation="DisassociateConnectPeer"`).
+///
+/// Like the records above, its state is a function of the clock rather than a field, so
+/// reading one never writes.
+#[derive(Debug, Clone)]
+pub struct ConnectPeerAssociationRecord {
+    pub connect_peer_id: String,
+    pub global_network_id: String,
+    pub device_id: String,
+    /// The link the device reaches this peering over, or `None` where the association
+    /// named none — the link is optional on the request that makes the association.
+    pub link_id: Option<String>,
+    /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
+    pub available_at: SystemTime,
+}
+
+impl ConnectPeerAssociationRecord {
+    /// This association's state as of `now`.
+    ///
+    /// `ConnectPeerAssociationState` carries PENDING, AVAILABLE, DELETING and DELETED
+    /// (`smithy_query shape=ConnectPeerAssociationState`, mirrored in
+    /// `ops::types::CONNECT_PEER_ASSOCIATION_STATE_VALUES`); the first three are spelled
+    /// exactly as [`STATE_PENDING`], [`STATE_AVAILABLE`] and [`STATE_DELETING`], so this
+    /// slice reuses those constants, as [`LinkAssociationRecord::state_at`] does.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.available_at {
+            STATE_AVAILABLE
+        } else {
+            STATE_PENDING
+        }
+    }
+
+    /// The modelled `ConnectPeerAssociation` for this record, as of `now`.
+    pub fn to_shape(&self, now: SystemTime) -> ConnectPeerAssociation {
+        ConnectPeerAssociation {
+            connect_peer_id: Some(self.connect_peer_id.clone()),
+            global_network_id: Some(self.global_network_id.clone()),
+            device_id: Some(self.device_id.clone()),
+            link_id: self.link_id.clone(),
+            state: Some(self.state_at(now).to_string()),
+        }
+    }
+}
+
 /// The two `Action` values `StartOrganizationServiceAccessUpdate` accepts, in the order
 /// its documentation lists them.
 ///
@@ -2904,6 +2962,15 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// Bounded by [`MAX_CONNECT_PEERS_PER_ATTACHMENT`] per attachment, on top of the
     /// per-core-network attachment quota, so no caller can grow the map without end.
     pub connect_peers: BTreeMap<String, ConnectPeerRecord>,
+    /// Connect peer associations by `ConnectPeerId` — the tie each peer has to one device
+    /// of a global network ([`ConnectPeerAssociationRecord`]). A `BTreeMap`, so listing
+    /// order is the stable peer-id order and a pagination token can name a key offset
+    /// into it.
+    ///
+    /// No quota of its own bounds this map: it holds at most one entry per stored Connect
+    /// peer, which [`MAX_CONNECT_PEERS_PER_ATTACHMENT`] and the per-core-network
+    /// attachment quota already bound.
+    pub connect_peer_associations: BTreeMap<String, ConnectPeerAssociationRecord>,
     /// Resource policies by the ARN of the resource they are attached to — the one store
     /// `PutResourcePolicy`, `GetResourcePolicy` and `DeleteResourcePolicy` share, holding
     /// the document exactly as it was accepted so a reader reports what was put.
@@ -2921,10 +2988,11 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// Telemetry-bearing connections by [`telemetry_key`]: the registrations
     /// `GetNetworkTelemetry` reports the session health of.
     ///
-    /// A connection is registered here by the operation that ties it to the global network
-    /// — `AssociateTransitGatewayConnectPeer` and `AssociateConnectPeer` for a Connect peer
-    /// of either kind, `RegisterTransitGateway` for the VPN connections a registered
-    /// gateway brings with it — each still a scaffold stub with its own issue, so an
+    /// A connection is registered here by the operation that ties it to the global network:
+    /// `AssociateConnectPeer` for a core network Connect peer,
+    /// `AssociateTransitGatewayConnectPeer` for a transit gateway one, and
+    /// `RegisterTransitGateway` for the VPN connections a registered gateway brings with
+    /// it — the last two still scaffold stubs with their own issues, so an
     /// emulator nobody has registered a connection with reports the empty telemetry it
     /// really holds rather than a placeholder. No quota of its own bounds the map: a
     /// registration exists only for a stored global network, which the per-account global

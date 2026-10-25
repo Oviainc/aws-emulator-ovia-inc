@@ -1,15 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConfirmProductInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ConfirmProductInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ConfirmProductInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports whether the product code the request names is attached to the
+//! instance it names, for a caller that OWNS that product code.
+//!
+//! ## Who owns a product code
+//!
+//! "This action can only be used by the owner of the product code." No EC2 operation
+//! mints a product code, so the codes this service knows are those carried by the paid
+//! resources it stores — "any product codes associated with the AMI"
+//! (`Image$ProductCodes`) and an Amazon FPGA Image's own (`FpgaImage$ProductCodes`) —
+//! each owned by that resource's own owner.
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::account_owns_product_code`] is that one
+//! reading of ownership. A caller that owns the code on no stored resource is refused
+//! `AuthFailure` (HTTP 400), and that refusal is answered BEFORE the instance id is
+//! resolved: a caller the action is not for learns nothing about whether another
+//! account's instance exists.
+//!
+//! ## What it answers
+//!
+//! "Returns true if the specified product code is owned by the requester and associated
+//! with the specified instance" (`ConfirmProductInstanceResult$Return`), and `OwnerId` —
+//! "the Amazon Web Services account ID of the instance owner" — "is only present if the
+//! product code is attached to the instance". A code reaches an instance through the AMI
+//! it was launched from, which is what
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::instance_product_codes`] reads and what
+//! `DescribeInstances` reports as `Instance$ProductCodes`, so the two cannot disagree.
+//! The instance owner is read off its reservation (`Reservation$OwnerId`).
+//!
+//! An id outside the form EC2 issues is `InvalidInstanceID.Malformed` and an id inside
+//! that form naming no instance of the account is `InvalidInstanceID.NotFound` (both from
+//! [`crate::state::require_instance_record`]), answered before `DryRun`, so a dry run
+//! reports whether the request WOULD have succeeded. `DryRun`'s own documentation names
+//! `DryRunOperation` or `UnauthorizedOperation`, which are about the CALLER's permission
+//! to call the operation; a product code the caller does not own is a fact of the
+//! RESOURCE, not of the caller's IAM policy, so it is refused with its own code before
+//! the flag is read — a dry run must not report that a call which would have been
+//! refused would have succeeded.
+//!
+//! This operation REPORTS; it writes nothing at all. Two calls about one instance answer
+//! the same thing, and a read can never change what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +171,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ConfirmProductInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConfirmProductInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ConfirmProductInstance"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{require_instance_record, require_service_state};
+
+        // Nothing about this answer depends on the request's Region or headers: a
+        // product code's owner and an instance's codes are facts of the stored
+        // resources.
+        let _ = ctx;
+
+        let state = require_service_state(&*self.engine)?;
+        // The guard is taken only to READ: this operation reports and writes nothing
+        // through it.
+        let store = state.lock();
+
+        // "This action can only be used by the owner of the product code" — and the
+        // emulator serves ONE account (`engine::emulator_account_id`), which is the
+        // account every request is made by. Answered first: a caller that does not own
+        // the code is told so without being told whether the instance exists.
+        if !store.account_owns_product_code(&input.product_code, ::engine::emulator_account_id()) {
+            // EC2 names the code the request asked about in the refusal, so a caller
+            // confirming several codes learns WHICH one it does not own; the wording is
+            // the one recorded from the service (British spelling and all), with the code
+            // taken from the request.
+            return Err(Scaffolded::auth_failure(format!(
+                "Not authorised for product code {}",
+                input.product_code
+            )));
+        }
+
+        // A malformed id before an unknown one, the order EC2 answers the two in, and
+        // the record itself so the id is resolved once.
+        let instance = require_instance_record(&store, &input.instance_id)?;
+
+        // DryRun sits AFTER everything that would refuse the request: the flag asks
+        // whether the request WOULD have succeeded.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let attached = store
+            .instance_product_codes(instance)
+            .iter()
+            .any(|code| code.product_code_id.as_deref() == Some(input.product_code.as_str()));
+
+        Ok(ConfirmProductInstanceOutput {
+            // "Returns true if the specified product code is owned by the requester and
+            // associated with the specified instance": ownership is established above,
+            // so what is left to report is the association.
+            r#return: Some(attached),
+            // "The Amazon Web Services account ID of the instance owner. This is only
+            // present if the product code is attached to the instance" — read off the
+            // reservation the launch created, not from the request.
+            owner_id: attached
+                .then(|| {
+                    store
+                        .reservations
+                        .get(&instance.reservation_id)
+                        .map(|reservation| reservation.owner_id.clone())
+                })
+                .flatten(),
+        })
     }
 }
